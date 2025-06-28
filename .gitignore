@@ -5,7 +5,9 @@ __pycache__/
 
 # C extensions
 *.so
-
+exp.py
+env.py
+run_test.py
 # Distribution / packaging
 .Python
 build/
