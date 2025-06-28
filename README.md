@@ -198,3 +198,8 @@ Contributions are welcome! Please see the [CONTRIBUTING.md](docs/contributing.rs
 ## License
 
 This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for details.
+
+## Refrences
+
+- [flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+- [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention)
