@@ -238,27 +238,27 @@ def native_spare_attention(
     The final output is a gated combination of these two components.
 
     Args:
-        q: Query tensor of shape `(B, T, HQ, K)`.
-        k: Key tensor of shape `(B, T, H, K)`. GQA is enforced, where the ratio
-            of query heads (HQ) to key/value heads (H) must be a multiple of 16.
-        v: Value tensor of shape `(B, T, H, V)`.
-        g_cmp: Optional gate tensor for compressed attention, shape `(B, T, HQ)`.
+        q: Query tensor of shape `(batch_size, sequence, query_heads, dimk)`.
+        k: Key tensor of shape `(batch_size, sequence, kvheads, dimk)`. GQA is enforced, where the ratio
+            of query heads (query_heads) to key/value heads (kvheads) must be a multiple of 16.
+        v: Value tensor of shape `(batch_size, sequence, kvheads, dimv)`.
+        g_cmp: Optional gate tensor for compressed attention, shape `(batch_size, sequence, query_heads)`.
             If provided, the compressed attention component is computed.
-        g_slc: Optional gate tensor for selected attention, shape `(B, T, HQ)`.
+        g_slc: Optional gate tensor for selected attention, shape `(batch_size, sequence, query_heads)`.
         block_indices: Optional tensor of pre-computed block indices for selected
-            attention, shape `(B, H, T, S)`. `S` is the number of selected
+            attention, shape `(batch_size, kvheads, sequence, S)`. `S` is the number of selected
             blocks (`block_counts`). If `g_cmp` is provided, this argument is
             ignored, and block indices are computed dynamically via top-k
             selection over the compressed keys. If `g_cmp` is NOT provided, this
             argument is required.
         block_counts: Number of blocks to select for each query. Defaults to 16.
         block_size: The size of each attention block. Defaults to 64.
-        scale: Scale factor for attention scores. Defaults to `1 / sqrt(K)`.
+        scale: Scale factor for attention scores. Defaults to `1 / sqrt(dimk)` or `dimk**-0.5`.
         cu_seqlens: Cumulative sequence lengths of shape `(N+1)` for
-            variable-length training. If provided, batch size B must be 1.
+            variable-length training. If provided, batch size batch_size must be 1.
 
     Returns:
-        The output tensor of shape `(B, T, HQ, V)`.
+        The output tensor of shape `(batch_size, sequence, query_heads, dimv)`.
     """
     assert block_counts is not None, "block counts must be provided for selection"
     if scale is None:
