@@ -99,8 +99,6 @@ def chunk_local_cumsum_vector(
     return result.astype(output_dtype)
 
 
-
-
 @partial(jit, static_argnames=["reverse", "head_first"])
 def chunk_global_cumsum_scalar(
     s: jnp.ndarray,

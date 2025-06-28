@@ -17,31 +17,10 @@ import sys
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import jax
 import jax.numpy as jnp
 
 from ejgpu import native_spare_attention
-from ejgpu.utils import cdiv, numeric_gen
-
-
-def generate_block_indices(batch_size, sequence_length, kv_heads, num_blocks_per_token, block_size, seed=0):
-    """
-    Generate sparse attention block indices.
-    """
-    block_indices = jnp.full(
-        (batch_size, sequence_length, kv_heads, num_blocks_per_token), sequence_length, dtype=jnp.int32
-    )
-    key = jax.random.PRNGKey(seed)
-
-    for b in range(batch_size):
-        for t in range(sequence_length):
-            for h in range(kv_heads):
-                key, subkey = jax.random.split(key)
-                max_blocks = max(1, cdiv(t, block_size))
-                selected_blocks = jax.random.permutation(subkey, max_blocks)[:num_blocks_per_token]
-                block_indices = block_indices.at[b, t, h, : len(selected_blocks)].set(selected_blocks)
-
-    return jnp.sort(block_indices, axis=-1)
+from ejgpu.utils import generate_block_indices, numeric_gen
 
 
 def run_attention_test(

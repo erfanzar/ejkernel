@@ -16,6 +16,8 @@
 
 # _os.environ["LET_TRITON_TALK"] = "off"
 
+__version__ = "0.0.1"
+
 from .triton_kernels import (
     apply_native_spare_attention,
     attention_varlen_vanilla,
