@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+from .decode_attention import decode_attention
 from .flash_attn import flash_attention
 from .flash_attn_varlen import attention_varlen_vanilla, flash_attn_varlen, flash_attn_varlen_decode
 from .gla import recurrent_gla
@@ -23,6 +23,7 @@ from .recurrent import recurrent
 __all__ = (
     "apply_native_spare_attention",
     "attention_varlen_vanilla",
+    "decode_attention",
     "flash_attention",
     "flash_attn_varlen",
     "flash_attn_varlen_decode",

@@ -21,6 +21,7 @@ __version__ = "0.0.1"
 from .triton_kernels import (
     apply_native_spare_attention,
     attention_varlen_vanilla,
+    decode_attention,
     flash_attention,
     flash_attn_varlen,
     flash_attn_varlen_decode,
@@ -34,6 +35,7 @@ from .triton_kernels import (
 __all__ = (
     "apply_native_spare_attention",
     "attention_varlen_vanilla",
+    "decode_attention",
     "flash_attention",
     "flash_attn_varlen",
     "flash_attn_varlen_decode",

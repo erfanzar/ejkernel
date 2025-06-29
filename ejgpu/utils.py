@@ -87,9 +87,7 @@ def strides_from_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def get_stride(shape: tuple[int, ...] | jax.Array, index=0) -> int:
-    if isinstance(shape, jax.Array):
-        shape = shape.shape
-    return strides_from_shape(shape=shape)[index]
+    return get_strides(shape)[index]
 
 
 def next_power_of_2(x: int) -> int:
