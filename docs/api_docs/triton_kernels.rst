@@ -5,6 +5,7 @@ Triton Kernels
    :maxdepth: 2
 
    triton_kernels___init__
+   triton_kernels_decode_attention
    triton_kernels_flash_attn
    triton_kernels_flash_attn_varlen
    triton_kernels_flash_mla
