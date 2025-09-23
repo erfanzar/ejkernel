@@ -1,7 +1,7 @@
-ejgpu.__init__
-==============
+ejkernel.__init__
+=================
 
-.. automodule:: ejgpu.__init__
+.. automodule:: ejkernel.__init__
     :members:
     :undoc-members:
     :show-inheritance:

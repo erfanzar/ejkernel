@@ -1,7 +1,7 @@
-ejgpu.utils
-===========
+ejkernel.utils
+==============
 
-.. automodule:: ejgpu.utils
+.. automodule:: ejkernel.utils
     :members:
     :undoc-members:
     :show-inheritance:

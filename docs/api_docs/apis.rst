@@ -1,11 +1,10 @@
-EjGPU APIs 🔮
+ejkernel APIs 🔮
 ====
 
 .. toctree::
    :maxdepth: 2
 
-   logging utils
-   triton kernels
+   kernels
    utils
    xla utils
    

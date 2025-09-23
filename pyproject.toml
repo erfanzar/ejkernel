@@ -1,18 +1,24 @@
-[tool.poetry]
-name = "ejgpu"
-version = "0.0.1"
+[build-system]
+requires = ["uv_build>=0.7.19,<0.8.0"]
+build-backend = "uv_build"
 
-description = "ejgpu"
-authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
-license = "Apache-2.0"
+[project]
+name = "ejkernel"
+version = "0.1.0"
+authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
+description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
-
-homepage = "https://github.com/erfanzar/ejgpu"
-repository = "https://github.com/erfanzar/ejgpu"
-documentation = "https://ejgpu.readthedocs.io/en/latest/"
-
-keywords = ["EasyDeL"]
-
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+keywords = [
+    "Deep Learning",
+    "Machine Learning",
+    "JAX",
+    "CUDA",
+    "XLA",
+    "Triton",
+    "Pallas",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -23,35 +29,44 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
+dependencies = ["eformer>=0.0.75", "jax>=0.7.2", "jaxlib>=0.7.2"]
 
-[tool.poetry.dependencies]
-python = ">=3.10,<3.14"
-jax = ">=0.6.0"
-jaxlib = ">=0.6.0"
-triton = "~3.2.0"
-jaxtyping = "~0.3.2"
-eformer = ">=0.0.41"
+[project.urls]
+"Homepage" = "https://github.com/erfanzar/ejkernel"
+"Repository" = "https://github.com/erfanzar/ejkernel"
+"Documentation" = "https://ejkernel.readthedocs.io/en/latest/"
 
-[build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+[tool.uv.build-backend]
+module-name = "ejkernel"
+module-root = "."
+
+[tool.setuptools]
+package-dir = { "" = "." }
 
 [tool.setuptools.packages.find]
 where = ["."]
 
 [tool.setuptools.package-data]
-"easydel" = ["py.typed"]
+"ejkernel" = ["py.typed"]
+
+[project.optional-dependencies]
+
+gpu = ["jax[cuda12]>=0.7.2"]
+tpu = ["jax[tpu]>=0.7.2"]
+profile = [
+    "xprof>=2.20.6",
+    "tb-nightly>=2.21.0a20250820",
+    "xprof-nightly>=2.21.6a20250820",
+]
 
 [tool.black]
 line-length = 121
-target-version = ["py310"]
+target-version = ["py311"]
 preview = true
-
 
 [tool.ruff]
 line-length = 121
-target-version = "py310"
-
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
@@ -61,7 +76,42 @@ ignore = ["F722", "B008", "UP015", "A005"]
 "__init__.py" = ["E402", "F401"]
 
 [tool.mypy]
-python_version = "3.10"
-
+python_version = "3.11"
 ignore_missing_imports = true
-exclude = ["ejgpu/"]
+exclude = ["ejkernel/"]
+
+[tool.basedpyright]
+reportAssignmentType = "none"
+reportUnknownVariableType = "none"
+reportPrivateUsage = "none"
+reportOptionalCall = "none"
+reportUnknownMemberType = "none"
+reportGeneralTypeIssues = "none"
+reportArgumentType = "none"
+enableTypeIgnoreComments = true
+reportMissingTypeArgument = "none"
+reportUnknownParameterType = "none"
+reportAny = "none"
+reportCallIssue = "none"
+reportUnknownArgumentType = "none"
+reportRedeclaration = "none"
+reportIgnoreCommentWithoutRule = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnusedCallResult = "none"
+reportUnknownLambdaType = "none"
+reportUnannotatedClassAttribute = "none"
+reportImplicitStringConcatenation = "none"
+reportMissingParameterType = "none"
+reportImplicitOverride = "none"
+reportImplicitAbstractClass = "none"
+reportExplicitAny = "none"
+reportIncompatibleMethodOverride = "none"
+reportIndexIssue = "none"
+reportAttributeAccessIssue = "none"
+reportUnreachable = "none"
+reportOptionalMemberAccess = "none"
+reportOperatorIssue = "none"
+reportUninitializedInstanceVariable = "none"
+reportIncompatibleVariableOverride = "none"
+reportPrivateImportUsage = "none"
+reportUnusedParameter = "none"

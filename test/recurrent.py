@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL/EJGPU(EasyDeLJaxGPUUtilities) Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ import jax.numpy as jnp
 import pytest
 from einops import rearrange
 
-from ejgpu import recurrent
-from ejgpu.utils import numeric_gen
+from ejkernel import recurrent
+from ejkernel.utils import numeric_gen
 
 
 def run_recurrent_test(

@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL/EJGPU(EasyDeLJaxGPUUtilities) Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,8 +19,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import jax
 import jax.numpy as jnp
-
-from ejgpu.triton_kernels.flash_attn_varlen._vanilla import attention_vanilla, attention_varlen
+from ejkernel.triton.flash_attn_varlen._vanilla import attention_vanilla, attention_varlen
 
 
 def vanilla_attention():

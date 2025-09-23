@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL/EJGPU(EasyDeLJaxGPUUtilities) Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ from flash_attn import flash_attn_varlen_func
 from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
 from jax import numpy as jnp
 
-from ejgpu import flash_attn_varlen
+from ejkernel import flash_attn_varlen
 
 to_jnp = lambda x: jnp.asarray(x.detach().cpu().numpy())  # noqa
 to_torch = lambda x: torch.from_numpy(np.asarray(x))  # noqa

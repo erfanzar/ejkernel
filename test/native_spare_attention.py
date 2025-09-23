@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL/EJGPU(EasyDeLJaxGPUUtilities) Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import jax.numpy as jnp
 
-from ejgpu import native_spare_attention
-from ejgpu.utils import generate_block_indices, numeric_gen
+from ejkernel import native_spare_attention
+from ejkernel.utils import generate_block_indices, numeric_gen
 
 
 def run_attention_test(

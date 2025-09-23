@@ -1,4 +1,4 @@
-# Copyright 2023 The EASYDEL/EJGPU(EasyDeLJaxGPUUtilities) Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from ejgpu.xla_utils.utils import (
+from ejkernel.xla_utils.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_cu_seqlens_from_mask,

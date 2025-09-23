@@ -1,0 +1,256 @@
+# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import functools
+
+import chex
+import jax
+from eformer.callib import ejit
+from jax import numpy as jnp
+
+from ._triton_impl_bwd import _bwd_attention_kernel_call
+from ._triton_impl_fwd import _fwd_attention_kernel_call
+
+
+def _jax_fwd_attention_call(
+    q: jnp.ndarray | None,
+    k: jnp.ndarray | None,
+    v: jnp.ndarray | None,
+    attention_mask: jnp.ndarray | None = None,  # legacy path
+    bias: jnp.ndarray | None = None,
+    softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
+    causal: bool = False,
+    dropout_seed: int | None = None,
+    cum_seqlens_q: jnp.ndarray | None = None,  # int32 [B+1]
+    cum_seqlens_k: jnp.ndarray | None = None,  # int32 [B+1]
+    sliding_window: int | tuple[int, int] | None = None,
+):
+    """Forward pass for flash attention with custom gradient support.
+
+    Computes scaled dot-product attention with optional masking and dropout.
+    Returns both the attention output and residuals needed for backward pass.
+
+    Args:
+        q: Query tensor of shape [batch, seq_len, num_heads, head_dim]
+        k: Key tensor of shape [batch, seq_len, num_heads, head_dim]
+        v: Value tensor of shape [batch, seq_len, num_heads, head_dim]
+        attention_mask: Optional attention mask (legacy, use bias instead)
+        bias: Optional attention bias of shape [batch, num_heads, seq_len, seq_len]
+        softmax_scale: Scaling factor for QK^T before softmax
+        dropout_prob: Dropout probability applied to attention weights
+        causal: Whether to apply causal masking
+        dropout_seed: Seed for dropout random number generation
+        cum_seqlens_q: Cumulative sequence lengths for queries in variable-length mode
+        cum_seqlens_k: Cumulative sequence lengths for keys in variable-length mode
+        sliding_window: Window size for local attention (int or tuple of left/right)
+
+    Returns:
+        tuple: (attention_output, residuals) where residuals contain intermediate
+               values needed for backward pass gradient computation
+    """
+    out, lse = _fwd_attention_kernel_call(
+        q=q,
+        k=k,
+        v=v,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
+        causal=causal,
+        dropout_seed=dropout_seed,
+        cum_seqlens_q=cum_seqlens_q,
+        cum_seqlens_k=cum_seqlens_k,
+        sliding_window=sliding_window,
+    )
+
+    return out, (q, k, v, bias, attention_mask, out, lse, dropout_seed, cum_seqlens_q, cum_seqlens_k)
+
+
+def _jax_bwd_attention_call(
+    softmax_scale: float | None,
+    dropout_prob: float,
+    causal: bool,
+    sliding_window: int | tuple[int, int] | None,
+    residual: tuple[chex.Array],
+    dO: chex.Array,
+):
+    """Backward pass for flash attention gradient computation.
+
+    Computes gradients with respect to queries, keys, and values using
+    the saved residuals from the forward pass.
+
+    Args:
+        softmax_scale: Scaling factor used in forward pass
+        dropout_prob: Dropout probability used in forward pass
+        causal: Whether causal masking was applied
+        sliding_window: Window size for local attention if used
+        residual: Saved tensors from forward pass containing q, k, v, bias,
+                 attention_mask, output, log-sum-exp, and other metadata
+        dO: Gradient of loss with respect to attention output
+
+    Returns:
+        tuple: Gradients (dq, dk, dv, d_attention_mask, d_bias, d_scale, d_prob, d_seed)
+               where only dq, dk, dv are non-None for differentiable parameters
+    """
+    q, k, v, bias, attention_mask, out, lse, dropout_seed, cum_seqlens_q, cum_seqlens_k = residual
+    dq, dk, dv = _bwd_attention_kernel_call(
+        dO=dO,
+        q=q,
+        k=k,
+        v=v,
+        bias=bias,
+        attention_mask=attention_mask,
+        o=out,
+        M=lse,
+        dropout_prob=dropout_prob,
+        causal=causal,
+        dropout_seed=dropout_seed,
+        softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        cum_seqlens_k=cum_seqlens_k,
+        cum_seqlens_q=cum_seqlens_q,
+    )
+    return dq, dk, dv, None, None, None, None, None
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 11))
+@ejit(static_argnums=(5, 6, 7, 11))
+def flash_attention_call(
+    q: chex.Array | None,
+    k: chex.Array | None,
+    v: chex.Array | None,
+    attention_mask: chex.Array | None = None,
+    bias: chex.Array | None = None,
+    softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
+    causal: bool = False,
+    dropout_seed: int | None = None,
+    cum_seqlens_q: jnp.ndarray | None = None,  # int32 [B+1]
+    cum_seqlens_k: jnp.ndarray | None = None,  # int32 [B+1]
+    sliding_window: int | tuple[int, int] | None = None,
+) -> chex.Array:
+    """Flash attention with custom gradient computation.
+
+    Efficient attention implementation using tiling and online softmax computation.
+    Supports variable sequence lengths, causal masking, and sliding windows.
+
+    This function is decorated with custom_vjp for efficient backward pass and
+    ejit for JIT compilation with static arguments.
+
+    Args:
+        q: Query tensor of shape [batch, seq_len, num_heads, head_dim]
+        k: Key tensor of shape [batch, seq_len, num_heads, head_dim]
+        v: Value tensor of shape [batch, seq_len, num_heads, head_dim]
+        attention_mask: Optional legacy attention mask (deprecated, use bias)
+        bias: Attention bias tensor for masking or positional encoding
+        softmax_scale: Scale factor for attention scores (default: 1/sqrt(head_dim))
+        dropout_prob: Dropout probability for attention weights
+        causal: Apply causal (autoregressive) masking
+        dropout_seed: Random seed for dropout
+        cum_seqlens_q: Cumulative sequence lengths for variable-length queries
+        cum_seqlens_k: Cumulative sequence lengths for variable-length keys
+        sliding_window: Local attention window size (int or (left, right) tuple)
+
+    Returns:
+        chex.Array: Attention output tensor with same shape as query
+
+    Note:
+        Arguments at positions 5, 6, 7, 11 (softmax_scale, dropout_prob,
+        causal, sliding_window) are marked as non-differentiable.
+    """
+    return _fwd_attention_kernel_call(
+        q=q,
+        k=k,
+        v=v,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
+        causal=causal,
+        dropout_seed=dropout_seed,
+        cum_seqlens_q=cum_seqlens_q,
+        cum_seqlens_k=cum_seqlens_k,
+        sliding_window=sliding_window,
+    )[0]
+
+
+flash_attention_call.defvjp(
+    _jax_fwd_attention_call,
+    _jax_bwd_attention_call,
+)
+
+
+def flash_attention(
+    q: jnp.ndarray | None,
+    k: jnp.ndarray | None,
+    v: jnp.ndarray | None,
+    attention_mask: jnp.ndarray | None = None,  # legacy path
+    bias: jnp.ndarray | None = None,
+    softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
+    causal: bool = False,
+    dropout_seed: int | None = None,
+    cum_seqlens_q: jnp.ndarray | None = None,  # int32 [B+1]
+    cum_seqlens_k: jnp.ndarray | None = None,  # int32 [B+1]
+    sliding_window: int | tuple[int, int] | None = None,
+) -> chex.Array:
+    """Compute flash attention for efficient scaled dot-product attention.
+
+    Flash Attention is a memory-efficient and fast implementation of exact
+    attention that uses tiling and recomputation to reduce memory usage
+    from O(N²) to O(N) where N is sequence length.
+
+    Args:
+        q: Query tensor of shape [batch, seq_len, num_heads, head_dim]
+        k: Key tensor of shape [batch, seq_len_k, num_heads, head_dim]
+        v: Value tensor of shape [batch, seq_len_k, num_heads, head_dim]
+        attention_mask: Optional attention mask (legacy, prefer bias parameter)
+        bias: Attention bias for masking or relative position encoding
+        softmax_scale: Scaling factor for QK^T (default: 1/sqrt(head_dim))
+        dropout_prob: Dropout probability for attention weights (0-1)
+        causal: Whether to apply causal masking for autoregressive models
+        dropout_seed: Random seed for reproducible dropout
+        cum_seqlens_q: Cumulative sequence lengths for packed variable-length sequences
+        cum_seqlens_k: Cumulative sequence lengths for keys in variable-length mode
+        sliding_window: Size of local attention window for sparse patterns
+
+    Returns:
+        chex.Array: Attention output with shape [batch, seq_len, num_heads, head_dim]
+
+    Examples:
+        >>> # Standard attention
+        >>> out = flash_attention(q, k, v, causal=True)
+        >>>
+        >>> # With dropout and custom scale
+        >>> out = flash_attention(q, k, v, dropout_prob=0.1, softmax_scale=0.125)
+        >>>
+        >>> # Variable-length sequences with packing
+        >>> out = flash_attention(q, k, v, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
+    """
+    return flash_attention_call(
+        q=q,
+        k=k,
+        v=v,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
+        causal=causal,
+        dropout_seed=dropout_seed,
+        cum_seqlens_q=cum_seqlens_q,
+        cum_seqlens_k=cum_seqlens_k,
+        sliding_window=sliding_window,
+    )

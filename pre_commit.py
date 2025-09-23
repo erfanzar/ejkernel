@@ -50,7 +50,7 @@ def get_inner(path: str):
     return [os.path.join(path, o) for o in os.listdir(path) if os.path.exists(os.path.join(path, o))]
 
 
-def run(project_locations="ejgpu/", current_head="ejgpu", base_head=None):
+def run(project_locations="ejkernel/", current_head="ejkernel", base_head=None):
     """
     Recursively traverse the project directory and add each Python module to the cache.
     The cache keys are tuples reflecting the full hierarchy.
@@ -102,7 +102,7 @@ def run(project_locations="ejgpu/", current_head="ejgpu", base_head=None):
 
 def get_rst_filename(module_dotted, fallback):
     if module_dotted:
-        fname = module_dotted.replace("ejgpu.", "").replace("src.", "")
+        fname = module_dotted.replace("ejkernel.", "").replace("src.", "")
         fname = fname.replace(".", "_").lower()
         return fname
     else:
@@ -117,7 +117,7 @@ def create_rst(name, children, output_dir, module_dotted=None):
       - name: A display name for the module/package (often the key from the hierarchy).
       - children: A dict (if a package) or a string (if a module).
       - output_dir: Where to write the file.
-      - module_dotted: The full module dotted name (e.g. "ejgpu.callib.triton_call").
+      - module_dotted: The full module dotted name (e.g. "ejkernel.callib.triton_call").
         This is used to compute a consistent file name.
     """
     if isinstance(children, dict):
@@ -190,7 +190,7 @@ def main():
     else:
         os.makedirs(base_api_docs)
 
-    run("ejgpu/", current_head="ejgpu")
+    run("ejkernel/", current_head="ejkernel")
 
     cache_adjusted = {("APIs", *k): v for k, v in cache.items()}
 
@@ -204,7 +204,7 @@ def main():
         if len(parts) > 1:
             if parts[1] != "Init":
                 st.add(parts[1])
-    apis_index = """EjGPU APIs 🔮
+    apis_index = """ejkernel APIs 🔮
 ====
 
 .. toctree::
