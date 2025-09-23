@@ -195,7 +195,7 @@ def basic_attention_refrence(
     query_padding_mask: Bool[Array, "batch seq_len_q"] | None = None,
     key_padding_mask: Bool[Array, "batch seq_len_k"] | None = None,
     dropout_prob: float = 0.0,
-    dropout_key: jax.random.PRNGKey | None = None,
+    dropout_key: jax.Array | None = None,
     window_size: tuple[int, int] = (-1, -1),
     causal: bool = False,
     softcap: float = 0.0,
