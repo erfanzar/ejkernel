@@ -15,29 +15,28 @@
 
 import functools
 
-import chex
 import jax
 from eformer.callib import ejit
-from jax import numpy as jnp
+from jaxtyping import Array, Bool, Float, Int
 
 from ._triton_impl_bwd import _bwd_attention_kernel_call
 from ._triton_impl_fwd import _fwd_attention_kernel_call
 
 
 def _jax_fwd_attention_call(
-    q: jnp.ndarray | None,
-    k: jnp.ndarray | None,
-    v: jnp.ndarray | None,
-    attention_mask: jnp.ndarray | None = None,  # legacy path
-    bias: jnp.ndarray | None = None,
+    q: Float[Array, "batch seq_len_q num_heads head_dim"] | None,
+    k: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    v: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,  # legacy path
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
-    cum_seqlens_q: jnp.ndarray | None = None,  # int32 [B+1]
-    cum_seqlens_k: jnp.ndarray | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     sliding_window: int | tuple[int, int] | None = None,
-):
+) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], tuple[Float[Array, "..."], ...]]:
     """Forward pass for flash attention with custom gradient support.
 
     Computes scaled dot-product attention with optional masking and dropout.
@@ -84,9 +83,18 @@ def _jax_bwd_attention_call(
     dropout_prob: float,
     causal: bool,
     sliding_window: int | tuple[int, int] | None,
-    residual: tuple[chex.Array],
-    dO: chex.Array,
-):
+    residual: tuple[Float[Array, "..."], ...],
+    dO: Float[Array, "batch seq_len num_heads head_dim"],
+) -> tuple[
+    Float[Array, "batch seq_len_q num_heads head_dim"] | None,
+    Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    None,
+    None,
+    None,
+    None,
+    None,
+]:
     """Backward pass for flash attention gradient computation.
 
     Computes gradients with respect to queries, keys, and values using
@@ -129,19 +137,19 @@ def _jax_bwd_attention_call(
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 11))
 @ejit(static_argnums=(5, 6, 7, 11))
 def flash_attention_call(
-    q: chex.Array | None,
-    k: chex.Array | None,
-    v: chex.Array | None,
-    attention_mask: chex.Array | None = None,
-    bias: chex.Array | None = None,
+    q: Float[Array, "batch seq_len_q num_heads head_dim"] | None,
+    k: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    v: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
-    cum_seqlens_q: jnp.ndarray | None = None,  # int32 [B+1]
-    cum_seqlens_k: jnp.ndarray | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     sliding_window: int | tuple[int, int] | None = None,
-) -> chex.Array:
+) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Flash attention with custom gradient computation.
 
     Efficient attention implementation using tiling and online softmax computation.
@@ -194,19 +202,19 @@ flash_attention_call.defvjp(
 
 
 def flash_attention(
-    q: jnp.ndarray | None,
-    k: jnp.ndarray | None,
-    v: jnp.ndarray | None,
-    attention_mask: jnp.ndarray | None = None,  # legacy path
-    bias: jnp.ndarray | None = None,
+    q: Float[Array, "batch seq_len_q num_heads head_dim"] | None,
+    k: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    v: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,  # legacy path
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
-    cum_seqlens_q: jnp.ndarray | None = None,  # int32 [B+1]
-    cum_seqlens_k: jnp.ndarray | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     sliding_window: int | tuple[int, int] | None = None,
-) -> chex.Array:
+) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention for efficient scaled dot-product attention.
 
     Flash Attention is a memory-efficient and fast implementation of exact

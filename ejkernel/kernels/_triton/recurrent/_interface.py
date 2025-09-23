@@ -14,24 +14,28 @@
 from functools import partial
 
 import jax
+from jaxtyping import Array, Float, Int
 
 from ._triton_impl_bwd import bwd_triton_impl
 from ._triton_impl_fwd import fwd_triton_impl
 
 
 def _fwd_call(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array | None = None,
-    g_gamma: jax.Array | None = None,
-    gk: jax.Array | None = None,
-    gv: jax.Array | None = None,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     scale: float | None = None,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
-    cu_seqlens: jax.Array | None = None,
-):
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> tuple[
+    tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]],
+    tuple[Float[Array, "..."], ...],
+]:
     """
     Forward pass for recurrent linear attention in a custom VJP.
 
@@ -70,13 +74,21 @@ def _fwd_call(
 
 
 def _bwd_call(
-    g_gamma: jax.Array | None,
+    g_gamma: Float[Array, "batch num_heads"] | None,
     scale: float | None,
     reverse: bool,
-    cu_seqlens: jax.Array | None,
-    residual: tuple[jax.Array],
-    dout: jax.Array,
-):
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
+    residual: tuple[Float[Array, "..."], ...],
+    dout: tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]],
+) -> tuple[
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dq
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dk
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dv
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dg
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dgk
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dgv
+    Float[Array, "batch num_heads head_dim head_dim"] | None,  # dinitial_state
+]:
     """
     Backward pass for recurrent linear attention in a custom VJP.
 
@@ -117,18 +129,18 @@ def _bwd_call(
 @partial(jax.custom_vjp, nondiff_argnums=(4, 7, 9, 10))
 @partial(jax.jit, static_argnums=(7, 9))
 def _recurrent(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array | None = None,
-    g_gamma: jax.Array | None = None,
-    gk: jax.Array | None = None,
-    gv: jax.Array | None = None,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     scale: float | None = None,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
-    cu_seqlens: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array]:
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
     """
     Core JIT-compiled recurrent function with a custom VJP.
 
@@ -174,18 +186,18 @@ _recurrent.defvjp(_fwd_call, _bwd_call)
 
 
 def recurrent(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array | None = None,
-    g_gamma: jax.Array | None = None,
-    gk: jax.Array | None = None,
-    gv: jax.Array | None = None,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     scale: float | None = None,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
-    cu_seqlens: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array]:
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
     """
     Computes a general recurrent linear attention using a custom Triton kernel.
 

@@ -17,6 +17,7 @@ from functools import partial
 
 import jax
 from jax import numpy as jnp
+from jaxtyping import Array, Float, Int
 
 from ejkernel.xla_utils.utils import prepare_token_indices
 
@@ -27,16 +28,19 @@ from ._triton_impl_fwd import fwd_triton_impl, nsa_topk
 
 
 def _fwd_call(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    block_indices: jax.Array,
-    block_counts: jax.Array | int,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    block_indices: Int[Array, "batch num_heads num_query_blocks num_keys_blocks"],
+    block_counts: Int[Array, "batch num_heads num_query_blocks"] | int,
     block_size: int,
     scale: float,
-    cu_seqlens: jax.Array | None = None,
-    token_indices: jax.Array | None = None,
-):
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    token_indices: Int[Array, "total_tokens"] | None = None,
+) -> tuple[
+    Float[Array, "batch seq_len num_heads head_dim"],
+    tuple[Float[Array, "..."], ...],
+]:
     """
     Forward pass for NSA in a custom VJP.
 
@@ -70,14 +74,14 @@ def _fwd_call(
 
 
 def _bwd_call(
-    block_indices: jax.Array,
-    block_counts: jax.Array | int,
+    block_indices: Int[Array, "batch num_heads num_query_blocks num_keys_blocks"],
+    block_counts: Int[Array, "batch num_heads num_query_blocks"] | int,
     block_size: int,
     scale: float,
-    cu_seqlens: jax.Array | None,
-    token_indices: jax.Array | None,
-    residual: tuple[jax.Array],
-    do: jax.Array,
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
+    token_indices: Int[Array, "total_tokens"] | None,
+    residual: tuple[Float[Array, "..."], ...],
+    do: Float[Array, "batch seq_len num_heads head_dim"],
 ):
     """
     Backward pass for NSA in a custom VJP.
@@ -116,16 +120,16 @@ def _bwd_call(
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8))
 @partial(jax.jit, static_argnums=(5, 6))
 def _apply_nsa(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    block_indices: jax.Array,
-    block_counts: jax.Array | int,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    block_indices: Int[Array, "batch num_heads num_query_blocks num_keys_blocks"],
+    block_counts: Int[Array, "batch num_heads num_query_blocks"] | int,
     block_size: int,
     scale: float,
-    cu_seqlens: jax.Array | None = None,
-    token_indices: jax.Array | None = None,
-) -> jax.Array:
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    token_indices: Int[Array, "total_tokens"] | None = None,
+) -> Float[Array, "batch seq_len num_heads head_dim"]:
     """
     Core JIT-compiled NSA function with a custom VJP.
 
@@ -163,16 +167,16 @@ _apply_nsa.defvjp(_fwd_call, _bwd_call)
 
 
 def apply_native_spare_attention(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    block_indices: jax.Array,
-    block_counts: jax.Array | int,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    block_indices: Int[Array, "batch num_heads num_query_blocks num_keys_blocks"],
+    block_counts: Int[Array, "batch num_heads num_query_blocks"] | int,
     block_size: int,
     scale: float,
-    cu_seqlens: jax.Array | None = None,
-    token_indices: jax.Array | None = None,
-) -> jax.Array:
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    token_indices: Int[Array, "total_tokens"] | None = None,
+) -> Float[Array, "batch seq_len num_heads head_dim"]:
     """
     Applies NativeSparseAttention using a pre-computed sparse block pattern.
 
@@ -215,17 +219,17 @@ def apply_native_spare_attention(
 
 
 def native_spare_attention(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g_cmp: jax.Array | None = None,
-    g_slc: jax.Array | None = None,
-    block_indices: jax.Array | None = None,
-    block_counts: jax.Array | int = 16,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    g_cmp: Float[Array, "batch seq_len hidden_dim"] | None = None,
+    g_slc: Float[Array, "batch seq_len hidden_dim"] | None = None,
+    block_indices: Int[Array, "batch num_heads num_query_blocks num_keys_blocks"] | None = None,
+    block_counts: Int[Array, "batch num_heads num_query_blocks"] | int = 16,
     block_size: int = 64,
     scale: float | None = None,
-    cu_seqlens: jax.Array | None = None,
-) -> jax.Array:
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> Float[Array, "batch seq_len num_heads head_dim"]:
     """
     NSA is a sparse attention mechanism that combines two components:
     1.  **Compressed Attention**: A coarse-grained attention over mean-pooled

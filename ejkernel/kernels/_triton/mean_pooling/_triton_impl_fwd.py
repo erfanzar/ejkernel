@@ -13,10 +13,12 @@
 # limitations under the License.
 
 
+
 import jax
 import triton
 import triton.language as tl
 from eformer.callib import cdiv, triton_call
+from jaxtyping import Array, Float, Int
 
 from ejkernel.xla_utils.utils import prepare_chunk_indices
 
@@ -89,7 +91,11 @@ def fwd_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
-def fwd_triton_impl(x: jax.Array, chunk_size: int, cu_seqlens: jax.Array | None = None) -> jax.Array:
+def fwd_triton_impl(
+    x: Float[Array, "batch seq_len hidden_dim"],
+    chunk_size: int,
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> Float[Array, "batch hidden_dim"]:
     """Execute mean pooling forward pass using Triton kernel.
 
     Launches the Triton kernel for efficient mean pooling computation,

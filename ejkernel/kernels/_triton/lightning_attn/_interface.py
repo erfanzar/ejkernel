@@ -12,23 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import jax
+
 from jax import numpy as jnp
+from jaxtyping import Array, Float, Int
 
 from ..recurrent import recurrent
 
 
 def lightning_attn(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
     layer_idx: int,
     num_layers: int,
     scale: float | None = None,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
-    cu_seqlens: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array]:
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
     """
     Computes Lightning Attention using a recurrent, linear-time mechanism.
 

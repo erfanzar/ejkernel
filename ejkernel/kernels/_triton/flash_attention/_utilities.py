@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import triton
 import triton.language as tl
 from eformer.callib import ejit
+from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.utils import get_strides
 
@@ -77,12 +78,12 @@ def padded_load(
 
 
 def calc_bias_strides(
-    bias: jnp.ndarray | None,
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None,
     batch: int,
     nheads_q: int,
     QSeq: int,
     KSeq: int,
-) -> tuple[int, ...]:
+) -> tuple[int, int, int]:
     """Calculate memory strides for bias tensor with broadcasting support.
 
     Validates bias tensor dimensions and computes appropriate strides
@@ -141,10 +142,10 @@ def calc_bias_strides(
 
 @ejit(static_argnames=["max_tokens"])
 def attention_pack_with_static_shape(
-    x: jnp.ndarray,
-    attention_mask: jnp.ndarray,
+    x: Float[Array, "batch seq_len num_heads head_dim"],
+    attention_mask: Bool[Array, "batch seq_len"],
     max_tokens: int | None = None,
-) -> jnp.ndarray:
+) -> Float[Array, "1 max_tokens num_heads head_dim"]:
     """
     Pack attention tensor by removing padding based on attention mask.
     Uses a static maximum shape to be compatible with JIT.
@@ -187,18 +188,18 @@ def attention_pack_with_static_shape(
 
 
 def basic_attention_refrence(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    attn_bias: jnp.ndarray | None = None,
-    query_padding_mask: jnp.ndarray | None = None,
-    key_padding_mask: jnp.ndarray | None = None,
+    q: Float[Array, "batch seq_len_q num_heads head_dim"],
+    k: Float[Array, "batch seq_len_k num_heads_kv head_dim"],
+    v: Float[Array, "batch seq_len_k num_heads_kv head_dim"],
+    attn_bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    query_padding_mask: Bool[Array, "batch seq_len_q"] | None = None,
+    key_padding_mask: Bool[Array, "batch seq_len_k"] | None = None,
     dropout_prob: float = 0.0,
-    dropout_key: jax.random.PRNGKey = None,
+    dropout_key: jax.random.PRNGKey | None = None,
     window_size: tuple[int, int] = (-1, -1),
     causal: bool = False,
     softcap: float = 0.0,
-):
+) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Reference implementation of attention for testing and validation.
 
     Provides a standard JAX implementation of scaled dot-product attention
@@ -292,10 +293,10 @@ def basic_attention_refrence(
 
 @ejit(static_argnames=["max_tokens"])
 def attention_pack_from_cu_static(
-    x: jnp.ndarray,  # [B, S_max, H, D]
-    cum_seqlens: jnp.ndarray,  # int32 [B+1]
+    x: Float[Array, "batch seq_max num_heads head_dim"],  # [B, S_max, H, D]
+    cum_seqlens: Int[Array, "batch_plus_one"],  # int32 [B+1]
     max_tokens: int | None = None,
-) -> jnp.ndarray:
+) -> Float[Array, "1 max_tokens num_heads head_dim"]:
     """
     Packs variable-length batch using cum_seqlens into a single [1, T, H, D] tensor.
     T can be any static upper bound (e.g., B*S_max). Only the first cum_seqlens[-1]
@@ -328,11 +329,11 @@ def attention_pack_from_cu_static(
 
 @ejit(static_argnames=["seqlen", "batch_size"])
 def attention_unpack_with_static_shape(
-    x: jnp.ndarray,  # [1, T, H, D] (T >= cum_seqlens[-1])
-    cum_seqlens: jnp.ndarray,  # int32 [B+1]
+    x: Float[Array, "1 max_tokens num_heads head_dim"],  # [1, T, H, D] (T >= cum_seqlens[-1])
+    cum_seqlens: Int[Array, "batch_plus_one"],  # int32 [B+1]
     batch_size: int,
     seqlen: int,
-) -> jnp.ndarray:
+) -> Float[Array, "batch seqlen num_heads head_dim"]:
     """
     Unpack back into [B, seqlen, H, D] using cum_seqlens. The 'seqlen' is a static
     padded max length; tokens past end are left as zeros.

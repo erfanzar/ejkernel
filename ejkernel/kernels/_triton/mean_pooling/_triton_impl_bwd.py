@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import jax
 import triton
 import triton.language as tl
 from eformer.callib import cdiv, triton_call
+from jaxtyping import Array, Float, Int
 
 from ejkernel.xla_utils.utils import prepare_chunk_indices
 
@@ -86,12 +88,12 @@ def bwd_kernel(
 
 
 def bwd_triton_impl(
-    do: jax.Array,
+    do: Float[Array, "batch hidden_dim"],
     batch_size: int,
     seq_len: int,
     chunk_size: int,
-    cu_seqlens: jax.Array | None = None,
-) -> jax.Array:
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> Float[Array, "batch seq_len hidden_dim"]:
     """Execute mean pooling backward pass using Triton kernel.
 
     Computes gradients with respect to the input by distributing the

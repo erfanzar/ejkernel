@@ -13,11 +13,13 @@
 # limitations under the License.
 
 
+
 import jax
 import triton
 import triton.language as tl
 from eformer.callib import cdiv, triton_call
 from jax import numpy as jnp
+from jaxtyping import Array, Float, Int
 
 from ejkernel.xla_utils.cumsum import chunk_global_cumsum
 
@@ -232,21 +234,29 @@ def bwd_kernel(
 
 
 def bwd_triton_impl(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array | None = None,
-    g_gamma: jax.Array | None = None,
-    gk: jax.Array | None = None,
-    gv: jax.Array | None = None,
-    o: jax.Array | None = None,
-    do: jax.Array | None = None,
-    dht: jax.Array | None = None,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    o: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    do: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    dht: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     scale: float | None = None,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
-    cu_seqlens: jax.Array | None = None,
-):
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> tuple[
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dq
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dk
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dv
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dg
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dgk
+    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dgv
+    Float[Array, "batch num_heads head_dim head_dim"] | None,  # dh0
+]:
     Z, SEQUENCE, HEAD, DIM_K, DIM_V = *k.shape, v.shape[-1]
     N = Z if cu_seqlens is None else len(cu_seqlens) - 1
 

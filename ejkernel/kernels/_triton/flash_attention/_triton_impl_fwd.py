@@ -14,13 +14,14 @@
 
 
 import math
-import typing as tp
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import triton
 import triton.language as tl
 from eformer.callib import triton_call
+from jaxtyping import Array, Bool, Float, Int
 from triton import Config
 
 from ejkernel.utils import dtype_index, get_strides
@@ -36,8 +37,8 @@ from ._utilities import (
 
 def config_prune_kernel(
     configs: list[Config],
-    named_args: dict[str, tp.Any],
-    **kwargs,
+    named_args: dict[str, Any],
+    **kwargs: Any,
 ) -> list[Config]:
     kept_configs = []
     for config in configs:
@@ -514,20 +515,19 @@ def _attn_fwd(
 
 
 def _fwd_attention_kernel_call(
-    q: jnp.ndarray | None,
-    k: jnp.ndarray | None,
-    v: jnp.ndarray | None,
-    attention_mask: jnp.ndarray | None = None,  # legacy path
-    bias: jnp.ndarray | None = None,
+    q: Float[Array, "batch seq_len_q num_heads head_dim"] | None,
+    k: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    v: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,  # legacy path
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
-    cum_seqlens_q: jnp.ndarray | None = None,  # int32 [B+1]
-    cum_seqlens_k: jnp.ndarray | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     sliding_window: int | tuple[int, int] | None = None,
-):
-    # Sliding window interpretation
+) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], Float[Array, "batch num_heads max_seqlen_q_rounded"]]:
     if sliding_window is None:
         window_left = 0
         window_right = 0

@@ -14,14 +14,14 @@
 
 
 import math
-import typing as tp
+from typing import Any
 
-import chex
 import jax
 import triton
 import triton.language as tl
 from eformer.callib import triton_call
 from jax import numpy as jnp
+from jaxtyping import Array, Bool, Float, Int
 from triton import Config
 
 from ejkernel.utils import dtype_index, get_sharding, get_strides
@@ -31,8 +31,8 @@ from ._utilities import attention_pack_with_static_shape, calc_bias_strides, pad
 
 def config_prune_kernel(
     configs: list[Config],
-    named_args: dict[str, tp.Any],
-    **kwargs,
+    named_args: dict[str, Any],
+    **kwargs: Any,
 ) -> list[Config]:
     """Prune autotuning configurations for backward pass kernel.
 
@@ -1024,22 +1024,26 @@ def _attn_bwd(
 
 
 def _bwd_attention_kernel_call(
-    dO: chex.Array,
-    q: chex.Array,
-    k: chex.Array,
-    v: chex.Array,
-    bias: chex.Array | None,
-    attention_mask: chex.Array | None,
-    o: chex.Array,
-    M: chex.Array,
+    dO: Float[Array, "batch seq_len_q num_heads head_dim"],
+    q: Float[Array, "batch seq_len_q num_heads head_dim"],
+    k: Float[Array, "batch seq_len_k num_heads head_dim"],
+    v: Float[Array, "batch seq_len_k num_heads head_dim"],
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None,
+    attention_mask: Bool[Array, "batch seq_len"] | None,
+    o: Float[Array, "batch seq_len_q num_heads head_dim"],
+    M: Float[Array, "batch num_heads max_seqlen_q_rounded"],
     dropout_prob: float,
     causal: bool,
     softmax_scale: float | None,
     dropout_seed: int | None,
-    cum_seqlens_q: jnp.ndarray | None = None,  # int32 [B+1]
-    cum_seqlens_k: jnp.ndarray | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     sliding_window: int | tuple[int, int] | None = None,
-):
+) -> tuple[
+    Float[Array, "batch seq_len_q num_heads head_dim"],
+    Float[Array, "batch seq_len_k num_heads head_dim"],
+    Float[Array, "batch seq_len_k num_heads head_dim"],
+]:
     """Execute flash attention backward pass using Triton kernels.
 
     Prepares inputs and launches Triton kernels for gradient computation.

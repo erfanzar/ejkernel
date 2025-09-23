@@ -1,0 +1,82 @@
+# Pre-commit hooks configuration
+# Install with: pip install pre-commit && pre-commit install
+
+repos:
+  # Python code formatters and linters
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Trailing whitespace and file fixes
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # Type checking with mypy (optional, comment out if not needed)
+  # - repo: https://github.com/pre-commit/mirrors-mypy
+  #   rev: v1.13.0
+  #   hooks:
+  #     - id: mypy
+  #       additional_dependencies: [types-all]
+  #       args: [--ignore-missing-imports]
+
+  # Custom hook for formatting and generating API documentation
+  - repo: local
+    hooks:
+      - id: format-and-generate-docs
+        name: Format Code and Generate API Documentation
+        entry: python scripts/format_and_generate_docs.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+  # Security checks
+  - repo: https://github.com/PyCQA/bandit
+    rev: '1.7.10'
+    hooks:
+      - id: bandit
+        args: [-r, ejkernel/, --skip, B101]
+        exclude: ^test/
+
+  # Check for secrets
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: [--baseline, .secrets.baseline]
+        exclude: package-lock.json
+
+# Global excludes
+exclude: |
+  (?x)^(
+    .*\.(pyc|pyo|egg-info|egg|whl|tar\.gz|zip)|
+    \.git/|
+    \.tox/|
+    \.venv/|
+    env/|
+    venv/|
+    \.env|
+    build/|
+    dist/|
+    __pycache__/|
+    \.pytest_cache/|
+    \.mypy_cache/|
+    \.ruff_cache/|
+    docs/_build/|
+    tmp-files/|
+    uv\.lock
+  )$

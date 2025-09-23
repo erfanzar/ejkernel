@@ -13,11 +13,13 @@
 # limitations under the License.
 
 
+
 import jax
 import triton
 import triton.language as tl
 from eformer.callib import cdiv, triton_call
 from jax import numpy as jnp
+from jaxtyping import Array, Float, Int
 
 
 @triton.autotune(
@@ -155,18 +157,18 @@ def fwd_kernel(
 
 
 def fwd_triton_impl(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    g: jax.Array | None = None,
-    g_gamma: jax.Array | None = None,
-    gk: jax.Array | None = None,
-    gv: jax.Array | None = None,
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     scale: float | None = None,
-    initial_state: jax.Array | None = None,
+    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
-    cu_seqlens: jax.Array | None = None,
-):
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     blocksize_k, blocksize_v = min(K, 64), min(V, 64)

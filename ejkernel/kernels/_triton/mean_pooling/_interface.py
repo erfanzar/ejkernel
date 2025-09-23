@@ -14,12 +14,17 @@
 from functools import partial
 
 import jax
+from jaxtyping import Array, Float, Int
 
 from ._triton_impl_bwd import bwd_triton_impl
 from ._triton_impl_fwd import fwd_triton_impl
 
 
-def _fwd_call(x: jax.Array, chunk_size: int, cu_seqlens: jax.Array | None = None):
+def _fwd_call(
+    x: Float[Array, "batch seq_len hidden_dim"],
+    chunk_size: int,
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> tuple[Float[Array, "batch hidden_dim"], tuple[int, int, Int[Array, "num_seqs_plus_one"] | None]]:
     """
     Forward pass for mean pooling with custom VJP.
 
@@ -37,7 +42,11 @@ def _fwd_call(x: jax.Array, chunk_size: int, cu_seqlens: jax.Array | None = None
     return o, residual
 
 
-def _bwd_call(chunk_size, residual: tuple[jax.Array], do: jax.Array):
+def _bwd_call(
+    chunk_size: int,
+    residual: tuple[int, int, Int[Array, "num_seqs_plus_one"] | None],
+    do: Float[Array, "batch hidden_dim"],
+) -> Float[Array, "batch seq_len hidden_dim"]:
     """
     Backward pass for mean pooling with custom VJP.
 
@@ -56,7 +65,11 @@ def _bwd_call(chunk_size, residual: tuple[jax.Array], do: jax.Array):
 
 @partial(jax.custom_vjp, nondiff_argnums=(1,))
 @partial(jax.jit, static_argnums=(1,))
-def _mean_pooling(x: jax.Array, chunk_size: int, cu_seqlens: jax.Array | None = None) -> jax.Array:
+def _mean_pooling(
+    x: Float[Array, "batch seq_len hidden_dim"],
+    chunk_size: int,
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> Float[Array, "batch hidden_dim"]:
     """
     Core JIT-compiled mean pooling function with a custom VJP.
 
@@ -78,7 +91,11 @@ def _mean_pooling(x: jax.Array, chunk_size: int, cu_seqlens: jax.Array | None = 
 _mean_pooling.defvjp(_fwd_call, _bwd_call)
 
 
-def mean_pooling(x: jax.Array, chunk_size: int, cu_seqlens: jax.Array | None = None) -> jax.Array:
+def mean_pooling(
+    x: Float[Array, "batch seq_len hidden_dim"],
+    chunk_size: int,
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> Float[Array, "batch hidden_dim"]:
     """
     Performs mean pooling over the sequence dimension using a Triton kernel.
 
