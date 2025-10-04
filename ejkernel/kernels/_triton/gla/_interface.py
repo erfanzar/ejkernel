@@ -15,13 +15,15 @@
 
 from jaxtyping import Array, Float, Int
 
+from ..._registry import Backend, Platform, kernel_registry
 from ..recurrent import recurrent
 
 
+@kernel_registry.register("gla", Platform.TRITON, Backend.GPU)
 def recurrent_gla(
-    q: Float[Array, "batch seq_len num_heads head_dim"],
-    k: Float[Array, "batch seq_len num_heads head_dim"],
-    v: Float[Array, "batch seq_len num_heads head_dim"],
+    query: Float[Array, "batch seq_len num_heads head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     g_gamma: Float[Array, "batch num_heads"] | None = None,
     scale: float | None = None,
@@ -41,10 +43,10 @@ def recurrent_gla(
     processing using cumulative sequence lengths (`cu_seqlens`).
 
     Args:
-        q: The query tensor. Expected shape is `(batch, seq_len, num_heads, head_dim)`
+        query: The query tensor. Expected shape is `(batch, seq_len, num_heads, head_dim)`
             or `(total_tokens, num_heads, head_dim)` if `cu_seqlens` is used.
-        k: The key tensor. Must have the same shape as `q`.
-        v: The value tensor. Must have the same shape as `q`.
+        key: The key tensor. Must have the same shape as `q`.
+        value: The value tensor. Must have the same shape as `q`.
         g: The gate tensor, specific to Gated Linear Attention. If provided, it
             should have the same shape as `q`.
         g_gamma: The gate decay factor.
@@ -55,7 +57,7 @@ def recurrent_gla(
         reverse: If `True`, the sequence is processed in reverse order.
         cu_seqlens: Cumulative sequence lengths for variable-length inputs.
             This is a 1D tensor like `[0, len_seq1, len_seq1+len_seq2, ...]`.
-            If provided, the input tensors `q, k, v, g` are expected to be
+            If provided, the input tensors `query, key, value, g` are expected to be
             "packed" with a shape of `(total_tokens, ...)`.
 
     Returns:
@@ -84,9 +86,9 @@ def recurrent_gla(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     o, final_state = recurrent(
-        q=q,
-        k=k,
-        v=v,
+        query=query,
+        key=key,
+        value=value,
         g=g,
         g_gamma=g_gamma,
         scale=scale,

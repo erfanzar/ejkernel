@@ -16,7 +16,10 @@
 
 from jaxtyping import Array, Float
 
+from ..._registry import Backend, Platform, kernel_registry
 
+
+@kernel_registry.register("flash_mla_attention_call", Platform.TRITON, Backend.GPU)
 def flash_mla_attention_call(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch num_heads seq_len head_dim"],
@@ -50,6 +53,7 @@ def flash_mla_attention_call(
     raise NotImplementedError("Flash MLA attention kernel not yet implemented")
 
 
+@kernel_registry.register("flash_mla", Platform.TRITON, Backend.GPU)
 def flash_mla_attention(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch num_heads seq_len head_dim"],

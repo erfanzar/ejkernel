@@ -13,18 +13,18 @@
 # limitations under the License.
 
 
-
 import jax
 import triton
 import triton.language as tl
-from eformer.callib import cdiv, triton_call
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
+
+from ejkernel.callib import cdiv, triton_call
 
 
 @triton.autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [4, 8]],
-    key=["blocksize_k", "blocksize_v", "USE_G", "USE_G_GAMMA", "USE_GK", "USE_GV"],
+    key=["key_chunk_size", "blocksize_v", "USE_G", "USE_G_GAMMA", "USE_GK", "USE_GV"],
 )
 @triton.heuristics(
     {
@@ -52,7 +52,7 @@ def fwd_kernel(
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    blocksize_k: tl.constexpr,
+    key_chunk_size: tl.constexpr,
     blocksize_v: tl.constexpr,
     REVERSE: tl.constexpr,
     USE_G: tl.constexpr,
@@ -80,7 +80,7 @@ def fwd_kernel(
         o: Output tensor pointer
         ht: Final hidden state pointer
         T, B, H, K, V: Tensor dimensions (sequence, batch, heads, key/value dims)
-        blocksize_k, blocksize_v: Block sizes for tiling
+        key_chunk_size, blocksize_v: Block sizes for tiling
         REVERSE: Process sequence in reverse order
         USE_G, USE_G_GAMMA, USE_GK, USE_GV: Gating configuration flags
         USE_INITIAL_STATE: Whether to use initial hidden state
@@ -97,7 +97,7 @@ def fwd_kernel(
         bos, eos = i_n * T, i_n * T + T
         scope = B * T
 
-    o_k = i_k * blocksize_k + tl.arange(0, blocksize_k)
+    o_k = i_k * key_chunk_size + tl.arange(0, key_chunk_size)
     o_v = i_v * blocksize_v + tl.arange(0, blocksize_v)
     p_q = q + (bos + ((T - 1) if REVERSE else 0)) * H * K + i_h * K + o_k
     p_k = k + (bos + ((T - 1) if REVERSE else 0)) * H * K + i_h * K + o_k
@@ -115,7 +115,7 @@ def fwd_kernel(
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
-    b_h = tl.zeros([blocksize_k, blocksize_v], dtype=tl.float32)
+    b_h = tl.zeros([key_chunk_size, blocksize_v], dtype=tl.float32)
 
     if USE_INITIAL_STATE:
         p_h0 = h0 + i_nh * K * V + o_k[:, None] * V + o_v[None, :]
@@ -171,8 +171,8 @@ def fwd_triton_impl(
 ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    blocksize_k, blocksize_v = min(K, 64), min(V, 64)
-    NumKBlocks, NumVBlocks = cdiv(K, blocksize_k), cdiv(V, blocksize_v)
+    key_chunk_size, blocksize_v = min(K, 64), min(V, 64)
+    NumKBlocks, NumVBlocks = cdiv(K, key_chunk_size), cdiv(V, blocksize_v)
 
     h0 = initial_state
     ht_shape = (N, H, K, V)
@@ -184,7 +184,7 @@ def fwd_triton_impl(
         H=H,
         K=K,
         V=V,
-        blocksize_k=blocksize_k,
+        key_chunk_size=key_chunk_size,
         blocksize_v=blocksize_v,
         USE_G=g is not None,
         USE_G_GAMMA=g_gamma is not None,
@@ -210,7 +210,6 @@ def fwd_triton_impl(
         ],
         name="ejgpu:lightning_attn:fwd_kernel",
         grid=grid,
-        disable_verbose_logging=True,
         **metaparams,
     )
     out = jnp.sum(out, axis=0)

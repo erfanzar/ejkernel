@@ -13,14 +13,13 @@
 # limitations under the License.
 
 
-
 import jax
 import triton
 import triton.language as tl
-from eformer.callib import cdiv, triton_call
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
 
+from ejkernel.callib import cdiv, triton_call
 from ejkernel.xla_utils.cumsum import chunk_global_cumsum
 
 
@@ -323,7 +322,6 @@ def bwd_triton_impl(
         ],
         name="ejgpu:lightning_attn:fwd_kernel",
         grid=grid,
-        disable_verbose_logging=True,
         **metaparams,
     )
 

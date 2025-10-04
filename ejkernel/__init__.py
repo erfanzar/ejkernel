@@ -14,6 +14,9 @@
 
 __version__ = "0.1.0"
 
-from . import kernels
+from . import kernels, modules
+from .kernels import Backend, Platform, kernel_registry
 
-__all__ = ("kernels",)
+kernel_registry.validate_signatures(None)
+
+__all__ = ("Backend", "Platform", "kernel_registry", "kernels", "modules")
