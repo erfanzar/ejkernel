@@ -19,9 +19,9 @@ import jax
 import jax.numpy as jnp
 import triton
 import triton.language as tl
-from eformer.callib import ejit
 from jaxtyping import Array, Bool, Float, Int
 
+from ejkernel.callib import ejit
 from ejkernel.utils import get_strides
 
 

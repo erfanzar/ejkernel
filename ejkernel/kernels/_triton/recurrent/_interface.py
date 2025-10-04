@@ -16,14 +16,15 @@ from functools import partial
 import jax
 from jaxtyping import Array, Float, Int
 
+from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_bwd import bwd_triton_impl
 from ._triton_impl_fwd import fwd_triton_impl
 
 
 def _fwd_call(
-    q: Float[Array, "batch seq_len num_heads head_dim"],
-    k: Float[Array, "batch seq_len num_heads head_dim"],
-    v: Float[Array, "batch seq_len num_heads head_dim"],
+    query: Float[Array, "batch seq_len num_heads head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     g_gamma: Float[Array, "batch num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
@@ -40,9 +41,9 @@ def _fwd_call(
     Forward pass for recurrent linear attention in a custom VJP.
 
     Args:
-        q: Query tensor.
-        k: Key tensor.
-        v: Value tensor.
+        query: Query tensor.
+        key: Key tensor.
+        value: Value tensor.
         g: Optional gate tensor for GLA-style gating.
         g_gamma: Optional decay factor for Lightning-style attention.
         gk: Optional gate applied directly to K.
@@ -57,9 +58,9 @@ def _fwd_call(
         residuals for the backward pass.
     """
     o, ht = fwd_triton_impl(
-        q=q,
-        k=k,
-        v=v,
+        query=query,
+        key=key,
+        value=value,
         g=g,
         g_gamma=g_gamma,
         gk=gk,
@@ -69,7 +70,7 @@ def _fwd_call(
         reverse=reverse,
         cu_seqlens=cu_seqlens,
     )
-    residual = q, k, v, g, gk, gv, o, initial_state
+    residual = query, key, value, g, gk, gv, o, initial_state
     return (o, ht), residual
 
 
@@ -103,14 +104,14 @@ def _bwd_call(
 
     Returns:
         A tuple of gradients corresponding to the differentiable inputs
-        (q, k, v, g, gk, gv, initial_state).
+        (query, key, value, g, gk, gv, initial_state).
     """
     do, dht = dout
-    q, k, v, g, gk, gv, o, initial_state = residual
+    query, key, value, g, gk, gv, o, initial_state = residual
     dq, dk, dv, dg, dgk, dgv, dh0 = bwd_triton_impl(
-        q=q,
-        k=k,
-        v=v,
+        query=query,
+        key=key,
+        value=value,
         g=g,
         g_gamma=g_gamma,
         gk=gk,
@@ -129,9 +130,9 @@ def _bwd_call(
 @partial(jax.custom_vjp, nondiff_argnums=(4, 7, 9, 10))
 @partial(jax.jit, static_argnums=(7, 9))
 def _recurrent(
-    q: Float[Array, "batch seq_len num_heads head_dim"],
-    k: Float[Array, "batch seq_len num_heads head_dim"],
-    v: Float[Array, "batch seq_len num_heads head_dim"],
+    query: Float[Array, "batch seq_len num_heads head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     g_gamma: Float[Array, "batch num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
@@ -148,9 +149,9 @@ def _recurrent(
     and is registered with JAX's custom differentiation system.
 
     Args:
-        q: Query tensor.
-        k: Key tensor.
-        v: Value tensor.
+        query: Query tensor.
+        key: Key tensor.
+        value: Value tensor.
         g: Optional gate tensor for GLA-style gating.
         g_gamma: Optional decay factor for Lightning-style attention.
         gk: Optional gate applied directly to K.
@@ -166,11 +167,11 @@ def _recurrent(
             - The final hidden state `ht`.
     """
     if scale is None:
-        scale = k.shape[-1] ** -0.5
+        scale = key.shape[-1] ** -0.5
     return fwd_triton_impl(
-        q=q,
-        k=k,
-        v=v,
+        query=query,
+        key=key,
+        value=value,
         g=g,
         g_gamma=g_gamma,
         gk=gk,
@@ -185,10 +186,11 @@ def _recurrent(
 _recurrent.defvjp(_fwd_call, _bwd_call)
 
 
+@kernel_registry.register("recurrent", Platform.TRITON, Backend.GPU)
 def recurrent(
-    q: Float[Array, "batch seq_len num_heads head_dim"],
-    k: Float[Array, "batch seq_len num_heads head_dim"],
-    v: Float[Array, "batch seq_len num_heads head_dim"],
+    query: Float[Array, "batch seq_len num_heads head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     g_gamma: Float[Array, "batch num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
@@ -211,9 +213,9 @@ def recurrent(
     processing using cumulative sequence lengths (`cu_seqlens`).
 
     Args:
-        q: The query tensor.
-        k: The key tensor.
-        v: The value tensor.
+        query: The query tensor.
+        key: The key tensor.
+        value: The value tensor.
         g: Optional gate tensor for Gated Linear Attention (GLA) style gating.
         g_gamma: Optional decay factor, used for mechanisms like Lightning
             Attention where the decay is fixed per-head or per-layer.
@@ -238,9 +240,9 @@ def recurrent(
               which can be used as `initial_state` for a subsequent segment.
     """
     return _recurrent(
-        q=q,
-        k=k,
-        v=v,
+        query=query,
+        key=key,
+        value=value,
         g=g,
         g_gamma=g_gamma,
         gk=gk,

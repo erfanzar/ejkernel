@@ -16,17 +16,21 @@
 import functools
 
 import jax
-from eformer.callib import ejit
+from jax import lax
+from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
+from ejkernel.callib import ejit
+
+from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_bwd import _bwd_attention_kernel_call
 from ._triton_impl_fwd import _fwd_attention_kernel_call
 
 
 def _jax_fwd_attention_call(
-    q: Float[Array, "batch seq_len_q num_heads head_dim"] | None,
-    k: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
-    v: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    query: Float[Array, "batch seq_len_q num_heads head_dim"],
+    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     attention_mask: Bool[Array, "batch seq_len"] | None = None,  # legacy path
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
@@ -36,6 +40,8 @@ def _jax_fwd_attention_call(
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     sliding_window: int | tuple[int, int] | None = None,
+    logits_soft_cap: float | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], tuple[Float[Array, "..."], ...]]:
     """Forward pass for flash attention with custom gradient support.
 
@@ -43,9 +49,9 @@ def _jax_fwd_attention_call(
     Returns both the attention output and residuals needed for backward pass.
 
     Args:
-        q: Query tensor of shape [batch, seq_len, num_heads, head_dim]
-        k: Key tensor of shape [batch, seq_len, num_heads, head_dim]
-        v: Value tensor of shape [batch, seq_len, num_heads, head_dim]
+        query: Query tensor of shape [batch, seq_len, num_heads, head_dim]
+        key: Key tensor of shape [batch, seq_len, num_heads, head_dim]
+        value: Value tensor of shape [batch, seq_len, num_heads, head_dim]
         attention_mask: Optional attention mask (legacy, use bias instead)
         bias: Optional attention bias of shape [batch, num_heads, seq_len, seq_len]
         softmax_scale: Scaling factor for QK^T before softmax
@@ -55,15 +61,17 @@ def _jax_fwd_attention_call(
         cum_seqlens_q: Cumulative sequence lengths for queries in variable-length mode
         cum_seqlens_k: Cumulative sequence lengths for keys in variable-length mode
         sliding_window: Window size for local attention (int or tuple of left/right)
+        logits_soft_cap: Optional soft cap value for logits
+        softmax_aux: Optional attention sink logits of shape [H, num_sinks] or [num_sinks]
 
     Returns:
         tuple: (attention_output, residuals) where residuals contain intermediate
                values needed for backward pass gradient computation
     """
     out, lse = _fwd_attention_kernel_call(
-        q=q,
-        k=k,
-        v=v,
+        q=query,
+        k=key,
+        v=value,
         attention_mask=attention_mask,
         bias=bias,
         softmax_scale=softmax_scale,
@@ -73,9 +81,11 @@ def _jax_fwd_attention_call(
         cum_seqlens_q=cum_seqlens_q,
         cum_seqlens_k=cum_seqlens_k,
         sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+        softmax_aux=softmax_aux,
     )
 
-    return out, (q, k, v, bias, attention_mask, out, lse, dropout_seed, cum_seqlens_q, cum_seqlens_k)
+    return out, (query, key, value, bias, attention_mask, out, lse, dropout_seed, cum_seqlens_q, cum_seqlens_k)
 
 
 def _jax_bwd_attention_call(
@@ -83,12 +93,14 @@ def _jax_bwd_attention_call(
     dropout_prob: float,
     causal: bool,
     sliding_window: int | tuple[int, int] | None,
+    logits_soft_cap: float | None,
     residual: tuple[Float[Array, "..."], ...],
     dO: Float[Array, "batch seq_len num_heads head_dim"],
 ) -> tuple[
     Float[Array, "batch seq_len_q num_heads head_dim"] | None,
     Float[Array, "batch seq_len_k num_heads head_dim"] | None,
     Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    None,
     None,
     None,
     None,
@@ -105,7 +117,7 @@ def _jax_bwd_attention_call(
         dropout_prob: Dropout probability used in forward pass
         causal: Whether causal masking was applied
         sliding_window: Window size for local attention if used
-        residual: Saved tensors from forward pass containing q, k, v, bias,
+        residual: Saved tensors from forward pass containing query, key, value, bias,
                  attention_mask, output, log-sum-exp, and other metadata
         dO: Gradient of loss with respect to attention output
 
@@ -113,12 +125,12 @@ def _jax_bwd_attention_call(
         tuple: Gradients (dq, dk, dv, d_attention_mask, d_bias, d_scale, d_prob, d_seed)
                where only dq, dk, dv are non-None for differentiable parameters
     """
-    q, k, v, bias, attention_mask, out, lse, dropout_seed, cum_seqlens_q, cum_seqlens_k = residual
+    query, key, value, bias, attention_mask, out, lse, dropout_seed, cum_seqlens_q, cum_seqlens_k = residual
     dq, dk, dv = _bwd_attention_kernel_call(
         dO=dO,
-        q=q,
-        k=k,
-        v=v,
+        q=query,
+        k=key,
+        v=value,
         bias=bias,
         attention_mask=attention_mask,
         o=out,
@@ -130,16 +142,17 @@ def _jax_bwd_attention_call(
         sliding_window=sliding_window,
         cum_seqlens_k=cum_seqlens_k,
         cum_seqlens_q=cum_seqlens_q,
+        logits_soft_cap=logits_soft_cap,
     )
-    return dq, dk, dv, None, None, None, None, None
+    return dq, dk, dv, None, None, None, None, None, None
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 11))
-@ejit(static_argnums=(5, 6, 7, 11))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 11, 12))
+@ejit(static_argnums=(5, 6, 7, 11, 12))
 def flash_attention_call(
-    q: Float[Array, "batch seq_len_q num_heads head_dim"] | None,
-    k: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
-    v: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    query: Float[Array, "batch seq_len_q num_heads head_dim"],
+    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     attention_mask: Bool[Array, "batch seq_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
@@ -149,6 +162,8 @@ def flash_attention_call(
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     sliding_window: int | tuple[int, int] | None = None,
+    logits_soft_cap: float | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Flash attention with custom gradient computation.
 
@@ -159,9 +174,9 @@ def flash_attention_call(
     ejit for JIT compilation with static arguments.
 
     Args:
-        q: Query tensor of shape [batch, seq_len, num_heads, head_dim]
-        k: Key tensor of shape [batch, seq_len, num_heads, head_dim]
-        v: Value tensor of shape [batch, seq_len, num_heads, head_dim]
+        query: Query tensor of shape [batch, seq_len, num_heads, head_dim]
+        key: Key tensor of shape [batch, seq_len, num_heads, head_dim]
+        value: Value tensor of shape [batch, seq_len, num_heads, head_dim]
         attention_mask: Optional legacy attention mask (deprecated, use bias)
         bias: Attention bias tensor for masking or positional encoding
         softmax_scale: Scale factor for attention scores (default: 1/sqrt(head_dim))
@@ -180,9 +195,9 @@ def flash_attention_call(
         causal, sliding_window) are marked as non-differentiable.
     """
     return _fwd_attention_kernel_call(
-        q=q,
-        k=k,
-        v=v,
+        q=query,
+        k=key,
+        v=value,
         attention_mask=attention_mask,
         bias=bias,
         softmax_scale=softmax_scale,
@@ -192,6 +207,8 @@ def flash_attention_call(
         cum_seqlens_q=cum_seqlens_q,
         cum_seqlens_k=cum_seqlens_k,
         sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+        softmax_aux=softmax_aux,
     )[0]
 
 
@@ -201,19 +218,31 @@ flash_attention_call.defvjp(
 )
 
 
+@kernel_registry.register("flash_attention", Platform.TRITON, Backend.GPU)
 def flash_attention(
-    q: Float[Array, "batch seq_len_q num_heads head_dim"] | None,
-    k: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
-    v: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
-    attention_mask: Bool[Array, "batch seq_len"] | None = None,  # legacy path
+    query: Float[Array, "batch seq_len_q num_heads head_dim"],
+    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
+    chunk_size_q: int = 128,
+    chunk_size_k: int = 128,
+    logits_soft_cap: float | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    normalize_output: bool = True,
+    precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
+    logits_dtype: jnp.dtype = jnp.float32,
+    *,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    debug: bool = False,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention for efficient scaled dot-product attention.
 
@@ -222,9 +251,9 @@ def flash_attention(
     from O(N²) to O(N) where N is sequence length.
 
     Args:
-        q: Query tensor of shape [batch, seq_len, num_heads, head_dim]
-        k: Key tensor of shape [batch, seq_len_k, num_heads, head_dim]
-        v: Value tensor of shape [batch, seq_len_k, num_heads, head_dim]
+        query: Query tensor of shape [batch, seq_len, num_heads, head_dim]
+        key: Key tensor of shape [batch, seq_len_k, num_heads, head_dim]
+        value: Value tensor of shape [batch, seq_len_k, num_heads, head_dim]
         attention_mask: Optional attention mask (legacy, prefer bias parameter)
         bias: Attention bias for masking or relative position encoding
         softmax_scale: Scaling factor for QK^T (default: 1/sqrt(head_dim))
@@ -234,24 +263,33 @@ def flash_attention(
         cum_seqlens_q: Cumulative sequence lengths for packed variable-length sequences
         cum_seqlens_k: Cumulative sequence lengths for keys in variable-length mode
         sliding_window: Size of local attention window for sparse patterns
+        logits_soft_cap: Optional soft cap value for logits (e.g., 20.0 for Gemma)
+        softmax_aux: Optional attention sink logits of shape [H, num_sinks] or [num_sinks]
+        segment_ids: Not supported in Triton implementation (raises NotImplementedError)
+        debug: Not supported in Triton implementation (ignored)
 
     Returns:
         chex.Array: Attention output with shape [batch, seq_len, num_heads, head_dim]
 
     Examples:
         >>> # Standard attention
-        >>> out = flash_attention(q, k, v, causal=True)
+        >>> out = flash_attention(query, key, value, causal=True)
         >>>
         >>> # With dropout and custom scale
-        >>> out = flash_attention(q, k, v, dropout_prob=0.1, softmax_scale=0.125)
+        >>> out = flash_attention(query, key, value, dropout_prob=0.1, softmax_scale=0.125)
         >>>
         >>> # Variable-length sequences with packing
-        >>> out = flash_attention(q, k, v, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
+        >>> out = flash_attention(query, key, value, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
     """
+    del chunk_size_q, chunk_size_k, precision, logits_dtype, debug, normalize_output
+    if q_segment_ids is not None:
+        raise NotImplementedError("`q_segment_ids` is not implemented in triton impl yet!")
+    if kv_segment_ids is not None:
+        raise NotImplementedError("`kv_segment_ids` is not implemented in triton impl yet!")
     return flash_attention_call(
-        q=q,
-        k=k,
-        v=v,
+        query=query,
+        key=key,
+        value=value,
         attention_mask=attention_mask,
         bias=bias,
         softmax_scale=softmax_scale,
@@ -261,4 +299,6 @@ def flash_attention(
         cum_seqlens_q=cum_seqlens_q,
         cum_seqlens_k=cum_seqlens_k,
         sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+        softmax_aux=softmax_aux,
     )

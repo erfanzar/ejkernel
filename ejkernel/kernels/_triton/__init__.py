@@ -24,7 +24,7 @@ Available kernels:
 - recurrent_gla: Gated Linear Attention implementation
 - lightning_attn: Lightning Attention with layer-adaptive decay
 - mean_pooling: Efficient mean pooling over sequence dimension
-- native_spare_attention: Sparse attention with dynamic block selection
+- native_sparse_attention: Sparse attention with dynamic block selection
 
 All implementations support:
 - Variable-length sequences via cumulative sequence lengths
@@ -36,15 +36,19 @@ from .flash_attention import flash_attention
 from .gla import recurrent_gla
 from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
-from .native_spare_attention import apply_native_spare_attention, native_spare_attention
+from .native_sparse_attention import apply_native_sparse_attention, native_sparse_attention
+from .page_attention import page_attention
+from .ragged_page_attention import ragged_page_attention
 from .recurrent import recurrent
 
 __all__ = (
-    "apply_native_spare_attention",
+    "apply_native_sparse_attention",
     "flash_attention",
     "lightning_attn",
     "mean_pooling",
-    "native_spare_attention",
+    "native_sparse_attention",
+    "page_attention",
+    "ragged_page_attention",
     "recurrent",
     "recurrent_gla",
 )

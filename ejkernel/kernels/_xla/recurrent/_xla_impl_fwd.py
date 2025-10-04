@@ -1,0 +1,268 @@
+# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Float, Int
+
+
+def _recurrent_attention_step(
+    carry: tuple[Float[Array, "num_heads key_dim value_dim"]],
+    inputs: tuple,
+    scale: float,
+    use_g: bool,
+    use_g_gamma: bool,
+    use_gk: bool,
+    use_gv: bool,
+) -> tuple[tuple[Float[Array, "num_heads key_dim value_dim"]], Float[Array, "num_heads value_dim"]]:
+    """
+    Single step of recurrent linear attention.
+
+    Updates hidden state: h_t = decay * h_{t-1} + k_t^T @ v_t
+    Computes output: o_t = h_t @ q_t
+
+    Args:
+        carry: Hidden state (h,) where h is [num_heads, key_dim, value_dim]
+        inputs: Tuple of (q, k, v, g, g_gamma, gk, gv) for current timestep
+        scale: Query scaling factor
+        use_g, use_g_gamma, use_gk, use_gv: Flags for gating mechanisms
+
+    Returns:
+        Updated carry and output for this timestep
+    """
+    (h,) = carry
+    q, k, v, g, g_gamma, gk, gv = inputs
+
+    # Apply gating/decay to hidden state
+    if use_g:
+        # GLA-style gating: decay based on gate value
+        # g: [num_heads, head_dim]
+        decay = jnp.exp(g)[:, :, None]  # [num_heads, head_dim, 1]
+        h = h * decay
+
+    if use_g_gamma:
+        # Lightning-style decay: fixed per-head decay
+        decay = jnp.exp(g_gamma)[:, None, None]  # [num_heads, 1, 1]
+        h = h * decay
+
+    if use_gk:
+        # Gate applied to keys
+        gk_decay = jnp.exp(gk)[:, :, None]  # [num_heads, key_dim, 1]
+        h = h * gk_decay
+
+    if use_gv:
+        # Gate applied to values
+        gv_decay = jnp.exp(gv)[:, None, :]  # [num_heads, 1, value_dim]
+        h = h * gv_decay
+
+    # Update: h = h + k^T @ v
+    # k: [num_heads, key_dim], v: [num_heads, value_dim]
+    # h: [num_heads, key_dim, value_dim]
+    h = h + k[:, :, None] * v[:, None, :]
+
+    # Output: o = h @ q
+    # q: [num_heads, key_dim] (scaled)
+    # o: [num_heads, value_dim]
+    q_scaled = q * scale
+    o = jnp.sum(h * q_scaled[:, :, None], axis=1)  # [num_heads, value_dim]
+
+    return (h,), o
+
+
+def _recurrent_attention_fwd(
+    q: Float[Array, "batch seq_len num_heads head_dim"],
+    k: Float[Array, "batch seq_len num_heads head_dim"],
+    v: Float[Array, "batch seq_len num_heads head_dim"],
+    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    g_gamma: Float[Array, "num_heads"] | None = None,
+    gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
+    scale: float | None = None,
+    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    reverse: bool = False,
+) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
+    """
+    Forward pass for recurrent linear attention.
+
+    Processes sequences sequentially with O(N) complexity by maintaining
+    a hidden state h that accumulates key-value information.
+
+    Args:
+        q, k, v: Query, key, value tensors [batch, seq_len, num_heads, head_dim]
+        g: Optional gate for GLA-style gating [batch, seq_len, num_heads, head_dim]
+        g_gamma: Optional per-head decay factor [num_heads]
+        gk, gv: Optional gates for keys/values [batch, seq_len, num_heads, head_dim]
+        scale: Query scaling factor
+        initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
+        reverse: If True, process sequence in reverse
+
+    Returns:
+        Tuple of (output, final_state)
+    """
+    batch, seq_len, num_heads, head_dim = q.shape
+
+    if scale is None:
+        scale = 1.0 / jnp.sqrt(head_dim).astype(jnp.float32)
+
+    # Determine which gating mechanisms are active
+    use_g = g is not None
+    use_g_gamma = g_gamma is not None
+    use_gk = gk is not None
+    use_gv = gv is not None
+
+    # Prepare inputs for scan
+    # If reverse, flip the sequence
+    if reverse:
+        q = jnp.flip(q, axis=1)
+        k = jnp.flip(k, axis=1)
+        v = jnp.flip(v, axis=1)
+        if use_g:
+            g = jnp.flip(g, axis=1)
+        if use_gk:
+            gk = jnp.flip(gk, axis=1)
+        if use_gv:
+            gv = jnp.flip(gv, axis=1)
+
+    # Default values for optional inputs
+    if g is None:
+        g = jnp.zeros((batch, seq_len, num_heads, head_dim))
+    if g_gamma is None:
+        g_gamma = jnp.zeros((num_heads,))
+    if gk is None:
+        gk = jnp.zeros((batch, seq_len, num_heads, head_dim))
+    if gv is None:
+        gv = jnp.zeros((batch, seq_len, num_heads, head_dim))
+
+    def process_batch(q_b, k_b, v_b, g_b, gk_b, gv_b, h0):
+        """Process a single batch element."""
+        # Broadcast g_gamma to all timesteps
+        g_gamma_seq = jnp.tile(g_gamma[None, :], (seq_len, 1))  # [seq_len, num_heads]
+
+        # Scan over sequence, storing hidden states
+        def scan_fn(carry, inputs):
+            (h,) = carry
+            (h_new,), o = _recurrent_attention_step((h,), inputs, scale, use_g, use_g_gamma, use_gk, use_gv)
+            # Return hidden state for next step, and output (hidden_state, output) for this step
+            return (h_new,), (h_new, o)
+
+        # Stack inputs for scan: each timestep gets (q_t, k_t, v_t, g_t, g_gamma, gk_t, gv_t)
+        scan_inputs = (q_b, k_b, v_b, g_b, g_gamma_seq, gk_b, gv_b)
+
+        (h_final,), (hidden_states, outputs) = jax.lax.scan(scan_fn, (h0,), scan_inputs)
+
+        return outputs, hidden_states, h_final
+
+    # Initialize hidden states
+    if initial_state is not None:
+        h0_batch = initial_state  # [batch, num_heads, head_dim, head_dim]
+    else:
+        h0_batch = jnp.zeros((batch, num_heads, head_dim, head_dim))
+
+    # Process all batches - vmap over batch dimension
+    outputs, hidden_states, final_states = jax.vmap(process_batch)(q, k, v, g, gk, gv, h0_batch)
+
+    # If reversed, flip outputs back
+    if reverse:
+        outputs = jnp.flip(outputs, axis=1)
+        hidden_states = jnp.flip(hidden_states, axis=1)
+
+    return outputs, hidden_states, final_states
+
+
+def _recurrent_attention_varlen_fwd(
+    q: Float[Array, "total_tokens num_heads head_dim"],
+    k: Float[Array, "total_tokens num_heads head_dim"],
+    v: Float[Array, "total_tokens num_heads head_dim"],
+    cu_seqlens: Int[Array, "num_seqs_plus_one"],
+    g: Float[Array, "total_tokens num_heads head_dim"] | None = None,
+    g_gamma: Float[Array, "num_heads"] | None = None,
+    gk: Float[Array, "total_tokens num_heads head_dim"] | None = None,
+    gv: Float[Array, "total_tokens num_heads head_dim"] | None = None,
+    scale: float | None = None,
+    initial_state: Float[Array, "num_seqs num_heads head_dim head_dim"] | None = None,
+    reverse: bool = False,
+) -> tuple[Float[Array, "total_tokens num_heads head_dim"], Float[Array, "num_seqs num_heads head_dim head_dim"]]:
+    """
+    Forward pass for recurrent linear attention with variable-length sequences.
+
+    Args:
+        q, k, v: Query, key, value tensors [total_tokens, num_heads, head_dim]
+        cu_seqlens: Cumulative sequence lengths [num_seqs + 1]
+        ... (other args same as fixed-length version)
+
+    Returns:
+        Tuple of (output, final_states)
+    """
+    num_seqs = len(cu_seqlens) - 1
+    head_dim = q.shape[2]
+
+    if scale is None:
+        scale = 1.0 / jnp.sqrt(head_dim).astype(jnp.float32)
+
+    def process_sequence(seq_idx):
+        """Process a single variable-length sequence."""
+        start = cu_seqlens[seq_idx]
+        end = cu_seqlens[seq_idx + 1]
+
+        # Extract this sequence's tokens
+        q_seq = q[start:end]  # [seq_len, num_heads, head_dim]
+        k_seq = k[start:end]
+        v_seq = v[start:end]
+
+        g_seq = g[start:end] if g is not None else None
+        gk_seq = gk[start:end] if gk is not None else None
+        gv_seq = gv[start:end] if gv is not None else None
+
+        # Get initial state for this sequence
+        h0 = initial_state[seq_idx] if initial_state is not None else None
+
+        # Process this sequence (batch size = 1)
+        q_batch = q_seq[None, ...]  # [1, seq_len, num_heads, head_dim]
+        k_batch = k_seq[None, ...]
+        v_batch = v_seq[None, ...]
+        g_batch = g_seq[None, ...] if g_seq is not None else None
+        gk_batch = gk_seq[None, ...] if gk_seq is not None else None
+        gv_batch = gv_seq[None, ...] if gv_seq is not None else None
+        h0_batch = h0[None, ...] if h0 is not None else None
+
+        o_batch, h_final_batch = _recurrent_attention_fwd(
+            q_batch,
+            k_batch,
+            v_batch,
+            g=g_batch,
+            g_gamma=g_gamma,
+            gk=gk_batch,
+            gv=gv_batch,
+            scale=scale,
+            initial_state=h0_batch,
+            reverse=reverse,
+        )
+
+        return o_batch[0], h_final_batch[0]  # Remove batch dimension
+
+    # Process all sequences
+    # Note: Can't use vmap easily due to variable lengths, so we loop
+    outputs_list = []
+    final_states_list = []
+
+    for seq_idx in range(num_seqs):
+        o_seq, h_final = process_sequence(seq_idx)
+        outputs_list.append(o_seq)
+        final_states_list.append(h_final)
+
+    # Concatenate outputs
+    outputs = jnp.concatenate(outputs_list, axis=0)
+    final_states = jnp.stack(final_states_list, axis=0)
+
+    return outputs, final_states

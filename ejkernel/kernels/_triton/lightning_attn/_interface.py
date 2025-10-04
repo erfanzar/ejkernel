@@ -16,13 +16,15 @@
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
 
+from ..._registry import Backend, Platform, kernel_registry
 from ..recurrent import recurrent
 
 
+@kernel_registry.register("lightning_attn", Platform.TRITON, Backend.GPU)
 def lightning_attn(
-    q: Float[Array, "batch seq_len num_heads head_dim"],
-    k: Float[Array, "batch seq_len num_heads head_dim"],
-    v: Float[Array, "batch seq_len num_heads head_dim"],
+    query: Float[Array, "batch seq_len num_heads head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     layer_idx: int,
     num_layers: int,
     scale: float | None = None,
@@ -44,10 +46,10 @@ def lightning_attn(
     processing and packed variable-length inputs via `cu_seqlens`.
 
     Args:
-        q: The query tensor. Expected shape is `(batch, seq_len, num_heads, head_dim)`
+        query: The query tensor. Expected shape is `(batch, seq_len, num_heads, head_dim)`
             or `(1, total_tokens, num_heads, head_dim)` if `cu_seqlens` is used.
-        k: The key tensor. Must have the same shape as `q`.
-        v: The value tensor. Must have the same shape as `q`.
+        key: The key tensor. Must have the same shape as `q`.
+        value: The value tensor. Must have the same shape as `q`.
         layer_idx: The 0-indexed index of the current layer, used to compute
             the layer-specific decay factor.
         num_layers: The total number of layers in the model.
@@ -88,9 +90,9 @@ def lightning_attn(
     qheads = q.shape[2]
     g_gamma = -(8 / qheads * (1 - layer_idx / num_layers)) * jnp.arange(qheads, dtype="f4")
     return recurrent(
-        q=q,
-        k=k,
-        v=v,
+        query=query,
+        key=key,
+        value=value,
         g_gamma=g_gamma,
         scale=scale,
         initial_state=initial_state,

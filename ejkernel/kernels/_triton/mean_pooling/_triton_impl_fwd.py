@@ -13,13 +13,12 @@
 # limitations under the License.
 
 
-
 import jax
 import triton
 import triton.language as tl
-from eformer.callib import cdiv, triton_call
 from jaxtyping import Array, Float, Int
 
+from ejkernel.callib import cdiv, triton_call
 from ejkernel.xla_utils.utils import prepare_chunk_indices
 
 
@@ -122,7 +121,6 @@ def fwd_triton_impl(
         out_shape=[jax.ShapeDtypeStruct((Z, NUM_SEQ_BLOCK, HEAD, DIM), x.dtype)],
         name="ejgpu:mean_pooling:fwd_kernel",
         grid=lambda META: (cdiv(DIM, META["BLOCK_DIM"]), NUM_SEQ_BLOCK, Z * HEAD),
-        disable_verbose_logging=True,
         **metaparams,
     )
     return o

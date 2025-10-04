@@ -29,7 +29,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-dependencies = ["eformer>=0.0.75", "jax>=0.7.2", "jaxlib>=0.7.2"]
+dependencies = ["einops>=0.8.1", "jax>=0.7.2", "jaxlib>=0.7.2", "triton==3.4.0"]
 
 [project.urls]
 "Homepage" = "https://github.com/erfanzar/ejkernel"
@@ -70,7 +70,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
-ignore = ["F722", "B008", "UP015", "A005","F821"]
+ignore = ["F722", "B008", "UP015", "A005", "F821", "E741", "UP037"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]

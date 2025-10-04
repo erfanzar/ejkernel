@@ -1,0 +1,262 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Ring Attention module with automatic optimization."""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from jaxtyping import Array, Float
+
+from ejkernel.kernels._registry import kernel_registry
+from ejkernel.ops import Invocation, Kernel
+
+from ..base import KernelConfig, create_default_executor, detect_platform
+
+
+class RingAttention(Kernel[KernelConfig, Array]):
+    """Ring Attention with custom optimization logic."""
+
+    def __init__(self):
+        """Initialize Ring Attention module."""
+        super().__init__(op_id="ring_attention")
+
+    def get_impl(self, cfg: KernelConfig):
+        """Get kernel implementation from registry."""
+        platform = detect_platform("ring_attention", cfg.platform)
+        return kernel_registry.get("ring_attention", platform=platform, backend=cfg.backend)
+
+    def run(
+        self,
+        query: Float[Array, "batch seq_len_q num_heads head_dim"],
+        key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+        value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+        q_segment_ids: Array | None = None,
+        kv_segment_ids: Array | None = None,
+        softmax_aux: Array | None = None,
+        cache_idx=None,
+        axis_name: str | None = None,
+        float32_logits: bool = True,
+        softmax_scale: float | None = None,
+        query_chunk_size: int = 512,
+        key_chunk_size: int = 512,
+        causal_block_size: int | None = None,
+        deterministic: bool = True,
+        dropout_rng=None,
+        pdrop: float = 0.0,
+        dtype=None,
+        policy=None,
+        precision=None,
+        prevent_cse: bool = True,
+        sliding_window: int | tuple[int, int] | None = None,
+        logit_soft_cap: float | None = None,
+        attention_sink_size: int = 0,
+        platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        *,
+        cfg: KernelConfig,
+    ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+        """Execute ring attention."""
+        # Override platform in config if specified
+        if platform is not None:
+            cfg = KernelConfig(
+                block_q=cfg.block_q,
+                block_k=cfg.block_k,
+                block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+                platform=platform,
+                backend=cfg.backend,
+            )
+        impl = self.get_impl(cfg)
+        return impl(
+            query=query,
+            key=key,
+            value=value,
+            bias=bias,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
+            softmax_aux=softmax_aux,
+            cache_idx=cache_idx,
+            axis_name=axis_name,
+            float32_logits=float32_logits,
+            softmax_scale=softmax_scale,
+            query_chunk_size=query_chunk_size,
+            key_chunk_size=key_chunk_size,
+            causal_block_size=causal_block_size,
+            deterministic=deterministic,
+            dropout_rng=dropout_rng,
+            pdrop=pdrop,
+            dtype=dtype,
+            policy=policy,
+            precision=precision,
+            prevent_cse=prevent_cse,
+            sliding_window=sliding_window,
+            logit_soft_cap=logit_soft_cap,
+            attention_sink_size=attention_sink_size,
+        )
+
+    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
+        """Provide default configuration with block sizes."""
+        return KernelConfig(
+            block_q=128,
+            block_k=128,
+            num_warps=4,
+            num_stages=2,
+            platform="auto",
+            backend="any",
+        )
+
+    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
+        """Generate candidate configurations for autotuning."""
+        block_configs = [
+            (64, 64, 4, 1),
+            (128, 128, 4, 2),
+            (256, 128, 8, 2),
+        ]
+
+        candidates = []
+        for block_q, block_k, num_warps, num_stages in block_configs:
+            candidates.append(
+                KernelConfig(
+                    block_q=block_q,
+                    block_k=block_k,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    platform="auto",
+                    backend="any",
+                )
+            )
+
+        return candidates
+
+
+_ring_executor = create_default_executor()
+
+
+def ring_attention(
+    query: Float[Array, "batch seq_len_q num_heads head_dim"],
+    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    q_segment_ids: Array | None = None,
+    kv_segment_ids: Array | None = None,
+    softmax_aux: Array | None = None,
+    cache_idx=None,
+    axis_name: str | None = None,
+    float32_logits: bool = True,
+    softmax_scale: float | None = None,
+    query_chunk_size: int = 512,
+    key_chunk_size: int = 512,
+    causal_block_size: int | None = None,
+    deterministic: bool = True,
+    dropout_rng=None,
+    pdrop: float = 0.0,
+    dtype=None,
+    policy=None,
+    precision=None,
+    prevent_cse: bool = True,
+    sliding_window: int | tuple[int, int] | None = None,
+    logit_soft_cap: float | None = None,
+    attention_sink_size: int = 0,
+    platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+    """Execute ring attention with automatic optimization.
+
+    Ring attention distributes attention computation across devices in a ring topology,
+    enabling efficient processing of very long sequences through communication-efficient
+    parallelization.
+
+    Args:
+        query: Query tensor [batch, seq_len_q, num_heads, head_dim]
+        key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim]
+        value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim]
+        bias: Optional attention bias tensor
+        q_segment_ids: Segment IDs for queries
+        kv_segment_ids: Segment IDs for keys/values
+        softmax_aux: Auxiliary softmax values
+        cache_idx: Cache index for inference
+        axis_name: Name of the axis for collective operations
+        float32_logits: Use float32 for logit computation
+        softmax_scale: Scaling factor for attention scores
+        query_chunk_size: Chunk size for queries (default: 512)
+        key_chunk_size: Chunk size for keys (default: 512)
+        causal_block_size: Block size for causal masking
+        deterministic: Use deterministic dropout
+        dropout_rng: RNG for dropout
+        pdrop: Dropout probability
+        dtype: Data type for computation
+        policy: Sharding policy
+        precision: Computation precision
+        prevent_cse: Prevent common subexpression elimination
+        sliding_window: Window size for local attention
+        logit_soft_cap: Soft capping value for logits
+        attention_sink_size: Size of attention sink
+
+            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+
+    Returns:
+        Attention output with same shape as query
+
+    Example:
+        >>> # Standard ring attention
+        >>> out = ring_attention(query, key, value)
+        >>>
+        >>> # With causal masking and custom chunk sizes
+        >>> out = ring_attention(
+        ...     query, key, value,
+        ...     causal_block_size=128,
+        ...     query_chunk_size=256,
+        ...     key_chunk_size=256
+        ... )
+        >>>
+        >>> # With sliding window and dropout
+        >>> out = ring_attention(
+        ...     query, key, value,
+        ...     sliding_window=1024,
+        ...     pdrop=0.1,
+        ...     dropout_rng=rng
+        ... )
+            >>>
+        >>> # Force specific platform
+        >>> out = ring_attention(..., platform="triton")
+    """
+    return _ring_executor(
+        RingAttention(),
+        query=query,
+        key=key,
+        value=value,
+        bias=bias,
+        q_segment_ids=q_segment_ids,
+        kv_segment_ids=kv_segment_ids,
+        softmax_aux=softmax_aux,
+        cache_idx=cache_idx,
+        axis_name=axis_name,
+        float32_logits=float32_logits,
+        softmax_scale=softmax_scale,
+        query_chunk_size=query_chunk_size,
+        key_chunk_size=key_chunk_size,
+        causal_block_size=causal_block_size,
+        deterministic=deterministic,
+        dropout_rng=dropout_rng,
+        pdrop=pdrop,
+        dtype=dtype,
+        policy=policy,
+        precision=precision,
+        prevent_cse=prevent_cse,
+        sliding_window=sliding_window,
+        logit_soft_cap=logit_soft_cap,
+        attention_sink_size=attention_sink_size,
+    )

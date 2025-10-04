@@ -20,10 +20,10 @@ import jax
 import jax.numpy as jnp
 import triton
 import triton.language as tl
-from eformer.callib import triton_call
 from jaxtyping import Array, Bool, Float, Int
 from triton import Config
 
+from ejkernel.callib import triton_call
 from ejkernel.utils import dtype_index, get_strides
 
 from ._utilities import (
@@ -77,6 +77,9 @@ def _attn_fwd_inner(
     dropout_offs,
     window_left,  # NEW
     window_right,  # NEW
+    logits_soft_cap,  # NEW
+    softmax_aux_ptrs,  # NEW
+    num_sinks,  # NEW
     stride_kn,
     stride_vn,
     index_start_n,
@@ -89,6 +92,8 @@ def _attn_fwd_inner(
     BOOL_BIAS: tl.constexpr,
     MASKED: tl.constexpr,
     SLIDING: tl.constexpr,  # NEW
+    SOFTCAP: tl.constexpr,  # NEW
+    USE_SINKS: tl.constexpr,  # NEW
     PADDED_COLS: tl.constexpr,
     PADDED_HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -120,7 +125,11 @@ def _attn_fwd_inner(
             )
 
     qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    qk += tl.dot(q, tl.trans(k))
+    # Compute QK in float32 when sinks are used for better precision with large sink values
+    if USE_SINKS:
+        qk += tl.dot(q.to(tl.float32), tl.trans(k.to(tl.float32)))
+    else:
+        qk += tl.dot(q, tl.trans(k))
 
     if PADDED_COLS:
         qk += tl.where(
@@ -150,9 +159,58 @@ def _attn_fwd_inner(
             LN2: tl.constexpr = 1.44269504089
             qk += bias * (LN2 / softmax_scale)
 
-    m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, me_i)
-    P_ij = tl.exp2(qk * softmax_scale - m_ij[:, None])
-    l_ij = tl.sum(P_ij, 1)
+    # Apply logits soft cap if enabled
+    # NOTE: qk is in log2 space, but softcap operates in natural space
+    LN2: tl.constexpr = 1.44269504089  # log2(e) for converting log2 to ln
+    if SOFTCAP:
+        # Convert from log2 to natural scale: multiply by softmax_scale and convert to ln
+        qk_natural = qk * (softmax_scale / LN2)
+        # Apply soft cap in natural space
+        x = qk_natural / logits_soft_cap
+        exp_2x = tl.exp(2.0 * x)
+        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+        qk = (logits_soft_cap * tanh_x) * LN2  # Convert back to log2 space
+    else:
+        qk = qk * softmax_scale
+
+    # Include attention sinks in softmax if enabled
+    if USE_SINKS:
+        # Load sink logits: [num_sinks] per head (raw, natural units)
+        sink_offs = tl.arange(0, 16)  # supports up to 16 sinks
+        sink_mask = sink_offs < num_sinks
+        aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf")).to(tl.float32)
+
+        # Apply soft cap (in natural units) if enabled
+        if SOFTCAP:
+            # Optional: clamp to stabilize large inputs in fp16/bf16 contexts
+            x_aux = aux_logits / logits_soft_cap
+            x_aux = tl.maximum(tl.minimum(x_aux, 8.0), -8.0)  # clamp [-8, 8]
+            exp_2x = tl.exp(2.0 * x_aux)
+            tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+            aux_natural = logits_soft_cap * tanh_x
+            aux_log2 = aux_natural * LN2
+        else:
+            # No softcap: convert natural -> log2 so exp2() matches XLA's e^(.)
+            aux_log2 = aux_logits * LN2
+
+        # Rowwise max that includes attention logits and sinks (both in log2 units)
+        qk_max = tl.max(qk, 1)  # qk already in log2 units after scaling step
+        aux_max = tl.max(tl.where(sink_mask, aux_log2, float("-inf")))
+        m_ij = tl.maximum(tl.maximum(qk_max, aux_max), me_i)  # [BLOCK_M]
+
+        # Attention contribution
+        P_ij = tl.exp2(qk - m_ij[:, None])  # [BLOCK_M, BLOCK_N]
+
+        # Rowwise sink contribution (more stable than "m_ij_max + adjust" trick)
+        aux_log2_row = tl.where(sink_mask[None, :], aux_log2[None, :], float("-inf"))
+        l_aux_row = tl.sum(tl.exp2(aux_log2_row - m_ij[:, None]), axis=1)  # [BLOCK_M]
+
+        # Total denominator
+        l_ij = tl.sum(P_ij, 1) + l_aux_row
+    else:
+        m_ij = tl.maximum(tl.max(qk, 1), me_i)
+        P_ij = tl.exp2(qk - m_ij[:, None])
+        l_ij = tl.sum(P_ij, 1)
 
     if USE_DROPOUT:
         dropout_offs = dropout_offs + index_start_n
@@ -220,7 +278,6 @@ def _attn_fwd_inner(
         "SLIDING",
     ],
     prune_configs_by={"early_config_prune": config_prune_kernel},
-    use_cuda_graph=True,
 )
 @triton.heuristics(
     {
@@ -237,6 +294,9 @@ def _attn_fwd(
     softmax_scale,
     dropout_prob,
     dropout_seed,
+    logits_soft_cap,  # NEW
+    softmax_aux,  # NEW
+    num_sinks,  # NEW
     stride_qz,
     stride_qm,
     stride_qh,
@@ -272,6 +332,8 @@ def _attn_fwd(
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
     SLIDING: tl.constexpr,  # NEW
+    SOFTCAP: tl.constexpr,  # NEW
+    USE_SINKS: tl.constexpr,  # NEW
     BOOL_BIAS: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     PADDED_HEADS: tl.constexpr,
@@ -389,6 +451,13 @@ def _attn_fwd(
     else:
         dropout_offs = None
 
+    # Set up softmax_aux pointer for this head
+    if USE_SINKS:
+        softmax_aux_ptrs = softmax_aux + off_head_q * num_sinks
+    else:
+        # Point to the dummy tensor (won't be accessed when USE_SINKS=False)
+        softmax_aux_ptrs = softmax_aux
+
     me_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
@@ -434,6 +503,9 @@ def _attn_fwd(
                 dropout_offs,
                 window_left,
                 window_right,  # NEW
+                logits_soft_cap,  # NEW
+                softmax_aux_ptrs,  # NEW
+                num_sinks,  # NEW
                 stride_kn,
                 stride_vn,
                 next_start_n,
@@ -446,6 +518,8 @@ def _attn_fwd(
                 BOOL_BIAS=BOOL_BIAS,
                 MASKED=False,
                 SLIDING=SLIDING,  # NEW
+                SOFTCAP=SOFTCAP,  # NEW
+                USE_SINKS=USE_SINKS,  # NEW
                 PADDED_COLS=False,
                 PADDED_HEADS=PADDED_HEADS,
                 BLOCK_M=BLOCK_M,
@@ -473,6 +547,9 @@ def _attn_fwd(
                 dropout_offs,
                 window_left,
                 window_right,  # NEW
+                logits_soft_cap,  # NEW
+                softmax_aux_ptrs,  # NEW
+                num_sinks,  # NEW
                 stride_kn,
                 stride_vn,
                 index_start_n,
@@ -485,6 +562,8 @@ def _attn_fwd(
                 BOOL_BIAS=BOOL_BIAS,
                 MASKED=True,
                 SLIDING=SLIDING,  # NEW
+                SOFTCAP=SOFTCAP,  # NEW
+                USE_SINKS=USE_SINKS,  # NEW
                 PADDED_COLS=pad_cols,
                 PADDED_HEADS=PADDED_HEADS,
                 BLOCK_M=BLOCK_M,
@@ -527,6 +606,8 @@ def _fwd_attention_kernel_call(
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
     sliding_window: int | tuple[int, int] | None = None,
+    logits_soft_cap: float | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], Float[Array, "batch num_heads max_seqlen_q_rounded"]]:
     if sliding_window is None:
         window_left = 0
@@ -543,13 +624,44 @@ def _fwd_attention_kernel_call(
         assert window_left >= 0 and window_right >= 0
         sliding_flag = (window_left > 0) or (window_right > 0)
 
+    # Handle logits soft cap
+    if logits_soft_cap is None:
+        logits_soft_cap_val = 0.0
+        softcap_flag = False
+    else:
+        logits_soft_cap_val = float(logits_soft_cap)
+        softcap_flag = True
+
+    # Handle softmax_aux (attention sinks)
+    if softmax_aux is None:
+        use_sinks = False
+        num_sinks_val = 0
+        softmax_aux_tensor = jnp.zeros((1,), dtype=q.dtype)  # Dummy
+    else:
+        use_sinks = True
+        # softmax_aux can be [num_sinks] or [num_heads, num_sinks]
+        if softmax_aux.ndim == 1:
+            # Broadcast to all heads: [num_sinks] -> [num_heads, num_sinks]
+            num_sinks_val = softmax_aux.shape[0]
+            num_heads = q.shape[2]
+            softmax_aux_tensor = jnp.broadcast_to(softmax_aux[None, :], (num_heads, num_sinks_val))
+        elif softmax_aux.ndim == 2:
+            num_sinks_val = softmax_aux.shape[1]
+            softmax_aux_tensor = softmax_aux
+        else:
+            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
+
+        # Don't preprocess sinks - pass them through as raw logits
+        # The kernel will handle them the same way it handles QK logits
+        pass
+
     # Prefer VARLEN path if cum arrays provided
     varlen_from_cu = (cum_seqlens_q is not None) and (cum_seqlens_k is not None)
     if varlen_from_cu:
         assert cum_seqlens_q.dtype == jnp.int32 and cum_seqlens_k.dtype == jnp.int32
         batch = q.shape[0]
-        QSeq_max = q.shape[1]
-        KSeq_max = k.shape[1]
+        QSeq_max = int(q.shape[1])  # static padded Tq_max
+        KSeq_max = int(k.shape[1])  # static padded Tk_max
         nheads_q = q.shape[2]
         nheads_kv = k.shape[2]
         head_dim = q.shape[3]
@@ -557,8 +669,8 @@ def _fwd_attention_kernel_call(
         assert q.dtype == k.dtype == v.dtype
         assert q.dtype in [jnp.float16, jnp.bfloat16]
 
-        max_seqlen_q = int((cum_seqlens_q[1:] - cum_seqlens_q[:-1]).max().item())
-        max_seqlen_k = int((cum_seqlens_k[1:] - cum_seqlens_k[:-1]).max().item())
+        max_seqlen_q = QSeq_max
+        max_seqlen_k = KSeq_max
 
         # packers as in the previous patch
         q_packed = attention_pack_from_cu_static(q, cum_seqlens_q, max_tokens=batch * QSeq_max)
@@ -587,6 +699,8 @@ def _fwd_attention_kernel_call(
             IS_CAUSAL=causal,
             BIAS_ON=False,
             SLIDING=sliding_flag,  # NEW
+            SOFTCAP=softcap_flag,  # NEW
+            USE_SINKS=use_sinks,  # NEW
             BOOL_BIAS=BOOL_BIAS,
             BLOCK_HEADDIM=BLOCK_HEADDIM,
             PADDED_HEADS=PADDED_HEADS,
@@ -605,6 +719,9 @@ def _fwd_attention_kernel_call(
             softmax_scale,
             dropout_prob,
             dropout_seed if dropout_seed is not None else jnp.zeros((1,), q.dtype),
+            logits_soft_cap_val,  # NEW
+            softmax_aux_tensor,  # NEW
+            num_sinks_val,  # NEW
             qz,
             qm,
             qh,
@@ -699,6 +816,8 @@ def _fwd_attention_kernel_call(
         IS_CAUSAL=causal,
         BIAS_ON=(bias is not None),
         SLIDING=sliding_flag,  # NEW
+        SOFTCAP=softcap_flag,  # NEW
+        USE_SINKS=use_sinks,  # NEW
         BOOL_BIAS=BOOL_BIAS,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         PADDED_HEADS=PADDED_HEADS,
@@ -717,6 +836,9 @@ def _fwd_attention_kernel_call(
         softmax_scale,
         dropout_prob,
         dropout_seed if dropout_seed is not None else jnp.zeros((1,), q.dtype),
+        logits_soft_cap_val,  # NEW
+        softmax_aux_tensor,  # NEW
+        num_sinks_val,  # NEW
         qz,
         qm,
         qh,

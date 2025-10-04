@@ -15,9 +15,9 @@
 import jax
 import triton
 import triton.language as tl
-from eformer.callib import cdiv, triton_call
 from jaxtyping import Array, Float, Int
 
+from ejkernel.callib import cdiv, triton_call
 from ejkernel.xla_utils.utils import prepare_chunk_indices
 
 

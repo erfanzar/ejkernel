@@ -12,22 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._triton import (
-    apply_native_spare_attention,
-    flash_attention,
-    lightning_attn,
-    mean_pooling,
-    native_spare_attention,
-    recurrent,
-    recurrent_gla,
-)
+from . import _cuda as cuda
+from . import _pallas as pallas
+from . import _triton as triton
+from . import _xla as xla
+from ._registry import Backend, Platform, kernel_registry
 
 __all__ = (
-    "apply_native_spare_attention",
-    "flash_attention",
-    "lightning_attn",
-    "mean_pooling",
-    "native_spare_attention",
-    "recurrent",
-    "recurrent_gla",
+    "Backend",
+    "Platform",
+    "cuda",
+    "kernel_registry",
+    "pallas",
+    "triton",
+    "xla",
 )

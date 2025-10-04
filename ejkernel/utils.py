@@ -20,11 +20,8 @@ import jax
 import numpy
 import numpy as np
 import triton
-from eformer.loggings import get_logger
 from jax import Array
 from jax import numpy as jnp
-
-logger = get_logger("ejgpu-utils")
 
 F = tp.TypeVar("F", bound=tp.Callable[..., tp.Any])
 
@@ -116,8 +113,6 @@ def safe_autotune(
     post_hook=None,
     warmup=None,
     rep=None,
-    use_cuda_graph=False,
-    do_bench=None,
 ) -> tp.Callable[[F], F]:
     """
     Applies `triton.autotune` safely. Falls back to the original function if autotuning fails.
@@ -139,7 +134,6 @@ def safe_autotune(
                     prune_configs_by=prune_configs_by,
                     warmup=warmup,
                     rep=rep,
-                    use_cuda_graph=use_cuda_graph,
                 )
             except Exception:
                 return fn
@@ -284,7 +278,7 @@ def get_err_ratio(x, y):
 def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
     abs_atol = get_abs_err(ref, tri)
     msg = f"{prefix} diff: {abs_atol:.6f} ratio: {get_err_ratio(ref, tri):.6f}"
-    logger.info(msg)
+    print(msg)
     error_rate = get_err_ratio(ref, tri)
     if abs_atol <= err_atol:
         return
@@ -318,3 +312,127 @@ def get_gpu_arch() -> str:
 
 def arch_supports_fp8():
     return is_hip() and get_gpu_arch() in ("gfx942")
+
+
+def generate_block_indices(
+    batch: int,
+    num_query_blocks: int,
+    heads: int,
+    selected_blocks: int,
+    block_size: int,
+    seed: int = 42,
+) -> jax.Array:
+    """Generate random block indices for sparse attention benchmarks.
+
+    This function generates a tensor of block indices where each query block attends to
+    a random selection of previous key blocks. The indices are sorted in ascending order.
+
+    Args:
+        batch: Batch size.
+        num_query_blocks: Number of query blocks.
+        heads: Number of attention heads (typically kv_heads for GQA).
+        selected_blocks: Number of key blocks each query block should attend to.
+        block_size: Size of each block (not used in calculation, kept for API compatibility).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        Array of shape (batch, num_query_blocks, heads, selected_blocks) containing sorted
+        block indices. Positions beyond available blocks are filled with -1.
+
+    Example:
+        >>> # For sequence_length=256, block_size=64, we have 4 query blocks
+        >>> indices = generate_block_indices(batch=2, num_query_blocks=4, heads=8, selected_blocks=2, block_size=64)
+        >>> indices.shape
+        (2, 4, 8, 2)
+    """
+    # Initialize with -1 (out of bounds marker, will be skipped by kernel)
+    block_indices = jnp.full((batch, num_query_blocks, heads, selected_blocks), -1, dtype=jnp.int32)
+
+    key = jax.random.PRNGKey(seed)
+
+    # Use Python loops since we need concrete values for permutation
+    for b in range(batch):
+        for qb in range(num_query_blocks):
+            for h in range(heads):
+                key, subkey = jax.random.split(key)
+                # Each query block can attend to itself and all previous blocks
+                num_available_blocks = qb + 1
+
+                # Generate random permutation of available blocks
+                perm = jax.random.permutation(subkey, num_available_blocks)[:selected_blocks]
+
+                # Pad if we don't have enough blocks
+                if num_available_blocks < selected_blocks:
+                    perm = jnp.pad(perm, (0, selected_blocks - num_available_blocks), constant_values=-1)
+
+                block_indices = block_indices.at[b, qb, h, :].set(perm)
+
+    # Sort indices along the last dimension
+    block_indices = jnp.sort(block_indices, axis=-1)
+
+    return block_indices
+
+
+_sync_counter = 0
+
+
+def barrier_sync(timeout: float = 200):
+    """Synchronize all JAX processes at a barrier point.
+
+    Blocks execution until all processes in the distributed JAX runtime reach
+    this barrier. This is essential for ensuring consistency across distributed
+    training, especially before/after collective operations or checkpointing.
+
+    The function uses a global counter to create unique barrier names, allowing
+    multiple barriers to be used sequentially without conflicts.
+
+    Args:
+        timeout: Maximum time to wait for all processes to reach the barrier,
+            in seconds. Defaults to 200 seconds (3.33 minutes). If the timeout
+            is exceeded, a RuntimeError will be raised by the underlying JAX
+            distributed client.
+
+    Returns:
+        None
+
+    Raises:
+        RuntimeError: If the JAX distributed client is not initialized. This
+            typically means JAX was not started in distributed mode or the
+            distributed runtime failed to initialize.
+
+    Note:
+        - This function is a no-op when running with a single process
+          (jax.process_count() == 1), allowing code to work seamlessly
+          in both single and multi-process environments.
+        - Each call increments a global counter to ensure unique barrier names,
+          preventing conflicts when multiple barriers are used in sequence.
+        - The timeout is converted to milliseconds for the underlying JAX API.
+
+    Example:
+        >>> # In distributed training
+        >>> model = train_step(model, batch)
+        >>> barrier_sync()  # Wait for all processes
+        >>> if jax.process_index() == 0:
+        ...     save_checkpoint(model)  # Only process 0 saves
+        >>> barrier_sync()  # Wait before continuing
+
+        >>> # With custom timeout for long operations
+        >>> barrier_sync(timeout=600)  # Wait up to 10 minutes
+
+    Warning:
+        Ensure all processes call barrier_sync() the same number of times and
+        in the same order, or deadlocks may occur. Conditional barriers based
+        on process rank should be avoided.
+    """
+    global _sync_counter
+    if jax.process_count() == 1:
+        return
+    import jax._src.distributed as distributed
+
+    client = distributed.global_state.client
+
+    if client is None:
+        raise RuntimeError("barrier_sync requires jax distributed client to be initialized")
+
+    _sync_counter += 1
+    client.wait_at_barrier(f"easy_barrier_sync_{_sync_counter}", timeout_in_ms=int(timeout * 1000.0))

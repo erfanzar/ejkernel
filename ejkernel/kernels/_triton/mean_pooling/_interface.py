@@ -16,6 +16,7 @@ from functools import partial
 import jax
 from jaxtyping import Array, Float, Int
 
+from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_bwd import bwd_triton_impl
 from ._triton_impl_fwd import fwd_triton_impl
 
@@ -91,9 +92,10 @@ def _mean_pooling(
 _mean_pooling.defvjp(_fwd_call, _bwd_call)
 
 
+@kernel_registry.register("mean_pooling", Platform.TRITON, Backend.GPU)
 def mean_pooling(
     x: Float[Array, "batch seq_len hidden_dim"],
-    chunk_size: int,
+    chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
     """
