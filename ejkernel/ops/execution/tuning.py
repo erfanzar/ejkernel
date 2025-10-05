@@ -34,7 +34,6 @@ from jax import numpy as jnp
 from jax import random
 from jax.interpreters import pxla
 from jax.sharding import PartitionSpec, Sharding, SingleDeviceSharding
-from tqdm import tqdm
 
 from ejkernel.loggings import get_logger
 
@@ -806,14 +805,11 @@ class FNAutotuner:
                     )
                     compiles[fut] = i
 
-                pbar = tqdm(total=len(compiles), disable=autotune_logger.level > logging.INFO, desc="Compiling...")
                 successful = {}
                 for fut in as_completed(compiles):
                     status, err, optf = fut.result()
                     if status:
                         successful[compiles[fut]] = (status, err, optf)
-                    pbar.update(1)
-                pbar.close()
 
                 if compile_only and compute_layouts:
                     for i, (_, _, optf) in successful.items():
@@ -881,12 +877,7 @@ class FNAutotuner:
                     f"Need to fall back to the python-level timing, but allow_fallback_timing=False. Error: {e}"
                 ) from None
 
-            for i, hs in tqdm(
-                hyperparam_settings.items(),
-                total=len(hyperparam_settings),
-                disable=autotune_logger.level > logging.INFO,
-                desc="Timing...",
-            ):
+            for i, hs in hyperparam_settings.items():
                 hs = dict(zip(hyperparams_norm.keys(), hs, strict=True))
                 t_mean, t_std = self._time_fn(partial(lambda fn: fn(*resolved_args, **resolved_kwargs), fns[i]))
                 results[i] = TimingResult(hs, t_mean, t_std)

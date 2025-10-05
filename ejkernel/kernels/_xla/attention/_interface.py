@@ -85,7 +85,7 @@ def attention(
             to match the query head structure for GQA/MQA.
     """
 
-    sm_scale = softmax_scale if softmax_scale is not None else query.shape[-1] ** -0.5
+    softmax_scale = softmax_scale if softmax_scale is not None else query.shape[-1] ** -0.5
 
     if softmax_dtype is None:
         softmax_dtype = jnp.float32
@@ -102,7 +102,7 @@ def attention(
     query = jnp.reshape(query, (b, qs, kh, num_reps, d))
     query, key, value = query.astype(dtype), key.astype(dtype), value.astype(dtype)
 
-    aw = jnp.einsum("bskhd,bmkd->bkhsm", query * sm_scale, key, optimize=True)
+    aw = jnp.einsum("bskhd,bmkd->bkhsm", query * softmax_scale, key, optimize=True)
 
     # Apply sliding window attention_mask if specified
     if sliding_window is not None:

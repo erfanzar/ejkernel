@@ -45,13 +45,13 @@ def _flash_attention_fwd(
     segment_ids,
     save_residuals,
     causal,
-    sm_scale,
+    softmax_scale,
     block_sizes,
     debug,
 ):
     if save_residuals:
         raise NotImplementedError("Higher-order AD not supported")
-    o, l, m = _flash_attention_impl(q, k, v, ab, segment_ids, True, causal, sm_scale, block_sizes, debug)
+    o, l, m = _flash_attention_impl(q, k, v, ab, segment_ids, True, causal, softmax_scale, block_sizes, debug)
     return o, (q, k, v, ab, segment_ids, o, l, m)
 
 
@@ -82,7 +82,7 @@ def _flash_attention_kernel_single_batch(
     acc_scratch_ref,
     *,
     causal,
-    sm_scale,
+    softmax_scale,
     block_k,
     kv_seq_len,
     mask_value,
@@ -118,13 +118,13 @@ def _flash_attention_kernel_single_batch(
 
             # Add attention bias if needed.
             # TODO(tanburn) Should the attention bias be added before or after
-            # multiplication by sm_scale?
+            # multiplication by softmax_scale?
             if ab_tile_ref is not None:
                 ab = ab_tile_ref[(*batch_idx, pl.dslice(None), pl.dslice(start_k, block_k))].astype(jnp.float32)
                 s += ab
 
-            if sm_scale != 1.0:
-                s *= sm_scale
+            if softmax_scale != 1.0:
+                s *= softmax_scale
 
             mask = None
             if q_segment_ids_tile_ref is not None:
@@ -205,7 +205,7 @@ def _flash_attention_kernel_single_batch_single_step(
     m_ref: Any | None = None,
     *,
     causal,
-    sm_scale,
+    softmax_scale,
     block_k,
     kv_seq_len,
     mask_value,
@@ -221,8 +221,8 @@ def _flash_attention_kernel_single_batch_single_step(
 
     if ab_tile_ref is not None:
         s += ab_tile_ref[batch_idx].astype(jnp.float32)
-    if sm_scale != 1.0:
-        s *= sm_scale
+    if softmax_scale != 1.0:
+        s *= softmax_scale
 
     mask = None
     if q_segment_ids_tile_ref is not None:
@@ -268,7 +268,7 @@ def _flash_attention_impl(
     segment_ids,
     save_residuals,
     causal,
-    sm_scale,
+    softmax_scale,
     block_b,
     block_q,
     block_k_major,
@@ -333,7 +333,7 @@ def _flash_attention_impl(
         _flash_attention_kernel,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         block_k=block_k,
         kv_seq_len=kv_seq_len,
     )
@@ -439,7 +439,7 @@ def _flash_attention_impl(
             ab,
             segment_ids,
             causal=causal,
-            sm_scale=sm_scale,
+            softmax_scale=softmax_scale,
             kernel_inputs_specs=(q, k, v, ab, q_segment_ids, kv_segment_ids),
             kernel_outputs_specs=out_shape,
         ),

@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .blocksparse_attention import block_sparse_attention as blocksparse_attention
 from .flash_attention import flash_attention
 from .grouped_matmul import grouped_matmul
 from .page_attention import page_attention
 from .ragged_page_attention import ragged_page_attention
 from .ring_attention import ring_attention
-from .splash import splash
 
-__all__ = ("flash_attention", "grouped_matmul", "page_attention", "ragged_page_attention", "ring_attention", "splash")
+__all__ = (
+    "blocksparse_attention",
+    "flash_attention",
+    "grouped_matmul",
+    "page_attention",
+    "ragged_page_attention",
+    "ring_attention",
+)

@@ -66,7 +66,7 @@ def ref_ragged_page_attention(
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     num_seqs: jax.Array,  # i32[1],
     *,
-    sm_scale: float = 1.0,
+    softmax_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
@@ -78,7 +78,7 @@ def ref_ragged_page_attention(
         block_tables,
         cu_q_lens,
         num_seqs,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,
@@ -104,7 +104,7 @@ def ref_ragged_page_attention(
         k = jnp.repeat(k, num_query_per_kv, axis=1)
         v = jnp.repeat(v, num_query_per_kv, axis=1)
         attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
-        attn *= sm_scale
+        attn *= softmax_scale
         q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
         kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
         mask = q_span < kv_span
@@ -130,7 +130,7 @@ def dynamic_validate_inputs(
     num_seqs: jax.Array,  # i32[1]
     *,
     # These inputs are optional. If not specified, we will not validate them.
-    sm_scale: float | None = None,
+    softmax_scale: float | None = None,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = None,
@@ -145,7 +145,7 @@ def dynamic_validate_inputs(
         block_tables,
         cu_q_lens,
         num_seqs,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,
@@ -183,7 +183,7 @@ def static_validate_inputs(
     num_seqs: jax.Array,  # i32[1]
     *,
     # These inputs are optional. If not specified, we will not validate them.
-    sm_scale: float | None = None,
+    softmax_scale: float | None = None,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = None,
@@ -226,7 +226,7 @@ def static_validate_inputs(
         raise ValueError(f"{num_queries_per_block=} must be positive.")
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
-    del sm_scale  # No constraints on sm_scale.
+    del softmax_scale  # No constraints on softmax_scale.
     del mask_value  # No consstraints on mask_value.
 
 
@@ -249,7 +249,7 @@ def ragged_page_attention_kernel(
     m_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
     acc_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
     *,
-    sm_scale: float,
+    softmax_scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
@@ -427,7 +427,7 @@ def ragged_page_attention_kernel(
             k = jnp.where(kv_mask, k.astype(jnp.float32), 0).astype(k.dtype)
             v = jnp.where(kv_mask, v.astype(jnp.float32), 0).astype(v.dtype)
 
-            qk = jnp.einsum("nd,md->nm", q, k, preferred_element_type=jnp.float32) * sm_scale
+            qk = jnp.einsum("nd,md->nm", q, k, preferred_element_type=jnp.float32) * softmax_scale
             store_start = jnp.maximum(q_start - q_len_start, 0)
             store_end = jnp.minimum(q_end - q_len_start, num_q_per_blk)
 

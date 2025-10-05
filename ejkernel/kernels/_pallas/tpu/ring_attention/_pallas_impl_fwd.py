@@ -134,7 +134,7 @@ def _ring_flash_attention_fwd_tpu(
             segment_ids=segment_ids_slice,
             save_residuals=False,
             causal_block_size=causal_block_size,
-            sm_scale=scale,
+            softmax_scale=scale,
             block_sizes=block_sizes,
             debug=False,
             sliding_window=sliding_window,
@@ -163,7 +163,7 @@ def _flash_attention(
     segment_ids,
     save_residuals,
     causal_block_size,
-    sm_scale,
+    softmax_scale,
     block_sizes,
     debug,
     sliding_window=None,
@@ -181,7 +181,7 @@ def _flash_attention(
         segment_ids,
         save_residuals,
         causal_block_size,
-        sm_scale,
+        softmax_scale,
         block_sizes.block_b,
         block_sizes.block_q,
         block_sizes.block_k_major,
@@ -204,7 +204,7 @@ def _flash_attention_fwd(
     segment_ids,
     save_residuals,
     causal_block_size,
-    sm_scale,
+    softmax_scale,
     block_sizes,
     debug,
     sliding_window=None,
@@ -224,7 +224,7 @@ def _flash_attention_fwd(
         segment_ids,
         True,
         causal_block_size,
-        sm_scale,
+        softmax_scale,
         block_sizes,
         debug,
         sliding_window,
@@ -253,7 +253,7 @@ def _flash_attention_kernel(
     l_ref,
     m_ref,
     causal_block_size,
-    sm_scale,
+    softmax_scale,
     block_k,
     kv_seq_len,
     mask_value,
@@ -288,7 +288,7 @@ def _flash_attention_kernel(
             l_ref,
             m_ref,
             causal_block_size=causal_block_size,
-            sm_scale=sm_scale,
+            softmax_scale=softmax_scale,
             block_k=block_k,
             kv_seq_len=kv_seq_len,
             mask_value=mask_value,
@@ -320,7 +320,7 @@ def _flash_attention_kernel_single_batch(
     m_ref: tp.Any | None = None,
     *,
     causal_block_size,
-    sm_scale,
+    softmax_scale,
     block_k,
     kv_seq_len,
     mask_value,
@@ -390,8 +390,8 @@ def _flash_attention_kernel_single_batch(
                 ).astype(s.dtype)
                 s += ab
 
-            if sm_scale != 1.0:
-                s *= sm_scale
+            if softmax_scale != 1.0:
+                s *= softmax_scale
 
             # Apply logit soft cap if specified
             if logit_soft_cap is not None:
@@ -502,7 +502,7 @@ def _flash_attention_impl(
     segment_ids,
     save_residuals,
     causal_block_size,
-    sm_scale,
+    softmax_scale,
     block_b,
     block_q,
     block_k_major,
@@ -591,7 +591,7 @@ def _flash_attention_impl(
         _flash_attention_kernel,
         causal_block_size=causal_block_size,
         mask_value=DEFAULT_MASK_VALUE,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         block_k=block_k,
         kv_seq_len=kv_seq_len,
         block_q=block_q,

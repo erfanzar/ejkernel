@@ -137,11 +137,11 @@ def _fwd_cost_estimate(
     segment_ids: SegmentIds | None,
     *,
     causal: bool,
-    sm_scale: jax.Array | None,
+    softmax_scale: jax.Array | None,
     kernel_inputs_specs,
     kernel_outputs_specs,
 ) -> pl.CostEstimate | None:
-    body_cost = pl.estimate_cost(mha_reference, q, k, v, ab, segment_ids, causal=causal, sm_scale=sm_scale)
+    body_cost = pl.estimate_cost(mha_reference, q, k, v, ab, segment_ids, causal=causal, softmax_scale=softmax_scale)
     input_bytes = sum(_bytes(x) for x in jax.tree.leaves(kernel_inputs_specs))
     output_bytes = sum(_bytes(x) for x in jax.tree.leaves(kernel_outputs_specs))
     return pl.CostEstimate(
@@ -161,14 +161,14 @@ def mha_reference_no_custom_vjp(
     *,
     causal: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
-    sm_scale: float = 1.0,
+    softmax_scale: float = 1.0,
     save_residuals: bool = False,
 ):
     logits = jnp.einsum("bhqc,bhkc->bhqk", q, k)
     if ab is not None:
         logits += ab
-    if sm_scale != 1.0:
-        logits *= sm_scale
+    if softmax_scale != 1.0:
+        logits *= softmax_scale
 
     mask = None
     if segment_ids is not None:
@@ -196,7 +196,7 @@ def mha_reference_no_custom_vjp(
     return out
 
 
-@functools.partial(jax.jit, static_argnames=["causal", "mask_value", "sm_scale"])
+@functools.partial(jax.jit, static_argnames=["causal", "mask_value", "softmax_scale"])
 @jax.default_matmul_precision("bfloat16")
 def mha_reference(
     q,
@@ -206,7 +206,7 @@ def mha_reference(
     segment_ids: SegmentIds | None = None,
     causal: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
-    sm_scale=1.0,
+    softmax_scale=1.0,
 ):
     return _mha_reference(
         q,
@@ -216,7 +216,7 @@ def mha_reference(
         segment_ids,
         causal=causal,
         mask_value=mask_value,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         save_residuals=False,
     )
 
@@ -230,7 +230,7 @@ def _mha_reference(
     segment_ids: SegmentIds | None,
     causal: bool,
     mask_value: float,
-    sm_scale: float,
+    softmax_scale: float,
     save_residuals: bool,
 ):
     return mha_reference_no_custom_vjp(
@@ -241,7 +241,7 @@ def _mha_reference(
         segment_ids,
         causal=causal,
         mask_value=mask_value,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         save_residuals=save_residuals,
     )
 
@@ -254,7 +254,7 @@ def _mha_reference_fwd(
     segment_ids: SegmentIds | None,
     causal: bool,
     mask_value: float,
-    sm_scale: float,
+    softmax_scale: float,
     save_residuals: bool,
 ):
     if save_residuals:
@@ -267,7 +267,7 @@ def _mha_reference_fwd(
         segment_ids,
         causal=causal,
         mask_value=mask_value,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         save_residuals=True,
     )
     assert isinstance(res, tuple)
@@ -280,7 +280,7 @@ def _mha_reference_fwd(
     static_argnames=[
         "causal",
         "mask_value",
-        "sm_scale",
+        "softmax_scale",
     ],
 )
 def mha_reference_bwd(
@@ -295,9 +295,9 @@ def mha_reference_bwd(
     do,
     causal: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
-    sm_scale: float = 1.0,
+    softmax_scale: float = 1.0,
 ):
-    if sm_scale != 1.0:
+    if softmax_scale != 1.0:
         raise NotImplementedError
 
     logits = jnp.einsum(
@@ -346,7 +346,7 @@ def mha_reference_bwd(
 def _mha_reference_bwd(
     causal: bool,
     mask_value: float,
-    sm_scale: float,
+    softmax_scale: float,
     save_residuals: bool,
     residuals,
     do,
@@ -365,7 +365,7 @@ def _mha_reference_bwd(
         do,
         causal=causal,
         mask_value=mask_value,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
     )
     return dq, dk, dv, dab, None
 

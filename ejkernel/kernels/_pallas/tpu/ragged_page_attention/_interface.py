@@ -34,7 +34,7 @@ from ._utils import get_tuned_block_sizes
 
 @ejit(
     static_argnames=[
-        "sm_scale",
+        "softmax_scale",
         "mask_value",
         "num_kv_pages_per_block",
         "num_queries_per_block",
@@ -51,7 +51,7 @@ def _ragged_page_attention(
     cu_q_lens: Int[Array, "max_num_seqs_plus_one"],
     num_seqs: jax.Array,
     *,
-    sm_scale: float = 1.0,
+    softmax_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
@@ -70,7 +70,7 @@ def _ragged_page_attention(
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
         context_lens, only the first num_seqs+1 values are valid.
       num_seqs: the dynamic number of sequences.
-      sm_scale: the softmax scale which will be applied to the Q@K^T.
+      softmax_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
       soft_cap: the logit soft cap for the attention.
       mask_value: mask value for causal mask.
@@ -90,7 +90,7 @@ def _ragged_page_attention(
         block_tables,
         cu_q_lens,
         num_seqs,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,
@@ -149,7 +149,7 @@ def _ragged_page_attention(
     kernel = pl.pallas_call(
         functools.partial(
             ragged_page_attention_kernel,
-            sm_scale=sm_scale,
+            softmax_scale=softmax_scale,
             sliding_window=sliding_window,
             soft_cap=soft_cap,
             mask_value=mask_value,
@@ -228,7 +228,7 @@ def ragged_page_attention(
         block_tables=block_tables,
         cu_q_lens=query_start_loc,
         num_seqs=num_seqs,
-        sm_scale=softmax_scale,
+        softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         mask_value=mask_value,

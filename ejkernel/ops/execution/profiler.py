@@ -27,7 +27,6 @@ from typing import Any
 import jax
 import numpy as np
 from jax.profiler import ProfileData
-from tqdm import tqdm
 
 
 class ProfilingError(Exception):
@@ -454,8 +453,7 @@ class Profiler:
         function_timings: dict[int, list[float]] = {}
         name_re = re.compile(r"^jit_autotune_fn_([0-9]+).*")
 
-        pbar = tqdm(range(total_calls_number), desc=f"Profiling {platform}", disable=not self.verbose)
-        for _ in pbar:
+        for _ in range(total_calls_number):
             now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             with tempfile.TemporaryDirectory(prefix=f"tuning_profile_{now}_") as tmpdir:
                 with jax.profiler.trace(tmpdir):

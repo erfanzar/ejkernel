@@ -87,7 +87,7 @@ def _paged_attn_kernel(
     part_idx = tl.program_id(2)
     max_num_partitions = tl.num_programs(2)
 
-    # scale sm_scale by log_2(e) and use
+    # scale softmax_scale by log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
     log2e: tl.constexpr = 1.4426950408889634

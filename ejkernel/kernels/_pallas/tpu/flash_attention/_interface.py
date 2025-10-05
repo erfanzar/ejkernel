@@ -121,7 +121,7 @@ def _flash_attention(
     segment_ids,
     save_residuals,
     causal,
-    sm_scale,
+    softmax_scale,
     block_sizes,
     debug,
 ):
@@ -133,7 +133,7 @@ def _flash_attention(
         segment_ids,
         save_residuals,
         causal,
-        sm_scale,
+        softmax_scale,
         block_sizes.block_b,
         block_sizes.block_q,
         block_sizes.block_k_major,

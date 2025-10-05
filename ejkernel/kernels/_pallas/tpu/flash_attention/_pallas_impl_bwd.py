@@ -52,7 +52,7 @@ def _flash_attention_dkv_kernel(
     dk_scratch_ref,
     dv_scratch_ref,
     *,
-    sm_scale: float,
+    softmax_scale: float,
     causal: bool,
     mask_value: float,
     q_seq_len: int,
@@ -94,8 +94,8 @@ def _flash_attention_dkv_kernel(
                 ].astype(jnp.float32)
                 capped_logits += ab
 
-            if sm_scale != 1.0:
-                capped_logits *= sm_scale
+            if softmax_scale != 1.0:
+                capped_logits *= softmax_scale
 
             mask = None
             if q_segment_ids_tile_ref is not None:
@@ -129,8 +129,8 @@ def _flash_attention_dkv_kernel(
             dp = lax.dot_general(do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
             ds = (dp - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1)) * p
 
-            if sm_scale != 1.0:
-                ds = ds * sm_scale
+            if softmax_scale != 1.0:
+                ds = ds * softmax_scale
 
             # ds: [block_q_major, block_k_major]
             # q: [block_q_major, head_dim]
@@ -169,7 +169,7 @@ def _flash_attention_bwd_dkv(
     block_q: int | None,
     block_k_major: int | None,
     block_k: int | None,
-    sm_scale: float,
+    softmax_scale: float,
     causal: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
     debug: bool = False,
@@ -312,7 +312,7 @@ def _flash_attention_bwd_dkv(
         _flash_attention_dkv_kernel,
         block_q=block_q,  # type: ignore
         block_k=block_k,  # type: ignore
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         causal=causal,
         mask_value=mask_value,
         q_seq_len=q_seq_len,
@@ -359,7 +359,7 @@ def _flash_attention_dq_kernel(
     ds_tile_ref,
     dq_scratch_ref,
     *,
-    sm_scale: float,
+    softmax_scale: float,
     causal: bool,
     mask_value: float,
     kv_seq_len: int,
@@ -391,8 +391,8 @@ def _flash_attention_dq_kernel(
             ab = ab_tile_ref[0, 0, :, pl.dslice(i * block_k, block_k)].astype(jnp.float32)
             capped_logits += ab
 
-        if sm_scale != 1.0:
-            capped_logits *= sm_scale
+        if softmax_scale != 1.0:
+            capped_logits *= softmax_scale
 
         mask = None
         if q_segment_ids_tile_ref is not None:
@@ -429,8 +429,8 @@ def _flash_attention_dq_kernel(
         # dp = jnp.dot(do, v.T)
         # ds = (dp - (dp * p).sum(axis=1)[:, None]) * p
 
-        if sm_scale != 1.0:
-            ds = ds * sm_scale
+        if softmax_scale != 1.0:
+            ds = ds * softmax_scale
 
         if ds_tile_ref is not None:
             ds_tile_ref[0, 0, :, pl.dslice(i * block_k, block_k)] = ds.astype(ds_tile_ref.dtype)
@@ -479,7 +479,7 @@ def _flash_attention_bwd_dq(
     block_q_major: int | None,
     block_k_major: int | None,
     block_k: int | None,
-    sm_scale: float,
+    softmax_scale: float,
     causal: bool,
     mask_value: float,
     debug: bool,
@@ -612,7 +612,7 @@ def _flash_attention_bwd_dq(
 
     kernel = functools.partial(
         _flash_attention_dq_kernel,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         causal=causal,
         mask_value=mask_value,
         block_k=block_k,  # type: ignore
@@ -648,7 +648,7 @@ def _flash_attention_bwd_dq(
 def _flash_attention_bwd(
     save_residuals: bool,
     causal: bool,
-    sm_scale: float,
+    softmax_scale: float,
     block_sizes: BlockSizes,
     debug: bool,
     residuals,
@@ -677,7 +677,7 @@ def _flash_attention_bwd(
         block_k_major=block_sizes.block_k_major_dkv,
         block_k=block_sizes.block_k_dkv,
         block_q=block_sizes.block_q_dkv,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
         debug=debug,
@@ -696,7 +696,7 @@ def _flash_attention_bwd(
         block_q_major=block_sizes.block_q_dq,
         block_k_major=block_sizes.block_k_major_dq,
         block_k=block_sizes.block_k_dq,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
         debug=debug,

@@ -11,6 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .tpu import flash_attention, grouped_matmul, page_attention, ragged_page_attention, ring_attention, splash
+from .tpu import (
+    blocksparse_attention,
+    flash_attention,
+    grouped_matmul,
+    page_attention,
+    ragged_page_attention,
+    ring_attention,
+)
 
-__all__ = ("flash_attention", "grouped_matmul", "page_attention", "ragged_page_attention", "ring_attention", "splash")
+__all__ = (
+    "blocksparse_attention",
+    "flash_attention",
+    "grouped_matmul",
+    "page_attention",
+    "ragged_page_attention",
+    "ring_attention",
+)

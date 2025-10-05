@@ -29,7 +29,15 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-dependencies = ["einops>=0.8.1", "jax>=0.7.2", "jaxlib>=0.7.2", "triton==3.4.0"]
+dependencies = [
+    "chex>=0.1.91",
+    "einops>=0.8.1",
+    "jax>=0.7.2",
+    "jaxlib>=0.7.2",
+    "jaxtyping>=0.3.2",
+    "pydantic>=2.11.10",
+    "triton==3.4.0",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/erfanzar/ejkernel"
