@@ -27,10 +27,7 @@ from ._xla_impl_bwd import _ring_attention_bwd
 from ._xla_impl_fwd import _ring_attention_fwd
 
 
-@partial(
-    jax.custom_vjp,
-    nondiff_argnums=[7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
-)
+@partial(jax.custom_vjp, nondiff_argnums=[7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
 def _ring_attention(
     query: chex.Array,
     key: chex.Array,
@@ -127,10 +124,7 @@ def _ring_attention(
 
 
 _ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)
-_ring_attention = ejit(
-    _ring_attention,
-    static_argnums=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22),
-)
+_ring_attention = ejit(_ring_attention, static_argnums=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22))
 
 
 @kernel_registry.register("ring_attention", Platform.XLA, Backend.ANY)
@@ -160,7 +154,6 @@ def ring_attention(
     logit_soft_cap: float | None = None,
     attention_sink_size: int = 0,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    del cache_idx
     return _ring_attention(
         query,
         key,

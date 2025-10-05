@@ -155,7 +155,7 @@ def _ragged_paged_attn_prefetch_kernel_combined(
 
                 # Apply soft cap if enabled
                 if USE_SOFT_CAP:
-                    # soft_cap * tanh(scores / soft_cap)
+                    # logit_soft_cap * tanh(scores / logit_soft_cap)
                     x = scores / SOFT_CAP
                     x = tl.maximum(tl.minimum(x, 8.0), -8.0)  # clamp for stability
                     exp_2x = tl.exp(2.0 * x)

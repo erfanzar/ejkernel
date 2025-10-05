@@ -27,7 +27,7 @@ def _ragged_page_attention(
     query_start_loc: jnp.ndarray,  # [S+1]
     num_seqs: jnp.ndarray,  # [1] or scalar
     softmax_scale: float,
-    soft_cap: float | None,
+    logit_soft_cap: float | None,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     sliding_window: int | None = None,
     softmax_aux: jnp.ndarray | None = None,
@@ -99,8 +99,8 @@ def _ragged_page_attention(
                         key_block.astype(compute_dtype),
                         optimize=True,
                     )
-                    if soft_cap is not None:
-                        attention_scores_block = jnp.tanh(attention_scores_block / soft_cap) * soft_cap
+                    if logit_soft_cap is not None:
+                        attention_scores_block = jnp.tanh(attention_scores_block / logit_soft_cap) * logit_soft_cap
 
                     causal_mask = jnp.expand_dims(query_token_indices, 1) >= jnp.expand_dims(kv_token_indices, 0)
                     kv_boundary_mask = jnp.expand_dims(kv_token_indices, 0) < kv_cache_len_for_seq
@@ -240,7 +240,7 @@ def _ragged_page_attention_optimized(
     query_start_loc: jnp.ndarray,  # [S+1]
     num_seqs: jnp.ndarray,  # [1] or scalar
     softmax_scale: float,
-    soft_cap: float | None,
+    logit_soft_cap: float | None,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     sliding_window: int | None = None,
     softmax_aux: jnp.ndarray | None = None,
@@ -322,8 +322,8 @@ def _ragged_page_attention_optimized(
                         key_block.astype(compute_dtype),
                         optimize=True,
                     )
-                    if soft_cap is not None:
-                        attention_scores_block = soft_cap * jnp.tanh(attention_scores_block / soft_cap)
+                    if logit_soft_cap is not None:
+                        attention_scores_block = logit_soft_cap * jnp.tanh(attention_scores_block / logit_soft_cap)
 
                     # Fused mask creation and application
                     attention_mask = (query_token_indices[:, None] >= kv_token_indices[None, :]) & (

@@ -40,7 +40,7 @@ from ._utils import get_tuned_block_sizes
         "num_queries_per_block",
         "vmem_limit_bytes",
         "sliding_window",
-        "soft_cap",
+        "logit_soft_cap",
     ]
 )
 def _ragged_page_attention(
@@ -53,7 +53,7 @@ def _ragged_page_attention(
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
@@ -72,7 +72,7 @@ def _ragged_page_attention(
       num_seqs: the dynamic number of sequences.
       softmax_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
-      soft_cap: the logit soft cap for the attention.
+      logit_soft_cap: the logit soft cap for the attention.
       mask_value: mask value for causal mask.
       num_kv_pages_per_block: number of kv pages to be processed in one flash
         attention block in the pallas kernel.
@@ -92,7 +92,7 @@ def _ragged_page_attention(
         num_seqs,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
-        soft_cap=soft_cap,
+        logit_soft_cap=logit_soft_cap,
         mask_value=mask_value,
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
@@ -151,7 +151,7 @@ def _ragged_page_attention(
             ragged_page_attention_kernel,
             softmax_scale=softmax_scale,
             sliding_window=sliding_window,
-            soft_cap=soft_cap,
+            logit_soft_cap=logit_soft_cap,
             mask_value=mask_value,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -182,7 +182,7 @@ def ragged_page_attention(
     num_seqs: Array | int,
     *,
     softmax_scale: float | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
@@ -205,7 +205,7 @@ def ragged_page_attention(
       num_seqs: the dynamic number of sequences.
       softmax_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
-      soft_cap: the logit soft cap for the attention.
+      logit_soft_cap: the logit soft cap for the attention.
       mask_value: mask value for causal mask.
       num_kv_pages_per_block: number of kv pages to be processed in one flash
         attention block in the pallas kernel.
@@ -230,7 +230,7 @@ def ragged_page_attention(
         num_seqs=num_seqs,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
-        soft_cap=soft_cap,
+        logit_soft_cap=logit_soft_cap,
         mask_value=mask_value,
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,

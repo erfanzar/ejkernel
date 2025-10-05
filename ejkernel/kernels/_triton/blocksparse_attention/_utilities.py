@@ -33,13 +33,15 @@ def generate_blocksparse_layout(
     local_blocks: int = 4,
     vert_stride: int = 0,
     homo_head: bool = True,
+    causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
     return_dense: bool = False,
     dtype: jnp.dtype = jnp.bool_,
 ) -> Bool[Array, "num_heads num_blocks_q num_blocks_k"] | Bool[Array, "num_blocks_q num_blocks_k"]:
     """Generate block-sparse attention pattern.
 
     Creates a block-level sparsity mask for attention computation, supporting
-    local attention windows and vertical stride patterns.
+    local attention windows, sliding windows, causal masking, and vertical stride patterns.
 
     Args:
         seq_len: Sequence length (must be divisible by block_size)
@@ -48,6 +50,11 @@ def generate_blocksparse_layout(
         local_blocks: Number of nearest blocks to attend to (local attention window)
         vert_stride: Vertical stride for additional block connections
         homo_head: Whether all heads share the same pattern (homogeneous)
+        causal: Whether to apply causal masking (attend only to past)
+        sliding_window: Sliding window size in tokens. Can be:
+            - int: Symmetric window (same left and right)
+            - tuple[int, int]: Asymmetric (left_window, right_window) in tokens
+            - None: Use local_blocks instead
         return_dense: Return dense mask instead of sparse indices
         dtype: Data type for the mask array
 
@@ -61,18 +68,55 @@ def generate_blocksparse_layout(
     # Create base pattern
     pattern = jnp.zeros((num_blocks, num_blocks), dtype=dtype)
 
-    # Add local attention blocks
-    for i in range(num_blocks):
-        # Causal: only attend to previous and current blocks
-        start = max(0, i - local_blocks + 1)
-        end = min(num_blocks, i + 1)
-        pattern = pattern.at[i, start:end].set(True)
+    # Handle sliding window
+    if sliding_window is not None:
+        if isinstance(sliding_window, int):
+            # Convert token-level window to block-level
+            # Add block_size - 1 to ensure we include partial blocks
+            left_window_blocks = (sliding_window + block_size - 1) // block_size
+            right_window_blocks = (sliding_window + block_size - 1) // block_size
+        else:
+            # Asymmetric window
+            left_window, right_window = sliding_window
+            left_window_blocks = (left_window + block_size - 1) // block_size
+            right_window_blocks = (right_window + block_size - 1) // block_size
+
+        # Apply sliding window pattern
+        for i in range(num_blocks):
+            # Determine window bounds
+            start = max(0, i - left_window_blocks)
+            end = min(num_blocks, i + right_window_blocks + 1)
+
+            # Apply causal constraint if needed
+            if causal:
+                end = min(end, i + 1)
+
+            pattern = pattern.at[i, start:end].set(True)
+    else:
+        # Use local_blocks pattern
+        for i in range(num_blocks):
+            if causal:
+                # Causal: only attend to previous and current blocks
+                start = max(0, i - local_blocks + 1)
+                end = min(num_blocks, i + 1)
+            else:
+                # Non-causal: attend to surrounding blocks
+                start = max(0, i - local_blocks // 2)
+                end = min(num_blocks, i + local_blocks // 2 + 1)
+            pattern = pattern.at[i, start:end].set(True)
 
     # Add vertical stride connections if specified
     if vert_stride > 0:
         for i in range(num_blocks):
-            for j in range(0, i, vert_stride):
-                pattern = pattern.at[i, j].set(True)
+            if causal:
+                # Only add connections to previous positions
+                for j in range(0, i, vert_stride):
+                    pattern = pattern.at[i, j].set(True)
+            else:
+                # Add connections in both directions
+                for j in range(0, num_blocks, vert_stride):
+                    if j != i:  # Don't duplicate diagonal
+                        pattern = pattern.at[i, j].set(True)
 
     # Handle heterogeneous vs homogeneous heads
     if homo_head or num_heads == 1:
@@ -158,6 +202,8 @@ def create_blocksparse_metadata(
     local_blocks: int = 4,
     vert_stride: int = 0,
     homo_head: bool = True,
+    causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
 ) -> dict:
     """Create metadata for blocksparse attention computation.
 
@@ -173,6 +219,8 @@ def create_blocksparse_metadata(
         local_blocks: Number of local attention blocks
         vert_stride: Vertical stride for sparse pattern
         homo_head: Whether heads share the same pattern
+        causal: Whether to apply causal masking
+        sliding_window: Sliding window size (in tokens) or tuple of (left, right)
 
     Returns:
         dict: Metadata containing layout, crow/ccol indices, and config
@@ -190,6 +238,8 @@ def create_blocksparse_metadata(
         local_blocks=local_blocks,
         vert_stride=vert_stride,
         homo_head=homo_head,
+        causal=causal,
+        sliding_window=sliding_window,
     )
 
     # Compute compression indices

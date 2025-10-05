@@ -2482,7 +2482,7 @@ def block_sparse_attention(
     q_segment_ids: Int[Array, "batch seq_len"] | None = None,
     kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
     softmax_aux: Float[Array, "..."] | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     query_chunk_size: int = 128,
     key_chunk_size: int = 128,
     softmax_scale: float | None = None,
@@ -2501,8 +2501,8 @@ def block_sparse_attention(
         q_segment_ids: Query segment ids [batch, seq_len]
         kv_segment_ids: KV segment ids [batch, kv_len]
         softmax_aux: Auxiliary softmax values for custom attention computations
-        soft_cap: Soft capping value for attention logits (like Gemma2).
-            When specified, applies tanh(logits / soft_cap) * soft_cap
+        logit_soft_cap: Soft capping value for attention logits (like Gemma2).
+            When specified, applies tanh(logits / logit_soft_cap) * logit_soft_cap
         query_chunk_size: Block size for queries
         key_chunk_size: Block size for keys
         softmax_scale: Softmax scale factor. If None, uses 1/sqrt(head_dim)
@@ -2580,7 +2580,7 @@ def block_sparse_attention(
                     ),
                     block_sizes=block_sizes,
                 ),
-                attn_logits_soft_cap=soft_cap,
+                attn_logits_soft_cap=logit_soft_cap,
             ),
             in_axes=(0, 0, 0, None, None),
         ),

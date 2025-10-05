@@ -36,7 +36,7 @@ def ragged_page_attention(
     num_seqs: Array | int,
     *,
     softmax_scale: float | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
@@ -67,8 +67,8 @@ def ragged_page_attention(
         mask_value = -2.381976426469702e38
 
     # Set feature flags
-    use_soft_cap = soft_cap is not None
-    soft_cap_value = soft_cap if use_soft_cap else 1.0  # dummy value when not used
+    use_soft_cap = logit_soft_cap is not None
+    soft_cap_value = logit_soft_cap if use_soft_cap else 1.0  # dummy value when not used
 
     use_sliding_window = sliding_window is not None
     sliding_window_size = sliding_window if use_sliding_window else 0  # dummy value when not used

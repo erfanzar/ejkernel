@@ -68,12 +68,33 @@ def _ring_flash_attention_fwd_tpu(
     m = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(q.dtype)
     if attn_bias is not None:
         attn_bias = attn_bias[:, 0, :, :]
-    axis_size = lax.psum(1, axis_name)
+
+    # Process softmax_aux (attention sink logits)
+    if softmax_aux is not None:
+        if softmax_aux.ndim == 1:
+            # [num_sinks] -> [1, num_heads, 1, num_sinks]
+            softmax_aux = softmax_aux.reshape(1, 1, 1, -1)
+            softmax_aux = jnp.broadcast_to(softmax_aux, (batch, num_heads, 1, softmax_aux.shape[-1]))
+        elif softmax_aux.ndim == 2:
+            # [num_heads, num_sinks] -> [batch, num_heads, 1, num_sinks]
+            softmax_aux = softmax_aux.reshape(1, num_heads, 1, -1)
+            softmax_aux = jnp.broadcast_to(softmax_aux, (batch, num_heads, 1, softmax_aux.shape[-1]))
+        else:
+            raise ValueError(f"softmax_aux must be 1D or 2D, got {softmax_aux.ndim}D")
+
+    # Handle single-device case where axis_name is None
+    if axis_name is not None:
+        axis_size = lax.psum(1, axis_name)
+    else:
+        axis_size = 1  # Single device
     q_block_size, kv_block_size = (q_len, kv_len)
 
     if segment_ids is not None:
         if cache_idx is None:
-            q_offset = lax.axis_index(axis_name) * q_len
+            if axis_name is not None:
+                q_offset = lax.axis_index(axis_name) * q_len
+            else:
+                q_offset = 0  # Single device
         else:
             q_offset = cache_idx
         q_segment_ids = lax.dynamic_slice_in_dim(segment_ids, q_offset, q_len, axis=-1)
@@ -96,7 +117,10 @@ def _ring_flash_attention_fwd_tpu(
 
     def scan_kv_block(carry, idx):
         o, lse_, m, k, v = carry
-        pad = (lax.axis_index(axis_name) - idx) % axis_size
+        if axis_name is not None:
+            pad = (lax.axis_index(axis_name) - idx) % axis_size
+        else:
+            pad = 0  # Single device
         if attn_bias is not None:
             attn_bias_slice = lax.dynamic_slice_in_dim(
                 attn_bias,
@@ -117,11 +141,17 @@ def _ring_flash_attention_fwd_tpu(
         else:
             segment_ids_slice = None
         if cache_idx is None:
-            q_block_idx = lax.axis_index(axis_name)
+            if axis_name is not None:
+                q_block_idx = lax.axis_index(axis_name)
+            else:
+                q_block_idx = 0  # Single device
             q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
         else:
             q_chunk_idx_start = cache_idx // query_chunk_size
-        k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
+        if axis_name is not None:
+            k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
+        else:
+            k_block_idx = 0  # Single device
         k_chunk_idx_start = k_block_idx * (kv_block_size // key_chunk_size)
         o, lse_, m = _flash_attention_fwd(
             q,
@@ -132,6 +162,7 @@ def _ring_flash_attention_fwd_tpu(
             k_chunk_idx_start=k_chunk_idx_start,
             ab=attn_bias_slice,
             segment_ids=segment_ids_slice,
+            softmax_aux=softmax_aux,
             save_residuals=False,
             causal_block_size=causal_block_size,
             softmax_scale=scale,
@@ -141,15 +172,17 @@ def _ring_flash_attention_fwd_tpu(
             logit_soft_cap=logit_soft_cap,
             attention_sink_size=attention_sink_size,
         )
-        k, v = map(
-            lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]),
-            (k, v),
-        )
+        if axis_name is not None:
+            k, v = map(
+                lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]),
+                (k, v),
+            )
+        # For single device, k and v remain unchanged
         return (o, lse_, m, k, v), None
 
     (o, lse_, m, _, _), _ = lax.scan(scan_kv_block, init=(o, lse_, m, k, v), xs=jnp.arange(0, axis_size))
     output = rearrange(o.astype(v.dtype), "b h q d -> b q h d")
-    return output, (o, q, k, v, attn_bias, segment_ids, cache_idx, lse_, m)
+    return output, (o, q, k, v, attn_bias, segment_ids, softmax_aux, cache_idx, lse_, m)
 
 
 def _flash_attention(
@@ -161,6 +194,7 @@ def _flash_attention(
     k_chunk_idx_start,
     ab,
     segment_ids,
+    softmax_aux,
     save_residuals,
     causal_block_size,
     softmax_scale,
@@ -179,6 +213,7 @@ def _flash_attention(
         k_chunk_idx_start,
         ab,
         segment_ids,
+        softmax_aux,
         save_residuals,
         causal_block_size,
         softmax_scale,
@@ -202,6 +237,7 @@ def _flash_attention_fwd(
     k_chunk_idx_start,
     ab,
     segment_ids,
+    softmax_aux,
     save_residuals,
     causal_block_size,
     softmax_scale,
@@ -222,6 +258,7 @@ def _flash_attention_fwd(
         k_chunk_idx_start,
         ab,
         segment_ids,
+        softmax_aux,
         True,
         causal_block_size,
         softmax_scale,
@@ -246,6 +283,7 @@ def _flash_attention_kernel(
     ab_tile_ref,
     q_segment_ids_tile_ref,
     kv_segment_ids_tile_ref,
+    softmax_aux_tile_ref,
     o_tile_ref,
     m_scratch_ref,
     l_scratch_ref,
@@ -281,6 +319,7 @@ def _flash_attention_kernel(
             ab_tile_ref,
             q_segment_ids_tile_ref,
             kv_segment_ids_tile_ref,
+            softmax_aux_tile_ref,
             o_tile_ref,
             m_scratch_ref,
             l_scratch_ref,
@@ -312,6 +351,7 @@ def _flash_attention_kernel_single_batch(
     ab_tile_ref,
     q_segment_ids_tile_ref,
     kv_segment_ids_tile_ref,
+    softmax_aux_tile_ref,
     o_tile_ref,
     m_scratch_ref,
     l_scratch_ref,
@@ -370,10 +410,7 @@ def _flash_attention_kernel_single_batch(
             l_prev = l_scratch_ref[batch_idx]
             q = q_tile_ref[batch_idx]  # [block_q, head_dim]
             start_k = i * block_k
-            k = pl.load(
-                k_tile_ref,
-                (*batch_idx, pl.dslice(start_k, block_k), slice(None)),
-            )
+            k = k_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
 
             s = jax.lax.dot_general(
                 q,
@@ -384,10 +421,9 @@ def _flash_attention_kernel_single_batch(
 
             # Add attention bias if needed.
             if ab_tile_ref is not None:
-                ab = pl.load(
-                    ab_tile_ref,
-                    (batch_idx[0], pl.dslice(0, block_q), pl.dslice(start_k, block_k)),
-                ).astype(s.dtype)
+                ab = ab_tile_ref[
+                    (batch_idx[0], pl.dslice(0, block_q), pl.dslice(start_k, block_k))
+                ].astype(s.dtype)
                 s += ab
 
             if softmax_scale != 1.0:
@@ -409,10 +445,9 @@ def _flash_attention_kernel_single_batch(
                     repeats,
                     axis=1,
                 )
-                kv_segment_ids = pl.load(
-                    kv_segment_ids_tile_ref,
-                    (batch_idx[0], pl.dslice(1), pl.dslice(start_k, block_k)),
-                )
+                kv_segment_ids = kv_segment_ids_tile_ref[
+                    (batch_idx[0], pl.dslice(1), pl.dslice(start_k, block_k))
+                ]
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal_block_size is not None:
@@ -452,19 +487,51 @@ def _flash_attention_kernel_single_batch(
 
             s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
 
-            m_curr = jnp.max(s, axis=1)[:, None]  # Row max, shape [block_q, 1].
-            m_next = jnp.maximum(m_prev, m_curr)  # Shape [block_q, 128].
+            # Handle softmax_aux (attention sink logits)
+            if softmax_aux_tile_ref is not None:
+                # softmax_aux is already preprocessed to [batch, num_heads, 1, num_sinks]
+                # Load the softmax_aux for the current batch and broadcast to query length
+                aux_logits = softmax_aux_tile_ref[(*batch_idx[:2], 0, slice(None))]
+                num_sinks = aux_logits.shape[-1]
+                aux_logits = jnp.broadcast_to(aux_logits, (block_q, num_sinks))
 
-            block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
-            if rem:
-                raise NotImplementedError(f"{block_k=} should be a multiple of {MIN_BLOCK_SIZE}")
-            p = jnp.exp(s - pltpu.repeat(m_next, block_k_repeats, 1))
+                # Concatenate sink logits with attention scores
+                s_combined = jnp.concatenate([s, aux_logits], axis=-1)
 
-            alpha = jnp.exp(m_prev - m_next)  # Shape [block_q, 128].
+                # Compute max over combined scores
+                m_curr = jnp.max(s_combined, axis=1)[:, None]  # Row max, shape [block_q, 1].
+                m_next = jnp.maximum(m_prev, m_curr)  # Shape [block_q, 128].
 
-            l_corr = alpha * l_prev
+                # Compute exponentials for combined scores
+                block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
+                if rem:
+                    raise NotImplementedError(f"{block_k=} should be a multiple of {MIN_BLOCK_SIZE}")
 
-            l_next = jnp.sum(p, axis=1)[:, None] + l_corr  # Shape [block_q, 128]
+                # Compute exp for attention scores
+                p = jnp.exp(s - pltpu.repeat(m_next, block_k_repeats, 1))
+
+                # Compute exp for sink logits
+                aux_exp = jnp.exp(aux_logits - m_next[:, :num_sinks])
+
+                alpha = jnp.exp(m_prev - m_next)  # Shape [block_q, 128].
+                l_corr = alpha * l_prev
+
+                # Sum includes both attention scores and sink logits
+                l_next = jnp.sum(p, axis=1)[:, None] + jnp.sum(aux_exp, axis=1)[:, None] + l_corr  # Shape [block_q, 128]
+            else:
+                m_curr = jnp.max(s, axis=1)[:, None]  # Row max, shape [block_q, 1].
+                m_next = jnp.maximum(m_prev, m_curr)  # Shape [block_q, 128].
+
+                block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
+                if rem:
+                    raise NotImplementedError(f"{block_k=} should be a multiple of {MIN_BLOCK_SIZE}")
+                p = jnp.exp(s - pltpu.repeat(m_next, block_k_repeats, 1))
+
+                alpha = jnp.exp(m_prev - m_next)  # Shape [block_q, 128].
+
+                l_corr = alpha * l_prev
+
+                l_next = jnp.sum(p, axis=1)[:, None] + l_corr  # Shape [block_q, 128]
 
             head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
             l_broadcast = lambda lse_: pltpu.repeat(lse_, head_dim_repeats, 1)  # noqa:E731
@@ -478,7 +545,7 @@ def _flash_attention_kernel_single_batch(
 
             l_next_inv_safe = jnp.where(l_next == 0.0, 1.0, 1.0 / l_next)
             acc_scratch_ref[batch_idx] *= l_broadcast(l_corr * l_next_inv_safe)
-            v = pl.load(v_tile_ref, (*batch_idx, pl.dslice(start_k, block_k), slice(None)))
+            v = v_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
             o_curr = jax.lax.dot(p.astype(v.dtype), v, preferred_element_type=jnp.float32)
             acc_scratch_ref[batch_idx] += o_curr * l_broadcast(l_next_inv_safe)
 
@@ -500,6 +567,7 @@ def _flash_attention_impl(
     k_chunk_idx_start,
     ab,
     segment_ids,
+    softmax_aux,
     save_residuals,
     causal_block_size,
     softmax_scale,
@@ -523,10 +591,8 @@ def _flash_attention_impl(
         lambda x: jnp.broadcast_to(x[..., None], (*x.shape, MIN_BLOCK_SIZE)),
         (l_prev, m_prev),
     )
-    q_chunk_idx_start, k_chunk_idx_start = (
-        q_chunk_idx_start[None],
-        k_chunk_idx_start[None],
-    )
+    q_chunk_idx_start = jnp.array([q_chunk_idx_start])
+    k_chunk_idx_start = jnp.array([k_chunk_idx_start])
     _verify_block("block_q", "q_seq_len", block_q, q_seq_len, should_divide=False)
     _verify_block("block_k_major", "kv_seq_len", block_k_major, kv_seq_len)
     _verify_block("block_k", "kv_seq_len", block_k, kv_seq_len)
@@ -628,6 +694,20 @@ def _flash_attention_impl(
 
     ab_block_spec = PatchBlockSpec(ab_index_map, (block_b, block_q, block_k_major)) if ab is not None else None
 
+    # Add softmax_aux spec
+    def softmax_aux_index_map(batch_index, head_index, q_seq_index, _, q_idx_ref, k_idx_ref):
+        return (batch_index, head_index, 0, 0)
+
+    softmax_aux_spec = None
+    if softmax_aux is not None:
+        # Ensure softmax_aux has correct shape for indexing
+        if softmax_aux.ndim == 4:
+            # Already in the right shape [batch, num_heads, 1, num_sinks]
+            pass
+        else:
+            raise ValueError("softmax_aux should be preprocessed to 4D")
+        softmax_aux_spec = PatchBlockSpec(softmax_aux_index_map, (block_b, 1, 1, softmax_aux.shape[-1]))
+
     q_segment_ids_spec = kv_segment_ids_spec = None
     q_segment_ids = kv_segment_ids = None
     if segment_ids is not None:
@@ -690,28 +770,15 @@ def _flash_attention_impl(
         ab_block_spec,
         q_segment_ids_spec,
         kv_segment_ids_spec,
+        softmax_aux_spec,
     ]
 
     o, *aux = pl.pallas_call(
         kernel,
         out_shape=out_shape,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            grid=grid,
-        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2, in_specs=in_specs, out_specs=out_specs, grid=grid),
         debug=debug,
-        compiler_params=dict(
-            mosaic=dict(
-                dimension_semantics=(
-                    "parallel",
-                    "parallel",
-                    "parallel",
-                    "arbitrary",
-                )
-            )
-        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")),
     )(
         q_chunk_idx_start,
         k_chunk_idx_start,
@@ -724,6 +791,7 @@ def _flash_attention_impl(
         ab,
         q_segment_ids,
         kv_segment_ids,
+        softmax_aux,
     )
     if save_residuals:
         lse_, m = (v[..., 0] for v in aux[-2:])

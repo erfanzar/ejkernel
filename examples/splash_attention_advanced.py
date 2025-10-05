@@ -45,7 +45,7 @@ output_with_cap = block_sparse_attention(
     query=query,
     key=key_array,
     value=value,
-    soft_cap=50.0,  # Apply tanh(logits/50) * 50
+    logit_soft_cap=50.0,  # Apply tanh(logits/50) * 50
     causal=True,
 )
 print(f"Output shape with soft cap: {output_with_cap.shape}")
@@ -122,7 +122,7 @@ output_cap_sliding = block_sparse_attention(
     query=query,
     key=key_array,
     value=value,
-    soft_cap=30.0,  # Lower cap for stronger effect
+    logit_soft_cap=30.0,  # Lower cap for stronger effect
     sliding_window=256,  # Local attention window
     causal=True,
 )
@@ -138,7 +138,7 @@ output_cap_chunked = block_sparse_attention(
     query=query,
     key=key_array,
     value=value,
-    soft_cap=40.0,
+    logit_soft_cap=40.0,
     chunk_size=128,  # Chunked causal attention
 )
 print(f"Output shape: {output_cap_chunked.shape}")
@@ -153,7 +153,7 @@ output_all_features = block_sparse_attention(
     query=query,
     key=key_array,
     value=value,
-    soft_cap=35.0,  # Soft capping
+    logit_soft_cap=35.0,  # Soft capping
     softmax_scale=0.15,  # Custom scale
     softmax_aux=softmax_aux,  # Auxiliary values
     sliding_window=(128, 64),  # Asymmetric window
@@ -177,7 +177,7 @@ for cap_value in soft_cap_values:
         query=query[:, :, :256, :],  # Smaller sequence for quick testing
         key=key_array[:, :, :256, :],
         value=value[:, :, :256, :],
-        soft_cap=cap_value,
+        logit_soft_cap=cap_value,
         causal=True,
     )
     outputs.append(output)
@@ -198,13 +198,13 @@ print("-" * 50)
 
 configs = [
     {"name": "Baseline", "params": {}},
-    {"name": "With soft cap", "params": {"soft_cap": 50.0}},
+    {"name": "With soft cap", "params": {"logit_soft_cap": 50.0}},
     {"name": "Custom scale", "params": {"softmax_scale": 0.2}},
     {"name": "Sliding window", "params": {"sliding_window": 256}},
     {
         "name": "All optimizations",
         "params": {
-            "soft_cap": 50.0,
+            "logit_soft_cap": 50.0,
             "softmax_scale": 0.15,
             "sliding_window": 256,
             "query_chunk_size": 256,

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+import jax
+from jax import numpy as jnp
 from jaxtyping import Array, Float
 
 from ejkernel.kernels._registry import kernel_registry
@@ -44,9 +46,9 @@ class RingAttention(Kernel[KernelConfig, Array]):
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-        q_segment_ids: Array | None = None,
-        kv_segment_ids: Array | None = None,
-        softmax_aux: Array | None = None,
+        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         cache_idx=None,
         axis_name: str | None = None,
         float32_logits: bool = True,
@@ -55,11 +57,11 @@ class RingAttention(Kernel[KernelConfig, Array]):
         key_chunk_size: int = 512,
         causal_block_size: int | None = None,
         deterministic: bool = True,
-        dropout_rng=None,
+        dropout_rng: chex.PRNGKey = None,
         pdrop: float = 0.0,
-        dtype=None,
-        policy=None,
-        precision=None,
+        dtype: jnp.dtype = jnp.float32,
+        policy=jax.checkpoint_policies.nothing_saveable,
+        precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         prevent_cse: bool = True,
         sliding_window: int | tuple[int, int] | None = None,
         logit_soft_cap: float | None = None,
@@ -151,9 +153,9 @@ def ring_attention(
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-    q_segment_ids: Array | None = None,
-    kv_segment_ids: Array | None = None,
-    softmax_aux: Array | None = None,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     cache_idx=None,
     axis_name: str | None = None,
     float32_logits: bool = True,
@@ -162,11 +164,11 @@ def ring_attention(
     key_chunk_size: int = 512,
     causal_block_size: int | None = None,
     deterministic: bool = True,
-    dropout_rng=None,
+    dropout_rng: chex.PRNGKey = None,
     pdrop: float = 0.0,
-    dtype=None,
-    policy=None,
-    precision=None,
+    dtype: jnp.dtype = jnp.float32,
+    policy=jax.checkpoint_policies.nothing_saveable,
+    precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     prevent_cse: bool = True,
     sliding_window: int | tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,

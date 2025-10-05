@@ -416,7 +416,7 @@ class TestSoftCapAndScale:
             query=query,
             key=key_array,
             value=value,
-            soft_cap=None,
+            logit_soft_cap=None,
             causal=True,
         )
 
@@ -425,7 +425,7 @@ class TestSoftCapAndScale:
             query=query,
             key=key_array,
             value=value,
-            soft_cap=50.0,
+            logit_soft_cap=50.0,
             causal=True,
         )
 
@@ -535,7 +535,7 @@ class TestSoftCapAndScale:
             query=query,
             key=key_array,
             value=value,
-            soft_cap=30.0,
+            logit_soft_cap=30.0,
             softmax_scale=0.2,
             sliding_window=256,
             causal=True,

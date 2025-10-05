@@ -38,6 +38,8 @@ from functools import partial
 
 import chex
 import jax
+import jaxtyping
+from beartype import beartype
 from jax import Array, lax
 from jax import numpy as jnp
 from jaxtyping import Float, Int
@@ -50,7 +52,7 @@ from ._utils import SegmentIds
 
 @partial(
     jax.custom_vjp,
-    nondiff_argnums=(6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18),
+    nondiff_argnums=(4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18),
 )
 def _ring_attention(
     query: Array,
@@ -104,6 +106,7 @@ _ring_attention.defvjp(_ring_flash_attention_fwd_tpu, _ring_flash_attention_bwd_
 
 
 @kernel_registry.register("ring_attention", Platform.PALLAS, Backend.TPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def ring_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],

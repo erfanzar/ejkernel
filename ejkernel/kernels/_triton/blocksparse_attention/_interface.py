@@ -25,7 +25,7 @@ from ejkernel.callib import ejit
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_bwd import _bwd_attention_kernel_call
 from ._triton_impl_fwd import _fwd_attention_kernel_call
-from ._utilities import compute_ccol_indices, compute_crow_indices, create_blocksparse_metadata
+from ._utilities import compute_crow_indices
 
 
 def _jax_fwd_blocksparse_attention_call(
@@ -113,7 +113,7 @@ def _jax_bwd_blocksparse_attention_call(
         tuple: Gradients (dq, dk, dv, d_crow_ptr, d_col_indices)
                where only dq, dk, dv are non-None for differentiable parameters
     """
-    query, key, value, out, lse, crow_ptr, col_indices, saved_block_m, saved_block_n = residual
+    query, key, value, out, lse, crow_ptr, col_indices, _saved_block_m, _saved_block_n = residual
 
     # For backward pass, we need CSC format (transpose of sparse pattern)
     # For simplicity, we'll use the same indices but swap their roles
@@ -267,6 +267,7 @@ def blocksparse_attention(
     layout: Bool[Array, "num_heads num_blocks_q num_blocks_k"] | Bool[Array, "num_blocks_q num_blocks_k"] | None = None,
     softmax_scale: float | None = None,
     causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
     block_m: int = 64,
     block_n: int = 64,
     local_blocks: int = 4,
@@ -288,12 +289,17 @@ def blocksparse_attention(
         key: Key tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
         value: Value tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
         layout: Optional pre-computed block sparse layout. If None, generates
-                a pattern using local_blocks and vert_stride parameters
+                a pattern using sliding_window, local_blocks and vert_stride parameters
         softmax_scale: Scaling factor for QK^T (default: 1/sqrt(head_dim))
         causal: Whether to apply causal masking for autoregressive models
+        sliding_window: Sliding window size in tokens. Can be:
+                - int: Symmetric window (same left and right)
+                - tuple[int, int]: Asymmetric (left_window, right_window) in tokens
+                - None: Use local_blocks instead
         block_m: Block size for query dimension (must divide seq_len_q)
         block_n: Block size for key dimension (must divide seq_len_k)
         local_blocks: Number of local blocks to attend to when auto-generating layout
+                     (ignored if sliding_window is provided)
         vert_stride: Vertical stride for sparse connections when auto-generating layout
         homo_head: Whether all heads share the same sparsity pattern
         precision: JAX precision setting (ignored in Triton implementation)
@@ -304,6 +310,13 @@ def blocksparse_attention(
         Attention output with shape [batch, seq_len_q, num_heads, head_dim]
 
     Examples:
+        >>> # Blocksparse attention with sliding window
+        >>> out = blocksparse_attention(query, key, value, sliding_window=256)
+        >>>
+        >>> # Causal blocksparse with asymmetric sliding window
+        >>> out = blocksparse_attention(query, key, value, causal=True,
+        ...                            sliding_window=(128, 64))
+        >>>
         >>> # Standard blocksparse attention with auto-generated pattern
         >>> out = blocksparse_attention(query, key, value, local_blocks=4)
         >>>
@@ -317,8 +330,8 @@ def blocksparse_attention(
     """
     del precision, logits_dtype, debug  # Unused in Triton implementation
 
-    batch, seq_len_q, num_heads, head_dim = query.shape
-    _, seq_len_k, num_kv_heads, _ = key.shape
+    _batch, seq_len_q, num_heads, _head_dim = query.shape
+    _, seq_len_k, _num_kv_heads, _ = key.shape
 
     # Generate layout if not provided
     if layout is None:
@@ -335,6 +348,8 @@ def blocksparse_attention(
             local_blocks=local_blocks,
             vert_stride=vert_stride,
             homo_head=homo_head,
+            causal=causal,
+            sliding_window=sliding_window,
         )
 
     return blocksparse_attention_call(

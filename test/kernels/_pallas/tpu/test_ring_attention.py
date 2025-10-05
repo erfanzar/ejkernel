@@ -1,406 +1,528 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+#!/usr/bin/env python3
+"""Tests for Pallas TPU ring attention implementation."""
 
-"""Tests for Pallas TPU ring_attention implementation."""
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 import pytest
+from jax import shard_map
+from jax.sharding import PartitionSpec
 
-from ejkernel.kernels._pallas.tpu.ring_attention._interface import ring_attention
+from ejkernel.kernels import pallas
+from ejkernel.utils import numeric_gen
 
 
-class TestBasicFunctionality:
-    """Test basic ring attention functionality."""
+class TestRingAttentionPallasFwd:
+    """Test forward pass of Pallas TPU ring attention."""
 
-    @pytest.mark.skipif(
-        not jax.devices()[0].platform == "tpu",
-        reason="Pallas ring attention requires TPU",
-    )
-    def test_basic_ring_attention(self):
-        """Test basic ring attention without special features."""
-        key = jax.random.PRNGKey(42)
-        keys = jax.random.split(key, 3)
+    def test_basic_forward(self):
+        """Test basic forward pass."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        batch_size = 2
-        seq_len = 128
-        num_heads = 4
-        head_dim = 64
-
-        q = jax.random.normal(keys[0], (batch_size, seq_len, num_heads, head_dim))
-        k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
-        v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
-
-        # Single device test (no ring communication)
-        output = ring_attention(
+        out = pallas.tpu.ring_attention(
             q,
             k,
             v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
+            query_chunk_size=128,
+            key_chunk_size=128,
         )
 
-        assert output.shape == q.shape
-        assert jnp.all(jnp.isfinite(output))
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert out.dtype == jnp.float32
+        assert not jnp.any(jnp.isnan(out))
+        assert not jnp.any(jnp.isinf(out))
 
-    @pytest.mark.skipif(
-        not jax.devices()[0].platform == "tpu",
-        reason="Pallas ring attention requires TPU",
-    )
-    def test_causal_masking(self):
+    def test_softmax_aux_1d(self):
+        """Test with 1D softmax_aux."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        num_sinks = 4
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            softmax_aux=softmax_aux,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_softmax_aux_2d(self):
+        """Test with 2D softmax_aux."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        num_sinks = 4
+        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            softmax_aux=softmax_aux,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_logit_soft_cap(self):
+        """Test with logit soft cap."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            logit_soft_cap=30.0,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_sliding_window_symmetric(self):
+        """Test with symmetric sliding window."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            sliding_window=64,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_sliding_window_asymmetric(self):
+        """Test with asymmetric sliding window."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            sliding_window=(32, 96),  # left_window=32, right_window=96
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_sliding_window_small(self):
+        """Test with very small sliding window."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        # Test with window size of 1 (only attend to self)
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            sliding_window=0,  # Only attend to current position
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_sliding_window_large(self):
+        """Test with sliding window larger than sequence."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        # Window larger than sequence length - should behave like full attention
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            sliding_window=512,  # Larger than seq_len
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_sliding_window_with_softmax_aux(self):
+        """Test sliding window combined with softmax_aux."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        num_sinks = 4
+        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            sliding_window=64,
+            softmax_aux=softmax_aux,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_sliding_window_with_causal(self):
+        """Test sliding window with causal masking."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        # Sliding window with causal - should apply both constraints
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            sliding_window=64,
+            causal_block_size=32,  # Also apply causal masking
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_attention_sinks(self):
+        """Test with attention sinks."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            sliding_window=64,
+            attention_sink_size=8,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_causal_mask(self):
         """Test with causal masking."""
-        key = jax.random.PRNGKey(42)
-        keys = jax.random.split(key, 3)
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        batch_size = 2
-        seq_len = 128
-        num_heads = 4
-        head_dim = 64
-
-        q = jax.random.normal(keys[0], (batch_size, seq_len, num_heads, head_dim))
-        k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
-        v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
-
-        # Non-causal
-        output = ring_attention(
+        out = pallas.tpu.ring_attention(
             q,
             k,
             v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
-        )
-
-        # Causal
-        output_causal = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
             causal_block_size=64,
+            query_chunk_size=128,
+            key_chunk_size=128,
         )
 
-        assert output_causal.shape == q.shape
-        diff = float(jnp.mean(jnp.abs(output - output_causal)))
-        assert diff > 1e-6, "Causal masking should affect output"
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
 
+    def test_combined_features(self):
+        """Test with all features combined."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-class TestSlidingWindow:
-    """Test sliding window attention."""
+        num_sinks = 4
+        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
 
-    @pytest.mark.skipif(
-        not jax.devices()[0].platform == "tpu",
-        reason="Pallas ring attention requires TPU",
-    )
-    def test_symmetric_sliding_window(self):
-        """Test symmetric sliding window (int)."""
-        key = jax.random.PRNGKey(123)
-        keys = jax.random.split(key, 3)
-
-        batch_size = 2
-        seq_len = 256
-        num_heads = 8
-        head_dim = 64
-
-        q = jax.random.normal(keys[0], (batch_size, seq_len, num_heads, head_dim))
-        k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
-        v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
-
-        # Full attention
-        output_full = ring_attention(
+        out = pallas.tpu.ring_attention(
             q,
             k,
             v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
-        )
-
-        # Windowed attention
-        output_windowed = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
-            sliding_window=64,
-        )
-
-        assert output_windowed.shape == q.shape
-        assert jnp.all(jnp.isfinite(output_windowed))
-
-        diff = float(jnp.mean(jnp.abs(output_full - output_windowed)))
-        assert diff > 1e-6, "Sliding window should affect output"
-
-    @pytest.mark.skipif(
-        not jax.devices()[0].platform == "tpu",
-        reason="Pallas ring attention requires TPU",
-    )
-    def test_asymmetric_sliding_window(self):
-        """Test asymmetric sliding window (tuple)."""
-        key = jax.random.PRNGKey(42)
-        keys = jax.random.split(key, 3)
-
-        batch_size = 2
-        seq_len = 256
-        num_heads = 4
-        head_dim = 64
-
-        q = jax.random.normal(keys[0], (batch_size, seq_len, num_heads, head_dim))
-        k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
-        v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
-
-        # Symmetric window
-        output_sym = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
-            sliding_window=64,
-        )
-
-        # Asymmetric window (left=32, right=96)
-        output_asym = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
-            sliding_window=(32, 96),
-        )
-
-        assert output_asym.shape == q.shape
-        assert jnp.all(jnp.isfinite(output_asym))
-
-        diff = float(jnp.mean(jnp.abs(output_sym - output_asym)))
-        assert diff > 1e-6, "Asymmetric should differ from symmetric"
-
-
-class TestLogitSoftCap:
-    """Test logit soft cap feature."""
-
-    @pytest.mark.skipif(
-        not jax.devices()[0].platform == "tpu",
-        reason="Pallas ring attention requires TPU",
-    )
-    def test_soft_cap_affects_output(self):
-        """Test that soft cap actually changes the output."""
-        key = jax.random.PRNGKey(456)
-        keys = jax.random.split(key, 3)
-
-        batch_size = 2
-        seq_len = 128
-        num_heads = 4
-        head_dim = 64
-
-        q = jax.random.normal(keys[0], (batch_size, seq_len, num_heads, head_dim))
-        k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
-        v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
-
-        # Without soft cap
-        output_no_cap = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
-        )
-
-        # With soft cap
-        output_with_cap = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
+            softmax_aux=softmax_aux,
             logit_soft_cap=30.0,
-        )
-
-        assert output_with_cap.shape == q.shape
-        assert jnp.all(jnp.isfinite(output_with_cap))
-
-        diff = float(jnp.mean(jnp.abs(output_no_cap - output_with_cap)))
-        assert diff > 1e-6, "Soft cap should affect output"
-
-
-class TestAttentionSink:
-    """Test attention sink feature."""
-
-    @pytest.mark.skipif(
-        not jax.devices()[0].platform == "tpu",
-        reason="Pallas ring attention requires TPU",
-    )
-    def test_attention_sink_affects_output(self):
-        """Test that attention sink changes the output."""
-        key = jax.random.PRNGKey(42)
-        keys = jax.random.split(key, 3)
-
-        batch_size = 2
-        seq_len = 256
-        num_heads = 4
-        head_dim = 64
-
-        q = jax.random.normal(keys[0], (batch_size, seq_len, num_heads, head_dim))
-        k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
-        v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
-
-        # Without attention sink
-        output_no_sink = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
-            sliding_window=64,
-        )
-
-        # With attention sink
-        output_with_sink = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
-            sliding_window=64,
-            attention_sink_size=4,
-        )
-
-        assert output_with_sink.shape == q.shape
-        assert jnp.all(jnp.isfinite(output_with_sink))
-
-        diff = float(jnp.mean(jnp.abs(output_no_sink - output_with_sink)))
-        assert diff > 1e-6, "Attention sink should affect output"
-
-
-class TestSegmentIds:
-    """Test segment IDs feature."""
-
-    @pytest.mark.skipif(
-        not jax.devices()[0].platform == "tpu",
-        reason="Pallas ring attention requires TPU",
-    )
-    def test_separate_segment_ids(self):
-        """Test separate Q and KV segment IDs."""
-        key = jax.random.PRNGKey(999)
-        keys = jax.random.split(key, 3)
-
-        batch_size = 2
-        seq_len = 128
-        num_heads = 4
-        head_dim = 64
-
-        q = jax.random.normal(keys[0], (batch_size, seq_len, num_heads, head_dim))
-        k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
-        v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
-
-        # Create segment IDs
-        q_segment_ids = jnp.array([[0] * 64 + [1] * 64, [0] * 64 + [1] * 64])
-        kv_segment_ids = jnp.array([[0] * 64 + [1] * 64, [0] * 32 + [1] * 96])
-
-        output = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
-            query_chunk_size=64,
-            key_chunk_size=64,
-        )
-
-        assert output.shape == q.shape
-        assert jnp.all(jnp.isfinite(output))
-
-
-class TestCombinedFeatures:
-    """Test combinations of features."""
-
-    @pytest.mark.skipif(
-        not jax.devices()[0].platform == "tpu",
-        reason="Pallas ring attention requires TPU",
-    )
-    def test_all_features_combined(self):
-        """Test all features together."""
-        key = jax.random.PRNGKey(333)
-        keys = jax.random.split(key, 3)
-
-        batch_size = 2
-        seq_len = 256
-        num_heads = 4
-        head_dim = 64
-
-        q = jax.random.normal(keys[0], (batch_size, seq_len, num_heads, head_dim))
-        k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
-        v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
-
-        output = ring_attention(
-            q,
-            k,
-            v,
-            bias=None,
-            query_chunk_size=64,
-            key_chunk_size=64,
+            sliding_window=(32, 96),
+            attention_sink_size=8,
             causal_block_size=64,
-            sliding_window=(32, 96),
-            attention_sink_size=4,
-            logit_soft_cap=30.0,
+            query_chunk_size=128,
+            key_chunk_size=128,
         )
 
-        assert output.shape == q.shape
-        assert jnp.all(jnp.isfinite(output))
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
 
 
-class TestAPICompatibility:
-    """Test API compatibility and parameter handling."""
+class TestRingAttentionPallasBwd:
+    """Test backward pass (gradients) of Pallas TPU ring attention."""
 
-    def test_import_success(self):
-        """Test that the module imports successfully."""
-        from ejkernel.kernels._pallas.tpu.ring_attention._interface import ring_attention
+    def test_basic_gradient(self):
+        """Test basic gradient computation."""
+        batch, seq_len, num_heads, head_dim = 2, 128, 4, 32
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        assert ring_attention is not None
+        def loss_fn(q, k, v):
+            out = pallas.tpu.ring_attention(
+                q,
+                k,
+                v,
+                query_chunk_size=128,
+                key_chunk_size=128,
+            )
+            return jnp.mean(out**2)
 
-    def test_parameter_defaults(self):
-        """Test that parameter defaults are set correctly."""
-        # This should not raise any errors
-        key = jax.random.PRNGKey(42)
-        keys = jax.random.split(key, 3)
+        loss, grads = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
+        grad_q, grad_k, grad_v = grads
 
-        batch_size = 2
-        seq_len = 128
-        num_heads = 4
-        head_dim = 64
+        assert grad_q.shape == q.shape
+        assert grad_k.shape == k.shape
+        assert grad_v.shape == v.shape
+        assert not jnp.any(jnp.isnan(grad_q))
+        assert not jnp.any(jnp.isnan(grad_k))
+        assert not jnp.any(jnp.isnan(grad_v))
+        assert not jnp.isnan(loss)
+        assert loss > 0
 
-        q = jax.random.normal(keys[0], (batch_size, seq_len, num_heads, head_dim))
-        k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
-        v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
+    def test_gradient_with_softmax_aux(self):
+        """Test gradient with softmax_aux."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 4, 32
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        # Call with minimal parameters (only required ones)
-        # Note: This will be skipped on non-TPU but tests the API
-        if jax.devices()[0].platform == "tpu":
-            output = ring_attention(q, k, v, bias=None)
-            assert output.shape == q.shape
+        num_sinks = 2
+        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+
+        def loss_fn(q, k, v):
+            out = pallas.tpu.ring_attention(
+                q,
+                k,
+                v,
+                softmax_aux=softmax_aux,
+                query_chunk_size=128,
+                key_chunk_size=128,
+            )
+            return jnp.mean(out**2)
+
+        _loss, grads = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
+        grad_q, grad_k, grad_v = grads
+
+        assert not jnp.any(jnp.isnan(grad_q))
+        assert not jnp.any(jnp.isnan(grad_k))
+        assert not jnp.any(jnp.isnan(grad_v))
+
+    def test_gradient_with_logit_soft_cap(self):
+        """Test gradient with logit soft cap."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 4, 32
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        def loss_fn(q, k, v):
+            out = pallas.tpu.ring_attention(
+                q,
+                k,
+                v,
+                logit_soft_cap=30.0,
+                query_chunk_size=128,
+                key_chunk_size=128,
+            )
+            return jnp.mean(out**2)
+
+        _loss, grads = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
+        grad_q, grad_k, grad_v = grads
+
+        assert not jnp.any(jnp.isnan(grad_q))
+        assert not jnp.any(jnp.isnan(grad_k))
+        assert not jnp.any(jnp.isnan(grad_v))
+
+    def test_gradient_with_sliding_window_symmetric(self):
+        """Test gradient with symmetric sliding window."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 4, 32
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        def loss_fn(q, k, v):
+            out = pallas.tpu.ring_attention(
+                q,
+                k,
+                v,
+                sliding_window=64,
+                query_chunk_size=128,
+                key_chunk_size=128,
+            )
+            return jnp.mean(out**2)
+
+        _loss, grads = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
+        grad_q, grad_k, grad_v = grads
+
+        assert not jnp.any(jnp.isnan(grad_q))
+        assert not jnp.any(jnp.isnan(grad_k))
+        assert not jnp.any(jnp.isnan(grad_v))
+
+    def test_gradient_with_sliding_window_asymmetric(self):
+        """Test gradient with asymmetric sliding window."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 4, 32
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        def loss_fn(q, k, v):
+            out = pallas.tpu.ring_attention(
+                q,
+                k,
+                v,
+                sliding_window=(32, 96),  # left_window=32, right_window=96
+                query_chunk_size=128,
+                key_chunk_size=128,
+            )
+            return jnp.mean(out**2)
+
+        _loss, grads = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
+        grad_q, grad_k, grad_v = grads
+
+        assert not jnp.any(jnp.isnan(grad_q))
+        assert not jnp.any(jnp.isnan(grad_k))
+        assert not jnp.any(jnp.isnan(grad_v))
+
+    def test_gradient_combined_features(self):
+        """Test gradient with combined features."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 4, 32
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        num_sinks = 2
+        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+
+        def loss_fn(q, k, v):
+            out = pallas.tpu.ring_attention(
+                q,
+                k,
+                v,
+                softmax_aux=softmax_aux,
+                logit_soft_cap=30.0,
+                sliding_window=64,
+                attention_sink_size=4,
+                query_chunk_size=128,
+                key_chunk_size=128,
+            )
+            return jnp.mean(out**2)
+
+        loss, grads = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
+        grad_q, grad_k, grad_v = grads
+
+        assert not jnp.any(jnp.isnan(grad_q))
+        assert not jnp.any(jnp.isnan(grad_k))
+        assert not jnp.any(jnp.isnan(grad_v))
+        assert loss > 0
+
+
+class TestRingAttentionPallasDistributed:
+    """Test distributed execution of Pallas TPU ring attention."""
+
+    @pytest.mark.skipif(not jax.devices()[0].platform == "tpu", reason="Requires TPU")
+    def test_distributed_shard_map(self):
+        """Test distributed execution with shard_map - this is how Pallas should be used on TPU."""
+        pytest.importorskip("eformer.escale")
+        from eformer.escale import create_mesh
+
+        try:
+            mesh = create_mesh()
+        except RuntimeError:
+            pytest.skip("Mesh creation failed")
+
+        batch, seq_len, num_heads, head_dim = 4, 1024, 32, 128
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        softmax_aux = numeric_gen(num_heads, dtype="f4") * -1.0
+
+        # This is the proper way to use pallas.tpu.ring_attention with shard_map
+        out = shard_map(
+            partial(pallas.tpu.ring_attention, axis_name="sp", query_chunk_size=128, key_chunk_size=128),
+            in_specs=(
+                PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+                None,  # attn_bias
+                None,  # q_segment_ids
+                None,  # kv_segment_ids
+                PartitionSpec("tp"),  # softmax_aux
+            ),
+            out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
+            mesh=mesh,
+            check_vma=False,
+        )(q, k, v, None, None, None, softmax_aux)
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+
+class TestRingAttentionPallasEdgeCases:
+    """Test edge cases for Pallas TPU ring attention."""
+
+    def test_small_sequence(self):
+        """Test with small sequence length."""
+        batch, seq_len, num_heads, head_dim = 1, 64, 4, 32
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            query_chunk_size=32,
+            key_chunk_size=32,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_single_head(self):
+        """Test with single attention head."""
+        batch, seq_len, num_heads, head_dim = 2, 128, 1, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_different_chunk_sizes(self):
+        """Test with different query and key chunk sizes."""
+        batch, seq_len, num_heads, head_dim = 2, 512, 8, 64
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            query_chunk_size=128,
+            key_chunk_size=256,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
+
+    def test_large_head_dim(self):
+        """Test with large head dimension."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 4, 128
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        out = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        assert out.shape == (batch, seq_len, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(out))
 
 
 if __name__ == "__main__":

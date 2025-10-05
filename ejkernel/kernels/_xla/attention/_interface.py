@@ -30,7 +30,7 @@ def attention(
     init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
     dropout_rng: jax.random.PRNGKey = None,
-    softmax_aux: Float[Array, "..."] | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     softmax_scale: float | None = None,
     dtype: jnp.dtype | None = jnp.bfloat16,
     softmax_dtype: jnp.dtype | None = None,
@@ -160,17 +160,22 @@ def attention(
         aw = jnp.where(attention_mask, aw, jnp.finfo(aw.dtype).min)
     if softmax_aux is not None:
         if softmax_aux.ndim == 2:
-            sinks = softmax_aux.reshape(1, kh, -1, 1, 1)
-            sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, 1))
+            # softmax_aux shape: [num_heads, num_sinks]
+            num_sinks = softmax_aux.shape[-1]
+            sinks = softmax_aux.reshape(1, kh, 1, 1, num_sinks)
+            sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, num_sinks))
         elif softmax_aux.ndim == 1:
-            sinks = softmax_aux.reshape(1, kh, -1, 1, 1)
-            sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, 1))
+            # softmax_aux shape: [num_sinks]
+            num_sinks = softmax_aux.shape[0]
+            sinks = softmax_aux.reshape(1, 1, 1, 1, num_sinks)
+            sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, num_sinks))
         else:
             raise ValueError(f"Unsupported softmax_aux shape: {softmax_aux.shape}")
         combined_logits = jnp.concatenate([aw, sinks], axis=-1)
         combined_logits = combined_logits - jnp.max(combined_logits, axis=-1, keepdims=True)
         probs = jax.nn.softmax(combined_logits.astype(softmax_dtype), axis=-1).astype(dtype)
-        aw = probs[..., :-1]
+        # Take only the attention weights, not the sink probabilities
+        aw = probs[..., :ks]
     else:
         aw = jax.nn.softmax(aw.astype(softmax_dtype), axis=-1).astype(dtype)
 

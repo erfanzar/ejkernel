@@ -42,7 +42,7 @@ def ragged_page_attention(
     num_seqs: Array | int,
     *,
     softmax_scale: float | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
@@ -80,7 +80,7 @@ def ragged_page_attention(
         num_seqs: The total number of sequences in the batch which should be a shape[1] int32.
         softmax_scale: The scaling factor to apply to the attention scores
             before the softmax operation (typically `1 / sqrt(head_size)`).
-        soft_cap: An optional value to cap the attention scores with `tanh`.
+        logit_soft_cap: An optional value to cap the attention scores with `tanh`.
         compute_dtype: The dtype to use for computation (default: bfloat16).
         optimized: Whether to use the optimized implementation (default: False).
         sliding_window: Optional sliding window size for local attention.
@@ -109,7 +109,7 @@ def ragged_page_attention(
         query_start_loc=query_start_loc,
         num_seqs=num_seqs,
         softmax_scale=softmax_scale,
-        soft_cap=soft_cap,
+        logit_soft_cap=logit_soft_cap,
         compute_dtype=compute_dtype,
         sliding_window=sliding_window,
         softmax_aux=softmax_aux,

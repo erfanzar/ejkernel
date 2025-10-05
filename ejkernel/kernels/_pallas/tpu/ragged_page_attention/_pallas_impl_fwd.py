@@ -68,7 +68,7 @@ def ref_ragged_page_attention(
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
 ):
     static_validate_inputs(
@@ -80,7 +80,7 @@ def ref_ragged_page_attention(
         num_seqs,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
-        soft_cap=soft_cap,
+        logit_soft_cap=logit_soft_cap,
         mask_value=mask_value,
     )
     if mask_value is None:
@@ -110,8 +110,8 @@ def ref_ragged_page_attention(
         mask = q_span < kv_span
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
-        if soft_cap is not None:
-            attn = soft_cap * jnp.tanh(attn / soft_cap)
+        if logit_soft_cap is not None:
+            attn = logit_soft_cap * jnp.tanh(attn / logit_soft_cap)
         attn += jnp.where(mask, mask_value, 0.0)
         attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
@@ -132,7 +132,7 @@ def dynamic_validate_inputs(
     # These inputs are optional. If not specified, we will not validate them.
     softmax_scale: float | None = None,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     mask_value: float | None = None,
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
@@ -147,7 +147,7 @@ def dynamic_validate_inputs(
         num_seqs,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
-        soft_cap=soft_cap,
+        logit_soft_cap=logit_soft_cap,
         mask_value=mask_value,
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
@@ -185,7 +185,7 @@ def static_validate_inputs(
     # These inputs are optional. If not specified, we will not validate them.
     softmax_scale: float | None = None,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     mask_value: float | None = None,
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
@@ -218,8 +218,8 @@ def static_validate_inputs(
         raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError(f"{sliding_window=} must be positive.")
-    if soft_cap is not None and soft_cap == 0.0:
-        raise ValueError(f"{soft_cap=} must not be 0.0.")
+    if logit_soft_cap is not None and logit_soft_cap == 0.0:
+        raise ValueError(f"{logit_soft_cap=} must not be 0.0.")
     if num_kv_pages_per_block is not None and not 0 < num_kv_pages_per_block <= pages_per_seq:
         raise ValueError(f"{num_kv_pages_per_block=} must be in range (0, {pages_per_seq}].")
     if num_queries_per_block is not None and num_queries_per_block <= 0:
@@ -251,7 +251,7 @@ def ragged_page_attention_kernel(
     *,
     softmax_scale: float,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
 ):
     if mask_value is None:
@@ -301,7 +301,6 @@ def ragged_page_attention_kernel(
         b_ref = ref.bitcast(jnp.uint32)
         b = b_ref[b_start::b_step, :]
 
-        # fixing the issue in mosaic's infer vector layout pass
         if ref.dtype == jnp.bfloat16:
             bk = b << 16
             bv = b & jnp.uint32(0xFFFF0000)
@@ -450,8 +449,8 @@ def ragged_page_attention_kernel(
             causal_mask = row_ids < col_ids
             if sliding_window is not None:
                 causal_mask = jnp.logical_or(causal_mask, row_ids - sliding_window >= col_ids)
-            if soft_cap is not None:
-                qk = soft_cap * jnp.tanh(qk / soft_cap)
+            if logit_soft_cap is not None:
+                qk = logit_soft_cap * jnp.tanh(qk / logit_soft_cap)
             qk += jnp.where(causal_mask, mask_value, 0.0)
             m_curr = jnp.max(qk, axis=1, keepdims=True)
             s_curr = jnp.exp(qk - m_curr)

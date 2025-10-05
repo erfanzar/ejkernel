@@ -186,7 +186,7 @@ class TestSoftCap:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=30.0,
+            logit_soft_cap=30.0,
         )
 
         # Outputs should be different
@@ -205,7 +205,7 @@ class TestSoftCap:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=10.0,
+            logit_soft_cap=10.0,
         )
 
         output_cap_50 = ragged_page_attention(
@@ -215,7 +215,7 @@ class TestSoftCap:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=50.0,
+            logit_soft_cap=50.0,
         )
 
         diff = float(jnp.mean(jnp.abs(output_cap_10 - output_cap_50)))
@@ -235,7 +235,7 @@ class TestSoftCap:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=30.0,
+            logit_soft_cap=30.0,
         )
 
         assert jnp.all(jnp.isfinite(output)), "Soft cap should prevent overflow/underflow"
@@ -344,7 +344,7 @@ class TestCombinedFeatures:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=30.0,
+            logit_soft_cap=30.0,
             sliding_window=128,
         )
 
@@ -362,7 +362,7 @@ class TestCombinedFeatures:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=30.0,
+            logit_soft_cap=30.0,
             sliding_window=128,
             mask_value=-1e10,
             softmax_scale=0.125,
@@ -393,7 +393,7 @@ class TestCombinedFeatures:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=30.0,
+            logit_soft_cap=30.0,
         )
 
         # Only window
@@ -415,7 +415,7 @@ class TestCombinedFeatures:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=30.0,
+            logit_soft_cap=30.0,
             sliding_window=64,
         )
 
@@ -445,7 +445,7 @@ class TestEdgeCases:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=30.0,
+            logit_soft_cap=30.0,
             sliding_window=64,
         )
 
@@ -472,7 +472,7 @@ class TestEdgeCases:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            soft_cap=1e6,  # Very large cap
+            logit_soft_cap=1e6,  # Very large cap
         )
 
         # Should be very similar (not identical due to tanh computation)

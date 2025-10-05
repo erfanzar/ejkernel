@@ -55,7 +55,7 @@ class RaggedPageAttention(Kernel[KernelConfig, Array]):
         *,
         cfg: KernelConfig,
         softmax_scale: float | None = None,
-        soft_cap: float | None = None,
+        logit_soft_cap: float | None = None,
         compute_dtype: jnp.dtype = jnp.bfloat16,
         optimized: bool = False,
         sliding_window: int | None = None,
@@ -86,7 +86,7 @@ class RaggedPageAttention(Kernel[KernelConfig, Array]):
             query_start_loc=query_start_loc,
             num_seqs=num_seqs,
             softmax_scale=softmax_scale,
-            soft_cap=soft_cap,
+            logit_soft_cap=logit_soft_cap,
             compute_dtype=compute_dtype,
             optimized=optimized,
             sliding_window=sliding_window,
@@ -144,7 +144,7 @@ def ragged_page_attention(
     query_start_loc: Int[Array, "num_seqs_plus_one"],
     num_seqs: Array | int,
     softmax_scale: float | None = None,
-    soft_cap: float | None = None,
+    logit_soft_cap: float | None = None,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
@@ -168,7 +168,7 @@ def ragged_page_attention(
         query_start_loc: Start locations for each sequence [num_seqs + 1]
         num_seqs: Number of sequences in the batch
         softmax_scale: Softmax scaling factor
-        soft_cap: Soft capping value for logits
+        logit_soft_cap: Soft capping value for logits
         compute_dtype: Computation dtype (default: bfloat16)
         optimized: Use optimized implementation
         sliding_window: Sliding window size for local attention
@@ -199,7 +199,7 @@ def ragged_page_attention(
         >>> # Optimized mode with soft capping
         >>> out = ragged_page_attention(
         ...     queries, kv_pages, context_lens, block_tables,
-        ...     query_start_loc, num_seqs, optimized=True, soft_cap=50.0
+        ...     query_start_loc, num_seqs, optimized=True, logit_soft_cap=50.0
         ... )
             >>>
         >>> # Force specific platform
@@ -214,7 +214,7 @@ def ragged_page_attention(
         query_start_loc=query_start_loc,
         num_seqs=num_seqs,
         softmax_scale=softmax_scale,
-        soft_cap=soft_cap,
+        logit_soft_cap=logit_soft_cap,
         compute_dtype=compute_dtype,
         optimized=optimized,
         sliding_window=sliding_window,
