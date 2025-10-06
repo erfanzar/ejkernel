@@ -13,7 +13,55 @@
 # limitations under the License.
 
 
-"""Attention kernel modules with automatic optimization."""
+"""Attention kernel modules with automatic optimization.
+
+This module provides a collection of high-performance attention mechanisms
+and related operations optimized for JAX. All implementations support automatic
+platform selection (XLA, Triton, Pallas, CUDA) and optional autotuning.
+
+Available Attention Variants:
+    - Attention: Standard multi-head attention with XLA optimization
+    - FlashAttention: Memory-efficient O(N) complexity attention
+    - FlashMLA: Multi-head latent attention with low-rank compression
+    - GLAttention: Gated linear attention mechanism
+    - LightningAttention: Layer-aware attention optimization
+    - NativeSparseAttention: Sparse attention with block patterns
+    - PageAttention: Paged KV cache for serving workloads
+    - RaggedPageAttention: Page attention for variable-length sequences
+    - RecurrentAttention: Stateful recurrent attention
+    - RingAttention: Distributed attention with ring topology
+    - ScaledDotProductAttention: Standard scaled dot-product attention
+
+Additional Operations:
+    - GroupedMatmul: Efficient grouped matrix multiplication
+    - MeanPooling: Sequence mean pooling operation
+
+Features:
+    - Automatic kernel selection based on hardware and input shapes
+    - Configuration caching for consistent performance
+    - Optional autotuning to find optimal block sizes
+    - Support for causal masking, dropout, and sliding windows
+    - Variable-length sequence handling via cumulative lengths
+    - Gradient-checkpointing support for memory efficiency
+
+Example:
+    >>> from ejkernel.modules.operations import flash_attention
+    >>>
+    >>> # Simple usage with automatic optimization
+    >>> output = flash_attention(query, key, value, causal=True)
+    >>>
+    >>> # Advanced usage with custom parameters
+    >>> output = flash_attention(
+    ...     query, key, value,
+    ...     softmax_scale=0.125,
+    ...     dropout_prob=0.1,
+    ...     sliding_window=(256, 256)
+    ... )
+
+Note:
+    All attention functions automatically handle mixed precision and
+    select the best available backend for your hardware.
+"""
 
 from .attention import Attention, attention
 from .flash import FlashAttention, flash_attention

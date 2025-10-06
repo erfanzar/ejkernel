@@ -19,11 +19,10 @@ from __future__ import annotations
 
 from typing import Literal
 
-import chex
 import jax
 from jax import lax
 from jax import numpy as jnp
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Float, Int, PRNGKeyArray
 
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.ops import Invocation, Kernel
@@ -60,7 +59,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
         key_chunk_size: int = 512,
         causal_block_size: int | None = None,
         deterministic: bool = True,
-        dropout_rng: chex.PRNGKey = None,
+        dropout_rng: PRNGKeyArray = None,
         pdrop: float = 0.0,
         dtype: jnp.dtype = jnp.float32,
         policy=jax.checkpoint_policies.nothing_saveable,
@@ -167,7 +166,7 @@ def ring_attention(
     key_chunk_size: int = 512,
     causal_block_size: int | None = None,
     deterministic: bool = True,
-    dropout_rng: chex.PRNGKey = None,
+    dropout_rng: PRNGKeyArray = None,
     pdrop: float = 0.0,
     dtype: jnp.dtype = jnp.float32,
     policy=jax.checkpoint_policies.nothing_saveable,

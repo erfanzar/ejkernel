@@ -13,7 +13,16 @@
 # limitations under the License.
 
 
-"""Lightning Attention module with automatic optimization."""
+"""Lightning Attention module with automatic optimization.
+
+This module implements Lightning Attention, a layer-aware attention mechanism that
+adapts computation based on the layer position in the network. It's particularly
+efficient for deep transformers where different layers may benefit from different
+attention strategies.
+
+Lightning Attention uses layer-specific optimizations and can maintain state across
+sequence processing for improved efficiency in recurrent-style computation.
+"""
 
 from __future__ import annotations
 
@@ -28,14 +37,41 @@ from ..base import KernelConfig, create_default_executor, detect_platform
 
 
 class LightningAttention(Kernel[KernelConfig, Array]):
-    """Lightning Attention with custom optimization logic."""
+    """Lightning Attention with custom optimization logic.
+
+    Implements a layer-aware attention mechanism optimized for deep transformer
+    architectures. The attention computation adapts based on the layer index,
+    allowing for more efficient processing in multi-layer networks.
+
+    Features:
+        - Layer-specific optimization strategies
+        - Support for stateful computation with initial states
+        - Bidirectional and reverse sequence processing
+        - Variable-length sequence handling
+        - Automatic platform selection (Triton/Pallas/XLA/CUDA)
+
+    This is particularly useful for:
+        - Very deep transformers where layer position matters
+        - Models with recurrent-style attention patterns
+        - Scenarios requiring different attention behavior per layer
+    """
 
     def __init__(self):
         """Initialize Lightning Attention module."""
         super().__init__(op_id="lightning_attn")
 
     def get_impl(self, cfg: KernelConfig):
-        """Get kernel implementation from registry."""
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for lightning attention
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("lightning_attn", cfg.platform)
         return kernel_registry.get("lightning_attn", platform=platform, backend=cfg.backend)
 
@@ -54,7 +90,28 @@ class LightningAttention(Kernel[KernelConfig, Array]):
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
-        """Execute lightning attention."""
+        """Execute lightning attention with layer-specific optimization.
+
+        Args:
+            query: Query tensor [batch, seq_len, num_heads, head_dim]
+            key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
+            value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
+            layer_idx: Index of current layer in the model (0-indexed)
+            num_layers: Total number of layers in the model
+            scale: Optional scaling factor for attention scores
+            initial_state: Optional initial hidden state [batch, num_heads, head_dim, head_dim]
+            reverse: If True, process sequence in reverse order
+            cu_seqlens: Cumulative sequence lengths for variable-length sequences
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
+            cfg: Kernel configuration object
+
+        Returns:
+            Attention output [batch, seq_len, num_heads, head_dim]
+
+        Note:
+            The layer_idx and num_layers parameters enable layer-specific
+            optimizations that can improve performance in deep networks.
+        """
 
         if platform is not None:
             cfg = KernelConfig(

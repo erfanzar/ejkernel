@@ -13,7 +13,18 @@
 # limitations under the License.
 
 
-"""Pooling operation modules with automatic optimization."""
+"""Pooling operation modules with automatic optimization.
+
+This module implements efficient pooling operations for sequence data, optimized
+for JAX execution. Mean pooling is particularly useful for:
+    - Sentence embeddings in NLP (pooling token representations)
+    - Sequence classification (reducing sequence to fixed-size representation)
+    - Feature aggregation across time steps
+    - Dimensionality reduction in transformer outputs
+
+The implementation supports variable-length sequences via cumulative sequence
+lengths, enabling efficient batched processing of sequences with different lengths.
+"""
 
 from __future__ import annotations
 
@@ -28,14 +39,38 @@ from ..base import KernelConfig, create_default_executor, detect_platform
 
 
 class MeanPooling(Kernel[KernelConfig, Array]):
-    """Mean Pooling with custom optimization logic."""
+    """Mean Pooling with custom optimization logic.
+
+    Computes the mean of sequence elements along the sequence dimension, with
+    support for variable-length sequences and chunked processing for memory efficiency.
+
+    Features:
+        - Efficient mean computation over sequence dimension
+        - Support for variable-length sequences via cu_seqlens
+        - Configurable chunk size for memory-efficient processing
+        - Automatic platform selection (Triton/Pallas/XLA/CUDA)
+        - Proper handling of padding in variable-length scenarios
+
+    This is commonly used to convert variable-length token sequences into
+    fixed-size representations for classification or embedding tasks.
+    """
 
     def __init__(self):
         """Initialize Mean Pooling module."""
         super().__init__(op_id="mean_pooling")
 
     def get_impl(self, cfg: KernelConfig):
-        """Get kernel implementation from registry."""
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for mean pooling
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("mean_pooling", cfg.platform)
         return kernel_registry.get("mean_pooling", platform=platform, backend=cfg.backend)
 
@@ -48,7 +83,23 @@ class MeanPooling(Kernel[KernelConfig, Array]):
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch hidden_dim"]:
-        """Execute mean pooling."""
+        """Execute mean pooling over sequence dimension.
+
+        Args:
+            x: Input tensor [batch, seq_len, hidden_dim]
+            chunk_size: Size of chunks for processing (default: 32)
+            cu_seqlens: Optional cumulative sequence lengths [num_seqs + 1] for
+                variable-length sequences
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
+            cfg: Kernel configuration object
+
+        Returns:
+            Pooled output [batch, hidden_dim]
+
+        Note:
+            When cu_seqlens is provided, padding tokens are excluded from the mean
+            computation, ensuring accurate pooling for variable-length sequences.
+        """
 
         if platform is not None:
             cfg = KernelConfig(

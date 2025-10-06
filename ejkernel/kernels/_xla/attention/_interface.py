@@ -19,7 +19,7 @@ import jax
 import jaxtyping
 from beartype import beartype
 from jax import numpy as jnp
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, PRNGKeyArray
 
 from ..._registry import Backend, Platform, kernel_registry
 
@@ -34,7 +34,7 @@ def attention(
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
-    dropout_rng: jax.random.PRNGKey = None,
+    dropout_rng: PRNGKeyArray = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     softmax_scale: float | None = None,
     dtype: jnp.dtype | None = jnp.bfloat16,

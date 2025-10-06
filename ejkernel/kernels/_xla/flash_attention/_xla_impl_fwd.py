@@ -17,6 +17,7 @@ import chex
 import jax
 import jax.lax as lax
 from jax import numpy as jnp
+from jaxtyping import PRNGKeyArray
 
 
 def _slice_along_axis(x: chex.Array | None, start: int, size: int, axis: int) -> chex.Array | None:
@@ -148,9 +149,9 @@ def _attend_chunk(
     logits_dtype: jnp.dtype,
     precision: lax.PrecisionLike,
     dropout_prob: float = 0.0,
-    dropout_key: chex.PRNGKey | None = None,
+    dropout_key: PRNGKeyArray | None = None,
     softmax_aux: chex.Array | None = None,
-) -> tuple[chex.Array, chex.Array, chex.Array, chex.PRNGKey | None]:
+) -> tuple[chex.Array, chex.Array, chex.Array, PRNGKeyArray | None]:
     """
     Process a single KV chunk with online softmax and optional attention sinks.
 
@@ -280,7 +281,7 @@ def _flash_attention_fwd(
     softmax_aux: chex.Array | None = None,
     causal: bool = False,
     dropout_prob: float = 0.0,
-    dropout_key: chex.PRNGKey | None = None,
+    dropout_key: PRNGKeyArray | None = None,
 ) -> chex.Array:
     """
     Forward pass for chunked flash attention with online softmax and optional attention sinks.
@@ -412,7 +413,11 @@ def _flash_attention_fwd(
             if mask is not None:
                 mask_q = lax.dynamic_slice_in_dim(mask, q_chunk_start, chunk_size_q, axis=-2)
                 mask_qk = lax.dynamic_slice_in_dim(mask_q, kv_chunk_start, Tk - kv_chunk_start, axis=-1)
-                mask_qk = jnp.pad(mask_qk, [(0, 0), (0, 0), (0, 0), (0, chunk_size_k - k_rem)], constant_values=False)
+                mask_qk = jnp.pad(
+                    mask_qk,
+                    [(0, 0), (0, 0), (0, 0), (0, chunk_size_k - k_rem)],
+                    constant_values=False,
+                )
                 mask_qk = mask_qk & pad_mask
             else:
                 mask_qk = pad_mask

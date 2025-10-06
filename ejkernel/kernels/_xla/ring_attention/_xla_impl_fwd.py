@@ -20,6 +20,7 @@ import jax
 import jax.lax as lax
 from einops import rearrange
 from jax import numpy as jnp
+from jaxtyping import PRNGKeyArray
 
 from ._utils import _chunk_attention_bias, below_or_on_diag
 
@@ -40,7 +41,7 @@ def _blockwise_attention_fwd(
     query_chunk_size: int,
     key_chunk_size: int,
     deterministic: bool,
-    dropout_rng: chex.PRNGKey | None,
+    dropout_rng: PRNGKeyArray | None,
     pdrop: float,
     dtype: jnp.dtype,
     policy,
@@ -248,7 +249,7 @@ def _ring_attention_fwd(
     key_chunk_size: int,
     causal_block_size: int | None,
     deterministic: bool,
-    dropout_rng: chex.PRNGKey | None,
+    dropout_rng: PRNGKeyArray | None,
     pdrop: float,
     dtype: jnp.dtype,
     policy,

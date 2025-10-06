@@ -42,7 +42,7 @@ import jaxtyping
 from beartype import beartype
 from jax import Array, lax
 from jax import numpy as jnp
-from jaxtyping import Float, Int
+from jaxtyping import Float, Int, PRNGKeyArray
 
 from ...._registry import Backend, Platform, kernel_registry
 from ._pallas_impl_bwd import _ring_flash_attention_bwd_tpu
@@ -68,7 +68,7 @@ def _ring_attention(
     key_chunk_size,
     causal_block_size,
     deterministic: bool,
-    dropout_rng: chex.PRNGKey,
+    dropout_rng: PRNGKeyArray,
     pdrop: float,
     sliding_window: int | tuple[int, int] | None,
     logit_soft_cap: float | None,
@@ -125,7 +125,7 @@ def ring_attention(
     key_chunk_size: int = 512,
     causal_block_size: int | None = None,
     deterministic: bool = True,
-    dropout_rng: chex.PRNGKey = None,
+    dropout_rng: PRNGKeyArray = None,
     pdrop: float = 0.0,
     dtype: jnp.dtype = jnp.float32,
     policy=jax.checkpoint_policies.nothing_saveable,

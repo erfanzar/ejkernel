@@ -13,7 +13,20 @@
 # limitations under the License.
 
 
-"""Matrix multiplication kernel modules with automatic optimization."""
+"""Grouped matrix multiplication kernel module with automatic optimization.
+
+This module implements grouped matrix multiplication, an efficient operation for
+batched matrix multiplication with variable group sizes. This is particularly
+useful for mixture-of-experts models, grouped convolutions, and other scenarios
+where different groups of inputs need to be multiplied with different weight matrices.
+
+Unlike standard batched matrix multiplication which assumes uniform batch sizes,
+grouped matmul handles variable-sized groups efficiently by:
+    1. Processing groups of different sizes in a single operation
+    2. Optimized memory access patterns for grouped computation
+    3. Support for both transposed and non-transposed RHS matrices
+    4. Optional accumulation into existing output tensors
+"""
 
 from __future__ import annotations
 
@@ -28,14 +41,42 @@ from ..base import KernelConfig, create_default_executor, detect_platform
 
 
 class GroupedMatmul(Kernel[KernelConfig, Array]):
-    """Grouped Matrix Multiplication with custom optimization logic."""
+    """Grouped Matrix Multiplication with custom optimization logic.
+
+    Performs efficient matrix multiplication for grouped inputs, where each group
+    can have a different size. This is essential for mixture-of-experts (MoE) models
+    where tokens are dynamically routed to different experts.
+
+    Features:
+        - Variable group size support via group_sizes array
+        - Configurable tiling for memory and compute efficiency
+        - Support for RHS transposition
+        - Optional output accumulation (for multi-pass operations)
+        - Group offset for partial computation
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
+    Typical use cases:
+        - MoE layer computation (different tokens to different experts)
+        - Grouped linear layers
+        - Dynamic routing architectures
+    """
 
     def __init__(self):
         """Initialize Grouped Matmul module."""
         super().__init__(op_id="grouped_matmul")
 
     def get_impl(self, cfg: KernelConfig):
-        """Get kernel implementation from registry."""
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for grouped matmul
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("grouped_matmul", cfg.platform)
         return kernel_registry.get("grouped_matmul", platform=platform, backend=cfg.backend)
 
@@ -55,7 +96,29 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "m n"]:
-        """Execute grouped matrix multiplication."""
+        """Execute grouped matrix multiplication.
+
+        Args:
+            lhs: Left-hand side matrix [m, k] (typically activations)
+            rhs: Right-hand side grouped matrices [num_groups, k, n] or [num_groups, n, k]
+            group_sizes: Size of each group [num_groups], sum(group_sizes) == m
+            preferred_element_type: Optional dtype for computation
+            tiling: Tile sizes (m_tile, n_tile, k_tile) for blocking strategy
+            group_offset: Optional offset into groups for partial computation
+            existing_out: Optional existing output to accumulate into [m, n]
+            transpose_rhs: Whether RHS matrices are transposed
+            interpret: Use interpreted mode (for debugging)
+            precision: Computation precision setting
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
+            cfg: Kernel configuration object
+
+        Returns:
+            Matrix multiplication result [m, n]
+
+        Note:
+            The group_sizes array partitions the m dimension of lhs. Each partition
+            is multiplied with the corresponding group matrix from rhs.
+        """
 
         if platform is not None:
             cfg = KernelConfig(

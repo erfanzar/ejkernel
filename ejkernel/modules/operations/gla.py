@@ -13,7 +13,16 @@
 # limitations under the License.
 
 
-"""GLA (Gated Linear Attention) module with automatic optimization."""
+"""GLA (Gated Linear Attention) module with automatic optimization.
+
+This module implements Gated Linear Attention, an efficient attention mechanism
+that uses gating to control information flow. GLA combines linear attention
+properties with learned gates to achieve both efficiency and expressiveness.
+
+The gating mechanism allows the model to dynamically control which information
+to retain or discard, making it particularly effective for long-range dependencies
+while maintaining linear complexity in certain configurations.
+"""
 
 from __future__ import annotations
 
@@ -28,14 +37,40 @@ from ..base import KernelConfig, create_default_executor, detect_platform
 
 
 class GLAttention(Kernel[KernelConfig, Array]):
-    """Gated Linear Attention with custom optimization logic."""
+    """Gated Linear Attention with custom optimization logic.
+
+    Implements gated linear attention combining the efficiency of linear attention
+    with learnable gating mechanisms for better expressiveness. The gating controls
+    information flow at both the query-key interaction and the state update levels.
+
+    Features:
+        - Gated attention computation with g (query gates) and g_gamma (layer-wise gates)
+        - Support for initial hidden states
+        - Bidirectional and reverse sequence processing
+        - Variable-length sequence handling via cumulative lengths
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
+    The dual gating mechanism (g and g_gamma) allows fine-grained control:
+        - g: Token-level gates applied to query representations
+        - g_gamma: Layer-level gates controlling overall attention strength
+    """
 
     def __init__(self):
         """Initialize GLA module."""
         super().__init__(op_id="gla")
 
     def get_impl(self, cfg: KernelConfig):
-        """Get kernel implementation from registry."""
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for gated linear attention
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("gla", cfg.platform)
         return kernel_registry.get("gla", platform=platform, backend=cfg.backend)
 
@@ -54,7 +89,28 @@ class GLAttention(Kernel[KernelConfig, Array]):
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
-        """Execute gated linear attention."""
+        """Execute gated linear attention computation.
+
+        Args:
+            query: Query tensor [batch, seq_len, num_heads, head_dim]
+            key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
+            value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
+            g: Token-level gating tensor [batch, seq_len, num_heads, head_dim]
+            g_gamma: Layer-level gating parameter [batch, num_heads]
+            scale: Optional scaling factor for attention scores
+            initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
+            reverse: If True, process sequence in reverse order
+            cu_seqlens: Cumulative sequence lengths for variable-length sequences
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
+            cfg: Kernel configuration object
+
+        Returns:
+            Gated attention output [batch, seq_len, num_heads, head_dim]
+
+        Note:
+            Both g and g_gamma are optional. When provided, they enable more
+            expressive attention patterns through learned gating.
+        """
 
         if platform is not None:
             cfg = KernelConfig(

@@ -20,6 +20,7 @@ import jax
 import jax.lax as lax
 from einops import rearrange
 from jax import numpy as jnp
+from jaxtyping import PRNGKeyArray
 
 from ._utils import _chunk_attention_bias, below_or_on_diag
 
@@ -41,7 +42,7 @@ def _blockwise_attention_bwd(
     query_chunk_size: int,
     key_chunk_size: int,
     deterministic: bool,
-    dropout_rng: chex.PRNGKey | None,
+    dropout_rng: PRNGKeyArray | None,
     pdrop: float,
     dtype: jnp.dtype,
     policy,
@@ -235,7 +236,7 @@ def _ring_attention_bwd(
     key_chunk_size: int,
     causal_block_size: int | None,
     deterministic: bool,
-    dropout_rng: chex.PRNGKey | None,
+    dropout_rng: PRNGKeyArray | None,
     pdrop: float,
     dtype: jnp.dtype,
     policy,
@@ -272,7 +273,17 @@ def _ring_attention_bwd(
             A tuple containing the gradients of the inputs.
     """
     del float32_logits
-    output, query, key, value, bias, q_segment_ids, kv_segment_ids, denominator, max_score = res
+    (
+        output,
+        query,
+        key,
+        value,
+        bias,
+        q_segment_ids,
+        kv_segment_ids,
+        denominator,
+        max_score,
+    ) = res
     _, q_len, _, _ = query.shape
     _, kv_len, _, _ = key.shape
     axis_size = lax.psum(1, axis_name) if axis_name is not None else 1

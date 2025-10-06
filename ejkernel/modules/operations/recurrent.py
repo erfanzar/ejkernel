@@ -13,7 +13,26 @@
 # limitations under the License.
 
 
-"""Recurrent Attention module with automatic optimization."""
+"""Recurrent Attention module with automatic optimization.
+
+This module implements recurrent-style attention mechanisms that maintain and update
+hidden states across sequence positions. Unlike standard attention which computes
+all positions independently, recurrent attention processes sequences sequentially
+with stateful computation.
+
+Features:
+    - Stateful attention with initial_state support
+    - Separate gating for queries (g), keys (gk), and values (gv)
+    - Layer-wise gating control via g_gamma
+    - Bidirectional processing support (forward and reverse)
+    - Variable-length sequence handling
+
+This is particularly useful for:
+    - Linear-time attention mechanisms
+    - Models requiring sequential dependency modeling
+    - Architectures with explicit state propagation
+    - Efficient inference with incremental state updates
+"""
 
 from __future__ import annotations
 
@@ -28,14 +47,43 @@ from ..base import KernelConfig, create_default_executor, detect_platform
 
 
 class RecurrentAttention(Kernel[KernelConfig, Array]):
-    """Recurrent Attention with custom optimization logic."""
+    """Recurrent Attention with custom optimization logic.
+
+    Implements attention with recurrent state updates, enabling linear-time complexity
+    for certain attention patterns. The mechanism maintains a hidden state that is
+    updated at each sequence position.
+
+    Features:
+        - Stateful computation with hidden state propagation
+        - Multiple gating mechanisms (g, gk, gv, g_gamma)
+        - Forward and reverse processing modes
+        - Support for initial states
+        - Variable-length sequence handling via cu_seqlens
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
+    The gating mechanisms provide fine-grained control:
+        - g: Query-level gates
+        - gk: Key-level gates
+        - gv: Value-level gates
+        - g_gamma: Layer-level gates
+    """
 
     def __init__(self):
         """Initialize Recurrent Attention module."""
         super().__init__(op_id="recurrent")
 
     def get_impl(self, cfg: KernelConfig):
-        """Get kernel implementation from registry."""
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for recurrent attention
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("recurrent", cfg.platform)
         return kernel_registry.get("recurrent", platform=platform, backend=cfg.backend)
 
@@ -56,7 +104,30 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
-        """Execute recurrent attention."""
+        """Execute recurrent attention with stateful computation.
+
+        Args:
+            query: Query tensor [batch, seq_len, num_heads, head_dim]
+            key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
+            value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
+            g: Query-level gating tensor [batch, seq_len, num_heads, head_dim]
+            g_gamma: Layer-level gating parameter [batch, num_heads]
+            gk: Key-level gating tensor [batch, seq_len, num_heads, head_dim]
+            gv: Value-level gating tensor [batch, seq_len, num_heads, head_dim]
+            scale: Optional scaling factor for attention scores
+            initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
+            reverse: If True, process sequence in reverse order
+            cu_seqlens: Cumulative sequence lengths for variable-length sequences
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
+            cfg: Kernel configuration object
+
+        Returns:
+            Attention output [batch, seq_len, num_heads, head_dim]
+
+        Note:
+            All gating parameters (g, gk, gv, g_gamma) are optional. When provided,
+            they enable more sophisticated gated recurrent mechanisms.
+        """
 
         if platform is not None:
             cfg = KernelConfig(

@@ -62,7 +62,7 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
 
     def __init__(self):
         """Initialize  ScaledDotProductAttention module."""
-        super().__init__(op_id="attention")
+        super().__init__(op_id="scaled_dot_product_attention")
 
     def get_impl(self, cfg: KernelConfig):
         """Get kernel implementation from registry based on configuration.
@@ -77,8 +77,8 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
             ValueError: If no matching implementation is found
         """
         return kernel_registry.get(
-            algorithm="attention",
-            platform=detect_platform("attention", cfg.platform),
+            algorithm="scaled_dot_product_attention",
+            platform=detect_platform("scaled_dot_product_attention", cfg.platform),
             backend=cfg.backend,
         )
 
@@ -95,17 +95,18 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
         sliding_window: int | tuple[int, int] | None = None,
         cum_seqlens_q: Int[Array, "batch"] | None = None,
         cum_seqlens_k: Int[Array, "batch"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-        """Execute flash attention with the given configuration.
+        """Execute scaled_dot_product_attention with the given configuration.
 
         Args:
             query: Query tensor [batch, seq_len_q, num_heads, head_dim]
             key: Key tensor [batch, seq_len_k, num_heads, head_dim]
             value: Value tensor [batch, seq_len_k, num_heads, head_dim]
-            attention_mask: Optional attention mask (legacy, prefer bias)
-            bias: Optional attention bias tensor
+            attention_mask: Optional scaled_dot_product_attention mask (legacy, prefer bias)
+            bias: Optional scaled_dot_product_attention bias tensor
             softmax_scale: Scaling factor for attention scores
             dropout_prob: Dropout probability for attention weights
             causal: Whether to apply causal masking
@@ -123,7 +124,20 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
         Returns:
             ScaledDotProductAttention output [batch, seq_len_q, num_heads, head_dim]
         """
+
+        if platform is not None:
+            cfg = KernelConfig(
+                block_q=cfg.block_q,
+                block_k=cfg.block_k,
+                block_d=cfg.block_d,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+                platform=platform,
+                backend=cfg.backend,
+            )
+
         impl = self.get_impl(cfg)
+
         return impl(
             query=query,
             key=key,
@@ -216,6 +230,7 @@ def scaled_dot_product_attention(
     sliding_window: int | tuple[int, int] | None = None,
     cum_seqlens_q: Int[Array, "batch"] | None = None,
     cum_seqlens_k: Int[Array, "batch"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute flash attention with automatic optimization.
 
@@ -241,13 +256,13 @@ def scaled_dot_product_attention(
 
     Example:
         >>>
-        >>> out = attention(query, key, value, causal=True)
+        >>> out = scaled_dot_product_attention(query, key, value, causal=True)
         >>>
         >>>
-        >>> out = attention(query, key, value, dropout_prob=0.1, softmax_scale=0.125)
+        >>> out = scaled_dot_product_attention(query, key, value, dropout_prob=0.1, softmax_scale=0.125)
         >>>
         >>>
-        >>> out = attention(query, key, value, cum_seqlens_q=cu_q, cum_seqlens_k=cu_k)
+        >>> out = scaled_dot_product_attention(query, key, value, cum_seqlens_q=cu_q, cum_seqlens_k=cu_k)
     """
 
     return _executor(
@@ -263,4 +278,5 @@ def scaled_dot_product_attention(
         causal=causal,
         cum_seqlens_q=cum_seqlens_q,
         cum_seqlens_k=cum_seqlens_k,
+        platform=platform,
     )

@@ -13,7 +13,21 @@
 # limitations under the License.
 
 
-"""Sparse Attention module with automatic optimization."""
+"""Native sparse attention module with automatic optimization.
+
+This module implements native sparse attention using explicit block indices to
+define sparsity patterns. Unlike block-sparse attention which uses mask builders,
+this implementation directly specifies which blocks to attend to via index arrays.
+
+This approach is particularly efficient when:
+    - The sparse pattern is known ahead of time
+    - Block indices can be precomputed and reused
+    - Fine-grained control over sparsity is needed
+
+The sparse pattern is defined by block_indices and block_counts arrays, allowing
+flexible sparse attention patterns like local windows, strided patterns, or
+custom document-structure-aware sparsity.
+"""
 
 from __future__ import annotations
 
@@ -28,14 +42,41 @@ from ..base import KernelConfig, create_default_executor, detect_platform
 
 
 class NativeSparseAttention(Kernel[KernelConfig, Array]):
-    """Native Sparse Attention with custom optimization logic."""
+    """Native Sparse Attention with custom optimization logic.
+
+    Implements sparse attention using explicit block index specification. This provides
+    direct control over which blocks participate in attention computation, enabling
+    efficient sparse patterns without runtime mask building.
+
+    Features:
+        - Direct block index specification for sparsity
+        - Configurable block size and block counts
+        - Support for variable-length sequences
+        - Token-level sparse patterns via token_indices
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
+    The sparsity is controlled by:
+        - block_indices: Which blocks each query block attends to
+        - block_counts: Number of key blocks per query block
+        - token_indices: Fine-grained token-level sparsity (optional)
+    """
 
     def __init__(self):
         """Initialize Native Sparse Attention module."""
         super().__init__(op_id="native_sparse_attention")
 
     def get_impl(self, cfg: KernelConfig):
-        """Get kernel implementation from registry."""
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for native sparse attention
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("native_sparse_attention", cfg.platform)
         return kernel_registry.get("native_sparse_attention", platform=platform, backend=cfg.backend)
 
@@ -54,7 +95,30 @@ class NativeSparseAttention(Kernel[KernelConfig, Array]):
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
-        """Execute native sparse attention."""
+        """Execute native sparse attention with explicit block indices.
+
+        Args:
+            query: Query tensor [batch, seq_len, num_heads, head_dim]
+            key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
+            value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
+            block_indices: Indices of key blocks to attend to for each query block
+                [batch, num_kv_heads, num_query_blocks, num_keys_blocks]
+            block_counts: Number of key blocks per query block (can be int or array)
+            block_size: Size of each attention block (default: 64)
+            scale: Optional scaling factor for attention scores
+            cu_seqlens: Cumulative sequence lengths for variable-length sequences
+            token_indices: Optional token-level indices for fine-grained sparsity
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
+            cfg: Kernel configuration object
+
+        Returns:
+            Sparse attention output [batch, seq_len, num_heads, head_dim]
+
+        Note:
+            When block_indices is None, a default pattern may be used depending
+            on the implementation. Providing explicit indices gives full control
+            over the sparsity pattern.
+        """
 
         if platform is not None:
             cfg = KernelConfig(

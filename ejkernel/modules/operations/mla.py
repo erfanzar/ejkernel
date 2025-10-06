@@ -13,7 +13,23 @@
 # limitations under the License.
 
 
-"""Multi-head Latent Attention (MLA) module with automatic optimization."""
+"""Multi-head Latent Attention (MLA) module with automatic optimization.
+
+This module implements Multi-head Latent Attention, a memory-efficient attention
+variant that uses low-rank compression for key-value pairs. MLA reduces the KV cache
+size by projecting keys and values through a low-rank bottleneck while maintaining
+attention quality.
+
+The key innovation is compressing the KV representations:
+    1. Keys and values are projected to a low-rank space (kv_lora_rank)
+    2. Compressed representations are stored efficiently
+    3. Full-rank keys/values are reconstructed on-the-fly using learned weights
+
+This is particularly beneficial for:
+    - Long context inference where KV cache dominates memory
+    - Multi-query or grouped-query attention patterns
+    - Deployment scenarios with memory constraints
+"""
 
 from __future__ import annotations
 
@@ -28,14 +44,41 @@ from ..base import KernelConfig, create_default_executor, detect_platform
 
 
 class FlashMLA(Kernel[KernelConfig, Array]):
-    """Flash Multi-head Latent Attention with custom optimization logic."""
+    """Flash Multi-head Latent Attention with custom optimization logic.
+
+    Combines flash attention's memory efficiency with MLA's low-rank KV compression.
+    This implementation uses tiling and on-the-fly decompression to achieve both
+    reduced memory footprint and computational efficiency.
+
+    Features:
+        - Low-rank KV compression via w_kc and w_vc weight matrices
+        - Optional RoPE bias for positional encoding (b_q, b_k)
+        - Flash attention-style tiling for memory efficiency
+        - Support for causal masking and variable-length sequences
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
+    The compression scheme:
+        - key_value: Compressed KV tensor [batch, seq_len, kv_lora_rank]
+        - w_kc, w_vc: Decompression weights [kv_lora_rank, kv_heads, head_dim]
+        - Keys/values are reconstructed as: key = key_value @ w_kc
+    """
 
     def __init__(self):
         """Initialize Flash MLA module."""
         super().__init__(op_id="flash_mla")
 
     def get_impl(self, cfg: KernelConfig):
-        """Get kernel implementation from registry."""
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for flash MLA
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("flash_mla", cfg.platform)
         return kernel_registry.get("flash_mla", platform=platform, backend=cfg.backend)
 
@@ -54,7 +97,28 @@ class FlashMLA(Kernel[KernelConfig, Array]):
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len q_heads head_dim"]:
-        """Execute flash MLA."""
+        """Execute flash multi-head latent attention.
+
+        Args:
+            query: Query tensor [batch, seq_len, q_heads, head_dim]
+            key_value: Compressed key-value tensor [batch, seq_len, kv_lora_rank]
+            w_kc: Key decompression weights [kv_lora_rank, kv_heads, head_dim]
+            w_vc: Value decompression weights [kv_lora_rank, kv_heads, head_dim]
+            b_q: Optional query RoPE bias [batch, seq_len, qk_rope_head_dim]
+            b_k: Optional key RoPE bias [batch, seq_len, qk_rope_head_dim]
+            softmax_scale: Optional scaling factor for attention scores
+            causal: Whether to apply causal masking (default: False)
+            cu_seqlens: Cumulative sequence lengths for variable-length sequences
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
+            cfg: Kernel configuration object
+
+        Returns:
+            Attention output [batch, seq_len, q_heads, head_dim]
+
+        Note:
+            The kv_lora_rank determines the compression ratio. Lower ranks
+            save more memory but may reduce quality. Typical values: 64-256.
+        """
 
         if platform is not None:
             cfg = KernelConfig(

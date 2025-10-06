@@ -21,7 +21,7 @@ import jaxtyping
 from beartype import beartype
 from jax import lax
 from jax import numpy as jnp
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from ejkernel.callib._ejit import ejit
 
@@ -91,7 +91,7 @@ def _flash_attention_core(
     logits_dtype_code: int,
     causal: bool,
     dropout_prob: float,
-    dropout_key: chex.PRNGKey | None,
+    dropout_key: PRNGKeyArray | None,
 ) -> chex.Array:
     """Core flash attention with custom_vjp and attention sinks."""
     sliding_window = None if (window_left < 0 or window_right < 0) else (window_left, window_right)
@@ -142,7 +142,7 @@ def _flash_attention_core_fwd(
     logits_dtype_code: int,
     causal: bool,
     dropout_prob: float,
-    dropout_key: chex.PRNGKey | None,
+    dropout_key: PRNGKeyArray | None,
 ):
     """Forward pass for custom_vjp."""
     y = _flash_attention_core(

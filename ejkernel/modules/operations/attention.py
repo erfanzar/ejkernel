@@ -13,15 +13,22 @@
 # limitations under the License.
 
 
-"""Attention module with automatic optimization."""
+"""Standard multi-head attention module with automatic optimization.
+
+This module implements standard multi-head attention (MHA) with XLA-optimized kernels.
+It provides a flexible interface supporting various attention patterns including causal
+masking, dropout, sliding windows, and variable-length sequences.
+
+Unlike FlashAttention which uses tiling for memory efficiency, this implementation
+leverages XLA's compiler optimizations for straightforward attention computation.
+"""
 
 from __future__ import annotations
 
 import typing
 
-import jax
 from jax import numpy as jnp
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, PRNGKeyArray
 
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.ops import Invocation, Kernel
@@ -93,7 +100,7 @@ class Attention(Kernel[KernelConfig, Array]):
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
         init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = True,
-        dropout_rng: jax.random.PRNGKey = None,
+        dropout_rng: PRNGKeyArray = None,
         softmax_aux: Float[Array, "..."] | None = None,
         softmax_scale: float | None = None,
         dtype: jnp.dtype | None = jnp.bfloat16,
@@ -220,7 +227,7 @@ def attention(
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
-    dropout_rng: jax.random.PRNGKey = None,
+    dropout_rng: PRNGKeyArray = None,
     softmax_aux: Float[Array, "..."] | None = None,
     softmax_scale: float | None = None,
     dtype: jnp.dtype | None = jnp.bfloat16,
