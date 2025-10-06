@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Recurrent Attention module with automatic optimization."""
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
         """Execute recurrent attention."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -157,17 +158,17 @@ def recurrent_attention(
         Attention output with same shape as query
 
     Example:
-        >>> # Standard recurrent attention
+        >>>
         >>> out = recurrent(query, key, value)
         >>>
-        >>> # With gating
+        >>>
         >>> out = recurrent(query, key, value, g=gates, gk=key_gates, gv=value_gates)
         >>>
-        >>> # With initial state
+        >>>
         >>> out = recurrent(query, key, value, initial_state=h0)
     """
     return _recurrent_executor(
-        Recurrent(),
+        RecurrentAttention(),
         query=query,
         key=key,
         value=value,

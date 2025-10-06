@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Configuration caching system for eFormer operations.
 
@@ -62,7 +63,6 @@ class ConfigCache(Generic[Cfg]):
     def __init__(self):
         """Initialize an empty configuration cache."""
         self._data: dict[tuple[str, str, str], Cfg] = {}
-        # key: (device_fingerprint, op_id, call_key) -> cfg
 
     def get(self, dev: str, op_id: str, call_key: str) -> Cfg | None:
         """Retrieve a cached configuration.
@@ -132,9 +132,9 @@ class overlay_cache:
         >>> cache.put('dev1', 'op1', 'key1', 'original_config')
         >>> override = {('dev1', 'op1', 'key1'): 'override_config'}
         >>> with overlay_cache(override):
-        ...     # Cache lookups will return 'override_config'
+        ...
         ...     config = cache.get('dev1', 'op1', 'key1')
-        >>> # Outside context, returns 'original_config'
+        >>>
     """
 
     def __init__(self, mapping: dict[tuple[str, str, str], Any]):

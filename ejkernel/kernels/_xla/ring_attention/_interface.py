@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from functools import partial
 
 import chex
 import jax
 import jax.lax as lax
+import jaxtyping
+from beartype import beartype
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
 
@@ -89,7 +92,7 @@ def _ring_attention(
     Returns:
             Output array of shape (batch, q_len, num_heads, dim_per_head).
     """
-    # Handle backward compatibility: if only one segment_ids is provided, use it for both
+
     if q_segment_ids is None and kv_segment_ids is not None:
         q_segment_ids = kv_segment_ids
     elif kv_segment_ids is None and q_segment_ids is not None:
@@ -128,6 +131,7 @@ _ring_attention = ejit(_ring_attention, static_argnums=(7, 8, 9, 10, 11, 12, 13,
 
 
 @kernel_registry.register("ring_attention", Platform.XLA, Backend.ANY)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def ring_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],

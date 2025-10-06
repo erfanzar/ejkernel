@@ -1,4 +1,4 @@
-# Copyright 2023 The JAX Authors.
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Flash Attention TPU kernel."""
 
@@ -57,7 +58,7 @@ def _flash_attention_fwd(
 
 def _flash_attention_kernel(q_tile_ref, *args, **kwargs):
     block_b = q_tile_ref.shape[0]
-    # If we're not going to tile the softmax, then we can avoid a bunch of VPU ops.
+
     if kwargs["block_k"] == kwargs["kv_seq_len"]:
         kernel = _flash_attention_kernel_single_batch_single_step
     else:
@@ -73,8 +74,8 @@ def _flash_attention_kernel_single_batch(
     v_tile_ref,
     ab_tile_ref,
     q_segment_ids_tile_ref,
-    kv_segment_ids_tile_ref,  # Input arrays
-    o_tile_ref,  # Output arrays
+    kv_segment_ids_tile_ref,
+    o_tile_ref,
     l_ref,
     m_ref,
     m_scratch_ref,
@@ -111,14 +112,11 @@ def _flash_attention_kernel_single_batch(
         def _body(start_k):
             m_prev = m_scratch_ref[batch_idx]
             l_prev = l_scratch_ref[batch_idx]
-            q = q_tile_ref[batch_idx]  # [block_q, head_dim]
-            k = k_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]  # [block_k, head_dim]
+            q = q_tile_ref[batch_idx]
+            k = k_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
 
-            s = jax.lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)  # [block_q, block_k]
+            s = jax.lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
-            # Add attention bias if needed.
-            # TODO(tanburn) Should the attention bias be added before or after
-            # multiplication by softmax_scale?
             if ab_tile_ref is not None:
                 ab = ab_tile_ref[(*batch_idx, pl.dslice(None), pl.dslice(start_k, block_k))].astype(jnp.float32)
                 s += ab
@@ -131,10 +129,8 @@ def _flash_attention_kernel_single_batch(
                 repeats, rem = divmod(block_k, NUM_LANES)
                 if rem:
                     raise NotImplementedError(f"kv block size must be a multiple of {NUM_LANES}")
-                q_segment_ids = pltpu.repeat(
-                    q_segment_ids_tile_ref[batch_idx[0]], repeats, axis=1
-                )  # [block_q, block_k].
-                kv_segment_ids = kv_segment_ids_tile_ref[batch_idx[0], :1, pl.dslice(start_k, block_k)]  # [1, block_k].
+                q_segment_ids = pltpu.repeat(q_segment_ids_tile_ref[batch_idx[0]], repeats, axis=1)
+                kv_segment_ids = kv_segment_ids_tile_ref[batch_idx[0], :1, pl.dslice(start_k, block_k)]
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal:
@@ -148,19 +144,19 @@ def _flash_attention_kernel_single_batch(
 
             s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
 
-            m_curr = jnp.max(s, axis=1)[:, None]  # Row max, shape [block_q, 1].
-            m_next = jnp.maximum(m_prev, m_curr)  # Shape [block_q, 128].
+            m_curr = jnp.max(s, axis=1)[:, None]
+            m_next = jnp.maximum(m_prev, m_curr)
 
             block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
             if rem:
                 raise NotImplementedError(f"{block_k=} should be a multiple of {MIN_BLOCK_SIZE}")
             p = jnp.exp(s - pltpu.repeat(m_next, block_k_repeats, 1))
 
-            alpha = jnp.exp(m_prev - m_next)  # Shape [block_q, 128].
+            alpha = jnp.exp(m_prev - m_next)
 
             l_corr = alpha * l_prev
 
-            l_next = jnp.sum(p, axis=1)[:, None] + l_corr  # Shape [block_q, 128]
+            l_next = jnp.sum(p, axis=1)[:, None] + l_corr
 
             head_dim_repeats, rem = divmod(head_dim, MIN_BLOCK_SIZE)
 
@@ -199,8 +195,8 @@ def _flash_attention_kernel_single_batch_single_step(
     v_tile_ref,
     ab_tile_ref,
     q_segment_ids_tile_ref,
-    kv_segment_ids_tile_ref,  # Input arrays
-    o_tile_ref,  # Output arrays
+    kv_segment_ids_tile_ref,
+    o_tile_ref,
     l_ref: Any | None = None,
     m_ref: Any | None = None,
     *,
@@ -215,9 +211,9 @@ def _flash_attention_kernel_single_batch_single_step(
 
     assert kv_seq_len == block_k_major == block_k
 
-    q = q_tile_ref[batch_idx]  # [block_q, head_dim]
-    k = k_tile_ref[batch_idx]  # [block_k, head_dim]
-    s = jax.lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)  # [block_q, block_k]
+    q = q_tile_ref[batch_idx]
+    k = k_tile_ref[batch_idx]
+    s = jax.lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
     if ab_tile_ref is not None:
         s += ab_tile_ref[batch_idx].astype(jnp.float32)
@@ -229,9 +225,9 @@ def _flash_attention_kernel_single_batch_single_step(
         repeats, rem = divmod(block_k, NUM_LANES)
         if rem:
             raise NotImplementedError(f"kv block size must be a multiple of {NUM_LANES}")
-        q_segment_ids = q_segment_ids_tile_ref[batch_idx[0]]  # [block_q, NUM_LANES].
-        q_segment_ids = pltpu.repeat(q_segment_ids, repeats, axis=1)  # [block_q, block_k].
-        kv_segment_ids = kv_segment_ids_tile_ref[batch_idx[0], :1]  # [1, block_k].
+        q_segment_ids = q_segment_ids_tile_ref[batch_idx[0]]
+        q_segment_ids = pltpu.repeat(q_segment_ids, repeats, axis=1)
+        kv_segment_ids = kv_segment_ids_tile_ref[batch_idx[0], :1]
         mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
     if causal:
@@ -282,7 +278,6 @@ def _flash_attention_impl(
     _verify_block("block_k", "kv_seq_len", block_k, kv_seq_len)
     _verify_block("block_b", "batch", block_b, batch_size, should_divide=False)
 
-    # TODO(apaszke): Tile over heads as well.
     grid = (
         pl.cdiv(batch_size, block_b),
         num_heads,
@@ -295,8 +290,6 @@ def _flash_attention_impl(
 
     def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
         if causal:
-            # If the kv block is skipped, prefetch the next valid kv block, i.e. the
-            # 0th one to be used for the next block_q rows.
             next_kv_index = lax.select(
                 below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k_major),
                 kv_seq_index,
@@ -309,8 +302,7 @@ def _flash_attention_impl(
     def ab_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
         if causal:
             should_run = below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k_major)
-            # If the ab block is skipped, prefetch the next valid ab block, i.e. the
-            # 0th kv to be used for the next block_q rows.
+
             next_q_index = lax.select(
                 should_run,
                 q_seq_index,

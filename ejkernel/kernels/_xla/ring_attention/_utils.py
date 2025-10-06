@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import chex
 import jax
@@ -81,7 +82,7 @@ def _chunk_attention_bias(
             slice_sizes=(kv_segment_ids.shape[0], key_chunk_size),
         )
         segment_ids_mask = ~jnp.equal(q_seg_chunk[:, :, None], kv_seg_chunk[:, None, :])
-        segment_ids_mask = segment_ids_mask[:, None]  # B1QK
+        segment_ids_mask = segment_ids_mask[:, None]
         segment_ids_bias = segment_ids_mask * jnp.finfo(dtype).min
         chunk_bias = jnp.minimum(chunk_bias, segment_ids_bias)
 
@@ -101,17 +102,14 @@ def _chunk_attention_bias(
         key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
         key_idx += key_offset
 
-        # Parse sliding window (can be int or tuple)
         if isinstance(sliding_window, tuple):
             left_window, right_window = sliding_window
         else:
             left_window = right_window = sliding_window
 
-        # Create sliding window mask: query can attend to keys within [query_pos - left_window, query_pos + right_window]
         pos_diff = query_idx - key_idx
         window_mask = (pos_diff >= -right_window) & (pos_diff <= left_window)
 
-        # Add attention sink: always allow attending to first N tokens
         if attention_sink_size > 0:
             sink_mask = key_idx < attention_sink_size
             window_mask = window_mask | sink_mask

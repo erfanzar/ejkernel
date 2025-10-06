@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """High-performance JAX operation framework with automatic configuration management.
 
@@ -47,12 +48,12 @@ Example Usage:
         def heuristic_cfg(self, inv):
             return MyConfig()
 
-    # Setup execution
+
     cache = ConfigCache()
     selector = ConfigSelectorChain(cache)
     executor = Executor(selector)
 
-    # Execute with automatic config management
+
     kernel = MyKernel("my_op")
     result = executor(kernel, a, b)
     ```

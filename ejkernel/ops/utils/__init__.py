@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Utility functions and helpers for eformer.ops.
 
 This module provides various utilities for device fingerprinting, serialization,
 metadata extraction, and other supporting functionality.
 
 Functions:
-    # Device fingerprinting and hashing
+
     device_fingerprint: Generate stable device identifier
     device_kind: Get device type (gpu, cpu, tpu)
     sharding_fingerprint: Extract sharding information from arrays
@@ -26,13 +27,13 @@ Functions:
     stable_json: Deterministic JSON serialization
     short_hash: Generate short hash from object
 
-    # Metadata extraction
+
     extract_labels_from_hlo_text: Find operation labels in HLO text
     find_labels_in_lowered: Extract labels from lowered JAX computation
     label: Generate operation label
     labels_to_configs: Map labels to configurations
 
-    # JSON serialization
+
     to_json: Serialize object to JSON string
     from_json: Deserialize object from JSON string
 """

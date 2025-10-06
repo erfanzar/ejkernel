@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import jaxtyping
+from beartype import beartype
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
 
@@ -20,6 +23,7 @@ from ..recurrent import recurrent
 
 
 @kernel_registry.register("lightning_attn", Platform.XLA, Backend.ANY)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def lightning_attn(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -74,7 +78,7 @@ def lightning_attn(
             does not match the number of sequences.
 
     Examples:
-        >>> # Lightning attention for layer 5 out of 24
+        >>>
         >>> q = jnp.ones((2, 100, 8, 64))
         >>> k = jnp.ones((2, 100, 8, 64))
         >>> v = jnp.ones((2, 100, 8, 64))
@@ -82,23 +86,23 @@ def lightning_attn(
         >>> output.shape
         (2, 100, 8, 64)
 
-        >>> # Different layers have different decay rates
-        >>> # Early layers (layer_idx=0) have stronger decay
-        >>> # Later layers (layer_idx=23) have weaker decay
+        >>>
+        >>>
+        >>>
 
-        >>> # Variable-length sequences
-        >>> q = jnp.ones((1, 150, 8, 64))  # batch=1 for varlen
+        >>>
+        >>> q = jnp.ones((1, 150, 8, 64))
         >>> k = jnp.ones((1, 150, 8, 64))
         >>> v = jnp.ones((1, 150, 8, 64))
-        >>> cu_seqlens = jnp.array([0, 50, 100, 150])  # 3 sequences
+        >>> cu_seqlens = jnp.array([0, 50, 100, 150])
         >>> output, final_state = lightning_attn(
         ...     query, key, value, layer_idx=10, num_layers=24, cu_seqlens=cu_seqlens
         ... )
     """
     if cu_seqlens is not None:
-        if q.shape[0] != 1:
+        if query.shape[0] != 1:
             raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`. "
+                f"The batch size is expected to be 1 rather than {query.shape[0]} when using `cu_seqlens`. "
                 f"Please flatten variable-length inputs before processing."
             )
         if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
@@ -108,11 +112,9 @@ def lightning_attn(
             )
 
     if scale is None:
-        scale = k.shape[-1] ** -0.5
+        scale = key.shape[-1] ** -0.5
 
-    # Compute layer-dependent decay factor
-    # Formula: -(8 / num_heads) * (1 - layer_idx / num_layers) for each head
-    num_heads = q.shape[2] if q.ndim == 4 else q.shape[1]
+    num_heads = query.shape[2] if query.ndim == 4 else query.shape[1]
     g_gamma = -(8 / num_heads * (1 - layer_idx / num_layers)) * jnp.arange(num_heads, dtype=jnp.float32)
 
     return recurrent(

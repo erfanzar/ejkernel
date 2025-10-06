@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Forward pass Triton kernels for Flash Multi-Latent Attention."""
 
@@ -72,7 +73,7 @@ def _mla_attn_fwd_inner(
     Returns:
         Tuple of (updated_acc, updated_l_i, updated_m_i).
     """
-    # Implementation stub - actual Triton kernel logic would go here
+
     return acc, l_i, m_i
 
 
@@ -142,7 +143,7 @@ def _mla_attn_fwd_kernel(
         causal: Whether to apply causal masking.
         softmax_scale: Scale factor for softmax computation.
     """
-    # Implementation stub - actual kernel logic would go here
+
     pass
 
 

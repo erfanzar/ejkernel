@@ -1,7 +1,24 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 import functools
 import math
 
 import jax
+import jaxtyping
+from beartype import beartype
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
@@ -22,7 +39,7 @@ def _transpose_layout_q2k_to_k2q(layout_q2k: jnp.ndarray, degree_q2k: jnp.ndarra
             kb = int(layout_q2k[qb, li])
             if 0 <= kb < n_k_blocks:
                 lists[kb].append(qb)
-    # Truncate/pad to max_degree_k
+
     layout_k2q = -jnp.ones((n_k_blocks, max_degree_k), dtype=jnp.int32)
     degree_k2q = jnp.zeros((n_k_blocks,), dtype=jnp.int32)
     for kb in range(n_k_blocks):
@@ -30,7 +47,7 @@ def _transpose_layout_q2k_to_k2q(layout_q2k: jnp.ndarray, degree_q2k: jnp.ndarra
         degree_k2q = degree_k2q.at[kb].set(deg)
         if deg > 0:
             layout_k2q = layout_k2q.at[kb, :deg].set(jnp.array(lists[kb][:deg], dtype=jnp.int32))
-    # Replace -1 with 0 (kernel masks with degree)
+
     layout_k2q = jnp.where(layout_k2q < 0, 0, layout_k2q)
     return layout_k2q, degree_k2q
 
@@ -50,7 +67,6 @@ def _jax_fwd_blocksparse_call(
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    # blocksparse-specific
     layout: Int[Array, "n_q_blocks max_degree"] | None = None,
     degree: Int[Array, "n_q_blocks"] | None = None,
     max_degree: int = 0,
@@ -78,7 +94,7 @@ def _jax_fwd_blocksparse_call(
         force_block_m=force_block_m,
         force_block_n=force_block_n,
     )
-    # Residuals: stash layout/meta for bwd
+
     return out, (
         query,
         key,
@@ -131,11 +147,9 @@ def _jax_bwd_blocksparse_call(
         softmax_aux,
     ) = residual
 
-    # Use the same window/softcap as forward if backward args are None
     window = sliding_window if sliding_window is not None else sliding_window_fwd
     cap = logits_soft_cap if logits_soft_cap is not None else logits_soft_cap_fwd
 
-    # Build K->Q layout if Q->K provided
     if layout_q2k is not None:
         if force_block_m == 0 or force_block_n == 0:
             raise ValueError("blocksparse backward requires force_block_m/force_block_n when using layout")
@@ -143,7 +157,7 @@ def _jax_bwd_blocksparse_call(
         KSeq = key.shape[1]
         _n_q_blocks = math.ceil(QSeq / force_block_m)
         n_k_blocks = math.ceil(KSeq / force_block_n)
-        max_degree_k = max_degree  # can choose different if you want
+        max_degree_k = max_degree
         layout_k2q, degree_k2q = _transpose_layout_q2k_to_k2q(layout_q2k, degree_q2k, n_k_blocks, max_degree_k)
     else:
         layout_k2q = degree_k2q = None
@@ -229,22 +243,8 @@ blocksparse_attention_call.defvjp(_jax_fwd_blocksparse_call, _jax_bwd_blockspars
 
 
 @kernel_registry.register("block_sparse_attention_GPU", Platform.TRITON, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def blocksparse_attention(
-    # query: Float[Array, "batch num_heads seq_len head_dim"],
-    # key: Float[Array, "batch kv_num_heads kv_len head_dim"],
-    # value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-    # q_segment_ids: Int[Array, "batch seq_len"] | None = None,
-    # kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
-    # softmax_aux: Float[Array, "..."] | None = None,
-    # logit_soft_cap: float | None = None,
-    # query_chunk_size: int = 128,
-    # key_chunk_size: int = 128,
-    # softmax_scale: float | None = None,
-    # mask_builder: typing.Callable[[int, int, int, int, int], Mask] | None = None,
-    # sliding_window: int | tuple[int, int] | None = None,
-    # chunk_size: int | None = None,
-    # causal: bool = True,
-    # fused_backward: bool = False,
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
@@ -270,11 +270,11 @@ def blocksparse_attention(
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     debug: bool = False,
-):
+) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], Float[Array, "batch num_heads seq_len_q"]]:
     del precision, logits_dtype, debug
     if q_segment_ids is not None or kv_segment_ids is not None:
         raise NotImplementedError("segment_ids are not supported in Triton implementation.")
-    # Call returns (out, residuals) where residuals contains lse at position 6
+
     out, residuals = blocksparse_attention_call(
         query=query,
         key=key,
@@ -296,6 +296,6 @@ def blocksparse_attention(
         force_block_m=force_block_m,
         force_block_n=force_block_n,
     )
-    # Extract LSE from residuals (it's at position 6)
+
     lse = residuals[6]
     return out, lse

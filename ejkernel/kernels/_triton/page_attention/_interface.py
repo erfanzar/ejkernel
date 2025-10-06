@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
 
 import jax
 import jax.numpy as jnp
+import jaxtyping
+from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ejkernel.callib import cdiv, strides_from_shape, triton_call
@@ -24,6 +26,7 @@ from ._triton_impl_fwd import _paged_attn_kernel, _paged_attn_v2_reduce_kernel
 
 
 @kernel_registry.register("page_attention", Platform.TRITON, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def page_attention(
     query: Float[Array, "num_seqs num_heads head_dim"],
     key_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],
@@ -61,19 +64,17 @@ def page_attention(
     if max_context_len is None:
         max_context_len = int(context_lens.max())
 
-    # Compute padded group size
     if query_group_size == 1:
         padded_group_size = 1
     elif query_group_size < 16:
         padded_group_size = 16
     else:
-        padded_group_size = 1 << (query_group_size - 1).bit_length()  # next power of 2
+        padded_group_size = 1 << (query_group_size - 1).bit_length()
 
     assert head_size in (16, 32, 64, 128, 256, 512), f"head_size={head_size}"
     assert padded_group_size == 1 or kv_block_size >= 16, f"kv_block_size={kv_block_size}"
 
-    # Determine partitioning strategy
-    num_sms = 108  # Default for A100, can be made dynamic
+    num_sms = 108
     if num_splits == 0:
         if num_seqs * num_kv_heads > 2 * num_sms:
             num_splits = 1
@@ -87,21 +88,18 @@ def page_attention(
                 num_splits = 1
     elif num_splits > 1:
         partition_size = cdiv(max_context_len, num_splits)
-        partition_size = 1 << (partition_size - 1).bit_length()  # next power of 2
+        partition_size = 1 << (partition_size - 1).bit_length()
 
-    # Compute strides using eformer utility
     stride_bt0, stride_bt1 = strides_from_shape(block_tables.shape)
     stride_q0, stride_q1, stride_q2 = strides_from_shape(query.shape)
     stride_kv0, stride_kv1, stride_kv2, stride_kv3 = strides_from_shape(key_cache.shape)
 
     if num_splits == 1:
-        # Single-pass attention
         out_shape = jax.ShapeDtypeStruct(query.shape, query.dtype)
 
         def grid(meta):
             return (num_seqs, num_kv_heads, 1)
 
-        # out strides same as query for single-pass
         stride_o0 = stride_q0
         stride_o1 = stride_q1
         stride_o2 = stride_q2
@@ -148,7 +146,6 @@ def page_attention(
         )
 
     else:
-        # Multi-pass attention with reduction
         tmp_out_shape = jax.ShapeDtypeStruct(
             (num_seqs, num_kv_heads, num_splits, query_group_size, head_size),
             query.dtype,
@@ -176,7 +173,6 @@ def page_attention(
             PARTITION_SIZE=partition_size,
         )
 
-        # Compute tmp_out strides: [num_seqs, num_kv_heads, num_splits, query_group_size, head_size]
         stride_tmp0, stride_tmp1, stride_tmp2, stride_tmp3, stride_tmp4 = strides_from_shape(
             (num_seqs, num_kv_heads, num_splits, query_group_size, head_size)
         )
@@ -197,8 +193,6 @@ def page_attention(
         metaparams["stride_o3"] = stride_tmp3
         metaparams["stride_o4"] = stride_tmp4
 
-        # First pass: compute partial outputs
-        # Kernel signature has inputs first, then outputs: q, k, v, context_lens, block_tables, m_i_ptr, l_i_ptr, out_ptr
         m_i, l_i, tmp_out = triton_call(
             query,
             key_cache,
@@ -210,13 +204,12 @@ def page_attention(
             **metaparams,
         )
 
-        # Second pass: reduce partial outputs
         out_shape = jax.ShapeDtypeStruct(query.shape, query.dtype)
 
         def reduce_grid(meta):
             return (num_seqs, num_kv_heads)
 
-        next_num_splits = 1 << (num_splits - 1).bit_length()  # next power of 2
+        next_num_splits = 1 << (num_splits - 1).bit_length()
 
         reduce_metaparams = dict(
             grid=reduce_grid,

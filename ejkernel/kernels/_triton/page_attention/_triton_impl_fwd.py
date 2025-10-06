@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import triton
 import triton.language as tl
 
@@ -20,7 +21,6 @@ def get_autotune_configs():
     """Generate dimension-aware autotune configurations for paged attention."""
     configs = []
 
-    # Small workloads: Less warps, more stages for memory latency hiding
     configs.extend(
         [
             triton.Config({}, num_warps=2, num_stages=4),
@@ -29,7 +29,6 @@ def get_autotune_configs():
         ]
     )
 
-    # Medium workloads: Balanced warps and stages
     configs.extend(
         [
             triton.Config({}, num_warps=8, num_stages=2),
@@ -38,7 +37,6 @@ def get_autotune_configs():
         ]
     )
 
-    # Large workloads: More warps for compute parallelism
     configs.extend(
         [
             triton.Config({}, num_warps=16, num_stages=2),
@@ -52,14 +50,14 @@ def get_autotune_configs():
 
 @triton.jit
 def _paged_attn_kernel(
-    q_ptr,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
-    k_cache_ptr,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
-    v_cache_ptr,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
-    context_lens_ptr,  # [num_seqs]
-    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
-    m_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
-    l_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
-    out_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE, HEAD_SIZE]
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
+    m_i_ptr,
+    l_i_ptr,
+    out_ptr,
     attn_scale,
     stride_bt0,
     stride_bt1,
@@ -87,9 +85,6 @@ def _paged_attn_kernel(
     part_idx = tl.program_id(2)
     max_num_partitions = tl.num_programs(2)
 
-    # scale softmax_scale by log_2(e) and use
-    # 2^x instead of exp in the loop because CSE and LICM
-    # don't work as expected with `exp` in the loop
     log2e: tl.constexpr = 1.4426950408889634
 
     USE_PARTITIONING = PARTITION_SIZE > 0
@@ -110,14 +105,13 @@ def _paged_attn_kernel(
 
     kv_offset = kv_head_idx * stride_kv1 + block_offset[:, None] * stride_kv2 + head_offset[None, :] * stride_kv3
 
-    # Load queries.
     q_offset = (
         seq_idx * stride_q0
         + (kv_head_idx * QUERY_GROUP_SIZE + padding_group_offset[:, None]) * stride_q1
         + head_offset[None, :] * stride_q2
     )
     group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
-    # q: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
+
     q = tl.load(q_ptr + q_offset, mask=group_mask, other=0.0)
 
     m_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32) - float("inf")
@@ -132,15 +126,12 @@ def _paged_attn_kernel(
         block_idx = num_prev_blocks + i
         block_number = tl.load(block_tables_ptr + seq_idx * stride_bt0 + block_idx * stride_bt1)
 
-        # Load a key block.
         kv_block_offset = block_number * stride_kv0 + kv_offset
         mask_offset = block_idx * KV_BLOCK_SIZE + block_offset
         kv_mask = mask_offset[:, None] < context_len
 
-        # k: [KV_BLOCK_SIZE, HEAD_SIZE]
         k = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
 
-        # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         if PADDED_QUERY_GROUP_SIZE == 1:
             qk = tl.sum(q[:, None, :] * k[None, :, :], axis=2)
         else:
@@ -151,12 +142,10 @@ def _paged_attn_kernel(
 
         m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
 
-        # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         p = tl.math.exp2((qk - m_i_new[:, None]) * log2e)
         alpha = tl.math.exp2((m_i - m_i_new) * log2e)
         acc *= alpha[:, None]
 
-        # v: [KV_BLOCK_SIZE, HEAD_SIZE]
         v = tl.load(v_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
 
         if PADDED_QUERY_GROUP_SIZE == 1:
@@ -196,18 +185,17 @@ try:
         key=["HEAD_SIZE", "QUERY_GROUP_SIZE", "KV_BLOCK_SIZE", "PARTITION_SIZE"],
     )(_paged_attn_kernel)
 except Exception:
-    # Fallback if autotune fails - use reasonable defaults
     pass
 
 
 @triton.jit
 def _paged_attn_v2_reduce_kernel(
-    m_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
-    l_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
-    tmp_out_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE, HEAD_SIZE]
-    context_lens_ptr,  # [num_seqs]
-    out_ptr,  # [num_seqs, NUM_KV_HEADS, QUERY_GROUP_SIZE, HEAD_SIZE]
-    max_num_partitions,  # partition stride
+    m_i_ptr,
+    l_i_ptr,
+    tmp_out_ptr,
+    context_lens_ptr,
+    out_ptr,
+    max_num_partitions,
     stride_o0,
     stride_o1,
     stride_o2,
@@ -234,7 +222,6 @@ def _paged_attn_v2_reduce_kernel(
         tl.store(out_ptr + out_offset, tmp_out)
         return
 
-    # Get the global max logit.
     ml_offset = (
         (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE
         + tl.arange(0, NUM_PARTITIONS)[:, None] * QUERY_GROUP_SIZE
@@ -242,18 +229,16 @@ def _paged_attn_v2_reduce_kernel(
     )
 
     mask = tl.arange(0, NUM_PARTITIONS)[:, None] < num_partitions
-    # m_i: [NUM_PARTITIONS, QUERY_GROUP_SIZE]
+
     m_i = tl.load(m_i_ptr + ml_offset, mask=mask, other=float("-inf"))
-    # m: [QUERY_GROUP_SIZE]
+
     m = tl.max(m_i, axis=0)
 
-    # Rescale the exp sums and compute the global sum.
-    # l_i: [NUM_PARTITIONS, QUERY_GROUP_SIZE]
     l_i = tl.load(l_i_ptr + ml_offset, mask=mask, other=0.0)
     l_i *= tl.exp(m_i - m[None, :])
-    # l: [QUERY_GROUP_SIZE]
+
     l = tl.sum(l_i, axis=0)
-    # r: [NUM_PARTITIONS, QUERY_GROUP_SIZE]
+
     r = l_i / l[None, :]
     r = tl.reshape(r, (NUM_PARTITIONS, QUERY_GROUP_SIZE, 1))
 
@@ -263,9 +248,9 @@ def _paged_attn_v2_reduce_kernel(
         + tl.arange(0, QUERY_GROUP_SIZE)[None, :, None] * HEAD_SIZE
         + tl.arange(0, HEAD_SIZE)[None, None, :]
     )
-    # tmp_out: [NUM_PARTITIONS, QUERY_GROUP_SIZE, HEAD_SIZE]
+
     tmp_out = tl.load(tmp_out_ptr + tmp_out_offset, mask=mask[:, :, None], other=0.0)
-    # out: [QUERY_GROUP_SIZE, HEAD_SIZE]
+
     out = tl.sum((tmp_out * r).to(tl.float32), axis=0)
 
     out_offset = seq_idx * stride_o0 + kv_head_idx * QUERY_GROUP_SIZE * stride_o1 + group_head_offset * stride_o2

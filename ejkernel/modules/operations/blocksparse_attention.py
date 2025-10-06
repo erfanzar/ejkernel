@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Attention module with automatic optimization."""
 
 from __future__ import annotations
@@ -90,7 +91,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
         Returns:
             Default configuration with block sizes
         """
-        # Default block sizes for flash block_sparse_attention
+
         return KernelConfig(
             block_q=128,
             block_k=128,
@@ -117,7 +118,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
             The autotuning system will benchmark each candidate and select
             the fastest one for the given input configuration.
         """
-        # Common block size combinations for autotuning
+
         block_configs = [
             (128, 128),
             (128, 256),

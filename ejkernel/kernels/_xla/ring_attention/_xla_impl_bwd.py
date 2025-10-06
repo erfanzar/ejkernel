@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -282,7 +282,7 @@ def _ring_attention_bwd(
     q_block_size, kv_block_size = (
         q_len,
         kv_len,
-    )  # assumes this function is pre-sharded inside shard_map
+    )
 
     def scan_kv_block(carry, idx):
         dq, dk, dv, key, value = carry
@@ -328,5 +328,5 @@ def _ring_attention_bwd(
 
     (dq, dk, dv, key, value), _ = lax.scan(scan_kv_block, init=(dq, dk, dv, key, value), xs=jnp.arange(0, axis_size))
     dq, dk, dv = dq.astype(query.dtype), dk.astype(key.dtype), dv.astype(key.dtype)
-    # Return gradients for: query, key, value, bias, q_segment_ids, kv_segment_ids, softmax_aux
+
     return dq, dk, dv, None, None, None, None

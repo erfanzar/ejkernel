@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from functools import partial
 
 import jax
 import jax.numpy as jnp
+import jaxtyping
+from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -43,7 +46,6 @@ def _recurrent_core(
             query, key, value, cu_seqlens, g, g_gamma, gk, gv, scale, initial_state, reverse
         )
     else:
-        # Forward returns (output, hidden_states, final_state), but we only expose (output, final_state)
         output, _, final_state = _recurrent_attention_fwd(
             query, key, value, g, g_gamma, gk, gv, scale, initial_state, reverse
         )
@@ -67,23 +69,21 @@ def _recurrent_fwd(
     tuple,
 ]:
     """Forward with residuals for backward."""
-    # Ensure we have actual values for backward (not None)
+
     if scale is None:
         scale = 1.0 / jnp.sqrt(query.shape[-1]).astype(jnp.float32)
     if g is None:
-        g = jnp.zeros_like(q)
+        g = jnp.zeros_like(query)
     if g_gamma is None:
         g_gamma = jnp.zeros((query.shape[2],))
     if gk is None:
-        gk = jnp.zeros_like(q)
+        gk = jnp.zeros_like(query)
     if gv is None:
-        gv = jnp.zeros_like(q)
+        gv = jnp.zeros_like(query)
     if initial_state is None:
         initial_state = jnp.zeros((query.shape[0], query.shape[2], query.shape[3], query.shape[3]))
 
-    # Call forward directly (not through _recurrent_core to avoid recursion)
     if cu_seqlens is not None:
-        # Varlen doesn't support storing hidden states yet
         raise NotImplementedError("Custom backward for varlen not yet implemented")
     else:
         o, hidden_states, final_state = _recurrent_attention_fwd(
@@ -106,17 +106,14 @@ def _recurrent_bwd(
     query, key, value, g, g_gamma, gk, gv, hidden_states, initial_state = residuals
     do, dfinal_state = grads
 
-    # Compute scale if None (same as forward)
     if scale_nondiff is None:
         scale = 1.0 / jnp.sqrt(query.shape[-1]).astype(jnp.float32)
     else:
         scale = scale_nondiff
 
-    # For now, only support fixed-length backward (not varlen)
     if cu_seqlens is not None:
         raise NotImplementedError("Variable-length backward not yet implemented")
 
-    # Call custom backward implementation
     dq, dk, dv, dg, dgk, dgv, dinitial_state = _recurrent_attention_bwd(
         query, key, value, g, g_gamma, gk, gv, hidden_states, do, dfinal_state, scale, initial_state, reverse
     )
@@ -128,6 +125,7 @@ _recurrent_core.defvjp(_recurrent_fwd, _recurrent_bwd)
 
 
 @kernel_registry.register("recurrent", Platform.XLA, Backend.ANY)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def recurrent(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -173,27 +171,27 @@ def recurrent(
             - final_state: Final hidden state [batch, num_heads, head_dim, head_dim]
 
     Examples:
-        >>> # Standard recurrent attention
-        >>> q = jnp.ones((2, 100, 8, 64))
-        >>> k = jnp.ones((2, 100, 8, 64))
-        >>> v = jnp.ones((2, 100, 8, 64))
-        >>> output, final_state = recurrent(query, key, v)
+        >>>
+        >>> query = jnp.ones((2, 100, 8, 64))
+        >>> key = jnp.ones((2, 100, 8, 64))
+        >>> value = jnp.ones((2, 100, 8, 64))
+        >>> output, final_state = recurrent(query, key, value)
         >>> output.shape
         (2, 100, 8, 64)
 
-        >>> # GLA with gating
+        >>>
         >>> g = jnp.ones((2, 100, 8, 64))
         >>> output, final_state = recurrent(query, key, value, g=g)
 
-        >>> # Lightning attention with per-head decay
+        >>>
         >>> g_gamma = -jnp.arange(8, dtype=jnp.float32) * 0.1
         >>> output, final_state = recurrent(query, key, value, g_gamma=g_gamma)
 
-        >>> # Variable-length sequences
-        >>> q = jnp.ones((150, 8, 64))  # 150 total tokens
-        >>> k = jnp.ones((150, 8, 64))
-        >>> v = jnp.ones((150, 8, 64))
-        >>> cu_seqlens = jnp.array([0, 50, 100, 150])  # 3 sequences
+        >>>
+        >>> query = jnp.ones((150, 8, 64))
+        >>> key = jnp.ones((150, 8, 64))
+        >>> value = jnp.ones((150, 8, 64))
+        >>> cu_seqlens = jnp.array([0, 50, 100, 150])
         >>> output, final_state = recurrent(query, key, value, cu_seqlens=cu_seqlens)
         >>> output.shape
         (150, 8, 64)

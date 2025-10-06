@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import jax
 import jax.numpy as jnp
@@ -27,11 +28,11 @@ class MultiPageAsyncCopyDescriptor:
 
     def __init__(
         self,
-        pages_hbm_ref,  # [total_num_pages, page_size, num_combined_kv_heads_per_blk, head_dim]
-        vmem_buf,  # [num_kv_pages_per_blk, page_size, num_combined_kv_heads_per_blk, head_dim]
+        pages_hbm_ref,
+        vmem_buf,
         sem,
-        page_indices_ref,  # i32[max_num_seqs, pages_per_seq]
-        metadata,  # [seq_idx, start_page_idx, end_page_idx]
+        page_indices_ref,
+        metadata,
     ):
         self._vmem_buf = vmem_buf
         seq_id, start_page_idx, end_page_idx = metadata
@@ -59,12 +60,12 @@ class MultiPageAsyncCopyDescriptor:
 
 
 def ref_ragged_page_attention(
-    queries: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    kv_pages: jax.Array,  # [total_num_pages, page_size, num_combined_kv_heads, head_dim]
-    context_lens: jax.Array,  # i32[max_num_seqs]
-    block_tables: jax.Array,  # i32[max_num_seqs, pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    num_seqs: jax.Array,  # i32[1],
+    queries: jax.Array,
+    kv_pages: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -120,16 +121,14 @@ def ref_ragged_page_attention(
     return jnp.concatenate(outputs, axis=0)
 
 
-# Expect to run these checks during runtime.
 def dynamic_validate_inputs(
-    q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    kv_pages: jax.Array,  # [total_num_pages, page_size, num_combined_kv_heads, head_dim]
-    context_lens: jax.Array,  # i32[max_num_seqs]
-    block_tables: jax.Array,  # i32[max_num_seqs, pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    num_seqs: jax.Array,  # i32[1]
+    q: jax.Array,
+    kv_pages: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
     *,
-    # These inputs are optional. If not specified, we will not validate them.
     softmax_scale: float | None = None,
     sliding_window: int | None = None,
     logit_soft_cap: float | None = None,
@@ -173,16 +172,14 @@ def dynamic_validate_inputs(
             raise ValueError(f"{q_len=} must be less or equal to {kv_len=} at sequence {i}.")
 
 
-# Expect to run these checks during compile time.
 def static_validate_inputs(
-    q: jax.Array,  # [max_num_batched_tokens, num_q_heads, head_dim]
-    kv_pages: jax.Array,  # [total_num_pages, page_size, num_combined_kv_heads, head_dim]
-    context_lens: jax.Array,  # i32[max_num_seqs]
-    block_tables: jax.Array,  # i32[max_num_seqs, pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
-    num_seqs: jax.Array,  # i32[1]
+    q: jax.Array,
+    kv_pages: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
     *,
-    # These inputs are optional. If not specified, we will not validate them.
     softmax_scale: float | None = None,
     sliding_window: int | None = None,
     logit_soft_cap: float | None = None,
@@ -226,28 +223,24 @@ def static_validate_inputs(
         raise ValueError(f"{num_queries_per_block=} must be positive.")
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
-    del softmax_scale  # No constraints on softmax_scale.
-    del mask_value  # No consstraints on mask_value.
+    del softmax_scale
+    del mask_value
 
 
 def ragged_page_attention_kernel(
-    # Prefetch
-    context_lens_ref,  # [max_num_seqs]
-    page_indices_ref,  # [max_num_seqs, pages_per_seq]
-    cu_q_lens_ref,  # [max_num_seqs + 1]
+    context_lens_ref,
+    page_indices_ref,
+    cu_q_lens_ref,
     seq_buf_idx_ref,
     num_seqs_ref,
-    # Input
-    q_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
-    kv_pages_hbm_ref,  # [total_num_pages, page_size, num_combined_kv_heads, head_dim]
-    # Output
-    o_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
-    # Scratch
-    kv_bufs,  # [2, num_kv_pages_per_blk, page_size, num_combined_kv_heads_per_blk, head_dim]
-    sems,  # [2, 2]
-    l_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
-    m_ref,  # [num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128]
-    acc_ref,  # [num_q_per_blk, num_q_heads_per_blk, head_dim]
+    q_ref,
+    kv_pages_hbm_ref,
+    o_ref,
+    kv_bufs,
+    sems,
+    l_ref,
+    m_ref,
+    acc_ref,
     *,
     softmax_scale: float,
     sliding_window: int | None = None,
@@ -287,8 +280,6 @@ def ragged_page_attention_kernel(
         )
         return async_copy_kv
 
-    # 1. Support arbitrary strided load/store for int4 and int8 dtype.
-    # 2. Support arbitrary strided load/store for any last dimension.
     def strided_load_kv(ref, start, step):
         packing = get_dtype_packing(ref.dtype)
         if packing == 1:
@@ -376,12 +367,12 @@ def ragged_page_attention_kernel(
             return next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
 
         def flash_attention(
-            q,  # [num_q_per_blk * num_q_heads_per_kv_head, head_dim]
-            k,  # [num_kv_per_blk, head_dim]
-            v,  # [num_kv_per_blk, head_dim]
-            head_l_ref,  # [num_q_per_blk * num_q_heads_per_kv_head, 128]
-            head_m_ref,  # [num_q_per_blk * num_q_heads_per_kv_head, 128]
-            head_acc_ref,  # [num_q_per_blk, num_q_heads_per_kv_head, head_dim]
+            q,
+            k,
+            v,
+            head_l_ref,
+            head_m_ref,
+            head_acc_ref,
             *,
             kv_blk_idx,
         ):
@@ -421,7 +412,6 @@ def ragged_page_attention_kernel(
             def load_with_init(ref, init_val):
                 return jnp.where(kv_blk_idx == 0, jnp.full_like(ref, init_val), ref[...])
 
-            # kv lens will be contracting dim, we should mask out the NaNs.
             kv_mask = lax.broadcasted_iota(jnp.int32, k.shape, 0) < kv_len - kv_len_start
             k = jnp.where(kv_mask, k.astype(jnp.float32), 0).astype(k.dtype)
             v = jnp.where(kv_mask, v.astype(jnp.float32), 0).astype(v.dtype)
@@ -481,7 +471,7 @@ def ragged_page_attention_kernel(
                 assert len(arr.shape) == len(shape)
                 assert arr.shape[0] == shape[0]
                 assert shape[1] % arr.shape[1] == 0
-                # no-op concatenation.
+
                 return jnp.concatenate([arr for _ in range(shape[1] // arr.shape[1])], axis=1)
 
             o_curr = load_with_init(head_acc_ref, 0.0).reshape(-1, head_dim)
@@ -511,7 +501,6 @@ def ragged_page_attention_kernel(
 
             @pl.when(next_heads_blk_idx < num_heads_blks)
             def prefetch_next_kv_blk():
-                # DMA to fixed size buffer!
                 next_async_copy_kv = create_kv_async_copy_descriptors(
                     next_heads_blk_idx, next_seq_idx, next_kv_blk_idx, next_buf_idx
                 )
@@ -523,7 +512,7 @@ def ragged_page_attention_kernel(
                 head_dim,
             )
             kv_packing = get_dtype_packing(kv_ref.dtype)
-            # NOTE: kv_packing is divided by 2 because k and v are packed together.
+
             kv_load_step = max(1, kv_packing // 2)
             for kv_head_chunk_idx in range(0, num_kv_heads_per_blk, kv_load_step):
                 k_list, v_list = strided_load_kv(kv_ref, kv_head_chunk_idx * 2, num_combined_kv_heads_per_blk)
@@ -547,7 +536,7 @@ def ragged_page_attention_kernel(
         _, next_buf_idx = lax.while_loop(
             is_valid_kv_blk_in_cur_seq,
             compute_with_kv_blk_in_cur_seq,
-            (0, cur_buf_idx),  # (kv_blk_idx, buf_idx)
+            (0, cur_buf_idx),
         )
         next_seq_idx = lax.select(q_end <= q_len_end, cur_seq_idx + 1, cur_seq_idx)
         done = lax.select(q_end < q_len_end, done, 1)
@@ -556,9 +545,9 @@ def ragged_page_attention_kernel(
     _, seq_idx, buf_idx = lax.while_loop(
         is_cur_q_blk_needed,
         compute_with_cur_q_blk,
-        (0, init_seq_idx, init_buf_idx),  # (done, seq_idx, buf_idx)
+        (0, init_seq_idx, init_buf_idx),
     )
-    # Reset seq_idx for next kv_heads_blk if run out of seqs!
+
     seq_buf_idx_ref[0] = lax.select(seq_idx < num_seqs, seq_idx, 0)
     seq_buf_idx_ref[1] = buf_idx
     o_ref[...] = acc_ref[...].astype(q_ref.dtype)
@@ -590,7 +579,7 @@ def get_min_heads_per_blk(num_q_heads, num_combined_kv_heads, q_dtype, kv_dtype)
     num_kv_heads = num_combined_kv_heads // 2
     assert num_q_heads % num_kv_heads == 0
     ratio = num_q_heads // num_kv_heads
-    # second minor tiling is not on.
+
     max_combined_kv_tiling = 8 * kv_packing
     min_combined_kv_heads = (
         max_combined_kv_tiling if num_combined_kv_heads % max_combined_kv_tiling == 0 else num_combined_kv_heads

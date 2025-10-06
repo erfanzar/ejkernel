@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Core kernel infrastructure for configurable JAX operations.
 
@@ -195,7 +196,7 @@ class Kernel(Generic[Cfg, Out]):
 
         Example:
             >>> def prepare(self, x, y, **kwargs):
-            ...     # Ensure inputs are JAX arrays
+            ...
             ...     x = jnp.asarray(x)
             ...     y = jnp.asarray(y)
             ...     return (x, y), kwargs
@@ -246,7 +247,7 @@ class Kernel(Generic[Cfg, Out]):
 
         Example:
             >>> def heuristic_cfg(self, inv) -> MatMulConfig:
-            ...     # Choose precision based on input dtypes
+            ...
             ...     dtype = inv.args[0].dtype
             ...     precision = 'bfloat16' if dtype == jnp.bfloat16 else 'float32'
             ...     return MatMulConfig(precision=precision)
@@ -302,7 +303,7 @@ class Kernel(Generic[Cfg, Out]):
         Example:
             >>> def fwd_with_residuals(self, x, y, cfg):
             ...     result = jnp.dot(x, y)
-            ...     residuals = (x, y, cfg)  # Save inputs for backward pass
+            ...     residuals = (x, y, cfg)
             ...     return result, residuals
 
         Note:

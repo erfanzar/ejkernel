@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,9 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
 from functools import partial
 
 import jax
+import jaxtyping
+from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -93,6 +97,7 @@ _mean_pooling.defvjp(_fwd_call, _bwd_call)
 
 
 @kernel_registry.register("mean_pooling", Platform.TRITON, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def mean_pooling(
     x: Float[Array, "batch seq_len hidden_dim"],
     chunk_size: int = 32,

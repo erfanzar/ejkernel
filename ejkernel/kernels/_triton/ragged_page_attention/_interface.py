@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
 
 import jax
 import jax.numpy as jnp
+import jaxtyping
+from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ejkernel.callib import cdiv, triton_call
@@ -22,11 +24,11 @@ from ejkernel.callib import cdiv, triton_call
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_fwd import _ragged_paged_attn_prefetch_kernel_combined
 
-# Default mask value matching Pallas implementation
 DEFAULT_MASK_VALUE = -2.381976426469702e38
 
 
 @kernel_registry.register("ragged_page_attention", Platform.TRITON, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def ragged_page_attention(
     queries: Float[Array, "total_tokens num_q_heads head_dim"],
     kv_pages: Float[Array, "num_pages page_size num_combined_kv_heads head_dim"],
@@ -50,28 +52,25 @@ def ragged_page_attention(
     T, QH, D = queries.shape
     if softmax_aux is not None:
         raise NotImplementedError("`softmax_aux` is not implemented in triton impl yet!")
-    # Validate unsupported TPU-specific parameters
+
     if num_queries_per_block is not None:
         raise NotImplementedError("num_queries_per_block is TPU-specific and not supported on GPU")
     if vmem_limit_bytes is not None:
         raise NotImplementedError("vmem_limit_bytes is TPU-specific and not supported on GPU")
 
-    # Handle parameters with defaults
     if softmax_scale is None:
-        softmax_scale = 1.0 / (D**0.5)  # Default to 1/sqrt(head_dim)
+        softmax_scale = 1.0 / (D**0.5)
 
     kv_pages_per_block = num_kv_pages_per_block if num_kv_pages_per_block is not None else 8
 
-    # Default mask_value to large negative number (match Pallas default)
     if mask_value is None:
         mask_value = -2.381976426469702e38
 
-    # Set feature flags
     use_soft_cap = logit_soft_cap is not None
-    soft_cap_value = logit_soft_cap if use_soft_cap else 1.0  # dummy value when not used
+    soft_cap_value = logit_soft_cap if use_soft_cap else 1.0
 
     use_sliding_window = sliding_window is not None
-    sliding_window_size = sliding_window if use_sliding_window else 0  # dummy value when not used
+    sliding_window_size = sliding_window if use_sliding_window else 0
     _P, PS, C, Dk = kv_pages.shape
     assert D == Dk, "head_size mismatch"
     assert C % 2 == 0, "combined kv heads must be even"
@@ -86,7 +85,6 @@ def ragged_page_attention(
         pad = jnp.zeros((T_padded - T, KVH, QHG, D), dtype=q4.dtype)
         q4 = jnp.concatenate([q4, pad], axis=0)
 
-    # per-row metadata
     starts = query_start_loc[:-1]
     ends = query_start_loc[1:]
     q_lens = (ends - starts).astype(jnp.int32)
@@ -101,8 +99,7 @@ def ragged_page_attention(
     row_qoff = t_idx - row_start
     row_firstk = (row_kvlen - row_qlen + row_qoff).astype(jnp.int32)
 
-    # active rows gating
-    ns_dev = jnp.asarray(num_seqs, dtype=jnp.int32)  # 0-d device scalar
+    ns_dev = jnp.asarray(num_seqs, dtype=jnp.int32)
     row_valid = (t_idx < T) & (row_seq < ns_dev)
 
     KV_PAGES_PER_BLOCK = int(kv_pages_per_block)
@@ -131,7 +128,6 @@ def ragged_page_attention(
         MASK_VALUE=mask_value,
     )
 
-    # Remove hardcoded num_warps and num_stages to let autotune decide
     out4_padded = triton_call(
         q4,
         kv_pages,

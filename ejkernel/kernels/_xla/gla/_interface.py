@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import jaxtyping
+from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -19,6 +22,7 @@ from ..recurrent import recurrent
 
 
 @kernel_registry.register("gla", Platform.XLA, Backend.ANY)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def recurrent_gla(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -72,21 +76,21 @@ def recurrent_gla(
             does not match the number of sequences.
 
     Examples:
-        >>> # Standard GLA
+        >>>
         >>> q = jnp.ones((2, 100, 8, 64))
         >>> k = jnp.ones((2, 100, 8, 64))
         >>> v = jnp.ones((2, 100, 8, 64))
-        >>> g = jnp.ones((2, 100, 8, 64))  # Gate values
+        >>> g = jnp.ones((2, 100, 8, 64))
         >>> output, final_state = recurrent_gla(query, key, value, g=g)
         >>> output.shape
         (2, 100, 8, 64)
 
-        >>> # GLA with variable-length sequences
-        >>> q = jnp.ones((150, 8, 64))  # 150 total tokens
+        >>>
+        >>> q = jnp.ones((150, 8, 64))
         >>> k = jnp.ones((150, 8, 64))
         >>> v = jnp.ones((150, 8, 64))
         >>> g = jnp.ones((150, 8, 64))
-        >>> cu_seqlens = jnp.array([0, 50, 100, 150])  # 3 sequences
+        >>> cu_seqlens = jnp.array([0, 50, 100, 150])
         >>> output, final_state = recurrent_gla(query, key, value, g=g, cu_seqlens=cu_seqlens)
         >>> output.shape
         (150, 8, 64)

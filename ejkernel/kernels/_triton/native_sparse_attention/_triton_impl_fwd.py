@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import jax
 import triton
@@ -305,15 +306,11 @@ def nsa_fwd_kernel(
 
             b_mp = b_m
 
-    # Avoid division by zero: if no valid blocks were attended to, b_acc is 0
-    # In this case, output should be 0 (no attention) not NaN
     b_acc_safe = tl.where(b_acc == 0, 1.0, b_acc)
     b_o = b_o / b_acc_safe[:, None]
-    # Zero out output where no attention was computed
+
     b_o = tl.where(b_acc[:, None] == 0, 0.0, b_o)
 
-    # Fix lse: when b_acc is 0, log(b_acc) = -inf which causes issues in backward pass
-    # Set lse to 0 when no attention (backward will correctly compute 0 gradients)
     b_m_update = tl.log(b_acc)
     b_m = tl.where(b_acc == 0, 0.0, b_m + b_m_update)
 
@@ -379,7 +376,6 @@ def fwd_triton_impl(
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
 ):
-    # Unpack dimensions from input tensors for clarity
     batch_size, seq_len, num_q_heads, head_dim = q.shape
     _, _, num_kv_heads, _ = k.shape
     head_dim_v = v.shape[-1]
@@ -413,7 +409,6 @@ def fwd_triton_impl(
         BLOCKSIZE_V=triton_block_size_v,
     )
 
-    # Launch the Triton kernel
     attn_output, lse = triton_call(
         q,
         k,

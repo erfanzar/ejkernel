@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Multi-head Latent Attention (MLA) module with automatic optimization."""
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ class FlashMLA(Kernel[KernelConfig, Array]):
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len q_heads head_dim"]:
         """Execute flash MLA."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -152,16 +153,16 @@ def mla_attention(
         Attention output with same shape as query
 
     Example:
-        >>> # Standard MLA
+        >>>
         >>> out = mla_attention(query, key_value, w_kc, w_vc)
         >>>
-        >>> # With causal masking
+        >>>
         >>> out = mla_attention(query, key_value, w_kc, w_vc, causal=True)
         >>>
-        >>> # With RoPE biases
+        >>>
         >>> out = mla_attention(query, key_value, w_kc, w_vc, b_q=q_rope, b_k=k_rope)
             >>>
-        >>> # Force specific platform
+        >>>
         >>> out = mla_attention(..., platform="triton")
     """
     return _mla_executor(

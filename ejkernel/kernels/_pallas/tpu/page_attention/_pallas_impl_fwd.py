@@ -1,4 +1,4 @@
-# Copyright 2024 The JAX Authors.
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """PagedAttention TPU kernel."""
 
@@ -248,8 +249,6 @@ def paged_flash_attention_kernel_inline_seq_dim(
 ):
     core_index, b, h = pl.program_id(0), pl.program_id(1), pl.program_id(2)
 
-    # Initialize the output HBM buffers to avoid accessing garbage memory inside
-    # the kernel body below.
     m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
     l_ref[...] = jnp.zeros_like(l_ref)
     o_ref[...] = jnp.zeros_like(o_ref)

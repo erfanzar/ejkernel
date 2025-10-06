@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 from __future__ import annotations
 
@@ -90,17 +91,13 @@ class Profiler:
         self.max_events_per_profile = max_events_per_profile
         self.verbose = verbose
 
-        # Compile regex if provided
         self._pattern = re.compile(event_filter_regex) if event_filter_regex is not None else None
 
-        # TF profiler hook availability and logging behavior
         self.require_tf = require_tf
         self._tf_avail_cache: bool | None = None
         if silence_tf_cpp_logs and "TF_CPP_MIN_LOG_LEVEL" not in os.environ:
-            # Reduce TF C++ log verbosity if TF is present/loaded
             os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-    # ---------- TensorFlow hook detection ----------
     def _tf_python_profiler_available(self) -> bool:
         """Check once whether tensorflow.python.profiler.trace can be imported.
 
@@ -120,7 +117,6 @@ class Profiler:
             self._tf_avail_cache = False
         return self._tf_avail_cache
 
-    # ---------- XSpace parsing helpers ----------
     @staticmethod
     def parse_profile_from_bytes(profile_bytes: bytes):  # type: ignore
         """Parse JAX profile data from serialized bytes.
@@ -242,7 +238,6 @@ class Profiler:
         else:
             name = event.name
 
-        # Suppress specific pybind11 deprecation triggered by event.stats access
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
@@ -251,17 +246,16 @@ class Profiler:
             )
             stats = cls._parse_stats(event.stats, stat_metadata)
 
-        # GPU uses hlo_module, TPU uses name
         name = stats.get("hlo_module", name)
         program_id = stats.get("program_id", stats.get("run_id"))
         scope_range_id = stats.get("scope_range_id", "None")
         key = f"{name}({program_id}-{scope_range_id})"
 
-        if hasattr(event, "duration_ps"):  # TPU
+        if hasattr(event, "duration_ps"):
             start_ps = int(event.offset_ps)
             end_ps = start_ps + int(event.duration_ps)
             dur_ps = int(event.duration_ps)
-        else:  # GPU
+        else:
             start_ps = int(event.start_ns * 1000)
             end_ps = start_ps + int(event.duration_ns * 1000)
             dur_ps = int(event.duration_ns * 1000)
@@ -339,7 +333,6 @@ class Profiler:
         total += cur_e - cur_s
         return total
 
-    # ---------- Plane extraction ----------
     def get_events_from_plane(self, p: Any, plane_idx: int) -> dict[str, float]:
         """Extract and process events from a specific execution plane.
 
@@ -412,7 +405,6 @@ class Profiler:
         except Exception as e:
             raise ProfilingError(f"Failed to extract events from plane {plane_idx}: {e}") from e
 
-    # ---------- End-to-end trace + aggregate ----------
     def profile_time_by_function_id(
         self,
         timing_closure: Callable[[], None],
@@ -444,7 +436,7 @@ class Profiler:
             ProfilingError: If TensorFlow profiler hooks are not available or profiling fails
             RuntimeError: If no profile data is generated during execution
         """
-        # Check TF hooks first to avoid stderr spam from python_hooks.cc
+
         if self.require_tf and not self._tf_python_profiler_available():
             raise ProfilingError("TensorFlow Python profiler hooks are not available")
         if not self._tf_python_profiler_available():

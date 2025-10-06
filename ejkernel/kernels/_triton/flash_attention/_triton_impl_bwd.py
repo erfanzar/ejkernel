@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -117,8 +117,8 @@ def _attn_bwd_preprocess(
     max_seqlen_q_rounded,
     cum_seqlens_q,
     headdim,
-    CQSeq,  # Re-compile argument
-    DRuntime,  # Re-compile argument
+    CQSeq,
+    DRuntime,
     Delta,
     VARLEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -196,7 +196,6 @@ def _attn_bwd_dkdv(
     actual_seqlen_k,
     fully_masked_lines,
     headdim,
-    # NEW runtime params
     window_left,
     window_right,
     logits_soft_cap,
@@ -210,13 +209,12 @@ def _attn_bwd_dkdv(
     PAD_ROWS: tl.constexpr,
     PAD_COLS: tl.constexpr,
     HEADS_PADDED: tl.constexpr,
-    # NEW constexpr params
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
 ):
     BIG_NEG: tl.constexpr = -2147483648
-    LN2: tl.constexpr = 1.44269504089  # log2(e)
+    LN2: tl.constexpr = 1.44269504089
 
     q_ptrs = q_ptrs + index_start_m * stride_qm
     do_ptrs = do_ptrs + index_start_m * stride_dom
@@ -255,7 +253,6 @@ def _attn_bwd_dkdv(
         if BOOL_BIAS:
             qk = tl.where(bias, qk, BIG_NEG)
         else:
-            # Bias uses the same natural-scale convention as forward
             qk += bias / softmax_scale
 
     offs_n_causal = offs_n - actual_seqlen_k + actual_seqlen_q
@@ -272,7 +269,6 @@ def _attn_bwd_dkdv(
         elif IS_CAUSAL:
             qk = tl.where(offs_m_curr[:, None] >= offs_n_causal[None, :], qk, float("-inf"))
 
-    # Sliding window mask (aligned with causal frame)
     if SLIDING:
         shift = actual_seqlen_k - actual_seqlen_q
         j_aligned = offs_n[None, :] - shift
@@ -280,25 +276,21 @@ def _attn_bwd_dkdv(
         in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
         qk = tl.where(in_window, qk, float("-inf"))
 
-    # Match forward scaling exactly, including softcap
     if SOFTCAP:
-        # Natural-scale logits (no /LN2 division in backward): s = qk * softmax_scale
         s = qk * softmax_scale
         x = s / logits_soft_cap
         exp_2x = tl.exp(2.0 * x)
-        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)  # tanh(x)
-        # Back to log2 scale for exp2
+        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+
         qk_after = (logits_soft_cap * tanh_x) * LN2
-        # Chain rule: ds/d(qk) = softmax_scale; dz/ds = 1 - tanh^2(x)
+
         jac = softmax_scale * (1.0 - tanh_x * tanh_x)
     else:
-        # No softcap: identical to original path
         qk_after = qk * (softmax_scale * LN2)
         jac = softmax_scale
 
     tl.debug_barrier()
 
-    # p matches forward: exp2(log2-scale logits - me_i)
     p = tl.exp2(qk_after - me_i[:, None])
 
     if MASKED and (fully_masked_lines > 0):
@@ -347,7 +339,6 @@ def _attn_bwd_block_dkdv(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
-    # NEW runtime params
     window_left,
     window_right,
     logits_soft_cap,
@@ -362,7 +353,6 @@ def _attn_bwd_block_dkdv(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
-    # NEW constexpr params
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
@@ -533,13 +523,11 @@ def _attn_bwd_dq(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
-    # NEW runtime args
     window_left,
     window_right,
     logits_soft_cap,
     softmax_aux_ptrs,
     num_sinks,
-    # constexpr
     MASKED: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
@@ -547,13 +535,12 @@ def _attn_bwd_dq(
     USE_DROPOUT: tl.constexpr,
     PAD_COLS: tl.constexpr,
     HEADS_PADDED: tl.constexpr,
-    # NEW constexpr params
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
 ):
     BIG_NEG: tl.constexpr = -2147483648
-    LN2: tl.constexpr = 1.44269504089  # log2(e)
+    LN2: tl.constexpr = 1.44269504089
 
     k_ptrs = k_ptrs + index_start_n * stride_kn
     v_ptrs = v_ptrs + index_start_n * stride_vn
@@ -592,7 +579,6 @@ def _attn_bwd_dq(
         elif IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= offs_n_causal[None, :], qk, float("-inf"))
 
-    # Sliding-window mask (aligned to causal frame)
     if SLIDING:
         shift = actual_seqlen_k - actual_seqlen_q
         j_aligned = offs_n_curr[None, :] - shift
@@ -600,19 +586,16 @@ def _attn_bwd_dq(
         in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
         qk = tl.where(in_window, qk, float("-inf"))
 
-    # Match forward scaling exactly, including softcap
     if SOFTCAP:
-        # Natural-scale logits (no /LN2 division in backward): s = qk * softmax_scale
         s = qk * softmax_scale
         x = s / logits_soft_cap
         exp_2x = tl.exp(2.0 * x)
-        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)  # tanh(x)
-        # Back to log2 scale for exp2
+        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+
         qk_after = (logits_soft_cap * tanh_x) * LN2
-        # Chain rule: ds/d(qk) = softmax_scale; dz/ds = 1 - tanh^2(x)
+
         jac = softmax_scale * (1.0 - tanh_x * tanh_x)
     else:
-        # No softcap: identical to original path
         qk_after = qk * (softmax_scale * LN2)
         jac = softmax_scale
 
@@ -649,13 +632,11 @@ def _attn_bwd_block_dq(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
-    # NEW runtime args
     window_left,
     window_right,
     logits_soft_cap,
     softmax_aux_ptrs,
     num_sinks,
-    # constexpr
     VARLEN: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
@@ -667,7 +648,6 @@ def _attn_bwd_block_dq(
     BLOCK_N: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     EVEN_N: tl.constexpr,
-    # NEW constexpr
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
@@ -703,7 +683,6 @@ def _attn_bwd_block_dq(
     else:
         bias_ptrs = None
 
-    # Optional: align dropout offset indexing with forward (recommended)
     if USE_DROPOUT:
         dropout_offs = Dropout + offs_m[:, None] * actual_seqlen_k + offs_n[None, :]
     else:
@@ -942,7 +921,6 @@ def _attn_bwd(
     stride_dvh,
     nheads_q,
     num_repeats,
-    # NEW
     window_left,
     window_right,
     QSeq,
@@ -954,9 +932,9 @@ def _attn_bwd(
     CQSeq,
     CKSeq,
     DRuntime,
-    logits_soft_cap,  # NEW (runtime)
-    softmax_aux,  # NEW (runtime)
-    num_sinks,  # NEW (runtime)
+    logits_soft_cap,
+    softmax_aux,
+    num_sinks,
     Dq,
     Dk,
     Dv,
@@ -976,9 +954,9 @@ def _attn_bwd(
     BLOCK_N1: tl.constexpr,
     BLOCK_M2: tl.constexpr,
     BLOCK_N2: tl.constexpr,
-    SLIDING: tl.constexpr,  # NEW
-    SOFTCAP: tl.constexpr,  # NEW
-    USE_SINKS: tl.constexpr,  # NEW
+    SLIDING: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    USE_SINKS: tl.constexpr,
 ):
     """Main backward pass kernel for flash attention gradient computation.
 
@@ -1021,11 +999,9 @@ def _attn_bwd(
         actual_seqlen_k * (cu_seq_start_q + actual_seqlen_q * (off_head_q + nheads_q * off_z)) if USE_DROPOUT else None
     )
 
-    # Set up softmax_aux pointer for this head
     if USE_SINKS:
         softmax_aux_ptrs = softmax_aux + off_head_q * num_sinks
     else:
-        # Point to the dummy tensor (won't be accessed when USE_SINKS=False)
         softmax_aux_ptrs = softmax_aux
 
     D += off_zh * seqlen_q_rounded
@@ -1136,8 +1112,8 @@ def _bwd_attention_kernel_call(
     causal: bool,
     softmax_scale: float | None,
     dropout_seed: int | None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,
@@ -1168,7 +1144,7 @@ def _bwd_attention_kernel_call(
     Returns:
         tuple: Gradients (dq, dk, dv) for query, key, and value tensors
     """
-    # Sliding window
+
     if sliding_window is None:
         window_left = 0
         window_right = 0
@@ -1184,7 +1160,6 @@ def _bwd_attention_kernel_call(
         assert window_left >= 0 and window_right >= 0
         sliding_flag = (window_left > 0) or (window_right > 0)
 
-    # Handle logits soft cap
     if logits_soft_cap is None:
         logits_soft_cap_val = 0.0
         softcap_flag = False
@@ -1192,16 +1167,14 @@ def _bwd_attention_kernel_call(
         logits_soft_cap_val = float(logits_soft_cap)
         softcap_flag = True
 
-    # Handle softmax_aux (attention sinks)
     if softmax_aux is None:
         use_sinks = False
         num_sinks_val = 0
-        softmax_aux_tensor = jnp.zeros((1,), dtype=q.dtype)  # Dummy
+        softmax_aux_tensor = jnp.zeros((1,), dtype=q.dtype)
     else:
         use_sinks = True
-        # softmax_aux can be [num_sinks] or [num_heads, num_sinks]
+
         if softmax_aux.ndim == 1:
-            # Broadcast to all heads: [num_sinks] -> [num_heads, num_sinks]
             num_sinks_val = softmax_aux.shape[0]
             num_heads = q.shape[2]
             softmax_aux_tensor = jnp.broadcast_to(softmax_aux[None, :], (num_heads, num_sinks_val))
@@ -1211,14 +1184,12 @@ def _bwd_attention_kernel_call(
         else:
             raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
 
-        # Apply scaling and soft cap to aux logits (preprocessing)
         head_dim = q.shape[-1]
         scale = 1.0 / math.sqrt(float(head_dim)) if softmax_scale is None else softmax_scale
         softmax_aux_tensor = softmax_aux_tensor * scale
         if softcap_flag:
             softmax_aux_tensor = logits_soft_cap_val * jnp.tanh(softmax_aux_tensor / logits_soft_cap_val)
 
-    # Prefer VARLEN via cum arrays
     varlen_from_cu = (cum_seqlens_q is not None) and (cum_seqlens_k is not None)
     if varlen_from_cu:
         assert cum_seqlens_q.dtype == jnp.int32 and cum_seqlens_k.dtype == jnp.int32
@@ -1234,7 +1205,6 @@ def _bwd_attention_kernel_call(
         max_seqlen_q_rounded = math.ceil(max_seqlen_q / 128) * 128
         BLOCK_HEADDIM = max(triton.next_power_of_2(head_dim), 16)
 
-        # Pack with cum arrays (requires attention_pack_from_cu_static)
         from ._utilities import attention_pack_from_cu_static, attention_unpack_with_static_shape
 
         q_p = attention_pack_from_cu_static(q, cum_seqlens_q, max_tokens=batch_size * QSeq_max)
@@ -1249,7 +1219,6 @@ def _bwd_attention_kernel_call(
         kz, kn, kh, _ = get_strides(k_p)
         vz, vn, vh, _ = get_strides(v_p)
 
-        # Preprocess: Delta
         (delta,) = triton_call(
             o_p,
             dO_p,
@@ -1260,9 +1229,9 @@ def _bwd_attention_kernel_call(
             dom,
             doh,
             nheads_q,
-            max_seqlen_q,  # QSeq (max)
+            max_seqlen_q,
             max_seqlen_q_rounded,
-            cum_seqlens_q,  # int32 (FIXED dtype)
+            cum_seqlens_q,
             head_dim,
             max_seqlen_q // 32,
             dtype_index(q_p),
@@ -1274,14 +1243,13 @@ def _bwd_attention_kernel_call(
             name="triton::ops::_attn_bwd_preprocess",
         )
 
-        # Bias strides (unused when BIAS_ON=False)
         bz = bm = bh = 0
 
         dq, dk, dv = triton_call(
             q_p,
             k_p,
             v_p,
-            jnp.zeros((1,), q.dtype),  # bias dummy
+            jnp.zeros((1,), q.dtype),
             dO_p,
             M,
             delta,
@@ -1315,28 +1283,28 @@ def _bwd_attention_kernel_call(
             nheads_q,
             num_repeats,
             window_left,
-            window_right,  # NEW
-            max_seqlen_q,  # QSeq (max)
-            cum_seqlens_q,  # int32
-            max_seqlen_k,  # KSeq (max)
-            cum_seqlens_k,  # int32
+            window_right,
+            max_seqlen_q,
+            cum_seqlens_q,
+            max_seqlen_k,
+            cum_seqlens_k,
             max_seqlen_q_rounded,
             head_dim,
             max_seqlen_q // 32,
             max_seqlen_k // 32,
             dtype_index(q_p),
-            logits_soft_cap_val,  # NEW
-            softmax_aux_tensor,  # NEW
-            num_sinks_val,  # NEW
+            logits_soft_cap_val,
+            softmax_aux_tensor,
+            num_sinks_val,
             BIAS_ON=False,
             VARLEN=True,
             IS_CAUSAL=causal,
             USE_DROPOUT=(dropout_prob > 0),
             BLOCK_HEADDIM=BLOCK_HEADDIM,
             BOOL_BIAS=False,
-            SLIDING=sliding_flag,  # NEW
-            SOFTCAP=softcap_flag,  # NEW
-            USE_SINKS=use_sinks,  # NEW
+            SLIDING=sliding_flag,
+            SOFTCAP=softcap_flag,
+            USE_SINKS=use_sinks,
             kernel=_attn_bwd,
             grid=lambda META: (
                 triton.cdiv(max_seqlen_k, META["BLOCK_N1"]) + triton.cdiv(max_seqlen_q, META["BLOCK_M2"]),
@@ -1350,20 +1318,15 @@ def _bwd_attention_kernel_call(
             name="triton::ops::_attn_bwd",
         )
 
-        # Reduce repeats if needed
         if num_repeats > 1:
             dk = dk.reshape(dk.shape[0], dk.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)
             dv = dv.reshape(dv.shape[0], dv.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)
 
-        # Unpack to padded [B, S_max, H, D]
         dq = attention_unpack_with_static_shape(dq, cum_seqlens_q, batch_size, QSeq_max)
         dk = attention_unpack_with_static_shape(dk, cum_seqlens_k, batch_size, KSeq_max)
         dv = attention_unpack_with_static_shape(dv, cum_seqlens_k, batch_size, KSeq_max)
         return dq, dk, dv
 
-    # ------------------------------
-    # Legacy dense/attention_mask path
-    # ------------------------------
     if attention_mask is not None and varlen_from_cu:
         assert bias is None, "mask + bias not supported; use bias alone or pack bias."
         assert q.shape[1] == k.shape[1], "mask varlen path supports QSeq == KSeq only."
@@ -1436,7 +1399,7 @@ def _bwd_attention_kernel_call(
         nheads_q,
         QSeq,
         max_seqlen_q_rounded,
-        cum_seqlens_q if cum_seqlens_q is not None else jnp.zeros((1,), jnp.int32),  # FIX dtype
+        cum_seqlens_q if cum_seqlens_q is not None else jnp.zeros((1,), jnp.int32),
         head_dim,
         max_seqlen_q // 32,
         dtype_index(q),
@@ -1486,28 +1449,28 @@ def _bwd_attention_kernel_call(
         nheads_q,
         num_repeats,
         window_left,
-        window_right,  # NEW
+        window_right,
         QSeq,
-        cum_seqlens_q if cum_seqlens_q is not None else jnp.zeros((1,), jnp.int32),  # FIX dtype
+        cum_seqlens_q if cum_seqlens_q is not None else jnp.zeros((1,), jnp.int32),
         KSeq,
-        cum_seqlens_k if cum_seqlens_k is not None else jnp.zeros((1,), jnp.int32),  # FIX dtype
+        cum_seqlens_k if cum_seqlens_k is not None else jnp.zeros((1,), jnp.int32),
         max_seqlen_q_rounded,
         head_dim,
         max_seqlen_q // 32,
         max_seqlen_k // 32,
         dtype_index(q),
-        logits_soft_cap_val,  # NEW
-        softmax_aux_tensor,  # NEW
-        num_sinks_val,  # NEW
+        logits_soft_cap_val,
+        softmax_aux_tensor,
+        num_sinks_val,
         BIAS_ON=(bias is not None),
         VARLEN=varlen_mode,
         IS_CAUSAL=causal,
         USE_DROPOUT=(dropout_prob > 0),
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         BOOL_BIAS=BOOL_BIAS,
-        SLIDING=sliding_flag,  # NEW
-        SOFTCAP=softcap_flag,  # NEW
-        USE_SINKS=use_sinks,  # NEW
+        SLIDING=sliding_flag,
+        SOFTCAP=softcap_flag,
+        USE_SINKS=use_sinks,
         kernel=_attn_bwd,
         grid=lambda META: (
             triton.cdiv(KSeq, META["BLOCK_N1"]) + triton.cdiv(QSeq, META["BLOCK_M2"]),

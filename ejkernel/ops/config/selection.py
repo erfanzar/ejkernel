@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Configuration selection and autotuning system for kernel optimization.
 
@@ -45,12 +46,12 @@ Example Usage:
     >>> policy = AutotunePolicy(allow_autotune=True)
     >>> selector = ConfigSelectorChain(cache, policy)
     >>>
-    >>> # Will autotune on first call, cache result for subsequent calls
+    >>>
     >>> config = selector.choose(invocation, kernel)
     >>>
-    >>> # Temporarily disable autotuning
+    >>>
     >>> with policy_override(selector, allow_autotune=False):
-    ...     config = selector.choose(invocation, kernel)  # Uses heuristics
+    ...     config = selector.choose(invocation, kernel)
 """
 
 from __future__ import annotations
@@ -102,11 +103,11 @@ class policy_override:
 
     Example:
         >>> with policy_override(selector, allow_autotune=False):
-        ...     result = executor(kernel, *args)  # Uses heuristics only
-        >>> # allow_autotune is restored to original value here
+        ...     result = executor(kernel, *args)
+        >>>
 
         >>> with policy_override(selector, cache_miss_fallback="heuristics"):
-        ...     config = selector.choose(inv, kernel)  # Skip autotuning
+        ...     config = selector.choose(inv, kernel)
     """
 
     def __init__(self, selector: ConfigSelectorChain, **updates):
@@ -274,7 +275,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
         dev = device_fingerprint()
         op_id = f"{kernel.op_id}@v{getattr(kernel, 'version', '0')}"
         call_key = inv.make_key(kernel.key_builder)
-        # 1) explicit override
+
         if inv.override_cfg is not None:
             cfg = inv.override_cfg
             self._emit("override", device=dev, op_id=op_id, call_key=call_key, cfg=cfg)
@@ -283,26 +284,22 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                 self.persistent.put(dev, op_id, call_key, cfg)
             return cfg
 
-        # 2) overlay cache
         for overlay in reversed(_cache_overlay.get()):
             if (cfg := overlay.get((dev, op_id, call_key))) is not None:
                 self._emit("overlay_hit", device=dev, op_id=op_id, call_key=call_key, cfg=cfg)
                 return cfg
 
-        # 3) in-memory cache
         if (cfg := self.cache.get(dev, op_id, call_key)) is not None:
             self._emit("cache_hit", level="memory", device=dev, op_id=op_id, call_key=call_key, cfg=cfg)
             return cfg
 
-        # 4) persistent cache (optional)
         if self.persistent is not None:
             if (cfg := self.persistent.get(dev, op_id, call_key)) is not None:
                 self._emit("cache_hit", level="persistent", device=dev, op_id=op_id, call_key=call_key, cfg=cfg)
-                # hydrate in-memory cache
+
                 self.cache.put(dev, op_id, call_key, cfg)
                 return cfg
 
-        # 5) autotune
         if self.policy.cache_miss_fallback == "autotune" and self.policy.allow_autotune:
             if self.forbid_reautotune and (dev, op_id, call_key) in self._autotuned_keys:
                 raise RuntimeError(f"Re-autotune requested for {(dev, op_id, call_key)}")
@@ -327,17 +324,15 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
             self._emit("autotune_finish", device=dev, op_id=op_id, call_key=call_key, cfg=best)
             return best
 
-        # 6) heuristics
         if self.policy.allow_heuristics:
             cfg = kernel.heuristic_cfg(inv)
             self._emit("heuristics", device=dev, op_id=op_id, call_key=call_key, cfg=cfg)
-            # Optionally also populate caches for determinism across runs.
+
             self.cache.put(dev, op_id, call_key, cfg)
             if self.persistent is not None and self.persist_autotune:
                 self.persistent.put(dev, op_id, call_key, cfg)
             return cfg
 
-        # 7) error
         self._emit("error", device=dev, op_id=op_id, call_key=call_key, reason="no_config")
         raise RuntimeError("No config found: override/overlay/cache/persistent/autotune/heuristics all unavailable.")
 

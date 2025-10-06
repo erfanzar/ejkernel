@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,50 +37,50 @@ from ._utils import (
 
 
 def _ring_flash_attention_bwd_tpu(
-    segment_ids,  # nondiff arg at index 4
-    cache_idx,  # nondiff arg at index 6
-    axis_name,  # nondiff arg at index 7
-    float32_logits,  # nondiff arg at index 8
-    query_chunk_size,  # nondiff arg at index 9
-    key_chunk_size,  # nondiff arg at index 10
-    causal_block_size,  # nondiff arg at index 11
-    deterministic,  # nondiff arg at index 12
-    dropout_rng,  # nondiff arg at index 13
-    pdrop,  # nondiff arg at index 14
-    sliding_window,  # nondiff arg at index 15
-    logit_soft_cap,  # nondiff arg at index 16
-    attention_sink_size,  # nondiff arg at index 17
-    policy,  # nondiff arg at index 18
+    segment_ids,
+    cache_idx,
+    axis_name,
+    float32_logits,
+    query_chunk_size,
+    key_chunk_size,
+    causal_block_size,
+    deterministic,
+    dropout_rng,
+    pdrop,
+    sliding_window,
+    logit_soft_cap,
+    attention_sink_size,
+    policy,
+    softmax_scale,
     res,
     g,
 ):
     del float32_logits, deterministic, dropout_rng, pdrop, policy
     o, q, k, v, attn_bias, segment_ids_res, softmax_aux_res, cache_idx_res, lse_, m = res
-    # segment_ids comes from nondiff args, not residuals
+
     segment_ids = segment_ids_res if segment_ids is None else segment_ids
     if cache_idx is None:
         cache_idx = cache_idx_res
     _batch, _num_heads, kv_len, _dim_per_head = k.shape
-    # Handle single-device case where axis_name is None
+
     if axis_name is not None:
         axis_size = lax.psum(1, axis_name)
     else:
-        axis_size = 1  # Single device
+        axis_size = 1
     dq = jnp.zeros_like(q, dtype=jnp.float32)
     dk = jnp.zeros_like(k, dtype=jnp.float32)
     dv = jnp.zeros_like(v, dtype=jnp.float32)
     q_block_size, kv_block_size = (
         q.shape[2],
         k.shape[2],
-    )  # assumes this function is pre-sharded inside shard_map
-    scale = q.shape[-1] ** -0.5
+    )
 
     if segment_ids is not None:
         if cache_idx is None:
             if axis_name is not None:
                 q_offset = lax.axis_index(axis_name) * q_block_size
             else:
-                q_offset = 0  # Single device
+                q_offset = 0
         else:
             q_offset = cache_idx
         q_segment_ids = lax.dynamic_slice_in_dim(segment_ids, q_offset, q_block_size, axis=-1)
@@ -106,7 +106,7 @@ def _ring_flash_attention_bwd_tpu(
             if axis_name is not None:
                 offset = (lax.axis_index(axis_name) - idx) % axis_size * kv_len
             else:
-                offset = 0  # Single device
+                offset = 0
             attn_bias_slice = lax.dynamic_slice_in_dim(
                 attn_bias,
                 offset,
@@ -119,7 +119,7 @@ def _ring_flash_attention_bwd_tpu(
             if axis_name is not None:
                 offset = (lax.axis_index(axis_name) - idx) % axis_size * kv_len
             else:
-                offset = 0  # Single device
+                offset = 0
             kv_segment_ids = lax.dynamic_slice_in_dim(
                 segment_ids,
                 offset,
@@ -133,14 +133,14 @@ def _ring_flash_attention_bwd_tpu(
             if axis_name is not None:
                 q_block_idx = lax.axis_index(axis_name)
             else:
-                q_block_idx = 0  # Single device
+                q_block_idx = 0
             q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
         else:
             q_chunk_idx_start = cache_idx // query_chunk_size
         if axis_name is not None:
             k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
         else:
-            k_block_idx = 0  # Single device
+            k_block_idx = 0
         k_chunk_idx_start = k_block_idx * (kv_block_size // key_chunk_size)
         (
             dq_i,
@@ -149,7 +149,7 @@ def _ring_flash_attention_bwd_tpu(
         ) = _flash_attention_bwd(
             save_residuals=False,
             causal_block_size=causal_block_size,
-            softmax_scale=scale,
+            softmax_scale=softmax_scale,
             block_sizes=block_sizes,
             debug=False,
             q_chunk_idx_start=q_chunk_idx_start,
@@ -168,15 +168,14 @@ def _ring_flash_attention_bwd_tpu(
                 lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]),
                 (k, v, dk, dv),
             )
-        # For single device, k, v, dk, dv remain unchanged
+
         return (dq, dk, dv, k, v), None
 
     (dq, dk, dv, k, v), _ = lax.scan(scan_kv_block, init=(dq, dk, dv, k, v), xs=jnp.arange(0, axis_size))
     dq, dk, dv = dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
     dq, dk, dv = map(lambda x: rearrange(x, "b h q d -> b q h d"), (dq, dk, dv))
-    # Return gradients for all differentiable parameters:
-    # query, key, value, attn_bias, (segment_ids is nondiff), softmax_aux
-    return dq, dk, dv, None, None  # attn_bias grad is None, softmax_aux grad is None
+
+    return dq, dk, dv, None, None
 
 
 def _flash_attention_bwd(
@@ -200,7 +199,7 @@ def _flash_attention_bwd(
     if not block_sizes.has_backward_blocks:
         raise ValueError("Program is being differentiated, but not all backward blocks are specified")
 
-    di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)  # [batch_size, num_heads, q_seq_len]
+    di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)
 
     dk, dv = _flash_attention_bwd_dkv(
         q_chunk_idx_start,
@@ -305,15 +304,13 @@ def _flash_attention_dkv_kernel(
             start_k = i * block_k
             k = k_tile_ref[(0, 0, pl.ds(start_k, block_k), slice(None))]
             v = v_tile_ref[(0, 0, pl.ds(start_k, block_k), slice(None))]
-            q = q_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))]  # [block_q, head_dim]
-            lse_ = l_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))]  # [block_q, 128]
-            m = m_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))]  # [block_q, 128]
-            do = do_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))]  # [block_q, 128]
-            di = di_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))].astype(jnp.float32)  # [block_q, 128]
+            q = q_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))]
+            lse_ = l_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))]
+            m = m_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))]
+            do = do_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))]
+            di = di_tile_ref[(0, 0, pl.ds(start_q, block_q), slice(None))].astype(jnp.float32)
 
-            capped_logits = lax.dot_general(
-                q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-            )  # [block_q_major, block_k]
+            capped_logits = lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
             if ab_tile_ref is not None:
                 ab = ab_tile_ref[(0, pl.dslice(0, block_q), pl.dslice(i * block_k, block_k))].astype(jnp.float32)
@@ -322,7 +319,6 @@ def _flash_attention_dkv_kernel(
             if softmax_scale != 1.0:
                 capped_logits *= softmax_scale
 
-            # Apply logit soft cap if specified
             if logit_soft_cap is not None:
                 capped_logits = capped_logits / logit_soft_cap
                 capped_logits = jnp.tanh(capped_logits)
@@ -333,11 +329,9 @@ def _flash_attention_dkv_kernel(
                 repeats, rem = divmod(block_k, NUM_LANES)
                 if rem:
                     raise NotImplementedError()
-                q_segment_ids = q_segment_ids_tile_ref[
-                    (0, pl.ds(start_q, block_q), slice(None))
-                ]  # [block_q, NUM_LANES].
-                q_segment_ids = pltpu.repeat(q_segment_ids, repeats, axis=1)  # [block_q, block_k].
-                kv_segment_ids = kv_segment_ids_tile_ref[(slice(None), 0, pl.ds(start_k, block_k))]  # [1, block_k].
+                q_segment_ids = q_segment_ids_tile_ref[(0, pl.ds(start_q, block_q), slice(None))]
+                q_segment_ids = pltpu.repeat(q_segment_ids, repeats, axis=1)
+                kv_segment_ids = kv_segment_ids_tile_ref[(slice(None), 0, pl.ds(start_k, block_k))]
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal_block_size is not None:
@@ -351,9 +345,7 @@ def _flash_attention_dkv_kernel(
                 causal_mask = col_ids <= row_ids
                 mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
 
-            # Apply sliding window mask if specified
             if sliding_window is not None:
-                # Parse sliding window
                 if isinstance(sliding_window, tuple):
                     left_window, right_window = sliding_window
                 else:
@@ -368,7 +360,6 @@ def _flash_attention_dkv_kernel(
                 pos_diff = query_idx - key_idx
                 window_mask = (pos_diff >= -right_window) & (pos_diff <= left_window)
 
-                # Add attention sink: always allow attending to first N tokens
                 if attention_sink_size > 0:
                     sink_mask = key_idx < attention_sink_size
                     window_mask = window_mask | sink_mask
@@ -378,23 +369,18 @@ def _flash_attention_dkv_kernel(
             capped_logits = capped_logits if mask is None else capped_logits + jnp.where(mask, 0.0, mask_value)
 
             p = jnp.exp(capped_logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))
-            p = p * pltpu.repeat(1 / lse_, block_k // MIN_BLOCK_SIZE, axis=1)  # [block_q_major, block_k_major]
+            p = p * pltpu.repeat(1 / lse_, block_k // MIN_BLOCK_SIZE, axis=1)
             dv = lax.dot(p.T.astype(do.dtype), do, preferred_element_type=jnp.float32)
             dv_scratch_ref[(pl.ds(start_k, block_k), slice(None))] = dv_scratch_ref[
                 (pl.ds(start_k, block_k), slice(None))
             ] + dv.astype(dv_scratch_ref.dtype)
 
-            # di: [block_q, 128]
-            # do: [block_q, head_dim]
-            # v: [block_k_major, head_dim]
             dp = lax.dot_general(do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
             ds = (dp - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1)) * p
 
             if softmax_scale != 1.0:
                 ds = ds * softmax_scale
 
-            # ds: [block_q_major, block_k_major]
-            # q: [block_q_major, head_dim]
             dk = lax.dot(ds.T.astype(do.dtype), q, preferred_element_type=jnp.float32)
             dk_scratch_ref[(pl.ds(start_k, block_k), slice(None))] = dk_scratch_ref[
                 (pl.ds(start_k, block_k), slice(None))
@@ -458,14 +444,11 @@ def _flash_attention_bwd_dkv(
     _verify_block("block_k_major_dkv", "kv_seq_len", block_k_major, kv_seq_len)
     _verify_block("block_k_dkv", "kv_seq_len", block_k, kv_seq_len)
 
-    # Broadcast out scalar values
     m = jnp.broadcast_to(m[..., None], (*m.shape, MIN_BLOCK_SIZE))
     lse_ = jnp.broadcast_to(lse_[..., None], (*lse_.shape, MIN_BLOCK_SIZE))
-    # Preprocess contraction for bwd pass
+
     di = jnp.broadcast_to(di[..., None], (*di.shape, MIN_BLOCK_SIZE))
 
-    # kv index needs to be before q index since q index is the contractng
-    # dimension.
     grid = (
         batch_size,
         num_heads,
@@ -475,7 +458,6 @@ def _flash_attention_bwd_dkv(
 
     def qo_index_map(batch_index, head_index, kv_seq_index, q_seq_index, q_idx_ref, k_idx_ref):
         if causal_block_size is not None:
-            # If the q block is skipped, stay at the 0th q block.
             next_q_index = lax.select(
                 below_or_on_diag(
                     q_seq_index + q_idx_ref[0],
@@ -572,8 +554,6 @@ def _flash_attention_bwd_dkv(
             ),
         )
 
-    # Add softmax_aux spec
-    # softmax_aux is used for gradient computation but doesn't receive gradients
     def softmax_aux_index_map(batch_index, head_index, kv_seq_index, q_seq_index, q_idx_ref, k_idx_ref):
         return (batch_index, head_index, 0, 0)
 
@@ -702,12 +682,12 @@ def _flash_attention_dq_kernel(
     def body(i, _):
         k_slice = pl.ds(i * block_k, block_k)
         q = q_tile_ref[0, 0, :, :]
-        k = k_tile_ref[(0, 0, k_slice, slice(None))]  # [block_k, head_dim]
-        v = v_tile_ref[(0, 0, k_slice, slice(None))]  # [block_k, head_dim]
-        lse_ = l_tile_ref[0, 0, :, :]  # [block_q_major, 128]
-        m = m_tile_ref[0, 0, :, :]  # [block_q_major, 128]
-        do = do_tile_ref[0, 0, :, :]  # [block_q_major, head_dim]
-        di = di_tile_ref[0, 0, :].astype(jnp.float32)  # [block_q_major, 128]
+        k = k_tile_ref[(0, 0, k_slice, slice(None))]
+        v = v_tile_ref[(0, 0, k_slice, slice(None))]
+        lse_ = l_tile_ref[0, 0, :, :]
+        m = m_tile_ref[0, 0, :, :]
+        do = do_tile_ref[0, 0, :, :]
+        di = di_tile_ref[0, 0, :].astype(jnp.float32)
 
         capped_logits = jax.lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
@@ -718,7 +698,6 @@ def _flash_attention_dq_kernel(
         if softmax_scale != 1.0:
             capped_logits *= softmax_scale
 
-        # Apply logit soft cap if specified
         if logit_soft_cap is not None:
             capped_logits = capped_logits / logit_soft_cap
             capped_logits = jnp.tanh(capped_logits)
@@ -744,9 +723,7 @@ def _flash_attention_dq_kernel(
             causal_mask = col_ids <= row_ids
             mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
 
-        # Apply sliding window mask if specified
         if sliding_window is not None:
-            # Parse sliding window
             if isinstance(sliding_window, tuple):
                 left_window, right_window = sliding_window
             else:
@@ -761,7 +738,6 @@ def _flash_attention_dq_kernel(
             pos_diff = query_idx - key_idx
             window_mask = (pos_diff >= -right_window) & (pos_diff <= left_window)
 
-            # Add attention sink: always allow attending to first N tokens
             if attention_sink_size > 0:
                 sink_mask = key_idx < attention_sink_size
                 window_mask = window_mask | sink_mask
@@ -771,11 +747,8 @@ def _flash_attention_dq_kernel(
         capped_logits = capped_logits if mask is None else capped_logits + jnp.where(mask, 0.0, mask_value)
 
         p = jnp.exp(capped_logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))
-        p = p * pltpu.repeat(1 / lse_, block_k // MIN_BLOCK_SIZE, axis=1)  # [block_q_major, block_k]
+        p = p * pltpu.repeat(1 / lse_, block_k // MIN_BLOCK_SIZE, axis=1)
 
-        # di: [block_q_major, 128]
-        # do: [block_q_major, head_dim]
-        # v: [block_k_major, head_dim]
         dp = jax.lax.dot_general(
             do,
             v,
@@ -790,8 +763,6 @@ def _flash_attention_dq_kernel(
         if ds_tile_ref is not None:
             ds_tile_ref[(0, pl.dslice(None), pl.dslice(i * block_k, block_k))] = ds.astype(ds_tile_ref.dtype)
 
-        # dp: [block_q_major, block_k]
-        # k: [block_k, head_dim]
         dq_scratch_ref[:, :] += lax.dot(
             ds.astype(k.dtype),
             k,
@@ -859,10 +830,9 @@ def _flash_attention_bwd_dq(
     _verify_block("block_k_major_dq", "kv_seq_len", block_k_major, kv_seq_len)
     _verify_block("block_k_dq", "block_k", block_k, kv_seq_len)
 
-    # Broadcast out scalar values
     m = jnp.broadcast_to(m[..., None], (*m.shape, MIN_BLOCK_SIZE))
     lse_ = jnp.broadcast_to(lse_[..., None], (*lse_.shape, MIN_BLOCK_SIZE))
-    # Preprocess contraction for bwd pass
+
     di = jnp.broadcast_to(di[..., None], (*di.shape, block_k_major))
 
     grid = (
@@ -880,8 +850,6 @@ def _flash_attention_bwd_dq(
 
     def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index, q_idx_ref, k_idx_ref):
         if causal_block_size is not None:
-            # If the kv block is skipped, prefetch the next valid kv block, i.e. the
-            # 0th one to be used for the next block_q rows.
             next_kv_index = lax.select(
                 below_or_on_diag(
                     q_seq_index + q_idx_ref[0],
@@ -933,8 +901,6 @@ def _flash_attention_bwd_dq(
         def kv_segment_ids_index_map(batch_index, head_index, q_seq_index, kv_seq_index, q_idx_ref, k_idx_ref):
             del head_index
             if causal_block_size is not None:
-                # If the kv block is skipped, prefetch the next valid kv block, i.e. the
-                # 0th one to be used for the next block_q rows.
                 next_kv_index = lax.select(
                     below_or_on_diag(
                         q_seq_index + q_idx_ref[0],
@@ -970,8 +936,6 @@ def _flash_attention_bwd_dq(
             ),
         )
 
-    # Add softmax_aux spec
-    # softmax_aux is used for gradient computation but doesn't receive gradients
     def softmax_aux_index_map(batch_index, head_index, kv_seq_index, q_seq_index, q_idx_ref, k_idx_ref):
         return (batch_index, head_index, 0, 0)
 

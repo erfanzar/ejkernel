@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -293,8 +293,8 @@ def basic_attention_refrence(
 
 @ejit(static_argnames=["max_tokens"])
 def attention_pack_from_cu_static(
-    x: Float[Array, "batch seq_max num_heads head_dim"],  # [B, S_max, H, D]
-    cum_seqlens: Int[Array, "batch_plus_one"],  # int32 [B+1]
+    x: Float[Array, "batch seq_max num_heads head_dim"],
+    cum_seqlens: Int[Array, "batch_plus_one"],
     max_tokens: int | None = None,
 ) -> Float[Array, "1 max_tokens num_heads head_dim"]:
     """
@@ -304,7 +304,6 @@ def attention_pack_from_cu_static(
     """
     B, S_max, H, D = x.shape
     if max_tokens is None:
-        # Static upper bound; using B*S_max is fine if you want a single compiled shape.
         max_tokens = B * S_max
 
     out = jnp.zeros((1, max_tokens, H, D), dtype=x.dtype)
@@ -329,8 +328,8 @@ def attention_pack_from_cu_static(
 
 @ejit(static_argnames=["seqlen", "batch_size"])
 def attention_unpack_with_static_shape(
-    x: Float[Array, "1 max_tokens num_heads head_dim"],  # [1, T, H, D] (T >= cum_seqlens[-1])
-    cum_seqlens: Int[Array, "batch_plus_one"],  # int32 [B+1]
+    x: Float[Array, "1 max_tokens num_heads head_dim"],
+    cum_seqlens: Int[Array, "batch_plus_one"],
     batch_size: int,
     seqlen: int,
 ) -> Float[Array, "batch seqlen num_heads head_dim"]:

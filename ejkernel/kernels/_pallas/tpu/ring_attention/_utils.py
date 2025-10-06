@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,8 +46,8 @@ class SegmentIds(tp.NamedTuple):
       kv: segment ids along the KV sequence.
     """
 
-    query: jax.Array  # [q_seq_len]
-    kv: jax.Array  # [kv_seq_len]
+    query: jax.Array
+    kv: jax.Array
 
 
 @chex.dataclass
@@ -96,7 +96,7 @@ class BlockSizes:
 
     @classmethod
     def get_default(cls, batch_size, num_heads, q_seq_len, kv_len, d_model):
-        del batch_size, num_heads, q_seq_len, kv_len, d_model  # Unused.
+        del batch_size, num_heads, q_seq_len, kv_len, d_model
         return BlockSizes(
             block_q=128,
             block_k_major=128,
@@ -170,24 +170,21 @@ def compute_sliding_window_mask(
     Returns:
             Boolean mask of shape (block_q, block_k).
     """
-    # Parse sliding window (can be int or tuple)
+
     if isinstance(sliding_window, tuple):
         left_window, right_window = sliding_window
     else:
         left_window = right_window = sliding_window
 
-    # Create position indices
     mask_shape = (block_q, block_k)
     query_idx = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
     query_idx += q_seq_index * block_q + q_chunk_idx_start * block_q
     key_idx = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
     key_idx += kv_seq_index * block_k + k_chunk_idx_start * block_k
 
-    # Create sliding window mask
     pos_diff = query_idx - key_idx
     window_mask = (pos_diff >= -right_window) & (pos_diff <= left_window)
 
-    # Add attention sink: always allow attending to first N tokens
     if attention_sink_size > 0:
         sink_mask = key_idx < attention_sink_size
         window_mask = window_mask | sink_mask

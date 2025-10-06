@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,9 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
 import typing as tp
 
 import jax
+import jaxtyping
+from beartype import beartype
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float
 
@@ -21,6 +25,7 @@ from ..._registry import Backend, Platform, kernel_registry
 
 
 @kernel_registry.register("attention", Platform.XLA, Backend.ANY)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch kv_len num_kv_heads head_dim"],
@@ -36,7 +41,7 @@ def attention(
     softmax_dtype: jnp.dtype | None = None,
     dropout_prob: float = 0.0,
     sliding_window: int | tuple[int, int] | None = None,
-):
+) -> tuple[Float[Array, "batch seq_len num_q_heads head_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
     """
     Computes multi-head attention using standard JAX operations.
 
@@ -104,7 +109,6 @@ def attention(
 
     aw = jnp.einsum("bskhd,bmkd->bkhsm", query * softmax_scale, key, optimize=True)
 
-    # Apply sliding window attention_mask if specified
     if sliding_window is not None:
         if isinstance(sliding_window, int):
             left_window = sliding_window
@@ -112,15 +116,12 @@ def attention(
         else:
             left_window, right_window = sliding_window
 
-        # Create position indices
-        q_pos = jnp.arange(qs)[:, None]  # [qs, 1]
-        k_pos = jnp.arange(ks)[None, :]  # [1, ks]
+        q_pos = jnp.arange(qs)[:, None]
+        k_pos = jnp.arange(ks)[None, :]
 
-        # Create sliding window attention_mask: positions within the window are True
         window_mask = (k_pos >= q_pos - left_window) & (k_pos <= q_pos + right_window)
-        window_mask = window_mask.reshape(1, 1, 1, qs, ks)  # [1, 1, 1, qs, ks]
+        window_mask = window_mask.reshape(1, 1, 1, qs, ks)
 
-        # Apply the window attention_mask
         aw = jnp.where(window_mask, aw, jnp.finfo(aw.dtype).min)
 
     if bias is not None:
@@ -160,12 +161,10 @@ def attention(
         aw = jnp.where(attention_mask, aw, jnp.finfo(aw.dtype).min)
     if softmax_aux is not None:
         if softmax_aux.ndim == 2:
-            # softmax_aux shape: [num_heads, num_sinks]
             num_sinks = softmax_aux.shape[-1]
             sinks = softmax_aux.reshape(1, kh, 1, 1, num_sinks)
             sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, num_sinks))
         elif softmax_aux.ndim == 1:
-            # softmax_aux shape: [num_sinks]
             num_sinks = softmax_aux.shape[0]
             sinks = softmax_aux.reshape(1, 1, 1, 1, num_sinks)
             sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, num_sinks))
@@ -174,7 +173,7 @@ def attention(
         combined_logits = jnp.concatenate([aw, sinks], axis=-1)
         combined_logits = combined_logits - jnp.max(combined_logits, axis=-1, keepdims=True)
         probs = jax.nn.softmax(combined_logits.astype(softmax_dtype), axis=-1).astype(dtype)
-        # Take only the attention weights, not the sink probabilities
+
         aw = probs[..., :ks]
     else:
         aw = jax.nn.softmax(aw.astype(softmax_dtype), axis=-1).astype(dtype)

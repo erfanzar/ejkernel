@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Batch processing utilities for vectorized and parallel execution.
 
@@ -40,11 +41,11 @@ Benefits:
     - Support for both CPU vectorization (vmap) and multi-device parallelism (pmap)
 
 Example Usage:
-    >>> # Vectorized execution over batch dimension
-    >>> vmapped_fn = vmap_with_config(executor, kernel, in_axes=0)
-    >>> batch_result = vmapped_fn(batch_input)  # Config selected once
     >>>
-    >>> # Parallel execution across devices
+    >>> vmapped_fn = vmap_with_config(executor, kernel, in_axes=0)
+    >>> batch_result = vmapped_fn(batch_input)
+    >>>
+    >>>
     >>> pmapped_fn = pmap_with_config(executor, kernel, in_axes=0)
     >>> device_result = pmapped_fn(device_sharded_input)
 
@@ -84,17 +85,17 @@ def vmap_with_config(executor, kernel, in_axes=0) -> Callable[..., Any]:
         Function that performs vectorized execution with shared config selection
 
     Example:
-        >>> # Setup
+        >>>
         >>> cache = ConfigCache()
         >>> selector = ConfigSelectorChain(cache)
         >>> executor = Executor(selector)
         >>>
-        >>> # Create vectorized function
+        >>>
         >>> vmapped_matmul = vmap_with_config(executor, matmul_kernel, in_axes=0)
         >>>
-        >>> # Execute on batch (config selected once for all elements)
-        >>> batch_x = jnp.array([x1, x2, x3, ...])  # Shape: (batch, ...)
-        >>> batch_y = jnp.array([y1, y2, y3, ...])  # Shape: (batch, ...)
+        >>>
+        >>> batch_x = jnp.array([x1, x2, x3, ...])
+        >>> batch_y = jnp.array([y1, y2, y3, ...])
         >>> batch_result = vmapped_matmul(batch_x, batch_y)
 
     Note:
@@ -112,20 +113,16 @@ def vmap_with_config(executor, kernel, in_axes=0) -> Callable[..., Any]:
                 return x
             return jax.lax.index_in_dim(x, 0, axis, keepdims=False)
 
-        # Create axis specification tree matching argument structure
         in_axes_tree = jax.tree.map(lambda _: in_axes, args) if not isinstance(in_axes, tuple | list) else in_axes
 
-        # Extract representative sample for configuration selection
         sample = jax.tree.map(slice0, args, in_axes_tree)
 
-        # Select configuration using sample (triggers config selection/caching)
         _ = executor(kernel, *sample, stamp=False, **kwargs)
 
         def fn(*a, **k):
             """Inner function to be vectorized by jax.vmap."""
             return executor(kernel, *a, **k)
 
-        # Execute vectorized computation with shared configuration
         return jax.vmap(fn, in_axes=in_axes)(*args, **kwargs)
 
     return wrapped
@@ -155,20 +152,20 @@ def pmap_with_config(executor, kernel, in_axes=0, axis_name="devices"):
         Function that performs parallel execution with shared config selection
 
     Example:
-        >>> # Setup multi-device execution
+        >>>
         >>> cache = ConfigCache()
         >>> selector = ConfigSelectorChain(cache)
         >>> executor = Executor(selector)
         >>>
-        >>> # Create parallel function
+        >>>
         >>> pmapped_matmul = pmap_with_config(executor, matmul_kernel, in_axes=0)
         >>>
-        >>> # Prepare device-sharded data
+        >>>
         >>> devices = jax.devices()
         >>> x_sharded = jax.device_put_sharded([x1, x2, x3, x4], devices)
         >>> y_sharded = jax.device_put_sharded([y1, y2, y3, y4], devices)
         >>>
-        >>> # Execute in parallel (config selected once for all devices)
+        >>>
         >>> result_sharded = pmapped_matmul(x_sharded, y_sharded)
 
     Note:
@@ -180,17 +177,15 @@ def pmap_with_config(executor, kernel, in_axes=0, axis_name="devices"):
 
     def wrapped(*args, **kwargs):
         """Wrapper that performs configuration selection and parallel execution."""
-        # Extract data from first device for configuration selection
+
         local_args = jax.tree.map(lambda x: x[0] if isinstance(x, jax.Array) else x, args)
 
-        # Select configuration using first device's data (triggers config selection/caching)
         _ = executor(kernel, *local_args, stamp=False, **kwargs)
 
         def fn(*a, **k):
             """Inner function to be parallelized by jax.pmap."""
             return executor(kernel, *a, **k)
 
-        # Execute parallel computation with shared configuration
         return jax.pmap(fn, in_axes=in_axes, axis_name=axis_name)(*args, **kwargs)
 
     return wrapped

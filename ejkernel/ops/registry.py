@@ -1,3 +1,18 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """Global registry for tracking kernel invocations across devices.
 
 This module provides a simple in-memory registry that tracks all kernel
@@ -14,10 +29,10 @@ The registry enables:
     - Debugging and profiling of kernel usage
 
 Example Usage:
-    >>> # Record an invocation (usually done automatically)
+    >>>
     >>> record_invocation('gpu|cuda_12.0', 'matmul@v1', 'abc123', kernel, args, kwargs)
     >>>
-    >>> # Get all invocations for a device
+    >>>
     >>> invocations = get_invocations('gpu|cuda_12.0')
     >>> for op_id, calls in invocations.items():
     ...     print(f"Operation {op_id} has {len(calls)} recorded calls")
@@ -31,7 +46,6 @@ from __future__ import annotations
 
 from typing import Any
 
-# device -> op_id_v -> call_key -> (kernel, args, kwargs)
 _REG: dict[str, dict[str, dict[str, tuple[Any, tuple[Any, ...], dict[str, Any]]]]] = {}
 
 

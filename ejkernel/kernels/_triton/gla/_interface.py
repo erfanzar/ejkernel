@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import jaxtyping
+from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -20,6 +22,7 @@ from ..recurrent import recurrent
 
 
 @kernel_registry.register("gla", Platform.TRITON, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def recurrent_gla(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -73,9 +76,9 @@ def recurrent_gla(
             does not match the number of sequences.
     """
     if cu_seqlens is not None:
-        if q.shape[0] != 1:
+        if query.shape[0] != 1:
             raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
+                f"The batch size is expected to be 1 rather than {query.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
         if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
@@ -84,7 +87,7 @@ def recurrent_gla(
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
             )
     if scale is None:
-        scale = k.shape[-1] ** -0.5
+        scale = key.shape[-1] ** -0.5
     o, final_state = recurrent(
         query=query,
         key=key,

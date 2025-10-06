@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 from functools import partial
 
@@ -136,32 +137,24 @@ def _blockwise_attention_fwd(
             bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
             attn_weights = attn_weights + bias_chunk
 
-            # Add attention sink logits if provided
             if softmax_aux is not None:
-                # Reshape sink logits: softmax_aux is [num_heads, num_sinks] or [num_sinks]
                 if softmax_aux.ndim == 1:
-                    # [num_sinks] -> [1, num_heads, 1, num_sinks]
                     sinks = softmax_aux.reshape(1, 1, 1, -1)
                     sinks = jnp.broadcast_to(sinks, (batch, num_heads, 1, softmax_aux.shape[0]))
                 elif softmax_aux.ndim == 2:
-                    # [num_heads, num_sinks] -> [1, num_heads, 1, num_sinks]
                     sinks = softmax_aux.reshape(1, num_heads, 1, -1)
                     sinks = jnp.broadcast_to(sinks, (batch, num_heads, 1, softmax_aux.shape[-1]))
                 else:
                     raise ValueError(f"softmax_aux must be 1D or 2D, got {softmax_aux.ndim}D")
 
-                # Broadcast to match query length
                 sinks = jnp.broadcast_to(sinks, (batch, num_heads, query_chunk_size, sinks.shape[-1]))
 
-                # Concatenate sink logits with attention weights
                 combined_weights = jnp.concatenate([attn_weights, sinks], axis=-1)
 
-                # Compute softmax with sinks
                 max_score_chunk = jnp.maximum(prev_max_score_chunk, jnp.max(combined_weights, axis=-1))
                 max_score_chunk = lax.stop_gradient(max_score_chunk)
                 combined_exp_weights = jnp.exp(combined_weights - max_score_chunk[..., None]).astype(jnp.float32)
 
-                # Extract only non-sink weights for value computation
                 exp_weights = combined_exp_weights[..., : attn_weights.shape[-1]]
                 exp_values = jnp.einsum(
                     "bhqk,bkhd->bqhd", exp_weights, value_chunk.astype(jnp.float32), precision=precision
@@ -173,7 +166,6 @@ def _blockwise_attention_fwd(
                 )[..., None]
                 numerator_chunk = numerator_chunk * correction + exp_values
 
-                # Sum includes all weights (including sinks) for correct normalization
                 denominator_chunk = denominator_chunk * jnp.exp(
                     prev_max_score_chunk - max_score_chunk
                 ) + combined_exp_weights.sum(axis=-1)

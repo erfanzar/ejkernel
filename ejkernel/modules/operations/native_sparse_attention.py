@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Sparse Attention module with automatic optimization."""
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ class NativeSparseAttention(Kernel[KernelConfig, Array]):
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
         """Execute native sparse attention."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -149,13 +150,13 @@ def sparse_attention(
         Attention output with same shape as query
 
     Example:
-        >>> # Standard sparse attention with default block patterns
+        >>>
         >>> out = native_sparse_attention(query, key, value)
         >>>
-        >>> # Custom block size and counts
+        >>>
         >>> out = native_sparse_attention(query, key, value, block_size=128, block_counts=32)
         >>>
-        >>> # With specific block indices
+        >>>
         >>> out = native_sparse_attention(query, key, value, block_indices=indices, block_size=64)
     """
     return _sparse_executor(

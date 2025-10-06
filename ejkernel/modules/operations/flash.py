@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Flash Attention module with automatic optimization."""
 
 from __future__ import annotations
@@ -46,21 +47,21 @@ class FlashAttention(Kernel[KernelConfig, Array]):
     Example:
         >>> from ejkernel.modules import FlashAttention, create_default_executor
         >>>
-        >>> # Create executor and module
+        >>>
         >>> executor = create_default_executor()
         >>> attn = FlashAttention()
         >>>
-        >>> # Execute with automatic optimization
+        >>>
         >>> output = executor(attn, query, key, value, causal=True, softmax_scale=0.125)
         >>>
-        >>> # With variable-length sequences
+        >>>
         >>> output = executor(
         ...     attn, query, key, value,
         ...     cum_seqlens_q=cu_seqlens_q,
         ...     cum_seqlens_k=cu_seqlens_k
         ... )
         >>>
-        >>> # With sliding window
+        >>>
         >>> output = executor(attn, query, key, value, sliding_window=(256, 256))
     """
 
@@ -137,7 +138,7 @@ class FlashAttention(Kernel[KernelConfig, Array]):
         Returns:
             Attention output [batch, seq_len_q, num_heads, head_dim]
         """
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -184,7 +185,7 @@ class FlashAttention(Kernel[KernelConfig, Array]):
         Returns:
             Default configuration with block sizes
         """
-        # Default block sizes for flash attention
+
         return KernelConfig(
             block_q=128,
             block_k=128,
@@ -211,7 +212,7 @@ class FlashAttention(Kernel[KernelConfig, Array]):
             The autotuning system will benchmark each candidate and select
             the fastest one for the given input configuration.
         """
-        # Common block size combinations for autotuning
+
         block_configs = [
             (128, 128),
             (128, 256),
@@ -285,16 +286,16 @@ def flash_attention(
         Attention output with same shape as query
 
     Example:
-        >>> # Standard causal attention
+        >>>
         >>> out = flash_attention(query, key, value, causal=True)
         >>>
-        >>> # With dropout and custom scale
+        >>>
         >>> out = flash_attention(query, key, value, dropout_prob=0.1, softmax_scale=0.125)
         >>>
-        >>> # Variable-length sequences
+        >>>
         >>> out = flash_attention(query, key, value, cum_seqlens_q=cu_q, cum_seqlens_k=cu_k)
         >>>
-        >>> # Force specific platform
+        >>>
         >>> out = flash_attention(query, key, value, platform="triton")
     """
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Custom VJP implementation for grouped matrix multiplication.
 
 This module defines the custom forward and backward passes for grouped matrix
@@ -22,6 +23,8 @@ to provide gradient support.
 
 import jax
 import jax.numpy as jnp
+import jaxtyping
+from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ...._registry import Backend, Platform, kernel_registry
@@ -148,6 +151,7 @@ _back_grouped_matmul.defvjp(_grouped_matmul_fwd, _grouped_matmul_bwd)
 
 
 @kernel_registry.register("grouped_matmul", Platform.PALLAS, Backend.TPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def grouped_matmul(
     lhs: Float[Array, "m k"],
     rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],

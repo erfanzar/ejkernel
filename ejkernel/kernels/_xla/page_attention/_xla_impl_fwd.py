@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import jax
 import jax.numpy as jnp
@@ -51,33 +52,27 @@ def _page_attention_fwd(
     num_kv_heads = key_cache.shape[1]
     max_blocks = block_tables.shape[1]
 
-    # Handle GQA: num_heads might be > num_kv_heads
     q_heads_per_kv_head = num_heads // num_kv_heads
 
-    # Reshape query for GQA: [num_seqs, num_kv_heads, q_heads_per_kv, head_dim]
     query = query.reshape(num_seqs, num_kv_heads, q_heads_per_kv_head, head_dim)
 
-    # Scale query
     query = query * attn_scale
 
     def attend_sequence(seq_idx):
         """Compute attention for a single sequence."""
-        q = query[seq_idx]  # [num_kv_heads, q_heads_per_kv, head_dim]
+        q = query[seq_idx]
         context_len = context_lens[seq_idx]
-        blocks = block_tables[seq_idx]  # [max_blocks]
+        blocks = block_tables[seq_idx]
 
         def attend_block(block_idx):
             """Attend to a single block."""
             physical_block = blocks[block_idx]
 
-            # Get K,V for this block: [num_kv_heads, block_size, head_dim]
             k_block = key_cache[physical_block]
             v_block = value_cache[physical_block]
 
-            # Compute attention scores: [num_kv_heads, q_heads_per_kv, block_size]
             scores = jnp.einsum("ihd,ikd->ihk", q, k_block)
 
-            # Create mask for valid tokens in this block
             block_start = block_idx * block_size
             token_indices = jnp.arange(block_size) + block_start
             valid_mask = token_indices < context_len
@@ -85,27 +80,18 @@ def _page_attention_fwd(
 
             return scores, v_block
 
-        # Attend to all blocks
         all_scores, all_values = jax.vmap(attend_block)(jnp.arange(max_blocks))
-        # all_scores: [max_blocks, num_kv_heads, q_heads_per_kv, block_size]
-        # all_values: [max_blocks, num_kv_heads, block_size, head_dim]
 
-        # Reshape scores to merge blocks: [num_kv_heads, q_heads_per_kv, max_blocks * block_size]
         all_scores = all_scores.transpose(1, 2, 0, 3).reshape(num_kv_heads, q_heads_per_kv_head, max_blocks * block_size)
 
-        # Reshape values: [num_kv_heads, max_blocks * block_size, head_dim]
         all_values = all_values.transpose(1, 0, 2, 3).reshape(num_kv_heads, max_blocks * block_size, head_dim)
 
-        # Apply softmax
-        attn_weights = jax.nn.softmax(all_scores, axis=-1)  # [num_kv_heads, q_heads_per_kv, max_blocks * block_size]
+        attn_weights = jax.nn.softmax(all_scores, axis=-1)
 
-        # Apply attention weights to values
-        output = jnp.einsum("ihk,ikd->ihd", attn_weights, all_values)  # [num_kv_heads, q_heads_per_kv, head_dim]
+        output = jnp.einsum("ihk,ikd->ihd", attn_weights, all_values)
 
-        # Reshape back to [num_heads, head_dim]
         return output.reshape(num_heads, head_dim)
 
-    # Process all sequences
     output = jax.vmap(attend_sequence)(jnp.arange(num_seqs))
 
     return output

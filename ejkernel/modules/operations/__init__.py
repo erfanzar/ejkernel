@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Attention kernel modules with automatic optimization."""
 
 from .attention import Attention, attention
@@ -26,6 +27,7 @@ from .pooling import MeanPooling, mean_pooling
 from .ragged_page_attention import RaggedPageAttention, ragged_page_attention
 from .recurrent import RecurrentAttention, recurrent_attention
 from .ring import RingAttention, ring_attention
+from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_product_attention
 
 __all__ = (
     "Attention",
@@ -40,6 +42,7 @@ __all__ = (
     "RaggedPageAttention",
     "RecurrentAttention",
     "RingAttention",
+    "ScaledDotProductAttention",
     "attention",
     "flash_attention",
     "gla_attention",
@@ -51,5 +54,6 @@ __all__ = (
     "ragged_page_attention",
     "recurrent_attention",
     "ring_attention",
+    "scaled_dot_product_attention",
     "sparse_attention",
 )

@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -117,8 +117,8 @@ def _attn_bwd_preprocess(
     max_seqlen_q_rounded,
     cum_seqlens_q,
     headdim,
-    CQSeq,  # Re-compile argument
-    DRuntime,  # Re-compile argument
+    CQSeq,
+    DRuntime,
     Delta,
     VARLEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -198,7 +198,6 @@ def _attn_bwd_dkdv(
     actual_seqlen_k,
     fully_masked_lines,
     headdim,
-    # NEW runtime params
     window_left,
     window_right,
     logits_soft_cap,
@@ -212,7 +211,6 @@ def _attn_bwd_dkdv(
     PAD_ROWS: tl.constexpr,
     PAD_COLS: tl.constexpr,
     HEADS_PADDED: tl.constexpr,
-    # NEW constexpr params
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
@@ -346,7 +344,6 @@ def _attn_bwd_block_dkdv(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
-    # NEW runtime params
     window_left,
     window_right,
     logits_soft_cap,
@@ -361,7 +358,6 @@ def _attn_bwd_block_dkdv(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
-    # NEW constexpr params
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
@@ -527,13 +523,11 @@ def _attn_bwd_dq(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
-    # NEW runtime args
     window_left,
     window_right,
     logits_soft_cap,
     softmax_aux_ptrs,
     num_sinks,
-    # constexpr
     MASKED: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
@@ -541,7 +535,6 @@ def _attn_bwd_dq(
     USE_DROPOUT: tl.constexpr,
     PAD_COLS: tl.constexpr,
     HEADS_PADDED: tl.constexpr,
-    # NEW constexpr params
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
@@ -641,13 +634,11 @@ def _attn_bwd_block_dq(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
-    # NEW runtime args
     window_left,
     window_right,
     logits_soft_cap,
     softmax_aux_ptrs,
     num_sinks,
-    # constexpr
     VARLEN: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
@@ -659,7 +650,6 @@ def _attn_bwd_block_dq(
     BLOCK_N: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     EVEN_N: tl.constexpr,
-    # NEW constexpr
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
@@ -695,7 +685,6 @@ def _attn_bwd_block_dq(
     else:
         bias_ptrs = None
 
-    # Optional: align dropout offset indexing with forward (recommended)
     if USE_DROPOUT:
         dropout_offs = Dropout + offs_m[:, None] * actual_seqlen_k + offs_n[None, :]
     else:
@@ -909,7 +898,6 @@ def _attn_bwd(
     stride_dvh,
     nheads_q,
     num_repeats,
-    # NEW
     window_left,
     window_right,
     QSeq,
@@ -921,9 +909,9 @@ def _attn_bwd(
     CQSeq,
     CKSeq,
     DRuntime,
-    logits_soft_cap,  # NEW (runtime)
-    softmax_aux,  # NEW (runtime)
-    num_sinks,  # NEW (runtime)
+    logits_soft_cap,
+    softmax_aux,
+    num_sinks,
     Dq,
     Dk,
     Dv,
@@ -943,9 +931,9 @@ def _attn_bwd(
     BLOCK_N1: tl.constexpr,
     BLOCK_M2: tl.constexpr,
     BLOCK_N2: tl.constexpr,
-    SLIDING: tl.constexpr,  # NEW
-    SOFTCAP: tl.constexpr,  # NEW
-    USE_SINKS: tl.constexpr,  # NEW
+    SLIDING: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    USE_SINKS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     off_zh = tl.program_id(1)
@@ -1118,7 +1106,7 @@ def _config_prune_blocksparse_bwd(
 
 @triton.jit
 def _attn_blocksparse_bwd_block_dkdv_layout(
-    k_block_start_n,  # token index for this K-block (k_block_id * BLOCK_N)
+    k_block_start_n,
     Q,
     K,
     V,
@@ -1147,10 +1135,8 @@ def _attn_blocksparse_bwd_block_dkdv_layout(
     logits_soft_cap,
     softmax_aux_ptrs,
     num_sinks,
-    # Layout (K -> list of Q blocks)
     layout_k_ptr,
     degree_k_ptr,
-    # constexpr
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
@@ -1269,7 +1255,7 @@ def _attn_blocksparse_bwd_block_dkdv_layout(
 
 @triton.jit
 def _attn_blocksparse_bwd_block_dq_layout(
-    q_block_start_m,  # token index for this Q-block (q_block_id * BLOCK_M)
+    q_block_start_m,
     Q,
     K,
     V,
@@ -1296,10 +1282,8 @@ def _attn_blocksparse_bwd_block_dq_layout(
     logits_soft_cap,
     softmax_aux_ptrs,
     num_sinks,
-    # Layout (Q -> list of K blocks)
     layout_q_ptr,
     degree_q_ptr,
-    # constexpr
     VARLEN: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
@@ -1343,7 +1327,6 @@ def _attn_blocksparse_bwd_block_dq_layout(
     me_i = tl.load(M + offs_m)
     de_i = tl.load(D + offs_m)
 
-    # Iterate only neighbor K-blocks for this Q-block
     q_block_id = q_block_start_m // BLOCK_M
     deg_q = tl.load(degree_q_ptr + q_block_id, mask=True, other=0)
 
@@ -1392,12 +1375,10 @@ def _attn_blocksparse_bwd_block_dq_layout(
                 USE_SINKS=USE_SINKS,
             )
 
-    # Mask fully causal lines
     fully_masked_lines = (actual_seqlen_q - actual_seqlen_k) if IS_CAUSAL else 0
     if fully_masked_lines > 0:
         dq = tl.where(offs_m[:, None] < fully_masked_lines, 0, dq)
 
-    # Store dq
     if HEADS_PADDED:
         tl.store(dq_ptrs, dq, mask=(offs_m[:, None] < actual_seqlen_q) & (offs_d[None, :] < headdim))
     else:
@@ -1405,11 +1386,6 @@ def _attn_blocksparse_bwd_block_dq_layout(
             tl.store(dq_ptrs, dq, mask=offs_m[:, None] < actual_seqlen_q)
         else:
             tl.store(dq_ptrs, dq)
-
-
-# --------------------------
-# Main blocksparse backward kernel
-# --------------------------
 
 
 def _prune_blocksparse_bwd_configs(configs: list[Config], named_args: dict[str, Any], **kwargs: Any) -> list[Config]:
@@ -1532,11 +1508,10 @@ def _attn_blocksparse_bwd(
     Dq,
     Dk,
     Dv,
-    # Layout args
     layout_q_ptr,
-    degree_q_ptr,  # [n_q_blocks, MAX_DEGREE_Q], [n_q_blocks]
+    degree_q_ptr,
     layout_k_ptr,
-    degree_k_ptr,  # [n_k_blocks, MAX_DEGREE_K], [n_k_blocks]
+    degree_k_ptr,
     FORCE_BLOCK_M,
     FORCE_BLOCK_N,
     VARLEN: tl.constexpr,
@@ -1812,7 +1787,6 @@ def _blocksparse_bwd_attention_kernel_call(
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    # blocksparse layout
     layout_q2k: Int[Array, "n_q_blocks max_degree"] | None = None,
     degree_q2k: Int[Array, "n_q_blocks"] | None = None,
     layout_k2q: Int[Array, "n_k_blocks max_degree"] | None = None,
@@ -1822,7 +1796,6 @@ def _blocksparse_bwd_attention_kernel_call(
     force_block_m: int = 0,
     force_block_n: int = 0,
 ):
-    # Sliding window parse
     if sliding_window is None:
         window_left, window_right, sliding_flag = 0, 0, False
     else:
@@ -1834,13 +1807,11 @@ def _blocksparse_bwd_attention_kernel_call(
             window_left, window_right = int(wl), int(wr)
         sliding_flag = (window_left > 0) or (window_right > 0)
 
-    # Softcap parse
     if logits_soft_cap is None:
         logits_soft_cap_val, softcap_flag = 0.0, False
     else:
         logits_soft_cap_val, softcap_flag = float(logits_soft_cap), True
 
-    # Sinks parse
     if softmax_aux is None:
         use_sinks = False
         num_sinks_val = 0
@@ -1856,10 +1827,8 @@ def _blocksparse_bwd_attention_kernel_call(
         else:
             raise ValueError("softmax_aux must be 1D or 2D")
 
-    # VARLEN path
     varlen_from_cu = (cum_seqlens_q is not None) and (cum_seqlens_k is not None)
     if varlen_from_cu:
-        # Enforce block sizes if using layout + VARLEN
         if (layout_q2k is not None) or (layout_k2q is not None):
             if force_block_m == 0 or force_block_n == 0:
                 raise ValueError(
@@ -1876,7 +1845,6 @@ def _blocksparse_bwd_attention_kernel_call(
         max_seqlen_q_rounded = math.ceil(max_seqlen_q / 128) * 128
         softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
 
-        # Pack using cumulative seqlens
         q_p = attention_pack_from_cu_static(q, cum_seqlens_q, max_tokens=batch_size * QSeq_max)
         k_p = attention_pack_from_cu_static(k, cum_seqlens_k, max_tokens=batch_size * KSeq_max)
         v_p = attention_pack_from_cu_static(v, cum_seqlens_k, max_tokens=batch_size * KSeq_max)
@@ -1889,7 +1857,6 @@ def _blocksparse_bwd_attention_kernel_call(
         kz, kn, kh, _ = get_strides(k_p)
         vz, vn, vh, _ = get_strides(v_p)
 
-        # Preprocess Delta
         (delta,) = triton_call(
             o_p,
             dO_p,
@@ -1914,7 +1881,6 @@ def _blocksparse_bwd_attention_kernel_call(
             name="triton::ops::_attn_bwd_preprocess",
         )
 
-        # Bias (not supported with varlen in current blocksparse path)
         bz = bm = bh = 0
 
         use_layout = (layout_q2k is not None) and (layout_k2q is not None)
@@ -2018,7 +1984,6 @@ def _blocksparse_bwd_attention_kernel_call(
         dv = attention_unpack_with_static_shape(dv, cum_seqlens_k, batch_size, KSeq_max)
         return dq, dk, dv
 
-    # Dense (non-packed) path
     batch, QSeq, nheads_q, head_dim = q.shape
     _, KSeq, nheads_kv, _ = k.shape
     assert nheads_q % nheads_kv == 0
@@ -2027,7 +1992,6 @@ def _blocksparse_bwd_attention_kernel_call(
     max_seqlen_q_rounded = math.ceil(QSeq / 128) * 128
     softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
 
-    # Bool bias fallback
     BOOL_BIAS = False
     if attention_mask is not None:
         if bias is not None:
@@ -2035,14 +1999,12 @@ def _blocksparse_bwd_attention_kernel_call(
         BOOL_BIAS = True
         bias = attention_mask.astype(jnp.bool_)
 
-    # Strides
     oz, om, oh, _ = get_strides(o)
     doz, dom, doh, _ = get_strides(dO)
     qz, qm, qh, _ = get_strides(q)
     kz, kn, kh, _ = get_strides(k)
     vz, vn, vh, _ = get_strides(v)
 
-    # Preprocess delta
     (delta,) = triton_call(
         o,
         dO,
@@ -2067,7 +2029,6 @@ def _blocksparse_bwd_attention_kernel_call(
         name="triton::ops::_attn_bwd_preprocess",
     )
 
-    # Bias strides
     if bias is not None:
         if not hasattr(bias, "strides"):
             from ejkernel.utils import get_strides as gs
@@ -2086,7 +2047,6 @@ def _blocksparse_bwd_attention_kernel_call(
     else:
         bz = bm = bh = 0
 
-    # Layout pointers
     use_layout = (layout_q2k is not None) and (layout_k2q is not None)
     layout_q_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else layout_q2k
     degree_q_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else degree_q2k
@@ -2179,7 +2139,6 @@ def _blocksparse_bwd_attention_kernel_call(
         FORCE_BLOCK_N=int(force_block_n),
     )
 
-    # Reduce repeats
     if num_repeats > 1:
         dk = dk.reshape(dk.shape[0], dk.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)
         dv = dv.reshape(dv.shape[0], dv.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)

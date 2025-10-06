@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Page Attention modules with automatic optimization."""
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ class RaggedPageAttention(Kernel[KernelConfig, Array]):
         vmem_limit_bytes: int | None = None,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
         """Execute ragged page attention."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -184,25 +185,25 @@ def ragged_page_attention(
         Attention output [total_tokens, num_q_heads, head_dim]
 
     Example:
-        >>> # Standard ragged page attention
+        >>>
         >>> out = ragged_page_attention(
         ...     queries, kv_pages, context_lens, block_tables,
         ...     query_start_loc, num_seqs
         ... )
         >>>
-        >>> # With sliding window
+        >>>
         >>> out = ragged_page_attention(
         ...     queries, kv_pages, context_lens, block_tables,
         ...     query_start_loc, num_seqs, sliding_window=256
         ... )
         >>>
-        >>> # Optimized mode with soft capping
+        >>>
         >>> out = ragged_page_attention(
         ...     queries, kv_pages, context_lens, block_tables,
         ...     query_start_loc, num_seqs, optimized=True, logit_soft_cap=50.0
         ... )
             >>>
-        >>> # Force specific platform
+        >>>
         >>> out = ragged_page_attention(..., platform="triton")
     """
     return _ragged_page_attention_executor(

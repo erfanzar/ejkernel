@@ -1,25 +1,26 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 import jax
 import jax.numpy as jnp
 
-# The page size is too small. We only have 32 SREGs in TC. If the pages
-# per seq is too large, SREGs will spill.
 MAX_PAGES_PER_SEQ = 16
 
-# key:
-#     - q_dtype_name
-#     - kv_dtype_name
-#     - num_q_heads_per_blk
-#     - num_kv_heads_per_blk
-#     - head_dim
-#     - page_size
-#     - max_num_batched_tokens
-#     - max_model_len = page_size * pages_per_seq
-# value:
-#     - num_kv_pages_per_block
-#     - num_queries_per_block
+
 TUNED_BLOCK_SIZES = {
     "TPU v6": {
-        # go/keep-sorted start
         ("bfloat16", "bfloat16", 32, 8, 128, 128, 1024, 1024): (8, 32),
         ("bfloat16", "bfloat16", 32, 8, 128, 128, 1024, 2048): (16, 32),
         ("bfloat16", "bfloat16", 32, 8, 128, 128, 1024, 4096): (32, 32),
@@ -212,10 +213,8 @@ TUNED_BLOCK_SIZES = {
         ("bfloat16", "bfloat16", 8, 1, 128, 64, 512, 256): (4, 64),
         ("bfloat16", "bfloat16", 8, 1, 128, 64, 512, 4096): (64, 32),
         ("bfloat16", "bfloat16", 8, 1, 128, 64, 512, 512): (8, 32),
-        # go/keep-sorted end
     },
     "TPU v5": {
-        # go/keep-sorted start
         ("bfloat16", "bfloat16", 32, 8, 128, 128, 1024, 1024): (8, 32),
         ("bfloat16", "bfloat16", 32, 8, 128, 128, 1024, 2048): (16, 32),
         ("bfloat16", "bfloat16", 32, 8, 128, 128, 1024, 512): (4, 32),
@@ -336,7 +335,6 @@ TUNED_BLOCK_SIZES = {
         ("bfloat16", "bfloat16", 8, 1, 128, 64, 512, 1024): (16, 32),
         ("bfloat16", "bfloat16", 8, 1, 128, 64, 512, 256): (4, 32),
         ("bfloat16", "bfloat16", 8, 1, 128, 64, 512, 512): (8, 32),
-        # go/keep-sorted end
     },
 }
 
@@ -425,11 +423,8 @@ def get_tuned_block_sizes(
     key = simplify_key(key)
     device_name = get_device_name()
 
-    # Default block sizes.
     bkv, bq = (128, 32)
     if tpu_version == 4:
-        # This default block size is not tuned, only make sure there's no
-        # OOM in vmem
         bkv, bq = (32, 32)
     elif device_name in TUNED_BLOCK_SIZES:
         if key in TUNED_BLOCK_SIZES[device_name]:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Lightning Attention module with automatic optimization."""
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ class LightningAttention(Kernel[KernelConfig, Array]):
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
         """Execute lightning attention."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -151,16 +152,16 @@ def lightning_attention(
         Attention output with same shape as query
 
     Example:
-        >>> # Standard lightning attention
+        >>>
         >>> out = lightning_attention(query, key, value, layer_idx=5, num_layers=32)
         >>>
-        >>> # With scaling
+        >>>
         >>> out = lightning_attention(query, key, value, layer_idx=0, num_layers=24, scale=0.125)
         >>>
-        >>> # Variable-length sequences
+        >>>
         >>> out = lightning_attention(query, key, value, layer_idx=10, num_layers=32, cu_seqlens=cu_seqs)
         >>>
-        >>> # Force specific platform
+        >>>
         >>> out = lightning_attention(query, key, value, layer_idx=0, num_layers=24, platform="pallas")
     """
     return _lightning_executor(

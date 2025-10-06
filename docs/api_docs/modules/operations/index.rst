@@ -17,3 +17,4 @@ ejkernel.modules.operations package
    modules/operations/ragged_page_attention
    modules/operations/recurrent
    modules/operations/ring
+   modules/operations/scaled_dot_product_attention

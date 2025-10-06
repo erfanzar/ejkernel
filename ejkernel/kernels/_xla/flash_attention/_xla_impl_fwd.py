@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import chex
 import jax
@@ -58,7 +59,6 @@ def _apply_logits_transforms(
     if logits_soft_cap is not None:
         logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
-    # Combine all masks
     masks_to_combine = []
     if mask is not None:
         masks_to_combine.append(mask)
@@ -72,7 +72,6 @@ def _apply_logits_transforms(
         mask_value = jnp.finfo(logits.dtype).min
         logits = jnp.where(combined, logits, mask_value)
 
-    # Promote to at least float32 for stability
     logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
     return logits
 
@@ -97,7 +96,7 @@ def _causal_mask_for_chunk(
     """
     q_pos = q_start + jnp.arange(q_len)
     k_pos = k_start + jnp.arange(k_len)
-    # Allow attention only to positions <= current position
+
     mask = k_pos[None, :] <= q_pos[:, None]
     return mask[None, None, ...]
 
@@ -187,7 +186,7 @@ def _attend_chunk(
         but don't contribute to the output. They can absorb probability mass, improving
         numerical stability and model behavior.
     """
-    # Compute logits: [B, H, q, k]
+
     logits = jnp.einsum(
         "...qhd,...khd->...hqk",
         q_chunk,
@@ -195,7 +194,6 @@ def _attend_chunk(
         precision=precision,
     )
 
-    # Combine masks including causal mask
     combined_mask = mask_chunk
     if window_mask is not None:
         combined_mask = window_mask if combined_mask is None else jnp.logical_and(combined_mask, window_mask)
@@ -208,30 +206,23 @@ def _attend_chunk(
         bias=bias_chunk,
         logits_soft_cap=logits_soft_cap,
         mask=combined_mask,
-        window_mask=None,  # Already combined above
+        window_mask=None,
         logits_dtype=logits_dtype,
     )
 
-    # Add attention sink logits if provided
     if softmax_aux is not None:
-        # Reshape sink logits to match batch/head dimensions
         if softmax_aux.ndim == 1:
-            # [num_sinks] -> [1, 1, 1, num_sinks]
             sinks = softmax_aux.reshape(1, 1, 1, -1)
         elif softmax_aux.ndim == 2:
-            # [H, num_sinks] -> [1, H, 1, num_sinks]
             sinks = softmax_aux.reshape(1, -1, 1, softmax_aux.shape[-1])
         else:
             raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
 
-        # Broadcast to match logits shape: [B, H, q, num_sinks]
         B, H, q, k = logits.shape
         sinks = jnp.broadcast_to(sinks, (B, H, q, sinks.shape[-1]))
 
-        # Concatenate sink logits with attention logits
         combined_logits = jnp.concatenate([logits, sinks], axis=-1)
 
-        # Streaming softmax update with sinks
         loc_x_max = jnp.max(combined_logits, axis=-1)
         new_x_max = jnp.maximum(x_max, loc_x_max)
         combined_weights = jnp.exp(combined_logits - new_x_max[..., None])
@@ -241,10 +232,8 @@ def _attend_chunk(
         accum = accum * alpha.swapaxes(-1, -2)[..., None]
         denom = (denom * alpha) + combined_weights.sum(axis=-1)
 
-        # Extract only the non-sink weights for output computation
         weights = combined_weights[..., :k]
     else:
-        # Standard streaming softmax update without sinks
         loc_x_max = jnp.max(logits, axis=-1)
         new_x_max = jnp.maximum(x_max, loc_x_max)
         weights = jnp.exp(logits - new_x_max[..., None])
@@ -254,18 +243,15 @@ def _attend_chunk(
         accum = accum * alpha.swapaxes(-1, -2)[..., None]
         denom = (denom * alpha) + weights.sum(axis=-1)
 
-    # Apply dropout if specified
     next_key = dropout_key
     if dropout_prob > 0.0 and dropout_key is not None:
-        # Split key for this chunk
         dropout_key, next_key = jax.random.split(dropout_key)
         keep_prob = 1.0 - dropout_prob
-        # Generate dropout mask
+
         dropout_mask = jax.random.bernoulli(dropout_key, keep_prob, shape=weights.shape)
-        # Apply dropout and scale
+
         weights = weights * dropout_mask / keep_prob
 
-    # Weighted sum (only non-sink weights contribute to output)
     weights = weights.astype(v_chunk.dtype)
     accum = accum + jnp.einsum(
         "...hqk,...khd->...qhd",
@@ -351,7 +337,6 @@ def _flash_attention_fwd(
         x_max = jnp.full((B, Hq, chunk_size_q), float("-inf"), dtype=jnp.float32)
         denom = jnp.zeros((B, Hq, chunk_size_q), dtype=jnp.float32)
 
-        # Split dropout key for this query chunk
         chunk_dropout_key = dropout_key_i
         if dropout_prob > 0.0 and dropout_key_i is not None:
             dropout_key_i, chunk_dropout_key = jax.random.split(dropout_key_i)
@@ -363,7 +348,6 @@ def _flash_attention_fwd(
             v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, chunk_size_k, axis=1)
             k_chunk, v_chunk = _maybe_broadcast_kv_to_q_heads(k_chunk, v_chunk, Hq)
 
-            # Slice bias/mask
             bias_qk = None
             if bias is not None:
                 bias_q = lax.dynamic_slice_in_dim(bias, q_chunk_start, chunk_size_q, axis=-2)
@@ -400,26 +384,23 @@ def _flash_attention_fwd(
             )
             return (acc2, x2, d2, dk2), None
 
-        # Process all KV chunks
         n_k_full = Tk // chunk_size_k
         (acc, x_max, denom, chunk_dropout_key), _ = lax.scan(
             kv_step, (acc, x_max, denom, chunk_dropout_key), jnp.arange(n_k_full)
         )
 
-        # Handle remainder KV chunks
         k_rem = Tk % chunk_size_k
         if k_rem > 0:
             kv_chunk_start = n_k_full * chunk_size_k
-            # Pad the remainder to chunk_size_k
+
             k_chunk = lax.dynamic_slice_in_dim(k, kv_chunk_start, Tk - kv_chunk_start, axis=1)
             v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, Tk - kv_chunk_start, axis=1)
             k_chunk = jnp.pad(k_chunk, [(0, 0), (0, chunk_size_k - k_rem), (0, 0), (0, 0)])
             v_chunk = jnp.pad(v_chunk, [(0, 0), (0, chunk_size_k - k_rem), (0, 0), (0, 0)])
             k_chunk, v_chunk = _maybe_broadcast_kv_to_q_heads(k_chunk, v_chunk, Hq)
 
-            # Create mask for padded region
             pad_mask = jnp.arange(chunk_size_k) < k_rem
-            pad_mask = pad_mask[None, None, None, :]  # [1, 1, 1, k]
+            pad_mask = pad_mask[None, None, None, :]
 
             bias_qk = None
             if bias is not None:
@@ -469,13 +450,11 @@ def _flash_attention_fwd(
         out_chunk = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
         return dropout_key_i, out_chunk.astype(q.dtype)
 
-    # Process all full Q chunks
     if n_q_full > 0:
         dropout_key, full_out = lax.scan(q_step, dropout_key, jnp.arange(n_q_full))
         full_out = jnp.swapaxes(full_out, 0, 1).reshape(B, n_q_full * chunk_size_q, Hq, d_out)
         outputs.append(full_out)
 
-    # Handle remainder Q chunks
     if q_rem > 0:
         q_chunk_start = n_q_full * chunk_size_q
         q_chunk = lax.dynamic_slice_in_dim(q, q_chunk_start, q_rem, axis=1)
@@ -484,10 +463,8 @@ def _flash_attention_fwd(
         x_max = jnp.full((B, Hq, q_rem), float("-inf"), dtype=jnp.float32)
         denom = jnp.zeros((B, Hq, q_rem), dtype=jnp.float32)
 
-        # Process KV chunks for remainder Q
         n_k_full = Tk // chunk_size_k
 
-        # Split dropout key for remainder chunk
         chunk_dropout_key = dropout_key
         if dropout_prob > 0.0 and dropout_key is not None:
             dropout_key, chunk_dropout_key = jax.random.split(dropout_key)
@@ -531,7 +508,6 @@ def _flash_attention_fwd(
                 softmax_aux=softmax_aux,
             )
 
-        # Handle remainder KV for remainder Q
         k_rem = Tk % chunk_size_k
         if k_rem > 0:
             kv_chunk_start = n_k_full * chunk_size_k

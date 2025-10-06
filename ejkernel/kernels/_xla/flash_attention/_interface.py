@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
 
 import chex
 import jax
+import jaxtyping
+from beartype import beartype
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
@@ -26,7 +29,6 @@ from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_bwd import _flash_attention_bwd
 from ._xla_impl_fwd import _flash_attention_fwd
 
-# Precision/dtype code mappers (to avoid passing enums/dtypes through jit/custom_vjp)
 _PREC_TO_CODE = {
     jax.lax.Precision.DEFAULT: 0,
     jax.lax.Precision.HIGHEST: 1,
@@ -97,7 +99,6 @@ def _flash_attention_core(
     logits_dtype = _CODE_TO_DTYPE[logits_dtype_code]
     logits_soft_cap = None if (softcap < 0) else softcap
 
-    # Handle scale: if -1.0, compute default
     if scale < 0:
         D = query.shape[-1]
         scale = 1.0 / jnp.sqrt(float(D))
@@ -168,7 +169,6 @@ def _flash_attention_core_fwd(
     sliding_window = None if (window_left < 0 or window_right < 0) else (window_left, window_right)
     logits_soft_cap = None if (softcap < 0) else softcap
 
-    # Handle scale: if -1.0, compute default
     if scale < 0:
         D = query.shape[-1]
         scale = 1.0 / jnp.sqrt(float(D))
@@ -241,6 +241,7 @@ _flash_attention_core.defvjp(_flash_attention_core_fwd, _flash_attention_core_bw
 
 
 @kernel_registry.register("flash_attention", Platform.XLA, Backend.ANY)
+@jaxtyping.jaxtyped(typechecker=beartype)
 @ejit(
     static_argnames=[
         "softmax_scale",
@@ -314,16 +315,16 @@ def flash_attention(
         Output array of shape [B, Tq, H, d]
 
     Examples:
-        >>> # Standard attention
+        >>>
         >>> y = flash_attention(q, key, v)
 
-        >>> # Causal attention with sliding window
+        >>>
         >>> y = flash_attention(q, key, value, sliding_window=(T-1, 0))
 
-        >>> # MQA with soft cap
+        >>>
         >>> y = flash_attention(q, k[:, :, :1], v[:, :, :1], logits_soft_cap=20.0)
 
-        >>> # Attention with sinks (4 learnable sink logits per head)
+        >>>
         >>> sinks = jax.random.normal(key, (H, 4))
         >>> y = flash_attention(q, key, value, softmax_aux=sinks)
 
@@ -342,14 +343,12 @@ def flash_attention(
     if cum_seqlens_q is not None:
         raise NotImplementedError("`cum_seqlens_q` is not implemented in xla!")
 
-    # Handle dropout seed and create RNG key
     dropout_key = None
     if dropout_prob > 0.0:
         if dropout_seed is None:
             dropout_seed = 0
         dropout_key = jax.random.PRNGKey(dropout_seed)
 
-    # Convert window to tuple or encode as negative values
     if isinstance(sliding_window, int):
         window_left = window_right = int(sliding_window)
     elif sliding_window is None:
@@ -367,10 +366,8 @@ def flash_attention(
     else:
         scale_val = float(softmax_scale)
 
-    # Convert soft cap - encode None as negative
     softcap = float(logits_soft_cap) if logits_soft_cap is not None else -1.0
 
-    # Convert precision and dtype to codes
     precision_code = _precision_to_code(precision)
     logits_dtype_code = _dtype_to_code(logits_dtype)
 

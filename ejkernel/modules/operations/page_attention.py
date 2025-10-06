@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Page Attention modules with automatic optimization."""
 
 from __future__ import annotations
@@ -69,7 +70,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
         inline_seq_dim: bool = True,
     ) -> Float[Array, "num_seqs num_heads head_dim"]:
         """Execute page attention."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -178,22 +179,22 @@ def page_attention(
         Attention output [num_seqs, num_heads, head_dim]
 
     Example:
-        >>> # Standard page attention
+        >>>
         >>> out = page_attention(query, key_cache, value_cache, context_lens, block_tables)
         >>>
-        >>> # With multi-split for long contexts
+        >>>
         >>> out = page_attention(
         ...     query, key_cache, value_cache, context_lens, block_tables,
         ...     num_splits=4, max_context_len=8192
         ... )
         >>>
-        >>> # With soft capping
+        >>>
         >>> out = page_attention(
         ...     query, key_cache, value_cache, context_lens, block_tables,
         ...     attn_logits_soft_cap=50.0
         ... )
             >>>
-        >>> # Force specific platform
+        >>>
         >>> out = page_attention(..., platform="triton")
     """
     return _page_attention_executor(

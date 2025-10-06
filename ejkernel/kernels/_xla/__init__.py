@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
 from .attention import attention
 from .flash_attention import flash_attention
 from .gla import recurrent_gla
@@ -21,6 +23,7 @@ from .page_attention import page_attention
 from .ragged_page_attention import ragged_page_attention
 from .recurrent import recurrent
 from .ring_attention import ring_attention
+from .scaled_dot_product_attention import scaled_dot_product_attention
 
 __all__ = [
     "apply_native_sparse_attention",
@@ -33,4 +36,5 @@ __all__ = [
     "recurrent",
     "recurrent_gla",
     "ring_attention",
+    "scaled_dot_product_attention",
 ]

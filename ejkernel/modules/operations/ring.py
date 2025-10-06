@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Ring Attention module with automatic optimization."""
 
 from __future__ import annotations
 
 from typing import Literal
 
+import chex
 import jax
+from jax import lax
 from jax import numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.ops import Invocation, Kernel
@@ -71,7 +74,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
         """Execute ring attention."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -213,10 +216,10 @@ def ring_attention(
         Attention output with same shape as query
 
     Example:
-        >>> # Standard ring attention
+        >>>
         >>> out = ring_attention(query, key, value)
         >>>
-        >>> # With causal masking and custom chunk sizes
+        >>>
         >>> out = ring_attention(
         ...     query, key, value,
         ...     causal_block_size=128,
@@ -224,7 +227,7 @@ def ring_attention(
         ...     key_chunk_size=256
         ... )
         >>>
-        >>> # With sliding window and dropout
+        >>>
         >>> out = ring_attention(
         ...     query, key, value,
         ...     sliding_window=1024,
@@ -232,7 +235,7 @@ def ring_attention(
         ...     dropout_rng=rng
         ... )
             >>>
-        >>> # Force specific platform
+        >>>
         >>> out = ring_attention(..., platform="triton")
     """
     return _ring_executor(

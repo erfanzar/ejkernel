@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import jax
 import jax.numpy as jnp
@@ -53,86 +54,67 @@ def _sparse_attention_fwd(
     num_query_blocks = (seq_len + block_size - 1) // block_size
     num_key_blocks = (seq_len + block_size - 1) // block_size
 
-    # Pad sequences to be divisible by block_size
     pad_len = num_query_blocks * block_size - seq_len
     if pad_len > 0:
         q = jnp.pad(q, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
         k = jnp.pad(k, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
         v = jnp.pad(v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
 
-    # Reshape into blocks
-    # q: [batch, num_query_blocks, block_size, num_q_heads, head_dim]
-    # k,v: [batch, num_key_blocks, block_size, num_kv_heads, head_dim]
     q_blocks = q.reshape(batch, num_query_blocks, block_size, num_q_heads, head_dim)
     k_blocks = k.reshape(batch, num_key_blocks, block_size, num_kv_heads, head_dim)
     v_blocks = v.reshape(batch, num_key_blocks, block_size, num_kv_heads, head_dim)
 
-    # Transpose to [batch, num_heads, num_blocks, block_size, head_dim]
-    q_blocks = q_blocks.transpose(0, 3, 1, 2, 4)  # [batch, num_q_heads, num_query_blocks, block_size, head_dim]
-    k_blocks = k_blocks.transpose(0, 3, 1, 2, 4)  # [batch, num_kv_heads, num_key_blocks, block_size, head_dim]
-    v_blocks = v_blocks.transpose(0, 3, 1, 2, 4)  # [batch, num_kv_heads, num_key_blocks, block_size, head_dim]
+    q_blocks = q_blocks.transpose(0, 3, 1, 2, 4)
+    k_blocks = k_blocks.transpose(0, 3, 1, 2, 4)
+    v_blocks = v_blocks.transpose(0, 3, 1, 2, 4)
 
     def attend_query_block(b_idx, q_h_idx, qb_idx):
         """Compute attention for a single query block."""
-        # For GQA: map query head to corresponding KV head
+
         kv_h_idx = q_h_idx // group_size
 
-        q_block = q_blocks[b_idx, q_h_idx, qb_idx]  # [block_size, head_dim]
+        q_block = q_blocks[b_idx, q_h_idx, qb_idx]
 
-        # Get which key blocks to attend to (indexed by kv head)
         num_blocks_for_this_query = block_counts[b_idx, kv_h_idx, qb_idx]
-        all_key_block_indices = block_indices[b_idx, kv_h_idx, qb_idx]  # [max_num_key_blocks]
+        all_key_block_indices = block_indices[b_idx, kv_h_idx, qb_idx]
 
         def attend_key_block(kb_pos):
             """Attend to a single key block position."""
             kb_idx = all_key_block_indices[kb_pos]
-            k_block = k_blocks[b_idx, kv_h_idx, kb_idx]  # [block_size, head_dim]
-            v_block = v_blocks[b_idx, kv_h_idx, kb_idx]  # [block_size, head_dim]
+            k_block = k_blocks[b_idx, kv_h_idx, kb_idx]
+            v_block = v_blocks[b_idx, kv_h_idx, kb_idx]
 
-            # Compute attention scores: [block_size, block_size]
             scores = jnp.einsum("qd,kd->qk", q_block, k_block) * scale
 
-            # Mask out this key block if beyond num_blocks
             is_valid = kb_pos < num_blocks_for_this_query
             scores = jnp.where(is_valid, scores, -1e9)
 
             return scores, v_block
 
-        # Process all potential key block positions
         max_num_key_blocks = all_key_block_indices.shape[0]
         scores_list, v_list = jax.vmap(attend_key_block)(jnp.arange(max_num_key_blocks))
-        # scores_list: [max_num_key_blocks, block_size, block_size]
-        # v_list: [max_num_key_blocks, block_size, head_dim]
 
-        # Reshape to merge key blocks: [block_size, max_num_key_blocks * block_size]
         all_scores = scores_list.transpose(1, 0, 2).reshape(block_size, -1)
-        all_values = v_list.transpose(1, 0, 2).reshape(-1, head_dim)  # [max_num_key_blocks * block_size, head_dim]
+        all_values = v_list.transpose(1, 0, 2).reshape(-1, head_dim)
 
-        # Apply softmax
-        attn_weights = jax.nn.softmax(all_scores, axis=-1)  # [block_size, max_num_key_blocks * block_size]
+        attn_weights = jax.nn.softmax(all_scores, axis=-1)
 
-        # Apply attention weights
-        output = jnp.einsum("qk,kd->qd", attn_weights, all_values)  # [block_size, head_dim]
+        output = jnp.einsum("qk,kd->qd", attn_weights, all_values)
 
         return output
 
-    # Process all query blocks
     def process_head(b_idx, q_h_idx):
         outputs = jax.vmap(lambda qb: attend_query_block(b_idx, q_h_idx, qb))(jnp.arange(num_query_blocks))
-        return outputs  # [num_query_blocks, block_size, head_dim]
+        return outputs
 
     def process_batch(b_idx):
         outputs = jax.vmap(lambda h: process_head(b_idx, h))(jnp.arange(num_q_heads))
-        return outputs  # [num_q_heads, num_query_blocks, block_size, head_dim]
+        return outputs
 
-    # Process all batches
     outputs = jax.vmap(process_batch)(jnp.arange(batch))
-    # outputs: [batch, num_q_heads, num_query_blocks, block_size, head_dim]
 
-    # Reshape back to [batch, seq_len, num_q_heads, head_dim]
     outputs = outputs.transpose(0, 2, 3, 1, 4).reshape(batch, -1, num_q_heads, head_dim)
 
-    # Remove padding
     outputs = outputs[:, :seq_len, :, :]
 
     return outputs

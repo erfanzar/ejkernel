@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Utility functions for TPU device detection and dtype validation.
 
@@ -74,9 +75,9 @@ def tpu_generation() -> int:
             version string format is unrecognized.
 
     Example:
-        >>> tpu_generation()  # On TPU v4
+        >>> tpu_generation()
         4
-        >>> tpu_generation()  # On TPU v5e
+        >>> tpu_generation()
         5
 
     Note:
@@ -105,9 +106,9 @@ def supports_bfloat16_matmul() -> bool:
 
     Example:
         >>> if supports_bfloat16_matmul():
-        ...     dtype = jnp.bfloat16  # Use bfloat16 for efficiency
+        ...     dtype = jnp.bfloat16
         ... else:
-        ...     dtype = jnp.float32   # Fall back to float32
+        ...     dtype = jnp.float32
 
     Note:
         - Returns True for non-TPU devices (CPU/GPU) as they typically
@@ -133,9 +134,9 @@ def assert_is_supported_dtype(dtype: jnp.dtype) -> None:
         ValueError: If dtype is not bfloat16 or float32.
 
     Example:
-        >>> assert_is_supported_dtype(jnp.float32)  # OK
-        >>> assert_is_supported_dtype(jnp.bfloat16)  # OK
-        >>> assert_is_supported_dtype(jnp.float64)  # Raises ValueError
+        >>> assert_is_supported_dtype(jnp.float32)
+        >>> assert_is_supported_dtype(jnp.bfloat16)
+        >>> assert_is_supported_dtype(jnp.float64)
 
     Note:
         - bfloat16: Preferred for TPU v4+, offers 2x throughput vs float32
@@ -168,7 +169,7 @@ def select_input_dtype(lhs: jnp.ndarray, rhs: jnp.ndarray) -> jnp.dtype:
     Example:
         >>> lhs = jnp.ones((10, 20), dtype=jnp.bfloat16)
         >>> rhs = jnp.ones((20, 30), dtype=jnp.bfloat16)
-        >>> select_input_dtype(lhs, rhs)  # On TPU v4+
+        >>> select_input_dtype(lhs, rhs)
         dtype('bfloat16')
 
         >>> lhs = jnp.ones((10, 20), dtype=jnp.float32)

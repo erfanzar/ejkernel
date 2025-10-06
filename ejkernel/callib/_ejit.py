@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Compilation utilities for JAX function optimization.
 
@@ -46,9 +47,9 @@ Example:
     ... def optimized_fn(x, y):
     ...     return x @ y + x.T @ y.T
     >>>
-    >>> # First call compiles and caches
+    >>>
     >>> result = optimized_fn(a, b)
-    >>> # Next run loads from cache
+    >>>
     >>> result = optimized_fn(a, b)
 """
 
@@ -171,9 +172,9 @@ def ejit(
         >>> @ejit
         ... def fast_matmul(a, b):
         ...     return a @ b
-        >>> # First call compiles and caches
+        >>>
         >>> result = fast_matmul(x, y)
-        >>> # Subsequent calls use cached version
+        >>>
     """
     if func is None:
         return functools.partial(
@@ -360,17 +361,17 @@ def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None =
         - {prefix}-compiled.executable: Serialized function and metadata
 
     Example:
-        >>> # Compile a function
+        >>>
         >>> jitted = jax.jit(my_function)
         >>> lowered = jitted.lower(sample_input)
         >>> compiled = lowered.compile()
         >>>
-        >>> # Save to disk
+        >>>
         >>> from pathlib import Path
         >>> cache_dir = Path("./my_cache")
         >>> save_compiled_fn(cache_dir, compiled, prefix="model_v1")
         >>>
-        >>> # File created: ./my_cache/model_v1-compiled.executable
+        >>>
 
     Raises:
         Warning: If serialization fails (logged, not raised).
@@ -503,8 +504,8 @@ if __name__ == "__main__":
     a = jnp.array([1, 2, 3], dtype=jnp.float32)
     b = jnp.array([4, 5, 6], dtype=jnp.float32)
 
-    result1 = my_function(a, b)  # Compiles and caches on first call
-    result2 = my_function(a, b)  # Returns cached result
+    result1 = my_function(a, b)
+    result2 = my_function(a, b)
 
     c = jnp.array([1, 2, 3], dtype=jnp.float32)
     d = jnp.array([1, 1, 1], dtype=jnp.float32)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """GLA (Gated Linear Attention) module with automatic optimization."""
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ class GLAttention(Kernel[KernelConfig, Array]):
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
         """Execute gated linear attention."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -66,7 +67,7 @@ class GLAttention(Kernel[KernelConfig, Array]):
                 backend=cfg.backend,
             )
         impl = self.get_impl(cfg)
-        # Don't pass backend to the kernel implementation
+
         return impl(
             query=query,
             key=key,
@@ -147,16 +148,16 @@ def gla_attention(
         Attention output with same shape as query
 
     Example:
-        >>> # Standard GLA
+        >>>
         >>> out = gla_attention(query, key, value)
         >>>
-        >>> # With gating
+        >>>
         >>> out = gla_attention(query, key, value, g=gates, g_gamma=gamma)
         >>>
-        >>> # Variable-length sequences
+        >>>
         >>> out = gla_attention(query, key, value, cu_seqlens=cu_seqs)
         >>>
-        >>> # Force specific platform
+        >>>
         >>> out = gla_attention(..., platform="triton")
     """
     return _gla_executor(

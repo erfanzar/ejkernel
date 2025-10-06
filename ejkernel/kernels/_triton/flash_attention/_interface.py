@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 import functools
 
 import jax
+import jaxtyping
+from beartype import beartype
 from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
@@ -31,14 +33,14 @@ def _jax_fwd_attention_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch seq_len"] | None = None,  # legacy path
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
@@ -159,8 +161,8 @@ def flash_attention_call(
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
@@ -219,6 +221,7 @@ flash_attention_call.defvjp(
 
 
 @kernel_registry.register("flash_attention", Platform.TRITON, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
@@ -272,13 +275,13 @@ def flash_attention(
         chex.Array: Attention output with shape [batch, seq_len, num_heads, head_dim]
 
     Examples:
-        >>> # Standard attention
+        >>>
         >>> out = flash_attention(query, key, value, causal=True)
         >>>
-        >>> # With dropout and custom scale
+        >>>
         >>> out = flash_attention(query, key, value, dropout_prob=0.1, softmax_scale=0.125)
         >>>
-        >>> # Variable-length sequences with packing
+        >>>
         >>> out = flash_attention(query, key, value, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
     """
     del chunk_size_q, chunk_size_k, precision, logits_dtype, debug, normalize_output

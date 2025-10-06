@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import chex
 import jax
@@ -60,7 +61,6 @@ def _flash_attention_bwd(
     """
     from ._xla_impl_fwd import _flash_attention_fwd
 
-    # Precision/dtype mappers
     _CODE_TO_PREC = {
         0: jax.lax.Precision.DEFAULT,
         1: jax.lax.Precision.HIGHEST,
@@ -105,19 +105,19 @@ def _flash_attention_bwd(
         dq,
         dk,
         dv,
-        None,  # bias
-        None,  # mask
-        None,  # softmax_aux
-        None,  # window_left
-        None,  # window_right
-        None,  # scale
-        None,  # softcap
-        None,  # chunk_size_q
-        None,  # chunk_size_k
-        None,  # normalize_output
-        None,  # precision_code
-        None,  # logits_dtype_code
-        None,  # causal
-        None,  # dropout_prob
-        None,  # dropout_key
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )

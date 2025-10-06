@@ -1,3 +1,18 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 from __future__ import annotations
 
 import dataclasses
@@ -92,7 +107,6 @@ def make_chunk_attention_mask(shape: tuple[int, int], chunk_size: int) -> np.nda
     q_idx = np.arange(q_seq_len, dtype=np.int32)
     kv_idx = np.arange(kv_seq_len, dtype=np.int32)
 
-    # chunk mask calculation
     same_chunk = (q_idx[:, None] // chunk_size) == (kv_idx[None, :] // chunk_size)
     mask = same_chunk & (q_idx[:, None] >= kv_idx[None, :])
     return mask
@@ -285,9 +299,6 @@ class CausalMask(_ComputableMask):
         self.offset = offset
 
         def causal_mask_function(q_ids, kv_ids):
-            # When evaluating the mask in _process_mask we typically work with numpy
-            # array views.
-            # Avoid the addition when possible to avoid instantiating an actual array.
             if self.offset == 0:
                 return q_ids >= kv_ids
             else:
@@ -346,13 +357,11 @@ class ChunkedCausalMask(_ComputableMask):
             raise ValueError("chunk_size must be positive")
         self.chunk_size = chunk_size
 
-        # Define the mask function for chunk attention
         def chunked_causal_mask_function(q_ids, kv_ids):
             """Computes the mask logic for the given slice indices."""
-            # Condition 1: Same chunk
+
             same_chunk = (q_ids // self.chunk_size) == (kv_ids // self.chunk_size)
 
-            # Condition 2: Causal
             causal = q_ids >= kv_ids
 
             return same_chunk & causal
@@ -419,7 +428,6 @@ class LocalMask(_ComputableMask):
             if left_size is None and right_size is None:
                 return np.ones((q_ids.shape[0], kv_ids.shape[1]), dtype=np.bool_)
 
-            # Avoid the addition when possible to avoid instantiating an actual array.
             if offset != 0:
                 shifted_q_ids = q_ids + self.offset
             else:
@@ -506,8 +514,6 @@ def _fill_slice(inp_slice: slice, size: int) -> slice:
 @dataclasses.dataclass(frozen=True)
 class FullMask(Mask):
     """Lazy full mask, allows all tokens to attend to all other tokens."""
-
-    # TODO(amagni): Transform FullMask into a _ComputableMask.
 
     _shape: tuple[int, int]
 

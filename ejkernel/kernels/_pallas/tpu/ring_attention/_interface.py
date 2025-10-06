@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ from ._utils import SegmentIds
 
 @partial(
     jax.custom_vjp,
-    nondiff_argnums=(4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18),
+    nondiff_argnums=(4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19),
 )
 def _ring_attention(
     query: Array,
@@ -74,6 +74,7 @@ def _ring_attention(
     logit_soft_cap: float | None,
     attention_sink_size: int,
     policy,
+    softmax_scale,
 ) -> chex.Array:
     """
     Computes ring attention using FlashAttention on TPU.
@@ -98,6 +99,7 @@ def _ring_attention(
         logit_soft_cap,
         attention_sink_size,
         policy,
+        softmax_scale,
     )
     return y
 
@@ -164,7 +166,7 @@ def ring_attention(
     Returns:
         Output array of shape (batch, q_len, num_heads, dim_per_head).
     """
-    # Handle backward compatibility for segment_ids
+
     if q_segment_ids is None and kv_segment_ids is None:
         segment_ids = None
     elif q_segment_ids is not None and kv_segment_ids is None:
@@ -173,7 +175,8 @@ def ring_attention(
         segment_ids = SegmentIds(query=kv_segment_ids, kv=kv_segment_ids)
     else:
         segment_ids = SegmentIds(query=q_segment_ids, kv=kv_segment_ids)
-
+    if softmax_scale is None:
+        softmax_scale = query.shape[-1] ** -0.5
     return _ring_attention(
         query,
         key,
@@ -194,4 +197,5 @@ def ring_attention(
         logit_soft_cap,
         attention_sink_size,
         policy,
+        softmax_scale,
     )

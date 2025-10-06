@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 from __future__ import annotations
 
@@ -145,11 +146,9 @@ class Autotuner(Generic[Cfg]):
                 fn = make_fn(cfg)
                 c = jax.jit(fn).lower(*args, **kwargs).compile()
 
-                # Warmup phase
                 for _ in range(self.warmup):
                     _ = c(*args, **kwargs).block_until_ready()
 
-                # Timing phase
                 t0 = time.perf_counter()
                 for _ in range(self.iters):
                     _ = c(*args, **kwargs).block_until_ready()
@@ -977,7 +976,7 @@ class FNAutotuner:
 
 
 def autotune(
-    fn: Callable[..., Any] | None = None,  # allow direct-call: autotune(fn, ...)
+    fn: Callable[..., Any] | None = None,
     /,
     *,
     allow_fallback_timing: bool = True,
@@ -1033,7 +1032,7 @@ def autotune(
     Args:
         fn: Function to autotune (when used as direct call)
 
-        # Timing and Profiling Configuration
+
         allow_fallback_timing: Enable Python timing fallback if profiler fails
         profiling_samples: Number of profiling iterations for statistical accuracy
         must_find_profiler_fraction: Minimum fraction of configs needing profiler results (0.0-1.0)
@@ -1042,14 +1041,14 @@ def autotune(
         timing_rounds: Number of timing rounds for statistical analysis
         calls_per_round: Function calls per timing round
 
-        # Profiler Configuration
+
         profiler_prefix_filter: Event name prefix filter for profiler (default: "jit_")
         profiler_event_regex: Optional regex filter for profiler events
         profiler_min_duration_ns: Minimum event duration for profiler inclusion (nanoseconds)
         profiler_max_events: Maximum events per profile to prevent memory issues
         profiler_verbose: Enable verbose profiler output
 
-        # Optimization Configuration
+
         find_optimal_layouts_automatically: Auto-discover optimal memory layouts
         max_compilation_time_seconds: Maximum compilation time per configuration
         cache_size_limit: Maximum cached optimization results
@@ -1057,7 +1056,7 @@ def autotune(
         max_workers: Maximum parallel workers for optimization
         sample_num: Maximum hyperparameter combinations to test
 
-        # Execution Configuration
+
         in_shardings: Input sharding specifications for distributed computation
         out_shardings: Output sharding specifications for distributed computation
         device: Target device or device string for computation
@@ -1085,10 +1084,10 @@ def autotune(
         ```python
         @autotune(hyperparams={'block_size': [64, 128, 256, 512]})
         def matrix_multiply(a, b, block_size=128):
-            # Implementation using block_size
+
             return jnp.dot(a, b)
 
-        result = matrix_multiply(x, y)  # Automatically finds optimal block_size
+        result = matrix_multiply(x, y)
         print(f"Optimal config: {matrix_multiply.optimal_hyperparams}")
         ```
 
@@ -1105,7 +1104,7 @@ def autotune(
             enable_detailed_logging=True
         )
         def compute_function(data, chunk_size=64, algorithm='parallel'):
-            # Implementation
+
             return processed_data
         ```
 
@@ -1123,11 +1122,11 @@ def autotune(
         ```python
         @autotune(
             hyperparams={'tile_size': [16, 32, 64]},
-            example_args=(jnp.zeros((1000, 1000)),),  # Concrete shapes for optimization
+            example_args=(jnp.zeros((1000, 1000)),),
             device='gpu'
         )
         def process_matrix(matrix, tile_size=32):
-            # Implementation
+
             return result
         ```
 

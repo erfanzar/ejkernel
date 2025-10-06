@@ -1,9 +1,26 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 import functools
 from collections.abc import Sequence
 from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import jaxtyping
+from beartype import beartype
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float, Int
@@ -19,6 +36,7 @@ from ._pallas_impl_fwd import (
 
 
 @kernel_registry.register("page_attention", Platform.PALLAS, Backend.TPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 @ejit(
     static_argnames=[
         "pages_per_compute_block",
@@ -94,8 +112,7 @@ def page_attention(
 
     if key_cache.shape != value_cache.shape:
         raise ValueError(
-            f"key_cache and value_cache must have the same shape. Got {key_cache.shape} and"
-            f" {value_cache.shape}"  # pytype: disable=attribute-error
+            f"key_cache and value_cache must have the same shape. Got {key_cache.shape} and {value_cache.shape}"
         )
     if num_q_heads % num_kv_heads != 0:
         raise ValueError(
@@ -115,7 +132,6 @@ def page_attention(
     if context_lens.dtype != jnp.int32:
         raise ValueError("The dtype of `context_lens` must be int32. Got {context_lens.dtype}")
 
-    # TODO(dinghua): get the actual cores per chip once there's an official API.
     if megacore_mode == "kv_head":
         if num_kv_heads % 2 != 0:
             raise ValueError("number of KV heads must be even when megacore_mode is 'kv_head'")
@@ -209,8 +225,6 @@ def page_attention(
             megacore_mode=megacore_mode,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            # There are 4 scalars prefetched per kernel call: `lengths_ref`,
-            # `page_indices_ref`, `buffer_index_ref`, `init_flag_ref`
             num_scalar_prefetch=4,
             in_specs=in_specs,
             out_specs=[
@@ -230,8 +244,8 @@ def page_attention(
     )(
         context_lens,
         block_tables.reshape(-1),
-        jnp.zeros((1,), jnp.int32),  # buffer index
-        jnp.ones((1,), jnp.int32),  # init flag
+        jnp.zeros((1,), jnp.int32),
+        jnp.ones((1,), jnp.int32),
         q.astype(q_dtype_for_kernel_launch),
         key_cache,
         value_cache,

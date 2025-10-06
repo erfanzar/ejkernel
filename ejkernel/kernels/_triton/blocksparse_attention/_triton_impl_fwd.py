@@ -1,5 +1,17 @@
-# Copyright 2025
-# blocksparse (block-sparse + Flash) forward kernel for Triton/JAX
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 import math
 from typing import Any
@@ -48,7 +60,7 @@ def config_prune_blocksparse_kernel(
         kept.append(cfg)
     if kept:
         return kept
-    # Fallback set (small to ensure compile)
+
     return [
         Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
         Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=2),
@@ -59,12 +71,12 @@ def config_prune_blocksparse_kernel(
 @triton.jit
 def _attn_fwd_inner(
     q,
-    m_i,  # running m in natural units (log)
-    me_i,  # running lse in natural units: me_i = m_i + log(l_i)
+    m_i,
+    me_i,
     k_ptrs,
     v_ptrs,
     bias_ptrs,
-    acc_o,  # running unnormalized output (o_scratch)
+    acc_o,
     offs_m,
     offs_n,
     offs_d,
@@ -110,10 +122,8 @@ def _attn_fwd_inner(
         LA1=headdim,
     ).to(tl.float32)
 
-    # Scores (fp32)
     qk = tl.dot(q.to(tl.float32), tl.trans(k))
 
-    # Masks
     if PADDED_COLS:
         valid_cols = (index_start_n + offs_n)[None, :] < actual_seqlen_k
         qk = tl.where(valid_cols, qk, BIG_NEG)
@@ -127,7 +137,6 @@ def _attn_fwd_inner(
         in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
         qk = tl.where(in_window, qk, BIG_NEG)
 
-    # Bias (natural units)
     if BIAS_ON:
         bias = tl.load(
             bias_ptrs + index_start_n,
@@ -141,22 +150,18 @@ def _attn_fwd_inner(
         else:
             qk = qk + bias.to(qk.dtype)
 
-    # Scale + softcap (natural)
     qk = qk * softmax_scale
     if SOFTCAP:
         qk = tl.tanh(qk / logits_soft_cap) * logits_soft_cap
 
-    # Tile max (natural log space like TPU reference)
-    # Load and process sinks once if needed
     if USE_SINKS:
         sink_offs = tl.arange(0, 16)
         sink_mask = sink_offs < num_sinks
         aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=BIG_NEG).to(tl.float32)
-        # Apply softcap if enabled (aux is in natural units)
+
         if SOFTCAP:
             aux_logits = tl.tanh(aux_logits / logits_soft_cap) * logits_soft_cap
 
-    # Compute tile max including sinks
     qk_max = tl.max(qk, 1)
     if USE_SINKS:
         aux_max = tl.max(tl.where(sink_mask, aux_logits, BIG_NEG))
@@ -164,39 +169,31 @@ def _attn_fwd_inner(
     else:
         m_curr = qk_max
 
-    # Stable recenter on m_next; guard rows that are fully-masked in this tile
     m_prev = m_i
     m_next = tl.maximum(m_prev, m_curr)
     row_valid = m_next > BIG_NEG
 
-    # Only compute qk - m_next for valid rows to avoid (-inf) subtraction
     qk_delta = tl.where(row_valid[:, None], qk - m_next[:, None], 0.0)
-    # Clip to avoid exp underflow/NaN in fp16/bf16
+
     qk_delta = tl.maximum(qk_delta, -80.0)
 
     s_curr = tl.where(row_valid[:, None], tl.exp(qk_delta), 0.0)
     l_curr = tl.sum(s_curr, 1)
 
-    # Add sink contributions to denominator
     if USE_SINKS:
-        # Compute contribution for each row, broadcasting aux across rows
         l_aux = tl.where(row_valid, tl.sum(tl.where(sink_mask, tl.exp(aux_logits - m_next[:, None]), 0.0), axis=1), 0.0)
         l_curr = l_curr + l_aux
 
-    # Previous l in linear space
     l_prev = tl.where(me_i > BIG_NEG, tl.exp(me_i - m_prev), 0.0)
 
-    # Combine prev/current with alpha factor
     alpha = tl.where(m_prev > BIG_NEG, tl.exp(m_prev - m_next), 0.0)
     l_next = l_prev * alpha + l_curr
 
-    # Optional dropout: drop numerator only (denom stays pre-dropout)
     if USE_DROPOUT:
         dropout_offs = dropout_offs + index_start_n
         dropout_mask = tl.rand(dropout_seed, dropout_offs) > dropout_prob
         s_curr = tl.where(dropout_mask, s_curr, 0.0)
 
-    # Accumulate o_scratch with same scale
     v = padded_load(
         v_ptrs + (index_start_n + offs_n)[:, None] * stride_vn + offs_d[None, :],
         index_start_n + offs_n,
@@ -208,7 +205,6 @@ def _attn_fwd_inner(
     ).to(tl.float32)
     acc_o = tl.where(row_valid[:, None], acc_o * alpha[:, None], acc_o) + tl.dot(s_curr, v)
 
-    # Update m and log-lse (keep m and me in sync, using natural log like TPU reference)
     valid_update = l_next > 0
     m_i = tl.where(valid_update, m_next, m_i)
     me_i = tl.where(valid_update, m_next + tl.log(l_next + 1e-30), me_i)
@@ -218,7 +214,6 @@ def _attn_fwd_inner(
 
 @triton.autotune(
     configs=[
-        # You can add/trim these to match your preferred tile-set
         Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
         Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
         Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
@@ -238,10 +233,10 @@ def _attn_fwd_inner(
         "BIAS_ON",
         "BLOCK_HEADDIM",
         "SLIDING",
-        "USE_LAYOUT",  # NEW
-        "MAX_DEGREE",  # NEW
-        "FORCE_BLOCK_M",  # NEW
-        "FORCE_BLOCK_N",  # NEW
+        "USE_LAYOUT",
+        "MAX_DEGREE",
+        "FORCE_BLOCK_M",
+        "FORCE_BLOCK_N",
     ],
     prune_configs_by={"early_config_prune": config_prune_blocksparse_kernel},
 )
@@ -283,9 +278,9 @@ def _attn_blocksparse_fwd(
     window_left,
     window_right,
     QSeq,
-    cum_seqlens_q,  # int32 [B+1] (or dummy)
+    cum_seqlens_q,
     KSeq,
-    cum_seqlens_k,  # int32 [B+1] (or dummy)
+    cum_seqlens_k,
     max_seqlen_q_rounded,
     headdim,
     CQSeq,
@@ -293,11 +288,10 @@ def _attn_blocksparse_fwd(
     DRuntime,
     Po,
     M,
-    # Layout
-    layout_ptr,  # int32 [n_q_blocks, MAX_DEGREE] row-major
-    degree_ptr,  # int32 [n_q_blocks]
-    FORCE_BLOCK_M,  # runtime "hint" for autotune pruning; unused in kernel body
-    FORCE_BLOCK_N,  # runtime "hint" for autotune pruning; unused in kernel body
+    layout_ptr,
+    degree_ptr,
+    FORCE_BLOCK_M,
+    FORCE_BLOCK_N,
     VARLEN: tl.constexpr,
     USE_DROPOUT: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -306,8 +300,8 @@ def _attn_blocksparse_fwd(
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
-    USE_LAYOUT: tl.constexpr,  # NEW
-    MAX_DEGREE: tl.constexpr,  # NEW
+    USE_LAYOUT: tl.constexpr,
+    MAX_DEGREE: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     PADDED_HEADS: tl.constexpr,
     EVEN_M: tl.constexpr,
@@ -315,14 +309,12 @@ def _attn_blocksparse_fwd(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # Program ids
     i_start_m = tl.program_id(0)
     off_zh = tl.program_id(1)
     off_head_q = off_zh % nheads_q
     off_head_kv = off_head_q // num_repeats
     off_z = off_zh // nheads_q
 
-    # Variable-length setup
     if VARLEN:
         cu_q0 = tl.load(cum_seqlens_q + off_z)
         cu_q1 = tl.load(cum_seqlens_q + off_z + 1)
@@ -341,9 +333,6 @@ def _attn_blocksparse_fwd(
         cu_seq_start_q = 0
         cu_seq_start_k = 0
 
-    # LN2: tl.constexpr = 1.44269504089
-    # softmax_scale = softmax_scale * LN2
-
     offs_m = i_start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
@@ -352,7 +341,6 @@ def _attn_blocksparse_fwd(
     if IS_CAUSAL and fully_masked_lines >= (i_start_m + 1) * BLOCK_M:
         return
 
-    # Base pointers
     q_ptrs = (
         q
         + off_z * stride_qz
@@ -380,33 +368,27 @@ def _attn_blocksparse_fwd(
     else:
         dropout_offs = None
 
-    # Sinks pointer for this head
     softmax_aux_ptrs = softmax_aux + off_head_q * num_sinks if USE_SINKS else softmax_aux
 
     me_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
 
-    # Load Q tile
     pad_rows = (not EVEN_M) or (VARLEN and (i_start_m * BLOCK_M > actual_seqlen_q))
     q = padded_load(q_ptrs, offs_m, offs_d, PA0=pad_rows, PA1=PADDED_HEADS, LA0=actual_seqlen_q, LA1=headdim)
 
-    # Decide which K tiles to visit
     if USE_LAYOUT:
-        # n_k_blocks for validity checks
         n_k_blocks = (actual_seqlen_k + BLOCK_N - 1) // BLOCK_N
-        # Row id in layout (one layout shared across batch/heads)
+
         q_block = i_start_m
 
-        # Load degree once
-        deg = tl.load(degree_ptr + q_block)  # int32
+        deg = tl.load(degree_ptr + q_block)
 
-        # Iterate adjacency list [q_block, :]
         for li in range(0, MAX_DEGREE):
             valid_li = li < deg
 
             col_block = tl.load(layout_ptr + q_block * MAX_DEGREE + li, mask=valid_li, other=0)
-            # Additional checks: col_block bounds
+
             in_bounds = (col_block >= 0) & (col_block < n_k_blocks)
             process = valid_li & in_bounds
 
@@ -445,7 +427,7 @@ def _attn_blocksparse_fwd(
                     BIAS_ON=BIAS_ON,
                     BOOL_BIAS=BOOL_BIAS,
                     MASKED=True,
-                    SLIDING=SLIDING,  # keep element-level sliding if desired
+                    SLIDING=SLIDING,
                     SOFTCAP=SOFTCAP,
                     USE_SINKS=USE_SINKS,
                     PADDED_COLS=pad_cols,
@@ -454,10 +436,9 @@ def _attn_blocksparse_fwd(
                     BLOCK_N=BLOCK_N,
                 )
     else:
-        # Dense or sliding-window "blocksparse" scanning over a contiguous range
         if SLIDING:
             q_start = i_start_m * BLOCK_M
-            q_end = tl.minimum(q_start + BLOCK_M, actual_seqlen_q) - 1  # inclusive
+            q_end = tl.minimum(q_start + BLOCK_M, actual_seqlen_q) - 1
             shift = actual_seqlen_k - actual_seqlen_q
             wr = 0 if IS_CAUSAL else window_right
 
@@ -517,10 +498,9 @@ def _attn_blocksparse_fwd(
                         BLOCK_N=BLOCK_N,
                     )
             else:
-                # Early-out: no valid keys for this Q tile
                 offs_m2 = i_start_m * BLOCK_M + tl.arange(0, BLOCK_M)
                 lse_ptrs = M + off_zh * max_seqlen_q_rounded + offs_m2
-                tl.store(lse_ptrs, me_i)  # keep -inf
+                tl.store(lse_ptrs, me_i)
                 offs_d2 = tl.arange(0, BLOCK_HEADDIM)
                 out_ptrs = (
                     Po
@@ -536,7 +516,6 @@ def _attn_blocksparse_fwd(
                 )
                 return
         else:
-            # Dense fallback (same as original dense end_n path)
             if IS_CAUSAL:
                 end_n = tl.minimum(actual_seqlen_k - actual_seqlen_q + (i_start_m + 1) * BLOCK_M, actual_seqlen_k)
                 if end_n < 0:
@@ -631,11 +610,9 @@ def _attn_blocksparse_fwd(
 
     valid_rows = me_i > (-float("inf"))
 
-    # Optional causal zeroing before normalization
     if IS_CAUSAL and fully_masked_lines > i_start_m * BLOCK_M:
         acc_o = tl.where(offs_m[:, None] < fully_masked_lines, 0, acc_o)
 
-    # Normalize with exp(m - me) in natural log space (like TPU reference); scrub invalid rows
     if USE_DROPOUT:
         o_scale_raw = tl.exp(m_i - me_i) / (1 - dropout_prob)
     else:
@@ -646,7 +623,6 @@ def _attn_blocksparse_fwd(
     if IS_CAUSAL and fully_masked_lines > i_start_m * BLOCK_M:
         acc_o = tl.where(offs_m[:, None] < fully_masked_lines, 0, acc_o)
 
-    # Store LSE (me_i) and O
     offs_m = i_start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     lse_ptrs = M + off_zh * max_seqlen_q_rounded + offs_m
     tl.store(lse_ptrs, me_i)
@@ -663,7 +639,6 @@ def _attn_blocksparse_fwd(
 
 
 def elem_strides_from_shape(shape):
-    # Row-major (C-order) element strides
     strides = [0] * len(shape)
     stride = 1
     for i in range(len(shape) - 1, -1, -1):
@@ -677,10 +652,8 @@ def _blocksparse_fwd_attention_kernel_call(
     k: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     v: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     *,
-    # Optional masks/bias
     attention_mask: Bool[Array, "batch seq_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-    # Flash extras
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
@@ -689,12 +662,10 @@ def _blocksparse_fwd_attention_kernel_call(
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    # Sparsity controls
     sliding_window: int | tuple[int, int] | None = None,
-    layout: Int[Array, "n_q_blocks max_degree"] | None = None,  # block indices (>=0)
+    layout: Int[Array, "n_q_blocks max_degree"] | None = None,
     degree: Int[Array, "n_q_blocks"] | None = None,
-    max_degree: int = 0,  # needed when layout is provided
-    # Tiling controls (optional, to match your layout block size)
+    max_degree: int = 0,
     force_block_m: int = 0,
     force_block_n: int = 0,
 ):
@@ -705,7 +676,7 @@ def _blocksparse_fwd_attention_kernel_call(
     If sliding_window is provided, it additionally masks within tiles.
     If neither is provided, falls back to dense FlashAttention behavior.
     """
-    # Sliding-window parsing
+
     if sliding_window is None:
         window_left, window_right, sliding_flag = 0, 0, False
     else:
@@ -718,13 +689,11 @@ def _blocksparse_fwd_attention_kernel_call(
         assert window_left >= 0 and window_right >= 0
         sliding_flag = (window_left > 0) or (window_right > 0)
 
-    # Softcap parsing
     if logits_soft_cap is None:
         logits_soft_cap_val, softcap_flag = 0.0, False
     else:
         logits_soft_cap_val, softcap_flag = float(logits_soft_cap), True
 
-    # Sinks parsing
     if softmax_aux is None:
         use_sinks = False
         num_sinks_val = 0
@@ -741,7 +710,6 @@ def _blocksparse_fwd_attention_kernel_call(
         else:
             raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
 
-    # Layout parsing
     use_layout = layout is not None
     if use_layout:
         assert degree is not None, "When passing layout, you must also pass degree"
@@ -762,7 +730,6 @@ def _blocksparse_fwd_attention_kernel_call(
         assert q.dtype == k.dtype == v.dtype
         assert q.dtype in [jnp.float16, jnp.bfloat16]
 
-        # Pack varlen
         q_packed = attention_pack_from_cu_static(q, cum_seqlens_q, max_tokens=batch * QSeq_max)
         k_packed = attention_pack_from_cu_static(k, cum_seqlens_k, max_tokens=batch * KSeq_max)
         v_packed = attention_pack_from_cu_static(v, cum_seqlens_k, max_tokens=batch * KSeq_max)
@@ -785,7 +752,6 @@ def _blocksparse_fwd_attention_kernel_call(
         PADDED_HEADS = BLOCK_HEADDIM > head_dim
         num_repeats = nheads_q // nheads_kv
 
-        # Validate layout shape against block_m if forced
         if use_layout and force_block_m > 0:
             n_q_blocks = (max_seqlen_q + force_block_m - 1) // force_block_m
             assert layout.shape[0] == n_q_blocks, f"layout rows {layout.shape[0]} != n_q_blocks {n_q_blocks}"
@@ -851,7 +817,6 @@ def _blocksparse_fwd_attention_kernel_call(
             max_seqlen_q // 128,
             max_seqlen_k // 128,
             dtype_index(q_packed),
-            # extra args
             jnp.zeros((1,), jnp.int32) if not use_layout else layout,
             jnp.zeros((1,), jnp.int32) if not use_layout else degree,
             int(force_block_m),
@@ -868,7 +833,6 @@ def _blocksparse_fwd_attention_kernel_call(
         out_unpacked = attention_unpack_with_static_shape(out, cum_seqlens_q, batch, QSeq_max)
         return out_unpacked, lse
 
-    # Dense (non-packed) path
     batch, QSeq, nheads_q, head_dim = q.shape
     _, KSeq, nheads_kv, _ = k.shape
     expected_kv_shape = (batch, KSeq, nheads_kv, head_dim)
@@ -892,7 +856,6 @@ def _blocksparse_fwd_attention_kernel_call(
     PADDED_HEADS = BLOCK_HEADDIM > head_dim
     num_repeats = nheads_q // nheads_kv
 
-    # Validate layout shape against forced block_m
     if use_layout and force_block_m > 0:
         n_q_blocks = (QSeq + force_block_m - 1) // force_block_m
         assert layout.shape[0] == n_q_blocks, f"layout rows {layout.shape[0]} != n_q_blocks {n_q_blocks}"
@@ -963,7 +926,6 @@ def _blocksparse_fwd_attention_kernel_call(
         QSeq // 128,
         KSeq // 128,
         dtype_index(q),
-        # extra args
         jnp.zeros((1,), jnp.int32) if not use_layout else layout,
         jnp.zeros((1,), jnp.int32) if not use_layout else degree,
         int(force_block_m),

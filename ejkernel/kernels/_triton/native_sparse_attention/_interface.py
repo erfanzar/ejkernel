@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import warnings
 from functools import partial
 
 import jax
+import jaxtyping
+from beartype import beartype
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
 
@@ -166,6 +169,7 @@ _apply_nsa.defvjp(_fwd_call, _bwd_call)
 
 
 @kernel_registry.register("apply_native_sparse_attention", Platform.TRITON, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def apply_native_sparse_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -204,7 +208,7 @@ def apply_native_sparse_attention(
         The output tensor from the sparse attention computation.
     """
     if scale is None:
-        scale = 1.0 / (q.shape[-1] ** 0.5)
+        scale = 1.0 / (query.shape[-1] ** 0.5)
     if token_indices is None:
         token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
     return _apply_nsa(
@@ -221,6 +225,7 @@ def apply_native_sparse_attention(
 
 
 @kernel_registry.register("native_sparse_attention", Platform.TRITON, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def native_sparse_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -269,19 +274,16 @@ def native_sparse_attention(
     """
     assert block_counts is not None, "block counts must be provided for selection"
     if scale is None:
-        scale = k.shape[-1] ** -0.5
+        scale = key.shape[-1] ** -0.5
     if cu_seqlens is not None:
-        assert q.shape[0] == 1, "batch size must be 1 when cu_seqlens are provided"
-    group_size = q.shape[2] // k.shape[2]
+        assert query.shape[0] == 1, "batch size must be 1 when cu_seqlens are provided"
+    group_size = query.shape[2] // key.shape[2]
     assert group_size % 16 == 0, f"Group size must be a multiple of 16 in NSA, got {group_size}"
 
-    # --- Compressed Attention Component ---
-    # Create compressed (mean-pooled) keys and values
     k_cmp, v_cmp = mean_pooling(key, block_size, cu_seqlens), mean_pooling(value, block_size, cu_seqlens)
     o_cmp = None
 
     if g_cmp is not None:
-        # Compute the compressed attention output
         o_cmp, lse_cmp = nsa_compression(
             query=query,
             key=k_cmp,
@@ -303,7 +305,6 @@ def native_sparse_attention(
             cu_seqlens=cu_seqlens,
         )
 
-    # --- Selected Attention Component ---
     assert block_indices is not None, "if `g_cmp` is not passed, `block_indices` must be provided."
     o_slc = apply_native_sparse_attention(
         query=query,
@@ -316,7 +317,6 @@ def native_sparse_attention(
         cu_seqlens=cu_seqlens,
     )
 
-    # --- Gating and Combination ---
     o = o_slc
     if g_slc is not None:
         o = o_slc * jnp.expand_dims(g_slc, -1)

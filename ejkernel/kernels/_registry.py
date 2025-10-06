@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Kernel registry system for managing multi-platform implementations."""
 
@@ -76,7 +77,7 @@ class KernelRegistry:
         >>> @registry.register("flash_attention", Platform.TRITON, Backend.GPU)
         ... def flash_attention_triton(q, k, v): ...
         >>>
-        >>> # Get implementation
+        >>>
         >>> impl = registry.get("flash_attention", platform="triton", backend="gpu")
     """
 
@@ -130,7 +131,7 @@ class KernelRegistry:
                 priority=priority,
             )
             self._registry[key].append(spec)
-            # Sort by priority (descending) for efficient lookup
+
             self._registry[key].sort(key=lambda x: x.priority, reverse=True)
             return func
 
@@ -169,7 +170,6 @@ class KernelRegistry:
 
         candidates = self._registry[key]
 
-        # Convert strings to enums if needed
         if isinstance(platform, str):
             platform = Platform(platform)
         if isinstance(backend, str):
@@ -233,14 +233,12 @@ class KernelRegistry:
 
         specs = self._registry[key]
         if len(specs) < 2:
-            return True  # Nothing to compare
+            return True
 
-        # Get signature of first implementation as reference
         reference_spec = specs[0]
         reference_sig = inspect.signature(reference_spec.implementation)
         reference_params = list(reference_sig.parameters.values())
 
-        # Log signatures if verbose
         if verbose:
             print(f"\n{'=' * 80}")
             print(f"Algorithm: {algorithm}")
@@ -258,12 +256,10 @@ class KernelRegistry:
 
         all_match = True
 
-        # Compare all other implementations against reference
         for spec in specs[1:]:
             sig = inspect.signature(spec.implementation)
             params = list(sig.parameters.values())
 
-            # Check parameter count
             if len(params) != len(reference_params):
                 warnings.warn(
                     f"Signature mismatch for algorithm '{algorithm}':\n"
@@ -276,9 +272,7 @@ class KernelRegistry:
                 all_match = False
                 continue
 
-            # Check each parameter
             for ref_param, param in zip(reference_params, params, strict=False):
-                # Check parameter name
                 if ref_param.name != param.name:
                     warnings.warn(
                         f"Signature mismatch for algorithm '{algorithm}':\n"
@@ -290,7 +284,6 @@ class KernelRegistry:
                     )
                     all_match = False
 
-                # Check parameter kind (positional, keyword-only, etc.)
                 if ref_param.kind != param.kind:
                     warnings.warn(
                         f"Signature mismatch for algorithm '{algorithm}' parameter '{ref_param.name}':\n"
@@ -301,7 +294,6 @@ class KernelRegistry:
                     )
                     all_match = False
 
-                # Check default values
                 if ref_param.default != param.default:
                     warnings.warn(
                         f"Signature mismatch for algorithm '{algorithm}' parameter '{ref_param.name}':\n"
@@ -313,7 +305,6 @@ class KernelRegistry:
                     )
                     all_match = False
 
-                # Check type annotations
                 if str(ref_param.annotation) != str(param.annotation):
                     warnings.warn(
                         f"Signature mismatch for algorithm '{algorithm}' parameter '{ref_param.name}':\n"
@@ -328,5 +319,4 @@ class KernelRegistry:
         return all_match
 
 
-# Global registry instance
 kernel_registry = KernelRegistry()

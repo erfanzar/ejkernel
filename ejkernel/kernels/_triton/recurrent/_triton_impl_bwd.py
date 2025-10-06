@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -171,7 +171,6 @@ def bwd_kernel(
         p_ht = ht + i_nh * DIM_K * DIM_V + o_k[:, None] * DIM_V + o_v[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
-    # sync threads
     tl.debug_barrier()
 
     p_q = q + (bos + ((SEQUENCE - 1) if not REVERSE else 0)) * HEAD * DIM_K + i_h * DIM_K + o_k
@@ -248,13 +247,13 @@ def bwd_triton_impl(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> tuple[
-    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dq
-    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dk
-    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dv
-    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dg
-    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dgk
-    Float[Array, "batch seq_len num_heads head_dim"] | None,  # dgv
-    Float[Array, "batch num_heads head_dim head_dim"] | None,  # dh0
+    Float[Array, "batch seq_len num_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_heads head_dim"] | None,
+    Float[Array, "batch seq_len num_heads head_dim"] | None,
+    Float[Array, "batch num_heads head_dim head_dim"] | None,
 ]:
     Z, SEQUENCE, HEAD, DIM_K, DIM_V = *k.shape, v.shape[-1]
     N = Z if cu_seqlens is None else len(cu_seqlens) - 1

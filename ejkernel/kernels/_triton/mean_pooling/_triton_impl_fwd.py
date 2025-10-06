@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -83,9 +83,9 @@ def fwd_kernel(
         (1, 0),
     )
     p_o = tl.make_block_ptr(o + (i_tg * HEAD + i_h) * DIM, (DIM,), (1,), (i_d * BLOCK_DIM,), (BLOCK_DIM,), (0,))
-    # [BLOCK_SEQ, BLOCK_DIM]
+
     b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-    # [BLOCK_DIM]
+
     b_o = tl.sum(b_x, axis=0) / min(BLOCK_SEQ, SEQUENCE - i_t * BLOCK_SEQ)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 

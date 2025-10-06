@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Base configuration for kernel modules.
 
 Provides shared configuration infrastructure for kernel execution,
@@ -52,26 +53,22 @@ def detect_platform(
 
     Example:
         >>> platform = detect_platform("flash_attention", platform="auto")
-        >>> # Returns Platform.TRITON if available on GPU, else Platform.XLA
+        >>>
     """
     if platform not in ("auto", None):
         return Platform(platform) if isinstance(platform, str) else platform
 
-    # Get JAX default backend
     try:
         jax_backend = jax.default_backend()
     except Exception:
         jax_backend = "cpu"
 
-    # Check if algorithm has triton implementation
     specs = kernel_registry.list_implementations(algorithm)
     has_triton = any(spec.platform == Platform.TRITON for spec in specs)
 
-    # Use triton if available and on GPU backend
     if has_triton and jax_backend in ("gpu", "cuda"):
         return Platform.TRITON
 
-    # Otherwise fallback to XLA
     return Platform.XLA
 
 
@@ -128,10 +125,10 @@ def create_default_executor(
         Configured Executor instance ready for kernel execution
 
     Example:
-        >>> # Create executor with persistent caching
+        >>>
         >>> executor = create_default_executor("/tmp/kernel_cache")
         >>>
-        >>> # Use with a kernel module
+        >>>
         >>> from ejkernel.modules import FlashAttention
         >>> attn = FlashAttention()
         >>> output = executor(attn, q, k, v, causal=True)

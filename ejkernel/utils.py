@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import functools
 import typing as tp
@@ -340,34 +341,30 @@ def generate_block_indices(
         block indices. Positions beyond available blocks are filled with -1.
 
     Example:
-        >>> # For sequence_length=256, block_size=64, we have 4 query blocks
+        >>>
         >>> indices = generate_block_indices(batch=2, num_query_blocks=4, heads=8, selected_blocks=2, block_size=64)
         >>> indices.shape
         (2, 4, 8, 2)
     """
-    # Initialize with -1 (out of bounds marker, will be skipped by kernel)
+
     block_indices = jnp.full((batch, num_query_blocks, heads, selected_blocks), -1, dtype=jnp.int32)
 
     key = jax.random.PRNGKey(seed)
 
-    # Use Python loops since we need concrete values for permutation
     for b in range(batch):
         for qb in range(num_query_blocks):
             for h in range(heads):
                 key, subkey = jax.random.split(key)
-                # Each query block can attend to itself and all previous blocks
+
                 num_available_blocks = qb + 1
 
-                # Generate random permutation of available blocks
                 perm = jax.random.permutation(subkey, num_available_blocks)[:selected_blocks]
 
-                # Pad if we don't have enough blocks
                 if num_available_blocks < selected_blocks:
                     perm = jnp.pad(perm, (0, selected_blocks - num_available_blocks), constant_values=-1)
 
                 block_indices = block_indices.at[b, qb, h, :].set(perm)
 
-    # Sort indices along the last dimension
     block_indices = jnp.sort(block_indices, axis=-1)
 
     return block_indices
@@ -409,15 +406,15 @@ def barrier_sync(timeout: float = 200):
         - The timeout is converted to milliseconds for the underlying JAX API.
 
     Example:
-        >>> # In distributed training
+        >>>
         >>> model = train_step(model, batch)
-        >>> barrier_sync()  # Wait for all processes
+        >>> barrier_sync()
         >>> if jax.process_index() == 0:
-        ...     save_checkpoint(model)  # Only process 0 saves
-        >>> barrier_sync()  # Wait before continuing
+        ...     save_checkpoint(model)
+        >>> barrier_sync()
 
-        >>> # With custom timeout for long operations
-        >>> barrier_sync(timeout=600)  # Wait up to 10 minutes
+        >>>
+        >>> barrier_sync(timeout=600)
 
     Warning:
         Ensure all processes call barrier_sync() the same number of times and

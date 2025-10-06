@@ -15,3 +15,4 @@ ejkernel.kernels._xla package
    kernels/_xla/ragged_page_attention/index
    kernels/_xla/recurrent/index
    kernels/_xla/ring_attention/index
+   kernels/_xla/scaled_dot_product_attention/index

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Pooling operation modules with automatic optimization."""
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ class MeanPooling(Kernel[KernelConfig, Array]):
         cfg: KernelConfig,
     ) -> Float[Array, "batch hidden_dim"]:
         """Execute mean pooling."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -122,16 +123,16 @@ def mean_pooling(
         Mean pooled output [batch, hidden_dim]
 
     Example:
-        >>> # Standard mean pooling
+        >>>
         >>> pooled = mean_pooling(x)
         >>>
-        >>> # With larger chunk size for better memory efficiency
+        >>>
         >>> pooled = mean_pooling(x, chunk_size=64)
         >>>
-        >>> # Variable-length sequences
+        >>>
         >>> pooled = mean_pooling(x, cu_seqlens=cu_seqs)
             >>>
-        >>> # Force specific platform
+        >>>
         >>> out = mean_pooling(..., platform="triton")
     """
     return _mean_pooling_executor(

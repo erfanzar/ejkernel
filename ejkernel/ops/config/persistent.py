@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Persistent disk-based configuration cache for kernel optimization.
 
@@ -32,12 +33,12 @@ The persistent cache complements the in-memory cache by providing:
     - Backup storage for critical optimization data
 
 Example Usage:
-    >>> # Basic usage with automatic serialization
+    >>>
     >>> cache = PersistentCache('/path/to/cache.json')
     >>> cache.put('gpu:0', 'matmul_v1', 'key123', my_config)
     >>> config = cache.get('gpu:0', 'matmul_v1', 'key123')
     >>>
-    >>> # Custom serialization for complex types
+    >>>
     >>> def custom_dumper(cfg): return cfg.to_dict()
     >>> def custom_loader(data): return MyConfig.from_dict(data)
     >>> cache = PersistentCache('/path/to/cache.json', custom_loader, custom_dumper)
@@ -155,17 +156,15 @@ class PersistentCache(Generic[Cfg]):
         if self.dumper is not None:
             val = self.dumper(cfg)
         else:
-            # Try dataclass, then pydantic, else raw
             if is_dataclass(cfg):
                 val = asdict(cfg)
             elif hasattr(cfg, "model_dump"):
-                val = cfg.model_dump()  # pydantic v2
+                val = cfg.model_dump()
             else:
                 val = cfg
 
         self._data[self._key(device, op_id, call_key)] = val
 
-        # Atomic file update to prevent corruption
         dir_name = os.path.dirname(os.path.abspath(self.path)) or "."
         with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False) as tmp:
             json.dump(self._data, tmp)

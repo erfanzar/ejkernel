@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import jaxtyping
+from beartype import beartype
 from jax import numpy as jnp
 from jaxtyping import Array, Float, Int
 
@@ -21,6 +23,7 @@ from ..recurrent import recurrent
 
 
 @kernel_registry.register("lightning_attn", Platform.TRITON, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def lightning_attn(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -75,9 +78,9 @@ def lightning_attn(
             does not match the number of sequences.
     """
     if cu_seqlens is not None:
-        if q.shape[0] != 1:
+        if query.shape[0] != 1:
             raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
+                f"The batch size is expected to be 1 rather than {query.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
         if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
@@ -86,8 +89,8 @@ def lightning_attn(
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
             )
     if scale is None:
-        scale = k.shape[-1] ** -0.5
-    qheads = q.shape[2]
+        scale = key.shape[-1] ** -0.5
+    qheads = query.shape[2]
     g_gamma = -(8 / qheads * (1 - layer_idx / num_layers)) * jnp.arange(qheads, dtype="f4")
     return recurrent(
         query=query,

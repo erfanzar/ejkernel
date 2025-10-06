@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Matrix multiplication kernel modules with automatic optimization."""
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
         cfg: KernelConfig,
     ) -> Float[Array, "m n"]:
         """Execute grouped matrix multiplication."""
-        # Override platform in config if specified
+
         if platform is not None:
             cfg = KernelConfig(
                 block_q=cfg.block_q,
@@ -156,19 +157,19 @@ def grouped_matmul(
         Matrix multiplication result [m, n]
 
     Example:
-        >>> # Standard grouped matmul
+        >>>
         >>> out = grouped_matmul(lhs, rhs, group_sizes)
         >>>
-        >>> # With custom tiling
+        >>>
         >>> out = grouped_matmul(lhs, rhs, group_sizes, tiling=(256, 256, 256))
         >>>
-        >>> # With transposed RHS
+        >>>
         >>> out = grouped_matmul(lhs, rhs_transposed, group_sizes, transpose_rhs=True)
         >>>
-        >>> # Accumulate into existing output
+        >>>
         >>> out = grouped_matmul(lhs, rhs, group_sizes, existing_out=prev_out)
             >>>
-        >>> # Force specific platform
+        >>>
         >>> out = grouped_matmul(..., platform="triton")
     """
     return _grouped_matmul_executor(

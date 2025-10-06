@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Type definitions for the eFormer operations system.
 
@@ -37,7 +38,7 @@ Example Usage:
     ...     def run(self, x: jax.Array, cfg: dict) -> jax.Array:
     ...         return x * cfg['multiplier']
     >>>
-    >>> # Cfg is dict, Out is jax.Array
+    >>>
     >>> kernel = MyKernel()
 """
 
@@ -45,5 +46,5 @@ from __future__ import annotations
 
 from typing import TypeVar
 
-Cfg = TypeVar("Cfg")  # Configuration type for kernel operations
-Out = TypeVar("Out")  # Output type for kernel operations
+Cfg = TypeVar("Cfg")
+Out = TypeVar("Out")

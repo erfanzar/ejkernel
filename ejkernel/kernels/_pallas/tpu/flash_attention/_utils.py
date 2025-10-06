@@ -1,4 +1,4 @@
-# Copyright 2023 The JAX Authors.
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Flash Attention TPU kernel."""
 
@@ -45,8 +46,8 @@ class SegmentIds(NamedTuple):
       kv: segment ids along the KV sequence.
     """
 
-    q: jax.Array  # [batch_size, q_seq_len]
-    kv: jax.Array  # [batch_size, kv_seq_len]
+    q: jax.Array
+    kv: jax.Array
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,8 +102,7 @@ class BlockSizes:
 
     @classmethod
     def get_default(cls, batch_size, num_heads, q_seq_len, kv_len, d_model):
-        # TODO(apaszke,sharadmv): Select better parameters based on a heuristic.
-        del batch_size, num_heads, q_seq_len, kv_len, d_model  # Unused.
+        del batch_size, num_heads, q_seq_len, kv_len, d_model
         return BlockSizes(
             block_q=128,
             block_k_major=128,
@@ -151,7 +151,6 @@ def _fwd_cost_estimate(
     )
 
 
-# For autograd testing.
 def mha_reference_no_custom_vjp(
     q,
     k,
@@ -330,15 +329,12 @@ def mha_reference_bwd(
 
     dp = jnp.einsum("bhpd,bhtd->bhpt", do.astype(jnp.float32), v.astype(jnp.float32))
 
-    di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)[
-        ..., None
-    ]  # [batch_size, num_heads, q_seq_len]
+    di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)[..., None]
 
     ds = (dp - di) * p
     dk = jnp.einsum("bhsd,bhst->bhtd", q.astype(jnp.float32), ds).astype(k.dtype)
     dq = jnp.einsum("bhst,bhtd->bhsd", ds, k.astype(jnp.float32)).astype(q.dtype)
 
-    # dab is just ds
     dab = ds if ab is not None else None
     return dq, dk, dv, dab
 

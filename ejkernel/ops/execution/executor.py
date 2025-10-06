@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Main execution engine for kernels with configuration management.
 
@@ -51,10 +52,10 @@ Example Usage:
     >>> selector = ConfigSelectorChain(cache)
     >>> executor = Executor(selector)
     >>>
-    >>> # Execute kernel with automatic config selection
+    >>>
     >>> result = executor(my_kernel, input_data)
     >>>
-    >>> # Pre-compile kernel with chosen configuration
+    >>>
     >>> compiled_fn = executor.compile(my_kernel, example_input)
     >>> result = compiled_fn(actual_input)
 """
@@ -253,7 +254,7 @@ class Executor(Generic[Cfg, Out]):
             def fn(*a, **_ignored_kwargs):
                 return g(*a)
         else:
-            # Inline simple case for better performance
+
             def fn(*a, **k):
                 return kernel.run(*a, cfg=chosen, **k)
 
@@ -314,7 +315,7 @@ class Executor(Generic[Cfg, Out]):
 
         Example:
             >>> compiled_matmul = executor.compile(matmul_kernel, x_example, y_example)
-            >>> # Fast execution with pre-selected config
+            >>>
             >>> result = compiled_matmul(x_actual, y_actual)
         """
         chosen = self.choose_config(kernel, *example_args, cfg=cfg, **example_kwargs)

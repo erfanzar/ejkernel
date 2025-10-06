@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -75,11 +75,11 @@ def _attn_fwd_inner(
     dropout_prob,
     dropout_seed,
     dropout_offs,
-    window_left,  # NEW
-    window_right,  # NEW
-    logits_soft_cap,  # NEW
-    softmax_aux_ptrs,  # NEW
-    num_sinks,  # NEW
+    window_left,
+    window_right,
+    logits_soft_cap,
+    softmax_aux_ptrs,
+    num_sinks,
     stride_kn,
     stride_vn,
     index_start_n,
@@ -91,9 +91,9 @@ def _attn_fwd_inner(
     BIAS_ON: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
     MASKED: tl.constexpr,
-    SLIDING: tl.constexpr,  # NEW
-    SOFTCAP: tl.constexpr,  # NEW
-    USE_SINKS: tl.constexpr,  # NEW
+    SLIDING: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    USE_SINKS: tl.constexpr,
     PADDED_COLS: tl.constexpr,
     PADDED_HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -125,7 +125,7 @@ def _attn_fwd_inner(
             )
 
     qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.bfloat16)
-    # Compute QK in float32 when sinks are used for better precision with large sink values
+
     if USE_SINKS:
         qk += tl.dot(q.to(tl.bfloat16), tl.trans(k.to(tl.bfloat16)))
     else:
@@ -142,12 +142,10 @@ def _attn_fwd_inner(
         causal_mask = offs_m[:, None] >= (index_start_n + offs_n - actual_seqlen_k + actual_seqlen_q)[None, :]
         qk += tl.where(causal_mask, 0, float("-inf"))
 
-    # Sliding-window mask (aligned like causal when Q != K):
-    # Compare i (query idx) to j' = j - (K - Q) so that i and j' are in same frame.
     if SLIDING:
         shift = actual_seqlen_k - actual_seqlen_q
-        j_aligned = (index_start_n + offs_n)[None, :] - shift  # [1, BLOCK_N]
-        i_idx = offs_m[:, None]  # [BLOCK_M, 1]
+        j_aligned = (index_start_n + offs_n)[None, :] - shift
+        i_idx = offs_m[:, None]
         in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
         qk = tl.where(in_window, qk, float("-inf"))
 
@@ -159,53 +157,41 @@ def _attn_fwd_inner(
             LN2: tl.constexpr = 1.44269504089
             qk += bias * (LN2 / softmax_scale)
 
-    # Apply logits soft cap if enabled
-    # NOTE: qk is in log2 space, but softcap operates in natural space
-    LN2: tl.constexpr = 1.44269504089  # log2(e) for converting log2 to ln
+    LN2: tl.constexpr = 1.44269504089
     if SOFTCAP:
-        # Convert from log2 to natural scale: multiply by softmax_scale and convert to ln
         qk_natural = qk * (softmax_scale / LN2)
-        # Apply soft cap in natural space
+
         x = qk_natural / logits_soft_cap
         exp_2x = tl.exp(2.0 * x)
         tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
-        qk = (logits_soft_cap * tanh_x) * LN2  # Convert back to log2 space
+        qk = (logits_soft_cap * tanh_x) * LN2
     else:
         qk = qk * softmax_scale
 
-    # Include attention sinks in softmax if enabled
     if USE_SINKS:
-        # Load sink logits: [num_sinks] per head (raw, natural units)
-        sink_offs = tl.arange(0, 16)  # supports up to 16 sinks
+        sink_offs = tl.arange(0, 16)
         sink_mask = sink_offs < num_sinks
         aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf")).to(tl.bfloat16)
 
-        # Apply soft cap (in natural units) if enabled
         if SOFTCAP:
-            # Optional: clamp to stabilize large inputs in fp16/bf16 contexts
             x_aux = aux_logits / logits_soft_cap
-            x_aux = tl.maximum(tl.minimum(x_aux, 8.0), -8.0)  # clamp [-8, 8]
+            x_aux = tl.maximum(tl.minimum(x_aux, 8.0), -8.0)
             exp_2x = tl.exp(2.0 * x_aux)
             tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
             aux_natural = logits_soft_cap * tanh_x
             aux_log2 = aux_natural * LN2
         else:
-            # No softcap: convert natural -> log2 so exp2() matches XLA's e^(.)
             aux_log2 = aux_logits * LN2
 
-        # Rowwise max that includes attention logits and sinks (both in log2 units)
-        qk_max = tl.max(qk, 1)  # qk already in log2 units after scaling step
+        qk_max = tl.max(qk, 1)
         aux_max = tl.max(tl.where(sink_mask, aux_log2, float("-inf")))
-        m_ij = tl.maximum(tl.maximum(qk_max, aux_max), me_i)  # [BLOCK_M]
+        m_ij = tl.maximum(tl.maximum(qk_max, aux_max), me_i)
 
-        # Attention contribution
-        P_ij = tl.exp2(qk - m_ij[:, None])  # [BLOCK_M, BLOCK_N]
+        P_ij = tl.exp2(qk - m_ij[:, None])
 
-        # Rowwise sink contribution (more stable than "m_ij_max + adjust" trick)
         aux_log2_row = tl.where(sink_mask[None, :], aux_log2[None, :], float("-inf"))
-        l_aux_row = tl.sum(tl.exp2(aux_log2_row - m_ij[:, None]), axis=1)  # [BLOCK_M]
+        l_aux_row = tl.sum(tl.exp2(aux_log2_row - m_ij[:, None]), axis=1)
 
-        # Total denominator
         l_ij = tl.sum(P_ij, 1) + l_aux_row
     else:
         m_ij = tl.maximum(tl.max(qk, 1), me_i)
@@ -293,9 +279,9 @@ def _attn_fwd(
     softmax_scale,
     dropout_prob,
     dropout_seed,
-    logits_soft_cap,  # NEW
-    softmax_aux,  # NEW
-    num_sinks,  # NEW
+    logits_soft_cap,
+    softmax_aux,
+    num_sinks,
     stride_qz,
     stride_qm,
     stride_qh,
@@ -313,12 +299,12 @@ def _attn_fwd(
     stride_bh,
     nheads_q,
     num_repeats,
-    window_left,  # NEW
-    window_right,  # NEW
+    window_left,
+    window_right,
     QSeq,
-    cum_seqlens_q,  # int32 [B+1]
+    cum_seqlens_q,
     KSeq,
-    cum_seqlens_k,  # int32 [B+1] (keep for VARLEN; dense can pass dummy)
+    cum_seqlens_k,
     max_seqlen_q_rounded,
     headdim,
     CQSeq,
@@ -330,9 +316,9 @@ def _attn_fwd(
     USE_DROPOUT: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
-    SLIDING: tl.constexpr,  # NEW
-    SOFTCAP: tl.constexpr,  # NEW
-    USE_SINKS: tl.constexpr,  # NEW
+    SLIDING: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    USE_SINKS: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     PADDED_HEADS: tl.constexpr,
@@ -450,11 +436,9 @@ def _attn_fwd(
     else:
         dropout_offs = None
 
-    # Set up softmax_aux pointer for this head
     if USE_SINKS:
         softmax_aux_ptrs = softmax_aux + off_head_q * num_sinks
     else:
-        # Point to the dummy tensor (won't be accessed when USE_SINKS=False)
         softmax_aux_ptrs = softmax_aux
 
     me_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -501,10 +485,10 @@ def _attn_fwd(
                 dropout_seed,
                 dropout_offs,
                 window_left,
-                window_right,  # NEW
-                logits_soft_cap,  # NEW
-                softmax_aux_ptrs,  # NEW
-                num_sinks,  # NEW
+                window_right,
+                logits_soft_cap,
+                softmax_aux_ptrs,
+                num_sinks,
                 stride_kn,
                 stride_vn,
                 next_start_n,
@@ -516,9 +500,9 @@ def _attn_fwd(
                 BIAS_ON=BIAS_ON,
                 BOOL_BIAS=BOOL_BIAS,
                 MASKED=False,
-                SLIDING=SLIDING,  # NEW
-                SOFTCAP=SOFTCAP,  # NEW
-                USE_SINKS=USE_SINKS,  # NEW
+                SLIDING=SLIDING,
+                SOFTCAP=SOFTCAP,
+                USE_SINKS=USE_SINKS,
                 PADDED_COLS=False,
                 PADDED_HEADS=PADDED_HEADS,
                 BLOCK_M=BLOCK_M,
@@ -545,10 +529,10 @@ def _attn_fwd(
                 dropout_seed,
                 dropout_offs,
                 window_left,
-                window_right,  # NEW
-                logits_soft_cap,  # NEW
-                softmax_aux_ptrs,  # NEW
-                num_sinks,  # NEW
+                window_right,
+                logits_soft_cap,
+                softmax_aux_ptrs,
+                num_sinks,
                 stride_kn,
                 stride_vn,
                 index_start_n,
@@ -560,9 +544,9 @@ def _attn_fwd(
                 BIAS_ON=BIAS_ON,
                 BOOL_BIAS=BOOL_BIAS,
                 MASKED=True,
-                SLIDING=SLIDING,  # NEW
-                SOFTCAP=SOFTCAP,  # NEW
-                USE_SINKS=USE_SINKS,  # NEW
+                SLIDING=SLIDING,
+                SOFTCAP=SOFTCAP,
+                USE_SINKS=USE_SINKS,
                 PADDED_COLS=pad_cols,
                 PADDED_HEADS=PADDED_HEADS,
                 BLOCK_M=BLOCK_M,
@@ -596,14 +580,14 @@ def _fwd_attention_kernel_call(
     q: Float[Array, "batch seq_len_q num_heads head_dim"] | None,
     k: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
     v: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
-    attention_mask: Bool[Array, "batch seq_len"] | None = None,  # legacy path
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,  # int32 [B+1]
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
@@ -623,7 +607,6 @@ def _fwd_attention_kernel_call(
         assert window_left >= 0 and window_right >= 0
         sliding_flag = (window_left > 0) or (window_right > 0)
 
-    # Handle logits soft cap
     if logits_soft_cap is None:
         logits_soft_cap_val = 0.0
         softcap_flag = False
@@ -631,16 +614,14 @@ def _fwd_attention_kernel_call(
         logits_soft_cap_val = float(logits_soft_cap)
         softcap_flag = True
 
-    # Handle softmax_aux (attention sinks)
     if softmax_aux is None:
         use_sinks = False
         num_sinks_val = 0
-        softmax_aux_tensor = jnp.zeros((1,), dtype=q.dtype)  # Dummy
+        softmax_aux_tensor = jnp.zeros((1,), dtype=q.dtype)
     else:
         use_sinks = True
-        # softmax_aux can be [num_sinks] or [num_heads, num_sinks]
+
         if softmax_aux.ndim == 1:
-            # Broadcast to all heads: [num_sinks] -> [num_heads, num_sinks]
             num_sinks_val = softmax_aux.shape[0]
             num_heads = q.shape[2]
             softmax_aux_tensor = jnp.broadcast_to(softmax_aux[None, :], (num_heads, num_sinks_val))
@@ -650,17 +631,14 @@ def _fwd_attention_kernel_call(
         else:
             raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
 
-        # Don't preprocess sinks - pass them through as raw logits
-        # The kernel will handle them the same way it handles QK logits
         pass
 
-    # Prefer VARLEN path if cum arrays provided
     varlen_from_cu = (cum_seqlens_q is not None) and (cum_seqlens_k is not None)
     if varlen_from_cu:
         assert cum_seqlens_q.dtype == jnp.int32 and cum_seqlens_k.dtype == jnp.int32
         batch = q.shape[0]
-        QSeq_max = int(q.shape[1])  # static padded Tq_max
-        KSeq_max = int(k.shape[1])  # static padded Tk_max
+        QSeq_max = int(q.shape[1])
+        KSeq_max = int(k.shape[1])
         nheads_q = q.shape[2]
         nheads_kv = k.shape[2]
         head_dim = q.shape[3]
@@ -671,7 +649,6 @@ def _fwd_attention_kernel_call(
         max_seqlen_q = QSeq_max
         max_seqlen_k = KSeq_max
 
-        # packers as in the previous patch
         q_packed = attention_pack_from_cu_static(q, cum_seqlens_q, max_tokens=batch * QSeq_max)
         k_packed = attention_pack_from_cu_static(k, cum_seqlens_k, max_tokens=batch * KSeq_max)
         v_packed = attention_pack_from_cu_static(v, cum_seqlens_k, max_tokens=batch * KSeq_max)
@@ -697,9 +674,9 @@ def _fwd_attention_kernel_call(
             USE_DROPOUT=(dropout_prob > 0),
             IS_CAUSAL=causal,
             BIAS_ON=False,
-            SLIDING=sliding_flag,  # NEW
-            SOFTCAP=softcap_flag,  # NEW
-            USE_SINKS=use_sinks,  # NEW
+            SLIDING=sliding_flag,
+            SOFTCAP=softcap_flag,
+            USE_SINKS=use_sinks,
             BOOL_BIAS=BOOL_BIAS,
             BLOCK_HEADDIM=BLOCK_HEADDIM,
             PADDED_HEADS=PADDED_HEADS,
@@ -718,9 +695,9 @@ def _fwd_attention_kernel_call(
             softmax_scale,
             dropout_prob,
             dropout_seed if dropout_seed is not None else jnp.zeros((1,), q.dtype),
-            logits_soft_cap_val,  # NEW
-            softmax_aux_tensor,  # NEW
-            num_sinks_val,  # NEW
+            logits_soft_cap_val,
+            softmax_aux_tensor,
+            num_sinks_val,
             qz,
             qm,
             qh,
@@ -735,15 +712,15 @@ def _fwd_attention_kernel_call(
             oh,
             0,
             0,
-            0,  # bias strides unused
+            0,
             nheads_q,
             num_repeats,
-            window_left,  # NEW
-            window_right,  # NEW
-            max_seqlen_q,  # QSeq
-            cum_seqlens_q,  # cum_seqlens_q
-            max_seqlen_k,  # KSeq
-            cum_seqlens_k,  # cum_seqlens_k
+            window_left,
+            window_right,
+            max_seqlen_q,
+            cum_seqlens_q,
+            max_seqlen_k,
+            cum_seqlens_k,
             max_seqlen_q_rounded,
             head_dim,
             max_seqlen_q // 128,
@@ -814,9 +791,9 @@ def _fwd_attention_kernel_call(
         USE_DROPOUT=(dropout_prob > 0),
         IS_CAUSAL=causal,
         BIAS_ON=(bias is not None),
-        SLIDING=sliding_flag,  # NEW
-        SOFTCAP=softcap_flag,  # NEW
-        USE_SINKS=use_sinks,  # NEW
+        SLIDING=sliding_flag,
+        SOFTCAP=softcap_flag,
+        USE_SINKS=use_sinks,
         BOOL_BIAS=BOOL_BIAS,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         PADDED_HEADS=PADDED_HEADS,
@@ -835,9 +812,9 @@ def _fwd_attention_kernel_call(
         softmax_scale,
         dropout_prob,
         dropout_seed if dropout_seed is not None else jnp.zeros((1,), q.dtype),
-        logits_soft_cap_val,  # NEW
-        softmax_aux_tensor,  # NEW
-        num_sinks_val,  # NEW
+        logits_soft_cap_val,
+        softmax_aux_tensor,
+        num_sinks_val,
         qz,
         qm,
         qh,
@@ -855,12 +832,12 @@ def _fwd_attention_kernel_call(
         bh,
         nheads_q,
         num_repeats,
-        window_left,  # NEW
-        window_right,  # NEW
+        window_left,
+        window_right,
         QSeq,
         cum_seqlens_q if cum_seqlens_q is not None else jnp.zeros((1,), jnp.int32),
         KSeq,
-        jnp.zeros((1,), jnp.int32),  # dense path dummy cum_k
+        jnp.zeros((1,), jnp.int32),
         max_seqlen_q_rounded,
         head_dim,
         max_seqlen_q // 128,

@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import jax.numpy as jnp
+import jaxtyping
+from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -20,6 +23,7 @@ from ._xla_impl_fwd import _page_attention_fwd
 
 
 @kernel_registry.register("page_attention", Platform.XLA, Backend.ANY)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def page_attention(
     query: Float[Array, "num_seqs num_heads head_dim"],
     key_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],
@@ -76,14 +80,14 @@ def page_attention(
 
     Examples:
         >>> num_seqs, num_heads, head_dim = 2, 8, 64
-        >>> num_kv_heads = 8  # or 1 for MQA, or 2 for GQA
+        >>> num_kv_heads = 8
         >>> num_blocks, block_size = 10, 16
         >>>
         >>> query = jnp.ones((num_seqs, num_heads, head_dim))
         >>> key_cache = jnp.ones((num_blocks, num_kv_heads, block_size, head_dim))
         >>> value_cache = jnp.ones((num_blocks, num_kv_heads, block_size, head_dim))
-        >>> context_lens = jnp.array([48, 32])  # seq 0 has 48 tokens, seq 1 has 32
-        >>> block_tables = jnp.array([[0, 1, 2, -1], [3, 4, -1, -1]])  # seq 0 uses blocks 0,1,2
+        >>> context_lens = jnp.array([48, 32])
+        >>> block_tables = jnp.array([[0, 1, 2, -1], [3, 4, -1, -1]])
         >>>
         >>> output = page_attention(query, key_cache, value_cache,
         ...                         context_lens, block_tables)

@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from functools import partial
 
 import jax
 import jax.numpy as jnp
+import jaxtyping
+from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -42,11 +45,11 @@ def _mean_pooling_varlen(
         start = cu_seqlens[i]
         end = cu_seqlens[i + 1]
         seq_len = end - start
-        # Use fixed size slice and mask
+
         seq_tokens = jax.lax.dynamic_slice(x, (start, 0), (max_seq_len, x.shape[-1]))
-        # Create mask for valid tokens
+
         mask = jnp.arange(max_seq_len) < seq_len
-        # Apply mask and compute mean
+
         masked_tokens = jnp.where(mask[:, None], seq_tokens, 0)
         return jnp.sum(masked_tokens, axis=0) / seq_len
 
@@ -99,7 +102,6 @@ def _mean_pooling_bwd(
     x_shape, _cu_seqlens_res = residual
 
     if cu_seqlens is not None:
-        # Variable-length case: distribute gradient evenly across each sequence
         _total_tokens, _hidden_dim = x_shape
         num_seqs = len(cu_seqlens) - 1
 
@@ -107,14 +109,12 @@ def _mean_pooling_bwd(
             start = cu_seqlens[i]
             end = cu_seqlens[i + 1]
             seq_len = end - start
-            # Gradient is g[i] / seq_len for each token in sequence
+
             return jnp.tile(g[i] / seq_len, (seq_len, 1))
 
-        # Concatenate gradients for all sequences
         dx_list = [grad_sequence(i) for i in range(num_seqs)]
         dx = jnp.concatenate(dx_list, axis=0)
     else:
-        # Fixed-length case: distribute gradient evenly across sequence dimension
         _batch, seq_len, _hidden_dim = x_shape
         dx = jnp.tile(g[:, None, :], (1, seq_len, 1)) / seq_len
 
@@ -125,9 +125,10 @@ _mean_pooling_core.defvjp(_mean_pooling_fwd, _mean_pooling_bwd)
 
 
 @kernel_registry.register("mean_pooling", Platform.XLA, Backend.ANY)
+@jaxtyping.jaxtyped(typechecker=beartype)
 def mean_pooling(
     x: Float[Array, "batch seq_len hidden_dim"],
-    chunk_size: int = 32,  # Ignored in XLA implementation (Triton-specific tuning parameter)
+    chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
     """
@@ -154,18 +155,18 @@ def mean_pooling(
         `cu_seqlens` (i.e., `len(cu_seqlens) - 1`).
 
     Examples:
-        >>> # Fixed-length sequences
-        >>> x = jnp.ones((2, 10, 128))  # 2 sequences, length 10, dim 128
+        >>>
+        >>> x = jnp.ones((2, 10, 128))
         >>> out = mean_pooling(x)
         >>> out.shape
         (2, 128)
 
-        >>> # Variable-length sequences
-        >>> x = jnp.ones((25, 128))  # 25 total tokens, dim 128
-        >>> cu_seqlens = jnp.array([0, 10, 25])  # seq1: 10 tokens, seq2: 15 tokens
+        >>>
+        >>> x = jnp.ones((25, 128))
+        >>> cu_seqlens = jnp.array([0, 10, 25])
         >>> out = mean_pooling(x, cu_seqlens=cu_seqlens)
         >>> out.shape
         (2, 128)
     """
-    # chunk_size is ignored - it's a Triton-specific performance parameter
+
     return _mean_pooling_core(x, cu_seqlens)

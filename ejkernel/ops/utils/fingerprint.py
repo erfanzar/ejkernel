@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Device fingerprinting and object hashing utilities for caching.
 
@@ -41,8 +42,8 @@ These utilities ensure that:
     - Sharding information is preserved for distributed computation
 
 Example Usage:
-    >>> device_id = device_fingerprint()  # 'gpu|cuda_12.0'
-    >>> config_hash = short_hash(my_config)  # '1a2b3c4d5e6f7g8h'
+    >>> device_id = device_fingerprint()
+    >>> config_hash = short_hash(my_config)
     >>> abstract_tree = abstractify(data_with_arrays)
     >>> cache_key = default_key_builder_with_sharding(invocation)
 """
@@ -79,7 +80,7 @@ def sharding_fingerprint(x: Any) -> Any:
     """
     if isinstance(x, jax.Array):
         try:
-            return repr(x.sharding)  # small, stable
+            return repr(x.sharding)
         except Exception:
             return None
     return None
@@ -105,7 +106,7 @@ def default_key_builder_with_sharding(inv) -> str:
         depending on how data is sharded across devices.
     """
 
-    shard_sig = jax.tree.map(sharding_fingerprint, inv.args)  # ignore kwargs by default
+    shard_sig = jax.tree.map(sharding_fingerprint, inv.args)
     spec = dict(
         args_spec=abstractify(inv.args),
         kwargs_spec=abstractify(dict(inv.kwargs)),
@@ -129,7 +130,7 @@ def device_fingerprint(dev: jax.Device | None = None) -> str:  # type:ignore
         String identifier like 'gpu|cuda_12.0', 'tpu|v4', or 'cpu|'
 
     Examples:
-        >>> device_fingerprint()  # Using default device
+        >>> device_fingerprint()
         'gpu|cuda_12.0'
         >>> device_fingerprint(jax.devices('cpu')[0])
         'cpu|'
@@ -218,9 +219,9 @@ def stable_json(obj: Any) -> str:
         if isinstance(o, jax.ShapeDtypeStruct):
             dtype = getattr(o.dtype, "name", str(o.dtype))
             return {"shape": tuple(int(s) for s in o.shape), "dtype": dtype}
-        if isinstance(o, np.dtype):  # dtype
+        if isinstance(o, np.dtype):
             return o.name
-        if isinstance(o, np.integer | np.floating | np.bool_):  # scalars
+        if isinstance(o, np.integer | np.floating | np.bool_):
             return o.item()
         return repr(o)
 
@@ -270,8 +271,8 @@ def abstractify(pytree: Any) -> Any:
         >>> import jax.numpy as jnp
         >>> data = {'x': jnp.array([1, 2, 3]), 'y': 'scalar'}
         >>> abstract = abstractify(data)
-        >>> # abstract['x'] is now ShapeDtypeStruct(shape=(3,), dtype=int32)
-        >>> # abstract['y'] is still 'scalar'
+        >>>
+        >>>
 
     Note:
         This is essential for creating cache keys based on array structure

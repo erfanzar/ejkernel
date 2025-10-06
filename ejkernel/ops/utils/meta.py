@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/eFormer Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Metadata extraction and label processing for compiled JAX programs.
 
@@ -35,15 +36,15 @@ These utilities enable:
     - Configuration recovery from compiled programs
 
 Example Usage:
-    >>> # Generate a label for an operation
-    >>> op_label = label('matmul@v1', '1a2b3c4d5e6f7g8h')
-    >>> print(op_label)  # 'eformer_ops#matmul@v1:1a2b3c4d5e6f7g8h'
     >>>
-    >>> # Extract labels from compiled code
+    >>> op_label = label('matmul@v1', '1a2b3c4d5e6f7g8h')
+    >>> print(op_label)
+    >>>
+    >>>
     >>> lowered = jax.jit(my_function).lower(args)
     >>> labels = find_labels_in_lowered(lowered)
     >>>
-    >>> # Map labels back to configurations
+    >>>
     >>> configs = labels_to_configs(lowered, selector)
 """
 

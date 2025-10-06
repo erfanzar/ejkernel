@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 from __future__ import annotations
 
@@ -130,12 +131,12 @@ def get_cache_dir() -> Path:
     """
     home_dir = Path.home()
     app_name = "eformer-cache"
-    if os.name == "nt":  # Windows
+    if os.name == "nt":
         cache_dir = Path(os.getenv("LOCALAPPDATA", home_dir / "AppData" / "Local")) / app_name
-    elif os.name == "posix":  # Linux and macOS
-        if "darwin" in os.sys.platform:  # macOS
+    elif os.name == "posix":
+        if "darwin" in os.sys.platform:
             cache_dir = home_dir / "Library" / "Caches" / app_name
-        else:  # Linux
+        else:
             cache_dir = home_dir / ".cache" / app_name
     else:
         cache_dir = home_dir / ".cache" / app_name

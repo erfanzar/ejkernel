@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import jax
 import jax.numpy as jnp
 
@@ -21,11 +22,11 @@ from ejkernel.callib import ejit
 @ejit(static_argnums=(6, 7, 8, 9))
 def _ragged_page_attention(
     queries: jnp.ndarray,
-    kv_pages: jnp.ndarray,  # [P, PS, 2*KVH, D] (K at 0::2, V at 1::2)
+    kv_pages: jnp.ndarray,
     context_lens: jnp.ndarray,
-    block_tables: jnp.ndarray,  # [S, max_pages_per_sequence]
-    query_start_loc: jnp.ndarray,  # [S+1]
-    num_seqs: jnp.ndarray,  # [1] or scalar
+    block_tables: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    num_seqs: jnp.ndarray,
     softmax_scale: float,
     logit_soft_cap: float | None,
     compute_dtype: jnp.dtype = jnp.bfloat16,
@@ -39,13 +40,11 @@ def _ragged_page_attention(
     out_shape = (total_query_tokens, num_q_heads, head_size)
     q_heads_per_group = num_q_heads // num_kv_heads
 
-    # reshape to [T, KVH, QHG, D] and scale
     queries = queries.reshape(total_query_tokens, num_kv_heads, q_heads_per_group, head_size)
     queries = (queries * softmax_scale).astype(compute_dtype)
     qblocks = min(4, total_query_tokens if total_query_tokens > 0 else 4)
     kvblocks = min(64, max_pages_per_sequence if max_pages_per_sequence > 0 else 64)
 
-    # pad by at least one block to avoid dynamic_slice clamping at tail
     padd = (qblocks - total_query_tokens % qblocks) % qblocks + qblocks
     if padd > 0:
         padding_shape = (padd, num_kv_heads, q_heads_per_group, head_size)
@@ -116,14 +115,10 @@ def _ragged_page_attention(
                     attention_mask = attention_mask[:, None, None, :]
                     attention_scores_block = jnp.where(attention_mask, attention_scores_block, -jnp.inf)
 
-                    # Add attention sink logits if provided
                     if softmax_aux is not None:
-                        # Reshape sink logits to match dimensions
                         if softmax_aux.ndim == 1:
-                            # [num_sinks] -> [1, 1, 1, num_sinks]
                             sinks = softmax_aux.reshape(1, 1, 1, -1)
                         elif softmax_aux.ndim == 2:
-                            # [num_kv_heads, num_sinks] -> [1, num_kv_heads, 1, num_sinks]
                             sinks = softmax_aux.reshape(1, -1, 1, softmax_aux.shape[-1])
                         else:
                             raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
@@ -131,26 +126,22 @@ def _ragged_page_attention(
                         sinks = jnp.broadcast_to(sinks, (qblocks, num_kv_heads, q_heads_per_group, sinks.shape[-1]))
                         sinks = sinks.astype(compute_dtype)
 
-                        # Concatenate sink logits with attention scores
                         combined_scores = jnp.concatenate([attention_scores_block, sinks], axis=3)
 
-                        # Compute softmax with sinks
                         current_max_score = jnp.max(combined_scores, axis=3, keepdims=False)
                         new_max_score_block = jnp.maximum(max_score_block, current_max_score)
 
                         combined_probs = jnp.exp(combined_scores - new_max_score_block[:, :, :, None])
 
-                        # Extract only non-sink probabilities for value computation
                         probabilities_block = combined_probs[:, :, :, : attention_scores_block.shape[3]]
                         probabilities_block = probabilities_block * attention_mask
 
                         rescale_factor = jnp.exp(max_score_block - new_max_score_block)
-                        # Sum includes all probabilities (including sinks) for correct normalization
+
                         sum_exponentials_block = (rescale_factor * sum_exponentials_block) + jnp.sum(
                             combined_probs, axis=3
                         )
                     else:
-                        # Standard online softmax without sinks
                         current_max_score = jnp.max(attention_scores_block, axis=3, keepdims=False)
                         new_max_score_block = jnp.maximum(max_score_block, current_max_score)
 
@@ -162,7 +153,6 @@ def _ragged_page_attention(
                             probabilities_block, axis=3
                         )
 
-                    # Value update (only non-sink probabilities contribute)
                     value_update = jnp.einsum(
                         "bihk,kid->bihd",
                         probabilities_block,
@@ -216,13 +206,12 @@ def _ragged_page_attention(
             lambda: output_accumulator,
         )
 
-    # IMPORTANT: do not int() this; keep it a JAX scalar
     num_S = (num_seqs[0] if num_seqs.shape != () else num_seqs).astype(jnp.int32)
 
     return jax.lax.slice(
         jax.lax.fori_loop(
             0,
-            num_S,  # JAX scalar, not Python int
+            num_S,
             _compute_attention_for_sequence,
             attention_output,
         ),
@@ -234,11 +223,11 @@ def _ragged_page_attention(
 @ejit(static_argnums=(6, 7, 8, 9))
 def _ragged_page_attention_optimized(
     queries: jnp.ndarray,
-    kv_pages: jnp.ndarray,  # [P, PS, 2*KVH, D] (K at 0::2, V at 1::2)
+    kv_pages: jnp.ndarray,
     context_lens: jnp.ndarray,
-    block_tables: jnp.ndarray,  # [S, max_pages_per_sequence]
-    query_start_loc: jnp.ndarray,  # [S+1]
-    num_seqs: jnp.ndarray,  # [1] or scalar
+    block_tables: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    num_seqs: jnp.ndarray,
     softmax_scale: float,
     logit_soft_cap: float | None,
     compute_dtype: jnp.dtype = jnp.bfloat16,
@@ -255,7 +244,6 @@ def _ragged_page_attention_optimized(
     queries = queries.reshape(total_query_tokens, num_kv_heads, q_heads_per_group, head_size)
     queries = (queries * jnp.float32(softmax_scale)).astype(compute_dtype)
 
-    # Adaptive block sizing for better memory efficiency
     if total_query_tokens > 512:
         qblocks = 16
     elif total_query_tokens > 256:
@@ -306,16 +294,14 @@ def _ragged_page_attention_optimized(
                     )
                     page_indices_for_kv_block = jnp.squeeze(page_indices_for_block, axis=0)
 
-                    # Extract KV blocks correctly
                     kv_block_shape = (kvblocks * page_size, num_kv_heads, head_size)
-                    kv_data = kv_pages[page_indices_for_kv_block]  # [kvblocks, page_size, 2*KVH, D]
+                    kv_data = kv_pages[page_indices_for_kv_block]
                     key_block = kv_data[:, :, 0::2, :].reshape(kv_block_shape)
                     value_block = kv_data[:, :, 1::2, :].reshape(kv_block_shape)
 
                     kv_token_start_index = kv_block_idx * kv_tokens_per_block
                     kv_token_indices = jnp.arange(kvblocks * page_size, dtype=jnp.int32) + kv_token_start_index
 
-                    # More efficient einsum with precision control
                     attention_scores_block = jnp.einsum(
                         "bihd,kid->bihk",
                         query_block,
@@ -325,7 +311,6 @@ def _ragged_page_attention_optimized(
                     if logit_soft_cap is not None:
                         attention_scores_block = logit_soft_cap * jnp.tanh(attention_scores_block / logit_soft_cap)
 
-                    # Fused mask creation and application
                     attention_mask = (query_token_indices[:, None] >= kv_token_indices[None, :]) & (
                         kv_token_indices[None, :] < kv_cache_len_for_seq
                     )
@@ -336,12 +321,9 @@ def _ragged_page_attention_optimized(
 
                     attention_mask = attention_mask[:, None, None, :]
 
-                    # Use -1e9 instead of -inf for better numerical stability
                     attention_scores_block = jnp.where(attention_mask, attention_scores_block, -1e9)
 
-                    # Add attention sink logits if provided
                     if softmax_aux is not None:
-                        # Reshape sink logits
                         if softmax_aux.ndim == 1:
                             sinks = softmax_aux.reshape(1, 1, 1, -1)
                         elif softmax_aux.ndim == 2:
@@ -349,23 +331,18 @@ def _ragged_page_attention_optimized(
                         else:
                             raise ValueError(f"softmax_aux must be 1D or 2D, got {softmax_aux.ndim}D")
 
-                        # Broadcast to match attention scores shape
                         sinks = jnp.broadcast_to(sinks, (qblocks, num_kv_heads, q_heads_per_group, sinks.shape[-1]))
                         sinks = sinks.astype(compute_dtype)
 
-                        # Concatenate sink logits with attention scores
                         combined_scores = jnp.concatenate([attention_scores_block, sinks], axis=3)
 
-                        # Compute softmax with sinks
                         current_max_score = jnp.max(combined_scores, axis=3, keepdims=False)
                         new_max_score_block = jnp.maximum(max_score_block, current_max_score)
                         combined_probs = jnp.exp(combined_scores - new_max_score_block[:, :, :, None])
 
-                        # Extract only non-sink probabilities for value computation
                         probabilities_block = combined_probs[:, :, :, : attention_scores_block.shape[3]]
                         probabilities_block = probabilities_block * attention_mask
 
-                        # Sum includes all probabilities (including sinks) for correct normalization
                         rescale_factor = jnp.exp(max_score_block - new_max_score_block)
                         sum_exponentials_block = (rescale_factor * sum_exponentials_block) + jnp.sum(
                             combined_probs, axis=3
@@ -374,7 +351,6 @@ def _ragged_page_attention_optimized(
                         current_max_score = jnp.max(attention_scores_block, axis=3)
                         new_max_score_block = jnp.maximum(max_score_block, current_max_score)
 
-                        # Fused exp and mask application
                         probabilities_block = jnp.exp(attention_scores_block - new_max_score_block[:, :, :, None])
                         probabilities_block = probabilities_block * attention_mask
 
@@ -383,7 +359,6 @@ def _ragged_page_attention_optimized(
                             probabilities_block, axis=3
                         )
 
-                    # More efficient value aggregation
                     value_update = jnp.einsum(
                         "bihk,kid->bihd",
                         probabilities_block,
@@ -398,7 +373,6 @@ def _ragged_page_attention_optimized(
                         new_max_score_block.astype(compute_dtype),
                     )
 
-                # Initialize with correct dtypes
                 initial_carry = (
                     jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=compute_dtype),
                     jnp.zeros((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype),
@@ -409,7 +383,6 @@ def _ragged_page_attention_optimized(
                     0, num_kv_blocks, _process_kv_block, initial_carry
                 )
 
-                # More stable normalization
                 normalized_output_block = (
                     output_block / jnp.maximum(sum_exponentials_block[:, :, :, None], 1e-10)
                 ).astype(padded_queries.dtype)

@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import jax
 import jax.numpy as jnp
@@ -60,13 +61,11 @@ def _recurrent_attention_bwd(
     """
     _batch, seq_len, _num_heads, _head_dim = q.shape
 
-    # Check which gating mechanisms are active
     use_g = jnp.any(g != 0.0)
     use_g_gamma = jnp.any(g_gamma != 0.0)
     use_gk = jnp.any(gk != 0.0)
     use_gv = jnp.any(gv != 0.0)
 
-    # If forward was reversed, reverse the gradients
     if reverse:
         do = jnp.flip(do, axis=1)
         q = jnp.flip(q, axis=1)
@@ -79,68 +78,52 @@ def _recurrent_attention_bwd(
 
     def process_batch(q_b, k_b, v_b, g_b, gk_b, gv_b, hidden_b, do_b, dfinal_h):
         """Process backward for a single batch element."""
-        # hidden_b: [seq_len, num_heads, head_dim, head_dim]
-        # q_b, k_b, v_b: [seq_len, num_heads, head_dim]
-        # do_b: [seq_len, num_heads, head_dim]
 
-        # Initialize
-        dh = dfinal_h  # [num_heads, head_dim, head_dim]
+        dh = dfinal_h
 
         def backward_step(carry, inputs):
             """Single backward step through time."""
             dh_next = carry
             _t_idx, q_t, k_t, v_t, g_t, gk_t, gv_t, h_t, do_t = inputs
 
-            # Gradient of output: o_t = sum(h_t * q_t_scaled[:, :, None], axis=1)
-            # where q_t_scaled = q_t * scale
-            # So: o_t[n, d] = sum_k h_t[n, k, d] * q_t[n, k] * scale
-            # dL/dq_t[n, k] = sum_d dL/do_t[n, d] * h_t[n, k, d] * scale
-            dq_t = jnp.sum(do_t[:, None, :] * h_t, axis=-1) * scale  # [num_heads, head_dim]
+            dq_t = jnp.sum(do_t[:, None, :] * h_t, axis=-1) * scale
 
-            # Gradient flowing into hidden state from output
-            # dL/dh_t[n, k, d] = dL/do_t[n, d] * q_t[n, k] * scale
-            dh_from_output = do_t[:, None, :] * (q_t * scale)[:, :, None]  # [num_heads, head_dim, head_dim]
+            dh_from_output = do_t[:, None, :] * (q_t * scale)[:, :, None]
             dh_current = dh_next + dh_from_output
 
-            # Gradient of k and v from hidden state update: h_t = ... + k_t^T ⊗ v_t
-            # dL/dk_t = dL/dh_t^T @ v_t
-            dk_t = jnp.einsum("nhd,nd->nh", dh_current.transpose(0, 2, 1), v_t)  # [num_heads, head_dim]
+            dk_t = jnp.einsum("nhd,nd->nh", dh_current.transpose(0, 2, 1), v_t)
 
-            # dL/dv_t = k_t^T @ dL/dh_t = dL/dh_t @ k_t
-            dv_t = jnp.einsum("nhd,nh->nd", dh_current, k_t)  # [num_heads, head_dim]
+            dv_t = jnp.einsum("nhd,nh->nd", dh_current, k_t)
 
-            # Prepare dh for previous timestep: dh_{t-1} = dh_t * decay_t
             dh_prev = dh_current
 
-            # Apply decay gradients (in reverse)
             dg_t = jnp.zeros_like(g_t)
             dgk_t = jnp.zeros_like(gk_t)
             dgv_t = jnp.zeros_like(gv_t)
 
             if use_g:
-                decay_g = jnp.exp(g_t)  # [num_heads, head_dim]
-                # h_t was multiplied by decay, so gradient flows through
-                dg_t = dh_prev * decay_g[:, :, None]  # gradient through exp(g)
+                decay_g = jnp.exp(g_t)
+
+                dg_t = dh_prev * decay_g[:, :, None]
                 dh_prev = dh_prev * decay_g[:, :, None]
 
             if use_g_gamma:
-                decay_gamma = jnp.exp(g_gamma)  # [num_heads]
+                decay_gamma = jnp.exp(g_gamma)
                 dh_prev = dh_prev * decay_gamma[:, None, None]
 
             if use_gk:
-                decay_gk = jnp.exp(gk_t)  # [num_heads, head_dim]
+                decay_gk = jnp.exp(gk_t)
                 dgk_t = dh_prev * decay_gk[:, :, None]
                 dh_prev = dh_prev * decay_gk[:, :, None]
 
             if use_gv:
-                decay_gv = jnp.exp(gv_t)  # [num_heads, head_dim]
+                decay_gv = jnp.exp(gv_t)
                 dgv_t = dh_prev * decay_gv[:, None, :]
                 dh_prev = dh_prev * decay_gv[:, None, :]
 
             outputs = (dq_t, dk_t, dv_t, dg_t, dgk_t, dgv_t)
             return dh_prev, outputs
 
-        # Prepare inputs for scan (reverse order)
         scan_inputs = (
             jnp.arange(seq_len)[::-1],
             q_b[::-1],
@@ -155,7 +138,6 @@ def _recurrent_attention_bwd(
 
         dh_initial, outputs = jax.lax.scan(backward_step, dh, scan_inputs)
 
-        # Unpack and reverse outputs
         dq_b, dk_b, dv_b, dg_b, dgk_b, dgv_b = outputs
         dq_b = dq_b[::-1]
         dk_b = dk_b[::-1]
@@ -166,12 +148,10 @@ def _recurrent_attention_bwd(
 
         return dq_b, dk_b, dv_b, dg_b, dgk_b, dgv_b, dh_initial
 
-    # Process all batches
     dq, dk, dv, dg, dgk, dgv, dinitial_state = jax.vmap(process_batch)(
         q, k, v, g, gk, gv, hidden_states, do, dfinal_state
     )
 
-    # If forward was reversed, reverse gradients back
     if reverse:
         dq = jnp.flip(dq, axis=1)
         dk = jnp.flip(dk, axis=1)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """High-level kernel modules with automatic optimization.
 
 This module provides user-friendly interfaces for kernel operations using the
@@ -33,10 +34,10 @@ Available Modules:
 Example:
     >>> from ejkernel.modules import FlashAttention, create_default_executor
     >>>
-    >>> # Create executor with caching and autotuning
+    >>>
     >>> executor = create_default_executor("/tmp/kernel_cache")
     >>>
-    >>> # Use module
+    >>>
     >>> attn = FlashAttention()
     >>> output = executor(attn, q, k, v, causal=True)
 """
@@ -55,6 +56,7 @@ from .operations import (
     RaggedPageAttention,
     RecurrentAttention,
     RingAttention,
+    ScaledDotProductAttention,
     attention,
     flash_attention,
     gla_attention,
@@ -66,6 +68,7 @@ from .operations import (
     ragged_page_attention,
     recurrent_attention,
     ring_attention,
+    scaled_dot_product_attention,
     sparse_attention,
 )
 
@@ -83,6 +86,7 @@ __all__ = (
     "RaggedPageAttention",
     "RecurrentAttention",
     "RingAttention",
+    "ScaledDotProductAttention",
     "attention",
     "create_default_executor",
     "flash_attention",
@@ -95,5 +99,6 @@ __all__ = (
     "ragged_page_attention",
     "recurrent_attention",
     "ring_attention",
+    "scaled_dot_product_attention",
     "sparse_attention",
 )
