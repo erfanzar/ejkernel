@@ -15,6 +15,7 @@
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import DTypeLike
 
 from ejkernel.callib import ejit
 
@@ -29,7 +30,7 @@ def _ragged_page_attention(
     num_seqs: jnp.ndarray,
     softmax_scale: float,
     logit_soft_cap: float | None,
-    compute_dtype: jnp.dtype = jnp.bfloat16,
+    compute_dtype: DTypeLike = jnp.bfloat16,
     sliding_window: int | None = None,
     softmax_aux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
@@ -123,7 +124,10 @@ def _ragged_page_attention(
                         else:
                             raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
 
-                        sinks = jnp.broadcast_to(sinks, (qblocks, num_kv_heads, q_heads_per_group, sinks.shape[-1]))
+                        sinks = jnp.broadcast_to(
+                            sinks,
+                            (qblocks, num_kv_heads, q_heads_per_group, sinks.shape[-1]),
+                        )
                         sinks = sinks.astype(compute_dtype)
 
                         combined_scores = jnp.concatenate([attention_scores_block, sinks], axis=3)
@@ -230,7 +234,7 @@ def _ragged_page_attention_optimized(
     num_seqs: jnp.ndarray,
     softmax_scale: float,
     logit_soft_cap: float | None,
-    compute_dtype: jnp.dtype = jnp.bfloat16,
+    compute_dtype: DTypeLike = jnp.bfloat16,
     sliding_window: int | None = None,
     softmax_aux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
@@ -331,7 +335,10 @@ def _ragged_page_attention_optimized(
                         else:
                             raise ValueError(f"softmax_aux must be 1D or 2D, got {softmax_aux.ndim}D")
 
-                        sinks = jnp.broadcast_to(sinks, (qblocks, num_kv_heads, q_heads_per_group, sinks.shape[-1]))
+                        sinks = jnp.broadcast_to(
+                            sinks,
+                            (qblocks, num_kv_heads, q_heads_per_group, sinks.shape[-1]),
+                        )
                         sinks = sinks.astype(compute_dtype)
 
                         combined_scores = jnp.concatenate([attention_scores_block, sinks], axis=3)
@@ -374,9 +381,16 @@ def _ragged_page_attention_optimized(
                     )
 
                 initial_carry = (
-                    jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=compute_dtype),
+                    jnp.zeros(
+                        (qblocks, num_kv_heads, q_heads_per_group, head_size),
+                        dtype=compute_dtype,
+                    ),
                     jnp.zeros((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype),
-                    jnp.full((qblocks, num_kv_heads, q_heads_per_group), -1e9, dtype=compute_dtype),
+                    jnp.full(
+                        (qblocks, num_kv_heads, q_heads_per_group),
+                        -1e9,
+                        dtype=compute_dtype,
+                    ),
                 )
 
                 output_block, sum_exponentials_block, _ = jax.lax.fori_loop(

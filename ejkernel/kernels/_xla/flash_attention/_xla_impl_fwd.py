@@ -17,7 +17,7 @@ import chex
 import jax
 import jax.lax as lax
 from jax import numpy as jnp
-from jaxtyping import PRNGKeyArray
+from jaxtyping import DTypeLike, PRNGKeyArray
 
 
 def _slice_along_axis(x: chex.Array | None, start: int, size: int, axis: int) -> chex.Array | None:
@@ -48,7 +48,7 @@ def _apply_logits_transforms(
     logits_soft_cap: float | None,
     mask: chex.Array | None,
     window_mask: chex.Array | None,
-    logits_dtype: jnp.dtype,
+    logits_dtype: DTypeLike,
 ) -> chex.Array:
     """Apply transformations to attention logits: scaling, bias, soft cap, masking."""
     logits = logits.astype(logits_dtype)
@@ -146,7 +146,7 @@ def _attend_chunk(
     window_mask: chex.Array | None,
     causal_mask: chex.Array | None,
     logits_soft_cap: float | None,
-    logits_dtype: jnp.dtype,
+    logits_dtype: DTypeLike,
     precision: lax.PrecisionLike,
     dropout_prob: float = 0.0,
     dropout_key: PRNGKeyArray | None = None,
@@ -277,7 +277,7 @@ def _flash_attention_fwd(
     chunk_size_k: int,
     normalize_output: bool,
     precision: lax.PrecisionLike,
-    logits_dtype: jnp.dtype,
+    logits_dtype: DTypeLike,
     softmax_aux: chex.Array | None = None,
     causal: bool = False,
     dropout_prob: float = 0.0,

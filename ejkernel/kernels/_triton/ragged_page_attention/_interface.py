@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, DTypeLike, Float, Int
 
 from ejkernel.callib import cdiv, triton_call
 
@@ -39,7 +39,7 @@ def ragged_page_attention(
     *,
     softmax_scale: float | None = None,
     logit_soft_cap: float | None = None,
-    compute_dtype: jnp.dtype = jnp.bfloat16,
+    compute_dtype: DTypeLike = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,

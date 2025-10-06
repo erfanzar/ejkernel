@@ -21,7 +21,7 @@ import jax.lax as lax
 import jaxtyping
 from beartype import beartype
 from jax import numpy as jnp
-from jaxtyping import Array, Float, Int, PRNGKeyArray
+from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
 
 from ejkernel.callib import ejit
 
@@ -46,9 +46,9 @@ def _ring_attention(
     key_chunk_size: int = 512,
     causal_block_size: int | None = None,
     deterministic: bool = True,
-    dropout_rng: PRNGKeyArray = None,
+    dropout_rng: PRNGKeyArray | None = None,
     pdrop: float = 0.0,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: DTypeLike = jnp.float32,
     policy=jax.checkpoint_policies.nothing_saveable,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     prevent_cse: bool = True,
@@ -148,9 +148,9 @@ def ring_attention(
     key_chunk_size: int = 512,
     causal_block_size: int | None = None,
     deterministic: bool = True,
-    dropout_rng: PRNGKeyArray = None,
+    dropout_rng: PRNGKeyArray | None = None,
     pdrop: float = 0.0,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: DTypeLike = jnp.float32,
     policy=jax.checkpoint_policies.nothing_saveable,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     prevent_cse: bool = True,

@@ -20,7 +20,7 @@ import jaxtyping
 from beartype import beartype
 from jax import lax
 from jax import numpy as jnp
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
 from ejkernel.callib import ejit
 
@@ -241,7 +241,7 @@ def flash_attention(
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
-    logits_dtype: jnp.dtype = jnp.float32,
+    logits_dtype: DTypeLike = jnp.float32,
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,

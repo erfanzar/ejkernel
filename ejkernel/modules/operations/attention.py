@@ -28,7 +28,7 @@ from __future__ import annotations
 import typing
 
 from jax import numpy as jnp
-from jaxtyping import Array, Bool, Float, PRNGKeyArray
+from jaxtyping import Array, Bool, DTypeLike, Float, PRNGKeyArray
 
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.ops import Invocation, Kernel
@@ -100,11 +100,11 @@ class Attention(Kernel[KernelConfig, Array]):
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
         init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = True,
-        dropout_rng: PRNGKeyArray = None,
+        dropout_rng: PRNGKeyArray | None = None,
         softmax_aux: Float[Array, "..."] | None = None,
         softmax_scale: float | None = None,
-        dtype: jnp.dtype | None = jnp.bfloat16,
-        softmax_dtype: jnp.dtype | None = None,
+        dtype: DTypeLike | None = jnp.bfloat16,
+        softmax_dtype: DTypeLike | None = None,
         dropout_prob: float = 0.0,
         sliding_window: int | tuple[int, int] | None = None,
         *,
@@ -227,11 +227,11 @@ def attention(
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
-    dropout_rng: PRNGKeyArray = None,
+    dropout_rng: PRNGKeyArray | None = None,
     softmax_aux: Float[Array, "..."] | None = None,
     softmax_scale: float | None = None,
-    dtype: jnp.dtype | None = jnp.bfloat16,
-    softmax_dtype: jnp.dtype | None = None,
+    dtype: DTypeLike | None = jnp.bfloat16,
+    softmax_dtype: DTypeLike | None = None,
     dropout_prob: float = 0.0,
     sliding_window: int | tuple[int, int] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:

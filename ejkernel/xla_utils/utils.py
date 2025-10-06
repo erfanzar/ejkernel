@@ -14,6 +14,7 @@
 
 
 import jax.numpy as jnp
+from jaxtyping import DTypeLike
 
 
 def cdiv(a: jnp.ndarray, b: int) -> jnp.ndarray:
@@ -47,7 +48,7 @@ def prepare_lens_from_mask(mask: jnp.ndarray) -> jnp.ndarray:
     return mask.sum(axis=-1, dtype=jnp.int32)
 
 
-def prepare_cu_seqlens_from_mask(mask: jnp.ndarray, out_dtype: jnp.dtype = jnp.int32) -> jnp.ndarray:
+def prepare_cu_seqlens_from_mask(mask: jnp.ndarray, out_dtype: DTypeLike = jnp.int32) -> jnp.ndarray:
     """
     Creates cumulative sequence lengths from a boolean attention mask.
 

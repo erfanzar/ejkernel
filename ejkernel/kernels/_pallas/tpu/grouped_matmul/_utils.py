@@ -24,6 +24,7 @@ import re
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import DTypeLike
 
 
 def is_tpu() -> bool:
@@ -120,7 +121,7 @@ def supports_bfloat16_matmul() -> bool:
     return not is_tpu() or tpu_generation() >= 4
 
 
-def assert_is_supported_dtype(dtype: jnp.dtype) -> None:
+def assert_is_supported_dtype(dtype: DTypeLike) -> None:
     """Validate that a dtype is supported for grouped matrix multiplication.
 
     The grouped matmul kernels are optimized for bfloat16 and float32 dtypes,

@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from ejkernel.kernels._xla.attention._interface import attention
 from ejkernel.kernels._xla.flash_attention import flash_attention
 
 
@@ -434,6 +435,103 @@ class TestGradients:
 
         grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
         assert all(jnp.all(jnp.isfinite(g)) for g in grads)
+
+
+class TestVanillaComparison:
+    """Compare flash_attention with vanilla attention."""
+
+    def test_basic_vs_vanilla(self):
+        """Compare basic flash attention with vanilla."""
+        key = jax.random.PRNGKey(42)
+        keys = jax.random.split(key, 3)
+
+        B, T, H, D = 2, 64, 4, 32
+        q = jax.random.normal(keys[0], (B, T, H, D))
+        k = jax.random.normal(keys[1], (B, T, H, D))
+        v = jax.random.normal(keys[2], (B, T, H, D))
+
+        flash_out = flash_attention(q, k, v, chunk_size_q=32, chunk_size_k=32)
+        vanilla_out, _ = attention(q, k, v)
+
+        max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
+        print(f"\nBasic flash vs vanilla: max_diff={max_diff:.6e}")
+        assert jnp.allclose(flash_out, vanilla_out, atol=2e-2)
+
+    def test_causal_vs_vanilla(self):
+        """Compare causal flash attention with vanilla."""
+        key = jax.random.PRNGKey(123)
+        keys = jax.random.split(key, 3)
+
+        B, T, H, D = 2, 64, 4, 32
+        q = jax.random.normal(keys[0], (B, T, H, D))
+        k = jax.random.normal(keys[1], (B, T, H, D))
+        v = jax.random.normal(keys[2], (B, T, H, D))
+
+        # Causal mask
+        causal_mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+        causal_mask = causal_mask[None, None, :, :]
+        causal_mask = jnp.broadcast_to(causal_mask, (B, 1, T, T))
+
+        flash_out = flash_attention(q, k, v, causal=True, chunk_size_q=32, chunk_size_k=32)
+        vanilla_out, _ = attention(q, k, v, attention_mask=causal_mask)
+
+        max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
+        print(f"\nCausal flash vs vanilla: max_diff={max_diff:.6e}")
+        assert jnp.allclose(flash_out, vanilla_out, atol=2e-2)
+
+    def test_bias_vs_vanilla(self):
+        """Compare flash attention with bias against vanilla."""
+        key = jax.random.PRNGKey(456)
+        keys = jax.random.split(key, 4)
+
+        B, T, H, D = 2, 64, 4, 32
+        q = jax.random.normal(keys[0], (B, T, H, D))
+        k = jax.random.normal(keys[1], (B, T, H, D))
+        v = jax.random.normal(keys[2], (B, T, H, D))
+        bias = jax.random.normal(keys[3], (B, H, T, T)) * 0.1
+
+        flash_out = flash_attention(q, k, v, bias=bias, chunk_size_q=32, chunk_size_k=32)
+        vanilla_out, _ = attention(q, k, v, bias=bias)
+
+        max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
+        print(f"\nBias flash vs vanilla: max_diff={max_diff:.6e}")
+        assert jnp.allclose(flash_out, vanilla_out, atol=2e-2)
+
+    def test_sliding_window_vs_vanilla(self):
+        """Compare flash attention with sliding window against vanilla."""
+        key = jax.random.PRNGKey(789)
+        keys = jax.random.split(key, 3)
+
+        B, T, H, D = 2, 64, 4, 32
+        q = jax.random.normal(keys[0], (B, T, H, D))
+        k = jax.random.normal(keys[1], (B, T, H, D))
+        v = jax.random.normal(keys[2], (B, T, H, D))
+
+        window = 16
+        flash_out = flash_attention(q, k, v, window=(window, window), chunk_size_q=32, chunk_size_k=32)
+        vanilla_out, _ = attention(q, k, v, sliding_window=window)
+
+        max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
+        print(f"\nSliding window flash vs vanilla: max_diff={max_diff:.6e}")
+        assert jnp.allclose(flash_out, vanilla_out, atol=2e-2)
+
+    def test_softmax_scale_vs_vanilla(self):
+        """Compare flash attention with custom softmax scale against vanilla."""
+        key = jax.random.PRNGKey(111)
+        keys = jax.random.split(key, 3)
+
+        B, T, H, D = 2, 64, 4, 32
+        q = jax.random.normal(keys[0], (B, T, H, D))
+        k = jax.random.normal(keys[1], (B, T, H, D))
+        v = jax.random.normal(keys[2], (B, T, H, D))
+
+        scale = 0.5
+        flash_out = flash_attention(q, k, v, softmax_scale=scale, chunk_size_q=32, chunk_size_k=32)
+        vanilla_out, _ = attention(q, k, v, softmax_scale=scale)
+
+        max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
+        print(f"\nSoftmax scale flash vs vanilla: max_diff={max_diff:.6e}")
+        assert jnp.allclose(flash_out, vanilla_out, atol=5e-2)
 
 
 if __name__ == "__main__":

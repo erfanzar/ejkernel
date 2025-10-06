@@ -17,6 +17,7 @@ import chex
 import jax
 import jax.lax as lax
 from jax import numpy as jnp
+from jaxtyping import DTypeLike
 
 
 def _chunk_attention_bias(
@@ -29,7 +30,7 @@ def _chunk_attention_bias(
     attn_dropout: chex.Array | None,
     pdrop: float,
     causal_block_size: int | None,
-    dtype: jnp.dtype,
+    dtype: DTypeLike,
     query_chunk_idx: int,
     key_chunk_idx: int,
     sliding_window: int | tuple[int, int] | None = None,
@@ -81,10 +82,25 @@ def _chunk_attention_bias(
             start_indices=(0, key_offset),
             slice_sizes=(kv_segment_ids.shape[0], key_chunk_size),
         )
-        segment_ids_mask = ~jnp.equal(q_seg_chunk[:, :, None], kv_seg_chunk[:, None, :])
+        # Segment IDs interpretation:
+        # - When used for document boundaries: different segment IDs = different documents, mask attention between them
+        # - When segment_id=0: this is a padding/invalid token that should not participate in attention at all
+
+        # Mask where segments don't match (for document boundaries)
+        segment_mismatch_mask = ~jnp.equal(q_seg_chunk[:, :, None], kv_seg_chunk[:, None, :])
+
+        # Also mask any interaction involving segment_id=0 (padding tokens)
+        # If either query or key has segment_id=0, mask the attention
+        q_or_kv_is_zero = (q_seg_chunk[:, :, None] == 0) | (kv_seg_chunk[:, None, :] == 0)
+
+        # Final mask: mask if segments mismatch OR if either is padding (segment 0)
+        segment_ids_mask = segment_mismatch_mask | q_or_kv_is_zero
+
         segment_ids_mask = segment_ids_mask[:, None]
         segment_ids_bias = segment_ids_mask * jnp.finfo(dtype).min
-        chunk_bias = jnp.minimum(chunk_bias, segment_ids_bias)
+        # Add segment masking bias to existing bias (additive, not minimum)
+        # This way, valid positions keep their bias value, masked positions become -inf
+        chunk_bias = chunk_bias + segment_ids_bias
 
     if causal_block_size is not None:
         query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
@@ -94,7 +110,8 @@ def _chunk_attention_bias(
         query_idx //= causal_block_size
         key_idx //= causal_block_size
         causal_mask_value = (query_idx < key_idx) * jnp.finfo(dtype).min
-        chunk_bias = jnp.minimum(chunk_bias, causal_mask_value.reshape(1, 1, *causal_mask_value.shape))
+        # Add causal masking bias (additive, not minimum)
+        chunk_bias = chunk_bias + causal_mask_value.reshape(1, 1, *causal_mask_value.shape)
 
     if sliding_window is not None:
         query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
@@ -115,7 +132,8 @@ def _chunk_attention_bias(
             window_mask = window_mask | sink_mask
 
         window_mask_value = (~window_mask) * jnp.finfo(dtype).min
-        chunk_bias = jnp.minimum(chunk_bias, window_mask_value.reshape(1, 1, *window_mask_value.shape))
+        # Add sliding window masking bias (additive, not minimum)
+        chunk_bias = chunk_bias + window_mask_value.reshape(1, 1, *window_mask_value.shape)
 
     if not deterministic and pdrop > 0.0:
         attn_dropout_slice = lax.dynamic_slice(

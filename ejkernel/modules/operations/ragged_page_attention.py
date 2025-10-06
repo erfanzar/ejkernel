@@ -20,7 +20,7 @@ from __future__ import annotations
 from typing import Literal
 
 from jax import numpy as jnp
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, DTypeLike, Float, Int
 
 from ejkernel.kernels._registry import kernel_registry
 from ejkernel.ops import Invocation, Kernel
@@ -57,7 +57,7 @@ class RaggedPageAttention(Kernel[KernelConfig, Array]):
         cfg: KernelConfig,
         softmax_scale: float | None = None,
         logit_soft_cap: float | None = None,
-        compute_dtype: jnp.dtype = jnp.bfloat16,
+        compute_dtype: DTypeLike = jnp.bfloat16,
         optimized: bool = False,
         sliding_window: int | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
@@ -146,7 +146,7 @@ def ragged_page_attention(
     num_seqs: Array | int,
     softmax_scale: float | None = None,
     logit_soft_cap: float | None = None,
-    compute_dtype: jnp.dtype = jnp.bfloat16,
+    compute_dtype: DTypeLike = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,

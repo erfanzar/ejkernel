@@ -18,6 +18,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from jax import jit, vmap
+from jaxtyping import DTypeLike
 
 
 @partial(jit, static_argnames=["chunk_size", "reverse", "head_first"])
@@ -27,7 +28,7 @@ def chunk_local_cumsum_scalar(
     reverse: bool = False,
     scale: float | None = None,
     head_first: bool = False,
-    output_dtype: jnp.dtype | None = None,
+    output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
     if head_first:
         B, H, T = g.shape
@@ -67,7 +68,7 @@ def chunk_local_cumsum_vector(
     reverse: bool = False,
     scale: float | None = None,
     head_first: bool = False,
-    output_dtype: jnp.dtype | None = None,
+    output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
     if head_first:
         B, H, T, _S = g.shape
@@ -107,7 +108,7 @@ def chunk_global_cumsum_scalar(
     cu_seqlens: jnp.ndarray | None = None,
     scale: float | None = None,
     head_first: bool = False,
-    output_dtype: jnp.dtype | None = None,
+    output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
     output_dtype = output_dtype or s.dtype
     time_axis = 2 if head_first else 1
@@ -128,7 +129,8 @@ def chunk_global_cumsum_scalar(
         zero_pad_shape = list(correction_values.shape)
         zero_pad_shape[time_axis] = 1
         full_correction_map = jnp.concatenate(
-            [jnp.zeros(zero_pad_shape, dtype=result.dtype), correction_values], axis=time_axis
+            [jnp.zeros(zero_pad_shape, dtype=result.dtype), correction_values],
+            axis=time_axis,
         )
 
         total_len = s.shape[time_axis]
@@ -157,7 +159,7 @@ def chunk_global_cumsum_vector(
     cu_seqlens: jnp.ndarray | None = None,
     scale: float | None = None,
     head_first: bool = False,
-    output_dtype: jnp.dtype | None = None,
+    output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
     """
     Perform global cumulative sum for vector values, with explicit support for cu_seqlens.
@@ -183,7 +185,8 @@ def chunk_global_cumsum_vector(
         zero_pad_shape = list(correction_values.shape)
         zero_pad_shape[time_axis] = 1
         full_correction_map = jnp.concatenate(
-            [jnp.zeros(zero_pad_shape, dtype=result.dtype), correction_values], axis=time_axis
+            [jnp.zeros(zero_pad_shape, dtype=result.dtype), correction_values],
+            axis=time_axis,
         )
 
         total_len = s.shape[time_axis]
@@ -205,7 +208,17 @@ def chunk_global_cumsum_vector(
     return result.astype(output_dtype)
 
 
-@partial(jit, static_argnames=["chunk_size", "reverse", "scale", "head_first", "output_dtype", "is_vector"])
+@partial(
+    jit,
+    static_argnames=[
+        "chunk_size",
+        "reverse",
+        "scale",
+        "head_first",
+        "output_dtype",
+        "is_vector",
+    ],
+)
 def _chunk_local_cumsum_vmap_core(
     g_padded_batched: jnp.ndarray,
     mask: jnp.ndarray,
@@ -213,7 +226,7 @@ def _chunk_local_cumsum_vmap_core(
     reverse: bool,
     scale: float | None,
     head_first: bool,
-    output_dtype: jnp.dtype | None,
+    output_dtype: DTypeLike | None,
     is_vector: bool,
 ):
     base_fn = chunk_local_cumsum_vector if is_vector else chunk_local_cumsum_scalar
@@ -229,7 +242,7 @@ def chunk_local_cumsum(
     scale: float | None = None,
     cu_seqlens: jnp.ndarray | None = None,
     head_first: bool = False,
-    output_dtype: jnp.dtype | None = None,
+    output_dtype: DTypeLike | None = None,
     **kwargs,
 ) -> jnp.ndarray:
     is_vector = g.ndim == 4
@@ -275,7 +288,7 @@ def chunk_global_cumsum(
     cu_seqlens: jnp.ndarray | None = None,
     scale: float | None = None,
     head_first: bool = False,
-    output_dtype: jnp.dtype | None = None,
+    output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
     is_vector = s.ndim == 4
     if is_vector:

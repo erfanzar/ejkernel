@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, DTypeLike, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
 
@@ -28,7 +28,7 @@ def grouped_matmul(
     lhs: Float[Array, "m k"],
     rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
     group_sizes: Int[Array, "num_groups"],
-    preferred_element_type: jnp.dtype = jnp.float32,
+    preferred_element_type: DTypeLike = jnp.float32,
     tiling: tuple[int, int, int] | None = (128, 128, 128),
     group_offset: Int[Array, "1"] | None = None,
     existing_out: Float[Array, "m n"] | None = None,
