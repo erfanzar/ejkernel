@@ -32,6 +32,7 @@ All implementations support:
 - Automatic kernel tuning for optimal performance
 """
 
+from .blocksparse_attention import blocksparse_attention
 from .flash_attention import flash_attention
 from .gla import recurrent_gla
 from .lightning_attn import lightning_attn
@@ -43,6 +44,7 @@ from .recurrent import recurrent
 
 __all__ = (
     "apply_native_sparse_attention",
+    "blocksparse_attention",
     "flash_attention",
     "lightning_attn",
     "mean_pooling",

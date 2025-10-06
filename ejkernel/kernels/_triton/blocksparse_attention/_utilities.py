@@ -14,7 +14,6 @@
 
 
 import math
-from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -24,257 +23,6 @@ from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.callib import ejit
 from ejkernel.utils import get_strides
-
-
-def generate_blocksparse_layout(
-    seq_len: int,
-    num_heads: int,
-    block_size: int,
-    local_blocks: int = 4,
-    vert_stride: int = 0,
-    homo_head: bool = True,
-    causal: bool = False,
-    sliding_window: int | tuple[int, int] | None = None,
-    return_dense: bool = False,
-    dtype: jnp.dtype = jnp.bool_,
-) -> Bool[Array, "num_heads num_blocks_q num_blocks_k"] | Bool[Array, "num_blocks_q num_blocks_k"]:
-    """Generate block-sparse attention pattern.
-
-    Creates a block-level sparsity mask for attention computation, supporting
-    local attention windows, sliding windows, causal masking, and vertical stride patterns.
-
-    Args:
-        seq_len: Sequence length (must be divisible by block_size)
-        num_heads: Number of attention heads
-        block_size: Size of each attention block
-        local_blocks: Number of nearest blocks to attend to (local attention window)
-        vert_stride: Vertical stride for additional block connections
-        homo_head: Whether all heads share the same pattern (homogeneous)
-        causal: Whether to apply causal masking (attend only to past)
-        sliding_window: Sliding window size in tokens. Can be:
-            - int: Symmetric window (same left and right)
-            - tuple[int, int]: Asymmetric (left_window, right_window) in tokens
-            - None: Use local_blocks instead
-        return_dense: Return dense mask instead of sparse indices
-        dtype: Data type for the mask array
-
-    Returns:
-        Block-sparse attention pattern as boolean mask array
-    """
-    assert seq_len % block_size == 0, f"seq_len {seq_len} must be divisible by block_size {block_size}"
-
-    num_blocks = seq_len // block_size
-
-    # Create base pattern
-    pattern = jnp.zeros((num_blocks, num_blocks), dtype=dtype)
-
-    # Handle sliding window
-    if sliding_window is not None:
-        if isinstance(sliding_window, int):
-            # Convert token-level window to block-level
-            # Add block_size - 1 to ensure we include partial blocks
-            left_window_blocks = (sliding_window + block_size - 1) // block_size
-            right_window_blocks = (sliding_window + block_size - 1) // block_size
-        else:
-            # Asymmetric window
-            left_window, right_window = sliding_window
-            left_window_blocks = (left_window + block_size - 1) // block_size
-            right_window_blocks = (right_window + block_size - 1) // block_size
-
-        # Apply sliding window pattern
-        for i in range(num_blocks):
-            # Determine window bounds
-            start = max(0, i - left_window_blocks)
-            end = min(num_blocks, i + right_window_blocks + 1)
-
-            # Apply causal constraint if needed
-            if causal:
-                end = min(end, i + 1)
-
-            pattern = pattern.at[i, start:end].set(True)
-    else:
-        # Use local_blocks pattern
-        for i in range(num_blocks):
-            if causal:
-                # Causal: only attend to previous and current blocks
-                start = max(0, i - local_blocks + 1)
-                end = min(num_blocks, i + 1)
-            else:
-                # Non-causal: attend to surrounding blocks
-                start = max(0, i - local_blocks // 2)
-                end = min(num_blocks, i + local_blocks // 2 + 1)
-            pattern = pattern.at[i, start:end].set(True)
-
-    # Add vertical stride connections if specified
-    if vert_stride > 0:
-        for i in range(num_blocks):
-            if causal:
-                # Only add connections to previous positions
-                for j in range(0, i, vert_stride):
-                    pattern = pattern.at[i, j].set(True)
-            else:
-                # Add connections in both directions
-                for j in range(0, num_blocks, vert_stride):
-                    if j != i:  # Don't duplicate diagonal
-                        pattern = pattern.at[i, j].set(True)
-
-    # Handle heterogeneous vs homogeneous heads
-    if homo_head or num_heads == 1:
-        return pattern
-    else:
-        # For heterogeneous heads, can create different patterns per head
-        # For now, replicate the same pattern
-        return jnp.broadcast_to(pattern[None, :, :], (num_heads, num_blocks, num_blocks))
-
-
-def compute_crow_indices(
-    layout: Bool[Array, "num_blocks_q num_blocks_k"],
-    dtype: jnp.dtype = jnp.int32,
-) -> tuple[Int[Array, "num_blocks_q + 1"], Int[Array, "nnz"]]:
-    """Convert block sparse layout to Compressed Row Storage (CSR) format.
-
-    Used for efficient forward pass traversal of sparse blocks.
-
-    Args:
-        layout: Boolean mask indicating which blocks are active
-        dtype: Integer dtype for indices
-
-    Returns:
-        tuple: (crow_ptr, col_indices) for CSR representation
-            - crow_ptr: Row pointers of shape [num_blocks_q + 1]
-            - col_indices: Column indices of shape [nnz]
-    """
-    num_blocks_q, num_blocks_k = layout.shape
-
-    # Count non-zero blocks per row
-    row_counts = jnp.sum(layout, axis=1, dtype=dtype)
-
-    # Compute row pointers (cumulative sum)
-    crow_ptr = jnp.zeros(num_blocks_q + 1, dtype=dtype)
-    crow_ptr = crow_ptr.at[1:].set(jnp.cumsum(row_counts))
-
-    # Extract column indices for non-zero blocks
-    row_indices, col_indices = jnp.nonzero(layout)
-
-    return crow_ptr, col_indices.astype(dtype)
-
-
-def compute_ccol_indices(
-    layout: Bool[Array, "num_blocks_q num_blocks_k"],
-    dtype: jnp.dtype = jnp.int32,
-) -> tuple[Int[Array, "num_blocks_k + 1"], Int[Array, "nnz"]]:
-    """Convert block sparse layout to Compressed Column Storage (CSC) format.
-
-    Used for efficient backward pass traversal of sparse blocks.
-
-    Args:
-        layout: Boolean mask indicating which blocks are active
-        dtype: Integer dtype for indices
-
-    Returns:
-        tuple: (ccol_ptr, row_indices) for CSC representation
-            - ccol_ptr: Column pointers of shape [num_blocks_k + 1]
-            - row_indices: Row indices of shape [nnz]
-    """
-    # Transpose for column-wise processing
-    layout_t = layout.T
-    num_blocks_k, num_blocks_q = layout_t.shape
-
-    # Count non-zero blocks per column
-    col_counts = jnp.sum(layout_t, axis=1, dtype=dtype)
-
-    # Compute column pointers
-    ccol_ptr = jnp.zeros(num_blocks_k + 1, dtype=dtype)
-    ccol_ptr = ccol_ptr.at[1:].set(jnp.cumsum(col_counts))
-
-    # Extract row indices for non-zero blocks
-    col_indices, row_indices = jnp.nonzero(layout_t)
-
-    return ccol_ptr, row_indices.astype(dtype)
-
-
-def create_blocksparse_metadata(
-    seq_len_q: int,
-    seq_len_k: int,
-    num_heads: int,
-    block_m: int,
-    block_n: int,
-    local_blocks: int = 4,
-    vert_stride: int = 0,
-    homo_head: bool = True,
-    causal: bool = False,
-    sliding_window: int | tuple[int, int] | None = None,
-) -> dict:
-    """Create metadata for blocksparse attention computation.
-
-    Generates all necessary indices and pointers for efficient sparse
-    attention computation in both forward and backward passes.
-
-    Args:
-        seq_len_q: Query sequence length
-        seq_len_k: Key sequence length
-        num_heads: Number of attention heads
-        block_m: Block size for queries
-        block_n: Block size for keys
-        local_blocks: Number of local attention blocks
-        vert_stride: Vertical stride for sparse pattern
-        homo_head: Whether heads share the same pattern
-        causal: Whether to apply causal masking
-        sliding_window: Sliding window size (in tokens) or tuple of (left, right)
-
-    Returns:
-        dict: Metadata containing layout, crow/ccol indices, and config
-    """
-    # For now, assume seq_len_q == seq_len_k for simplicity
-    assert seq_len_q == seq_len_k, "Different Q/K lengths not yet supported"
-    assert seq_len_q % block_m == 0, f"seq_len_q {seq_len_q} must be divisible by block_m {block_m}"
-    assert seq_len_k % block_n == 0, f"seq_len_k {seq_len_k} must be divisible by block_n {block_n}"
-
-    # Generate sparse layout
-    layout = generate_blocksparse_layout(
-        seq_len=seq_len_q,
-        num_heads=num_heads if not homo_head else 1,
-        block_size=block_m,  # Assuming square blocks for now
-        local_blocks=local_blocks,
-        vert_stride=vert_stride,
-        homo_head=homo_head,
-        causal=causal,
-        sliding_window=sliding_window,
-    )
-
-    # Compute compression indices
-    if layout.ndim == 2:
-        crow_ptr, col_indices = compute_crow_indices(layout)
-        ccol_ptr, row_indices = compute_ccol_indices(layout)
-    else:
-        # Handle per-head patterns
-        crow_ptrs, col_indices_list = [], []
-        ccol_ptrs, row_indices_list = [], []
-        for h in range(num_heads):
-            crow, cols = compute_crow_indices(layout[h])
-            ccol, rows = compute_ccol_indices(layout[h])
-            crow_ptrs.append(crow)
-            col_indices_list.append(cols)
-            ccol_ptrs.append(ccol)
-            row_indices_list.append(rows)
-
-        crow_ptr = jnp.stack(crow_ptrs)
-        col_indices = jnp.stack(col_indices_list)
-        ccol_ptr = jnp.stack(ccol_ptrs)
-        row_indices = jnp.stack(row_indices_list)
-
-    return {
-        "layout": layout,
-        "crow_ptr": crow_ptr,
-        "col_indices": col_indices,
-        "ccol_ptr": ccol_ptr,
-        "row_indices": row_indices,
-        "num_blocks_q": seq_len_q // block_m,
-        "num_blocks_k": seq_len_k // block_n,
-        "block_m": block_m,
-        "block_n": block_n,
-        "nnz": jnp.sum(layout),
-    }
 
 
 @triton.jit
@@ -327,3 +75,285 @@ def padded_load(
         else:
             x = tl.load(ptrs)
     return x
+
+
+def calc_bias_strides(
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None,
+    batch: int,
+    nheads_q: int,
+    QSeq: int,
+    KSeq: int,
+) -> tuple[int, int, int]:
+    """Calculate memory strides for bias tensor with broadcasting support.
+
+    Validates bias tensor dimensions and computes appropriate strides
+    for batch and head dimensions, supporting broadcasting when dimensions are 1.
+
+    Args:
+        bias: Optional bias tensor with shape [batch, heads, QSeq, KSeq]
+        batch: Expected batch size
+        nheads_q: Number of query attention heads
+        QSeq: Query sequence length
+        KSeq: Key sequence length
+
+    Returns:
+        tuple: (stride_bz, stride_bh, stride_bm, stride_bn) memory strides
+
+    Raises:
+        ValueError: If bias dimensions are incompatible with expected shapes
+    """
+    if bias is not None:
+        if not hasattr(bias, "strides"):
+            strides = tuple(map(lambda x: x * bias.itemsize, get_strides(bias)))
+        else:
+            strides = bias.strides
+        if bias.shape[2] != QSeq or bias.shape[3] != KSeq:
+            raise ValueError(
+                f"Bias tensor has incompatible sequence dimensions. "
+                f"Expected shape [..., {QSeq}, {KSeq}], but got [..., {bias.shape[2]}, {bias.shape[3]}]. "
+                f"Full bias shape: {bias.shape}"
+            )
+        if bias.shape[0] == 1:
+            stride_bz = 0
+        elif bias.shape[0] == batch:
+            stride_bz = strides[0] // bias.itemsize
+        else:
+            raise ValueError(
+                f"Batch dimension mismatch in bias tensor. "
+                f"Expected either 1 (for broadcasting) or {batch} (batch size), "
+                f"but got {bias.shape[0]}. Consider reshaping your bias tensor."
+            )
+        if bias.shape[1] == 1:
+            stride_bh = 0
+        elif bias.shape[1] == nheads_q:
+            stride_bh = strides[1] // bias.itemsize
+        else:
+            raise ValueError(
+                f"Head dimension mismatch in bias tensor. "
+                f"Expected either 1 (for broadcasting) or {nheads_q} (number of heads), "
+                f"but got {bias.shape[1]}. Check that your bias tensor matches the model configuration."
+            )
+
+        stride_bm = strides[2] // bias.itemsize
+    else:
+        stride_bz, stride_bh, stride_bm = 0, 0, 0
+    return stride_bz, stride_bh, stride_bm
+
+
+@ejit(static_argnames=["max_tokens"])
+def attention_pack_with_static_shape(
+    x: Float[Array, "batch seq_len num_heads head_dim"],
+    attention_mask: Bool[Array, "batch seq_len"],
+    max_tokens: int | None = None,
+) -> Float[Array, "1 max_tokens num_heads head_dim"]:
+    """
+    Pack attention tensor by removing padding based on attention mask.
+    Uses a static maximum shape to be compatible with JIT.
+    """
+    batch_size, seqlen = attention_mask.shape
+    num_heads, head_dim = x.shape[2], x.shape[3]
+
+    if max_tokens is None:
+        max_tokens = batch_size * seqlen
+
+    seqlens = jnp.sum(attention_mask, axis=1).astype(jnp.int32)
+    offsets = jnp.zeros((batch_size,), dtype=jnp.int32)
+    offsets = offsets.at[1:].set(jnp.cumsum(seqlens[:-1]))
+    packed = jnp.zeros((1, max_tokens, num_heads, head_dim), dtype=x.dtype)
+    batch_idx, pos_idx = jnp.meshgrid(jnp.arange(batch_size), jnp.arange(seqlen), indexing="ij")
+
+    batch_idx_flat = batch_idx.reshape(-1)
+    pos_idx_flat = pos_idx.reshape(-1)
+
+    valid_mask = pos_idx < seqlens[:, None]
+    target_idx = jnp.where(
+        valid_mask,
+        offsets[:, None] + pos_idx,
+        jnp.zeros_like(pos_idx),
+    )
+    target_idx_flat = target_idx.reshape(-1)
+    valid_mask_flat = valid_mask.reshape(-1)
+
+    def process_token(i, packed_acc):
+        b = batch_idx_flat[i]
+        p = pos_idx_flat[i]
+        t = target_idx_flat[i]
+        valid = valid_mask_flat[i]
+        packed_acc = jnp.where(valid, packed_acc.at[0, t].set(x[b, p]), packed_acc)
+
+        return packed_acc
+
+    packed = jax.lax.fori_loop(0, batch_size * seqlen, process_token, packed)
+    return packed
+
+
+def basic_attention_refrence(
+    q: Float[Array, "batch seq_len_q num_heads head_dim"],
+    k: Float[Array, "batch seq_len_k num_heads_kv head_dim"],
+    v: Float[Array, "batch seq_len_k num_heads_kv head_dim"],
+    attn_bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    query_padding_mask: Bool[Array, "batch seq_len_q"] | None = None,
+    key_padding_mask: Bool[Array, "batch seq_len_k"] | None = None,
+    dropout_prob: float = 0.0,
+    dropout_key: jax.Array | None = None,
+    window_size: tuple[int, int] = (-1, -1),
+    causal: bool = False,
+    softcap: float = 0.0,
+) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+    """Reference implementation of attention for testing and validation.
+
+    Provides a standard JAX implementation of scaled dot-product attention
+    with support for various masking options, useful for validating the
+    optimized Triton kernels.
+
+    Args:
+        q: Query tensor [batch, seq_len, num_heads, head_dim]
+        k: Key tensor [batch, seq_len_k, num_heads_kv, head_dim]
+        v: Value tensor [batch, seq_len_k, num_heads_kv, head_dim]
+        attn_bias: Optional attention bias tensor
+        query_padding_mask: Boolean mask for query positions
+        key_padding_mask: Boolean mask for key positions
+        dropout_prob: Dropout probability for attention weights
+        dropout_key: JAX random key for dropout
+        window_size: Local attention window (left, right)
+        causal: Whether to apply causal masking
+        softcap: Soft capping value for attention scores
+
+    Returns:
+        jnp.ndarray: Attention output with same shape as queries
+    """
+    if causal:
+        window_size = (window_size[0], 0)
+    dtype_og = q.dtype
+    q, k, v = q.astype(jnp.float32), k.astype(jnp.float32), v.astype(jnp.float32)
+    QSeq, KSeq = q.shape[1], k.shape[1]
+    repeats = q.shape[2] // k.shape[2]
+    if repeats > 1:
+        k = jnp.repeat(k, repeats=repeats, axis=2)
+        v = jnp.repeat(v, repeats=repeats, axis=2)
+    d = q.shape[-1]
+    q_scaled = q / math.sqrt(d)
+    scores = jnp.einsum("bthd,bshd->bhts", q_scaled, k)
+    if softcap is not None and softcap > 0:
+        scores = scores / softcap
+        scores = jnp.tanh(scores)
+        scores = scores * softcap
+    if key_padding_mask is not None:
+        key_mask = (~key_padding_mask).reshape(key_padding_mask.shape[0], 1, 1, KSeq)
+        scores = jnp.where(key_mask, jnp.finfo(scores.dtype).min, scores)
+    if window_size is not None and (window_size[0] >= 0 or window_size[1] >= 0):
+        row_idx = jnp.arange(QSeq).reshape(-1, 1)
+        col_idx = jnp.arange(KSeq)
+        if key_padding_mask is None:
+            sk = KSeq
+        else:
+            sk = jnp.sum(key_padding_mask, axis=-1).reshape(-1, 1, 1, 1, 1)
+        if query_padding_mask is None:
+            sq = QSeq
+        else:
+            sq = jnp.sum(query_padding_mask, axis=-1).reshape(-1, 1, 1, 1, 1)
+        if window_size[0] < 0:
+            local_mask = col_idx > row_idx + sk - sq + window_size[1]
+        else:
+            if key_padding_mask is None:
+                sk_full = jnp.full_like(col_idx, KSeq)
+            else:
+                sk_full = sk
+            local_mask = jnp.logical_or(
+                col_idx > jnp.minimum(row_idx + sk - sq + window_size[1], sk_full),
+                col_idx < row_idx + sk - sq - window_size[0],
+            )
+        scores = jnp.where(local_mask, jnp.finfo(scores.dtype).min, scores)
+    if attn_bias is not None:
+        scores = scores + attn_bias
+    attention = jax.nn.softmax(scores, axis=-1).astype(v.dtype)
+    if window_size is not None and (window_size[0] >= 0 or window_size[1] >= 0):
+        all_masked = jnp.all(local_mask, axis=-1, keepdims=True)
+        attention = jnp.where(all_masked, 0.0, attention)
+    if query_padding_mask is not None:
+        query_mask = (~query_padding_mask).reshape(query_padding_mask.shape[0], 1, QSeq, 1)
+        attention = jnp.where(query_mask, 0.0, attention)
+    dropout_scaling = 1.0 / (1 - dropout_prob)
+    if dropout_prob > 0 and dropout_key is not None:
+        dropout_mask = jax.random.bernoulli(dropout_key, p=1 - dropout_prob, shape=attention.shape)
+        attention_drop = attention * dropout_mask * dropout_scaling
+    else:
+        attention_drop = attention
+    output = jnp.einsum("bhts,bshd->bthd", attention_drop, v)
+    if query_padding_mask is not None:
+        query_mask_expanded = (~query_padding_mask).reshape(
+            query_padding_mask.shape[0],
+            QSeq,
+            1,
+            1,
+        )
+        output = jnp.where(query_mask_expanded, 0.0, output)
+    return output.astype(dtype_og)
+
+
+@ejit(static_argnames=["max_tokens"])
+def attention_pack_from_cu_static(
+    x: Float[Array, "batch seq_max num_heads head_dim"],  # [B, S_max, H, D]
+    cum_seqlens: Int[Array, "batch_plus_one"],  # int32 [B+1]
+    max_tokens: int | None = None,
+) -> Float[Array, "1 max_tokens num_heads head_dim"]:
+    """
+    Packs variable-length batch using cum_seqlens into a single [1, T, H, D] tensor.
+    T can be any static upper bound (e.g., B*S_max). Only the first cum_seqlens[-1]
+    tokens will be written; the rest stay zero.
+    """
+    B, S_max, H, D = x.shape
+    if max_tokens is None:
+        # Static upper bound; using B*S_max is fine if you want a single compiled shape.
+        max_tokens = B * S_max
+
+    out = jnp.zeros((1, max_tokens, H, D), dtype=x.dtype)
+
+    def body_b(b, out_acc):
+        start = cum_seqlens[b]
+        end = cum_seqlens[b + 1]
+        L = end - start
+
+        def body_p(p, acc):
+            valid = p < L
+            dst = start + p
+            acc = jnp.where(valid, acc.at[0, dst].set(x[b, p]), acc)
+            return acc
+
+        out_acc = jax.lax.fori_loop(0, S_max, body_p, out_acc)
+        return out_acc
+
+    out = jax.lax.fori_loop(0, B, body_b, out)
+    return out
+
+
+@ejit(static_argnames=["seqlen", "batch_size"])
+def attention_unpack_with_static_shape(
+    x: Float[Array, "1 max_tokens num_heads head_dim"],  # [1, T, H, D] (T >= cum_seqlens[-1])
+    cum_seqlens: Int[Array, "batch_plus_one"],  # int32 [B+1]
+    batch_size: int,
+    seqlen: int,
+) -> Float[Array, "batch seqlen num_heads head_dim"]:
+    """
+    Unpack back into [B, seqlen, H, D] using cum_seqlens. The 'seqlen' is a static
+    padded max length; tokens past end are left as zeros.
+    """
+    H, D = x.shape[2], x.shape[3]
+    out = jnp.zeros((batch_size, seqlen, H, D), dtype=x.dtype)
+
+    def body_b(b, out_acc):
+        start = cum_seqlens[b]
+        end = cum_seqlens[b + 1]
+        L = end - start
+
+        def body_p(p, acc):
+            valid = p < L
+            src = start + p
+            acc = jnp.where(valid, acc.at[b, p].set(x[0, src]), acc)
+            return acc
+
+        out_acc = jax.lax.fori_loop(0, seqlen, body_p, out_acc)
+        return out_acc
+
+    out = jax.lax.fori_loop(0, batch_size, body_b, out)
+    return out

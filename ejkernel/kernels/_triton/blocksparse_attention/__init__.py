@@ -19,19 +19,6 @@ custom JAX gradients and Triton acceleration. Supports various sparsity
 patterns including local attention and vertical stride patterns.
 """
 
-from ._interface import blocksparse_attention, blocksparse_attention_call
-from ._utilities import (
-    compute_ccol_indices,
-    compute_crow_indices,
-    create_blocksparse_metadata,
-    generate_blocksparse_layout,
-)
+from ._interface import blocksparse_attention
 
-__all__ = [
-    "blocksparse_attention",
-    "blocksparse_attention_call",
-    "generate_blocksparse_layout",
-    "create_blocksparse_metadata",
-    "compute_crow_indices",
-    "compute_ccol_indices",
-]
+__all__ = ["blocksparse_attention"]

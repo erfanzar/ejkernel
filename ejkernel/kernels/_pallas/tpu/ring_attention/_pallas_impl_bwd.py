@@ -316,9 +316,7 @@ def _flash_attention_dkv_kernel(
             )  # [block_q_major, block_k]
 
             if ab_tile_ref is not None:
-                ab = ab_tile_ref[
-                    (0, pl.dslice(0, block_q), pl.dslice(i * block_k, block_k))
-                ].astype(jnp.float32)
+                ab = ab_tile_ref[(0, pl.dslice(0, block_q), pl.dslice(i * block_k, block_k))].astype(jnp.float32)
                 capped_logits += ab
 
             if softmax_scale != 1.0:
@@ -339,9 +337,7 @@ def _flash_attention_dkv_kernel(
                     (0, pl.ds(start_q, block_q), slice(None))
                 ]  # [block_q, NUM_LANES].
                 q_segment_ids = pltpu.repeat(q_segment_ids, repeats, axis=1)  # [block_q, block_k].
-                kv_segment_ids = kv_segment_ids_tile_ref[
-                    (slice(None), 0, pl.ds(start_k, block_k))
-                ]  # [1, block_k].
+                kv_segment_ids = kv_segment_ids_tile_ref[(slice(None), 0, pl.ds(start_k, block_k))]  # [1, block_k].
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal_block_size is not None:
@@ -384,9 +380,9 @@ def _flash_attention_dkv_kernel(
             p = jnp.exp(capped_logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))
             p = p * pltpu.repeat(1 / lse_, block_k // MIN_BLOCK_SIZE, axis=1)  # [block_q_major, block_k_major]
             dv = lax.dot(p.T.astype(do.dtype), do, preferred_element_type=jnp.float32)
-            dv_scratch_ref[(pl.ds(start_k, block_k), slice(None))] = (
-                dv_scratch_ref[(pl.ds(start_k, block_k), slice(None))] + dv.astype(dv_scratch_ref.dtype)
-            )
+            dv_scratch_ref[(pl.ds(start_k, block_k), slice(None))] = dv_scratch_ref[
+                (pl.ds(start_k, block_k), slice(None))
+            ] + dv.astype(dv_scratch_ref.dtype)
 
             # di: [block_q, 128]
             # do: [block_q, head_dim]
@@ -400,9 +396,9 @@ def _flash_attention_dkv_kernel(
             # ds: [block_q_major, block_k_major]
             # q: [block_q_major, head_dim]
             dk = lax.dot(ds.T.astype(do.dtype), q, preferred_element_type=jnp.float32)
-            dk_scratch_ref[(pl.ds(start_k, block_k), slice(None))] = (
-                dk_scratch_ref[(pl.ds(start_k, block_k), slice(None))] + dk.astype(dk_scratch_ref.dtype)
-            )
+            dk_scratch_ref[(pl.ds(start_k, block_k), slice(None))] = dk_scratch_ref[
+                (pl.ds(start_k, block_k), slice(None))
+            ] + dk.astype(dk_scratch_ref.dtype)
 
         lax.fori_loop(0, block_k_major // block_k, k_body, None, unroll=True)
 
@@ -716,9 +712,7 @@ def _flash_attention_dq_kernel(
         capped_logits = jax.lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
         if ab_tile_ref is not None:
-            ab = ab_tile_ref[
-                (0, pl.dslice(0, block_q_major), pl.dslice(i * block_k, block_k))
-            ].astype(jnp.float32)
+            ab = ab_tile_ref[(0, pl.dslice(0, block_q_major), pl.dslice(i * block_k, block_k))].astype(jnp.float32)
             capped_logits += ab
 
         if softmax_scale != 1.0:

@@ -20,12 +20,12 @@ from .gla import GLAttention, gla_attention
 from .lightning import LightningAttention, lightning_attention
 from .matmul import GroupedMatmul, grouped_matmul
 from .mla import FlashMLA, mla_attention
+from .native_sparse_attention import NativeSparseAttention, sparse_attention
 from .page_attention import PageAttention, page_attention
 from .pooling import MeanPooling, mean_pooling
 from .ragged_page_attention import RaggedPageAttention, ragged_page_attention
 from .recurrent import RecurrentAttention, recurrent_attention
 from .ring import RingAttention, ring_attention
-from .sparse import NativeSparseAttention, sparse_attention
 
 __all__ = (
     "Attention",

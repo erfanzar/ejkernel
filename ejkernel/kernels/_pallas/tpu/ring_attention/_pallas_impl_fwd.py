@@ -421,9 +421,7 @@ def _flash_attention_kernel_single_batch(
 
             # Add attention bias if needed.
             if ab_tile_ref is not None:
-                ab = ab_tile_ref[
-                    (batch_idx[0], pl.dslice(0, block_q), pl.dslice(start_k, block_k))
-                ].astype(s.dtype)
+                ab = ab_tile_ref[(batch_idx[0], pl.dslice(0, block_q), pl.dslice(start_k, block_k))].astype(s.dtype)
                 s += ab
 
             if softmax_scale != 1.0:
@@ -445,9 +443,7 @@ def _flash_attention_kernel_single_batch(
                     repeats,
                     axis=1,
                 )
-                kv_segment_ids = kv_segment_ids_tile_ref[
-                    (batch_idx[0], pl.dslice(1), pl.dslice(start_k, block_k))
-                ]
+                kv_segment_ids = kv_segment_ids_tile_ref[(batch_idx[0], pl.dslice(1), pl.dslice(start_k, block_k))]
                 mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 
             if causal_block_size is not None:

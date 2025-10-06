@@ -124,10 +124,10 @@ def _attn_fwd_inner(
                 other=0.0,
             )
 
-    qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.bfloat16)
     # Compute QK in float32 when sinks are used for better precision with large sink values
     if USE_SINKS:
-        qk += tl.dot(q.to(tl.float32), tl.trans(k.to(tl.float32)))
+        qk += tl.dot(q.to(tl.bfloat16), tl.trans(k.to(tl.bfloat16)))
     else:
         qk += tl.dot(q, tl.trans(k))
 
@@ -178,7 +178,7 @@ def _attn_fwd_inner(
         # Load sink logits: [num_sinks] per head (raw, natural units)
         sink_offs = tl.arange(0, 16)  # supports up to 16 sinks
         sink_mask = sink_offs < num_sinks
-        aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf")).to(tl.float32)
+        aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf")).to(tl.bfloat16)
 
         # Apply soft cap (in natural units) if enabled
         if SOFTCAP:
@@ -231,12 +231,11 @@ def _attn_fwd_inner(
         LA1=headdim,
     )
 
-    v_f32 = v.to(tl.float32)
-    acc_o += tl.dot(P_ij, v_f32)
+    acc_o += tl.dot(P_ij.to(tl.bfloat16), v.to(tl.bfloat16))
     m_i = m_ij
     l_i_new = tl.exp2(me_i - m_ij) + l_ij
     me_i = m_ij + tl.log2(l_i_new)
-    return m_i, me_i, acc_o
+    return m_i, me_i, acc_o.to(tl.bfloat16)
 
 
 @triton.autotune(
@@ -460,7 +459,7 @@ def _attn_fwd(
 
     me_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+    acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.bfloat16)
 
     pad_rows = (not EVEN_M) or (VARLEN and (i_start_m * BLOCK_M > actual_seqlen_q))
     q = padded_load(q_ptrs, offs_m, offs_d, PA0=pad_rows, PA1=PADDED_HEADS, LA0=actual_seqlen_q, LA1=headdim)

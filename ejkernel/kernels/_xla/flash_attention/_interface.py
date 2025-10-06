@@ -20,6 +20,8 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
+from ejkernel.callib._ejit import ejit
+
 from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_bwd import _flash_attention_bwd
 from ._xla_impl_fwd import _flash_attention_fwd
@@ -239,6 +241,22 @@ _flash_attention_core.defvjp(_flash_attention_core_fwd, _flash_attention_core_bw
 
 
 @kernel_registry.register("flash_attention", Platform.XLA, Backend.ANY)
+@ejit(
+    static_argnames=[
+        "softmax_scale",
+        "dropout_prob",
+        "causal",
+        "dropout_seed",
+        "sliding_window",
+        "chunk_size_q",
+        "chunk_size_k",
+        "logits_soft_cap",
+        "normalize_output",
+        "debug",
+        "logits_dtype",
+        "precision",
+    ]
+)
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],

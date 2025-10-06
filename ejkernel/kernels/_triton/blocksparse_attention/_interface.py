@@ -1,19 +1,5 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 import functools
+import math
 
 import jax
 from jax import lax
@@ -23,342 +9,293 @@ from jaxtyping import Array, Bool, Float, Int
 from ejkernel.callib import ejit
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._triton_impl_bwd import _bwd_attention_kernel_call
-from ._triton_impl_fwd import _fwd_attention_kernel_call
-from ._utilities import compute_crow_indices
+from ._triton_impl_bwd import _blocksparse_bwd_attention_kernel_call
+from ._triton_impl_fwd import _blocksparse_fwd_attention_kernel_call
 
 
-def _jax_fwd_blocksparse_attention_call(
+def _transpose_layout_q2k_to_k2q(layout_q2k: jnp.ndarray, degree_q2k: jnp.ndarray, n_k_blocks: int, max_degree_k: int):
+    lists = [[] for _ in range(n_k_blocks)]
+    n_q_blocks, _max_degree_q = layout_q2k.shape
+    for qb in range(n_q_blocks):
+        deg = int(degree_q2k[qb])
+        for li in range(deg):
+            kb = int(layout_q2k[qb, li])
+            if 0 <= kb < n_k_blocks:
+                lists[kb].append(qb)
+    # Truncate/pad to max_degree_k
+    layout_k2q = -jnp.ones((n_k_blocks, max_degree_k), dtype=jnp.int32)
+    degree_k2q = jnp.zeros((n_k_blocks,), dtype=jnp.int32)
+    for kb in range(n_k_blocks):
+        deg = min(len(lists[kb]), max_degree_k)
+        degree_k2q = degree_k2q.at[kb].set(deg)
+        if deg > 0:
+            layout_k2q = layout_k2q.at[kb, :deg].set(jnp.array(lists[kb][:deg], dtype=jnp.int32))
+    # Replace -1 with 0 (kernel masks with degree)
+    layout_k2q = jnp.where(layout_k2q < 0, 0, layout_k2q)
+    return layout_k2q, degree_k2q
+
+
+def _jax_fwd_blocksparse_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    crow_ptr: Int[Array, "..."],
-    col_indices: Int[Array, "..."],
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
     causal: bool = False,
-    block_m: int = 64,
-    block_n: int = 64,
-) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], tuple[Float[Array, "..."], ...]]:
-    """Forward pass for blocksparse attention with custom gradient support.
-
-    Computes scaled dot-product attention with block-level sparsity pattern.
-    Returns both the attention output and residuals needed for backward pass.
-
-    Args:
-        query: Query tensor of shape [batch, seq_len_q, num_heads, head_dim]
-        key: Key tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
-        value: Value tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
-        crow_ptr: Compressed row pointers for sparse layout
-        col_indices: Column indices for non-zero blocks
-        softmax_scale: Scaling factor for QK^T before softmax
-        causal: Whether to apply causal masking
-        block_m: Block size for queries
-        block_n: Block size for keys
-
-    Returns:
-        tuple: (attention_output, residuals) where residuals contain intermediate
-               values needed for backward pass gradient computation
-    """
-    # Compute CSC format for backward pass
-    # We need to recreate the layout from crow_ptr and col_indices
-    # For simplicity, we'll pass these through to the backward pass and compute there
-
-    out, lse = _fwd_attention_kernel_call(
+    dropout_seed: int | None = None,
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+    sliding_window: int | tuple[int, int] | None = None,
+    logits_soft_cap: float | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    # blocksparse-specific
+    layout: Int[Array, "n_q_blocks max_degree"] | None = None,
+    degree: Int[Array, "n_q_blocks"] | None = None,
+    max_degree: int = 0,
+    force_block_m: int = 0,
+    force_block_n: int = 0,
+):
+    out, lse = _blocksparse_fwd_attention_kernel_call(
         q=query,
         k=key,
         v=value,
-        layout_crow_ptr=crow_ptr,
-        layout_col_indices=col_indices,
+        attention_mask=attention_mask,
+        bias=bias,
         softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
         causal=causal,
-        block_m=block_m,
-        block_n=block_n,
+        dropout_seed=dropout_seed,
+        cum_seqlens_q=cum_seqlens_q,
+        cum_seqlens_k=cum_seqlens_k,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+        softmax_aux=softmax_aux,
+        layout=layout,
+        degree=degree,
+        max_degree=max_degree,
+        force_block_m=force_block_m,
+        force_block_n=force_block_n,
+    )
+    # Residuals: stash layout/meta for bwd
+    return out, (
+        query,
+        key,
+        value,
+        bias,
+        attention_mask,
+        out,
+        lse,
+        dropout_seed,
+        cum_seqlens_q,
+        cum_seqlens_k,
+        layout,
+        degree,
+        max_degree,
+        sliding_window,
+        force_block_m,
+        force_block_n,
+        logits_soft_cap,
+        softmax_aux,
     )
 
-    # Save residuals for backward pass
-    residual = (query, key, value, out, lse, crow_ptr, col_indices, block_m, block_n)
 
-    return out, residual
-
-
-def _jax_bwd_blocksparse_attention_call(
+def _jax_bwd_blocksparse_call(
     softmax_scale: float | None,
+    dropout_prob: float,
     causal: bool,
-    block_m: int,
-    block_n: int,
+    sliding_window: int | tuple[int, int] | None,
+    logits_soft_cap: float | None,
     residual: tuple[Float[Array, "..."], ...],
     dO: Float[Array, "batch seq_len num_heads head_dim"],
-) -> tuple[
-    Float[Array, "batch seq_len_q num_heads head_dim"] | None,
-    Float[Array, "batch seq_len_k num_heads head_dim"] | None,
-    Float[Array, "batch seq_len_k num_heads head_dim"] | None,
-    None,
-    None,
-]:
-    """Backward pass for blocksparse attention gradient computation.
+):
+    (
+        query,
+        key,
+        value,
+        bias,
+        attention_mask,
+        out,
+        lse,
+        dropout_seed,
+        cum_seqlens_q,
+        cum_seqlens_k,
+        layout_q2k,
+        degree_q2k,
+        max_degree,
+        sliding_window_fwd,
+        force_block_m,
+        force_block_n,
+        logits_soft_cap_fwd,
+        softmax_aux,
+    ) = residual
 
-    Computes gradients with respect to queries, keys, and values using
-    the saved residuals from the forward pass.
+    # Use the same window/softcap as forward if backward args are None
+    window = sliding_window if sliding_window is not None else sliding_window_fwd
+    cap = logits_soft_cap if logits_soft_cap is not None else logits_soft_cap_fwd
 
-    Args:
-        softmax_scale: Scaling factor used in forward pass
-        causal: Whether causal masking was applied
-        block_m: Block size for queries
-        block_n: Block size for keys
-        residual: Saved tensors from forward pass containing query, key, value,
-                 output, log-sum-exp, and layout metadata
-        dO: Gradient of loss with respect to attention output
+    # Build K->Q layout if Q->K provided
+    if layout_q2k is not None:
+        if force_block_m == 0 or force_block_n == 0:
+            raise ValueError("blocksparse backward requires force_block_m/force_block_n when using layout")
+        QSeq = query.shape[1]
+        KSeq = key.shape[1]
+        _n_q_blocks = math.ceil(QSeq / force_block_m)
+        n_k_blocks = math.ceil(KSeq / force_block_n)
+        max_degree_k = max_degree  # can choose different if you want
+        layout_k2q, degree_k2q = _transpose_layout_q2k_to_k2q(layout_q2k, degree_q2k, n_k_blocks, max_degree_k)
+    else:
+        layout_k2q = degree_k2q = None
+        max_degree_k = 0
 
-    Returns:
-        tuple: Gradients (dq, dk, dv, d_crow_ptr, d_col_indices)
-               where only dq, dk, dv are non-None for differentiable parameters
-    """
-    query, key, value, out, lse, crow_ptr, col_indices, _saved_block_m, _saved_block_n = residual
-
-    # For backward pass, we need CSC format (transpose of sparse pattern)
-    # For simplicity, we'll use the same indices but swap their roles
-    # In production, you'd compute proper CSC format
-    ccol_ptr = crow_ptr  # This is a simplification
-    row_indices = col_indices  # This is a simplification
-
-    dq, dk, dv = _bwd_attention_kernel_call(
+    dq, dk, dv = _blocksparse_bwd_attention_kernel_call(
         dO=dO,
         q=query,
         k=key,
         v=value,
+        bias=bias,
+        attention_mask=attention_mask,
         o=out,
         M=lse,
-        layout_ccol_ptr=ccol_ptr,
-        layout_row_indices=row_indices,
-        softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
         causal=causal,
-        block_m=block_m,
-        block_n=block_n,
+        softmax_scale=softmax_scale,
+        dropout_seed=dropout_seed,
+        cum_seqlens_q=cum_seqlens_q,
+        cum_seqlens_k=cum_seqlens_k,
+        sliding_window=window,
+        logits_soft_cap=cap,
+        softmax_aux=softmax_aux,
+        layout_q2k=layout_q2k,
+        degree_q2k=degree_q2k,
+        layout_k2q=layout_k2q,
+        degree_k2q=degree_k2q,
+        max_degree_q=(max_degree or 0),
+        max_degree_k=(max_degree_k or 0),
+        force_block_m=force_block_m,
+        force_block_n=force_block_n,
     )
-
-    return dq, dk, dv, None, None
-
-
-def _blocksparse_attention_inner(
-    query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    crow_ptr: Int[Array, "..."],
-    col_indices: Int[Array, "..."],
-    softmax_scale: float | None = None,
-    causal: bool = False,
-    block_m: int = 64,
-    block_n: int = 64,
-) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    """Inner blocksparse attention call with precomputed indices."""
-    return _fwd_attention_kernel_call(
-        q=query,
-        k=key,
-        v=value,
-        layout_crow_ptr=crow_ptr,
-        layout_col_indices=col_indices,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        block_m=block_m,
-        block_n=block_n,
-    )[0]
+    return dq, dk, dv, None, None, None, None, None, None
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8))
-@ejit(static_argnums=(5, 6, 7, 8))
-def blocksparse_attention_call_vjp(
-    query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    crow_ptr: Int[Array, "..."],
-    col_indices: Int[Array, "..."],
-    softmax_scale: float | None = None,
-    causal: bool = False,
-    block_m: int = 64,
-    block_n: int = 64,
-) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    """Blocksparse attention with custom gradient computation (pre-computed indices)."""
-    return _fwd_attention_kernel_call(
-        q=query,
-        k=key,
-        v=value,
-        layout_crow_ptr=crow_ptr,
-        layout_col_indices=col_indices,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        block_m=block_m,
-        block_n=block_n,
-    )[0]
-
-
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 11, 12, 13, 14, 15, 16, 17, 18))
+@ejit(static_argnums=(5, 6, 7, 11, 12, 13, 14, 15, 16, 17, 18))
 def blocksparse_attention_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    layout: Bool[Array, "num_heads num_blocks_q num_blocks_k"] | Bool[Array, "num_blocks_q num_blocks_k"],
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
     causal: bool = False,
-    block_m: int = 64,
-    block_n: int = 64,
+    dropout_seed: int | None = None,
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+    sliding_window: int | tuple[int, int] | None = None,
+    logits_soft_cap: float | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    layout: Int[Array, "n_q_blocks max_degree"] | None = None,
+    degree: Int[Array, "n_q_blocks"] | None = None,
+    max_degree: int = 0,
+    force_block_m: int = 0,
+    force_block_n: int = 0,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    """Blocksparse attention with custom gradient computation.
-
-    Efficient attention implementation using block-level sparsity patterns
-    to reduce computation and memory usage.
-
-    This function is decorated with custom_vjp for efficient backward pass and
-    ejit for JIT compilation with static arguments.
-
-    Args:
-        query: Query tensor of shape [batch, seq_len_q, num_heads, head_dim]
-        key: Key tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
-        value: Value tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
-        layout: Block-sparse pattern mask indicating active blocks
-        softmax_scale: Scale factor for attention scores (default: 1/sqrt(head_dim))
-        causal: Apply causal (autoregressive) masking
-        block_m: Block size for query dimension
-        block_n: Block size for key dimension
-
-    Returns:
-        Attention output tensor with same shape as query
-
-    Note:
-        Arguments at positions 4, 5, 6, 7 (softmax_scale, causal, block_m, block_n)
-        are marked as non-differentiable.
-    """
-    # Convert layout to CSR format (outside JIT)
-    if layout.ndim == 2:
-        crow_ptr, col_indices = compute_crow_indices(layout)
-    else:
-        # Handle per-head patterns
-        crow_ptrs, col_indices_list = [], []
-        for h in range(layout.shape[0]):
-            crow, cols = compute_crow_indices(layout[h])
-            crow_ptrs.append(crow)
-            col_indices_list.append(cols)
-
-        crow_ptr = jnp.stack(crow_ptrs)
-        col_indices = jnp.concatenate(col_indices_list)
-
-    return blocksparse_attention_call_vjp(
-        query=query,
-        key=key,
-        value=value,
-        crow_ptr=crow_ptr,
-        col_indices=col_indices,
+    return _blocksparse_fwd_attention_kernel_call(
+        q=query,
+        k=key,
+        v=value,
+        attention_mask=attention_mask,
+        bias=bias,
         softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
         causal=causal,
-        block_m=block_m,
-        block_n=block_n,
+        dropout_seed=dropout_seed,
+        cum_seqlens_q=cum_seqlens_q,
+        cum_seqlens_k=cum_seqlens_k,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+        softmax_aux=softmax_aux,
+        layout=layout,
+        degree=degree,
+        max_degree=max_degree,
+        force_block_m=force_block_m,
+        force_block_n=force_block_n,
     )
 
 
-blocksparse_attention_call_vjp.defvjp(
-    _jax_fwd_blocksparse_attention_call,
-    _jax_bwd_blocksparse_attention_call,
-)
+blocksparse_attention_call.defvjp(_jax_fwd_blocksparse_call, _jax_bwd_blocksparse_call)
 
 
-@kernel_registry.register("blocksparse_attention", Platform.TRITON, Backend.GPU)
+@kernel_registry.register("block_sparse_attention_GPU", Platform.TRITON, Backend.GPU)
 def blocksparse_attention(
+    # query: Float[Array, "batch num_heads seq_len head_dim"],
+    # key: Float[Array, "batch kv_num_heads kv_len head_dim"],
+    # value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
+    # q_segment_ids: Int[Array, "batch seq_len"] | None = None,
+    # kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
+    # softmax_aux: Float[Array, "..."] | None = None,
+    # logit_soft_cap: float | None = None,
+    # query_chunk_size: int = 128,
+    # key_chunk_size: int = 128,
+    # softmax_scale: float | None = None,
+    # mask_builder: typing.Callable[[int, int, int, int, int], Mask] | None = None,
+    # sliding_window: int | tuple[int, int] | None = None,
+    # chunk_size: int | None = None,
+    # causal: bool = True,
+    # fused_backward: bool = False,
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    layout: Bool[Array, "num_heads num_blocks_q num_blocks_k"] | Bool[Array, "num_blocks_q num_blocks_k"] | None = None,
+    attention_mask: Bool[Array, "batch seq_len"] | None = None,
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
     causal: bool = False,
+    dropout_seed: int | None = None,
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
-    block_m: int = 64,
-    block_n: int = 64,
-    local_blocks: int = 4,
-    vert_stride: int = 0,
-    homo_head: bool = True,
+    logits_soft_cap: float | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    layout: Int[Array, "n_q_blocks max_degree"] | None = None,
+    degree: Int[Array, "n_q_blocks"] | None = None,
+    max_degree: int = 0,
+    force_block_m: int = 0,
+    force_block_n: int = 0,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     logits_dtype: jnp.dtype = jnp.float32,
     *,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     debug: bool = False,
-) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    """Compute blocksparse attention for efficient scaled dot-product attention.
-
-    Blocksparse Attention is a memory-efficient and fast implementation of
-    attention that uses block-level sparsity patterns to reduce computation
-    from O(N^2) to O(N x S) where S is the number of sparse blocks.
-
-    Args:
-        query: Query tensor of shape [batch, seq_len_q, num_heads, head_dim]
-        key: Key tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
-        value: Value tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
-        layout: Optional pre-computed block sparse layout. If None, generates
-                a pattern using sliding_window, local_blocks and vert_stride parameters
-        softmax_scale: Scaling factor for QK^T (default: 1/sqrt(head_dim))
-        causal: Whether to apply causal masking for autoregressive models
-        sliding_window: Sliding window size in tokens. Can be:
-                - int: Symmetric window (same left and right)
-                - tuple[int, int]: Asymmetric (left_window, right_window) in tokens
-                - None: Use local_blocks instead
-        block_m: Block size for query dimension (must divide seq_len_q)
-        block_n: Block size for key dimension (must divide seq_len_k)
-        local_blocks: Number of local blocks to attend to when auto-generating layout
-                     (ignored if sliding_window is provided)
-        vert_stride: Vertical stride for sparse connections when auto-generating layout
-        homo_head: Whether all heads share the same sparsity pattern
-        precision: JAX precision setting (ignored in Triton implementation)
-        logits_dtype: Data type for logits computation (ignored in Triton implementation)
-        debug: Enable debug mode (ignored in Triton implementation)
-
-    Returns:
-        Attention output with shape [batch, seq_len_q, num_heads, head_dim]
-
-    Examples:
-        >>> # Blocksparse attention with sliding window
-        >>> out = blocksparse_attention(query, key, value, sliding_window=256)
-        >>>
-        >>> # Causal blocksparse with asymmetric sliding window
-        >>> out = blocksparse_attention(query, key, value, causal=True,
-        ...                            sliding_window=(128, 64))
-        >>>
-        >>> # Standard blocksparse attention with auto-generated pattern
-        >>> out = blocksparse_attention(query, key, value, local_blocks=4)
-        >>>
-        >>> # With custom sparse layout
-        >>> layout = generate_custom_layout(seq_len, num_heads, block_size)
-        >>> out = blocksparse_attention(query, key, value, layout=layout)
-        >>>
-        >>> # Causal blocksparse with vertical stride
-        >>> out = blocksparse_attention(query, key, value, causal=True,
-        ...                            local_blocks=8, vert_stride=4)
-    """
-    del precision, logits_dtype, debug  # Unused in Triton implementation
-
-    _batch, seq_len_q, num_heads, _head_dim = query.shape
-    _, seq_len_k, _num_kv_heads, _ = key.shape
-
-    # Generate layout if not provided
-    if layout is None:
-        # For now, assume seq_len_q == seq_len_k for simplicity
-        assert seq_len_q == seq_len_k, "Auto-generated layouts require equal Q/K lengths"
-        assert seq_len_q % block_m == 0, f"seq_len_q {seq_len_q} must be divisible by block_m {block_m}"
-
-        from ._utilities import generate_blocksparse_layout
-
-        layout = generate_blocksparse_layout(
-            seq_len=seq_len_q,
-            num_heads=num_heads if not homo_head else 1,
-            block_size=block_m,  # Assuming square blocks
-            local_blocks=local_blocks,
-            vert_stride=vert_stride,
-            homo_head=homo_head,
-            causal=causal,
-            sliding_window=sliding_window,
-        )
-
-    return blocksparse_attention_call(
+):
+    del precision, logits_dtype, debug
+    if q_segment_ids is not None or kv_segment_ids is not None:
+        raise NotImplementedError("segment_ids are not supported in Triton implementation.")
+    # Call returns (out, residuals) where residuals contains lse at position 6
+    out, residuals = blocksparse_attention_call(
         query=query,
         key=key,
         value=value,
-        layout=layout,
+        attention_mask=attention_mask,
+        bias=bias,
         softmax_scale=softmax_scale,
+        dropout_prob=dropout_prob,
         causal=causal,
-        block_m=block_m,
-        block_n=block_n,
+        dropout_seed=dropout_seed,
+        cum_seqlens_q=cum_seqlens_q,
+        cum_seqlens_k=cum_seqlens_k,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+        softmax_aux=softmax_aux,
+        layout=layout,
+        degree=degree,
+        max_degree=max_degree,
+        force_block_m=force_block_m,
+        force_block_n=force_block_n,
     )
+    # Extract LSE from residuals (it's at position 6)
+    lse = residuals[6]
+    return out, lse

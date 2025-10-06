@@ -5,14 +5,132 @@ This works as a pre-commit hook when called from .pre-commit-config.yaml.
 """
 
 import argparse
+import shutil
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
-# Project configuration
-PROJECT_ROOT = Path(__file__).parent.parent  # Go up one level from scripts/
 PROJECT_NAME = "ejkernel"
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DOCS_API_DIR = PROJECT_ROOT / "docs" / "api_docs"
+
+
+def _strip_prefix(module_path: str) -> str:
+    prefix = f"{PROJECT_NAME}."
+    return module_path[len(prefix) :] if module_path.startswith(prefix) else module_path
+
+
+def _docname_from_module(module_path: str) -> str:
+    return _strip_prefix(module_path).replace(".", "/")
+
+
+def create_rst_file(name: str, module_path: str, output_dir: Path) -> None:
+    """
+    Create a module page at a nested path (mirrors package structure).
+    """
+    docname = _docname_from_module(module_path)
+    rst_path = output_dir / f"{docname}.rst"
+    rst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    title = name
+    with open(rst_path, "w", encoding="utf-8") as f:
+        f.write(f"{title}\n")
+        f.write("=" * len(title) + "\n\n")
+        f.write(f".. automodule:: {module_path}\n")
+        f.write("   :members:\n")
+        f.write("   :undoc-members:\n")
+        f.write("   :show-inheritance:\n")
+
+
+def _write_package_index(pkg_docname: str, children: list[str], packages: set[str]) -> None:
+    """
+    Write index.rst for a package.
+    pkg_docname: '' for top-level, otherwise 'kernels' or 'kernels/triton_flash_attention', etc.
+    children: list of docnames for immediate children (packages or modules)
+    """
+    if pkg_docname:
+        index_path = DOCS_API_DIR / pkg_docname / "index.rst"
+    else:
+        index_path = DOCS_API_DIR / "index.rst"
+
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if pkg_docname:
+        dotted = pkg_docname.replace("/", ".")
+        title = f"{PROJECT_NAME}.{dotted} package"
+    else:
+        title = f"{PROJECT_NAME} API Reference"
+
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(f"{title}\n")
+        f.write("=" * len(title) + "\n\n")
+        f.write(".. toctree::\n")
+        f.write("   :maxdepth: 2\n\n")
+
+        # Show packages first, then modules
+        for child in sorted(children, key=lambda c: (0 if c in packages else 1, c)):
+            entry = f"{child}/index" if child in packages else child
+            f.write(f"   {entry}\n")
+
+
+def generate_api_docs(clean: bool = True) -> bool:
+    """
+    Generate API documentation with a hierarchical layout.
+    """
+    print("Generating API documentation...")
+
+    # Clean output dir completely to avoid stale files and empty dirs
+    if clean and DOCS_API_DIR.exists():
+        shutil.rmtree(DOCS_API_DIR)
+    DOCS_API_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Discover modules (full import paths, e.g., ejkernel.kernels.foo.bar)
+    modules = sorted(discover_modules(PROJECT_NAME))
+    if not modules:
+        print("No modules found to document")
+        return False
+
+    # Build package tree: packages set and a children map for toctrees
+    packages: set[str] = set()
+    children_map: defaultdict[str, set[str]] = defaultdict(set)
+
+    for full_module in modules:
+        short = _strip_prefix(full_module)
+        parts = short.split(".")
+        children_map[""].add(parts[0])
+
+        # Register all ancestor packages
+        for i in range(1, len(parts)):
+            pkg = "/".join(parts[:i])
+            packages.add(pkg)
+
+        # Link package -> subpackage chain
+        for i in range(1, len(parts) - 1):
+            parent_pkg = "/".join(parts[:i])
+            child_pkg = "/".join(parts[: i + 1])
+            children_map[parent_pkg].add(child_pkg)
+
+        # Add module as a child of its immediate package (or root if top-level)
+        parent_pkg = "/".join(parts[:-1]) if len(parts) > 1 else ""
+        mod_doc = "/".join(parts)
+        children_map[parent_pkg].add(mod_doc)
+
+    # Write module pages
+    for module_path in modules:
+        create_rst_file(module_path, module_path, DOCS_API_DIR)  # title = full import path
+
+    # Write per-package index pages
+    for pkg_docname in sorted(packages):
+        children = list(children_map.get(pkg_docname, []))
+        _write_package_index(pkg_docname, children, packages)
+
+    # Write top-level index
+    _write_package_index("", list(children_map[""]), packages)
+
+    print(f"✓ Generated documentation for {len(modules)} modules")
+    return True
 
 
 def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -63,7 +181,8 @@ def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
     if fix:
         print("Running ruff check with fixes...")
         result = run_command(
-            ["ruff", "check", "--fix", "--config", "pyproject.toml"] + [str(f) for f in python_files], check=False
+            ["ruff", "check", "--fix", "--unsafe-fixes", "--config", "pyproject.toml"] + [str(f) for f in python_files],
+            check=False,
         )
         if result.returncode != 0:
             print(f"Ruff check found issues (exit code: {result.returncode})")
@@ -84,113 +203,19 @@ def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
     return success
 
 
-def discover_modules(base_dir: str = PROJECT_NAME) -> dict[tuple[str, ...], str]:
-    """
-    Discover all Python modules in the project.
+def discover_modules(project_name: str) -> list[str]:
+    base_dir = (PROJECT_ROOT / project_name).resolve()
+    if not base_dir.is_dir():
+        raise FileNotFoundError(f"Package directory not found: {base_dir}")
 
-    Args:
-        base_dir: Base directory to search.
-
-    Returns:
-        Dictionary mapping module paths to import names.
-    """
-    modules = {}
-    base_path = Path(base_dir)
-
-    for py_file in base_path.rglob("*.py"):
-        # Skip test files and private modules
-        if any(part.startswith("test") for part in py_file.parts):
+    modules = []
+    for py_file in base_dir.rglob("*.py"):
+        if py_file.name == "__init__.py":
             continue
-        if "__pycache__" in str(py_file):
-            continue
-
-        # Convert to module path
-        relative = py_file.relative_to(PROJECT_ROOT)
-        module_parts = list(relative.parts[:-1])  # Remove .py file
-        if relative.stem != "__init__":
-            module_parts.append(relative.stem)
-
-        # Create display name
-        display_parts = tuple(" ".join(word.capitalize() for word in part.split("_")) for part in module_parts)
-
-        # Create import path
-        import_path = ".".join(module_parts)
-        modules[display_parts] = import_path
-
-    return modules
-
-
-def create_rst_file(name: str, module_path: str, output_dir: Path) -> None:
-    """
-    Create an RST documentation file for a module.
-
-    Args:
-        name: Display name for the module.
-        module_path: Import path for the module.
-        output_dir: Directory to write RST files.
-    """
-    # Create filename from module path
-    filename = module_path.replace(f"{PROJECT_NAME}.", "").replace(".", "_") + ".rst"
-    rst_path = output_dir / filename
-
-    # Write RST content
-    title = name
-    with open(rst_path, "w") as f:
-        f.write(f"{title}\n")
-        f.write("=" * len(title) + "\n\n")
-        f.write(f".. automodule:: {module_path}\n")
-        f.write("   :members:\n")
-        f.write("   :undoc-members:\n")
-        f.write("   :show-inheritance:\n")
-
-
-def generate_api_docs(clean: bool = True) -> bool:
-    """
-    Generate API documentation RST files.
-
-    Args:
-        clean: Whether to clean existing docs first.
-
-    Returns:
-        True if successful, False otherwise.
-    """
-    print("Generating API documentation...")
-
-    # Ensure docs directory exists
-    DOCS_API_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Clean existing docs if requested
-    if clean:
-        for rst_file in DOCS_API_DIR.glob("*.rst"):
-            rst_file.unlink()
-
-    # Discover modules
-    modules = discover_modules(PROJECT_NAME)
-
-    if not modules:
-        print("No modules found to document")
-        return False
-
-    # Generate RST files
-    for display_parts, module_path in modules.items():
-        name = display_parts[-1] if display_parts else "Index"
-        create_rst_file(name, module_path, DOCS_API_DIR)
-
-    # Generate index file
-    index_path = DOCS_API_DIR / "index.rst"
-    with open(index_path, "w") as f:
-        f.write(f"{PROJECT_NAME.upper()} API Reference\n")
-        f.write("=" * (len(PROJECT_NAME) + 14) + "\n\n")
-        f.write(".. toctree::\n")
-        f.write("   :maxdepth: 2\n\n")
-
-        # Add all generated RST files
-        for rst_file in sorted(DOCS_API_DIR.glob("*.rst")):
-            if rst_file.name != "index.rst":
-                f.write(f"   {rst_file.stem}\n")
-
-    print(f"✓ Generated documentation for {len(modules)} modules")
-    return True
+        rel = py_file.relative_to(base_dir)  # relative inside the package
+        dotted = rel.with_suffix("").as_posix().replace("/", ".")
+        modules.append(f"{project_name}.{dotted}")
+    return sorted(set(modules))
 
 
 def run_tests(test_dir: str = "test") -> bool:
@@ -227,12 +252,24 @@ def main():
 
     # Options
     parser.add_argument(
-        "--no-fix", dest="fix", action="store_false", default=True, help="Don't apply fixes automatically"
+        "--no-fix",
+        dest="fix",
+        action="store_false",
+        default=True,
+        help="Don't apply fixes automatically",
     )
     parser.add_argument(
-        "--no-clean", dest="clean", action="store_false", default=True, help="Don't clean old documentation"
+        "--no-clean",
+        dest="clean",
+        action="store_false",
+        default=True,
+        help="Don't clean old documentation",
     )
-    parser.add_argument("--directory", default=PROJECT_NAME, help=f"Directory to format (default: {PROJECT_NAME})")
+    parser.add_argument(
+        "--directory",
+        default=PROJECT_NAME,
+        help=f"Directory to format (default: {PROJECT_NAME})",
+    )
 
     args = parser.parse_args()
 
