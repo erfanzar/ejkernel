@@ -10,7 +10,8 @@ This demonstrates advanced features:
 
 import jax
 import jax.numpy as jnp
-from ejkernel.kernels._pallas.tpu.block_sparse_attention import block_sparse_attention
+
+from ejkernel.kernels._pallas.tpu.blocksparse_attention import blocksparse_attention
 
 # Set up example tensors
 batch_size = 2
@@ -32,7 +33,7 @@ print("Example 1: Soft capping for attention logits (Gemma2 style)")
 print("-" * 50)
 
 # Without soft cap
-output_no_cap = block_sparse_attention(
+output_no_cap = blocksparse_attention(
     query=query,
     key=key_array,
     value=value,
@@ -41,7 +42,7 @@ output_no_cap = block_sparse_attention(
 print(f"Output shape without soft cap: {output_no_cap.shape}")
 
 # With soft cap (Gemma2 uses 50.0)
-output_with_cap = block_sparse_attention(
+output_with_cap = blocksparse_attention(
     query=query,
     key=key_array,
     value=value,
@@ -61,7 +62,7 @@ print("Example 2: Custom softmax scale")
 print("-" * 50)
 
 # Default scale (1/sqrt(head_dim) = 1/sqrt(64) = 0.125)
-output_default_scale = block_sparse_attention(
+output_default_scale = blocksparse_attention(
     query=query,
     key=key_array,
     value=value,
@@ -71,7 +72,7 @@ output_default_scale = block_sparse_attention(
 print(f"Output shape with default scale (1/√{head_dim}): {output_default_scale.shape}")
 
 # Custom scale (e.g., for temperature control)
-output_custom_scale = block_sparse_attention(
+output_custom_scale = blocksparse_attention(
     query=query,
     key=key_array,
     value=value,
@@ -81,7 +82,7 @@ output_custom_scale = block_sparse_attention(
 print(f"Output shape with custom scale (0.2): {output_custom_scale.shape}")
 
 # Lower temperature (sharper attention)
-output_sharp = block_sparse_attention(
+output_sharp = blocksparse_attention(
     query=query,
     key=key_array,
     value=value,
@@ -103,7 +104,7 @@ print("-" * 50)
 aux_key = jax.random.key(123)
 softmax_aux = jax.random.normal(aux_key, (batch_size, num_heads), dtype=jnp.float32)
 
-output_with_aux = block_sparse_attention(
+output_with_aux = blocksparse_attention(
     query=query,
     key=key_array,
     value=value,
@@ -118,7 +119,7 @@ print("✓ Auxiliary values can be used for sink tokens or special patterns\n")
 print("Example 4: Combining soft cap with sliding window")
 print("-" * 50)
 
-output_cap_sliding = block_sparse_attention(
+output_cap_sliding = blocksparse_attention(
     query=query,
     key=key_array,
     value=value,
@@ -134,7 +135,7 @@ print("✓ Soft capping works with sliding windows\n")
 print("Example 5: Combining soft cap with chunked causal")
 print("-" * 50)
 
-output_cap_chunked = block_sparse_attention(
+output_cap_chunked = blocksparse_attention(
     query=query,
     key=key_array,
     value=value,
@@ -149,7 +150,7 @@ print("✓ Soft capping works with chunked causal masks\n")
 print("Example 6: Combining all features")
 print("-" * 50)
 
-output_all_features = block_sparse_attention(
+output_all_features = blocksparse_attention(
     query=query,
     key=key_array,
     value=value,
@@ -173,7 +174,7 @@ soft_cap_values = [10.0, 30.0, 50.0, 100.0, None]
 outputs = []
 
 for cap_value in soft_cap_values:
-    output = block_sparse_attention(
+    output = blocksparse_attention(
         query=query[:, :, :256, :],  # Smaller sequence for quick testing
         key=key_array[:, :, :256, :],
         value=value[:, :, :256, :],
@@ -214,7 +215,7 @@ configs = [
 ]
 
 for config in configs:
-    output = block_sparse_attention(query=query, key=key_array, value=value, causal=True, **config["params"])
+    output = blocksparse_attention(query=query, key=key_array, value=value, causal=True, **config["params"])
     print(f"{config['name']:20s} -> Shape: {output.shape}, Finite: {jnp.all(jnp.isfinite(output))}")
 
 print("\n✓ All configurations produce valid outputs")

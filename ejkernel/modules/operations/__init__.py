@@ -64,21 +64,23 @@ Note:
 """
 
 from .attention import Attention, attention
-from .flash import FlashAttention, flash_attention
-from .gla import GLAttention, gla_attention
-from .lightning import LightningAttention, lightning_attention
+from .blocksparse_attention import BlockSparseAttention, blocksparse_attention
+from .flash_attention import FlashAttention, flash_attention
+from .gated_linear_attention import GLAttention, gla_attention
+from .lightning_attention import LightningAttention, lightning_attention
 from .matmul import GroupedMatmul, grouped_matmul
-from .mla import FlashMLA, mla_attention
-from .native_sparse_attention import NativeSparseAttention, sparse_attention
+from .multi_head_latent_attention import FlashMLA, mla_attention
+from .native_sparse_attention import NativeSparseAttention, native_sparse_attention
 from .page_attention import PageAttention, page_attention
 from .pooling import MeanPooling, mean_pooling
 from .ragged_page_attention import RaggedPageAttention, ragged_page_attention
 from .recurrent import RecurrentAttention, recurrent_attention
-from .ring import RingAttention, ring_attention
+from .ring_attention import RingAttention, ring_attention
 from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_product_attention
 
 __all__ = (
     "Attention",
+    "BlockSparseAttention",
     "FlashAttention",
     "FlashMLA",
     "GLAttention",
@@ -92,16 +94,17 @@ __all__ = (
     "RingAttention",
     "ScaledDotProductAttention",
     "attention",
+    "blocksparse_attention",
     "flash_attention",
     "gla_attention",
     "grouped_matmul",
     "lightning_attention",
     "mean_pooling",
     "mla_attention",
+    "native_sparse_attention",
     "page_attention",
     "ragged_page_attention",
     "recurrent_attention",
     "ring_attention",
     "scaled_dot_product_attention",
-    "sparse_attention",
 )

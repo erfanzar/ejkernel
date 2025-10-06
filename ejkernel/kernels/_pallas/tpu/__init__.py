@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from .blocksparse_attention import block_sparse_attention as blocksparse_attention
+from .blocksparse_attention import blocksparse_attention as blocksparse_attention
 from .flash_attention import flash_attention
 from .grouped_matmul import grouped_matmul
 from .page_attention import page_attention

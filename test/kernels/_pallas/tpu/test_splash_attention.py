@@ -17,11 +17,12 @@
 import jax
 import jax.numpy as jnp
 import pytest
-from ejkernel.kernels._pallas.tpu.block_sparse_attention import (
+
+from ejkernel.kernels._pallas.tpu.blocksparse_attention import (
     CausalMask,
     ChunkedCausalMask,
     LocalMask,
-    block_sparse_attention,
+    blocksparse_attention,
     make_causal_mask,
     make_chunk_attention_mask,
     make_local_attention_mask,
@@ -29,7 +30,7 @@ from ejkernel.kernels._pallas.tpu.block_sparse_attention import (
 
 
 class TestBasicFunctionality:
-    """Test basic block_sparse_attention attention functionality."""
+    """Test basic blocksparse_attention attention functionality."""
 
     @pytest.mark.skipif(
         not jax.devices()[0].platform == "tpu",
@@ -49,7 +50,7 @@ class TestBasicFunctionality:
         key_array = jax.random.normal(keys[1], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
-        output = block_sparse_attention(
+        output = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -77,7 +78,7 @@ class TestBasicFunctionality:
         key_array = jax.random.normal(keys[1], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
-        output = block_sparse_attention(
+        output = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -110,7 +111,7 @@ class TestSlidingWindowAttention:
         key_array = jax.random.normal(keys[1], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
-        output = block_sparse_attention(
+        output = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -141,7 +142,7 @@ class TestSlidingWindowAttention:
         key_array = jax.random.normal(keys[1], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
-        output = block_sparse_attention(
+        output = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -172,7 +173,7 @@ class TestSlidingWindowAttention:
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
         # Causal + sliding window
-        output_causal_sliding = block_sparse_attention(
+        output_causal_sliding = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -181,7 +182,7 @@ class TestSlidingWindowAttention:
         )
 
         # Pure sliding window (no causal)
-        output_sliding = block_sparse_attention(
+        output_sliding = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -219,7 +220,7 @@ class TestChunkedCausalAttention:
         key_array = jax.random.normal(keys[1], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
-        output = block_sparse_attention(
+        output = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -249,7 +250,7 @@ class TestChunkedCausalAttention:
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
         # Chunked causal
-        output_chunked = block_sparse_attention(
+        output_chunked = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -257,7 +258,7 @@ class TestChunkedCausalAttention:
         )
 
         # Standard causal
-        output_causal = block_sparse_attention(
+        output_causal = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -300,7 +301,7 @@ class TestSegmentIds:
         )
         kv_segment_ids = q_segment_ids
 
-        output = block_sparse_attention(
+        output = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -343,7 +344,7 @@ class TestCustomMaskBuilder:
             else:
                 return LocalMask(shape=(q_len, kv_len), window_size=(128, 128), offset=0)
 
-        output = block_sparse_attention(
+        output = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -377,7 +378,7 @@ class TestPerformanceTuning:
 
         # Test different chunk sizes
         for query_chunk_size, key_chunk_size in [(128, 128), (256, 256), (512, 512)]:
-            output = block_sparse_attention(
+            output = blocksparse_attention(
                 query=query,
                 key=key_array,
                 value=value,
@@ -412,7 +413,7 @@ class TestSoftCapAndScale:
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
         # Without soft cap
-        output_no_cap = block_sparse_attention(
+        output_no_cap = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -421,7 +422,7 @@ class TestSoftCapAndScale:
         )
 
         # With soft cap (like Gemma2 uses 50.0)
-        output_with_cap = block_sparse_attention(
+        output_with_cap = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -455,7 +456,7 @@ class TestSoftCapAndScale:
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
         # Default scale (1/sqrt(head_dim))
-        output_default = block_sparse_attention(
+        output_default = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -464,7 +465,7 @@ class TestSoftCapAndScale:
         )
 
         # Custom scale
-        output_custom = block_sparse_attention(
+        output_custom = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -501,7 +502,7 @@ class TestSoftCapAndScale:
         softmax_aux = jax.random.normal(keys[3], (batch_size, num_heads), dtype=jnp.float32)
 
         # With softmax_aux
-        output = block_sparse_attention(
+        output = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,
@@ -531,7 +532,7 @@ class TestSoftCapAndScale:
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
         # Combined soft cap and custom scale
-        output = block_sparse_attention(
+        output = blocksparse_attention(
             query=query,
             key=key_array,
             value=value,

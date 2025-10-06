@@ -21,6 +21,7 @@ ejkernel.ops framework for automatic configuration management and performance tu
 Available Modules:
     Operations:
         - FlashAttention: Memory-efficient exact attention
+        - BlockSparseAttention: Memory-efficient Sparse attention
         - PageAttention: Paged KV cache attention for serving
         - RaggedPageAttention: Variable-length page attention
         - NativeSparseAttention: Block-wise sparse attention
@@ -45,6 +46,7 @@ Example:
 from .base import KernelConfig, create_default_executor
 from .operations import (
     Attention,
+    BlockSparseAttention,
     FlashAttention,
     FlashMLA,
     GLAttention,
@@ -58,22 +60,24 @@ from .operations import (
     RingAttention,
     ScaledDotProductAttention,
     attention,
+    blocksparse_attention,
     flash_attention,
     gla_attention,
     grouped_matmul,
     lightning_attention,
     mean_pooling,
     mla_attention,
+    native_sparse_attention,
     page_attention,
     ragged_page_attention,
     recurrent_attention,
     ring_attention,
     scaled_dot_product_attention,
-    sparse_attention,
 )
 
 __all__ = (
     "Attention",
+    "BlockSparseAttention",
     "FlashAttention",
     "FlashMLA",
     "GLAttention",
@@ -88,6 +92,7 @@ __all__ = (
     "RingAttention",
     "ScaledDotProductAttention",
     "attention",
+    "blocksparse_attention",
     "create_default_executor",
     "flash_attention",
     "gla_attention",
@@ -95,10 +100,10 @@ __all__ = (
     "lightning_attention",
     "mean_pooling",
     "mla_attention",
+    "native_sparse_attention",
     "page_attention",
     "ragged_page_attention",
     "recurrent_attention",
     "ring_attention",
     "scaled_dot_product_attention",
-    "sparse_attention",
 )

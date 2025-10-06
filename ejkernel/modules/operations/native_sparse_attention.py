@@ -183,7 +183,7 @@ class NativeSparseAttention(Kernel[KernelConfig, Array]):
 _sparse_executor = create_default_executor()
 
 
-def sparse_attention(
+def native_sparse_attention(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],

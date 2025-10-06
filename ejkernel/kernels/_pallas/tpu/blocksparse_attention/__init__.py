@@ -16,7 +16,7 @@
 from ._info import MaskInfo
 from ._kernel import (
     BlockSizes,
-    block_sparse_attention,
+    blocksparse_attention,
     make_attention_reference,
     make_masked_mha_reference,
     make_masked_mqa_reference,
@@ -49,7 +49,7 @@ __all__ = (
     "MaskInfo",
     "MultiHeadMask",
     "NumpyMask",
-    "block_sparse_attention",
+    "blocksparse_attention",
     "make_attention_reference",
     "make_causal_mask",
     "make_chunk_attention_mask",

@@ -474,7 +474,7 @@ class BlockSizes:
     greatly.
 
     Note that changing the layouts only influences the physical layout that the
-    kernel will enforce. The logical interface to block_sparse_attention attention always takes
+    kernel will enforce. The logical interface to blocksparse_attention attention always takes
     the head dimension as the minormost one.
     """
 
@@ -2386,7 +2386,7 @@ make_splash_mha_single_device = partial(make_splash_mha, is_mqa=False, head_shar
 make_splash_mqa_single_device = partial(make_splash_mha, is_mqa=True, head_shards=1, q_seq_shards=1)
 
 
-@kernel_registry.register("block_sparse_attention", Platform.PALLAS, Backend.TPU)
+@kernel_registry.register("blocksparse_attention", Platform.PALLAS, Backend.TPU)
 @ejit(
     static_argnames=(
         "query_chunk_size",
@@ -2399,7 +2399,7 @@ make_splash_mqa_single_device = partial(make_splash_mha, is_mqa=True, head_shard
         "fused_backward",
     )
 )
-def block_sparse_attention(
+def blocksparse_attention(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch kv_num_heads kv_len head_dim"],
     value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],

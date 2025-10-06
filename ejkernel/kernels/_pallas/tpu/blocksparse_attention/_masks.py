@@ -23,7 +23,7 @@ import numpy as np
 
 
 class Mask:
-    """A base class for block_sparse_attention attention masks."""
+    """A base class for blocksparse_attention attention masks."""
 
     @property
     def shape(self) -> tuple[int, ...]:

@@ -242,7 +242,7 @@ def blocksparse_attention_call(
 blocksparse_attention_call.defvjp(_jax_fwd_blocksparse_call, _jax_bwd_blocksparse_call)
 
 
-@kernel_registry.register("block_sparse_attention_GPU", Platform.TRITON, Backend.GPU)
+@kernel_registry.register("blocksparse_attention_GPU", Platform.TRITON, Backend.GPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def blocksparse_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],

@@ -83,7 +83,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
 
     def __init__(self):
         """Initialize BlockSparseAttention module."""
-        super().__init__(op_id="block_sparse_attention")
+        super().__init__(op_id="blocksparse_attention")
 
     def get_impl(self, cfg: KernelConfig):
         """Get kernel implementation from registry based on configuration.
@@ -98,8 +98,8 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
             ValueError: If no matching implementation is found for the configuration
         """
         return kernel_registry.get(
-            algorithm="block_sparse_attention",
-            platform=detect_platform("block_sparse_attention", cfg.platform),
+            algorithm="blocksparse_attention",
+            platform=detect_platform("blocksparse_attention", cfg.platform),
             backend=cfg.backend,
         )
 
@@ -236,7 +236,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
 _executor = create_default_executor()
 
 
-def block_sparse_attention(
+def blocksparse_attention(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch kv_num_heads kv_len head_dim"],
     value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
@@ -281,24 +281,24 @@ def block_sparse_attention(
         Attention output [batch, kv_num_heads, kv_len, vhead_dim]
 
     Example:
-        >>> from ejkernel.modules.operations import block_sparse_attention
+        >>> from ejkernel.modules.operations import blocksparse_attention
         >>>
         >>> # Simple causal sparse attention
-        >>> output = block_sparse_attention(query, key, value, causal=True)
+        >>> output = blocksparse_attention(query, key, value, causal=True)
         >>>
         >>> # Custom sparse pattern with mask builder
         >>> def local_plus_global(q_idx, k_idx, q_size, k_size, window):
         ...     # Create mask for local + global tokens
         ...     return create_local_global_mask(q_idx, k_idx, window)
         >>>
-        >>> output = block_sparse_attention(
+        >>> output = blocksparse_attention(
         ...     query, key, value,
         ...     mask_builder=local_plus_global,
         ...     sliding_window=256
         ... )
         >>>
         >>> # With logit soft capping for numerical stability
-        >>> output = block_sparse_attention(
+        >>> output = blocksparse_attention(
         ...     query, key, value,
         ...     logit_soft_cap=50.0,
         ...     softmax_scale=0.125
