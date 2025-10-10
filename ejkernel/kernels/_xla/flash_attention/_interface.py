@@ -72,7 +72,164 @@ def _dtype_to_code(dtype) -> int:
         raise ValueError("logits_dtype must be one of float16, bfloat16, float32, float64.") from e
 
 
-@jax.custom_vjp
+def _make_core_func(
+    precision_code_val: int,
+    logits_dtype_code_val: int,
+    chunk_size_q_val: int,
+    chunk_size_k_val: int,
+    normalize_output_val: bool,
+    causal_val: bool,
+    dropout_prob_val: float,
+):
+    """Create a specialized core function for given static parameters."""
+    precision = _CODE_TO_PREC[precision_code_val]
+    logits_dtype = _CODE_TO_DTYPE[logits_dtype_code_val]
+
+    @jax.custom_vjp
+    def _flash_attention_core_specialized(
+        query: chex.Array,
+        key: chex.Array,
+        value: chex.Array,
+        bias: chex.Array | None,
+        attention_mask: chex.Array | None,
+        softmax_aux: chex.Array | None,
+        sliding_window: tuple[int, int] | None,
+        softmax_scale: float,
+        logits_soft_cap: float | None,
+        dropout_key: PRNGKeyArray | None,
+    ) -> chex.Array:
+        """Core flash attention with custom_vjp and attention sinks."""
+        return _flash_attention_fwd(
+            query,
+            key,
+            value,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            bias=bias,
+            mask=attention_mask,
+            window=sliding_window,
+            chunk_size_q=chunk_size_q_val,
+            chunk_size_k=chunk_size_k_val,
+            normalize_output=normalize_output_val,
+            precision=precision,
+            logits_dtype=logits_dtype,
+            softmax_aux=softmax_aux,
+            causal=causal_val,
+            dropout_prob=dropout_prob_val,
+            dropout_key=dropout_key,
+        )
+
+    def _fwd(
+        query: chex.Array,
+        key: chex.Array,
+        value: chex.Array,
+        bias: chex.Array | None,
+        attention_mask: chex.Array | None,
+        softmax_aux: chex.Array | None,
+        sliding_window: tuple[int, int] | None,
+        softmax_scale: float,
+        logits_soft_cap: float | None,
+        dropout_key: PRNGKeyArray | None,
+    ):
+        """Forward pass for custom_vjp: compute y and stash residuals."""
+        y = _flash_attention_fwd(
+            query,
+            key,
+            value,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            bias=bias,
+            mask=attention_mask,
+            window=sliding_window,
+            chunk_size_q=chunk_size_q_val,
+            chunk_size_k=chunk_size_k_val,
+            normalize_output=normalize_output_val,
+            precision=precision,
+            logits_dtype=logits_dtype,
+            softmax_aux=softmax_aux,
+            causal=causal_val,
+            dropout_prob=dropout_prob_val,
+            dropout_key=dropout_key,
+        )
+
+        ctx = (
+            bias,
+            attention_mask,
+            softmax_aux,
+            sliding_window,
+            softmax_scale,
+            logits_soft_cap,
+            chunk_size_q_val,
+            chunk_size_k_val,
+            normalize_output_val,
+            query,
+            key,
+            value,
+            causal_val,
+            dropout_prob_val,
+            dropout_key,
+        )
+        return y, ctx
+
+    def _bwd(ctx, g):
+        """Backward pass wrapper for custom_vjp."""
+        (
+            bias,
+            attention_mask,
+            softmax_aux,
+            sliding_window,
+            softmax_scale,
+            logits_soft_cap,
+            chunk_size_q_val_,
+            chunk_size_k_val_,
+            normalize_output_val_,
+            query,
+            key,
+            value,
+            causal_val_,
+            dropout_prob_val_,
+            dropout_key,
+        ) = ctx
+
+        dq, dk, dv = _flash_attention_bwd(
+            bias=bias,
+            mask=attention_mask,
+            softmax_aux=softmax_aux,
+            window=sliding_window,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            chunk_size_q=chunk_size_q_val_,
+            chunk_size_k=chunk_size_k_val_,
+            normalize_output=normalize_output_val_,
+            precision_code=precision_code_val,
+            logits_dtype_code=logits_dtype_code_val,
+            causal=causal_val_,
+            dropout_prob=dropout_prob_val_,
+            dropout_key=dropout_key,
+            res=(query, key, value),
+            g=g,
+        )
+
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+    _flash_attention_core_specialized.defvjp(_fwd, _bwd)
+    return _flash_attention_core_specialized
+
+
+_CORE_FUNC_CACHE = {}
+
+
 def _flash_attention_core(
     query: chex.Array,
     key: chex.Array,
@@ -80,10 +237,9 @@ def _flash_attention_core(
     bias: chex.Array | None,
     attention_mask: chex.Array | None,
     softmax_aux: chex.Array | None,
-    window_left: int,
-    window_right: int,
-    scale: float,
-    softcap: float,
+    sliding_window: tuple[int, int] | None,
+    softmax_scale: float,
+    logits_soft_cap: float | None,
     chunk_size_q: int,
     chunk_size_k: int,
     normalize_output: bool,
@@ -93,151 +249,25 @@ def _flash_attention_core(
     dropout_prob: float,
     dropout_key: PRNGKeyArray | None,
 ) -> chex.Array:
-    """Core flash attention with custom_vjp and attention sinks."""
-    sliding_window = None if (window_left < 0 or window_right < 0) else (window_left, window_right)
-    precision = _CODE_TO_PREC[precision_code]
-    logits_dtype = _CODE_TO_DTYPE[logits_dtype_code]
-    logits_soft_cap = None if (softcap < 0) else softcap
+    """Core flash attention dispatcher."""
+    cache_key = (precision_code, logits_dtype_code, chunk_size_q, chunk_size_k, normalize_output, causal, dropout_prob)
+    if cache_key not in _CORE_FUNC_CACHE:
+        _CORE_FUNC_CACHE[cache_key] = _make_core_func(
+            precision_code, logits_dtype_code, chunk_size_q, chunk_size_k, normalize_output, causal, dropout_prob
+        )
 
-    if scale < 0:
-        D = query.shape[-1]
-        scale = 1.0 / jnp.sqrt(float(D))
-
-    return _flash_attention_fwd(
+    return _CORE_FUNC_CACHE[cache_key](
         query,
         key,
         value,
-        scale=scale,
-        logits_soft_cap=logits_soft_cap,
-        bias=bias,
-        mask=attention_mask,
-        window=sliding_window,
-        chunk_size_q=chunk_size_q,
-        chunk_size_k=chunk_size_k,
-        normalize_output=normalize_output,
-        precision=precision,
-        logits_dtype=logits_dtype,
-        softmax_aux=softmax_aux,
-        causal=causal,
-        dropout_prob=dropout_prob,
-        dropout_key=dropout_key,
-    )
-
-
-def _flash_attention_core_fwd(
-    query: chex.Array,
-    key: chex.Array,
-    value: chex.Array,
-    bias: chex.Array | None,
-    attention_mask: chex.Array | None,
-    softmax_aux: chex.Array | None,
-    window_left: int,
-    window_right: int,
-    scale: float,
-    softcap: float,
-    chunk_size_q: int,
-    chunk_size_k: int,
-    normalize_output: bool,
-    precision_code: int,
-    logits_dtype_code: int,
-    causal: bool,
-    dropout_prob: float,
-    dropout_key: PRNGKeyArray | None,
-):
-    """Forward pass for custom_vjp."""
-    y = _flash_attention_core(
-        query,
-        key,
-        value,
-        bias,
-        attention_mask,
-        softmax_aux,
-        window_left,
-        window_right,
-        scale,
-        softcap,
-        chunk_size_q,
-        chunk_size_k,
-        normalize_output,
-        precision_code,
-        logits_dtype_code,
-        causal,
-        dropout_prob,
-        dropout_key,
-    )
-
-    sliding_window = None if (window_left < 0 or window_right < 0) else (window_left, window_right)
-    logits_soft_cap = None if (softcap < 0) else softcap
-
-    if scale < 0:
-        D = query.shape[-1]
-        scale = 1.0 / jnp.sqrt(float(D))
-
-    ctx = (
         bias,
         attention_mask,
         softmax_aux,
         sliding_window,
-        scale,
+        softmax_scale,
         logits_soft_cap,
-        chunk_size_q,
-        chunk_size_k,
-        normalize_output,
-        precision_code,
-        logits_dtype_code,
-        query,
-        key,
-        value,
-        causal,
-        dropout_prob,
         dropout_key,
     )
-    return y, ctx
-
-
-def _flash_attention_core_bwd_wrapper(ctx, g):
-    """Backward pass wrapper for custom_vjp."""
-    (
-        bias,
-        attention_mask,
-        softmax_aux,
-        sliding_window,
-        scale,
-        logits_soft_cap,
-        chunk_size_q,
-        chunk_size_k,
-        normalize_output,
-        precision_code,
-        logits_dtype_code,
-        query,
-        key,
-        value,
-        causal,
-        dropout_prob,
-        dropout_key,
-    ) = ctx
-
-    return _flash_attention_bwd(
-        bias,
-        attention_mask,
-        softmax_aux,
-        sliding_window,
-        scale,
-        logits_soft_cap,
-        chunk_size_q,
-        chunk_size_k,
-        normalize_output,
-        precision_code,
-        logits_dtype_code,
-        causal,
-        dropout_prob,
-        dropout_key,
-        (query, key, value),
-        g,
-    )
-
-
-_flash_attention_core.defvjp(_flash_attention_core_fwd, _flash_attention_core_bwd_wrapper)
 
 
 @kernel_registry.register("flash_attention", Platform.XLA, Backend.ANY)
@@ -289,50 +319,6 @@ def flash_attention(
     This implementation uses online softmax to compute attention in chunks,
     reducing memory usage from O(N²) to O(N). Supports sliding window attention,
     logit soft capping, grouped query attention (GQA/MQA), and attention sinks.
-
-    Args:
-        query: Query array of shape [B, Tq, H, D]
-        key: Key array of shape [B, Tk, Hk, D] where Hk can be 1 (MQA) or H (MHA)
-        value: Value array of shape [B, Tk, Hk, d]
-        bias: Optional bias array broadcastable to [B, H, Tq, Tk]
-        attention_mask: Optional boolean mask array broadcastable to [B, H, Tq, Tk]
-        sliding_window: Optional sliding window size. Can be:
-            - int: symmetric window (n tokens on each side)
-            - tuple (left, right): asymmetric window
-            - None: no window (full attention)
-        scale: Optional softmax scale. If None, uses 1/sqrt(D)
-        logits_soft_cap: Optional soft cap value for logits to prevent overflow
-        chunk_size_q: Query chunk size for memory efficiency
-        chunk_size_k: Key chunk size for memory efficiency
-        normalize_output: Whether to normalize output by softmax denominator
-        precision: Matrix multiplication precision
-        logits_dtype: Dtype for logits computation (promotes to at least float32)
-        softmax_aux: Optional attention sink logits of shape [H, num_sinks] or [num_sinks].
-            These are auxiliary logits that participate in softmax normalization but
-            don't contribute to output, allowing the model to absorb probability mass.
-
-    Returns:
-        Output array of shape [B, Tq, H, d]
-
-    Examples:
-        >>>
-        >>> y = flash_attention(q, key, v)
-
-        >>>
-        >>> y = flash_attention(q, key, value, sliding_window=(T-1, 0))
-
-        >>>
-        >>> y = flash_attention(q, k[:, :, :1], v[:, :, :1], logits_soft_cap=20.0)
-
-        >>>
-        >>> sinks = jax.random.normal(key, (H, 4))
-        >>> y = flash_attention(q, key, value, softmax_aux=sinks)
-
-    Note:
-        Attention sinks are learnable parameters that participate in the softmax
-        normalization but don't produce output. They allow the model to "dump"
-        attention probability mass, which can improve numerical stability and help
-        the model learn better attention distributions.
     """
     if kv_segment_ids is not None:
         raise NotImplementedError("`kv_segment_ids` is not implemented in xla!")
@@ -350,23 +336,20 @@ def flash_attention(
         dropout_key = jax.random.PRNGKey(dropout_seed)
 
     if isinstance(sliding_window, int):
-        window_left = window_right = int(sliding_window)
+        window_tuple = (int(sliding_window), int(sliding_window))
     elif sliding_window is None:
-        window_left = window_right = -1
+        window_tuple = None
     else:
         window_left, window_right = sliding_window
         if window_left < 0 or window_right < 0:
             raise ValueError("Window bounds must be non-negative.")
-        window_left = int(window_left)
-        window_right = int(window_right)
+        window_tuple = (int(window_left), int(window_right))
 
     if softmax_scale is None:
         D = query.shape[-1]
         scale_val = float(1.0 / math.sqrt(D))
     else:
         scale_val = float(softmax_scale)
-
-    softcap = float(logits_soft_cap) if logits_soft_cap is not None else -1.0
 
     precision_code = _precision_to_code(precision)
     logits_dtype_code = _dtype_to_code(logits_dtype)
@@ -378,10 +361,9 @@ def flash_attention(
         bias,
         attention_mask,
         softmax_aux,
-        window_left,
-        window_right,
+        window_tuple,
         scale_val,
-        softcap,
+        logits_soft_cap,
         int(chunk_size_q),
         int(chunk_size_k),
         bool(normalize_output),

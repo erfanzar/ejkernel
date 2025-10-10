@@ -13,2134 +13,1390 @@
 # limitations under the License.
 
 
-import math
-from typing import Any
-
+import chex
 import jax
+import jax.numpy as jnp
 import triton
 import triton.language as tl
-from jax import numpy as jnp
-from jaxtyping import Array, Float, Int
-from triton import Config
+from jaxtyping import ArrayLike
 
-from ejkernel.callib import triton_call
-from ejkernel.utils import dtype_index, get_sharding, get_strides
+from ejkernel.callib import cdiv, next_power_of_2, strides_from_shape, triton_call
+from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask
 
-from ._utilities import attention_pack_from_cu_static, attention_unpack_with_static_shape, padded_load
-
-
-def config_prune_kernel(
-    configs: list[Config],
-    named_args: dict[str, Any],
-    **kwargs: Any,
-) -> list[Config]:
-    """Prune autotuning configurations for backward pass kernel.
-
-    Filters out configurations where block dimensions exceed sequence lengths.
-    Falls back to small default configs if all configs are pruned.
-
-    Args:
-        configs: List of triton autotuning configurations
-        named_args: Dictionary with kernel arguments including QSeq and KSeq
-        **kwargs: Additional unused arguments
-
-    Returns:
-        list[Config]: Valid configurations for the given problem size
-    """
-    kept_configs = []
-    for config in configs:
-        largest_m = (
-            max(
-                config.kwargs["BLOCK_M1"],
-                config.kwargs["BLOCK_M2"],
-            )
-            > named_args["QSeq"]
-        )
-        largest_n = (
-            max(
-                config.kwargs["BLOCK_N1"],
-                config.kwargs["BLOCK_N2"],
-            )
-            > named_args["KSeq"]
-        )
-        if largest_m or largest_n:
-            pass
-        else:
-            kept_configs.append(config)
-    if kept_configs:
-        return kept_configs
-    return [
-        Config(
-            {
-                "BLOCK_M1": 32,
-                "BLOCK_N1": 32,
-                "BLOCK_M2": 32,
-                "BLOCK_N2": 32,
-            },
-            num_warps=4,
-            num_stages=0,
-        ),
-        Config(
-            {
-                "BLOCK_M1": 32,
-                "BLOCK_N1": 32,
-                "BLOCK_M2": 32,
-                "BLOCK_N2": 32,
-            },
-            num_warps=2,
-            num_stages=0,
-        ),
-    ]
+from ._utilities import make_causal_mask, make_segment_mask
 
 
 @triton.autotune(
     configs=[
-        Config({"BLOCK_M": 16}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M": 32}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M": 64}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M": 128}, num_warps=4, num_stages=0),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
     ],
-    key=["CQSeq", "DRuntime"],
+    key=["SEQ_LEN", "HEAD_DIM"],
 )
 @triton.jit
-def _attn_bwd_preprocess(
+def blocksparse_attn_bwd_preprocess(
     Po,
     Do,
     stride_oz,
-    stride_om,
     stride_oh,
-    stride_dez,
-    stride_dem,
-    stride_deh,
-    nheads,
-    QSeq,
-    max_seqlen_q_rounded,
-    cum_seqlens_q,
-    headdim,
-    CQSeq,
-    DRuntime,
-    Delta,
-    VARLEN: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_HEADDIM: tl.constexpr,
+    stride_om,
+    stride_ok,
+    delta,
+    NUM_HEADS: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
-    """Preprocessing kernel for backward pass gradient computation.
+    """Preprocessing kernel for block-sparse attention backward pass.
 
-    Computes delta values needed for efficient gradient calculation by
-    combining output gradients with output values.
+    Computes delta values (element-wise product sum of output and output gradients)
+    needed for the backward pass gradient computation.
 
-    This kernel runs before the main backward pass to prepare intermediate
-    values that are reused across all attention blocks.
+    Args:
+        Po: Forward pass output tensor
+        Do: Output gradient tensor
+        stride_oz, stride_oh, stride_om, stride_ok: Output strides
+        delta: Output buffer for delta values
+        NUM_HEADS: Number of attention heads (constexpr)
+        SEQ_LEN: Sequence length (constexpr)
+        BLOCK_SIZE: Block size for computation (constexpr)
+        HEAD_DIM: Head dimension (constexpr)
     """
-    start_m = tl.program_id(0)
-    off_zh = tl.program_id(1)
-    off_z = off_zh // nheads
-    off_h = off_zh % nheads
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_HEADDIM)
+    block_id = tl.program_id(0).to(tl.int64)
+    batch_size_id = tl.program_id(1).to(tl.int64)
+    num_heads_id = tl.program_id(2).to(tl.int64)
 
-    if VARLEN:
-        start_seqlen_q = tl.load(cum_seqlens_q + off_z)
-        actual_seqlen_q = tl.load(cum_seqlens_q + off_z + 1) - start_seqlen_q
-        cu_seq_start_q = tl.load(cum_seqlens_q + off_z)
-        off_z = 0
-    else:
-        actual_seqlen_q = QSeq
-        cu_seq_start_q = 0
+    init_offset = batch_size_id * stride_oz + num_heads_id * stride_oh
 
-    o_ptrs = (
-        Po
-        + off_z * stride_oz
-        + off_h * stride_oh
-        + cu_seq_start_q * stride_om
-        + offs_m[:, None] * stride_om
-        + offs_d[None, :]
-    )
-    do_ptrs = (
-        Do
-        + off_z * stride_dez
-        + off_h * stride_deh
-        + cu_seq_start_q * stride_dem
-        + offs_m[:, None] * stride_dem
-        + offs_d[None, :]
-    )
+    block_arange = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    head_dim_arange = tl.arange(0, HEAD_DIM)
 
-    mask = (offs_m[:, None] < actual_seqlen_q) & (offs_d[None, :] < headdim)
-    o = tl.load(o_ptrs, mask=mask, other=0.0).to(tl.float32)
-    do = tl.load(do_ptrs, mask=mask, other=0.0).to(tl.float32)
-    delta = tl.sum(o * do, axis=1)
-    tl.store(Delta + off_zh * max_seqlen_q_rounded + offs_m, delta)
+    offsets = init_offset + block_arange[:, None] * stride_om + head_dim_arange[None, :] * stride_ok
+
+    valid = block_arange < SEQ_LEN
+    out = tl.load(Po + offsets, mask=valid[:, None], other=0.0)
+    dout = tl.load(Do + offsets, mask=valid[:, None], other=0.0).to(tl.float32)
+
+    delta_val = tl.sum(out * dout, axis=1)
+
+    delta_offsets = batch_size_id * (NUM_HEADS * SEQ_LEN) + num_heads_id * SEQ_LEN
+    delta_offsets += block_arange
+
+    tl.store(delta + delta_offsets, delta_val, mask=valid)
 
 
 @triton.jit
-def _attn_bwd_dkdv(
-    index_start_m,
-    k,
-    v,
+def _blocksparse_attn_bwd_dkdv_inner(
     dk,
     dv,
-    M,
-    D,
-    offs_m,
-    offs_n,
-    offs_d,
-    q_ptrs,
-    bias_ptrs,
-    dropout_offs,
-    do_ptrs,
-    softmax_scale,
-    dropout_prob,
-    dropout_seed,
-    stride_qm,
-    stride_bm,
-    stride_dom,
-    actual_seqlen_q,
-    actual_seqlen_k,
-    fully_masked_lines,
-    headdim,
-    window_left,
-    window_right,
+    kv_segment_ids,
+    kv_positions_block,
+    query,
+    q_segment_ids,
+    q_positions,
+    dout,
+    lse,
+    delta,
+    key,
+    value,
+    qk_scale,
     logits_soft_cap,
-    softmax_aux_ptrs,
-    num_sinks,
-    MASKED: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    BIAS_ON: tl.constexpr,
-    BOOL_BIAS: tl.constexpr,
-    USE_DROPOUT: tl.constexpr,
-    PAD_ROWS: tl.constexpr,
-    PAD_COLS: tl.constexpr,
-    HEADS_PADDED: tl.constexpr,
-    SLIDING: tl.constexpr,
+    softmax_scale,
+    stride_qm,
+    stride_qk,
+    stride_om,
+    stride_ok,
+    stride_lm,
+    lower_bound,
+    upper_bound,
+    BLOCK_M: tl.constexpr,
+    QK_HEAD_DIM: tl.constexpr,
+    QK_HEAD_DIM_PAD: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
+    EVEN_QK_HEAD_DIMS: tl.constexpr,
+    query_global_offset: tl.constexpr,
+    kv_span: tl.constexpr,
+    USE_CAUSAL: tl.constexpr,
+    USE_SEGMENT_MASK: tl.constexpr,
     SOFTCAP: tl.constexpr,
-    USE_SINKS: tl.constexpr,
 ):
-    BIG_NEG: tl.constexpr = -2147483648
+    """Inner loop for computing dK and dV gradients in backward pass.
 
-    q_ptrs = q_ptrs + index_start_m * stride_qm
-    do_ptrs = do_ptrs + index_start_m * stride_dom
-    if BIAS_ON:
-        bias_ptrs = bias_ptrs + index_start_m * stride_bm
-    if USE_DROPOUT:
-        dropout_offs += index_start_m * actual_seqlen_k
+    Accumulates gradients for key and value tensors across query blocks.
+    When SOFTCAP is enabled, applies the Jacobian of the tanh soft cap function
+    to ensure correct gradients.
 
-    offs_m_curr = index_start_m + offs_m
+    Args:
+        dk: Accumulated key gradients [BLOCK_N, QK_HEAD_DIM]
+        dv: Accumulated value gradients [BLOCK_N, V_HEAD_DIM]
+        kv_segment_ids: KV segment IDs [BLOCK_N]
+        kv_positions_block: KV positions [BLOCK_N]
+        query: Query tensor pointer
+        q_segment_ids: Query segment IDs pointer
+        q_positions: Query positions pointer
+        dout: Output gradients pointer
+        lse: Log-sum-exp from forward pass pointer
+        delta: Delta values for softmax gradients pointer
+        key: Key tensor pointer
+        value: Value tensor pointer
+        qk_scale: QK scaling factor
+        logits_soft_cap: Soft cap value. When SOFTCAP is True, Jacobian
+            (1 - tanh²(x)) is applied to gradients for proper backpropagation
+        softmax_scale: Softmax scaling factor
+        stride_qm, stride_qk: Query strides
+        stride_om, stride_ok: Output gradient strides
+        stride_lm: LSE stride
+        lower_bound: Lower query block index
+        upper_bound: Upper query block index
+        BLOCK_M: Query block size (constexpr)
+        QK_HEAD_DIM: Query/key head dimension (constexpr)
+        QK_HEAD_DIM_PAD: Padded head dimension (constexpr)
+        V_HEAD_DIM: Value head dimension (constexpr)
+        EVEN_QK_HEAD_DIMS: Whether head dims are power of 2 (constexpr)
+        query_global_offset: Global query offset (constexpr)
+        kv_span: KV indices in block (constexpr)
+        USE_CAUSAL: Enable causal masking (constexpr)
+        USE_SEGMENT_MASK: Enable segment masking (constexpr)
+        SOFTCAP: Enable logit soft capping (constexpr)
 
-    q = padded_load(
-        q_ptrs,
-        offs_m_curr,
-        offs_d,
-        PA0=PAD_ROWS or HEADS_PADDED,
-        PA1=PAD_ROWS or HEADS_PADDED,
-        LA0=actual_seqlen_q,
-        LA1=headdim,
-    )
-    me_i = tl.load(M + offs_m_curr)
+    Returns:
+        Updated (dk, dv) tuple
+    """
+    query_arange = lower_bound * BLOCK_M + tl.arange(0, BLOCK_M)
+    value_head_dim_arange = tl.arange(0, V_HEAD_DIM)
+    qk_head_dim_pad_arange = tl.arange(0, QK_HEAD_DIM_PAD)
 
-    if BIAS_ON:
-        bias = padded_load(
-            bias_ptrs,
-            offs_m_curr,
-            offs_n,
-            PA0=PAD_ROWS or HEADS_PADDED,
-            PA1=PAD_ROWS or HEADS_PADDED,
-            LA0=actual_seqlen_q,
-            LA1=actual_seqlen_k,
-        )
+    query_transpose_ptr = query + query_arange[None, :] * stride_qm + qk_head_dim_pad_arange[:, None] * stride_qk
+    dout += query_arange[:, None] * stride_om + value_head_dim_arange[None, :] * stride_ok
 
-    qk = tl.dot(q, tl.trans(k)).to(tl.float32)
+    lse_offset = query_arange * stride_lm
+    query_offset = 0
+    output_offset = 0
 
-    if BIAS_ON:
-        if BOOL_BIAS:
-            qk = tl.where(bias, qk, BIG_NEG)
+    for query_block_id in range(lower_bound, upper_bound):
+        if EVEN_QK_HEAD_DIMS:
+            query_transpose = tl.load(query_transpose_ptr + query_offset)
         else:
-            qk += bias / softmax_scale
+            qk_head_dim_mask = qk_head_dim_pad_arange[:, None] < QK_HEAD_DIM
+            query_transpose = tl.load(query_transpose_ptr + query_offset, mask=qk_head_dim_mask, other=0.0)
 
-    offs_n_causal = offs_n - actual_seqlen_k + actual_seqlen_q
-    if MASKED:
-        if PAD_COLS:
-            if IS_CAUSAL:
-                qk = tl.where(
-                    tl.minimum(actual_seqlen_q - 1, offs_m_curr)[:, None] >= offs_n_causal[None, :],
-                    qk,
-                    float("-inf"),
-                )
+        attn_weights_transpose = tl.dot(key, query_transpose)
+
+        query_seq_len_offset = query_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+
+        if USE_SEGMENT_MASK:
+            query_segment_ids_block = tl.load(q_segment_ids + query_seq_len_offset)
+            mask = make_segment_mask(query_segment_ids_block, kv_segment_ids, True)
+        if USE_CAUSAL:
+            query_positions_block = tl.load(q_positions + query_seq_len_offset)
+            causal_mask = make_causal_mask(query_positions_block, kv_positions_block, True)
+            if USE_SEGMENT_MASK:
+                mask = causal_mask & mask
             else:
-                qk = tl.where(actual_seqlen_q - 1 >= offs_n_causal[None, :], qk, float("-inf"))
-        elif IS_CAUSAL:
-            qk = tl.where(offs_m_curr[:, None] >= offs_n_causal[None, :], qk, float("-inf"))
+                mask = causal_mask
 
-    if SLIDING:
-        shift = actual_seqlen_k - actual_seqlen_q
-        j_aligned = offs_n[None, :] - shift
-        i_idx = offs_m_curr[:, None]
-        in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
-        qk = tl.where(in_window, qk, float("-inf"))
+        if SOFTCAP:
+            LN2: tl.constexpr = 0.6931471824645996
+            s = attn_weights_transpose * softmax_scale
+            x = s / logits_soft_cap
+            exp_2x = tl.exp(2.0 * x)
+            tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+            qk_after = (logits_soft_cap * tanh_x) * LN2
+            jac = softmax_scale * (1.0 - tanh_x * tanh_x)
+        else:
+            qk_after = (attn_weights_transpose * qk_scale).to(tl.float32)
+            jac = qk_scale
 
-    if SOFTCAP:
-        s = qk * softmax_scale
-        x = s / logits_soft_cap
-        exp_2x = tl.exp(2.0 * x)
-        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
-        qk_after = logits_soft_cap * tanh_x
-        jac = softmax_scale * (1.0 - tanh_x * tanh_x)
-    else:
-        qk_after = qk * softmax_scale
-        jac = softmax_scale
+        lse_val = tl.load(lse + lse_offset)
+        pT = tl.math.exp2(qk_after - lse_val[None, :])
 
-    tl.debug_barrier()
+        if USE_SEGMENT_MASK or USE_CAUSAL:
+            pT = tl.where(mask, pT, 0.0)
 
-    p = tl.exp(qk_after - me_i[:, None])
+        dout_val = tl.load(dout + output_offset)
 
-    if MASKED and (fully_masked_lines > 0):
-        p = tl.where(offs_m_curr[:, None] < fully_masked_lines, 0, p)
+        dv += tl.dot(pT.to(dout_val.type.element_ty), dout_val)
 
-    if USE_DROPOUT:
-        dropout_mask = tl.rand(dropout_seed, dropout_offs) > dropout_prob
-        p = tl.where(dropout_mask, p, 0.0)
+        delta_val = tl.load(delta + lse_offset)
 
-    do = padded_load(
-        do_ptrs,
-        offs_m_curr,
-        offs_d,
-        PA0=PAD_ROWS,
-        PA1=HEADS_PADDED,
-        LA0=actual_seqlen_q,
-        LA1=headdim,
-    ).to(tl.float32)
+        dpT = tl.dot(value, tl.trans(dout_val))
+        dsT = pT * (dpT - delta_val[None, :])
+        dsT = (dsT * jac).to(query.type.element_ty)
 
-    dv += tl.dot(tl.trans(p), do)
-    dp = tl.dot(do, tl.trans(v.to(tl.float32)))
-    Di = tl.load(D + offs_m_curr)
-    ds = (p * (dp - Di[:, None]) * jac).to(q.dtype)
-    dk += tl.dot(tl.trans(ds), q)
+        dk += tl.dot(dsT, tl.trans(query_transpose))
+
+        query_offset += BLOCK_M * stride_qm
+        output_offset += BLOCK_M * stride_om
+        lse_offset += BLOCK_M * stride_lm
 
     return dk, dv
 
 
 @triton.jit
-def _attn_bwd_block_dkdv(
-    index_start_n,
-    Q,
-    K,
-    V,
-    B,
-    Dropout,
-    Do,
-    Dk,
-    Dv,
-    M,
-    D,
-    softmax_scale,
-    dropout_prob,
-    dropout_seed,
-    stride_qm,
-    stride_kn,
-    stride_vn,
-    stride_bm,
-    stride_dom,
-    stride_dkn,
-    stride_dvn,
-    actual_seqlen_q,
-    actual_seqlen_k,
-    headdim,
-    window_left,
-    window_right,
-    logits_soft_cap,
-    softmax_aux_ptrs,
-    num_sinks,
-    IS_CAUSAL: tl.constexpr,
-    BIAS_ON: tl.constexpr,
-    BOOL_BIAS: tl.constexpr,
-    USE_DROPOUT: tl.constexpr,
-    PAD_COLS: tl.constexpr,
-    HEADS_PADDED: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_HEADDIM: tl.constexpr,
-    SLIDING: tl.constexpr,
-    SOFTCAP: tl.constexpr,
-    USE_SINKS: tl.constexpr,
-):
-    index_begin_m = max(index_start_n + actual_seqlen_q - actual_seqlen_k, 0) if IS_CAUSAL else 0
-    index_begin_m = (index_begin_m // BLOCK_M) * BLOCK_M
-    index_end_m = actual_seqlen_q
-
-    fully_masked_lines = (actual_seqlen_q - actual_seqlen_k) if IS_CAUSAL else 0
-    if (index_begin_m >= actual_seqlen_q) or (index_start_n >= actual_seqlen_k):
-        return
-
-    offs_n = index_start_n + tl.arange(0, BLOCK_N)
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_HEADDIM)
-
-    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :])
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
-    dk_ptrs = Dk + (offs_n[:, None] * stride_dkn + offs_d[None, :])
-    dv_ptrs = Dv + (offs_n[:, None] * stride_dvn + offs_d[None, :])
-    do_ptrs = Do + (offs_m[:, None] * stride_dom + offs_d[None, :])
-    bias_ptrs = B + (offs_m[:, None] * stride_bm + offs_n[None, :]) if BIAS_ON else None
-    dropout_offs = Dropout + offs_m[:, None] * actual_seqlen_k + offs_n[None, :] if USE_DROPOUT else None
-
-    dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-    dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-    k = padded_load(k_ptrs, offs_n, offs_d, PA0=PAD_COLS, PA1=HEADS_PADDED, LA0=actual_seqlen_k, LA1=headdim)
-    v = padded_load(v_ptrs, offs_n, offs_d, PA0=PAD_COLS, PA1=HEADS_PADDED, LA0=actual_seqlen_k, LA1=headdim)
-
-    fr = max(0, index_start_n + BLOCK_N - 1 + actual_seqlen_q - actual_seqlen_k)
-    fb = BLOCK_M * ((min(fr, actual_seqlen_q) + BLOCK_M - 1) // BLOCK_M)
-    num_masked_blocks = (fb - index_begin_m) // BLOCK_M if IS_CAUSAL else 0
-    index_next_start_m = index_begin_m
-
-    if num_masked_blocks > 0:
-        for _ in range(0, num_masked_blocks):
-            dk, dv = _attn_bwd_dkdv(
-                index_next_start_m,
-                k,
-                v,
-                dk,
-                dv,
-                M,
-                D,
-                offs_m,
-                offs_n,
-                offs_d,
-                q_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                do_ptrs,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_qm,
-                stride_bm,
-                stride_dom,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                fully_masked_lines,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                MASKED=True,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_ROWS=True,
-                PAD_COLS=PAD_COLS,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-            )
-            index_next_start_m += BLOCK_M
-
-    if index_next_start_m < index_end_m:
-        for index_start_m in range(index_next_start_m, index_end_m, BLOCK_M):
-            dk, dv = _attn_bwd_dkdv(
-                index_start_m,
-                k,
-                v,
-                dk,
-                dv,
-                M,
-                D,
-                offs_m,
-                offs_n,
-                offs_d,
-                q_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                do_ptrs,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_qm,
-                stride_bm,
-                stride_dom,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                fully_masked_lines,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                MASKED=False,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_ROWS=True,
-                PAD_COLS=PAD_COLS,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-            )
-
-    if HEADS_PADDED:
-        if PAD_COLS:
-            tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < actual_seqlen_k) & (offs_d[None, :] < headdim))
-            tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < actual_seqlen_k) & (offs_d[None, :] < headdim))
-        else:
-            tl.store(dk_ptrs, dk, mask=offs_d[None, :] < headdim)
-            tl.store(dv_ptrs, dv, mask=offs_d[None, :] < headdim)
-    else:
-        if PAD_COLS:
-            tl.store(dk_ptrs, dk, mask=offs_n[:, None] < actual_seqlen_k)
-            tl.store(dv_ptrs, dv, mask=offs_n[:, None] < actual_seqlen_k)
-        else:
-            tl.store(dk_ptrs, dk)
-            tl.store(dv_ptrs, dv)
-
-
-@triton.jit
-def _attn_bwd_dq(
-    index_start_n,
-    q,
+def _blocksparse_attn_bwd_dq_inner(
     dq,
-    do,
-    me_i,
-    de_i,
-    offs_m,
-    offs_n,
-    offs_d,
-    k_ptrs,
-    v_ptrs,
-    bias_ptrs,
-    dropout_offs,
-    softmax_scale,
-    dropout_prob,
-    dropout_seed,
-    stride_kn,
-    stride_vn,
-    actual_seqlen_q,
-    actual_seqlen_k,
-    headdim,
-    window_left,
-    window_right,
+    q_segment_ids,
+    q_positions,
+    key,
+    value,
+    kv_segment_ids,
+    kv_positions,
+    query,
+    dout,
+    lse,
+    delta,
     logits_soft_cap,
-    softmax_aux_ptrs,
-    num_sinks,
-    MASKED: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    BIAS_ON: tl.constexpr,
-    BOOL_BIAS: tl.constexpr,
-    USE_DROPOUT: tl.constexpr,
-    PAD_COLS: tl.constexpr,
-    HEADS_PADDED: tl.constexpr,
-    SLIDING: tl.constexpr,
+    softmax_scale,
+    stride_kn,
+    stride_kk,
+    stride_vn,
+    stride_vk,
+    lower_bound,
+    upper_bound,
+    BLOCK_N: tl.constexpr,
+    QK_HEAD_DIM: tl.constexpr,
+    QK_HEAD_DIM_PAD: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
+    EVEN_QK_HEAD_DIMS: tl.constexpr,
+    kv_global_offset: tl.constexpr,
+    query_span: tl.constexpr,
+    USE_CAUSAL: tl.constexpr,
+    USE_SEGMENT_MASK: tl.constexpr,
     SOFTCAP: tl.constexpr,
-    USE_SINKS: tl.constexpr,
 ):
-    BIG_NEG: tl.constexpr = -2147483648
+    """Inner loop for computing dQ gradients in backward pass.
 
-    k_ptrs = k_ptrs + index_start_n * stride_kn
-    v_ptrs = v_ptrs + index_start_n * stride_vn
-    offs_n_curr = index_start_n + offs_n
-    if BIAS_ON:
-        bias_ptrs += index_start_n
-    if USE_DROPOUT:
-        dropout_offs += index_start_n
+    Accumulates gradients for query tensor across KV blocks.
+    When SOFTCAP is enabled, applies the Jacobian of the tanh soft cap function
+    to ensure correct gradients.
 
-    k = padded_load(k_ptrs, offs_n_curr, offs_d, PA0=PAD_COLS, PA1=HEADS_PADDED, LA0=actual_seqlen_k, LA1=headdim)
-    v = padded_load(v_ptrs, offs_n_curr, offs_d, PA0=PAD_COLS, PA1=HEADS_PADDED, LA0=actual_seqlen_k, LA1=headdim)
-    if BIAS_ON:
-        bias = padded_load(
-            bias_ptrs, offs_m, offs_n_curr, PA0=True, PA1=PAD_COLS, LA0=actual_seqlen_q, LA1=actual_seqlen_k
-        )
+    Args:
+        dq: Accumulated query gradients [BLOCK_M, QK_HEAD_DIM]
+        q_segment_ids: Query segment IDs [BLOCK_M]
+        q_positions: Query positions [BLOCK_M]
+        key: Key tensor pointer
+        value: Value tensor pointer
+        kv_segment_ids: KV segment IDs pointer
+        kv_positions: KV positions pointer
+        query: Query tensor pointer
+        dout: Output gradients pointer
+        lse: Log-sum-exp from forward pass pointer
+        delta: Delta values for softmax gradients pointer
+        logits_soft_cap: Soft cap value. When SOFTCAP is True, Jacobian
+            (1 - tanh²(x)) is applied to gradients for proper backpropagation
+        softmax_scale: Softmax scaling factor
+        stride_kn, stride_kk: Key strides
+        stride_vn, stride_vk: Value strides
+        lower_bound: Lower KV block index
+        upper_bound: Upper KV block index
+        BLOCK_N: KV block size (constexpr)
+        QK_HEAD_DIM: Query/key head dimension (constexpr)
+        QK_HEAD_DIM_PAD: Padded head dimension (constexpr)
+        V_HEAD_DIM: Value head dimension (constexpr)
+        EVEN_QK_HEAD_DIMS: Whether head dims are power of 2 (constexpr)
+        kv_global_offset: Global KV offset (constexpr)
+        query_span: Query indices in block (constexpr)
+        USE_CAUSAL: Enable causal masking (constexpr)
+        USE_SEGMENT_MASK: Enable segment masking (constexpr)
+        SOFTCAP: Enable logit soft capping (constexpr)
 
-    qk = tl.dot(q, tl.trans(k))
+    Returns:
+        Updated dq
+    """
+    kv_arange = lower_bound * BLOCK_N + tl.arange(0, BLOCK_N)
+    qk_head_dim_pad_arange = tl.arange(0, QK_HEAD_DIM_PAD)
+    value_head_dim_arange = tl.arange(0, V_HEAD_DIM)
 
-    if BIAS_ON:
-        if BOOL_BIAS:
-            qk = tl.where(bias, qk, BIG_NEG)
+    k_offsets = (kv_arange[None, :] * stride_kn + qk_head_dim_pad_arange[:, None] * stride_kk).to(tl.int64)
+    v_offsets = (kv_arange[None, :] * stride_vn + value_head_dim_arange[:, None] * stride_vk).to(tl.int64)
+
+    key_transpose_ptr = key + k_offsets
+    value_transpose_ptr = value + v_offsets
+
+    for kv_block_id in range(lower_bound, upper_bound):
+        if EVEN_QK_HEAD_DIMS:
+            key_transpose = tl.load(key_transpose_ptr)
         else:
-            qk += bias / softmax_scale
+            key_transpose = tl.load(
+                key_transpose_ptr,
+                mask=qk_head_dim_pad_arange[:, None] < QK_HEAD_DIM,
+                other=0.0,
+            )
+        value_transpose = tl.load(value_transpose_ptr)
+        attention_weights = tl.dot(query, key_transpose)
 
-    offs_n_causal = offs_n_curr - actual_seqlen_k + actual_seqlen_q
-    if MASKED:
-        if PAD_COLS:
-            if IS_CAUSAL:
-                qk = tl.where(
-                    tl.minimum(actual_seqlen_q - 1, offs_m)[:, None] >= offs_n_causal[None, :],
-                    qk,
-                    float("-inf"),
-                )
+        kv_leq_len_offset = kv_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        if USE_SEGMENT_MASK:
+            kv_segment_ids_block = tl.load(kv_segment_ids + kv_leq_len_offset)
+            mask = make_segment_mask(q_segment_ids, kv_segment_ids_block, False)
+        if USE_CAUSAL:
+            kv_positions_block = tl.load(kv_positions + kv_leq_len_offset)
+            causal_mask = make_causal_mask(q_positions, kv_positions_block, False)
+            if USE_SEGMENT_MASK:
+                mask = causal_mask & mask
             else:
-                qk = tl.where(actual_seqlen_q - 1 >= offs_n_causal[None, :], qk, float("-inf"))
-        elif IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= offs_n_causal[None, :], qk, float("-inf"))
+                mask = causal_mask
 
-    if SLIDING:
-        shift = actual_seqlen_k - actual_seqlen_q
-        j_aligned = offs_n_curr[None, :] - shift
-        i_idx = offs_m[:, None]
-        in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
-        qk = tl.where(in_window, qk, float("-inf"))
+        if SOFTCAP:
+            LN2: tl.constexpr = 0.6931471824645996
+            s = attention_weights * softmax_scale
+            x = s / logits_soft_cap
+            exp_2x = tl.exp(2.0 * x)
+            tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+            qk_after = (logits_soft_cap * tanh_x) * LN2
+            jac = softmax_scale * (1.0 - tanh_x * tanh_x)
+        else:
+            qk_after = attention_weights
+            jac = 1.0
 
-    if SOFTCAP:
-        s = qk * softmax_scale
-        x = s / logits_soft_cap
-        exp_2x = tl.exp(2.0 * x)
-        tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
-        qk_after = logits_soft_cap * tanh_x
-        jac = softmax_scale * (1.0 - tanh_x * tanh_x)
-    else:
-        qk_after = qk * softmax_scale
-        jac = softmax_scale
+        p = tl.math.exp2(qk_after - lse)
 
-    tl.debug_barrier()
+        if USE_SEGMENT_MASK or USE_CAUSAL:
+            p = tl.where(mask, p, 0.0)
 
-    p = tl.exp(qk_after - me_i[:, None])
+        dp = tl.dot(dout, value_transpose).to(tl.float32)
+        ds = p * (dp - delta[:, None])
+        ds = (ds * jac).to(key_transpose.type.element_ty)
 
-    if USE_DROPOUT:
-        dropout_mask = tl.rand(dropout_seed, dropout_offs) > dropout_prob
-        p = tl.where(dropout_mask, p, 0.0)
+        dq += tl.dot(ds, tl.trans(key_transpose))
 
-    dp = tl.dot(do, tl.trans(v.to(tl.float32)))
-    ds = (p * (dp - de_i[:, None]) * jac).to(q.dtype)
-    dq += tl.dot(ds, k)
+        key_transpose_ptr += BLOCK_N * stride_kn
+        value_transpose_ptr += BLOCK_N * stride_vn
     return dq
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=4),
+    ],
+    key=["Q_SEQ_LEN", "KV_SEQ_LEN", "QK_HEAD_DIM", "V_HEAD_DIM", "BLOCK_M", "BLOCK_N"],
+)
 @triton.jit
-def _attn_bwd_block_dq(
-    index_start_m,
-    Q,
-    K,
-    V,
-    B,
-    Dropout,
-    Do,
-    Dq,
-    M,
-    D,
+def blocksparse_attn_bwd_dq(
+    q,
+    k,
+    v,
+    q_positions,
+    q_segment_ids,
+    kv_positions,
+    kv_segment_ids,
+    dout,
+    lse,
+    delta,
+    lower_blocks,
+    upper_blocks,
+    lower_full_blocks,
+    upper_full_blocks,
+    query_global_offset,
     softmax_scale,
-    dropout_prob,
-    dropout_seed,
-    stride_qm,
-    stride_kn,
-    stride_vn,
-    stride_bm,
-    stride_dom,
-    stride_dqm,
-    actual_seqlen_q,
-    actual_seqlen_k,
-    headdim,
-    window_left,
-    window_right,
     logits_soft_cap,
-    softmax_aux_ptrs,
-    num_sinks,
-    VARLEN: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    BIAS_ON: tl.constexpr,
-    BOOL_BIAS: tl.constexpr,
-    USE_DROPOUT: tl.constexpr,
-    PAD_ROWS: tl.constexpr,
-    HEADS_PADDED: tl.constexpr,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    stride_lz,
+    stride_lh,
+    stride_lm,
+    dq,
+    Q_SEQ_LEN: tl.constexpr,
+    KV_SEQ_LEN: tl.constexpr,
+    QK_HEAD_DIM: tl.constexpr,
+    QK_HEAD_DIM_PAD: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_HEADDIM: tl.constexpr,
-    EVEN_N: tl.constexpr,
-    SLIDING: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    IS_CONTEXT_PARALLELISM: tl.constexpr,
     SOFTCAP: tl.constexpr,
-    USE_SINKS: tl.constexpr,
 ):
-    if IS_CAUSAL:
-        index_end_n = min(
-            actual_seqlen_k - actual_seqlen_q + index_start_m + BLOCK_M,
-            actual_seqlen_k,
-        )
-        if index_end_n < 0:
-            return
-    else:
-        index_end_n = actual_seqlen_k
+    LOG2_CONST: tl.constexpr = 1.4426950408889634
+    query_block_id = tl.program_id(0)
+    batch_size_id = tl.program_id(1).to(tl.int64)
+    num_heads_id = tl.program_id(2).to(tl.int64)
+    num_query_block_programs = tl.num_programs(0)
 
-    fully_masked_lines = actual_seqlen_q - actual_seqlen_k if IS_CAUSAL else 0
-    mask_reached = fully_masked_lines >= index_start_m + BLOCK_M
-    if (index_start_m >= actual_seqlen_q) or mask_reached:
+    mask_offset = batch_size_id * num_query_block_programs + query_block_id
+    lower_bound = tl.load(lower_blocks + mask_offset)
+    lower_full_bound = tl.load(lower_full_blocks + mask_offset)
+    upper_full_bound = tl.load(upper_full_blocks + mask_offset)
+    upper_bound = tl.load(upper_blocks + mask_offset)
+
+    num_blocks_to_attend = upper_bound - lower_bound
+
+    EVEN_QK_HEAD_DIMS_LOCAL: tl.constexpr = QK_HEAD_DIM_PAD == QK_HEAD_DIM
+
+    query_init_offset = (batch_size_id * stride_qz + num_heads_id * stride_qh).to(tl.int64)
+
+    k_init_offset = (batch_size_id * stride_kz + (num_heads_id // NUM_GROUPS) * stride_kh).to(tl.int64)
+
+    v_init_offset = (batch_size_id * stride_vz + (num_heads_id // NUM_GROUPS) * stride_vh).to(tl.int64)
+
+    out_init_offset = (batch_size_id * stride_oz + num_heads_id * stride_oh).to(tl.int64)
+
+    lse_init_offset = (batch_size_id * stride_lz + num_heads_id * stride_lh).to(tl.int64)
+
+    qk_head_dim_pad_arange = tl.arange(0, QK_HEAD_DIM_PAD)
+    value_head_dim_arange = tl.arange(0, V_HEAD_DIM)
+
+    if not EVEN_QK_HEAD_DIMS_LOCAL:
+        qk_head_dim_mask = qk_head_dim_pad_arange[None, :] < QK_HEAD_DIM
+
+    q += query_init_offset
+    k += k_init_offset
+    v += v_init_offset
+    dout += out_init_offset
+    dq += query_init_offset
+    lse += lse_init_offset
+    delta += lse_init_offset
+
+    q_segment_ids += batch_size_id * Q_SEQ_LEN
+    kv_segment_ids += batch_size_id * KV_SEQ_LEN
+
+    q_positions += batch_size_id * Q_SEQ_LEN
+    kv_positions += batch_size_id * KV_SEQ_LEN
+
+    if IS_CONTEXT_PARALLELISM:
+        query_global_offs = tl.load(query_global_offset + query_block_id)
+    else:
+        query_global_offs = 0
+
+    query_block_offset = query_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+
+    query_offsets = query_block_offset[:, None] * stride_qm + qk_head_dim_pad_arange[None, :] * stride_qk
+
+    out_offsets = query_block_offset[:, None] * stride_om + value_head_dim_arange[None, :] * stride_ok
+
+    if num_blocks_to_attend == 0:
+        dq_zero = tl.zeros([BLOCK_M, QK_HEAD_DIM_PAD], dtype=tl.float32)
+        if EVEN_QK_HEAD_DIMS_LOCAL:
+            tl.store(dq + query_offsets, dq_zero.to(dq.type.element_ty))
+        else:
+            tl.store(dq + query_offsets, dq_zero.to(dq.type.element_ty), mask=qk_head_dim_mask)
         return
 
-    offs_m = tl.arange(0, BLOCK_M) + index_start_m
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_HEADDIM)
+    dout_val = tl.load(dout + out_offsets)
+    dq_val = tl.zeros([BLOCK_M, QK_HEAD_DIM_PAD], dtype=tl.float32)
+    qk_scale = (softmax_scale * LOG2_CONST).to(tl.float32)
 
-    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :])
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
-
-    dq_ptrs = Dq + (offs_m[:, None] * stride_dqm + offs_d[None, :])
-    do_ptrs = Do + (offs_m[:, None] * stride_dom + offs_d[None, :])
-
-    if BIAS_ON:
-        bias_ptrs = B + (offs_m[:, None] * stride_bm + offs_n[None, :])
+    if EVEN_QK_HEAD_DIMS_LOCAL:
+        query_val = tl.load(q + query_offsets)
     else:
-        bias_ptrs = None
+        query_val = tl.load(q + query_offsets, mask=qk_head_dim_mask, other=0.0)
 
-    if USE_DROPOUT:
-        dropout_offs = Dropout + offs_m[:, None] * actual_seqlen_k + offs_n[None, :]
-    else:
-        dropout_offs = None
+    lse_offset = query_block_offset * stride_lm
+    lse_val = tl.load(lse + lse_offset)
+    delta_val = tl.load(delta + lse_offset)
 
-    dq = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
-    q = padded_load(q_ptrs, offs_m, offs_d, PA0=PAD_ROWS, PA1=HEADS_PADDED, LA0=actual_seqlen_q, LA1=headdim)
-    do = padded_load(do_ptrs, offs_m, offs_d, PA0=PAD_ROWS, PA1=HEADS_PADDED, LA0=actual_seqlen_q, LA1=headdim).to(
-        tl.float32
+    lse_val = lse_val[:, None]
+    query_val = (query_val * qk_scale).to(k.type.element_ty)
+
+    query_segment_ids_block = tl.load(q_segment_ids + query_block_offset)
+    query_positions_block = tl.load(q_positions + query_block_offset)
+
+    dq_val = _blocksparse_attn_bwd_dq_inner(
+        dq_val,
+        query_segment_ids_block,
+        query_positions_block,
+        k,
+        v,
+        kv_segment_ids,
+        kv_positions,
+        query_val,
+        dout_val,
+        lse_val,
+        delta_val,
+        logits_soft_cap,
+        softmax_scale,
+        stride_kn,
+        stride_kk,
+        stride_vn,
+        stride_vk,
+        lower_bound,
+        lower_full_bound,
+        BLOCK_N=BLOCK_N,
+        QK_HEAD_DIM=QK_HEAD_DIM,
+        QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
+        V_HEAD_DIM=V_HEAD_DIM,
+        EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        kv_global_offset=0,
+        query_span=query_global_offs + query_block_offset,
+        USE_CAUSAL=False,
+        USE_SEGMENT_MASK=True,
+        SOFTCAP=SOFTCAP,
     )
-    me_i = tl.load(M + offs_m)
-    de_i = tl.load(D + offs_m)
 
-    uneven_n = actual_seqlen_k % BLOCK_N != 0
-    attention_padding = VARLEN & uneven_n
-    if IS_CAUSAL:
-        first_masked_col = index_start_m + 1 + actual_seqlen_k - actual_seqlen_q
-    elif attention_padding:
-        first_masked_col = actual_seqlen_k
+    dq_val = _blocksparse_attn_bwd_dq_inner(
+        dq_val,
+        query_segment_ids_block,
+        query_positions_block,
+        k,
+        v,
+        kv_segment_ids,
+        kv_positions,
+        query_val,
+        dout_val,
+        lse_val,
+        delta_val,
+        logits_soft_cap,
+        softmax_scale,
+        stride_kn,
+        stride_kk,
+        stride_vn,
+        stride_vk,
+        lower_full_bound,
+        upper_full_bound,
+        BLOCK_N=BLOCK_N,
+        QK_HEAD_DIM=QK_HEAD_DIM,
+        QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
+        V_HEAD_DIM=V_HEAD_DIM,
+        EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        kv_global_offset=0,
+        query_span=query_global_offs + query_block_offset,
+        USE_CAUSAL=False,
+        USE_SEGMENT_MASK=False,
+        SOFTCAP=SOFTCAP,
+    )
+
+    dq_val = _blocksparse_attn_bwd_dq_inner(
+        dq_val,
+        query_segment_ids_block,
+        query_positions_block,
+        k,
+        v,
+        kv_segment_ids,
+        kv_positions,
+        query_val,
+        dout_val,
+        lse_val,
+        delta_val,
+        logits_soft_cap,
+        softmax_scale,
+        stride_kn,
+        stride_kk,
+        stride_vn,
+        stride_vk,
+        upper_full_bound,
+        upper_bound,
+        BLOCK_N=BLOCK_N,
+        QK_HEAD_DIM=QK_HEAD_DIM,
+        QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
+        V_HEAD_DIM=V_HEAD_DIM,
+        EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        kv_global_offset=0,
+        query_span=query_global_offs + query_block_offset,
+        USE_CAUSAL=True,
+        USE_SEGMENT_MASK=True,
+        SOFTCAP=SOFTCAP,
+    )
+
+    dq_val *= softmax_scale.to(tl.float32)
+
+    if EVEN_QK_HEAD_DIMS_LOCAL:
+        tl.store(dq + query_offsets, dq_val.to(dq.type.element_ty))
     else:
-        first_masked_col = index_end_n
-    nb_full_blocks = first_masked_col // BLOCK_N
-
-    index_next_start_n = 0
-    if nb_full_blocks > 0:
-        for _ in range(0, nb_full_blocks):
-            index_next_start_n = tl.multiple_of(index_next_start_n, BLOCK_N)
-            dq = _attn_bwd_dq(
-                index_next_start_n,
-                q,
-                dq,
-                do,
-                me_i,
-                de_i,
-                offs_m,
-                offs_n,
-                offs_d,
-                k_ptrs,
-                v_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_kn,
-                stride_vn,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                MASKED=False,
-                PAD_COLS=False,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-            )
-            index_next_start_n += BLOCK_N
-
-    if index_next_start_n < index_end_n:
-        for index_start_n in range(index_next_start_n, index_end_n, BLOCK_N):
-            pad_cols = (not EVEN_N) or (VARLEN and (index_start_n + BLOCK_N > actual_seqlen_k))
-            dq = _attn_bwd_dq(
-                index_start_n,
-                q,
-                dq,
-                do,
-                me_i,
-                de_i,
-                offs_m,
-                offs_n,
-                offs_d,
-                k_ptrs,
-                v_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_kn,
-                stride_vn,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                MASKED=True,
-                PAD_COLS=pad_cols,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-            )
-
-    if fully_masked_lines > 0:
-        dq = tl.where(offs_m[:, None] < fully_masked_lines, 0, dq)
-
-    if HEADS_PADDED:
-        if PAD_ROWS:
-            tl.store(dq_ptrs, dq, mask=(offs_m[:, None] < actual_seqlen_q) & (offs_d[None, :] < headdim))
-        else:
-            tl.store(dq_ptrs, dq, mask=offs_d[None, :] < headdim)
-    else:
-        if PAD_ROWS:
-            tl.store(dq_ptrs, dq, mask=offs_m[:, None] < actual_seqlen_q)
-        else:
-            tl.store(dq_ptrs, dq)
+        tl.store(
+            dq + query_offsets,
+            dq_val.to(dq.type.element_ty),
+            mask=qk_head_dim_mask,
+        )
 
 
 @triton.autotune(
     configs=[
-        Config(
-            {"BLOCK_M1": 16, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 16},
-            num_warps=2,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 32, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 32},
-            num_warps=2,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32},
-            num_warps=2,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 64, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 64},
-            num_warps=2,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 64, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64},
-            num_warps=2,
-            num_stages=0,
-        ),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=4),
     ],
-    key=[
-        "CQSeq",
-        "CKSeq",
-        "DRuntime",
-        "VARLEN",
-        "USE_DROPOUT",
-        "IS_CAUSAL",
-        "BIAS_ON",
-        "BLOCK_HEADDIM",
-        "SLIDING",
-    ],
-    prune_configs_by={"early_config_prune": config_prune_kernel},
-)
-@triton.heuristics(
-    {
-        "EVEN_M1": lambda args: args["QSeq"] % args["BLOCK_M1"] == 0,
-        "EVEN_N1": lambda args: args["KSeq"] % args["BLOCK_N1"] == 0,
-        "EVEN_M2": lambda args: args["QSeq"] % args["BLOCK_M2"] == 0,
-        "EVEN_N2": lambda args: args["KSeq"] % args["BLOCK_N2"] == 0,
-        "HEADS_PADDED": lambda args: args["headdim"] != args["BLOCK_HEADDIM"],
-        "NUM_BLOCKS_KV": lambda args: math.ceil(args["KSeq"] / args["BLOCK_N1"]),
-    }
+    key=["Q_SEQ_LEN", "KV_SEQ_LEN", "QK_HEAD_DIM", "V_HEAD_DIM", "BLOCK_M", "BLOCK_N"],
 )
 @triton.jit
-def _attn_bwd(
-    Q,
-    K,
-    V,
-    B,
-    Do,
-    M,
-    D,
+def blocksparse_attn_bwd_dkdv(
+    q,
+    k,
+    v,
+    q_positions,
+    q_segment_ids,
+    kv_positions,
+    kv_segment_ids,
+    dout,
+    lse,
+    delta,
+    lower_blocks,
+    upper_blocks,
+    lower_full_blocks,
+    upper_full_blocks,
+    query_global_offset,
     softmax_scale,
-    dropout_prob,
-    dropout_seed,
+    logits_soft_cap,
     stride_qz,
-    stride_qm,
     stride_qh,
-    stride_kz,
-    stride_kn,
-    stride_kh,
-    stride_vz,
-    stride_vn,
-    stride_vh,
-    stride_bz,
-    stride_bm,
-    stride_bh,
-    stride_doz,
-    stride_dom,
-    stride_doh,
-    stride_dqz,
-    stride_dqm,
-    stride_dqh,
-    stride_dkz,
-    stride_dkn,
-    stride_dkh,
-    stride_dvz,
-    stride_dvn,
-    stride_dvh,
-    nheads_q,
-    num_repeats,
-    window_left,
-    window_right,
-    QSeq,
-    cum_seqlens_q,
-    KSeq,
-    cum_seqlens_k,
-    seqlen_q_rounded,
-    headdim,
-    CQSeq,
-    CKSeq,
-    DRuntime,
-    logits_soft_cap,
-    softmax_aux,
-    num_sinks,
-    Dq,
-    Dk,
-    Dv,
-    VARLEN: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    BIAS_ON: tl.constexpr,
-    BOOL_BIAS: tl.constexpr,
-    USE_DROPOUT: tl.constexpr,
-    BLOCK_HEADDIM: tl.constexpr,
-    EVEN_M1: tl.constexpr,
-    EVEN_N1: tl.constexpr,
-    EVEN_M2: tl.constexpr,
-    EVEN_N2: tl.constexpr,
-    NUM_BLOCKS_KV: tl.constexpr,
-    HEADS_PADDED: tl.constexpr,
-    BLOCK_M1: tl.constexpr,
-    BLOCK_N1: tl.constexpr,
-    BLOCK_M2: tl.constexpr,
-    BLOCK_N2: tl.constexpr,
-    SLIDING: tl.constexpr,
-    SOFTCAP: tl.constexpr,
-    USE_SINKS: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    off_zh = tl.program_id(1)
-    off_z = off_zh // nheads_q
-    off_head_q = off_zh % nheads_q
-    off_head_kv = off_head_q // num_repeats
-
-    if VARLEN:
-        cu_seq_start_q = tl.load(cum_seqlens_q + off_z)
-        cu_seq_start_k = tl.load(cum_seqlens_k + off_z)
-        actual_seqlen_q = tl.load(cum_seqlens_q + off_z + 1) - cu_seq_start_q
-        actual_seqlen_k = tl.load(cum_seqlens_k + off_z + 1) - cu_seq_start_k
-        off_z = 0
-    else:
-        cu_seq_start_q = 0
-        cu_seq_start_k = 0
-        actual_seqlen_q = QSeq
-        actual_seqlen_k = KSeq
-
-    Q += off_z * stride_qz + off_head_q * stride_qh + cu_seq_start_q * stride_qm
-    K += off_z * stride_kz + off_head_kv * stride_kh + cu_seq_start_k * stride_kn
-    V += off_z * stride_vz + off_head_kv * stride_vh + cu_seq_start_k * stride_vn
-
-    Do += off_z * stride_doz + off_head_q * stride_doh + cu_seq_start_q * stride_dom
-    Dq += off_z * stride_dqz + off_head_q * stride_dqh + cu_seq_start_q * stride_dqm
-    Dk += off_z * stride_dkz + off_head_q * stride_dkh + cu_seq_start_k * stride_dkn
-    Dv += off_z * stride_dvz + off_head_q * stride_dvh + cu_seq_start_k * stride_dvn
-
-    if BIAS_ON:
-        B += off_z * stride_bz + off_head_q * stride_bh + cu_seq_start_q * stride_bm
-    Dropout = (
-        actual_seqlen_k * (cu_seq_start_q + actual_seqlen_q * (off_head_q + nheads_q * off_z)) if USE_DROPOUT else None
-    )
-
-    softmax_aux_ptrs = softmax_aux + off_head_q * num_sinks if USE_SINKS else softmax_aux
-
-    D += off_zh * seqlen_q_rounded
-    M += off_zh * seqlen_q_rounded
-
-    if pid < NUM_BLOCKS_KV:
-        i_start_n = pid
-        pad_cols = (not EVEN_N1) or (VARLEN and ((i_start_n + 1) * BLOCK_N1 > actual_seqlen_k))
-        _attn_bwd_block_dkdv(
-            i_start_n * BLOCK_N1,
-            Q,
-            K,
-            V,
-            B,
-            Dropout,
-            Do,
-            Dk,
-            Dv,
-            M,
-            D,
-            softmax_scale,
-            dropout_prob,
-            dropout_seed,
-            stride_qm,
-            stride_kn,
-            stride_vn,
-            stride_bm,
-            stride_dom,
-            stride_dkn,
-            stride_dvn,
-            actual_seqlen_q,
-            actual_seqlen_k,
-            headdim,
-            window_left,
-            window_right,
-            logits_soft_cap,
-            softmax_aux_ptrs,
-            num_sinks,
-            IS_CAUSAL=IS_CAUSAL,
-            BIAS_ON=BIAS_ON,
-            BOOL_BIAS=BOOL_BIAS,
-            USE_DROPOUT=USE_DROPOUT,
-            PAD_COLS=pad_cols,
-            HEADS_PADDED=HEADS_PADDED,
-            BLOCK_M=BLOCK_M1,
-            BLOCK_N=BLOCK_N1,
-            BLOCK_HEADDIM=BLOCK_HEADDIM,
-            SLIDING=SLIDING,
-            SOFTCAP=SOFTCAP,
-            USE_SINKS=USE_SINKS,
-        )
-    else:
-        i_start_m = pid - NUM_BLOCKS_KV
-        pad_rows = (not EVEN_M2) or (VARLEN and ((i_start_m + 1) * BLOCK_M2 > actual_seqlen_q))
-        _attn_bwd_block_dq(
-            i_start_m * BLOCK_M2,
-            Q,
-            K,
-            V,
-            B,
-            Dropout,
-            Do,
-            Dq,
-            M,
-            D,
-            softmax_scale,
-            dropout_prob,
-            dropout_seed,
-            stride_qm,
-            stride_kn,
-            stride_vn,
-            stride_bm,
-            stride_dom,
-            stride_dqm,
-            actual_seqlen_q,
-            actual_seqlen_k,
-            headdim,
-            window_left,
-            window_right,
-            logits_soft_cap,
-            softmax_aux_ptrs,
-            num_sinks,
-            VARLEN=VARLEN,
-            IS_CAUSAL=IS_CAUSAL,
-            BIAS_ON=BIAS_ON,
-            BOOL_BIAS=BOOL_BIAS,
-            USE_DROPOUT=USE_DROPOUT,
-            PAD_ROWS=pad_rows,
-            HEADS_PADDED=HEADS_PADDED,
-            BLOCK_M=BLOCK_M2,
-            BLOCK_N=BLOCK_N2,
-            BLOCK_HEADDIM=BLOCK_HEADDIM,
-            EVEN_N=EVEN_N2,
-            SLIDING=SLIDING,
-            SOFTCAP=SOFTCAP,
-            USE_SINKS=USE_SINKS,
-        )
-
-
-def _config_prune_blocksparse_bwd(
-    configs: list[Config],
-    named_args: dict[str, Any],
-    **kwargs: Any,
-) -> list[Config]:
-    QSeq = named_args["QSeq"]
-    KSeq = named_args["KSeq"]
-    fm1 = named_args.get("FORCE_BLOCK_M1", 0)
-    fn1 = named_args.get("FORCE_BLOCK_N1", 0)
-    fm2 = named_args.get("FORCE_BLOCK_M2", 0)
-    fn2 = named_args.get("FORCE_BLOCK_N2", 0)
-
-    kept = []
-    for cfg in configs:
-        bm1 = cfg.kwargs["BLOCK_M1"]
-        bn1 = cfg.kwargs["BLOCK_N1"]
-        bm2 = cfg.kwargs["BLOCK_M2"]
-        bn2 = cfg.kwargs["BLOCK_N2"]
-        if max(bm1, bm2) > QSeq or max(bn1, bn2) > KSeq:
-            continue
-        if fm1 and bm1 != fm1:
-            continue
-        if fn1 and bn1 != fn1:
-            continue
-        if fm2 and bm2 != fm2:
-            continue
-        if fn2 and bn2 != fn2:
-            continue
-        kept.append(cfg)
-    if kept:
-        return kept
-    return [
-        Config({"BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M1": 64, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 64}, num_warps=4, num_stages=0),
-    ]
-
-
-@triton.jit
-def _attn_blocksparse_bwd_block_dkdv_layout(
-    k_block_start_n,
-    Q,
-    K,
-    V,
-    B,
-    Dropout,
-    Do,
-    Dk,
-    Dv,
-    M,
-    D,
-    softmax_scale,
-    dropout_prob,
-    dropout_seed,
     stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
     stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
     stride_vn,
-    stride_bm,
-    stride_dom,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    stride_lz,
+    stride_lh,
+    stride_lm,
+    stride_dkz,
+    stride_dkh,
     stride_dkn,
+    stride_dkk,
+    stride_dvz,
+    stride_dvh,
     stride_dvn,
-    actual_seqlen_q,
-    actual_seqlen_k,
-    headdim,
-    window_left,
-    window_right,
-    logits_soft_cap,
-    softmax_aux_ptrs,
-    num_sinks,
-    layout_k_ptr,
-    degree_k_ptr,
-    IS_CAUSAL: tl.constexpr,
-    BIAS_ON: tl.constexpr,
-    BOOL_BIAS: tl.constexpr,
-    USE_DROPOUT: tl.constexpr,
-    PAD_COLS: tl.constexpr,
-    HEADS_PADDED: tl.constexpr,
+    stride_dvk,
+    dk,
+    dv,
+    Q_SEQ_LEN: tl.constexpr,
+    KV_SEQ_LEN: tl.constexpr,
+    QK_HEAD_DIM: tl.constexpr,
+    QK_HEAD_DIM_PAD: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_HEADDIM: tl.constexpr,
-    MAX_DEGREE_K: tl.constexpr,
-    SLIDING: tl.constexpr,
+    LOAD_SECOND_OFFSET: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    IS_CONTEXT_PARALLELISM: tl.constexpr,
     SOFTCAP: tl.constexpr,
-    USE_SINKS: tl.constexpr,
 ):
-    offs_n = k_block_start_n + tl.arange(0, BLOCK_N)
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_HEADDIM)
+    LOG2_CONST: tl.constexpr = 1.4426950408889634
+    kv_block_id = tl.program_id(0)
+    batch_size_id = tl.program_id(1).to(tl.int64)
+    num_heads_id = tl.program_id(2).to(tl.int64)
+    num_kv_block_programs = tl.num_programs(0)
 
-    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :])
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
-    dk_ptrs = Dk + (offs_n[:, None] * stride_dkn + offs_d[None, :])
-    dv_ptrs = Dv + (offs_n[:, None] * stride_dvn + offs_d[None, :])
-    bias_ptrs = B + (offs_m[:, None] * stride_bm + offs_n[None, :]) if BIAS_ON else None
-    dropout_offs = Dropout + offs_m[:, None] * actual_seqlen_k + offs_n[None, :] if USE_DROPOUT else None
-
-    dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-    dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-    k = tl.load(
-        k_ptrs,
-        mask=(offs_n[:, None] < actual_seqlen_k) & (offs_d[None, :] < headdim) if PAD_COLS or HEADS_PADDED else None,
-        other=0.0,
-    )
-    v = tl.load(
-        v_ptrs,
-        mask=(offs_n[:, None] < actual_seqlen_k) & (offs_d[None, :] < headdim) if PAD_COLS or HEADS_PADDED else None,
-        other=0.0,
-    )
-
-    k_block_id = k_block_start_n // BLOCK_N
-    deg_k = tl.load(degree_k_ptr + k_block_id, mask=True, other=0)
-    if deg_k == 0:
-        if HEADS_PADDED:
-            tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < actual_seqlen_k) & (offs_d[None, :] < headdim))
-            tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < actual_seqlen_k) & (offs_d[None, :] < headdim))
-        else:
-            if PAD_COLS:
-                tl.store(dk_ptrs, dk, mask=offs_n[:, None] < actual_seqlen_k)
-                tl.store(dv_ptrs, dv, mask=offs_n[:, None] < actual_seqlen_k)
-            else:
-                tl.store(dk_ptrs, dk)
-                tl.store(dv_ptrs, dv)
-        return
-
-    fully_masked_lines = (actual_seqlen_q - actual_seqlen_k) if IS_CAUSAL else 0
-
-    for li in range(0, MAX_DEGREE_K):
-        valid = li < deg_k
-        q_block = tl.load(layout_k_ptr + k_block_id * MAX_DEGREE_K + li, mask=valid, other=0)
-        if valid:
-            index_start_m = q_block * BLOCK_M
-            dk, dv = _attn_bwd_dkdv(
-                index_start_m,
-                k,
-                v,
-                dk,
-                dv,
-                M,
-                D,
-                offs_m,
-                offs_n,
-                offs_d,
-                q_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                Do,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_qm,
-                stride_bm,
-                stride_dom,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                fully_masked_lines,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                MASKED=True,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_ROWS=True,
-                PAD_COLS=PAD_COLS,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-            )
-
-    if HEADS_PADDED:
-        tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < actual_seqlen_k) & (offs_d[None, :] < headdim))
-        tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < actual_seqlen_k) & (offs_d[None, :] < headdim))
+    if IS_CONTEXT_PARALLELISM:
+        query_global_offs = tl.load(query_global_offset)
+        if LOAD_SECOND_OFFSET and kv_block_id * BLOCK_N - query_global_offs >= Q_SEQ_LEN // 2:
+            query_global_offs = tl.load(query_global_offset + 1)
     else:
-        if PAD_COLS:
-            tl.store(dk_ptrs, dk, mask=offs_n[:, None] < actual_seqlen_k)
-            tl.store(dv_ptrs, dv, mask=offs_n[:, None] < actual_seqlen_k)
-        else:
-            tl.store(dk_ptrs, dk)
-            tl.store(dv_ptrs, dv)
+        query_global_offs = 0
+
+    mask_offset = batch_size_id * num_kv_block_programs + kv_block_id
+    lower_bound = tl.load(lower_blocks + mask_offset)
+    lower_full_bound = tl.load(lower_full_blocks + mask_offset)
+    upper_full_bound = tl.load(upper_full_blocks + mask_offset)
+    upper_bound = tl.load(upper_blocks + mask_offset)
+
+    EVEN_QK_HEAD_DIMS_LOCAL: tl.constexpr = QK_HEAD_DIM_PAD == QK_HEAD_DIM
+
+    query_init_offset = (batch_size_id * stride_qz + num_heads_id * stride_qh).to(tl.int64)
+
+    k_init_offset = (batch_size_id * stride_kz + (num_heads_id // NUM_GROUPS) * stride_kh).to(tl.int64)
+
+    v_init_offset = (batch_size_id * stride_vz + (num_heads_id // NUM_GROUPS) * stride_vh).to(tl.int64)
+
+    out_init_offset = (batch_size_id * stride_oz + num_heads_id * stride_oh).to(tl.int64)
+
+    lse_init_offset = (batch_size_id * stride_lz + num_heads_id * stride_lh).to(tl.int64)
+
+    dk_init_offset = (batch_size_id * stride_dkz + (num_heads_id // NUM_GROUPS) * stride_dkh).to(tl.int64)
+
+    dv_init_offset = (batch_size_id * stride_dvz + (num_heads_id // NUM_GROUPS) * stride_dvh).to(tl.int64)
+
+    q += query_init_offset
+    k += k_init_offset
+    v += v_init_offset
+    dout += out_init_offset
+
+    dk += dk_init_offset
+    dv += dv_init_offset
+    lse += lse_init_offset
+    delta += lse_init_offset
+
+    q_segment_ids += batch_size_id * Q_SEQ_LEN
+    kv_segment_ids += batch_size_id * KV_SEQ_LEN
+
+    q_positions += batch_size_id * Q_SEQ_LEN
+    kv_positions += batch_size_id * KV_SEQ_LEN
+
+    qk_head_dim_pad_arange = tl.arange(0, QK_HEAD_DIM_PAD)
+    value_head_dim_arange = tl.arange(0, V_HEAD_DIM)
+    qk_scale = (softmax_scale * LOG2_CONST).to(tl.float32)
+
+    kv_block_offset = kv_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    dv_val = tl.zeros([BLOCK_N, V_HEAD_DIM], dtype=tl.float32)
+    dk_val = tl.zeros([BLOCK_N, QK_HEAD_DIM_PAD], dtype=tl.float32)
+
+    k_offsets = kv_block_offset[:, None] * stride_kn + qk_head_dim_pad_arange[None, :] * stride_kk
+
+    v_offsets = kv_block_offset[:, None] * stride_vn + value_head_dim_arange[None, :] * stride_vk
+
+    dk_offsets = kv_block_offset[:, None] * stride_dkn + qk_head_dim_pad_arange[None, :] * stride_dkk
+
+    dv_offsets = kv_block_offset[:, None] * stride_dvn + value_head_dim_arange[None, :] * stride_dvk
+
+    if EVEN_QK_HEAD_DIMS_LOCAL:
+        key_val = tl.load(k + k_offsets)
+    else:
+        qk_head_dim_mask = qk_head_dim_pad_arange[None, :] < QK_HEAD_DIM
+        key_val = tl.load(k + k_offsets, mask=qk_head_dim_mask, other=0.0)
+
+    value_val = tl.load(v + v_offsets)
+
+    kv_segment_ids_block = tl.load(kv_segment_ids + kv_block_offset)
+    kv_positions_block = tl.load(kv_positions + kv_block_offset)
+
+    dk_val, dv_val = _blocksparse_attn_bwd_dkdv_inner(
+        dk_val,
+        dv_val,
+        kv_segment_ids_block,
+        kv_positions_block,
+        q,
+        q_segment_ids,
+        q_positions,
+        dout,
+        lse,
+        delta,
+        key_val,
+        value_val,
+        qk_scale,
+        logits_soft_cap,
+        softmax_scale,
+        stride_qm,
+        stride_qk,
+        stride_om,
+        stride_ok,
+        stride_lm,
+        lower_bound,
+        lower_full_bound,
+        BLOCK_M=BLOCK_M,
+        QK_HEAD_DIM=QK_HEAD_DIM,
+        QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
+        V_HEAD_DIM=V_HEAD_DIM,
+        EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        query_global_offset=query_global_offs,
+        kv_span=kv_block_offset,
+        USE_CAUSAL=True,
+        USE_SEGMENT_MASK=True,
+        SOFTCAP=SOFTCAP,
+    )
+
+    dk_val, dv_val = _blocksparse_attn_bwd_dkdv_inner(
+        dk_val,
+        dv_val,
+        kv_segment_ids_block,
+        kv_positions_block,
+        q,
+        q_segment_ids,
+        q_positions,
+        dout,
+        lse,
+        delta,
+        key_val,
+        value_val,
+        qk_scale,
+        logits_soft_cap,
+        softmax_scale,
+        stride_qm,
+        stride_qk,
+        stride_om,
+        stride_ok,
+        stride_lm,
+        lower_full_bound,
+        upper_full_bound,
+        BLOCK_M=BLOCK_M,
+        QK_HEAD_DIM=QK_HEAD_DIM,
+        QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
+        V_HEAD_DIM=V_HEAD_DIM,
+        EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        query_global_offset=query_global_offs,
+        kv_span=kv_block_offset,
+        USE_CAUSAL=False,
+        USE_SEGMENT_MASK=False,
+        SOFTCAP=SOFTCAP,
+    )
+
+    dk_val, dv_val = _blocksparse_attn_bwd_dkdv_inner(
+        dk_val,
+        dv_val,
+        kv_segment_ids_block,
+        kv_positions_block,
+        q,
+        q_segment_ids,
+        q_positions,
+        dout,
+        lse,
+        delta,
+        key_val,
+        value_val,
+        qk_scale,
+        logits_soft_cap,
+        softmax_scale,
+        stride_qm,
+        stride_qk,
+        stride_om,
+        stride_ok,
+        stride_lm,
+        upper_full_bound,
+        upper_bound,
+        BLOCK_M=BLOCK_M,
+        QK_HEAD_DIM=QK_HEAD_DIM,
+        QK_HEAD_DIM_PAD=QK_HEAD_DIM_PAD,
+        V_HEAD_DIM=V_HEAD_DIM,
+        EVEN_QK_HEAD_DIMS=EVEN_QK_HEAD_DIMS_LOCAL,
+        query_global_offset=query_global_offs,
+        kv_span=kv_block_offset,
+        USE_CAUSAL=False,
+        USE_SEGMENT_MASK=True,
+        SOFTCAP=SOFTCAP,
+    )
+
+    dk_val *= softmax_scale.to(tl.float32)
+
+    tl.atomic_add(dv + dv_offsets, dv_val.to(dv.type.element_ty))
+    if EVEN_QK_HEAD_DIMS_LOCAL:
+        tl.atomic_add(dk + dk_offsets, dk_val.to(dk.type.element_ty))
+    else:
+        tl.atomic_add(
+            dk + dk_offsets,
+            dk_val.to(dk.type.element_ty),
+            mask=qk_head_dim_mask,
+        )
 
 
 @triton.jit
-def _attn_blocksparse_bwd_block_dq_layout(
-    q_block_start_m,
-    Q,
-    K,
-    V,
-    B,
-    Dropout,
-    Do,
-    Dq,
-    M,
-    D,
+def blocksparse_attn_bwd(
+    q,
+    k,
+    v,
+    q_positions,
+    q_segment_ids,
+    kv_positions,
+    kv_segment_ids,
+    dout,
+    lse,
+    delta,
+    lower_blocks_query,
+    upper_blocks_query,
+    lower_full_blocks_query,
+    upper_full_blocks_query,
+    lower_blocks_kv,
+    upper_blocks_kv,
+    lower_full_blocks_kv,
+    upper_full_blocks_kv,
+    query_global_offset,
     softmax_scale,
-    dropout_prob,
-    dropout_seed,
-    stride_qm,
-    stride_kn,
-    stride_vn,
-    stride_bm,
-    stride_dom,
-    stride_dqm,
-    actual_seqlen_q,
-    actual_seqlen_k,
-    headdim,
-    window_left,
-    window_right,
     logits_soft_cap,
-    softmax_aux_ptrs,
-    num_sinks,
-    layout_q_ptr,
-    degree_q_ptr,
-    VARLEN: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    BIAS_ON: tl.constexpr,
-    BOOL_BIAS: tl.constexpr,
-    USE_DROPOUT: tl.constexpr,
-    PAD_ROWS: tl.constexpr,
-    HEADS_PADDED: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_HEADDIM: tl.constexpr,
-    SLIDING: tl.constexpr,
-    SOFTCAP: tl.constexpr,
-    USE_SINKS: tl.constexpr,
-    MAX_DEGREE_Q: tl.constexpr,
-):
-    offs_m = tl.arange(0, BLOCK_M) + q_block_start_m
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_HEADDIM)
-
-    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :])
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
-
-    dq_ptrs = Dq + (offs_m[:, None] * stride_dqm + offs_d[None, :])
-    do_ptrs = Do + (offs_m[:, None] * stride_dom + offs_d[None, :])
-
-    bias_ptrs = B + (offs_m[:, None] * stride_bm + offs_n[None, :]) if BIAS_ON else None
-    dropout_offs = Dropout + offs_m[:, None] * actual_seqlen_k + offs_n[None, :] if USE_DROPOUT else None
-
-    dq = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
-    q = tl.load(
-        q_ptrs,
-        mask=(offs_m[:, None] < actual_seqlen_q) & (offs_d[None, :] < headdim) if (PAD_ROWS or HEADS_PADDED) else None,
-        other=0.0,
-    )
-    do = tl.load(
-        do_ptrs,
-        mask=(offs_m[:, None] < actual_seqlen_q) & (offs_d[None, :] < headdim) if (PAD_ROWS or HEADS_PADDED) else None,
-        other=0.0,
-    ).to(tl.float32)
-    me_i = tl.load(M + offs_m)
-    de_i = tl.load(D + offs_m)
-
-    q_block_id = q_block_start_m // BLOCK_M
-    deg_q = tl.load(degree_q_ptr + q_block_id, mask=True, other=0)
-
-    for li in range(0, MAX_DEGREE_Q):
-        valid = li < deg_q
-        k_block = tl.load(layout_q_ptr + q_block_id * MAX_DEGREE_Q + li, mask=valid, other=0)
-        if valid:
-            index_start_n = k_block * BLOCK_N
-            pad_cols = (index_start_n + BLOCK_N > actual_seqlen_k) or VARLEN
-            dq = _attn_bwd_dq(
-                index_start_n,
-                q,
-                dq,
-                do,
-                me_i,
-                de_i,
-                offs_m,
-                offs_n,
-                offs_d,
-                k_ptrs,
-                v_ptrs,
-                bias_ptrs,
-                dropout_offs,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_kn,
-                stride_vn,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                MASKED=True,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_COLS=pad_cols,
-                HEADS_PADDED=HEADS_PADDED,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-            )
-
-    fully_masked_lines = (actual_seqlen_q - actual_seqlen_k) if IS_CAUSAL else 0
-    if fully_masked_lines > 0:
-        dq = tl.where(offs_m[:, None] < fully_masked_lines, 0, dq)
-
-    if HEADS_PADDED:
-        tl.store(dq_ptrs, dq, mask=(offs_m[:, None] < actual_seqlen_q) & (offs_d[None, :] < headdim))
-    else:
-        if PAD_ROWS:
-            tl.store(dq_ptrs, dq, mask=offs_m[:, None] < actual_seqlen_q)
-        else:
-            tl.store(dq_ptrs, dq)
-
-
-def _prune_blocksparse_bwd_configs(configs: list[Config], named_args: dict[str, Any], **kwargs: Any) -> list[Config]:
-    QSeq = named_args["QSeq"]
-    KSeq = named_args["KSeq"]
-    force_m = named_args.get("FORCE_BLOCK_M", 0)
-    force_n = named_args.get("FORCE_BLOCK_N", 0)
-    kept = []
-    for cfg in configs:
-        ok = True
-        for key in ["BLOCK_M1", "BLOCK_M2"]:
-            if cfg.kwargs[key] > QSeq:
-                ok = False
-        for key in ["BLOCK_N1", "BLOCK_N2"]:
-            if cfg.kwargs[key] > KSeq:
-                ok = False
-        if force_m and (cfg.kwargs["BLOCK_M1"] != force_m or cfg.kwargs["BLOCK_M2"] != force_m):
-            ok = False
-        if force_n and (cfg.kwargs["BLOCK_N1"] != force_n or cfg.kwargs["BLOCK_N2"] != force_n):
-            ok = False
-        if ok:
-            kept.append(cfg)
-    if kept:
-        return kept
-    return [
-        Config({"BLOCK_M1": 64, "BLOCK_N1": 128, "BLOCK_M2": 64, "BLOCK_N2": 128}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M1": 64, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 64}, num_warps=4, num_stages=0),
-    ]
-
-
-@triton.autotune(
-    configs=[
-        Config({"BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 32, "BLOCK_N2": 64}, num_warps=2, num_stages=0),
-        Config({"BLOCK_M1": 64, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 64}, num_warps=2, num_stages=0),
-        Config({"BLOCK_M1": 64, "BLOCK_N1": 128, "BLOCK_M2": 64, "BLOCK_N2": 128}, num_warps=2, num_stages=0),
-        Config({"BLOCK_M1": 128, "BLOCK_N1": 64, "BLOCK_M2": 128, "BLOCK_N2": 64}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128}, num_warps=4, num_stages=0),
-    ],
-    key=[
-        "CQSeq",
-        "CKSeq",
-        "DRuntime",
-        "VARLEN",
-        "USE_DROPOUT",
-        "IS_CAUSAL",
-        "BIAS_ON",
-        "BLOCK_HEADDIM",
-        "SLIDING",
-        "USE_LAYOUT",
-        "MAX_DEGREE_Q",
-        "MAX_DEGREE_K",
-        "FORCE_BLOCK_M",
-        "FORCE_BLOCK_N",
-    ],
-    prune_configs_by={"early_config_prune": _prune_blocksparse_bwd_configs},
-)
-@triton.heuristics(
-    {
-        "EVEN_M1": lambda args: args["QSeq"] % args["BLOCK_M1"] == 0,
-        "EVEN_N1": lambda args: args["KSeq"] % args["BLOCK_N1"] == 0,
-        "EVEN_M2": lambda args: args["QSeq"] % args["BLOCK_M2"] == 0,
-        "EVEN_N2": lambda args: args["KSeq"] % args["BLOCK_N2"] == 0,
-        "HEADS_PADDED": lambda args: args["headdim"] != args["BLOCK_HEADDIM"],
-        "NUM_BLOCKS_KV": lambda args: math.ceil(args["KSeq"] / args["BLOCK_N1"]),
-    }
-)
-@triton.jit
-def _attn_blocksparse_bwd(
-    Q,
-    K,
-    V,
-    B,
-    Do,
-    M,
-    D,
-    softmax_scale,
-    dropout_prob,
-    dropout_seed,
     stride_qz,
-    stride_qm,
     stride_qh,
+    stride_qm,
+    stride_qk,
     stride_kz,
-    stride_kn,
     stride_kh,
+    stride_kn,
+    stride_kk,
     stride_vz,
-    stride_vn,
     stride_vh,
-    stride_bz,
-    stride_bm,
-    stride_bh,
-    stride_doz,
-    stride_dom,
-    stride_doh,
-    stride_dqz,
-    stride_dqm,
-    stride_dqh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    stride_lz,
+    stride_lh,
+    stride_lm,
     stride_dkz,
-    stride_dkn,
     stride_dkh,
+    stride_dkn,
+    stride_dkk,
     stride_dvz,
-    stride_dvn,
     stride_dvh,
-    nheads_q,
-    num_repeats,
-    window_left,
-    window_right,
-    QSeq,
-    cum_seqlens_q,
-    KSeq,
-    cum_seqlens_k,
-    seqlen_q_rounded,
-    headdim,
-    CQSeq,
-    CKSeq,
-    DRuntime,
-    logits_soft_cap,
-    softmax_aux,
-    num_sinks,
-    Dq,
-    Dk,
-    Dv,
-    layout_q_ptr,
-    degree_q_ptr,
-    layout_k_ptr,
-    degree_k_ptr,
-    FORCE_BLOCK_M,
-    FORCE_BLOCK_N,
-    VARLEN: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    BIAS_ON: tl.constexpr,
-    BOOL_BIAS: tl.constexpr,
-    USE_DROPOUT: tl.constexpr,
-    BLOCK_HEADDIM: tl.constexpr,
-    EVEN_M1: tl.constexpr,
-    EVEN_N1: tl.constexpr,
-    EVEN_M2: tl.constexpr,
-    EVEN_N2: tl.constexpr,
-    NUM_BLOCKS_KV: tl.constexpr,
-    HEADS_PADDED: tl.constexpr,
-    BLOCK_M1: tl.constexpr,
-    BLOCK_N1: tl.constexpr,
-    BLOCK_M2: tl.constexpr,
-    BLOCK_N2: tl.constexpr,
-    SLIDING: tl.constexpr,
+    stride_dvn,
+    stride_dvk,
+    dq,
+    dk,
+    dv,
+    Q_SEQ_LEN: tl.constexpr,
+    KV_SEQ_LEN: tl.constexpr,
+    QK_HEAD_DIM: tl.constexpr,
+    QK_HEAD_DIM_PAD: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
+    BLOCK_M_DKDV: tl.constexpr,
+    BLOCK_N_DKDV: tl.constexpr,
+    BLOCK_M_DQ: tl.constexpr,
+    BLOCK_N_DQ: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     SOFTCAP: tl.constexpr,
-    USE_SINKS: tl.constexpr,
-    USE_LAYOUT: tl.constexpr,
-    MAX_DEGREE_Q: tl.constexpr,
-    MAX_DEGREE_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    off_zh = tl.program_id(1)
-    off_z = off_zh // nheads_q
-    off_head_q = off_zh % nheads_q
-    off_head_kv = off_head_q // num_repeats
+    """Main Triton kernel wrapper for block-sparse attention backward pass.
 
-    if VARLEN:
-        cu_seq_start_q = tl.load(cum_seqlens_q + off_z)
-        cu_seq_start_k = tl.load(cum_seqlens_k + off_z)
-        actual_seqlen_q = tl.load(cum_seqlens_q + off_z + 1) - cu_seq_start_q
-        actual_seqlen_k = tl.load(cum_seqlens_k + off_z + 1) - cu_seq_start_k
-        off_z = 0
-    else:
-        cu_seq_start_q = 0
-        cu_seq_start_k = 0
-        actual_seqlen_q = QSeq
-        actual_seqlen_k = KSeq
+    Computes gradients for query, key, and value tensors by calling specialized
+    dQ and dKdV kernels. When SOFTCAP is enabled, properly handles the Jacobian
+    of the tanh soft cap function for correct gradient computation.
 
-    Q += off_z * stride_qz + off_head_q * stride_qh + cu_seq_start_q * stride_qm
-    K += off_z * stride_kz + off_head_kv * stride_kh + cu_seq_start_k * stride_kn
-    V += off_z * stride_vz + off_head_kv * stride_vh + cu_seq_start_k * stride_vn
-
-    Do += off_z * stride_doz + off_head_q * stride_doh + cu_seq_start_q * stride_dom
-    Dq += off_z * stride_dqz + off_head_q * stride_dqh + cu_seq_start_q * stride_dqm
-    Dk += off_z * stride_dkz + off_head_q * stride_dkh + cu_seq_start_k * stride_dkn
-    Dv += off_z * stride_dvz + off_head_q * stride_dvh + cu_seq_start_k * stride_dvn
-
-    if BIAS_ON:
-        B += off_z * stride_bz + off_head_q * stride_bh + cu_seq_start_q * stride_bm
-    Dropout = (
-        actual_seqlen_k * (cu_seq_start_q + actual_seqlen_q * (off_head_q + nheads_q * off_z)) if USE_DROPOUT else None
-    )
-
-    softmax_aux_ptrs = softmax_aux + off_head_q * num_sinks if USE_SINKS else softmax_aux
-
-    D += off_zh * seqlen_q_rounded
-    M += off_zh * seqlen_q_rounded
-
-    if pid < NUM_BLOCKS_KV:
-        k_block_id = pid
-        pad_cols = (not EVEN_N1) or (VARLEN and ((k_block_id + 1) * BLOCK_N1 > actual_seqlen_k))
-        k_block_start_n = k_block_id * BLOCK_N1
-
-        if USE_LAYOUT:
-            _attn_blocksparse_bwd_block_dkdv_layout(
-                k_block_start_n,
-                Q,
-                K,
-                V,
-                B,
-                Dropout,
-                Do,
-                Dk,
-                Dv,
-                M,
-                D,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_qm,
-                stride_kn,
-                stride_vn,
-                stride_bm,
-                stride_dom,
-                stride_dkn,
-                stride_dvn,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                layout_k_ptr,
-                degree_k_ptr,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_COLS=pad_cols,
-                HEADS_PADDED=HEADS_PADDED,
-                BLOCK_M=BLOCK_M1,
-                BLOCK_N=BLOCK_N1,
-                BLOCK_HEADDIM=BLOCK_HEADDIM,
-                MAX_DEGREE_K=MAX_DEGREE_K,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-            )
-        else:
-            _attn_bwd_block_dkdv(
-                k_block_start_n,
-                Q,
-                K,
-                V,
-                B,
-                Dropout,
-                Do,
-                Dk,
-                Dv,
-                M,
-                D,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_qm,
-                stride_kn,
-                stride_vn,
-                stride_bm,
-                stride_dom,
-                stride_dkn,
-                stride_dvn,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_COLS=pad_cols,
-                HEADS_PADDED=HEADS_PADDED,
-                BLOCK_M=BLOCK_M1,
-                BLOCK_N=BLOCK_N1,
-                BLOCK_HEADDIM=BLOCK_HEADDIM,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-            )
-    else:
-        q_block_id = pid - NUM_BLOCKS_KV
-        pad_rows = (not EVEN_M2) or (VARLEN and ((q_block_id + 1) * BLOCK_M2 > actual_seqlen_q))
-        q_block_start_m = q_block_id * BLOCK_M2
-
-        if USE_LAYOUT:
-            _attn_blocksparse_bwd_block_dq_layout(
-                q_block_start_m,
-                Q,
-                K,
-                V,
-                B,
-                Dropout,
-                Do,
-                Dq,
-                M,
-                D,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_qm,
-                stride_kn,
-                stride_vn,
-                stride_bm,
-                stride_dom,
-                stride_dqm,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                layout_q_ptr,
-                degree_q_ptr,
-                VARLEN=VARLEN,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_ROWS=pad_rows,
-                HEADS_PADDED=HEADS_PADDED,
-                BLOCK_M=BLOCK_M2,
-                BLOCK_N=BLOCK_N2,
-                BLOCK_HEADDIM=BLOCK_HEADDIM,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-                MAX_DEGREE_Q=MAX_DEGREE_Q,
-            )
-        else:
-            _attn_bwd_block_dq(
-                q_block_start_m,
-                Q,
-                K,
-                V,
-                B,
-                Dropout,
-                Do,
-                Dq,
-                M,
-                D,
-                softmax_scale,
-                dropout_prob,
-                dropout_seed,
-                stride_qm,
-                stride_kn,
-                stride_vn,
-                stride_bm,
-                stride_dom,
-                stride_dqm,
-                actual_seqlen_q,
-                actual_seqlen_k,
-                headdim,
-                window_left,
-                window_right,
-                logits_soft_cap,
-                softmax_aux_ptrs,
-                num_sinks,
-                VARLEN=VARLEN,
-                IS_CAUSAL=IS_CAUSAL,
-                BIAS_ON=BIAS_ON,
-                BOOL_BIAS=BOOL_BIAS,
-                USE_DROPOUT=USE_DROPOUT,
-                PAD_ROWS=pad_rows,
-                HEADS_PADDED=HEADS_PADDED,
-                BLOCK_M=BLOCK_M2,
-                BLOCK_N=BLOCK_N2,
-                BLOCK_HEADDIM=BLOCK_HEADDIM,
-                EVEN_N=EVEN_N2,
-                SLIDING=SLIDING,
-                SOFTCAP=SOFTCAP,
-                USE_SINKS=USE_SINKS,
-            )
-
-
-def _blocksparse_bwd_attention_kernel_call(
-    dO: Float[Array, "batch seq_len_q num_heads head_dim"],
-    q: Float[Array, "batch seq_len_q num_heads head_dim"],
-    k: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    v: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    *,
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None,
-    attention_mask: jnp.ndarray | None,
-    o: Float[Array, "batch seq_len_q num_heads head_dim"],
-    M: Float[Array, "batch num_heads max_seqlen_q_rounded"],
-    dropout_prob: float,
-    causal: bool,
-    softmax_scale: float | None,
-    dropout_seed: int | None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
-    sliding_window: int | tuple[int, int] | None = None,
-    logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    layout_q2k: Int[Array, "n_q_blocks max_degree"] | None = None,
-    degree_q2k: Int[Array, "n_q_blocks"] | None = None,
-    layout_k2q: Int[Array, "n_k_blocks max_degree"] | None = None,
-    degree_k2q: Int[Array, "n_k_blocks"] | None = None,
-    max_degree_q: int = 0,
-    max_degree_k: int = 0,
-    force_block_m: int = 0,
-    force_block_n: int = 0,
-):
-    if sliding_window is None:
-        window_left, window_right, sliding_flag = 0, 0, False
-    else:
-        if isinstance(sliding_window, int):
-            window_left = int(sliding_window)
-            window_right = 0 if causal else int(sliding_window)
-        else:
-            wl, wr = sliding_window
-            window_left, window_right = int(wl), int(wr)
-        sliding_flag = (window_left > 0) or (window_right > 0)
-
-    if logits_soft_cap is None:
-        logits_soft_cap_val, softcap_flag = 0.0, False
-    else:
-        logits_soft_cap_val, softcap_flag = float(logits_soft_cap), True
-
-    if softmax_aux is None:
-        use_sinks = False
-        num_sinks_val = 0
-        softmax_aux_tensor = jnp.zeros((1,), dtype=q.dtype)
-    else:
-        use_sinks = True
-        if softmax_aux.ndim == 1:
-            num_sinks_val = softmax_aux.shape[0]
-            softmax_aux_tensor = jnp.broadcast_to(softmax_aux[None, :], (q.shape[2], num_sinks_val))
-        elif softmax_aux.ndim == 2:
-            num_sinks_val = softmax_aux.shape[1]
-            softmax_aux_tensor = softmax_aux
-        else:
-            raise ValueError("softmax_aux must be 1D or 2D")
-
-    varlen_from_cu = (cum_seqlens_q is not None) and (cum_seqlens_k is not None)
-    if varlen_from_cu:
-        if (layout_q2k is not None) or (layout_k2q is not None):
-            if force_block_m == 0 or force_block_n == 0:
-                raise ValueError(
-                    "When using layout with VARLEN, please set force_block_m and force_block_n "
-                    "to match your layout block units."
-                )
-        batch_size, QSeq_max, nheads_q, head_dim = q.shape
-        _, KSeq_max, nheads_kv, _ = k.shape
-        assert nheads_q % nheads_kv == 0
-        num_repeats = nheads_q // nheads_kv
-        BLOCK_HEADDIM = max(triton.next_power_of_2(head_dim), 16)
-        max_seqlen_q = QSeq_max
-        max_seqlen_k = KSeq_max
-        max_seqlen_q_rounded = math.ceil(max_seqlen_q / 128) * 128
-        softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
-
-        q_p = attention_pack_from_cu_static(q, cum_seqlens_q, max_tokens=batch_size * QSeq_max)
-        k_p = attention_pack_from_cu_static(k, cum_seqlens_k, max_tokens=batch_size * KSeq_max)
-        v_p = attention_pack_from_cu_static(v, cum_seqlens_k, max_tokens=batch_size * KSeq_max)
-        o_p = attention_pack_from_cu_static(o, cum_seqlens_q, max_tokens=batch_size * QSeq_max)
-        dO_p = attention_pack_from_cu_static(dO, cum_seqlens_q, max_tokens=batch_size * QSeq_max)
-
-        oz, om, oh, _ = get_strides(o_p)
-        doz, dom, doh, _ = get_strides(dO_p)
-        qz, qm, qh, _ = get_strides(q_p)
-        kz, kn, kh, _ = get_strides(k_p)
-        vz, vn, vh, _ = get_strides(v_p)
-
-        (delta,) = triton_call(
-            o_p,
-            dO_p,
-            oz,
-            om,
-            oh,
-            doz,
-            dom,
-            doh,
-            nheads_q,
-            max_seqlen_q,
-            max_seqlen_q_rounded,
-            cum_seqlens_q,
-            head_dim,
-            max_seqlen_q // 32,
-            dtype_index(q_p),
-            VARLEN=True,
-            BLOCK_HEADDIM=BLOCK_HEADDIM,
-            out_shape=[jax.ShapeDtypeStruct(shape=M.shape, dtype="f4", sharding=get_sharding(M))],
-            grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch_size * nheads_q),
-            kernel=_attn_bwd_preprocess,
-            name="triton::ops::_attn_bwd_preprocess",
-        )
-
-        bz = bm = bh = 0
-
-        use_layout = (layout_q2k is not None) and (layout_k2q is not None)
-        max_degree_q = int(max_degree_q) if use_layout else 1
-        max_degree_k = int(max_degree_k) if use_layout else 1
-        layout_q_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else layout_q2k
-        degree_q_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else degree_q2k
-        layout_k_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else layout_k2q
-        degree_k_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else degree_k2q
-
-        dq, dk, dv = triton_call(
-            q_p,
-            k_p,
-            v_p,
-            jnp.zeros((1,), q.dtype),
-            dO_p,
-            M,
-            delta,
-            softmax_scale,
-            dropout_prob,
-            dropout_seed if dropout_seed is not None else jnp.zeros((1,), q.dtype),
-            qz,
-            qm,
-            qh,
-            kz,
-            kn,
-            kh,
-            vz,
-            vn,
-            vh,
-            bz,
-            bm,
-            bh,
-            doz,
-            dom,
-            doh,
-            qz,
-            qm,
-            qh,
-            kz,
-            kn,
-            kh,
-            vz,
-            vn,
-            vh,
-            nheads_q,
-            num_repeats,
-            window_left,
-            window_right,
-            max_seqlen_q,
-            cum_seqlens_q,
-            max_seqlen_k,
-            cum_seqlens_k,
-            max_seqlen_q_rounded,
-            head_dim,
-            max_seqlen_q // 32,
-            max_seqlen_k // 32,
-            dtype_index(q_p),
-            logits_soft_cap_val,
-            softmax_aux_tensor,
-            num_sinks_val,
-            jnp.zeros((1,), jnp.int32) if not use_layout else layout_q_ptr,
-            jnp.zeros((1,), jnp.int32) if not use_layout else degree_q_ptr,
-            jnp.zeros((1,), jnp.int32) if not use_layout else layout_k_ptr,
-            jnp.zeros((1,), jnp.int32) if not use_layout else degree_k_ptr,
-            int(force_block_m),
-            int(force_block_n),
-            kernel=_attn_blocksparse_bwd,
-            grid=lambda META: (
-                triton.cdiv(max_seqlen_k, META["BLOCK_N1"]) + triton.cdiv(max_seqlen_q, META["BLOCK_M2"]),
-                batch_size * nheads_q,
-            ),
-            out_shape=[
-                jax.ShapeDtypeStruct(shape=q_p.shape, dtype="f4", sharding=get_sharding(q)),
-                jax.ShapeDtypeStruct(shape=(k_p.shape[0], k_p.shape[1], q_p.shape[2], k_p.shape[3]), dtype=k.dtype),
-                jax.ShapeDtypeStruct(shape=(v_p.shape[0], v_p.shape[1], q_p.shape[2], v_p.shape[3]), dtype=v.dtype),
-            ],
-            name="triton::ops::_attn_blocksparse_bwd",
-            VARLEN=True,
-            IS_CAUSAL=causal,
-            USE_DROPOUT=(dropout_prob > 0),
-            BIAS_ON=False,
-            BOOL_BIAS=False,
-            BLOCK_HEADDIM=BLOCK_HEADDIM,
-            SLIDING=sliding_flag,
-            SOFTCAP=softcap_flag,
-            USE_SINKS=use_sinks,
-            USE_LAYOUT=use_layout,
-            MAX_DEGREE_Q=max_degree_q,
-            MAX_DEGREE_K=max_degree_k,
-            FORCE_BLOCK_M=int(force_block_m),
-            FORCE_BLOCK_N=int(force_block_n),
-        )
-
-        if num_repeats > 1:
-            dk = dk.reshape(dk.shape[0], dk.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)
-            dv = dv.reshape(dv.shape[0], dv.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)
-
-        dq = attention_unpack_with_static_shape(dq, cum_seqlens_q, batch_size, QSeq_max)
-        dk = attention_unpack_with_static_shape(dk, cum_seqlens_k, batch_size, KSeq_max)
-        dv = attention_unpack_with_static_shape(dv, cum_seqlens_k, batch_size, KSeq_max)
-        return dq, dk, dv
-
-    batch, QSeq, nheads_q, head_dim = q.shape
-    _, KSeq, nheads_kv, _ = k.shape
-    assert nheads_q % nheads_kv == 0
-    num_repeats = nheads_q // nheads_kv
-    BLOCK_HEADDIM = max(triton.next_power_of_2(head_dim), 16)
-    max_seqlen_q_rounded = math.ceil(QSeq / 128) * 128
-    softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
-
-    BOOL_BIAS = False
-    if attention_mask is not None:
-        if bias is not None:
-            raise ValueError("Use either attention_mask or bias, not both.")
-        BOOL_BIAS = True
-        bias = attention_mask.astype(jnp.bool_)
-
-    oz, om, oh, _ = get_strides(o)
-    doz, dom, doh, _ = get_strides(dO)
-    qz, qm, qh, _ = get_strides(q)
-    kz, kn, kh, _ = get_strides(k)
-    vz, vn, vh, _ = get_strides(v)
-
-    (delta,) = triton_call(
-        o,
-        dO,
-        oz,
-        om,
-        oh,
-        doz,
-        dom,
-        doh,
-        nheads_q,
-        QSeq,
-        max_seqlen_q_rounded,
-        jnp.zeros((1,), jnp.int32),
-        head_dim,
-        QSeq // 32,
-        dtype_index(q),
-        VARLEN=False,
-        BLOCK_HEADDIM=BLOCK_HEADDIM,
-        out_shape=[jax.ShapeDtypeStruct(shape=M.shape, dtype="f4", sharding=get_sharding(M))],
-        grid=lambda META: (triton.cdiv(QSeq, META["BLOCK_M"]), batch * nheads_q),
-        kernel=_attn_bwd_preprocess,
-        name="triton::ops::_attn_bwd_preprocess",
-    )
-
-    if bias is not None:
-        if not hasattr(bias, "strides"):
-            from ejkernel.utils import get_strides as gs
-
-            bz, bm, bh, _ = gs(bias.shape)
-            bz, bm, bh = (
-                bz * bias.itemsize // bias.itemsize,
-                bm * bias.itemsize // bias.itemsize,
-                bh * bias.itemsize // bias.itemsize,
-            )
-        else:
-            bz, bm, bh, _ = bias.strides
-            bz //= bias.itemsize
-            bm //= bias.itemsize
-            bh //= bias.itemsize
-    else:
-        bz = bm = bh = 0
-
-    use_layout = (layout_q2k is not None) and (layout_k2q is not None)
-    layout_q_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else layout_q2k
-    degree_q_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else degree_q2k
-    layout_k_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else layout_k2q
-    degree_k_ptr = jnp.zeros((1,), jnp.int32) if not use_layout else degree_k2q
-    max_degree_q = int(max_degree_q) if use_layout else 1
-    max_degree_k = int(max_degree_k) if use_layout else 1
-
-    dq, dk, dv = triton_call(
+    Args:
+        q, k, v: Query, key, value tensors
+        q_positions, q_segment_ids: Query position and segment IDs
+        kv_positions, kv_segment_ids: KV position and segment IDs
+        dout: Output gradient tensor
+        lse: Log-sum-exp from forward pass
+        delta: Precomputed delta values (out * dout sum)
+        lower_blocks_query, upper_blocks_query: Query block bounds
+        lower_full_blocks_query, upper_full_blocks_query: Query full block bounds
+        lower_blocks_kv, upper_blocks_kv: KV block bounds
+        lower_full_blocks_kv, upper_full_blocks_kv: KV full block bounds
+        query_global_offset: Global query offsets for context parallelism
+        softmax_scale: Softmax scaling factor
+        logits_soft_cap: Soft cap value. When SOFTCAP is True, Jacobian
+            (1 - tanh²(x)) is applied during gradient computation
+        stride_qz, stride_qh, stride_qm, stride_qk: Query strides
+        stride_kz, stride_kh, stride_kn, stride_kk: Key strides
+        stride_vz, stride_vh, stride_vn, stride_vk: Value strides
+        stride_oz, stride_oh, stride_om, stride_ok: Output gradient strides
+        stride_lz, stride_lh, stride_lm: LSE strides
+        stride_dkz, stride_dkh, stride_dkn, stride_dkk: dK strides
+        stride_dvz, stride_dvh, stride_dvn, stride_dvk: dV strides
+        dq, dk, dv: Output gradient buffers
+        Q_SEQ_LEN: Query sequence length (constexpr)
+        KV_SEQ_LEN: Key/value sequence length (constexpr)
+        QK_HEAD_DIM: Query/key head dimension (constexpr)
+        QK_HEAD_DIM_PAD: Padded head dimension (constexpr)
+        V_HEAD_DIM: Value head dimension (constexpr)
+        BLOCK_M_DKDV: Query block size for dKdV kernel (constexpr)
+        BLOCK_N_DKDV: KV block size for dKdV kernel (constexpr)
+        BLOCK_M_DQ: Query block size for dQ kernel (constexpr)
+        BLOCK_N_DQ: KV block size for dQ kernel (constexpr)
+        NUM_GROUPS: Number of query groups per KV head (constexpr)
+        SOFTCAP: Enable logit soft capping (constexpr)
+    """
+    blocksparse_attn_bwd_dkdv(
         q,
         k,
         v,
-        bias if bias is not None else jnp.zeros((1,), q.dtype),
-        dO,
-        M,
+        q_positions,
+        q_segment_ids,
+        kv_positions,
+        kv_segment_ids,
+        dout,
+        lse,
         delta,
+        lower_blocks_kv,
+        upper_blocks_kv,
+        lower_full_blocks_kv,
+        upper_full_blocks_kv,
+        query_global_offset,
         softmax_scale,
-        dropout_prob,
-        dropout_seed if dropout_seed is not None else jnp.zeros((1,), q.dtype),
-        qz,
-        qm,
-        qh,
-        kz,
-        kn,
-        kh,
-        vz,
-        vn,
-        vh,
-        bz,
-        bm,
-        bh,
-        doz,
-        dom,
-        doh,
-        qz,
-        qm,
-        qh,
-        kz,
-        kn,
-        kh,
-        vz,
-        vn,
-        vh,
-        nheads_q,
-        num_repeats,
-        window_left,
-        window_right,
-        QSeq,
-        jnp.zeros((1,), jnp.int32),
-        KSeq,
-        jnp.zeros((1,), jnp.int32),
-        max_seqlen_q_rounded,
-        head_dim,
-        QSeq // 32,
-        KSeq // 32,
-        dtype_index(q),
-        logits_soft_cap_val,
-        softmax_aux_tensor,
-        num_sinks_val,
-        layout_q_ptr,
-        degree_q_ptr,
-        layout_k_ptr,
-        degree_k_ptr,
-        int(force_block_m),
-        int(force_block_n),
-        kernel=_attn_blocksparse_bwd,
-        grid=lambda META: (
-            triton.cdiv(KSeq, META["BLOCK_N1"]) + triton.cdiv(QSeq, META["BLOCK_M2"]),
-            batch * nheads_q,
-        ),
-        out_shape=[
-            jax.ShapeDtypeStruct(shape=q.shape, dtype="f4", sharding=get_sharding(q)),
-            jax.ShapeDtypeStruct(shape=(k.shape[0], k.shape[1], q.shape[2], k.shape[3]), dtype=k.dtype),
-            jax.ShapeDtypeStruct(shape=(v.shape[0], v.shape[1], q.shape[2], v.shape[3]), dtype=v.dtype),
-        ],
-        name="triton::ops::_attn_blocksparse_bwd",
-        VARLEN=False,
-        IS_CAUSAL=causal,
-        USE_DROPOUT=(dropout_prob > 0),
-        BIAS_ON=(bias is not None),
-        BOOL_BIAS=BOOL_BIAS,
-        BLOCK_HEADDIM=BLOCK_HEADDIM,
-        SLIDING=sliding_flag,
-        SOFTCAP=softcap_flag,
-        USE_SINKS=use_sinks,
-        USE_LAYOUT=use_layout,
-        MAX_DEGREE_Q=max_degree_q,
-        MAX_DEGREE_K=max_degree_k,
-        FORCE_BLOCK_M=int(force_block_m),
-        FORCE_BLOCK_N=int(force_block_n),
+        logits_soft_cap,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_ok,
+        stride_lz,
+        stride_lh,
+        stride_lm,
+        stride_dkz,
+        stride_dkh,
+        stride_dkn,
+        stride_dkk,
+        stride_dvz,
+        stride_dvh,
+        stride_dvn,
+        stride_dvk,
+        dk,
+        dv,
+        Q_SEQ_LEN,
+        KV_SEQ_LEN,
+        QK_HEAD_DIM,
+        QK_HEAD_DIM_PAD,
+        V_HEAD_DIM,
+        BLOCK_M_DKDV,
+        BLOCK_N_DKDV,
+        False,
+        NUM_GROUPS,
+        False,
+        SOFTCAP,
     )
 
-    if num_repeats > 1:
-        dk = dk.reshape(dk.shape[0], dk.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)
-        dv = dv.reshape(dv.shape[0], dv.shape[1], (nheads_q // num_repeats), num_repeats, -1).sum(axis=3)
+    blocksparse_attn_bwd_dq(
+        q,
+        k,
+        v,
+        q_positions,
+        q_segment_ids,
+        kv_positions,
+        kv_segment_ids,
+        dout,
+        lse,
+        delta,
+        lower_blocks_query,
+        upper_blocks_query,
+        lower_full_blocks_query,
+        upper_full_blocks_query,
+        query_global_offset,
+        softmax_scale,
+        logits_soft_cap,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_ok,
+        stride_lz,
+        stride_lh,
+        stride_lm,
+        dq,
+        Q_SEQ_LEN,
+        KV_SEQ_LEN,
+        QK_HEAD_DIM,
+        QK_HEAD_DIM_PAD,
+        V_HEAD_DIM,
+        BLOCK_M_DQ,
+        BLOCK_N_DQ,
+        NUM_GROUPS,
+        False,
+        SOFTCAP,
+    )
 
-    return dq, dk, dv
+
+def _bwd_blocksparse_attn_call(
+    softmax_scale: float,
+    bias: ArrayLike | None,
+    apply_load_balance: bool,
+    sequence_parallelism_mesh_axis_name: str | None,
+    window_left: int,
+    window_right: int,
+    causal: bool,
+    q_blocksize: int,
+    kv_blocksize: int,
+    bwd_q_blocksize: int,
+    bwd_kv_blocksize: int,
+    logit_soft_cap: float | None,
+    debug: bool,
+    res: ArrayLike,
+    dout: ArrayLike,
+):
+    (
+        query,
+        key,
+        value,
+        q_positions,
+        q_segment_ids,
+        kv_positions,
+        kv_segment_ids,
+        qkv_layouts,
+        out,
+        lse,
+    ) = res
+    qkv_layouts: tuple[SparseMask]
+    dout = dout.transpose(0, 2, 1, 3)
+
+    BLOCK_M_DKDV = bwd_q_blocksize
+    BLOCK_N_DKDV = bwd_kv_blocksize
+    BLOCK_M_DQ = bwd_q_blocksize
+    BLOCK_N_DQ = bwd_kv_blocksize
+
+    chex.assert_rank([query, key, value, out, dout], 4)
+
+    batch_size, num_heads, query_seq_len, qk_head_dim = query.shape
+    _, num_kv_heads, kv_seq_len, value_head_dim = value.shape
+    qk_head_dim_pad = next_power_of_2(qk_head_dim)
+
+    num_groups = num_heads // num_kv_heads
+
+    chex.assert_is_divisible(query_seq_len, bwd_q_blocksize)
+    chex.assert_is_divisible(kv_seq_len, bwd_kv_blocksize)
+    chex.assert_is_divisible(kv_seq_len, bwd_kv_blocksize)
+
+    num_query_blocks = query_seq_len // BLOCK_M_DQ
+    num_kv_blocks = kv_seq_len // BLOCK_N_DKDV
+    grid = (num_kv_blocks, batch_size, num_heads)
+
+    using_sequence_parallelism = sequence_parallelism_mesh_axis_name is not None
+
+    use_separate_kernel_impl = True
+
+    if using_sequence_parallelism:
+        query_chunk_idx = jax.lax.axis_index(sequence_parallelism_mesh_axis_name)
+        chex.assert_is_divisible(query_seq_len, BLOCK_M_DKDV)
+        chex.assert_is_divisible(query_seq_len, BLOCK_M_DQ)
+
+        if apply_load_balance:
+            axis_size = jax.lax.psum(1, sequence_parallelism_mesh_axis_name)
+            query_global_offset_dkdv = jnp.zeros((2), dtype=jnp.int32)
+            query_global_offset_dq = jnp.zeros((query_seq_len // BLOCK_M_DQ), dtype=jnp.int32)
+
+            query_global_offset_first_part = query_chunk_idx * query_seq_len // 2
+            query_global_offset_second_part = (
+                2 * axis_size - query_chunk_idx - 1
+            ) * query_seq_len // 2 - query_seq_len // 2
+
+            half_seq_len = 1
+            query_global_offset_dkdv = query_global_offset_dkdv.at[:half_seq_len].set(query_global_offset_first_part)
+            query_global_offset_dkdv = query_global_offset_dkdv.at[half_seq_len:].set(query_global_offset_second_part)
+
+            half_seq_len = query_seq_len // BLOCK_M_DQ // 2
+            query_global_offset_dq = query_global_offset_dq.at[:half_seq_len].set(query_global_offset_first_part)
+            query_global_offset_dq = query_global_offset_dq.at[half_seq_len:].set(query_global_offset_second_part)
+
+        else:
+            query_global_offset_dkdv = query_chunk_idx * query_seq_len
+
+            query_global_offset_dq = (
+                jnp.ones((query_seq_len // BLOCK_M_DQ), dtype=jnp.int32) * query_chunk_idx * query_seq_len
+            )
+    else:
+        query_global_offset_dkdv = jnp.zeros((1,), dtype=jnp.int32)
+        query_global_offset_dq = jnp.zeros((query_seq_len // BLOCK_M_DQ), dtype=jnp.int32)
+
+    if len(qkv_layouts) != 3:
+        raise ValueError("Length of qkv_layouts should be equal to three")
+
+    mask_dq = qkv_layouts[1]
+    mask_dkdv = qkv_layouts[2]
+
+    preprocess_block_size = 128
+
+    seq_len_eff = out.shape[2]
+    pre_grid = (cdiv(seq_len_eff, preprocess_block_size), batch_size, num_heads)
+
+    out_shape = jax.ShapeDtypeStruct(shape=lse.shape, dtype=jnp.float32)
+
+    delta = triton_call(
+        out,
+        dout,
+        *strides_from_shape(out.shape),
+        NUM_HEADS=num_heads,
+        SEQ_LEN=seq_len_eff,
+        kernel=blocksparse_attn_bwd_preprocess,
+        out_shape=out_shape,
+        grid=pre_grid,
+        name="ejkernel::triton::blocksparse_attn_bwd_preprocess",
+        BLOCK_SIZE=preprocess_block_size,
+        HEAD_DIM=value_head_dim,
+        zeroed_outputs=(0,),
+    )
+
+    if seq_len_eff != query_seq_len:
+        pad_len = query_seq_len - seq_len_eff
+
+        lse_padded = jnp.pad(lse, ((0, 0), (0, 0), (0, pad_len)), constant_values=0.0)
+        delta_padded = jnp.pad(delta, ((0, 0), (0, 0), (0, pad_len)), constant_values=0.0)
+
+        dout_padded = jnp.pad(dout, ((0, 0), (0, 0), (0, pad_len), (0, 0)), constant_values=0.0)
+    else:
+        lse_padded = lse
+        delta_padded = delta
+        dout_padded = dout
+
+    if logit_soft_cap is None:
+        logits_soft_cap_val = 0.0
+        softcap_flag = False
+    else:
+        logits_soft_cap_val = float(logit_soft_cap)
+        softcap_flag = True
+
+    metaparams = dict(
+        Q_SEQ_LEN=query_seq_len,
+        KV_SEQ_LEN=kv_seq_len,
+        QK_HEAD_DIM=qk_head_dim,
+        QK_HEAD_DIM_PAD=qk_head_dim_pad,
+        V_HEAD_DIM=value_head_dim,
+        NUM_GROUPS=num_groups,
+        SOFTCAP=softcap_flag,
+    )
+
+    dk_shape = (batch_size, num_kv_heads, kv_seq_len, qk_head_dim)
+    dv_shape = (batch_size, num_kv_heads, kv_seq_len, value_head_dim)
+    zeroed_outputs = (0, 1) if use_separate_kernel_impl else (1, 2)
+
+    dq_shape_dtype = jax.ShapeDtypeStruct(shape=query.shape, dtype=query.dtype)
+    dk_shape_dtype = jax.ShapeDtypeStruct(shape=dk_shape, dtype=jnp.float32)
+    dv_shape_dtype = jax.ShapeDtypeStruct(shape=dv_shape, dtype=jnp.float32)
+
+    if use_separate_kernel_impl:
+        out_shape = [dq_shape_dtype]
+        dq_metaparams = dict(
+            **metaparams,
+            BLOCK_M=BLOCK_M_DQ,
+            BLOCK_N=BLOCK_N_DQ,
+            IS_CONTEXT_PARALLELISM=using_sequence_parallelism,
+        )
+        dq = triton_call(
+            query,
+            key,
+            value,
+            q_positions,
+            q_segment_ids,
+            kv_positions,
+            kv_segment_ids,
+            dout_padded,
+            lse_padded,
+            delta_padded,
+            mask_dq.lower_bounds,
+            mask_dq.upper_bounds,
+            mask_dq.lower_full_bounds,
+            mask_dq.upper_full_bounds,
+            query_global_offset_dq,
+            softmax_scale,
+            logits_soft_cap_val,
+            *strides_from_shape(query.shape),
+            *strides_from_shape(key.shape),
+            *strides_from_shape(value.shape),
+            *strides_from_shape(dout_padded.shape),
+            *strides_from_shape(lse_padded.shape),
+            kernel=blocksparse_attn_bwd_dq,
+            out_shape=out_shape,
+            grid=(num_query_blocks, batch_size, num_heads),
+            name="ejkernel::triton::blocksparse_attn_bwd_dq",
+            **dq_metaparams,
+        )[0]
+
+        out_shape = [dk_shape_dtype, dv_shape_dtype]
+        dkdv_metaparams = dict(
+            **metaparams,
+            BLOCK_M=BLOCK_M_DKDV,
+            BLOCK_N=BLOCK_N_DKDV,
+            IS_CONTEXT_PARALLELISM=using_sequence_parallelism,
+            LOAD_SECOND_OFFSET=using_sequence_parallelism and apply_load_balance,
+        )
+        dk, dv = triton_call(
+            query,
+            key,
+            value,
+            q_positions,
+            q_segment_ids,
+            kv_positions,
+            kv_segment_ids,
+            dout_padded,
+            lse_padded,
+            delta_padded,
+            mask_dkdv.lower_bounds,
+            mask_dkdv.upper_bounds,
+            mask_dkdv.lower_full_bounds,
+            mask_dkdv.upper_full_bounds,
+            query_global_offset_dkdv,
+            softmax_scale,
+            logits_soft_cap_val,
+            *strides_from_shape(query.shape),
+            *strides_from_shape(key.shape),
+            *strides_from_shape(value.shape),
+            *strides_from_shape(dout_padded.shape),
+            *strides_from_shape(lse_padded.shape),
+            *strides_from_shape(dk_shape),
+            *strides_from_shape(dv_shape),
+            kernel=blocksparse_attn_bwd_dkdv,
+            out_shape=out_shape,
+            grid=grid,
+            name="ejkernel::triton::blocksparse_attn_bwd_dkdv",
+            **dkdv_metaparams,
+            zeroed_outputs=zeroed_outputs,
+        )
+    else:
+        out_shape = [dq_shape_dtype, dk_shape_dtype, dv_shape_dtype]
+        metaparams = dict(
+            **metaparams,
+            BLOCK_M_DKDV=BLOCK_M_DKDV,
+            BLOCK_N_DKDV=BLOCK_N_DKDV,
+            BLOCK_M_DQ=BLOCK_M_DQ,
+            BLOCK_N_DQ=BLOCK_N_DQ,
+        )
+        query_global_offset = 0
+        dq, dk, dv = triton_call(
+            query,
+            key,
+            value,
+            q_positions,
+            q_segment_ids,
+            kv_positions,
+            kv_segment_ids,
+            dout_padded,
+            lse_padded,
+            delta_padded,
+            mask_dq.lower_bounds,
+            mask_dq.upper_bounds,
+            mask_dq.lower_full_bounds,
+            mask_dq.upper_full_bounds,
+            mask_dkdv.lower_bounds,
+            mask_dkdv.upper_bounds,
+            mask_dkdv.lower_full_bounds,
+            mask_dkdv.upper_full_bounds,
+            query_global_offset,
+            softmax_scale,
+            logits_soft_cap_val,
+            *strides_from_shape(query.shape),
+            *strides_from_shape(key.shape),
+            *strides_from_shape(value.shape),
+            *strides_from_shape(dout_padded.shape),
+            *strides_from_shape(lse_padded.shape),
+            *strides_from_shape(dk_shape),
+            *strides_from_shape(dv_shape),
+            kernel=blocksparse_attn_bwd,
+            out_shape=out_shape,
+            grid=grid,
+            name="ejkernel::triton::blocksparse_attn_bwd",
+            **metaparams,
+            zeroed_outputs=zeroed_outputs,
+        )
+
+    return (
+        dq,
+        dk,
+        dv,
+        None,
+        None,
+        None,
+        None,
+        (
+            SparseMask(lower_bounds=None, upper_bounds=None, lower_full_bounds=None, upper_full_bounds=None),
+            SparseMask(lower_bounds=None, upper_bounds=None, lower_full_bounds=None, upper_full_bounds=None),
+            SparseMask(lower_bounds=None, upper_bounds=None, lower_full_bounds=None, upper_full_bounds=None),
+        ),
+        None,
+    )

@@ -14,6 +14,7 @@
 
 
 import math
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +24,8 @@ from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.callib import ejit
 from ejkernel.utils import get_strides
+
+PADDING_SEGMENT_ID = -1
 
 
 @triton.jit
@@ -185,6 +188,53 @@ def attention_pack_with_static_shape(
 
     packed = jax.lax.fori_loop(0, batch_size * seqlen, process_token, packed)
     return packed
+
+
+@triton.jit
+def make_segment_mask(q_segment_ids, kv_segment_ids, transposed: tl.constexpr):
+    if transposed:
+        res = q_segment_ids[None, :] == kv_segment_ids[:, None]
+    else:
+        res = q_segment_ids[:, None] == kv_segment_ids[None, :]
+    return res
+
+
+@triton.jit
+def make_causal_mask(q_positions, kv_positions, transposed: tl.constexpr):
+    if transposed:
+        causal_mask = q_positions[None, :] >= kv_positions[:, None]
+    else:
+        causal_mask = q_positions[:, None] >= kv_positions[None, :]
+    return causal_mask
+
+
+@triton.jit
+def make_sliding_window_mask(
+    q_positions,
+    kv_positions,
+    window_left: tl.constexpr,
+    window_right: tl.constexpr,
+    transposed: tl.constexpr,
+):
+    """Create sliding window mask.
+
+    Args:
+        q_positions: Query token positions
+        kv_positions: KV token positions
+        window_left: How many positions to the left (past) to attend to
+        window_right: How many positions to the right (future) to attend to
+        transposed: Whether to transpose the mask
+
+    Returns:
+        Boolean mask where True means attend
+    """
+    if transposed:
+        distance = q_positions[None, :] - kv_positions[:, None]
+    else:
+        distance = q_positions[:, None] - kv_positions[None, :]
+
+    in_window = (distance >= -window_right) & (distance <= window_left)
+    return in_window
 
 
 def basic_attention_refrence(
@@ -356,3 +406,32 @@ def attention_unpack_with_static_shape(
 
     out = jax.lax.fori_loop(0, batch_size, body_b, out)
     return out
+
+
+def pad_to_block_size(
+    inputs: Sequence[Array] | None,
+    indexs: Array | None,
+    segment_ids: Array | None,
+    block_size: int,
+    pos_fill_value: int,
+    transposed_inputs: bool = False,
+):
+    seq_len = indexs.shape[1]
+    padded_seq_len = (seq_len + block_size - 1) // block_size * block_size
+    pad_len = padded_seq_len - seq_len
+
+    if transposed_inputs:
+        inputs_axis = ((0, 0), (0, 0), (0, pad_len), (0, 0))
+    else:
+        inputs_axis = ((0, 0), (0, pad_len), (0, 0), (0, 0))
+
+    if pad_len > 0:
+        if inputs is not None:
+            inputs = [jnp.pad(e, inputs_axis) for e in inputs]
+
+        if indexs is not None:
+            indexs = jnp.pad(indexs, ((0, 0), (0, pad_len)), constant_values=pos_fill_value)
+        if segment_ids is not None:
+            segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)), constant_values=PADDING_SEGMENT_ID)
+
+    return inputs, indexs, segment_ids

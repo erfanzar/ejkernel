@@ -36,7 +36,7 @@ from ejkernel.ops import Invocation, Kernel
 from ..base import KernelConfig, create_default_executor, detect_platform
 
 
-class Attention(Kernel[KernelConfig, Array]):
+class Attention(Kernel[KernelConfig, tuple[Array, Array]]):
     """Attention with custom optimization logic.
 
     Supports causal masking, dropout, sliding windows, and variable-length sequences.
@@ -101,7 +101,7 @@ class Attention(Kernel[KernelConfig, Array]):
         init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = True,
         dropout_rng: PRNGKeyArray | None = None,
-        softmax_aux: Float[Array, "..."] | None = None,
+        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         softmax_scale: float | None = None,
         dtype: DTypeLike | None = jnp.bfloat16,
         softmax_dtype: DTypeLike | None = None,
@@ -109,7 +109,7 @@ class Attention(Kernel[KernelConfig, Array]):
         sliding_window: int | tuple[int, int] | None = None,
         *,
         cfg: KernelConfig,
-    ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+    ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
         """Execute flash attention with the given configuration.
 
         Args:
@@ -120,17 +120,9 @@ class Attention(Kernel[KernelConfig, Array]):
             bias: Optional attention bias tensor
             softmax_scale: Scaling factor for attention scores
             dropout_prob: Dropout probability for attention weights
-            causal: Whether to apply causal masking
-            dropout_seed: Random seed for dropout
-            cum_seqlens_q: Cumulative sequence lengths for variable-length queries
-            cum_seqlens_k: Cumulative sequence lengths for variable-length keys
             sliding_window: Window size for local attention
-            logits_soft_cap: Optional soft cap value for logits
-            softmax_aux: Optional attention sink logits
+            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
             cfg: Configuration object specifying platform/backend
-            segment_ids: Segment IDs for grouped sequences (TPU-specific)
-            block_sizes: Block sizes for kernel execution (TPU-specific)
-            debug: Enable debug mode
 
         Returns:
             Attention output [batch, seq_len_q, num_heads, head_dim]
@@ -228,7 +220,7 @@ def attention(
     init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
     dropout_rng: PRNGKeyArray | None = None,
-    softmax_aux: Float[Array, "..."] | None = None,
+    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     softmax_scale: float | None = None,
     dtype: DTypeLike | None = jnp.bfloat16,
     softmax_dtype: DTypeLike | None = None,
@@ -247,25 +239,21 @@ def attention(
         bias: Optional attention bias tensor
         softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
         dropout_prob: Dropout probability for attention weights
-        causal: Whether to apply causal masking
-        dropout_seed: Random seed for dropout
-        cum_seqlens_q: Cumulative sequence lengths for variable-length queries
-        cum_seqlens_k: Cumulative sequence lengths for variable-length keys
         sliding_window: Window size for local attention (int or (left, right) tuple)
-        logits_soft_cap: Optional soft cap value for logits
+        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
 
     Returns:
         Attention output with same shape as query
 
     Example:
         >>>
-        >>> out = attention(query, key, value, causal=True)
+        >>> out = attention(query, key, value)
         >>>
         >>>
         >>> out = attention(query, key, value, dropout_prob=0.1, softmax_scale=0.125)
         >>>
         >>>
-        >>> out = attention(query, key, value, cum_seqlens_q=cu_q, cum_seqlens_k=cu_k)
+        >>> out = attention(query, key, value, platform="xla")
     """
 
     return _executor(

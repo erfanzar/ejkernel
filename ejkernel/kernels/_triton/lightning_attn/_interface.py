@@ -13,6 +13,45 @@
 # limitations under the License.
 
 
+"""Lightning Attention implementation using Triton kernels.
+
+This module provides an efficient implementation of Lightning Attention, a
+linear attention mechanism that uses layer-dependent decay rates to adaptively
+adjust the temporal receptive field across different layers of a neural network.
+
+Lightning Attention is designed for efficient sequence processing with O(N)
+complexity while allowing different layers to have different memory characteristics.
+Shallow layers can focus on local patterns with faster decay, while deeper layers
+can capture longer-range dependencies with slower decay.
+
+Key innovation:
+The decay rate (g_gamma) is computed based on layer position:
+    g_gamma = -(8 / num_heads) * (1 - layer_idx / num_layers) * head_indices
+
+This creates a progressive increase in temporal context as we move deeper into
+the network, mimicking the hierarchical feature learning in transformers but
+with linear complexity.
+
+Features:
+- O(N) time complexity via recurrent formulation
+- Layer-adaptive decay rates for hierarchical learning
+- Support for variable-length sequences
+- GPU-optimized Triton kernels
+- Full gradient support via JAX autodiff
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.lightning_attn import lightning_attn
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 2048, 8, 64
+    >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>>
+    >>>
+    >>> output, final_state = lightning_attn(q, k, v, layer_idx=5, num_layers=12)
+"""
+
 import jaxtyping
 from beartype import beartype
 from jax import numpy as jnp
@@ -25,16 +64,16 @@ from ..recurrent import recurrent
 @kernel_registry.register("lightning_attn", Platform.TRITON, Backend.GPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def lightning_attn(
-    query: Float[Array, "batch seq_len num_heads head_dim"],
-    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    query: Float[Array, "batch seq_len num_heads qk_head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads qk_head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads v_head_dim"],
     layer_idx: int,
     num_layers: int,
-    scale: float | None = None,
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    softmax_scale: float | None = None,
+    initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
+) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """
     Computes Lightning Attention using a recurrent, linear-time mechanism.
 
@@ -56,7 +95,7 @@ def lightning_attn(
         layer_idx: The 0-indexed index of the current layer, used to compute
             the layer-specific decay factor.
         num_layers: The total number of layers in the model.
-        scale: A scaling factor applied to the query. If `None`, it defaults
+        softmax_scale: A scaling factor applied to the query. If `None`, it defaults
             to `1 / sqrt(head_dim)`.
         initial_state: The initial hidden state for the recurrence. Useful for
             chunked processing of long sequences.
@@ -88,8 +127,8 @@ def lightning_attn(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
             )
-    if scale is None:
-        scale = key.shape[-1] ** -0.5
+    if softmax_scale is None:
+        softmax_scale = key.shape[-1] ** -0.5
     qheads = query.shape[2]
     g_gamma = -(8 / qheads * (1 - layer_idx / num_layers)) * jnp.arange(qheads, dtype="f4")
     return recurrent(
@@ -97,7 +136,7 @@ def lightning_attn(
         key=key,
         value=value,
         g_gamma=g_gamma,
-        scale=scale,
+        softmax_scale=softmax_scale,
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,

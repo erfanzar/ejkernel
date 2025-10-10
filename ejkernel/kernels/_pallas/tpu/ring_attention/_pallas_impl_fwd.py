@@ -58,6 +58,7 @@ def _ring_flash_attention_fwd_tpu(
     attention_sink_size,
     policy,
     softmax_scale,
+    causal,
 ):
     if float32_logits:
         q, k = q.astype(jnp.float32), k.astype(jnp.float32)
@@ -85,7 +86,7 @@ def _ring_flash_attention_fwd_tpu(
         axis_size = lax.psum(1, axis_name)
     else:
         axis_size = 1
-    q_block_size, kv_block_size = (q_len, kv_len)
+    q_block_size, kv_blocksize = (q_len, kv_len)
 
     if segment_ids is not None:
         if cache_idx is None:
@@ -148,7 +149,7 @@ def _ring_flash_attention_fwd_tpu(
             k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
         else:
             k_block_idx = 0
-        k_chunk_idx_start = k_block_idx * (kv_block_size // key_chunk_size)
+        k_chunk_idx_start = k_block_idx * (kv_blocksize // key_chunk_size)
         o, lse_, m = _flash_attention_fwd(
             q,
             k,

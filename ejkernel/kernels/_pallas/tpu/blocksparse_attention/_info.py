@@ -215,9 +215,9 @@ def _get_mask_info_for_shard(
     """
     _, _, kv_seq_len = mask.shape
 
-    q_block_size, kv_block_size = block_shape
+    q_block_size, kv_blocksize = block_shape
     q_block_count, q_mod = divmod(q_seq_shard_size, q_block_size)
-    kv_block_count, kv_mod = divmod(kv_seq_len, kv_block_size)
+    kv_block_count, kv_mod = divmod(kv_seq_len, kv_blocksize)
 
     assert q_mod == 0
     assert kv_mod == 0
@@ -241,7 +241,7 @@ def _get_mask_info_for_shard(
                     q_seq_start + q_index * q_block_size,
                     q_seq_start + (q_index + 1) * q_block_size,
                 ),
-                slice(kv_index * kv_block_size, (kv_index + 1) * kv_block_size),
+                slice(kv_index * kv_blocksize, (kv_index + 1) * kv_blocksize),
             )
         ]
         if chunk.any():
@@ -361,14 +361,14 @@ def _process_dynamic_mask(
         raise ValueError(f"Expected a bool mask, instead got: {mask.dtype}.")
 
     head_count, q_seq_len, kv_seq_len = mask.shape
-    q_block_size, kv_block_size = block_shape
+    q_block_size, kv_blocksize = block_shape
     q_blocks_count, q_mod = divmod(q_seq_len, q_block_size)
-    kv_blocks_count, kv_mod = divmod(kv_seq_len, kv_block_size)
+    kv_blocks_count, kv_mod = divmod(kv_seq_len, kv_blocksize)
 
     if q_mod != 0:
         raise ValueError(f"{q_block_size=} should divide {q_seq_len=}.")
     if kv_mod != 0:
-        raise ValueError(f"{kv_block_size=} should divide {kv_seq_len=}.")
+        raise ValueError(f"{kv_blocksize=} should divide {kv_seq_len=}.")
 
     q_seq_len_per_shard, mod = divmod(q_seq_len, q_seq_shards)
     if mod != 0:
@@ -394,7 +394,7 @@ def _process_dynamic_mask(
             q_blocks_count,
             q_block_size,
             kv_blocks_count,
-            kv_block_size,
+            kv_blocksize,
         )
         .swapaxes(-2, -3)
         .astype(np.bool_)
@@ -526,14 +526,14 @@ def _process_mask(
         raise ValueError(f"Expected a 3-dim mask, instead got: {mask.shape=}")
 
     head_count, q_seq_len, kv_seq_len = mask.shape
-    q_block_size, kv_block_size = block_shape
+    q_block_size, kv_blocksize = block_shape
     q_blocks_count, q_mod = divmod(q_seq_len, q_block_size)
-    kv_blocks_count, kv_mod = divmod(kv_seq_len, kv_block_size)
+    kv_blocks_count, kv_mod = divmod(kv_seq_len, kv_blocksize)
 
     if q_mod != 0:
         raise ValueError(f"{q_block_size=} should divide {q_seq_len=}.")
     if kv_mod != 0:
-        raise ValueError(f"{kv_block_size=} should divide {kv_seq_len=}.")
+        raise ValueError(f"{kv_blocksize=} should divide {kv_seq_len=}.")
 
     q_seq_len_per_shard, mod = divmod(q_seq_len, q_seq_shards)
     if mod != 0:
@@ -607,7 +607,7 @@ def _process_mask(
             chunk = unique_mask[
                 (
                     slice(q_index * q_block_size, (q_index + 1) * q_block_size),
-                    slice(kv_index * kv_block_size, (kv_index + 1) * kv_block_size),
+                    slice(kv_index * kv_blocksize, (kv_index + 1) * kv_blocksize),
                 )
             ]
             has_nonzero = chunk.any()

@@ -42,7 +42,7 @@ def nsa_bwd_kernel_dq(
     lse,
     delta,
     do,
-    scale,
+    softmax_scale,
     block_indices,
     block_counts,
     cu_seqlens,
@@ -96,7 +96,7 @@ def nsa_bwd_kernel_dq(
     )
 
     b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_q = (b_q * scale).to(b_q.dtype)
+    b_q = (b_q * softmax_scale).to(b_q.dtype)
 
     p_do = tl.make_block_ptr(
         do,
@@ -137,7 +137,7 @@ def nsa_bwd_kernel_dq(
             b_dp = tl.dot(b_do, b_v)
             b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
             b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
-    b_dq *= scale
+    b_dq *= softmax_scale
 
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
 
@@ -158,7 +158,7 @@ def nsa_bwd_kernel_dkv(
     block_mask,
     cu_seqlens,
     chunk_indices,
-    scale,
+    softmax_scale,
     dk,
     dv,
     SEQUENCE: tl.constexpr,
@@ -235,7 +235,7 @@ def nsa_bwd_kernel_dkv(
                 (1, 0),
             )
             b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_q = (b_q * scale).to(b_q.dtype)
+            b_q = (b_q * softmax_scale).to(b_q.dtype)
 
             p_do = tl.make_block_ptr(
                 do + (bos + i) * Q_HEADS * BLOCK_DIMV,
@@ -285,7 +285,7 @@ def bwd_triton_impl(
     block_indices: jax.Array,
     block_counts: jax.Array | int,
     block_size: int = 64,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
 ):
@@ -303,14 +303,13 @@ def bwd_triton_impl(
 
     delta_shape = o.shape[:-1]
     delta_numel = jnp.prod(jnp.array(delta_shape))
-
     (delta,) = triton_call(
         o,
         do,
         kernel=bwd_kernel_preprocess,
-        grid=lambda META: (int(delta_numel),),
+        grid=lambda META: (delta_numel,),
         out_shape=[jax.ShapeDtypeStruct(delta_shape, dtype="f4")],
-        name="ejgpu::bwd_kernel_preprocess",
+        name="ejkernel::triton::sparse_attn_compression_bwd_preprocess",
         Z=next_power_of_2(o.shape[-1]),
         BLOCK_DIMV=o.shape[-1],
     )
@@ -336,7 +335,7 @@ def bwd_triton_impl(
         lse,
         delta,
         do,
-        scale,
+        softmax_scale,
         block_indices if block_indices is not None else 1,
         block_counts if block_counts is not None else 1,
         cu_seqlens if cu_seqlens is not None else 1,
@@ -344,7 +343,7 @@ def bwd_triton_impl(
         kernel=nsa_bwd_kernel_dq,
         grid=lambda META: (SEQUENCE, NumVBlocks, Z * KV_HEADS),
         out_shape=outputs,
-        name="ejgpu:native_sparse_attention:nsa_bwd:dq",
+        name="ejkernel::triton::sparse_attn_bwd_dq",
         **metaparams,
     )
     dq = jnp.sum(dq, 0)
@@ -384,11 +383,11 @@ def bwd_triton_impl(
         block_mask if block_mask is not None else 1,
         cu_seqlens if cu_seqlens is not None else 1,
         chunk_indices if chunk_indices is not None else 1,
-        scale,
+        softmax_scale,
         kernel=nsa_bwd_kernel_dkv,
         grid=lambda META: (NumVBlocks, NS, Z * KV_HEADS),
         out_shape=outputs,
-        name="ejgpu:native_sparse_attention:nsa_bwd:dkdv",
+        name="ejkernel::triton::sparse_attn_bwd_dkdv",
         **metaparams,
     )
     dk = jnp.sum(dk, 0)

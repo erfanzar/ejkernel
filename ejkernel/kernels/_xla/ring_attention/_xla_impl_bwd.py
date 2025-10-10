@@ -51,6 +51,7 @@ def _blockwise_attention_bwd(
     sliding_window: int | tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
     attention_sink_size: int = 0,
+    causal: bool = False,
 ):
     """Backward pass for blockwise attention.
 
@@ -65,7 +66,7 @@ def _blockwise_attention_bwd(
             bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
             q_segment_ids: tp.Optional query segment ids array of shape (batch, q_len).
             kv_segment_ids: tp.Optional key/value segment ids array of shape (batch, kv_len).
-            softmax_scale: scale for softmax or depth ** -0.5.
+            softmax_scale: softmax_scale for softmax or depth ** -0.5.
             causal_block_size: Size of causal blocks.
             query_chunk_size: Size of query chunks.
             key_chunk_size: Size of key chunks.
@@ -78,6 +79,7 @@ def _blockwise_attention_bwd(
             prevent_cse: Whether to prevent common subexpression elimination.
             sliding_window: Size of sliding window for local attention.
             logit_soft_cap: Soft cap value for logits to prevent overflow.
+            causal: If True, applies causal masking.
 
     Returns:
             A tuple containing the gradients of the query, key, and value arrays.
@@ -104,7 +106,9 @@ def _blockwise_attention_bwd(
     value = value.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
     query, key, value = map(lambda x: jnp.moveaxis(x, 1, 0), (query, key, value))
 
-    scale = jnp.sqrt(query.shape[-1]).astype(jnp.float32) if softmax_scale is None else jnp.float32(1 / softmax_scale)
+    softmax_scale = (
+        jnp.sqrt(query.shape[-1]).astype(jnp.float32) if softmax_scale is None else jnp.float32(1 / softmax_scale)
+    )
     if not deterministic and pdrop > 0.0:
         attn_dropout_rng, dropout_rng = jax.random.split(dropout_rng)
         attn_dropout = jax.random.bernoulli(attn_dropout_rng, pdrop, (batch, num_heads, q_len, kv_len))
@@ -120,7 +124,7 @@ def _blockwise_attention_bwd(
         deterministic,
         attn_dropout,
         pdrop,
-        causal_block_size,
+        causal_block_size if causal else None,
         dtype,
         sliding_window=sliding_window,
         attention_sink_size=attention_sink_size,
@@ -143,7 +147,7 @@ def _blockwise_attention_bwd(
         def scan_kv_block(carry, scan):
             k_chunk, value_chunk, k_chunk_idx = scan
             dq_chunk = carry
-            attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / scale
+            attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / softmax_scale
 
             if logit_soft_cap is not None:
                 attn_weights_uncapped = attn_weights
@@ -151,7 +155,12 @@ def _blockwise_attention_bwd(
 
             bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
             attn_weights = attn_weights + bias_chunk
-            exp_weights = jnp.exp(attn_weights - max_score_chunk[..., None]) / denominator_chunk[..., None]
+            valid = jnp.isfinite(attn_weights)
+
+            exp_logits = jnp.where(valid, jnp.exp(attn_weights - max_score_chunk[..., None]), 0.0)
+
+            denom = denominator_chunk[..., None]
+            exp_weights = jnp.where(denom > 0, exp_logits / denom, 0.0)
 
             ds = jnp.einsum("bqhd,bkhd->bhqk", g_chunk, value_chunk)
             dl = (ds - dl_part) * exp_weights
@@ -159,8 +168,8 @@ def _blockwise_attention_bwd(
             if logit_soft_cap is not None:
                 sech2 = 1 - jnp.tanh(attn_weights_uncapped / logit_soft_cap) ** 2
                 dl = dl * sech2
-            dq_chunk = dq_chunk + jnp.einsum("bhqk,bkhd->bqhd", dl, k_chunk) / scale
-            dk_chunk = jnp.einsum("bqhd,bhqk->bkhd", q_chunk, dl) / scale
+            dq_chunk = dq_chunk + jnp.einsum("bhqk,bkhd->bqhd", dl, k_chunk) / softmax_scale
+            dk_chunk = jnp.einsum("bqhd,bhqk->bkhd", q_chunk, dl) / softmax_scale
             dv_chunk = jnp.einsum("bhqk,bqhd->bkhd", exp_weights, g_chunk)
 
             return dq_chunk, (
@@ -245,6 +254,7 @@ def _ring_attention_bwd(
     sliding_window: int | tuple[int, int] | None,
     logit_soft_cap: float | None,
     attention_sink_size: int,
+    causal: bool,
     res,
     g: chex.Array,
 ):
@@ -253,7 +263,7 @@ def _ring_attention_bwd(
     Args:
             axis_name: Name of the axis to ppermute over.
             float32_logits: Whether to compute logits in float32.
-            softmax_scale: scale for softmax or depth ** -0.5.
+            softmax_scale: softmax_scale for softmax or depth ** -0.5.
             query_chunk_size: Size of query chunks.
             key_chunk_size: Size of key chunks.
             causal_block_size: Size of causal blocks.
@@ -290,7 +300,7 @@ def _ring_attention_bwd(
     dq = jnp.zeros_like(query, dtype=jnp.float32)
     dk = jnp.zeros_like(key, dtype=jnp.float32)
     dv = jnp.zeros_like(value, dtype=jnp.float32)
-    q_block_size, kv_block_size = (
+    q_block_size, kv_blocksize = (
         q_len,
         kv_len,
     )
@@ -301,7 +311,7 @@ def _ring_attention_bwd(
         q_block_idx = axis_idx
         q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
         k_block_idx = (axis_idx - idx) % axis_size
-        k_chunk_idx_start = k_block_idx * (kv_block_size // key_chunk_size)
+        k_chunk_idx_start = k_block_idx * (kv_blocksize // key_chunk_size)
         dq, dk, dv = _blockwise_attention_bwd(
             query,
             key,
@@ -328,6 +338,7 @@ def _ring_attention_bwd(
             sliding_window=sliding_window,
             logit_soft_cap=logit_soft_cap,
             attention_sink_size=attention_sink_size,
+            causal=causal,
         )
         key, value, dk, dv = map(
             lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)])
@@ -338,6 +349,6 @@ def _ring_attention_bwd(
         return (dq, dk, dv, key, value), None
 
     (dq, dk, dv, key, value), _ = lax.scan(scan_kv_block, init=(dq, dk, dv, key, value), xs=jnp.arange(0, axis_size))
-    dq, dk, dv = dq.astype(query.dtype), dk.astype(key.dtype), dv.astype(key.dtype)
+    dq, dk, dv = dq.astype(query.dtype), dk.astype(key.dtype), dv.astype(value.dtype)
 
     return dq, dk, dv, None, None, None, None

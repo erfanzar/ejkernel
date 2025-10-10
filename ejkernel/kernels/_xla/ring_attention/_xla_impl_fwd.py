@@ -50,6 +50,7 @@ def _blockwise_attention_fwd(
     sliding_window: int | tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
     attention_sink_size: int = 0,
+    causal: bool = False,
 ):
     """Forward pass for blockwise attention.
 
@@ -63,7 +64,7 @@ def _blockwise_attention_fwd(
             bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
             q_segment_ids: tp.Optional query segment ids array of shape (batch, q_len).
             kv_segment_ids: tp.Optional key/value segment ids array of shape (batch, kv_len).
-            softmax_scale: scale for softmax or depth ** -0.5.
+            softmax_scale: softmax_scale for softmax or depth ** -0.5.
             causal_block_size: Size of causal blocks.
             query_chunk_size: Size of query chunks.
             key_chunk_size: Size of key chunks.
@@ -77,6 +78,7 @@ def _blockwise_attention_fwd(
             sliding_window: Size of sliding window for local attention. Can be int or tuple (left_window, right_window).
             logit_soft_cap: Soft cap value for logits to prevent overflow.
             attention_sink_size: Number of initial tokens to always attend to (attention sink).
+            causal: If True, applies causal masking.
 
     Returns:
             A tuple containing the numerator, denominator, and max score arrays.
@@ -99,7 +101,9 @@ def _blockwise_attention_fwd(
 
     denominator, max_score = map(lambda x: rearrange(x, "b h n c -> n b h c"), (denominator, max_score))
 
-    scale = jnp.sqrt(query.shape[-1]).astype(jnp.float32) if softmax_scale is None else jnp.float32(1 / softmax_scale)
+    softmax_scale = (
+        jnp.sqrt(query.shape[-1]).astype(jnp.float32) if softmax_scale is None else jnp.float32(1 / softmax_scale)
+    )
     if not deterministic and pdrop > 0.0:
         attn_dropout_rng, dropout_rng = jax.random.split(dropout_rng)
         attn_dropout = jax.random.bernoulli(attn_dropout_rng, pdrop, (batch, num_heads, q_len, kv_len))
@@ -115,7 +119,7 @@ def _blockwise_attention_fwd(
         deterministic,
         attn_dropout,
         pdrop,
-        causal_block_size,
+        causal_block_size if causal else None,
         dtype,
         sliding_window=sliding_window,
         attention_sink_size=attention_sink_size,
@@ -130,13 +134,17 @@ def _blockwise_attention_fwd(
 
             numerator_chunk, denominator_chunk, prev_max_score_chunk = carry
 
-            attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / scale
+            attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / softmax_scale
 
             if logit_soft_cap is not None:
                 attn_weights = jnp.tanh(attn_weights / logit_soft_cap) * logit_soft_cap
 
             bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
             attn_weights = attn_weights + bias_chunk
+
+            valid = jnp.isfinite(attn_weights)
+
+            masked_logits = jnp.where(valid, attn_weights, -jnp.inf)
 
             if softmax_aux is not None:
                 if softmax_aux.ndim == 1:
@@ -161,30 +169,38 @@ def _blockwise_attention_fwd(
                     "bhqk,bkhd->bqhd", exp_weights, value_chunk.astype(jnp.float32), precision=precision
                 )
 
-                correction = rearrange(
-                    jnp.exp(prev_max_score_chunk - max_score_chunk),
-                    "b h query -> b query h",
-                )[..., None]
+                corr_raw = jnp.exp(prev_max_score_chunk - max_score_chunk)
+                corr_raw = jnp.where(jnp.isfinite(max_score_chunk), corr_raw, jnp.array(1.0, corr_raw.dtype))
+                correction = rearrange(corr_raw, "b h query -> b query h")[..., None]
                 numerator_chunk = numerator_chunk * correction + exp_values
-
-                denominator_chunk = denominator_chunk * jnp.exp(
-                    prev_max_score_chunk - max_score_chunk
-                ) + combined_exp_weights.sum(axis=-1)
+                corr_denom = jnp.exp(prev_max_score_chunk - max_score_chunk)
+                corr_denom = jnp.where(
+                    jnp.isfinite(max_score_chunk),
+                    corr_denom,
+                    jnp.array(1.0, denominator_chunk.dtype),
+                )
+                denominator_chunk = denominator_chunk * corr_denom + combined_exp_weights.sum(axis=-1)
             else:
-                max_score_chunk = jnp.maximum(prev_max_score_chunk, jnp.max(attn_weights, axis=-1))
+                local_max = jnp.max(masked_logits, axis=-1)
+                max_score_chunk = jnp.maximum(prev_max_score_chunk, local_max)
                 max_score_chunk = lax.stop_gradient(max_score_chunk)
-                exp_weights = jnp.exp(attn_weights - max_score_chunk[..., None]).astype(jnp.float32)
+                exp_weights = jnp.where(valid, jnp.exp(attn_weights - max_score_chunk[..., None]), 0.0).astype(
+                    jnp.float32
+                )
                 exp_values = jnp.einsum(
                     "bhqk,bkhd->bqhd", exp_weights, value_chunk.astype(jnp.float32), precision=precision
                 )
-                correction = rearrange(
-                    jnp.exp(prev_max_score_chunk - max_score_chunk),
-                    "b h query -> b query h",
-                )[..., None]
+                corr_raw = jnp.exp(prev_max_score_chunk - max_score_chunk)
+                corr_raw = jnp.where(jnp.isfinite(max_score_chunk), corr_raw, jnp.array(1.0, corr_raw.dtype))
+                correction = rearrange(corr_raw, "b h query -> b query h")[..., None]
                 numerator_chunk = numerator_chunk * correction + exp_values
-                denominator_chunk = denominator_chunk * jnp.exp(
-                    prev_max_score_chunk - max_score_chunk
-                ) + exp_weights.sum(axis=-1)
+                corr_denom = jnp.exp(prev_max_score_chunk - max_score_chunk)
+                corr_denom = jnp.where(
+                    jnp.isfinite(max_score_chunk),
+                    corr_denom,
+                    jnp.array(1.0, denominator_chunk.dtype),
+                )
+                denominator_chunk = denominator_chunk * corr_denom + exp_weights.sum(axis=-1)
 
             return (
                 numerator_chunk,
@@ -216,7 +232,9 @@ def _blockwise_attention_fwd(
             init=(numerator_chunk, denominator_chunk, max_score_chunk),
             xs=(key, value, jnp.arange(0, num_kv)),
         )
-        output_chunk = numerator_chunk / rearrange(denominator_chunk, "b h query -> b query h")[..., None].astype(dtype)
+        denom = rearrange(denominator_chunk, "b h query -> b query h")[..., None]
+
+        output_chunk = jnp.where(denom > 0, numerator_chunk / denom, 0.0).astype(dtype)
         return (), (output_chunk, numerator_chunk, denominator_chunk, max_score_chunk)
 
     _, (_, numerator, denominator, max_score) = lax.scan(
@@ -242,7 +260,7 @@ def _ring_attention_fwd(
     q_segment_ids: chex.Array | None,
     kv_segment_ids: chex.Array | None,
     softmax_aux: chex.Array | None,
-    axis_name: str,
+    axis_name: str | None,
     float32_logits: bool,
     softmax_scale: float | None,
     query_chunk_size: int,
@@ -258,6 +276,7 @@ def _ring_attention_fwd(
     sliding_window: int | tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
     attention_sink_size: int = 0,
+    causal: bool = False,
 ):
     """Forward pass for ring attention.
 
@@ -270,7 +289,7 @@ def _ring_attention_fwd(
             kv_segment_ids: tp.Optional key/value segment ids array of shape (batch, kv_len).
             axis_name: Name of the axis to ppermute over.
             float32_logits: Whether to compute logits in float32.
-            softmax_scale: scale for softmax or depth ** -0.5.
+            softmax_scale: softmax_scale for softmax or depth ** -0.5.
             query_chunk_size: Size of query chunks.
             key_chunk_size: Size of key chunks.
             causal_block_size: Size of causal blocks.
@@ -284,6 +303,7 @@ def _ring_attention_fwd(
             sliding_window: Size of sliding window for local attention. Can be int or tuple (left_window, right_window).
             logit_soft_cap: Soft cap value for logits to prevent overflow.
             attention_sink_size: Number of initial tokens to always attend to (attention sink).
+            causal: If True, applies causal masking.
 
     Returns:
             A tuple containing the output array and a tuple of intermediate values.
@@ -295,7 +315,7 @@ def _ring_attention_fwd(
     numerator = jnp.zeros((batch, q_len, num_heads, dim_per_head)).astype(jnp.float32)
     denominator = jnp.zeros((batch, num_heads, q_len)).astype(jnp.float32)
     axis_size = lax.psum(1, axis_name) if axis_name is not None else 1
-    q_block_size, kv_block_size = (q_len, kv_len)
+    q_block_size, kv_blocksize = (q_len, kv_len)
 
     def scan_kv_block(carry, idx):
         prev_max_score, numerator, denominator, key, value = carry
@@ -303,7 +323,7 @@ def _ring_attention_fwd(
         q_block_idx = axis_idx
         q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
         k_block_idx = (axis_idx - idx) % axis_size
-        k_chunk_idx_start = k_block_idx * (kv_block_size // key_chunk_size)
+        k_chunk_idx_start = k_block_idx * (kv_blocksize // key_chunk_size)
         numerator, denominator, max_score = _blockwise_attention_fwd(
             query,
             key,
@@ -329,6 +349,7 @@ def _ring_attention_fwd(
             sliding_window=sliding_window,
             logit_soft_cap=logit_soft_cap,
             attention_sink_size=attention_sink_size,
+            causal=causal,
         )
         key, value = map(
             lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)])
@@ -344,7 +365,16 @@ def _ring_attention_fwd(
         init=(prev_max_score, numerator, denominator, key, value),
         xs=jnp.arange(0, axis_size),
     )
-    output = numerator / rearrange(denominator, "b h query -> b query h")[..., None]
+    denom_full = rearrange(denominator, "b h query -> b query h")
+    max_full = rearrange(max_score, "b h query -> b query h")
+    eps = jnp.finfo(jnp.float32).tiny
+    me = max_full + jnp.log(jnp.maximum(denom_full, eps))
+
+    delta = max_full - me
+    delta = jnp.where(jnp.isfinite(delta), delta, jnp.array(-jnp.inf, dtype=delta.dtype))
+    o_scale = jnp.exp(delta)[..., None]
+    output = numerator * o_scale
+
     return output.astype(value.dtype), (
         output,
         query,

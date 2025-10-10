@@ -26,7 +26,7 @@ def chunk_local_cumsum_scalar(
     g: jnp.ndarray,
     chunk_size: int,
     reverse: bool = False,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
@@ -51,8 +51,8 @@ def chunk_local_cumsum_scalar(
         result_chunked = jnp.flip(cumsum_flipped, axis=-1)
     else:
         result_chunked = jnp.cumsum(g_chunked, axis=-1)
-    if scale is not None:
-        result_chunked *= scale
+    if softmax_scale is not None:
+        result_chunked *= softmax_scale
     result = result_chunked.reshape(B, H, T_padded)
     if pad_length > 0:
         result = result[:, :, :T]
@@ -66,7 +66,7 @@ def chunk_local_cumsum_vector(
     g: jnp.ndarray,
     chunk_size: int,
     reverse: bool = False,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
@@ -91,8 +91,8 @@ def chunk_local_cumsum_vector(
         result_chunked = jnp.flip(cumsum_flipped, axis=-2)
     else:
         result_chunked = jnp.cumsum(g_chunked, axis=-2)
-    if scale is not None:
-        result_chunked *= scale
+    if softmax_scale is not None:
+        result_chunked *= softmax_scale
     result = result_chunked.reshape(B, H, T_padded, g.shape[-1])
     if pad_length > 0:
         result = result[:, :, :T, :]
@@ -106,7 +106,7 @@ def chunk_global_cumsum_scalar(
     s: jnp.ndarray,
     reverse: bool = False,
     cu_seqlens: jnp.ndarray | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
@@ -146,8 +146,8 @@ def chunk_global_cumsum_scalar(
     if reverse:
         result = jnp.flip(result, axis=time_axis)
 
-    if scale is not None:
-        result *= scale
+    if softmax_scale is not None:
+        result *= softmax_scale
 
     return result.astype(output_dtype)
 
@@ -157,7 +157,7 @@ def chunk_global_cumsum_vector(
     s: jnp.ndarray,
     reverse: bool = False,
     cu_seqlens: jnp.ndarray | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
@@ -202,8 +202,8 @@ def chunk_global_cumsum_vector(
     if reverse:
         result = jnp.flip(result, axis=time_axis)
 
-    if scale is not None:
-        result *= scale
+    if softmax_scale is not None:
+        result *= softmax_scale
 
     return result.astype(output_dtype)
 
@@ -213,7 +213,7 @@ def chunk_global_cumsum_vector(
     static_argnames=[
         "chunk_size",
         "reverse",
-        "scale",
+        "softmax_scale",
         "head_first",
         "output_dtype",
         "is_vector",
@@ -224,14 +224,14 @@ def _chunk_local_cumsum_vmap_core(
     mask: jnp.ndarray,
     chunk_size: int,
     reverse: bool,
-    scale: float | None,
+    softmax_scale: float | None,
     head_first: bool,
     output_dtype: DTypeLike | None,
     is_vector: bool,
 ):
     base_fn = chunk_local_cumsum_vector if is_vector else chunk_local_cumsum_scalar
     vmapped_fn = vmap(base_fn, in_axes=(0, None, None, None, None, None), out_axes=0)
-    result_padded = vmapped_fn(g_padded_batched, chunk_size, reverse, scale, head_first, output_dtype)
+    result_padded = vmapped_fn(g_padded_batched, chunk_size, reverse, softmax_scale, head_first, output_dtype)
     return result_padded * mask
 
 
@@ -239,7 +239,7 @@ def chunk_local_cumsum(
     g: jnp.ndarray,
     chunk_size: int,
     reverse: bool = False,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     cu_seqlens: jnp.ndarray | None = None,
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
@@ -248,7 +248,7 @@ def chunk_local_cumsum(
     is_vector = g.ndim == 4
     base_fn = chunk_local_cumsum_vector if is_vector else chunk_local_cumsum_scalar
     if cu_seqlens is None:
-        return base_fn(g, chunk_size, reverse, scale, None, head_first, output_dtype)
+        return base_fn(g, chunk_size, reverse, softmax_scale, None, head_first, output_dtype)
     assert g.shape[0] == 1, "Only batch size 1 is supported when cu_seqlens are provided"
     seqlens = jnp.diff(cu_seqlens)
     max_seq_len = jnp.max(seqlens)
@@ -272,7 +272,7 @@ def chunk_local_cumsum(
         mask,
         chunk_size,
         reverse,
-        scale,
+        softmax_scale,
         head_first,
         output_dtype,
         is_vector,
@@ -286,12 +286,12 @@ def chunk_global_cumsum(
     s: jnp.ndarray,
     reverse: bool = False,
     cu_seqlens: jnp.ndarray | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
     is_vector = s.ndim == 4
     if is_vector:
-        return chunk_global_cumsum_vector(s, reverse, cu_seqlens, scale, head_first, output_dtype)
+        return chunk_global_cumsum_vector(s, reverse, cu_seqlens, softmax_scale, head_first, output_dtype)
     else:
-        return chunk_global_cumsum_scalar(s, reverse, cu_seqlens, scale, head_first, output_dtype)
+        return chunk_global_cumsum_scalar(s, reverse, cu_seqlens, softmax_scale, head_first, output_dtype)

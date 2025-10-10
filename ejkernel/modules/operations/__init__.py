@@ -47,10 +47,10 @@ Features:
 Example:
     >>> from ejkernel.modules.operations import flash_attention
     >>>
-    >>> # Simple usage with automatic optimization
+    >>>
     >>> output = flash_attention(query, key, value, causal=True)
     >>>
-    >>> # Advanced usage with custom parameters
+    >>>
     >>> output = flash_attention(
     ...     query, key, value,
     ...     softmax_scale=0.125,
@@ -67,12 +67,13 @@ from .attention import Attention, attention
 from .blocksparse_attention import BlockSparseAttention, blocksparse_attention
 from .flash_attention import FlashAttention, flash_attention
 from .gated_linear_attention import GLAttention, gla_attention
+from .grouped_matmul import GroupedMatmul, grouped_matmul
 from .lightning_attention import LightningAttention, lightning_attention
-from .matmul import GroupedMatmul, grouped_matmul
 from .multi_head_latent_attention import FlashMLA, mla_attention
 from .native_sparse_attention import NativeSparseAttention, native_sparse_attention
 from .page_attention import PageAttention, page_attention
 from .pooling import MeanPooling, mean_pooling
+from .ragged_decode_attention import RaggedDecodeAttention, ragged_decode_attention
 from .ragged_page_attention import RaggedPageAttention, ragged_page_attention
 from .recurrent import RecurrentAttention, recurrent_attention
 from .ring_attention import RingAttention, ring_attention
@@ -89,6 +90,7 @@ __all__ = (
     "MeanPooling",
     "NativeSparseAttention",
     "PageAttention",
+    "RaggedDecodeAttention",
     "RaggedPageAttention",
     "RecurrentAttention",
     "RingAttention",
@@ -103,6 +105,7 @@ __all__ = (
     "mla_attention",
     "native_sparse_attention",
     "page_attention",
+    "ragged_decode_attention",
     "ragged_page_attention",
     "recurrent_attention",
     "ring_attention",

@@ -13,6 +13,38 @@
 # limitations under the License.
 
 
+"""Mean pooling operations using Triton kernels.
+
+This module provides GPU-accelerated mean pooling over sequence dimensions,
+commonly used in NLP tasks to aggregate token embeddings into fixed-size
+representations. The implementation uses custom Triton kernels for optimal
+performance on GPUs.
+
+Mean pooling computes the average of all token embeddings in a sequence,
+producing a single vector representation. This is particularly useful for:
+- Sentence/document embeddings in classification tasks
+- Block compression in sparse attention mechanisms
+- Sequence-level representations for downstream tasks
+
+The implementation supports:
+- Standard batched sequences with uniform lengths
+- Variable-length sequences via cumulative sequence lengths (cu_seqlens)
+- Efficient GPU parallelization via Triton
+- Full automatic differentiation support
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.mean_pooling import mean_pooling
+    >>>
+    >>>
+    >>> batch, seq_len, hidden_dim = 4, 128, 768
+    >>> x = jnp.ones((batch, seq_len, hidden_dim))
+    >>>
+    >>>
+    >>> pooled = mean_pooling(x, chunk_size=32)
+    >>> print(pooled.shape)
+"""
+
 from functools import partial
 
 import jax
@@ -26,7 +58,7 @@ from ._triton_impl_fwd import fwd_triton_impl
 
 
 def _fwd_call(
-    x: Float[Array, "batch seq_len hidden_dim"],
+    x: Float[Array, "... hidden_dim"],
     chunk_size: int,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> tuple[Float[Array, "batch hidden_dim"], tuple[int, int, Int[Array, "num_seqs_plus_one"] | None]]:
@@ -71,7 +103,7 @@ def _bwd_call(
 @partial(jax.custom_vjp, nondiff_argnums=(1,))
 @partial(jax.jit, static_argnums=(1,))
 def _mean_pooling(
-    x: Float[Array, "batch seq_len hidden_dim"],
+    x: Float[Array, "... hidden_dim"],
     chunk_size: int,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
@@ -99,10 +131,10 @@ _mean_pooling.defvjp(_fwd_call, _bwd_call)
 @kernel_registry.register("mean_pooling", Platform.TRITON, Backend.GPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def mean_pooling(
-    x: Float[Array, "batch seq_len hidden_dim"],
+    x: Float[Array, "... hidden_dim"],
     chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-) -> Float[Array, "batch hidden_dim"]:
+) -> Float[Array, "... hidden_dim"]:
     """
     Performs mean pooling over the sequence dimension using a Triton kernel.
 

@@ -13,6 +13,38 @@
 # limitations under the License.
 
 
+"""Recurrent linear attention implementation using Triton kernels.
+
+This module provides a highly optimized, GPU-accelerated implementation of
+recurrent linear attention mechanisms. Unlike traditional attention mechanisms
+with O(N²) complexity, recurrent linear attention processes sequences
+step-by-step with O(N) complexity, making it ideal for very long sequences.
+
+The implementation is general enough to support various linear attention
+variants including:
+- Gated Linear Attention (GLA) via the `g` parameter
+- Lightning Attention via the `g_gamma` parameter
+- Standard linear attention without gating
+
+Key features:
+- O(N) time complexity for sequence processing
+- Custom Triton kernels for GPU acceleration
+- Support for variable-length sequences via cumulative sequence lengths
+- Bidirectional processing via the `reverse` parameter
+- Stateful processing via initial_state parameter for chunked computation
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.recurrent import recurrent
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64
+    >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>>
+    >>> output, final_state = recurrent(q, k, v)
+"""
+
 from functools import partial
 
 import jax
@@ -33,7 +65,7 @@ def _fwd_call(
     g_gamma: Float[Array, "batch num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -52,7 +84,7 @@ def _fwd_call(
         g_gamma: Optional decay factor for Lightning-style attention.
         gk: Optional gate applied directly to K.
         gv: Optional gate applied directly to V.
-        scale: Scaling factor for attention.
+        softmax_scale: Scaling factor for attention.
         initial_state: Initial hidden state for the recurrence.
         reverse: If True, process sequence in reverse.
         cu_seqlens: Cumulative sequence lengths for variable-length sequences.
@@ -69,7 +101,7 @@ def _fwd_call(
         g_gamma=g_gamma,
         gk=gk,
         gv=gv,
-        scale=scale,
+        softmax_scale=softmax_scale,
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
@@ -80,7 +112,7 @@ def _fwd_call(
 
 def _bwd_call(
     g_gamma: Float[Array, "batch num_heads"] | None,
-    scale: float | None,
+    softmax_scale: float | None,
     reverse: bool,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
     residual: tuple[Float[Array, "..."], ...],
@@ -99,7 +131,7 @@ def _bwd_call(
 
     Args:
         g_gamma: Non-differentiable decay factor.
-        scale: Non-differentiable scaling factor.
+        softmax_scale: Non-differentiable scaling factor.
         reverse: Non-differentiable reverse flag.
         cu_seqlens: Non-differentiable cumulative sequence lengths.
         residual: Tensors saved from the forward pass.
@@ -123,7 +155,7 @@ def _bwd_call(
         o=o,
         do=do,
         dht=dht,
-        scale=scale,
+        softmax_scale=softmax_scale,
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
@@ -138,14 +170,14 @@ def _recurrent(
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    scale: float | None = None,
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    softmax_scale: float | None = None,
+    initial_state: Float[Array, "... num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
+) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "... num_heads head_dim head_dim"]]:
     """
     Core JIT-compiled recurrent function with a custom VJP.
 
@@ -160,7 +192,7 @@ def _recurrent(
         g_gamma: Optional decay factor for Lightning-style attention.
         gk: Optional gate applied directly to K.
         gv: Optional gate applied directly to V.
-        scale: Scaling factor for attention (static argument).
+        softmax_scale: Scaling factor for attention (static argument).
         initial_state: Initial hidden state for the recurrence.
         reverse: If True, process sequence in reverse (static argument).
         cu_seqlens: Cumulative sequence lengths for variable-length sequences.
@@ -170,17 +202,17 @@ def _recurrent(
             - The output tensor `o`.
             - The final hidden state `ht`.
     """
-    if scale is None:
-        scale = key.shape[-1] ** -0.5
+    if softmax_scale is None:
+        softmax_scale = key.shape[-1] ** -0.5
     return fwd_triton_impl(
-        query=query,
-        key=key,
-        value=value,
+        q=query,
+        k=key,
+        v=value,
         g=g,
         g_gamma=g_gamma,
         gk=gk,
         gv=gv,
-        scale=scale,
+        softmax_scale=softmax_scale,
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
@@ -193,18 +225,18 @@ _recurrent.defvjp(_fwd_call, _bwd_call)
 @kernel_registry.register("recurrent", Platform.TRITON, Backend.GPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def recurrent(
-    query: Float[Array, "batch seq_len num_heads head_dim"],
-    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "batch num_heads"] | None = None,
-    gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    scale: float | None = None,
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    query: Float[Array, "batch seq_len num_heads qk_head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads qk_head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads v_head_dim"],
+    g: Float[Array, "batch seq_len num_heads qk_head_dim"] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
+    gk: Float[Array, "batch seq_len num_heads qk_head_dim"] | None = None,
+    gv: Float[Array, "batch seq_len num_heads v_head_dim"] | None = None,
+    softmax_scale: float | None = None,
+    initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
+) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """
     Computes a general recurrent linear attention using a custom Triton kernel.
 
@@ -226,7 +258,7 @@ def recurrent(
             Attention where the decay is fixed per-head or per-layer.
         gk: Optional gate tensor applied element-wise to keys.
         gv: Optional gate tensor applied element-wise to values.
-        scale: A scaling factor applied to the query. If `None`, it defaults
+        softmax_scale: A scaling factor applied to the query. If `None`, it defaults
             to `1 / sqrt(head_dim)`.
         initial_state: The initial hidden state for the recurrence. This is
             useful for chunked processing of very long sequences or for stateful
@@ -252,7 +284,7 @@ def recurrent(
         g_gamma=g_gamma,
         gk=gk,
         gv=gv,
-        scale=scale,
+        softmax_scale=softmax_scale,
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,

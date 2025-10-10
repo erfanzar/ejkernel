@@ -119,7 +119,7 @@ def fwd_triton_impl(
         chunk_indices if chunk_indices is not None else 1,
         kernel=fwd_kernel,
         out_shape=[jax.ShapeDtypeStruct((Z, NUM_SEQ_BLOCK, HEAD, DIM), x.dtype)],
-        name="ejgpu:mean_pooling:fwd_kernel",
+        name="ejkernel::triton::mean_pooling_fwd",
         grid=lambda META: (cdiv(DIM, META["BLOCK_DIM"]), NUM_SEQ_BLOCK, Z * HEAD),
         **metaparams,
     )

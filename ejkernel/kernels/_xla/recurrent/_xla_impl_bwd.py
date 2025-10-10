@@ -29,7 +29,7 @@ def _recurrent_attention_bwd(
     hidden_states: Float[Array, "batch seq_len num_heads head_dim head_dim"],
     do: Float[Array, "batch seq_len num_heads head_dim"],
     dfinal_state: Float[Array, "batch num_heads head_dim head_dim"],
-    scale: float,
+    softmax_scale: float,
     initial_state: Float[Array, "batch num_heads head_dim head_dim"],
     reverse: bool,
 ) -> tuple:
@@ -41,7 +41,7 @@ def _recurrent_attention_bwd(
         o_t = h_t @ q_t
 
     Gradients:
-        dL/dq_t = scale * (dL/do_t @ h_t^T)
+        dL/dq_t = softmax_scale * (dL/do_t @ h_t^T)
         dL/dh_t = q_t @ dL/do_t^T + decay_{t+1} * dL/dh_{t+1}
         dL/dk_t = dL/dh_t^T @ v_t
         dL/dv_t = k_t^T @ dL/dh_t
@@ -52,7 +52,7 @@ def _recurrent_attention_bwd(
         hidden_states: Hidden states from forward [batch, seq_len, num_heads, head_dim, head_dim]
         do: Gradient of output [batch, seq_len, num_heads, head_dim]
         dfinal_state: Gradient of final hidden state [batch, num_heads, head_dim, head_dim]
-        scale: Query scaling factor
+        softmax_scale: Query scaling factor
         initial_state: Initial hidden state
         reverse: Whether forward was reversed
 
@@ -86,9 +86,9 @@ def _recurrent_attention_bwd(
             dh_next = carry
             _t_idx, q_t, k_t, v_t, g_t, gk_t, gv_t, h_t, do_t = inputs
 
-            dq_t = jnp.sum(do_t[:, None, :] * h_t, axis=-1) * scale
+            dq_t = jnp.sum(do_t[:, None, :] * h_t, axis=-1) * softmax_scale
 
-            dh_from_output = do_t[:, None, :] * (q_t * scale)[:, :, None]
+            dh_from_output = do_t[:, None, :] * (q_t * softmax_scale)[:, :, None]
             dh_current = dh_next + dh_from_output
 
             dk_t = jnp.einsum("nhd,nd->nh", dh_current.transpose(0, 2, 1), v_t)

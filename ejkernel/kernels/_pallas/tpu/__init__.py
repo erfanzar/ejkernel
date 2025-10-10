@@ -17,6 +17,7 @@ from .blocksparse_attention import blocksparse_attention as blocksparse_attentio
 from .flash_attention import flash_attention
 from .grouped_matmul import grouped_matmul
 from .page_attention import page_attention
+from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention import ragged_page_attention
 from .ring_attention import ring_attention
 
@@ -25,6 +26,7 @@ __all__ = (
     "flash_attention",
     "grouped_matmul",
     "page_attention",
+    "ragged_decode_attention",
     "ragged_page_attention",
     "ring_attention",
 )

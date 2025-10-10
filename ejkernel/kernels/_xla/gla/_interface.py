@@ -24,16 +24,16 @@ from ..recurrent import recurrent
 @kernel_registry.register("gla", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def recurrent_gla(
-    query: Float[Array, "batch seq_len num_heads head_dim"],
-    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "batch num_heads"] | None = None,
-    scale: float | None = None,
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    query: Float[Array, "batch seq_len num_heads qk_head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads qk_head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads v_head_dim"],
+    g: Float[Array, "batch seq_len num_heads qk_head_dim"] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
+    softmax_scale: float | None = None,
+    initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
+) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """
     Computes Gated Linear Attention (GLA) in a recurrent, linear-time manner using JAX/XLA.
 
@@ -53,7 +53,7 @@ def recurrent_gla(
         g: The gate tensor, specific to Gated Linear Attention. If provided, it
             should have the same shape as `q`.
         g_gamma: The gate decay factor.
-        scale: A scaling factor applied to the query before the recurrent
+        softmax_scale: A scaling factor applied to the query before the recurrent
             computation. If `None`, it defaults to `1 / sqrt(head_dim)`.
         initial_state: The initial hidden state for the recurrence. Useful for
             chunked processing of long sequences.
@@ -106,8 +106,8 @@ def recurrent_gla(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
             )
-    if scale is None:
-        scale = key.shape[-1] ** -0.5
+    if softmax_scale is None:
+        softmax_scale = key.shape[-1] ** -0.5
 
     o, final_state = recurrent(
         query=query,
@@ -115,7 +115,7 @@ def recurrent_gla(
         value=value,
         g=g,
         g_gamma=g_gamma,
-        scale=scale,
+        softmax_scale=softmax_scale,
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,

@@ -2,14 +2,6 @@
 # Install with: pip install pre-commit && pre-commit install
 
 repos:
-  # Python code formatters and linters
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.4
-    hooks:
-      - id: ruff
-        args: [--fix, --exit-non-zero-on-fix]
-      - id: ruff-format
-
   # Trailing whitespace and file fixes
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

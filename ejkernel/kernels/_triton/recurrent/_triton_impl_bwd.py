@@ -48,7 +48,7 @@ def bwd_kernel(
     do,
     dht,
     cu_seqlens,
-    scale,
+    softmax_scale,
     ht,
     dq,
     dk,
@@ -85,7 +85,7 @@ def bwd_kernel(
         do: Gradient of output tensor
         dht: Gradient of final hidden state
         cu_seqlens: Cumulative sequence lengths for variable-length mode
-        scale: Query scaling factor
+        softmax_scale: Query scaling factor
         ht: Final hidden state from forward pass
         dq, dk, dv: Output gradient pointers for q, k, v
         dh0: Output gradient pointer for initial state
@@ -152,7 +152,7 @@ def bwd_kernel(
 
         b_h += b_k[:, None] * b_v[None, :]
         b_dq = b_h * b_do[None, :]
-        b_dq = tl.sum(b_dq, axis=1) * scale
+        b_dq = tl.sum(b_dq, axis=1) * softmax_scale
 
         tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), mask=mask_k)
 
@@ -192,7 +192,7 @@ def bwd_kernel(
         b_dh += tl.load(p_dht, mask=mask_h, other=0).to(tl.float32)
 
     for _ in range(SEQUENCE):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32) * scale
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32) * softmax_scale
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_do = tl.load(p_do, mask=mask_v, other=0).to(tl.float32)
@@ -242,7 +242,7 @@ def bwd_triton_impl(
     o: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     do: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     dht: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -310,7 +310,7 @@ def bwd_triton_impl(
         do if do is not None else 1,
         dht if dht is not None else 1,
         cu_seqlens if cu_seqlens is not None else 1,
-        scale if scale is not None else 1,
+        softmax_scale if softmax_scale is not None else 1,
         kernel=bwd_kernel,
         out_shape=[
             jax.ShapeDtypeStruct(ht_shape, jnp.float32),
@@ -319,7 +319,7 @@ def bwd_triton_impl(
             jax.ShapeDtypeStruct(dv_shape, jnp.float32),
             jax.ShapeDtypeStruct(dh0_shape, jnp.float32),
         ],
-        name="ejgpu:lightning_attn:fwd_kernel",
+        name="ejkernel::triton::recurrent_bwd",
         grid=grid,
         **metaparams,
     )

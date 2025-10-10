@@ -73,7 +73,7 @@ def _mean_pooling_fixed(
 
 @partial(jax.custom_vjp, nondiff_argnums=(1,))
 def _mean_pooling_core(
-    x: Float[Array, "batch seq_len hidden_dim"],
+    x: Float[Array, "... hidden_dim"],
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
     """Core mean pooling implementation with custom VJP."""
@@ -84,7 +84,7 @@ def _mean_pooling_core(
 
 
 def _mean_pooling_fwd(
-    x: Float[Array, "batch seq_len hidden_dim"],
+    x: Float[Array, "... hidden_dim"],
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> tuple[Float[Array, "batch hidden_dim"], tuple]:
     """Forward pass for mean pooling with residuals."""
@@ -97,12 +97,11 @@ def _mean_pooling_bwd(
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
     residual: tuple,
     g: Float[Array, "batch hidden_dim"],
-) -> Float[Array, "batch seq_len hidden_dim"]:
+) -> tuple[Float[Array, "... hidden_dim"]]:
     """Backward pass for mean pooling."""
-    x_shape, _cu_seqlens_res = residual
+    x_shape, _ = residual
 
     if cu_seqlens is not None:
-        _total_tokens, _hidden_dim = x_shape
         num_seqs = len(cu_seqlens) - 1
 
         def grad_sequence(i):
@@ -115,7 +114,7 @@ def _mean_pooling_bwd(
         dx_list = [grad_sequence(i) for i in range(num_seqs)]
         dx = jnp.concatenate(dx_list, axis=0)
     else:
-        _batch, seq_len, _hidden_dim = x_shape
+        seq_len = x_shape[1]
         dx = jnp.tile(g[:, None, :], (1, seq_len, 1)) / seq_len
 
     return (dx,)
@@ -127,7 +126,7 @@ _mean_pooling_core.defvjp(_mean_pooling_fwd, _mean_pooling_bwd)
 @kernel_registry.register("mean_pooling", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def mean_pooling(
-    x: Float[Array, "batch seq_len hidden_dim"],
+    x: Float[Array, "... hidden_dim"],
     chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> Float[Array, "batch hidden_dim"]:

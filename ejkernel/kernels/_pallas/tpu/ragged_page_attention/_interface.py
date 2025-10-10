@@ -74,7 +74,7 @@ def _ragged_page_attention(
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
         context_lens, only the first num_seqs+1 values are valid.
       num_seqs: the dynamic number of sequences.
-      softmax_scale: the softmax scale which will be applied to the Q@K^T.
+      softmax_scale: the softmax softmax_scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
       logit_soft_cap: the logit soft cap for the attention.
       mask_value: mask value for causal mask.
@@ -208,7 +208,7 @@ def ragged_page_attention(
       query_start_loc: the cumulative sum of the effective query lengths. Similar to
         context_lens, only the first num_seqs+1 values are valid.
       num_seqs: the dynamic number of sequences.
-      softmax_scale: the softmax scale which will be applied to the Q@K^T.
+      softmax_scale: the softmax softmax_scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
       logit_soft_cap: the logit soft cap for the attention.
       mask_value: mask value for causal mask.

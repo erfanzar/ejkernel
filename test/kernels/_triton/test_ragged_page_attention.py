@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Unified tests for ragged_page_attention (Triton implementation)."""
 
 import jax
@@ -19,6 +20,11 @@ import jax.numpy as jnp
 import pytest
 
 from ejkernel.kernels._triton.ragged_page_attention._interface import ragged_page_attention
+
+pytestmark = pytest.mark.skipif(
+    jax.devices()[0].platform != "gpu",
+    reason="Triton tests require GPU backend",
+)
 
 
 def create_test_data(
@@ -34,30 +40,22 @@ def create_test_data(
     key = jax.random.PRNGKey(seed)
     keys = jax.random.split(key, 10)
 
-    # Create variable length sequences
     seq_lens = jax.random.randint(keys[0], (num_seqs,), 32, max_seq_len + 1)
     total_query_tokens = int(jnp.sum(seq_lens))
 
-    # Create queries
     queries = jax.random.normal(keys[1], (total_query_tokens, num_q_heads, head_size))
 
-    # Calculate number of pages needed
     max_pages = (int(jnp.max(seq_lens)) + page_size - 1) // page_size
     num_pages = num_seqs * max_pages
 
-    # Create KV pages (interleaved K and V)
     kv_pages = jax.random.normal(keys[2], (num_pages, page_size, 2 * num_kv_heads, head_size))
 
-    # Create context lens (same as sequence lengths for this test)
     context_lens = seq_lens
 
-    # Create block tables
     block_tables = jnp.arange(num_seqs * max_pages).reshape(num_seqs, max_pages)
 
-    # Create query start locations
     query_start_loc = jnp.concatenate([jnp.array([0]), jnp.cumsum(seq_lens)])
 
-    # Number of sequences
     num_seqs_val = num_seqs
 
     return {
@@ -153,7 +151,6 @@ class TestBasicFunctionality:
             num_seqs=num_seqs_val,
         )
 
-        # Check each sequence output
         for i in range(num_seqs):
             start = int(query_start_loc[i])
             end = int(query_start_loc[i + 1])
@@ -168,7 +165,6 @@ class TestSoftCap:
         """Test that soft cap actually changes the output."""
         data = create_test_data(num_seqs=2, max_seq_len=128, seed=42)
 
-        # Run without soft cap
         output_no_cap = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -178,7 +174,6 @@ class TestSoftCap:
             num_seqs=data["num_seqs"],
         )
 
-        # Run with soft cap
         output_with_cap = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -189,7 +184,6 @@ class TestSoftCap:
             logit_soft_cap=30.0,
         )
 
-        # Outputs should be different
         diff = float(jnp.mean(jnp.abs(output_no_cap - output_with_cap)))
         assert diff > 1e-6, f"Soft cap should affect output, got diff={diff}"
         assert jnp.all(jnp.isfinite(output_with_cap))
@@ -225,7 +219,6 @@ class TestSoftCap:
         """Test that soft cap doesn't cause numerical instabilities."""
         data = create_test_data(num_seqs=2, max_seq_len=128, seed=999)
 
-        # Scale queries to create large logits
         large_queries = data["queries"] * 10.0
 
         output = ragged_page_attention(
@@ -248,7 +241,6 @@ class TestSlidingWindow:
         """Test that sliding window changes the output."""
         data = create_test_data(num_seqs=2, max_seq_len=256, seed=42)
 
-        # Run with full attention
         output_full = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -258,7 +250,6 @@ class TestSlidingWindow:
             num_seqs=data["num_seqs"],
         )
 
-        # Run with sliding window
         output_windowed = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -289,7 +280,6 @@ class TestSlidingWindow:
                 sliding_window=window_size,
             )
 
-        # Different window sizes should produce different outputs
         diff_32_64 = float(jnp.mean(jnp.abs(outputs[32] - outputs[64])))
         diff_64_128 = float(jnp.mean(jnp.abs(outputs[64] - outputs[128])))
 
@@ -304,7 +294,6 @@ class TestMaskValue:
         """Test that custom mask value works."""
         data = create_test_data(num_seqs=2, max_seq_len=128, seed=42)
 
-        # Use default mask value
         output_default = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -314,7 +303,6 @@ class TestMaskValue:
             num_seqs=data["num_seqs"],
         )
 
-        # Use custom mask value
         output_custom = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -325,7 +313,6 @@ class TestMaskValue:
             mask_value=-1e10,
         )
 
-        # Both should be finite
         assert jnp.all(jnp.isfinite(output_default))
         assert jnp.all(jnp.isfinite(output_custom))
 
@@ -375,7 +362,6 @@ class TestCombinedFeatures:
         """Test that different feature combinations produce different results."""
         data = create_test_data(num_seqs=2, max_seq_len=128, seed=456)
 
-        # Baseline
         output_baseline = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -385,7 +371,6 @@ class TestCombinedFeatures:
             num_seqs=data["num_seqs"],
         )
 
-        # Only soft cap
         output_cap = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -396,7 +381,6 @@ class TestCombinedFeatures:
             logit_soft_cap=30.0,
         )
 
-        # Only window
         output_window = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -407,7 +391,6 @@ class TestCombinedFeatures:
             sliding_window=64,
         )
 
-        # Both
         output_both = ragged_page_attention(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
@@ -419,7 +402,6 @@ class TestCombinedFeatures:
             sliding_window=64,
         )
 
-        # All should be different
         diff_base_cap = float(jnp.mean(jnp.abs(output_baseline - output_cap)))
         diff_base_window = float(jnp.mean(jnp.abs(output_baseline - output_window)))
         diff_cap_both = float(jnp.mean(jnp.abs(output_cap - output_both)))
@@ -472,10 +454,9 @@ class TestEdgeCases:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            logit_soft_cap=1e6,  # Very large cap
+            logit_soft_cap=1e6,
         )
 
-        # Should be very similar (not identical due to tanh computation)
         diff = float(jnp.max(jnp.abs(output_no_cap - output_large_cap)))
         assert diff < 0.1, "Very large soft cap should behave similar to no cap"
 
@@ -499,10 +480,9 @@ class TestEdgeCases:
             block_tables=data["block_tables"],
             query_start_loc=data["query_start_loc"],
             num_seqs=data["num_seqs"],
-            sliding_window=1000,  # Much larger than max_seq_len
+            sliding_window=1000,
         )
 
-        # Should be identical
         diff = float(jnp.max(jnp.abs(output_no_window - output_large_window)))
         assert diff < 1e-5, "Window larger than sequence should match full attention"
 

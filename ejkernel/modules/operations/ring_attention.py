@@ -13,7 +13,51 @@
 # limitations under the License.
 
 
-"""Ring Attention module with automatic optimization."""
+"""Ring Attention module with automatic optimization.
+
+This module implements Ring Attention, a distributed attention mechanism that enables
+efficient processing of extremely long sequences by distributing computation across
+multiple devices in a ring topology. Unlike standard attention which requires all KV
+pairs to fit in a single device's memory, Ring Attention overlaps communication and
+computation through pipelining.
+
+Ring Attention is particularly valuable for:
+    - Ultra-long sequence processing (100K+ tokens)
+    - Training large language models with long contexts
+    - Distributed inference scenarios
+    - Memory-constrained environments requiring sequence parallelism
+
+Key Innovation:
+    Ring Attention partitions the KV pairs across devices and uses a ring-based
+    communication pattern to stream KV blocks through each device. Each device:
+    1. Computes attention with its local KV block
+    2. Passes the KV block to the next device in the ring
+    3. Receives the next KV block from the previous device
+    4. Continues until all KV blocks have been processed
+
+    This achieves O(N) memory per device while maintaining O(N^2) computation.
+
+Mathematical Foundation:
+    For a sequence of length N split across D devices:
+    - Each device holds N/D query tokens
+    - KV pairs are rotated through the ring
+    - Attention is computed incrementally: softmax_i = exp(QK_i^T) / sum_j(exp(QK_j^T))
+    - Running statistics (max, sum) are maintained for numerical stability
+
+Communication Pattern:
+    Device 0: KV_0 -> KV_1 -> ... -> KV_{D-1}
+    Device 1: KV_1 -> KV_2 -> ... -> KV_0
+    Device i: KV_i -> KV_{i+1} -> ... -> KV_{i-1} (mod D)
+
+Performance Characteristics:
+    - Memory: O(N/D) per device vs O(N) for standard attention
+    - Computation: O(N^2/D) per device (same asymptotic cost)
+    - Communication: O(N) per device (bandwidth-efficient with overlap)
+
+References:
+    Liu et al., "Ring Attention with Blockwise Transformers for Near-Infinite Context"
+    https://arxiv.org/abs/2310.01889
+"""
 
 from __future__ import annotations
 
@@ -31,14 +75,52 @@ from ..base import KernelConfig, create_default_executor, detect_platform
 
 
 class RingAttention(Kernel[KernelConfig, Array]):
-    """Ring Attention with custom optimization logic."""
+    """Ring Attention with custom optimization logic.
+
+    Implements distributed attention using ring communication topology for
+    processing ultra-long sequences across multiple devices with memory efficiency.
+
+    Features:
+        - Distributed KV processing via ring communication
+        - Overlapped computation and communication for efficiency
+        - Causal and non-causal attention support
+        - Sliding window attention for local patterns
+        - Attention sink mechanism for long-context stability
+        - Configurable chunk sizes for memory-computation tradeoffs
+        - Gradient checkpointing support for training
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
+    The implementation maintains numerical stability through:
+        - Online softmax with running max/sum statistics
+        - Logit soft capping to prevent overflow
+        - Float32 logit accumulation (configurable)
+
+    Typical Usage Patterns:
+        - Multi-GPU training with sequence parallelism
+        - Long-context inference on multiple devices
+        - Blockwise transformer architectures
+    """
 
     def __init__(self):
-        """Initialize Ring Attention module."""
+        """Initialize Ring Attention module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and distributed execution management.
+        """
         super().__init__(op_id="ring_attention")
 
     def get_impl(self, cfg: KernelConfig):
-        """Get kernel implementation from registry."""
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend preferences
+
+        Returns:
+            Callable kernel implementation for ring attention
+
+        Raises:
+            ValueError: If no matching implementation is found for the configuration
+        """
         platform = detect_platform("ring_attention", cfg.platform)
         return kernel_registry.get("ring_attention", platform=platform, backend=cfg.backend)
 
@@ -72,7 +154,55 @@ class RingAttention(Kernel[KernelConfig, Array]):
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-        """Execute ring attention."""
+        """Execute ring attention with distributed KV processing.
+
+        Computes attention across devices using ring communication pattern,
+        enabling efficient processing of sequences that don't fit in single device memory.
+
+        Args:
+            query: Query tensor [batch, seq_len_q, num_heads, head_dim]
+            key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim] (distributed)
+            value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim] (distributed)
+            bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k]
+            q_segment_ids: Optional query segment IDs [batch, seq_len_q]
+            kv_segment_ids: Optional KV segment IDs [batch, seq_len_k]
+            softmax_aux: Optional attention sink logits for long-context stability
+            cache_idx: Optional cache index for incremental decoding
+            axis_name: Name of the axis for collective operations (required for multi-device)
+            float32_logits: Use float32 for logit computation (default: True)
+            softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
+            query_chunk_size: Size of query chunks for tiling (default: 512)
+            key_chunk_size: Size of key chunks for tiling (default: 512)
+            causal_block_size: Block size for causal masking (None = no causal)
+            deterministic: Use deterministic dropout (default: True)
+            dropout_rng: PRNG key for dropout
+            pdrop: Dropout probability (default: 0.0)
+            dtype: Computation dtype (default: float32)
+            policy: Gradient checkpointing policy
+            precision: Matrix multiplication precision setting
+            prevent_cse: Prevent common subexpression elimination (default: True)
+            sliding_window: Window size for local attention (int or (left, right) tuple)
+            logit_soft_cap: Soft cap value to bound attention logits
+            attention_sink_size: Number of sink tokens for attention stability
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
+            cfg: Kernel configuration object
+
+        Returns:
+            Attention output [batch, seq_len_q, num_heads, head_dim]
+
+        Note:
+            Ring attention requires proper device mesh setup with the specified axis_name.
+            Each device processes a slice of the sequence and communicates KV pairs
+            through the ring topology.
+
+        Example:
+            >>>
+            >>> mesh = jax.sharding.Mesh(devices, axis_names=['sp'])
+            >>>
+            >>>
+            >>> with mesh:
+            ...     out = ring_attention(q, k, v, axis_name='sp')
+        """
 
         if platform is not None:
             cfg = KernelConfig(
@@ -113,7 +243,15 @@ class RingAttention(Kernel[KernelConfig, Array]):
         )
 
     def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
-        """Provide default configuration with block sizes."""
+        """Provide default configuration optimized for ring attention.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default KernelConfig with block sizes balanced for communication
+            and computation overlap in distributed settings
+        """
         return KernelConfig(
             block_q=128,
             block_k=128,
@@ -124,7 +262,21 @@ class RingAttention(Kernel[KernelConfig, Array]):
         )
 
     def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+        """Generate candidate configurations for autotuning.
+
+        Creates configurations optimized for different sequence lengths and
+        device counts, balancing chunk size with communication overhead.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of candidate configurations to benchmark during autotuning
+
+        Note:
+            Ring attention performance is sensitive to chunk sizes relative
+            to sequence length per device and communication bandwidth.
+        """
         block_configs = [
             (64, 64, 4, 1),
             (128, 128, 4, 2),
@@ -263,4 +415,5 @@ def ring_attention(
         sliding_window=sliding_window,
         logit_soft_cap=logit_soft_cap,
         attention_sink_size=attention_sink_size,
+        platform=platform,
     )

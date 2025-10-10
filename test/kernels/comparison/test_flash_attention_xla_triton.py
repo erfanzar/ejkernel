@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 """Comparison tests between XLA and Triton flash attention implementations."""
 
@@ -30,7 +31,6 @@ class TestBasicComparison:
         batch, seq_len, num_heads, head_dim = 2, 32, 4, 64
         key = jax.random.PRNGKey(0)
 
-        # XLA uses float32, Triton needs float16/bfloat16
         q_f32 = jax.random.normal(key, (batch, seq_len, num_heads, head_dim))
         k_f32 = jax.random.normal(key, (batch, seq_len, num_heads, head_dim))
         v_f32 = jax.random.normal(key, (batch, seq_len, num_heads, head_dim))
@@ -42,7 +42,6 @@ class TestBasicComparison:
         out_xla = flash_attention_xla(q_f32, k_f32, v_f32)
         out_triton = flash_attention_triton(q_f16, k_f16, v_f16)
 
-        # Should be reasonably close (accounting for float16 precision)
         assert jnp.allclose(out_xla, out_triton.astype(jnp.float32), rtol=1e-2, atol=1e-3)
 
 
@@ -67,7 +66,6 @@ class TestSoftCapComparison:
         out_xla = flash_attention_xla(q_f32, k_f32, v_f32, logits_soft_cap=logit_soft_cap)
         out_triton = flash_attention_triton(q_f16, k_f16, v_f16, logits_soft_cap=logit_soft_cap)
 
-        # Both should apply soft cap similarly
         assert jnp.allclose(out_xla, out_triton.astype(jnp.float32), rtol=2e-2, atol=1e-3)
 
     def test_soft_cap_gradient_agreement(self):
@@ -94,7 +92,6 @@ class TestSoftCapComparison:
         grads_xla = jax.grad(loss_xla, argnums=(0, 1, 2))(q_f32, k_f32, v_f32)
         grads_triton = jax.grad(loss_triton, argnums=(0, 1, 2))(q_f16, k_f16, v_f16)
 
-        # Gradients should be similar
         for g_xla, g_triton in zip(grads_xla, grads_triton, strict=False):
             assert jnp.allclose(g_xla, g_triton.astype(jnp.float32), rtol=5e-2, atol=1e-2)
 
@@ -121,7 +118,6 @@ class TestSoftmaxAuxComparison:
         out_xla = flash_attention_xla(q_f32, k_f32, v_f32, softmax_aux=sinks_f32)
         out_triton = flash_attention_triton(q_f16, k_f16, v_f16, softmax_aux=sinks_f16)
 
-        # Should be similar
         assert jnp.allclose(out_xla, out_triton.astype(jnp.float32), rtol=2e-2, atol=1e-3)
 
     def test_sinks_broadcast_agreement(self):
@@ -168,7 +164,6 @@ class TestCombinedFeaturesComparison:
         out_xla = flash_attention_xla(q_f32, k_f32, v_f32, logits_soft_cap=20.0, softmax_aux=sinks_f32)
         out_triton = flash_attention_triton(q_f16, k_f16, v_f16, logits_soft_cap=20.0, softmax_aux=sinks_f16)
 
-        # Combined features should still produce similar results
         assert jnp.allclose(out_xla, out_triton.astype(jnp.float32), rtol=3e-2, atol=1e-3)
 
     def test_all_features_with_causal(self):
@@ -187,7 +182,6 @@ class TestCombinedFeaturesComparison:
         v_f16 = v_f32.astype(jnp.float16)
         sinks_f16 = sinks_f32.astype(jnp.float16)
 
-        # Use window for XLA causal (since it doesn't have a causal flag)
         out_xla = flash_attention_xla(
             q_f32,
             k_f32,
@@ -205,7 +199,6 @@ class TestCombinedFeaturesComparison:
             softmax_aux=sinks_f16,
         )
 
-        # Causal + all features
         assert jnp.allclose(out_xla, out_triton.astype(jnp.float32), rtol=3e-2, atol=1e-3)
 
 
@@ -217,34 +210,28 @@ class TestNumericalStability:
         batch, seq_len, num_heads, head_dim = 1, 8, 2, 16
         key = jax.random.PRNGKey(0)
 
-        # Create queries and keys that will produce large logits
         q_f32 = jax.random.normal(key, (batch, seq_len, num_heads, head_dim)) * 3
-        k_f32 = q_f32  # Same as queries to get large dot products
+        k_f32 = q_f32
         v_f32 = jax.random.normal(key, (batch, seq_len, num_heads, head_dim))
 
         q_f16 = q_f32.astype(jnp.float16)
         k_f16 = k_f32.astype(jnp.float16)
         v_f16 = v_f32.astype(jnp.float16)
 
-        # Without soft cap, may have numerical issues
         out_xla_no_cap = flash_attention_xla(q_f32, k_f32, v_f32)
         out_triton_no_cap = flash_attention_triton(q_f16, k_f16, v_f16)
 
-        # With soft cap, should be more stable
         out_xla_cap = flash_attention_xla(q_f32, k_f32, v_f32, logits_soft_cap=20.0)
         out_triton_cap = flash_attention_triton(q_f16, k_f16, v_f16, logits_soft_cap=20.0)
 
-        # All outputs should be finite
         assert jnp.all(jnp.isfinite(out_xla_no_cap))
         assert jnp.all(jnp.isfinite(out_triton_no_cap))
         assert jnp.all(jnp.isfinite(out_xla_cap))
         assert jnp.all(jnp.isfinite(out_triton_cap))
 
-        # Soft cap should produce more similar results
         _diff_no_cap = jnp.abs(out_xla_no_cap - out_triton_no_cap.astype(jnp.float32)).mean()
         diff_cap = jnp.abs(out_xla_cap - out_triton_cap.astype(jnp.float32)).mean()
 
-        # With large logits, soft cap should help convergence
         assert jnp.isfinite(diff_cap)
 
 

@@ -44,7 +44,7 @@ def fwd_kernel(
     gv,
     h0,
     cu_seqlens,
-    scale,
+    softmax_scale,
     o,
     ht,
     T: tl.constexpr,
@@ -76,7 +76,7 @@ def fwd_kernel(
         gk, gv: Optional gates applied to keys and values
         h0: Initial hidden state pointer
         cu_seqlens: Cumulative sequence lengths for variable-length mode
-        scale: Query scaling factor
+        softmax_scale: Query scaling factor
         o: Output tensor pointer
         ht: Final hidden state pointer
         T, B, H, K, V: Tensor dimensions (sequence, batch, heads, key/value dims)
@@ -122,7 +122,7 @@ def fwd_kernel(
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for _ in range(0, T):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32) * scale
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32) * softmax_scale
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         if USE_G:
@@ -164,7 +164,7 @@ def fwd_triton_impl(
     g_gamma: Float[Array, "batch num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -202,13 +202,13 @@ def fwd_triton_impl(
         gv if gv is not None else 1,
         h0 if h0 is not None else 1,
         cu_seqlens if cu_seqlens is not None else 1,
-        scale if scale is not None else 1,
+        softmax_scale if softmax_scale is not None else 1,
         kernel=fwd_kernel,
         out_shape=[
             jax.ShapeDtypeStruct(out_shape, q.dtype),
             jax.ShapeDtypeStruct(ht_shape, jnp.float32),
         ],
-        name="ejgpu:lightning_attn:fwd_kernel",
+        name="ejkernel::triton::recurrent_fwd",
         grid=grid,
         **metaparams,
     )

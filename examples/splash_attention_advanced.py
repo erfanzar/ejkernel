@@ -57,11 +57,11 @@ print(f"Mean absolute difference: {diff:.6f}")
 print("✓ Soft capping changes the attention distribution\n")
 
 
-# Example 2: Custom softmax scale
-print("Example 2: Custom softmax scale")
+# Example 2: Custom softmax softmax_scale
+print("Example 2: Custom softmax softmax_scale")
 print("-" * 50)
 
-# Default scale (1/sqrt(head_dim) = 1/sqrt(64) = 0.125)
+# Default softmax_scale (1/sqrt(head_dim) = 1/sqrt(64) = 0.125)
 output_default_scale = blocksparse_attention(
     query=query,
     key=key_array,
@@ -69,9 +69,9 @@ output_default_scale = blocksparse_attention(
     softmax_scale=None,  # Will use default
     causal=True,
 )
-print(f"Output shape with default scale (1/√{head_dim}): {output_default_scale.shape}")
+print(f"Output shape with default softmax_scale (1/√{head_dim}): {output_default_scale.shape}")
 
-# Custom scale (e.g., for temperature control)
+# Custom softmax_scale (e.g., for temperature control)
 output_custom_scale = blocksparse_attention(
     query=query,
     key=key_array,
@@ -79,7 +79,7 @@ output_custom_scale = blocksparse_attention(
     softmax_scale=0.2,  # Higher temperature (softer attention)
     causal=True,
 )
-print(f"Output shape with custom scale (0.2): {output_custom_scale.shape}")
+print(f"Output shape with custom softmax_scale (0.2): {output_custom_scale.shape}")
 
 # Lower temperature (sharper attention)
 output_sharp = blocksparse_attention(
@@ -89,10 +89,10 @@ output_sharp = blocksparse_attention(
     softmax_scale=0.05,  # Lower temperature
     causal=True,
 )
-print(f"Output shape with sharp scale (0.05): {output_sharp.shape}")
+print(f"Output shape with sharp softmax_scale (0.05): {output_sharp.shape}")
 
 diff_scale = float(jnp.mean(jnp.abs(output_default_scale - output_custom_scale)))
-print(f"Difference between default and custom scale: {diff_scale:.6f}")
+print(f"Difference between default and custom softmax_scale: {diff_scale:.6f}")
 print("✓ Different scales control attention sharpness\n")
 
 
@@ -155,7 +155,7 @@ output_all_features = blocksparse_attention(
     key=key_array,
     value=value,
     logit_soft_cap=35.0,  # Soft capping
-    softmax_scale=0.15,  # Custom scale
+    softmax_scale=0.15,  # Custom softmax_scale
     softmax_aux=softmax_aux,  # Auxiliary values
     sliding_window=(128, 64),  # Asymmetric window
     causal=True,
@@ -200,7 +200,7 @@ print("-" * 50)
 configs = [
     {"name": "Baseline", "params": {}},
     {"name": "With soft cap", "params": {"logit_soft_cap": 50.0}},
-    {"name": "Custom scale", "params": {"softmax_scale": 0.2}},
+    {"name": "Custom softmax_scale", "params": {"softmax_scale": 0.2}},
     {"name": "Sliding window", "params": {"sliding_window": 256}},
     {
         "name": "All optimizations",

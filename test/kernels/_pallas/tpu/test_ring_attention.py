@@ -1,4 +1,18 @@
-#!/usr/bin/env python3
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """Tests for Pallas TPU ring attention implementation."""
 
 from functools import partial
@@ -11,6 +25,11 @@ from jax.sharding import PartitionSpec
 
 from ejkernel.kernels import pallas
 from ejkernel.utils import numeric_gen
+
+pytestmark = pytest.mark.skipif(
+    jax.devices()[0].platform != "tpu",
+    reason="Pallas TPU tests require TPU backend",
+)
 
 
 class TestRingAttentionPallasFwd:
@@ -117,7 +136,7 @@ class TestRingAttentionPallasFwd:
             q,
             k,
             v,
-            sliding_window=(32, 96),  # left_window=32, right_window=96
+            sliding_window=(32, 96),
             query_chunk_size=128,
             key_chunk_size=128,
         )
@@ -130,12 +149,11 @@ class TestRingAttentionPallasFwd:
         batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        # Test with window size of 1 (only attend to self)
         out = pallas.tpu.ring_attention(
             q,
             k,
             v,
-            sliding_window=0,  # Only attend to current position
+            sliding_window=0,
             query_chunk_size=128,
             key_chunk_size=128,
         )
@@ -148,12 +166,11 @@ class TestRingAttentionPallasFwd:
         batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        # Window larger than sequence length - should behave like full attention
         out = pallas.tpu.ring_attention(
             q,
             k,
             v,
-            sliding_window=512,  # Larger than seq_len
+            sliding_window=512,
             query_chunk_size=128,
             key_chunk_size=128,
         )
@@ -187,13 +204,12 @@ class TestRingAttentionPallasFwd:
         batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        # Sliding window with causal - should apply both constraints
         out = pallas.tpu.ring_attention(
             q,
             k,
             v,
             sliding_window=64,
-            causal_block_size=32,  # Also apply causal masking
+            causal_block_size=32,
             query_chunk_size=128,
             key_chunk_size=128,
         )
@@ -373,7 +389,7 @@ class TestRingAttentionPallasBwd:
                 q,
                 k,
                 v,
-                sliding_window=(32, 96),  # left_window=32, right_window=96
+                sliding_window=(32, 96),
                 query_chunk_size=128,
                 key_chunk_size=128,
             )
@@ -420,7 +436,6 @@ class TestRingAttentionPallasBwd:
 class TestRingAttentionPallasDistributed:
     """Test distributed execution of Pallas TPU ring attention."""
 
-    @pytest.mark.skipif(not jax.devices()[0].platform == "tpu", reason="Requires TPU")
     def test_distributed_shard_map(self):
         """Test distributed execution with shard_map - this is how Pallas should be used on TPU."""
         pytest.importorskip("eformer.escale")
@@ -436,17 +451,16 @@ class TestRingAttentionPallasDistributed:
 
         softmax_aux = numeric_gen(num_heads, dtype="f4") * -1.0
 
-        # This is the proper way to use pallas.tpu.ring_attention with shard_map
         out = shard_map(
             partial(pallas.tpu.ring_attention, axis_name="sp", query_chunk_size=128, key_chunk_size=128),
             in_specs=(
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-                None,  # attn_bias
-                None,  # q_segment_ids
-                None,  # kv_segment_ids
-                PartitionSpec("tp"),  # softmax_aux
+                None,
+                None,
+                None,
+                PartitionSpec("tp"),
             ),
             out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             mesh=mesh,

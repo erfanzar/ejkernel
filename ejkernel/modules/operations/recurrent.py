@@ -96,7 +96,7 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
         g_gamma: Float[Array, "batch num_heads"] | None = None,
         gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
         gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-        scale: float | None = None,
+        softmax_scale: float | None = None,
         initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -114,7 +114,7 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
             g_gamma: Layer-level gating parameter [batch, num_heads]
             gk: Key-level gating tensor [batch, seq_len, num_heads, head_dim]
             gv: Value-level gating tensor [batch, seq_len, num_heads, head_dim]
-            scale: Optional scaling factor for attention scores
+            softmax_scale: Optional scaling factor for attention scores
             initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
             reverse: If True, process sequence in reverse order
             cu_seqlens: Cumulative sequence lengths for variable-length sequences
@@ -148,7 +148,7 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
             g_gamma=g_gamma,
             gk=gk,
             gv=gv,
-            scale=scale,
+            softmax_scale=softmax_scale,
             initial_state=initial_state,
             reverse=reverse,
             cu_seqlens=cu_seqlens,
@@ -202,10 +202,11 @@ def recurrent_attention(
     g_gamma: Float[Array, "batch num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
 ) -> Float[Array, "batch seq_len num_heads head_dim"]:
     """Execute recurrent attention with automatic optimization.
 
@@ -220,23 +221,24 @@ def recurrent_attention(
         g_gamma: Gating gamma [batch, num_heads]
         gk: Gating tensor for keys [batch, seq_len, num_heads, head_dim]
         gv: Gating tensor for values [batch, seq_len, num_heads, head_dim]
-        scale: Scaling factor for attention
+        softmax_scale: Scaling factor for attention
         initial_state: Initial hidden state
         reverse: Whether to process sequence in reverse
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
+        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
 
     Returns:
         Attention output with same shape as query
 
     Example:
         >>>
-        >>> out = recurrent(query, key, value)
+        >>> out = recurrent_attention(query, key, value)
         >>>
         >>>
-        >>> out = recurrent(query, key, value, g=gates, gk=key_gates, gv=value_gates)
+        >>> out = recurrent_attention(query, key, value, g=gates, gk=key_gates, gv=value_gates)
         >>>
         >>>
-        >>> out = recurrent(query, key, value, initial_state=h0)
+        >>> out = recurrent_attention(query, key, value, platform="xla")
     """
     return _recurrent_executor(
         RecurrentAttention(),
@@ -247,8 +249,9 @@ def recurrent_attention(
         g_gamma=g_gamma,
         gk=gk,
         gv=gv,
-        scale=scale,
+        softmax_scale=softmax_scale,
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        platform=platform,
     )

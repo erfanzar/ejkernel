@@ -937,29 +937,41 @@ class FNAutotuner:
                     results = None
 
             if optimal_hyperparams is None:
-                with jax.core.eval_context():
-                    _, optimal_hyperparams, results = self.tune(
-                        fn,
-                        args=args,
-                        kwargs=kws,
-                        hyperparams=hyperparams,
-                        max_workers=max_workers,
-                        in_shardings=in_shardings,
-                        out_shardings=out_shardings,
-                        device=device,
-                        example_args=example_args,
-                        example_kws=example_kws,
-                        sample_num=sample_num,
-                        event_filter_regex=event_filter_regex,
-                        timeout=timeout,
-                    )
+                flat_vals = jax.tree.leaves((args, kws))
+                has_tracers = any(not jax.core.is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
+                if has_tracers:
+                    if wrapped.optimal_hyperparams:
+                        optimal_hyperparams = wrapped.optimal_hyperparams.copy()
+                        results = wrapped.timing_results
+                    else:
+                        optimal_hyperparams = {
+                            k: (v[0] if isinstance(v, list) else v) for k, v in (hyperparams or {}).items()
+                        }
+                        results = []
+                else:
+                    with jax.core.eval_context():
+                        _, optimal_hyperparams, results = self.tune(
+                            fn,
+                            args=args,
+                            kwargs=kws,
+                            hyperparams=hyperparams,
+                            max_workers=max_workers,
+                            in_shardings=in_shardings,
+                            out_shardings=out_shardings,
+                            device=device,
+                            example_args=example_args,
+                            example_kws=example_kws,
+                            sample_num=sample_num,
+                            event_filter_regex=event_filter_regex,
+                            timeout=timeout,
+                        )
 
-                with cache_lock:
-                    if lookup_key is not None:
-                        if len(cache) >= self.cache_size_limit:
-                            oldest_key = next(iter(cache))
-                            del cache[oldest_key]
-                        cache[lookup_key] = (optimal_hyperparams, results)
+                    with cache_lock:
+                        if lookup_key is not None:
+                            if len(cache) >= self.cache_size_limit:
+                                oldest_key = next(iter(cache))
+                                del cache[oldest_key]
+                            cache[lookup_key] = (optimal_hyperparams, results)
 
             wrapped.timing_results = results
             wrapped.optimal_hyperparams = optimal_hyperparams

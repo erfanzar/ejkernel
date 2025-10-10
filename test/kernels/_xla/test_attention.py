@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Tests for XLA attention kernel with sliding window support."""
 
 import jax
@@ -21,24 +22,22 @@ import pytest
 from ejkernel.kernels._xla.attention._interface import attention
 
 
-def naive_attention_with_window(q, k, v, scale=None, sliding_window=None):
+def naive_attention_with_window(q, k, v, softmax_scale=None, sliding_window=None):
     """Reference implementation with sliding window for testing."""
-    if scale is None:
-        scale = 1.0 / jnp.sqrt(q.shape[-1])
+    if softmax_scale is None:
+        softmax_scale = 1.0 / jnp.sqrt(q.shape[-1])
 
     B, qs, H, _D = q.shape
     _, ks, _, _ = k.shape
 
-    # Reshape for GQA/MQA if needed
     kv_heads = k.shape[2]
     if kv_heads != H:
         num_reps = H // kv_heads
         k = jnp.repeat(k, num_reps, axis=2)
         v = jnp.repeat(v, num_reps, axis=2)
 
-    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) * scale
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) * softmax_scale
 
-    # Apply sliding window mask
     if sliding_window is not None:
         if isinstance(sliding_window, int):
             left_window = sliding_window
@@ -87,7 +86,7 @@ class TestSlidingWindow:
         k = jax.random.normal(keys[1], (B, T, H, D), dtype=jnp.float32)
         v = jax.random.normal(keys[2], (B, T, H, D), dtype=jnp.float32)
 
-        window = (32, 8)  # left=32, right=8
+        window = (32, 8)
         output_xla, _ = attention(q, k, v, sliding_window=window, dtype=jnp.float32)
         output_naive = naive_attention_with_window(q, k, v, sliding_window=window)
 
@@ -104,7 +103,6 @@ class TestSlidingWindow:
         k = jax.random.normal(keys[1], (B, T, H, D), dtype=jnp.float32)
         v = jax.random.normal(keys[2], (B, T, H, D), dtype=jnp.float32)
 
-        # Causal: look at all past (left=infinity represented by large number), no future (right=0)
         window = (T - 1, 0)
         output_xla, _ = attention(q, k, v, sliding_window=window, dtype=jnp.float32)
         output_naive = naive_attention_with_window(q, k, v, sliding_window=window)
@@ -135,7 +133,7 @@ class TestSlidingWindow:
 
         B, T, H, D = 2, 64, 8, 32
         q = jax.random.normal(keys[0], (B, T, H, D), dtype=jnp.float32)
-        k = jax.random.normal(keys[1], (B, T, 2, D), dtype=jnp.float32)  # GQA: 8 q heads, 2 kv heads
+        k = jax.random.normal(keys[1], (B, T, 2, D), dtype=jnp.float32)
         v = jax.random.normal(keys[2], (B, T, 2, D), dtype=jnp.float32)
 
         window_size = 16
@@ -216,11 +214,9 @@ class TestWindowWithOtherFeatures:
         k = jax.random.normal(keys[1], (B, T, H, D), dtype=jnp.float32)
         v = jax.random.normal(keys[2], (B, T, H, D), dtype=jnp.float32)
 
-        # Create a custom mask (e.g., causal)
         mask = jnp.tril(jnp.ones((B, 1, T, T), dtype=bool))
 
-        # Note: window is applied first, then mask is applied on top
-        output, _ = attention(q, k, v, mask=mask, sliding_window=16, dtype=jnp.float32)
+        output, _ = attention(q, k, v, attention_mask=mask, sliding_window=16, dtype=jnp.float32)
 
         assert output.shape == q.shape
         assert jnp.all(jnp.isfinite(output))

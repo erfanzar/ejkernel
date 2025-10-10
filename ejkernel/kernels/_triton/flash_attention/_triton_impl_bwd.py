@@ -1185,8 +1185,8 @@ def _bwd_attention_kernel_call(
             raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
 
         head_dim = q.shape[-1]
-        scale = 1.0 / math.sqrt(float(head_dim)) if softmax_scale is None else softmax_scale
-        softmax_aux_tensor = softmax_aux_tensor * scale
+        softmax_scale = 1.0 / math.sqrt(float(head_dim)) if softmax_scale is None else softmax_scale
+        softmax_aux_tensor = softmax_aux_tensor * softmax_scale
         if softcap_flag:
             softmax_aux_tensor = logits_soft_cap_val * jnp.tanh(softmax_aux_tensor / logits_soft_cap_val)
 
@@ -1240,7 +1240,7 @@ def _bwd_attention_kernel_call(
             out_shape=[jax.ShapeDtypeStruct(shape=M.shape, dtype="f4", sharding=get_sharding(M))],
             grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch_size * nheads_q),
             kernel=_attn_bwd_preprocess,
-            name="triton::ops::_attn_bwd_preprocess",
+            name="ejkernel::triton::flash_attn_bwd_preprocess",
         )
 
         bz = bm = bh = 0
@@ -1315,7 +1315,7 @@ def _bwd_attention_kernel_call(
                 jax.ShapeDtypeStruct(shape=(*k_p.shape[:2], q_p.shape[2], k_p.shape[3]), dtype=k.dtype),
                 jax.ShapeDtypeStruct(shape=(*v_p.shape[:2], q_p.shape[2], v_p.shape[3]), dtype=v.dtype),
             ],
-            name="triton::ops::_attn_bwd",
+            name="ejkernel::triton::flash_attn_bwd",
         )
 
         if num_repeats > 1:
@@ -1408,7 +1408,7 @@ def _bwd_attention_kernel_call(
         out_shape=[jax.ShapeDtypeStruct(shape=M.shape, dtype="f4", sharding=get_sharding(M))],
         grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch_size * nheads_q),
         kernel=_attn_bwd_preprocess,
-        name="triton::ops::_attn_bwd_preprocess",
+        name="ejkernel::triton::flash_attn_bwd_preprocess",
     )
 
     dq, dk, dv = triton_call(
@@ -1481,7 +1481,7 @@ def _bwd_attention_kernel_call(
             jax.ShapeDtypeStruct(shape=(k.shape[0], k.shape[1], q.shape[2], k.shape[3]), dtype=k.dtype),
             jax.ShapeDtypeStruct(shape=(v.shape[0], v.shape[1], q.shape[2], v.shape[3]), dtype=v.dtype),
         ],
-        name="triton::ops::_attn_bwd",
+        name="ejkernel::triton::flash_attn_bwd",
     )
 
     if num_repeats > 1:

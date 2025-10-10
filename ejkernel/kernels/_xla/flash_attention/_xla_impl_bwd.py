@@ -22,7 +22,7 @@ def _flash_attention_bwd(
     mask: chex.Array | None,
     softmax_aux: chex.Array | None,
     window: tuple[int, int] | None,
-    scale: float,
+    softmax_scale: float,
     logits_soft_cap: float | None,
     chunk_size_q: int,
     chunk_size_k: int,
@@ -34,30 +34,12 @@ def _flash_attention_bwd(
     dropout_key: chex.Array | None,
     res: tuple,
     g: chex.Array,
-) -> tuple:
+) -> tuple[chex.Array, chex.Array, chex.Array]:
     """
     Backward pass for flash attention using JAX autodiff.
 
-    Args:
-            bias: Optional bias array
-            mask: Optional mask array
-            softmax_aux: Optional attention sink logits
-            window: Optional sliding window
-            scale: Softmax scale factor
-            logits_soft_cap: Optional soft cap value
-            chunk_size_q: Query chunk size
-            chunk_size_k: Key chunk size
-            normalize_output: Whether to normalize output
-            precision_code: Precision code
-            logits_dtype_code: Logits dtype code
-            causal: Whether to apply causal masking
-            dropout_prob: Dropout probability
-            dropout_key: PRNG key for dropout
-            res: Residuals from forward pass (q, k, v)
-            g: Gradient of output
-
     Returns:
-            Tuple of gradients (dq, dk, dv, None, None, ...)
+        dq, dk, dv
     """
     from ._xla_impl_fwd import _flash_attention_fwd
 
@@ -82,7 +64,7 @@ def _flash_attention_bwd(
             q_,
             k_,
             v_,
-            scale=scale,
+            softmax_scale=softmax_scale,
             logits_soft_cap=logits_soft_cap,
             bias=bias,
             mask=mask,
@@ -100,24 +82,4 @@ def _flash_attention_bwd(
 
     _, pullback = jax.vjp(f, q, k, v)
     dq, dk, dv = pullback(g)
-
-    return (
-        dq,
-        dk,
-        dv,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
+    return dq, dk, dv

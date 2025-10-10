@@ -12,6 +12,7 @@ ejkernel.kernels._xla package
    kernels/_xla/mean_pooling/index
    kernels/_xla/native_sparse_attention/index
    kernels/_xla/page_attention/index
+   kernels/_xla/ragged_decode_attention/index
    kernels/_xla/ragged_page_attention/index
    kernels/_xla/recurrent/index
    kernels/_xla/ring_attention/index

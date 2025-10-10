@@ -20,15 +20,6 @@ from jax import numpy as jnp
 from jaxtyping import DTypeLike, PRNGKeyArray
 
 
-def _slice_along_axis(x: chex.Array | None, start: int, size: int, axis: int) -> chex.Array | None:
-    """Slice array along a given axis."""
-    if x is None:
-        return None
-    if x.shape[axis] == 1:
-        return x
-    return lax.dynamic_slice_in_dim(x, start_index=start, slice_size=size, axis=axis)
-
-
 def _maybe_broadcast_kv_to_q_heads(k: chex.Array, v: chex.Array, hq: int) -> tuple[chex.Array, chex.Array]:
     """Broadcast KV heads to match Q heads for GQA/MQA support."""
     if k.shape[-2] == hq:
@@ -43,16 +34,15 @@ def _maybe_broadcast_kv_to_q_heads(k: chex.Array, v: chex.Array, hq: int) -> tup
 def _apply_logits_transforms(
     logits: chex.Array,
     *,
-    scale: float,
+    softmax_scale: float,
     bias: chex.Array | None,
     logits_soft_cap: float | None,
     mask: chex.Array | None,
-    window_mask: chex.Array | None,
     logits_dtype: DTypeLike,
 ) -> chex.Array:
     """Apply transformations to attention logits: scaling, bias, soft cap, masking."""
     logits = logits.astype(logits_dtype)
-    logits = logits * scale
+    logits = logits * softmax_scale
 
     if bias is not None:
         logits = logits + bias.astype(logits.dtype)
@@ -60,18 +50,10 @@ def _apply_logits_transforms(
     if logits_soft_cap is not None:
         logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
-    masks_to_combine = []
     if mask is not None:
-        masks_to_combine.append(mask)
-    if window_mask is not None:
-        masks_to_combine.append(window_mask)
-
-    if len(masks_to_combine) > 0:
-        combined = masks_to_combine[0]
-        for m in masks_to_combine[1:]:
-            combined = jnp.logical_and(combined, m)
+        mask = mask.astype(bool)
         mask_value = jnp.finfo(logits.dtype).min
-        logits = jnp.where(combined, logits, mask_value)
+        logits = jnp.where(mask, logits, mask_value)
 
     logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
     return logits
@@ -86,18 +68,11 @@ def _causal_mask_for_chunk(
     """
     Create causal attention mask for a chunk.
 
-    Args:
-        q_start: Starting position of query chunk in sequence
-        q_len: Length of query chunk
-        k_start: Starting position of key chunk in sequence
-        k_len: Length of key chunk
-
     Returns:
-        Boolean mask of shape [1, 1, q_len, k_len] where True means attend
+        [1, 1, q_len, k_len] where True means attend
     """
     q_pos = q_start + jnp.arange(q_len)
     k_pos = k_start + jnp.arange(k_len)
-
     mask = k_pos[None, :] <= q_pos[:, None]
     return mask[None, None, ...]
 
@@ -112,24 +87,45 @@ def _window_mask_for_chunk(
     """
     Create sliding window attention mask for a chunk.
 
-    Args:
-        q_start: Starting position of query chunk in sequence
-        q_len: Length of query chunk
-        k_start: Starting position of key chunk in sequence
-        k_len: Length of key chunk
-        window: Optional (left_window, right_window) for local attention
-
     Returns:
-        Boolean mask of shape [1, 1, q_len, k_len] where True means attend, or None
+        [1, 1, q_len, k_len] where True means attend, or None
     """
     if window is None:
         return None
+
     w_left, w_right = window
+    w_left = jnp.asarray(w_left)
+    w_right = jnp.asarray(w_right)
+
     q_pos = q_start + jnp.arange(q_len)
     k_pos = k_start + jnp.arange(k_len)
     diff = k_pos[None, :] - q_pos[:, None]
-    ok = (diff >= -int(w_left)) & (diff <= int(w_right))
+    ok = (diff >= -w_left) & (diff <= w_right)
     return ok[None, None, ...]
+
+
+def _slice_broadcast_qk(x: chex.Array | None, q_start: int, q_len: int, k_start: int, k_len: int) -> chex.Array | None:
+    """Slice x along query/key axes with broadcasting-aware semantics to [*,*,q_len,k_len]."""
+    if x is None:
+        return None
+    if x.ndim > 4:
+        raise ValueError(f"bias/mask must be broadcastable to [B,H,Tq,Tk], got shape {x.shape}")
+    if x.ndim < 4:
+        x = x.reshape((1,) * (4 - x.ndim) + x.shape)
+
+    if x.shape[-2] == 1:
+        x_q = x
+    else:
+        x_q = lax.dynamic_slice_in_dim(x, q_start, q_len, axis=-2)
+
+    if x_q.shape[-1] == 1:
+        x_qk = x_q
+    else:
+        x_qk = lax.dynamic_slice_in_dim(x_q, k_start, k_len, axis=-1)
+
+    target_shape = (x_qk.shape[0], x_qk.shape[1], q_len, k_len)
+    x_qk = jnp.broadcast_to(x_qk, target_shape)
+    return x_qk
 
 
 def _attend_chunk(
@@ -140,7 +136,7 @@ def _attend_chunk(
     x_max: chex.Array,
     denom: chex.Array,
     *,
-    scale: float,
+    softmax_scale: float,
     bias_chunk: chex.Array | None,
     mask_chunk: chex.Array | None,
     window_mask: chex.Array | None,
@@ -154,42 +150,10 @@ def _attend_chunk(
 ) -> tuple[chex.Array, chex.Array, chex.Array, PRNGKeyArray | None]:
     """
     Process a single KV chunk with online softmax and optional attention sinks.
-
-    This function computes attention for a chunk of keys/values, updating the running
-    statistics for online softmax computation. Optionally supports attention sinks
-    (auxiliary softmax logits) that absorb probability mass without contributing to output.
-
-    Args:
-        q_chunk: Query chunk of shape [B, q, H, D]
-        k_chunk: Key chunk of shape [B, k, H, D]
-        v_chunk: Value chunk of shape [B, k, H, d]
-        accum: Accumulated weighted sum of shape [B, q, H, d]
-        x_max: Running max of logits of shape [B, H, q]
-        denom: Running sum of exp weights of shape [B, H, q]
-        scale: Softmax scale factor
-        bias_chunk: Optional bias of shape [B or 1, H or 1, q or 1, k or 1]
-        mask_chunk: Optional mask of shape [B or 1, H or 1, q or 1, k or 1]
-        window_mask: Optional window mask of shape [1, 1, q, k]
-        causal_mask: Optional causal mask of shape [1, 1, q, k]
-        logits_soft_cap: Optional soft cap value
-        logits_dtype: Dtype for logits computation
-        precision: Matrix multiplication precision
-        dropout_prob: Dropout probability for attention weights
-        dropout_key: PRNG key for dropout
-        softmax_aux: Optional attention sink logits of shape [1, H, num_sinks, 1, 1]
-                     or [H, num_sinks]. These participate in softmax but don't produce output.
-
-    Returns:
-        Updated (accum, x_max, denom, next_dropout_key) tuple
-
-    Note:
-        Attention sinks are auxiliary logits that participate in the softmax normalization
-        but don't contribute to the output. They can absorb probability mass, improving
-        numerical stability and model behavior.
     """
 
     logits = jnp.einsum(
-        "...qhd,...khd->...hqk",
+        "bqhd,bkhd->bhqk",
         q_chunk,
         k_chunk,
         precision=precision,
@@ -203,11 +167,10 @@ def _attend_chunk(
 
     logits = _apply_logits_transforms(
         logits,
-        scale=scale,
+        softmax_scale=softmax_scale,
         bias=bias_chunk,
         logits_soft_cap=logits_soft_cap,
         mask=combined_mask,
-        window_mask=None,
         logits_dtype=logits_dtype,
     )
 
@@ -221,7 +184,6 @@ def _attend_chunk(
 
         B, H, q, k = logits.shape
         sinks = jnp.broadcast_to(sinks, (B, H, q, sinks.shape[-1]))
-
         combined_logits = jnp.concatenate([logits, sinks], axis=-1)
 
         loc_x_max = jnp.max(combined_logits, axis=-1)
@@ -248,18 +210,12 @@ def _attend_chunk(
     if dropout_prob > 0.0 and dropout_key is not None:
         dropout_key, next_key = jax.random.split(dropout_key)
         keep_prob = 1.0 - dropout_prob
-
         dropout_mask = jax.random.bernoulli(dropout_key, keep_prob, shape=weights.shape)
-
         weights = weights * dropout_mask / keep_prob
 
-    weights = weights.astype(v_chunk.dtype)
-    accum = accum + jnp.einsum(
-        "...hqk,...khd->...qhd",
-        weights,
-        v_chunk,
-        precision=precision,
-    )
+    att_v = jnp.einsum("bhqk,bkhd->bqhd", weights, v_chunk, precision=precision).astype(accum.dtype)
+    accum = accum + att_v
+
     return accum, x_max, denom, next_key
 
 
@@ -268,7 +224,7 @@ def _flash_attention_fwd(
     k: chex.Array,
     v: chex.Array,
     *,
-    scale: float,
+    softmax_scale: float,
     logits_soft_cap: float | None,
     bias: chex.Array | None,
     mask: chex.Array | None,
@@ -285,35 +241,6 @@ def _flash_attention_fwd(
 ) -> chex.Array:
     """
     Forward pass for chunked flash attention with online softmax and optional attention sinks.
-
-    Computes memory-efficient attention using chunked computation with O(N) memory complexity.
-    Supports sliding window attention, logit soft capping, GQA/MQA, and attention sinks.
-
-    Args:
-        q: Query array of shape [B, Tq, H, D]
-        k: Key array of shape [B, Tk, Hk, D] where Hk can be 1 (MQA) or H (MHA)
-        v: Value array of shape [B, Tk, Hk, d]
-        scale: Softmax scale factor (typically 1/sqrt(D))
-        logits_soft_cap: Optional soft cap value for logits to prevent overflow
-        bias: Optional bias array broadcastable to [B, H, Tq, Tk]
-        mask: Optional boolean mask array broadcastable to [B, H, Tq, Tk]
-        window: Optional (left_window, right_window) for sliding window/local attention
-        chunk_size_q: Query chunk size for memory efficiency
-        chunk_size_k: Key chunk size for memory efficiency
-        normalize_output: Whether to normalize output by softmax denominator
-        precision: Matrix multiplication precision
-        logits_dtype: Dtype for logits computation (promoted to at least float32)
-        softmax_aux: Optional attention sink logits of shape [H, num_sinks] or [num_sinks].
-                     These participate in softmax but don't contribute to output, allowing
-                     the model to absorb probability mass without affecting the result.
-
-    Returns:
-        Output array of shape [B, Tq, H, d]
-
-    Note:
-        Attention sinks are auxiliary logits that participate in the softmax normalization
-        but don't contribute to the output. They improve numerical stability and can help
-        models learn better attention distributions by providing "absorption" points.
     """
     B, Tq, Hq, D = q.shape
     _, Tk, Hk, Dk = k.shape
@@ -325,6 +252,9 @@ def _flash_attention_fwd(
         raise ValueError("k and v must share head count.")
     d_out = v.shape[-1]
 
+    S_Q = min(chunk_size_q, Tq)
+    S_K = min(chunk_size_k, Tk)
+
     outputs = []
     n_q_full = Tq // chunk_size_q
     q_rem = Tq % chunk_size_q
@@ -332,11 +262,12 @@ def _flash_attention_fwd(
     def q_step(carry, i):
         dropout_key_i = carry
         q_chunk_start = i * chunk_size_q
-        q_chunk = lax.dynamic_slice_in_dim(q, q_chunk_start, chunk_size_q, axis=1)
+        q_chunk_len = S_Q
+        q_chunk = lax.dynamic_slice_in_dim(q, q_chunk_start, q_chunk_len, axis=1)
 
-        acc = jnp.zeros((B, chunk_size_q, Hq, d_out), dtype=jnp.float32)
-        x_max = jnp.full((B, Hq, chunk_size_q), float("-inf"), dtype=jnp.float32)
-        denom = jnp.zeros((B, Hq, chunk_size_q), dtype=jnp.float32)
+        acc = jnp.zeros((B, q_chunk_len, Hq, d_out), dtype=jnp.float32)
+        x_max = jnp.full((B, Hq, q_chunk_len), -jnp.inf, dtype=jnp.float32)
+        denom = jnp.zeros((B, Hq, q_chunk_len), dtype=jnp.float32)
 
         chunk_dropout_key = dropout_key_i
         if dropout_prob > 0.0 and dropout_key_i is not None:
@@ -345,23 +276,17 @@ def _flash_attention_fwd(
         def kv_step(carry, j):
             acc_, x_max_, denom_, dk_ = carry
             kv_chunk_start = j * chunk_size_k
-            k_chunk = lax.dynamic_slice_in_dim(k, kv_chunk_start, chunk_size_k, axis=1)
-            v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, chunk_size_k, axis=1)
+            kv_chunk_len = S_K
+            k_chunk = lax.dynamic_slice_in_dim(k, kv_chunk_start, kv_chunk_len, axis=1)
+            v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, kv_chunk_len, axis=1)
             k_chunk, v_chunk = _maybe_broadcast_kv_to_q_heads(k_chunk, v_chunk, Hq)
 
-            bias_qk = None
-            if bias is not None:
-                bias_q = lax.dynamic_slice_in_dim(bias, q_chunk_start, chunk_size_q, axis=-2)
-                bias_qk = lax.dynamic_slice_in_dim(bias_q, kv_chunk_start, chunk_size_k, axis=-1)
+            bias_qk = _slice_broadcast_qk(bias, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
+            mask_qk = _slice_broadcast_qk(mask, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
 
-            mask_qk = None
-            if mask is not None:
-                mask_q = lax.dynamic_slice_in_dim(mask, q_chunk_start, chunk_size_q, axis=-2)
-                mask_qk = lax.dynamic_slice_in_dim(mask_q, kv_chunk_start, chunk_size_k, axis=-1)
-
-            win_mask = _window_mask_for_chunk(q_chunk_start, chunk_size_q, kv_chunk_start, chunk_size_k, window)
+            win_mask = _window_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len, window)
             causal_mask = (
-                _causal_mask_for_chunk(q_chunk_start, chunk_size_q, kv_chunk_start, chunk_size_k) if causal else None
+                _causal_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len) if causal else None
             )
 
             acc2, x2, d2, dk2 = _attend_chunk(
@@ -371,7 +296,7 @@ def _flash_attention_fwd(
                 acc_,
                 x_max_,
                 denom_,
-                scale=scale,
+                softmax_scale=softmax_scale,
                 bias_chunk=bias_qk,
                 mask_chunk=mask_qk,
                 window_mask=win_mask,
@@ -391,55 +316,33 @@ def _flash_attention_fwd(
         )
 
         k_rem = Tk % chunk_size_k
-        if k_rem > 0:
-            kv_chunk_start = n_k_full * chunk_size_k
 
-            k_chunk = lax.dynamic_slice_in_dim(k, kv_chunk_start, Tk - kv_chunk_start, axis=1)
-            v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, Tk - kv_chunk_start, axis=1)
-            k_chunk = jnp.pad(k_chunk, [(0, 0), (0, chunk_size_k - k_rem), (0, 0), (0, 0)])
-            v_chunk = jnp.pad(v_chunk, [(0, 0), (0, chunk_size_k - k_rem), (0, 0), (0, 0)])
+        def handle_k_rem():
+            if k_rem == 0:
+                return acc, x_max, denom, chunk_dropout_key
+
+            kv_chunk_start = n_k_full * chunk_size_k
+            kv_chunk_len = k_rem
+            k_chunk = lax.dynamic_slice_in_dim(k, kv_chunk_start, kv_chunk_len, axis=1)
+            v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, kv_chunk_len, axis=1)
             k_chunk, v_chunk = _maybe_broadcast_kv_to_q_heads(k_chunk, v_chunk, Hq)
 
-            pad_mask = jnp.arange(chunk_size_k) < k_rem
-            pad_mask = pad_mask[None, None, None, :]
+            bias_qk = _slice_broadcast_qk(bias, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
+            mask_qk = _slice_broadcast_qk(mask, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
 
-            bias_qk = None
-            if bias is not None:
-                bias_q = lax.dynamic_slice_in_dim(bias, q_chunk_start, chunk_size_q, axis=-2)
-                bias_qk = lax.dynamic_slice_in_dim(bias_q, kv_chunk_start, Tk - kv_chunk_start, axis=-1)
-                bias_qk = jnp.pad(bias_qk, [(0, 0), (0, 0), (0, 0), (0, chunk_size_k - k_rem)])
-
-            mask_qk = None
-            if mask is not None:
-                mask_q = lax.dynamic_slice_in_dim(mask, q_chunk_start, chunk_size_q, axis=-2)
-                mask_qk = lax.dynamic_slice_in_dim(mask_q, kv_chunk_start, Tk - kv_chunk_start, axis=-1)
-                mask_qk = jnp.pad(
-                    mask_qk,
-                    [(0, 0), (0, 0), (0, 0), (0, chunk_size_k - k_rem)],
-                    constant_values=False,
-                )
-                mask_qk = mask_qk & pad_mask
-            else:
-                mask_qk = pad_mask
-
-            win_mask = _window_mask_for_chunk(q_chunk_start, chunk_size_q, kv_chunk_start, chunk_size_k, window)
-            if win_mask is not None:
-                win_mask = win_mask & pad_mask
-
+            win_mask = _window_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len, window)
             causal_mask = (
-                _causal_mask_for_chunk(q_chunk_start, chunk_size_q, kv_chunk_start, chunk_size_k) if causal else None
+                _causal_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len) if causal else None
             )
-            if causal_mask is not None:
-                causal_mask = causal_mask & pad_mask
 
-            acc, x_max, denom, chunk_dropout_key = _attend_chunk(
+            return _attend_chunk(
                 q_chunk,
                 k_chunk,
                 v_chunk,
                 acc,
                 x_max,
                 denom,
-                scale=scale,
+                softmax_scale=softmax_scale,
                 bias_chunk=bias_qk,
                 mask_chunk=mask_qk,
                 window_mask=win_mask,
@@ -451,109 +354,121 @@ def _flash_attention_fwd(
                 dropout_key=chunk_dropout_key,
                 softmax_aux=softmax_aux,
             )
+
+        acc, x_max, denom, chunk_dropout_key = lax.cond(
+            k_rem > 0,
+            handle_k_rem,
+            lambda: (acc, x_max, denom, chunk_dropout_key),
+        )
 
         out_chunk = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
         return dropout_key_i, out_chunk.astype(q.dtype)
 
-    if n_q_full > 0:
-        dropout_key, full_out = lax.scan(q_step, dropout_key, jnp.arange(n_q_full))
-        full_out = jnp.swapaxes(full_out, 0, 1).reshape(B, n_q_full * chunk_size_q, Hq, d_out)
-        outputs.append(full_out)
+    dropout_key, full_out = lax.scan(q_step, dropout_key, jnp.arange(n_q_full))
+    full_out = jnp.swapaxes(full_out, 0, 1).reshape(B, n_q_full * chunk_size_q, Hq, d_out)
+    outputs.append(full_out)
 
     if q_rem > 0:
-        q_chunk_start = n_q_full * chunk_size_q
-        q_chunk = lax.dynamic_slice_in_dim(q, q_chunk_start, q_rem, axis=1)
 
-        acc = jnp.zeros((B, q_rem, Hq, d_out), dtype=jnp.float32)
-        x_max = jnp.full((B, Hq, q_rem), float("-inf"), dtype=jnp.float32)
-        denom = jnp.zeros((B, Hq, q_rem), dtype=jnp.float32)
+        def process_remainder():
+            q_chunk_start = n_q_full * chunk_size_q
+            q_chunk_len = q_rem
+            q_chunk = lax.dynamic_slice_in_dim(q, q_chunk_start, q_chunk_len, axis=1)
 
-        n_k_full = Tk // chunk_size_k
+            acc = jnp.zeros((B, q_chunk_len, Hq, d_out), dtype=jnp.float32)
+            x_max = jnp.full((B, Hq, q_chunk_len), -jnp.inf, dtype=jnp.float32)
+            denom = jnp.zeros((B, Hq, q_chunk_len), dtype=jnp.float32)
 
-        chunk_dropout_key = dropout_key
-        if dropout_prob > 0.0 and dropout_key is not None:
-            dropout_key, chunk_dropout_key = jax.random.split(dropout_key)
+            n_k_full = Tk // chunk_size_k
+            k_rem = Tk % chunk_size_k
 
-        for j in range(n_k_full):
-            kv_chunk_start = j * chunk_size_k
-            k_chunk = lax.dynamic_slice_in_dim(k, kv_chunk_start, chunk_size_k, axis=1)
-            v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, chunk_size_k, axis=1)
-            k_chunk, v_chunk = _maybe_broadcast_kv_to_q_heads(k_chunk, v_chunk, Hq)
+            if dropout_prob > 0.0 and dropout_key is not None:
+                _, chunk_dropout_key = jax.random.split(dropout_key)
+            else:
+                chunk_dropout_key = dropout_key
 
-            bias_qk = None
-            if bias is not None:
-                bias_q = lax.dynamic_slice_in_dim(bias, q_chunk_start, q_rem, axis=-2)
-                bias_qk = lax.dynamic_slice_in_dim(bias_q, kv_chunk_start, chunk_size_k, axis=-1)
+            def kv_step_rem(carry, j):
+                acc_, x_max_, denom_, dk_ = carry
+                kv_chunk_start = j * chunk_size_k
+                kv_chunk_len = S_K
+                k_chunk = lax.dynamic_slice_in_dim(k, kv_chunk_start, kv_chunk_len, axis=1)
+                v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, kv_chunk_len, axis=1)
+                k_chunk_bc, v_chunk_bc = _maybe_broadcast_kv_to_q_heads(k_chunk, v_chunk, Hq)
 
-            mask_qk = None
-            if mask is not None:
-                mask_q = lax.dynamic_slice_in_dim(mask, q_chunk_start, q_rem, axis=-2)
-                mask_qk = lax.dynamic_slice_in_dim(mask_q, kv_chunk_start, chunk_size_k, axis=-1)
+                bias_qk = _slice_broadcast_qk(bias, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
+                mask_qk = _slice_broadcast_qk(mask, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
 
-            win_mask = _window_mask_for_chunk(q_chunk_start, q_rem, kv_chunk_start, chunk_size_k, window)
-            causal_mask = _causal_mask_for_chunk(q_chunk_start, q_rem, kv_chunk_start, chunk_size_k) if causal else None
+                win_mask = _window_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len, window)
+                causal_mask = (
+                    _causal_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len) if causal else None
+                )
 
-            acc, x_max, denom, chunk_dropout_key = _attend_chunk(
-                q_chunk,
-                k_chunk,
-                v_chunk,
-                acc,
-                x_max,
-                denom,
-                scale=scale,
-                bias_chunk=bias_qk,
-                mask_chunk=mask_qk,
-                window_mask=win_mask,
-                causal_mask=causal_mask,
-                logits_soft_cap=logits_soft_cap,
-                logits_dtype=logits_dtype,
-                precision=precision,
-                dropout_prob=dropout_prob,
-                dropout_key=chunk_dropout_key,
-                softmax_aux=softmax_aux,
+                acc2, x2, d2, dk2 = _attend_chunk(
+                    q_chunk,
+                    k_chunk_bc,
+                    v_chunk_bc,
+                    acc_,
+                    x_max_,
+                    denom_,
+                    softmax_scale=softmax_scale,
+                    bias_chunk=bias_qk,
+                    mask_chunk=mask_qk,
+                    window_mask=win_mask,
+                    causal_mask=causal_mask,
+                    logits_soft_cap=logits_soft_cap,
+                    logits_dtype=logits_dtype,
+                    precision=precision,
+                    dropout_prob=dropout_prob,
+                    dropout_key=dk_,
+                    softmax_aux=softmax_aux,
+                )
+                return (acc2, x2, d2, dk2), None
+
+            (acc, x_max, denom, chunk_dropout_key), _ = lax.scan(
+                kv_step_rem, (acc, x_max, denom, chunk_dropout_key), jnp.arange(n_k_full)
             )
 
-        k_rem = Tk % chunk_size_k
-        if k_rem > 0:
-            kv_chunk_start = n_k_full * chunk_size_k
-            k_chunk = lax.dynamic_slice_in_dim(k, kv_chunk_start, k_rem, axis=1)
-            v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, k_rem, axis=1)
-            k_chunk, v_chunk = _maybe_broadcast_kv_to_q_heads(k_chunk, v_chunk, Hq)
+            if k_rem > 0:
+                kv_chunk_start = n_k_full * chunk_size_k
+                kv_chunk_len = k_rem
+                k_chunk = lax.dynamic_slice_in_dim(k, kv_chunk_start, kv_chunk_len, axis=1)
+                v_chunk = lax.dynamic_slice_in_dim(v, kv_chunk_start, kv_chunk_len, axis=1)
+                k_chunk_bc, v_chunk_bc = _maybe_broadcast_kv_to_q_heads(k_chunk, v_chunk, Hq)
 
-            bias_qk = None
-            if bias is not None:
-                bias_q = lax.dynamic_slice_in_dim(bias, q_chunk_start, q_rem, axis=-2)
-                bias_qk = lax.dynamic_slice_in_dim(bias_q, kv_chunk_start, k_rem, axis=-1)
+                bias_qk = _slice_broadcast_qk(bias, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
+                mask_qk = _slice_broadcast_qk(mask, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
 
-            mask_qk = None
-            if mask is not None:
-                mask_q = lax.dynamic_slice_in_dim(mask, q_chunk_start, q_rem, axis=-2)
-                mask_qk = lax.dynamic_slice_in_dim(mask_q, kv_chunk_start, k_rem, axis=-1)
+                win_mask = _window_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len, window)
+                causal_mask = (
+                    _causal_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len) if causal else None
+                )
 
-            win_mask = _window_mask_for_chunk(q_chunk_start, q_rem, kv_chunk_start, k_rem, window)
-            causal_mask = _causal_mask_for_chunk(q_chunk_start, q_rem, kv_chunk_start, k_rem) if causal else None
+                acc, x_max, denom, chunk_dropout_key = _attend_chunk(
+                    q_chunk,
+                    k_chunk_bc,
+                    v_chunk_bc,
+                    acc,
+                    x_max,
+                    denom,
+                    softmax_scale=softmax_scale,
+                    bias_chunk=bias_qk,
+                    mask_chunk=mask_qk,
+                    window_mask=win_mask,
+                    causal_mask=causal_mask,
+                    logits_soft_cap=logits_soft_cap,
+                    logits_dtype=logits_dtype,
+                    precision=precision,
+                    dropout_prob=dropout_prob,
+                    dropout_key=chunk_dropout_key,
+                    softmax_aux=softmax_aux,
+                )
 
-            acc, x_max, denom, chunk_dropout_key = _attend_chunk(
-                q_chunk,
-                k_chunk,
-                v_chunk,
-                acc,
-                x_max,
-                denom,
-                scale=scale,
-                bias_chunk=bias_qk,
-                mask_chunk=mask_qk,
-                window_mask=win_mask,
-                causal_mask=causal_mask,
-                logits_soft_cap=logits_soft_cap,
-                logits_dtype=logits_dtype,
-                precision=precision,
-                dropout_prob=dropout_prob,
-                dropout_key=chunk_dropout_key,
-                softmax_aux=softmax_aux,
-            )
+            rem_out = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
+            return rem_out.astype(q.dtype)
 
-        rem_out = acc / denom.swapaxes(-1, -2)[..., None] if normalize_output else acc
-        outputs.append(rem_out.astype(q.dtype))
+        rem_out = process_remainder()
+    else:
+        rem_out = jnp.zeros((B, 0, Hq, d_out), dtype=q.dtype)
 
-    return outputs[0] if len(outputs) == 1 else jnp.concatenate(outputs, axis=1)
+    outputs.append(rem_out)
+    return jnp.concatenate(outputs, axis=1)

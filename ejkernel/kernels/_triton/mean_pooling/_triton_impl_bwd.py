@@ -123,6 +123,7 @@ def bwd_triton_impl(
         kernel=bwd_kernel,
         grid=lambda META: (cdiv(DIM, META["BLOCK_DIM"]), NT, Z * HEAD),
         out_shape=[jax.ShapeDtypeStruct((Z, SEQUENCE, HEAD, DIM), dtype=do.dtype)],
+        name="ejkernel::triton::mean_pooling_bwd",
         **metaparams,
     )
 

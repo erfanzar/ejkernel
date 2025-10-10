@@ -52,10 +52,11 @@ def _ring_flash_attention_bwd_tpu(
     attention_sink_size,
     policy,
     softmax_scale,
+    causal,
     res,
     g,
 ):
-    del float32_logits, deterministic, dropout_rng, pdrop, policy
+    del float32_logits, deterministic, dropout_rng, pdrop, policy, causal
     o, q, k, v, attn_bias, segment_ids_res, softmax_aux_res, cache_idx_res, lse_, m = res
 
     segment_ids = segment_ids_res if segment_ids is None else segment_ids
@@ -70,7 +71,7 @@ def _ring_flash_attention_bwd_tpu(
     dq = jnp.zeros_like(q, dtype=jnp.float32)
     dk = jnp.zeros_like(k, dtype=jnp.float32)
     dv = jnp.zeros_like(v, dtype=jnp.float32)
-    q_block_size, kv_block_size = (
+    q_block_size, kv_blocksize = (
         q.shape[2],
         k.shape[2],
     )
@@ -141,7 +142,7 @@ def _ring_flash_attention_bwd_tpu(
             k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
         else:
             k_block_idx = 0
-        k_chunk_idx_start = k_block_idx * (kv_block_size // key_chunk_size)
+        k_chunk_idx_start = k_block_idx * (kv_blocksize // key_chunk_size)
         (
             dq_i,
             dk_i,

@@ -1,12 +1,26 @@
-#!/usr/bin/env python3
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """Test runner for ejkernels test suite.
 
 Usage:
-    python test/run_tests.py                    # Run all tests
-    python test/run_tests.py --xla              # Run only XLA tests
-    python test/run_tests.py --triton           # Run only Triton tests
-    python test/run_tests.py --comparison       # Run only comparison tests
-    python test/run_tests.py --verbose          # Verbose output
+    python test/run_tests.py
+    python test/run_tests.py --xla
+    python test/run_tests.py --triton
+    python test/run_tests.py --comparison
+    python test/run_tests.py --verbose
 """
 
 import argparse
@@ -28,10 +42,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Build pytest arguments
     pytest_args = []
 
-    # Determine which tests to run
     if args.xla:
         pytest_args.append("test/kernels/_xla")
     elif args.triton:
@@ -39,27 +51,21 @@ def main():
     elif args.comparison:
         pytest_args.append("test/kernels/comparison")
     else:
-        # Run all tests
         pytest_args.append("test/kernels")
 
-    # Add verbosity
     if args.verbose:
         pytest_args.append("-v")
     else:
-        pytest_args.append("-v")  # Always verbose for better output
+        pytest_args.append("-v")
 
-    # Add keyword filter
     if args.keyword:
         pytest_args.extend(["-k", args.keyword])
 
-    # Add fail fast
     if args.failfast:
         pytest_args.append("-x")
 
-    # Traceback style
     pytest_args.append(f"--tb={args.tb}")
 
-    # Add test summary
     pytest_args.append("-ra")
 
     print("=" * 70)
@@ -70,7 +76,6 @@ def main():
     print("=" * 70)
     print()
 
-    # Run pytest
     exit_code = pytest.main(pytest_args)
 
     print()

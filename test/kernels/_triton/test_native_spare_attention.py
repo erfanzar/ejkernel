@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Comprehensive tests for native_sparse_attention Triton implementation."""
 
 import jax
@@ -24,6 +25,29 @@ from ejkernel.kernels._triton.native_sparse_attention import (
 )
 from ejkernel.utils import generate_block_indices
 
+pytestmark = pytest.mark.skipif(
+    jax.devices()[0].platform != "gpu",
+    reason="Triton tests require GPU backend",
+)
+
+
+def _to_token_block_indices(block_indices, seq_len: int, block_size: int):
+    """
+    Convert block-level indices [B, num_query_blocks, H_kv, S]
+    to per-token indices [B, seq_len, H_kv, S], if needed.
+    If already per-token, returns as-is.
+    """
+    if block_indices.shape[1] == seq_len:
+        return block_indices
+    num_query_blocks = seq_len // block_size
+    assert (
+        block_indices.shape[1] == num_query_blocks
+    ), f"block_indices has unexpected shape {block_indices.shape}, expected second dim {num_query_blocks} or {seq_len}"
+
+    qb_map = jnp.arange(seq_len) // block_size
+
+    return jnp.take(block_indices, qb_map, axis=1)
+
 
 class TestNativeSparseAttentionForward:
     """Test forward pass of native sparse attention."""
@@ -31,36 +55,34 @@ class TestNativeSparseAttentionForward:
     @pytest.mark.parametrize(
         "batch_size,seq_len,num_q_heads,num_kv_heads,head_dim,block_size,num_blocks",
         [
-            (1, 128, 16, 1, 64, 64, 2),  # Minimal GQA (16/1 = 16)
-            (2, 256, 32, 2, 64, 64, 4),  # Standard GQA (32/2 = 16)
-            (1, 256, 64, 4, 64, 64, 4),  # Higher GQA (64/4 = 16)
-            (2, 512, 64, 2, 128, 64, 8),  # Larger head_dim
-            (1, 256, 128, 8, 64, 64, 4),  # More heads (128/8 = 16)
+            (1, 128, 16, 1, 64, 64, 2),
+            (2, 256, 32, 2, 64, 64, 4),
+            (1, 256, 64, 4, 64, 64, 4),
+            (2, 512, 64, 2, 128, 64, 8),
+            (1, 256, 128, 8, 64, 64, 4),
         ],
     )
     def test_forward_shapes(self, batch_size, seq_len, num_q_heads, num_kv_heads, head_dim, block_size, num_blocks):
         """Test that forward pass produces correct output shapes."""
-        # Create inputs
-        q = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, num_q_heads, head_dim), dtype=jnp.float16)
-        k = jax.random.normal(jax.random.PRNGKey(1), (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
-        v = jax.random.normal(jax.random.PRNGKey(2), (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
+        key_q = jax.random.PRNGKey(0)
+        key_k = jax.random.PRNGKey(1)
+        key_v = jax.random.PRNGKey(2)
+
+        q = jax.random.normal(key_q, (batch_size, seq_len, num_q_heads, head_dim), dtype=jnp.float16)
+        k = jax.random.normal(key_k, (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
+        v = jax.random.normal(key_v, (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
 
         num_query_blocks = seq_len // block_size
-        block_indices = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
-        scale = float(1.0 / jnp.sqrt(head_dim))
+        block_indices_blocks = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
+        block_indices = _to_token_block_indices(block_indices_blocks, seq_len, block_size)
 
-        # Forward pass
-        output = apply_native_sparse_attention(q, k, v, block_indices, num_blocks, block_size, scale)
+        softmax_scale = float(1.0 / jnp.sqrt(head_dim))
+        output = apply_native_sparse_attention(q, k, v, block_indices, num_blocks, block_size, softmax_scale)
 
-        # Check output shape
         assert output.shape == (batch_size, seq_len, num_q_heads, head_dim)
         assert output.dtype == jnp.float16
-
-        # First block (tokens 0 to block_size-1) may have NaNs for first few tokens with no history
-        # Check tokens after first block
-        output_after_first_block = output[:, block_size:, :, :]
-        assert not jnp.any(jnp.isnan(output_after_first_block)), "NaN found in output after first block"
-        assert not jnp.any(jnp.isinf(output_after_first_block)), "Inf found in output after first block"
+        assert not jnp.any(jnp.isnan(output)), "NaN found in output"
+        assert not jnp.any(jnp.isinf(output)), "Inf found in output"
 
     def test_forward_no_nans_or_infs(self):
         """Test that forward pass doesn't produce NaNs or Infs."""
@@ -73,15 +95,14 @@ class TestNativeSparseAttentionForward:
         v = jax.random.normal(jax.random.PRNGKey(2), (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
 
         num_query_blocks = seq_len // block_size
-        block_indices = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
-        scale = float(1.0 / jnp.sqrt(head_dim))
+        block_indices_blocks = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
+        block_indices = _to_token_block_indices(block_indices_blocks, seq_len, block_size)
 
-        output = apply_native_sparse_attention(q, k, v, block_indices, num_blocks, block_size, scale)
+        softmax_scale = float(1.0 / jnp.sqrt(head_dim))
+        output = apply_native_sparse_attention(q, k, v, block_indices, num_blocks, block_size, softmax_scale)
 
-        # Check tokens after first block (first block may have NaNs for tokens with no history)
-        output_after_first_block = output[:, block_size:, :, :]
-        assert not jnp.any(jnp.isnan(output_after_first_block)), "Output contains NaN values"
-        assert not jnp.any(jnp.isinf(output_after_first_block)), "Output contains Inf values"
+        assert not jnp.any(jnp.isnan(output)), "Output contains NaN values"
+        assert not jnp.any(jnp.isinf(output)), "Output contains Inf values"
 
     def test_forward_gqa_assertion(self):
         """Test that GQA group size assertion works correctly."""
@@ -92,7 +113,6 @@ class TestNativeSparseAttentionForward:
         k = jax.random.normal(jax.random.PRNGKey(1), (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
         v = jax.random.normal(jax.random.PRNGKey(2), (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
 
-        # Should raise assertion error because 15 % (1 * 16) != 0
         with pytest.raises(AssertionError, match="Group size must be a multiple of 16"):
             native_sparse_attention(q, k, v, block_size=block_size)
 
@@ -111,26 +131,24 @@ class TestNativeSparseAttentionBackward:
         v = jax.random.normal(jax.random.PRNGKey(2), (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
 
         num_query_blocks = seq_len // block_size
-        block_indices = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
-        scale = float(1.0 / jnp.sqrt(head_dim))
+        block_indices_blocks = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
+        block_indices = _to_token_block_indices(block_indices_blocks, seq_len, block_size)
+        softmax_scale = float(1.0 / jnp.sqrt(head_dim))
 
         def loss_fn(q, k, v):
-            output = apply_native_sparse_attention(q, k, v, block_indices, num_blocks, block_size, scale)
+            output = apply_native_sparse_attention(q, k, v, block_indices, num_blocks, block_size, softmax_scale)
             return jnp.sum(output**2)
 
         grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
 
-        # Check gradients exist and have correct shapes
         assert grads[0].shape == q.shape
         assert grads[1].shape == k.shape
         assert grads[2].shape == v.shape
 
-        # Check gradients are not all zeros
         assert jnp.abs(grads[0]).max() > 0
         assert jnp.abs(grads[1]).max() > 0
         assert jnp.abs(grads[2]).max() > 0
 
-        # Check gradients don't have NaN or Inf
         assert not jnp.any(jnp.isnan(grads[0]))
         assert not jnp.any(jnp.isnan(grads[1]))
         assert not jnp.any(jnp.isnan(grads[2]))
@@ -153,11 +171,12 @@ class TestNativeSparseAttentionBackward:
         v = jax.random.normal(jax.random.PRNGKey(2), (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
 
         num_query_blocks = seq_len // block_size
-        block_indices = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
-        scale = float(1.0 / jnp.sqrt(head_dim))
+        block_indices_blocks = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
+        block_indices = _to_token_block_indices(block_indices_blocks, seq_len, block_size)
+        softmax_scale = float(1.0 / jnp.sqrt(head_dim))
 
         def loss_fn(q, k, v):
-            output = apply_native_sparse_attention(q, k, v, block_indices, num_blocks, block_size, scale)
+            output = apply_native_sparse_attention(q, k, v, block_indices, num_blocks, block_size, softmax_scale)
             return jnp.sum(output**2)
 
         grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
@@ -182,9 +201,9 @@ class TestNativeSparseAttentionWithCompression:
         g_cmp = jax.random.uniform(jax.random.PRNGKey(3), (batch_size, seq_len, num_q_heads), dtype=jnp.float16)
 
         output = native_sparse_attention(
-            q=q,
-            k=k,
-            v=v,
+            query=q,
+            key=k,
+            value=v,
             g_cmp=g_cmp,
             block_counts=num_blocks,
             block_size=block_size,
@@ -207,9 +226,9 @@ class TestNativeSparseAttentionWithCompression:
         g_slc = jax.random.uniform(jax.random.PRNGKey(4), (batch_size, seq_len, num_q_heads), dtype=jnp.float16)
 
         output = native_sparse_attention(
-            q=q,
-            k=k,
-            v=v,
+            query=q,
+            key=k,
+            value=v,
             g_cmp=g_cmp,
             g_slc=g_slc,
             block_counts=num_blocks,
@@ -230,9 +249,9 @@ class TestNativeSparseAttentionWithCompression:
         v = jax.random.normal(jax.random.PRNGKey(2), (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
         g_slc = jax.random.uniform(jax.random.PRNGKey(3), (batch_size, seq_len, num_q_heads), dtype=jnp.float16)
 
-        # Use precomputed indices instead of g_cmp to avoid nsa_topk differentiation issue
         num_query_blocks = seq_len // block_size
-        block_indices = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
+        block_indices_blocks = generate_block_indices(batch_size, num_query_blocks, num_kv_heads, num_blocks, block_size)
+        block_indices = _to_token_block_indices(block_indices_blocks, seq_len, block_size)
 
         def loss_fn(q, k, v):
             output = native_sparse_attention(

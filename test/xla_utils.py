@@ -1,4 +1,4 @@
-# Copyright 2023 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 
 import os
 import sys
@@ -40,10 +41,10 @@ CU_SEQLENS = jnp.array([0, 3, 4, 8, 10], dtype=jnp.int32)
 TOTAL_TOKENS = int(CU_SEQLENS[-1])
 MASK = jnp.array(
     [
-        [1, 1, 1, 0],  # Length 3
-        [1, 0, 0, 0],  # Length 1
-        [1, 1, 1, 1],  # Length 4
-        [1, 1, 0, 0],  # Length 2
+        [1, 1, 1, 0],
+        [1, 0, 0, 0],
+        [1, 1, 1, 1],
+        [1, 1, 0, 0],
     ],
     dtype=jnp.bool_,
 )

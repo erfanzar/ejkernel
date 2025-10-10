@@ -13,289 +13,502 @@
 # limitations under the License.
 
 
+"""Block-sparse Attention implementation using Triton kernels.
+
+This module provides an efficient implementation of block-sparse attention,
+where the attention pattern is defined by a sparse mask at the block level
+rather than at the token level. This enables significant computational and
+memory savings while maintaining expressive attention patterns.
+
+Block-sparse attention operates on fixed-size blocks of queries and keys,
+where entire blocks either attend to each other or are masked out. This
+coarse-grained sparsity enables:
+1. Reduced computational complexity: O(N²/B²) for block size B
+2. Memory efficiency: Only compute attention for active blocks
+3. Flexible attention patterns: Causal, local, strided, custom patterns
+4. Better cache utilization: Block-level operations improve memory access
+
+Key concepts:
+- **Blocks**: Fixed-size chunks of the sequence (typically 64 or 128 tokens)
+- **Sparse Mask**: Binary mask indicating which query blocks attend to which key blocks
+- **QKV Layouts**: Pre-computed sparsity patterns defining block connectivity
+- **Load Balancing**: Ensures even distribution of work across GPU threads
+
+Common sparse patterns supported:
+- Causal masking (lower triangular)
+- Sliding window attention (local context)
+- Strided patterns (e.g., every k-th block)
+- Custom patterns via mask_builder
+
+The implementation uses the SparseMask dataclass to define attention patterns
+and automatically handles gradient computation through custom VJP definitions.
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.blocksparse_attention import blocksparse_attention
+    >>>
+    >>> batch, num_heads, seq_len, head_dim = 2, 12, 2048, 64
+    >>> q = jnp.ones((batch, num_heads, seq_len, head_dim))
+    >>> k = jnp.ones((batch, num_heads, seq_len, head_dim))
+    >>> v = jnp.ones((batch, num_heads, seq_len, head_dim))
+    >>>
+    >>>
+    >>> output = blocksparse_attention(
+    ...     q, k, v,
+    ...     q_blocksize=128,
+    ...     kv_blocksize=128,
+    ...     causal=True
+    ... )
+    >>>
+    >>>
+    >>> output = blocksparse_attention(
+    ...     q, k, v,
+    ...     sliding_window=(256, 256),
+    ...     q_blocksize=64,
+    ...     kv_blocksize=64
+    ... )
+
+Reference:
+    Sparse Attention patterns and efficient implementations
+    https://arxiv.org/abs/1904.10509
+"""
+
+from __future__ import annotations
+
 import functools
-import math
+import typing
 
 import jax
 import jaxtyping
 from beartype import beartype
-from jax import lax
-from jax import numpy as jnp
-from jaxtyping import Array, Bool, DTypeLike, Float, Int
+from jaxtyping import Array, ArrayLike, Bool, Float, Int
 
 from ejkernel.callib import ejit
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 
-from ..._registry import Backend, Platform, kernel_registry
-from ._triton_impl_bwd import _blocksparse_bwd_attention_kernel_call
-from ._triton_impl_fwd import _blocksparse_fwd_attention_kernel_call
+from ._mask import SparseMask, create_sparsity_mask
+from ._triton_impl_bwd import _bwd_blocksparse_attn_call
+from ._triton_impl_fwd import _fwd_blocksparse_attn_call
 
-
-def _transpose_layout_q2k_to_k2q(layout_q2k: jnp.ndarray, degree_q2k: jnp.ndarray, n_k_blocks: int, max_degree_k: int):
-    lists = [[] for _ in range(n_k_blocks)]
-    n_q_blocks, _max_degree_q = layout_q2k.shape
-    for qb in range(n_q_blocks):
-        deg = int(degree_q2k[qb])
-        for li in range(deg):
-            kb = int(layout_q2k[qb, li])
-            if 0 <= kb < n_k_blocks:
-                lists[kb].append(qb)
-
-    layout_k2q = -jnp.ones((n_k_blocks, max_degree_k), dtype=jnp.int32)
-    degree_k2q = jnp.zeros((n_k_blocks,), dtype=jnp.int32)
-    for kb in range(n_k_blocks):
-        deg = min(len(lists[kb]), max_degree_k)
-        degree_k2q = degree_k2q.at[kb].set(deg)
-        if deg > 0:
-            layout_k2q = layout_k2q.at[kb, :deg].set(jnp.array(lists[kb][:deg], dtype=jnp.int32))
-
-    layout_k2q = jnp.where(layout_k2q < 0, 0, layout_k2q)
-    return layout_k2q, degree_k2q
+if typing.TYPE_CHECKING:
+    from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
-def _jax_fwd_blocksparse_call(
-    query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch seq_len"] | None = None,
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-    softmax_scale: float | None = None,
-    dropout_prob: float = 0.0,
-    causal: bool = False,
-    dropout_seed: int | None = None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
-    sliding_window: int | tuple[int, int] | None = None,
-    logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    layout: Int[Array, "n_q_blocks max_degree"] | None = None,
-    degree: Int[Array, "n_q_blocks"] | None = None,
-    max_degree: int = 0,
-    force_block_m: int = 0,
-    force_block_n: int = 0,
-):
-    out, lse = _blocksparse_fwd_attention_kernel_call(
-        q=query,
-        k=key,
-        v=value,
-        attention_mask=attention_mask,
-        bias=bias,
-        softmax_scale=softmax_scale,
-        dropout_prob=dropout_prob,
-        causal=causal,
-        dropout_seed=dropout_seed,
-        cum_seqlens_q=cum_seqlens_q,
-        cum_seqlens_k=cum_seqlens_k,
-        sliding_window=sliding_window,
-        logits_soft_cap=logits_soft_cap,
-        softmax_aux=softmax_aux,
-        layout=layout,
-        degree=degree,
-        max_degree=max_degree,
-        force_block_m=force_block_m,
-        force_block_n=force_block_n,
-    )
-
-    return out, (
-        query,
-        key,
-        value,
-        bias,
-        attention_mask,
-        out,
-        lse,
-        dropout_seed,
-        cum_seqlens_q,
-        cum_seqlens_k,
-        layout,
-        degree,
-        max_degree,
-        sliding_window,
-        force_block_m,
-        force_block_n,
-        logits_soft_cap,
-        softmax_aux,
-    )
-
-
-def _jax_bwd_blocksparse_call(
-    softmax_scale: float | None,
-    dropout_prob: float,
-    causal: bool,
-    sliding_window: int | tuple[int, int] | None,
-    logits_soft_cap: float | None,
-    residual: tuple[Float[Array, "..."], ...],
-    dO: Float[Array, "batch seq_len num_heads head_dim"],
-):
-    (
-        query,
-        key,
-        value,
-        bias,
-        attention_mask,
-        out,
-        lse,
-        dropout_seed,
-        cum_seqlens_q,
-        cum_seqlens_k,
-        layout_q2k,
-        degree_q2k,
-        max_degree,
-        sliding_window_fwd,
-        force_block_m,
-        force_block_n,
-        logits_soft_cap_fwd,
-        softmax_aux,
-    ) = residual
-
-    window = sliding_window if sliding_window is not None else sliding_window_fwd
-    cap = logits_soft_cap if logits_soft_cap is not None else logits_soft_cap_fwd
-
-    if layout_q2k is not None:
-        if force_block_m == 0 or force_block_n == 0:
-            raise ValueError("blocksparse backward requires force_block_m/force_block_n when using layout")
-        QSeq = query.shape[1]
-        KSeq = key.shape[1]
-        _n_q_blocks = math.ceil(QSeq / force_block_m)
-        n_k_blocks = math.ceil(KSeq / force_block_n)
-        max_degree_k = max_degree
-        layout_k2q, degree_k2q = _transpose_layout_q2k_to_k2q(layout_q2k, degree_q2k, n_k_blocks, max_degree_k)
-    else:
-        layout_k2q = degree_k2q = None
-        max_degree_k = 0
-
-    dq, dk, dv = _blocksparse_bwd_attention_kernel_call(
-        dO=dO,
-        q=query,
-        k=key,
-        v=value,
-        bias=bias,
-        attention_mask=attention_mask,
-        o=out,
-        M=lse,
-        dropout_prob=dropout_prob,
-        causal=causal,
-        softmax_scale=softmax_scale,
-        dropout_seed=dropout_seed,
-        cum_seqlens_q=cum_seqlens_q,
-        cum_seqlens_k=cum_seqlens_k,
-        sliding_window=window,
-        logits_soft_cap=cap,
-        softmax_aux=softmax_aux,
-        layout_q2k=layout_q2k,
-        degree_q2k=degree_q2k,
-        layout_k2q=layout_k2q,
-        degree_k2q=degree_k2q,
-        max_degree_q=(max_degree or 0),
-        max_degree_k=(max_degree_k or 0),
-        force_block_m=force_block_m,
-        force_block_n=force_block_n,
-    )
-    return dq, dk, dv, None, None, None, None, None, None
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 11, 12, 13, 14, 15, 16, 17, 18))
-@ejit(static_argnums=(5, 6, 7, 11, 12, 13, 14, 15, 16, 17, 18))
-def blocksparse_attention_call(
-    query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch seq_len"] | None = None,
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-    softmax_scale: float | None = None,
-    dropout_prob: float = 0.0,
-    causal: bool = False,
-    dropout_seed: int | None = None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
-    sliding_window: int | tuple[int, int] | None = None,
-    logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    layout: Int[Array, "n_q_blocks max_degree"] | None = None,
-    degree: Int[Array, "n_q_blocks"] | None = None,
-    max_degree: int = 0,
-    force_block_m: int = 0,
-    force_block_n: int = 0,
-) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    return _blocksparse_fwd_attention_kernel_call(
-        q=query,
-        k=key,
-        v=value,
-        attention_mask=attention_mask,
-        bias=bias,
-        softmax_scale=softmax_scale,
-        dropout_prob=dropout_prob,
-        causal=causal,
-        dropout_seed=dropout_seed,
-        cum_seqlens_q=cum_seqlens_q,
-        cum_seqlens_k=cum_seqlens_k,
-        sliding_window=sliding_window,
-        logits_soft_cap=logits_soft_cap,
-        softmax_aux=softmax_aux,
-        layout=layout,
-        degree=degree,
-        max_degree=max_degree,
-        force_block_m=force_block_m,
-        force_block_n=force_block_n,
-    )
-
-
-blocksparse_attention_call.defvjp(_jax_fwd_blocksparse_call, _jax_bwd_blocksparse_call)
-
-
-@kernel_registry.register("blocksparse_attention_GPU", Platform.TRITON, Backend.GPU)
-@jaxtyping.jaxtyped(typechecker=beartype)
-def blocksparse_attention(
-    query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch seq_len"] | None = None,
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-    softmax_scale: float | None = None,
-    dropout_prob: float = 0.0,
-    causal: bool = False,
-    dropout_seed: int | None = None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
-    sliding_window: int | tuple[int, int] | None = None,
-    logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    layout: Int[Array, "n_q_blocks max_degree"] | None = None,
-    degree: Int[Array, "n_q_blocks"] | None = None,
-    max_degree: int = 0,
-    force_block_m: int = 0,
-    force_block_n: int = 0,
-    precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
-    logits_dtype: DTypeLike = jnp.float32,
-    *,
-    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+@functools.partial(jax.custom_vjp, nondiff_argnums=[8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21])
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "softmax_scale",
+        "bias",
+        "apply_load_balance",
+        "sequence_parallelism_mesh_axis_name",
+        "window_left",
+        "window_right",
+        "causal",
+        "q_blocksize",
+        "kv_blocksize",
+        "bwd_q_blocksize",
+        "bwd_kv_blocksize",
+        "logit_soft_cap",
+        "debug",
+    ],
+)
+def _blocksparse_attention_bhtd(
+    query: ArrayLike,
+    key: ArrayLike,
+    value: ArrayLike,
+    q_positions: ArrayLike,
+    q_segment_ids: ArrayLike,
+    kv_positions: ArrayLike,
+    kv_segment_ids: ArrayLike,
+    qkv_layouts: tuple[SparseMask] | None = None,
+    softmax_scale: float = 1.0,
+    softmax_aux: ArrayLike | None = None,
+    bias: ArrayLike | None = None,
+    apply_load_balance: bool = True,
+    sequence_parallelism_mesh_axis_name: str | None = None,
+    window_left: int = -1,
+    window_right: int = -1,
+    causal: bool = True,
+    q_blocksize: int = 64,
+    kv_blocksize: int = 64,
+    bwd_q_blocksize: int = 64,
+    bwd_kv_blocksize: int = 64,
+    logit_soft_cap: float | None = None,
     debug: bool = False,
-) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], Float[Array, "batch num_heads seq_len_q"]]:
-    del precision, logits_dtype, debug
-    if q_segment_ids is not None or kv_segment_ids is not None:
-        raise NotImplementedError("segment_ids are not supported in Triton implementation.")
+) -> ArrayLike:
+    """Internal JIT-compiled block-sparse attention with custom VJP.
 
-    out, residuals = blocksparse_attention_call(
+    This is the core computation function that applies block-sparse attention
+    with custom gradient definitions. It's wrapped by the public API to handle
+    parameter preprocessing and mask generation.
+
+    Args:
+        query: Query tensor.
+        key: Key tensor.
+        value: Value tensor.
+        q_positions: Position indices for queries.
+        q_segment_ids: Segment IDs for queries (for packed sequences).
+        kv_positions: Position indices for keys/values.
+        kv_segment_ids: Segment IDs for keys/values.
+        qkv_layouts: Pre-computed sparse mask layouts.
+        softmax_scale: Attention score scaling factor.
+        softmax_aux: Optional auxiliary softmax values (attention sinks).
+        bias: Optional attention bias tensor.
+        apply_load_balance: Whether to apply load balancing across threads.
+        sequence_parallelism_mesh_axis_name: Axis name for sequence parallelism.
+        window_left: Left window size for sliding window attention (-1 for no limit).
+        window_right: Right window size for sliding window attention (-1 for no limit).
+        causal: Whether to apply causal masking.
+        q_blocksize: Query block size for forward pass.
+        kv_blocksize: Key/value block size for forward pass.
+        bwd_q_blocksize: Query block size for backward pass.
+        bwd_kv_blocksize: Key/value block size for backward pass.
+        logit_soft_cap: Optional soft capping value for attention logits.
+        debug: Whether to enable debug mode with mask printing.
+
+    Returns:
+        Attention output tensor with same shape as query.
+    """
+    result = _fwd_blocksparse_attn_call(
         query=query,
         key=key,
         value=value,
-        attention_mask=attention_mask,
-        bias=bias,
+        q_positions=q_positions,
+        q_segment_ids=q_segment_ids,
+        kv_positions=kv_positions,
+        kv_segment_ids=kv_segment_ids,
+        qkv_layouts=qkv_layouts,
         softmax_scale=softmax_scale,
-        dropout_prob=dropout_prob,
-        causal=causal,
-        dropout_seed=dropout_seed,
-        cum_seqlens_q=cum_seqlens_q,
-        cum_seqlens_k=cum_seqlens_k,
-        sliding_window=sliding_window,
-        logits_soft_cap=logits_soft_cap,
         softmax_aux=softmax_aux,
-        layout=layout,
-        degree=degree,
-        max_degree=max_degree,
-        force_block_m=force_block_m,
-        force_block_n=force_block_n,
+        bias=bias,
+        apply_load_balance=apply_load_balance,
+        sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
+        window_left=window_left,
+        window_right=window_right,
+        causal=causal,
+        q_blocksize=q_blocksize,
+        kv_blocksize=kv_blocksize,
+        logit_soft_cap=logit_soft_cap,
+        debug=debug,
+    )[0]
+
+    return result
+
+
+def _blocksparse_attention_bhtd_fwd(
+    query: ArrayLike,
+    key: ArrayLike,
+    value: ArrayLike,
+    q_positions: ArrayLike,
+    q_segment_ids: ArrayLike,
+    kv_positions: ArrayLike,
+    kv_segment_ids: ArrayLike,
+    qkv_layouts: tuple[SparseMask] | None,
+    softmax_scale: float,
+    softmax_aux: ArrayLike | None,
+    bias: ArrayLike | None,
+    apply_load_balance: bool,
+    sequence_parallelism_mesh_axis_name: str | None,
+    window_left: int,
+    window_right: int,
+    causal: bool,
+    q_blocksize: int,
+    kv_blocksize: int,
+    bwd_q_blocksize: int,
+    bwd_kv_blocksize: int,
+    logit_soft_cap: float | None,
+    debug: bool,
+):
+    """Forward pass for block-sparse attention in custom VJP.
+
+    Computes block-sparse attention and returns both the output and residuals
+    needed for the backward pass. This function is registered as the forward
+    pass in the custom VJP definition.
+
+    Args:
+        query: Query tensor.
+        key: Key tensor.
+        value: Value tensor.
+        q_positions: Position indices for queries.
+        q_segment_ids: Segment IDs for queries.
+        kv_positions: Position indices for keys/values.
+        kv_segment_ids: Segment IDs for keys/values.
+        qkv_layouts: Pre-computed sparse mask layouts.
+        softmax_scale: Attention score scaling factor.
+        softmax_aux: Optional auxiliary softmax values.
+        bias: Optional attention bias.
+        apply_load_balance: Whether to apply load balancing.
+        sequence_parallelism_mesh_axis_name: Axis name for sequence parallelism.
+        window_left: Left window size.
+        window_right: Right window size.
+        causal: Whether to apply causal masking.
+        q_blocksize: Query block size.
+        kv_blocksize: Key/value block size.
+        bwd_q_blocksize: Backward query block size.
+        bwd_kv_blocksize: Backward key/value block size.
+        logit_soft_cap: Optional soft capping value.
+        debug: Debug mode flag.
+
+    Returns:
+        Tuple of (output, lse) and residuals for backward pass.
+    """
+    return _fwd_blocksparse_attn_call(
+        query=query,
+        key=key,
+        value=value,
+        q_positions=q_positions,
+        q_segment_ids=q_segment_ids,
+        kv_positions=kv_positions,
+        kv_segment_ids=kv_segment_ids,
+        qkv_layouts=qkv_layouts,
+        softmax_scale=softmax_scale,
+        softmax_aux=softmax_aux,
+        bias=bias,
+        apply_load_balance=apply_load_balance,
+        sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
+        window_left=window_left,
+        window_right=window_right,
+        causal=causal,
+        q_blocksize=q_blocksize,
+        kv_blocksize=kv_blocksize,
+        logit_soft_cap=logit_soft_cap,
+        debug=debug,
     )
 
-    lse = residuals[6]
-    return out, lse
+
+def _blocksparse_attention_bhtd_bwd(
+    softmax_scale: float,
+    bias: ArrayLike | None,
+    apply_load_balance: bool,
+    sequence_parallelism_mesh_axis_name: str | None,
+    window_left: int,
+    window_right: int,
+    causal: bool,
+    q_blocksize: int,
+    kv_blocksize: int,
+    bwd_q_blocksize: int,
+    bwd_kv_blocksize: int,
+    logit_soft_cap: float | None,
+    debug: bool,
+    res: ArrayLike,
+    dout: ArrayLike,
+):
+    """Backward pass for block-sparse attention in custom VJP.
+
+    Computes gradients with respect to queries, keys, and values using the
+    residuals saved from the forward pass. This function is registered as the
+    backward pass in the custom VJP definition.
+
+    Args:
+        softmax_scale: Attention score scaling factor (non-differentiable).
+        bias: Optional attention bias (non-differentiable).
+        apply_load_balance: Load balancing flag (non-differentiable).
+        sequence_parallelism_mesh_axis_name: Sequence parallelism axis (non-differentiable).
+        window_left: Left window size (non-differentiable).
+        window_right: Right window size (non-differentiable).
+        causal: Causal masking flag (non-differentiable).
+        q_blocksize: Query block size (non-differentiable).
+        kv_blocksize: Key/value block size (non-differentiable).
+        bwd_q_blocksize: Backward query block size (non-differentiable).
+        bwd_kv_blocksize: Backward key/value block size (non-differentiable).
+        logit_soft_cap: Soft capping value (non-differentiable).
+        debug: Debug mode flag (non-differentiable).
+        res: Residuals from forward pass containing intermediate values.
+        dout: Gradient of loss with respect to the output.
+
+    Returns:
+        Tuple of gradients (dq, dk, dv, d_q_positions, d_q_segment_ids,
+        d_kv_positions, d_kv_segment_ids, d_qkv_layouts, d_softmax_aux)
+        where only dq, dk, dv are non-None for differentiable parameters.
+    """
+    return _bwd_blocksparse_attn_call(
+        softmax_scale=softmax_scale,
+        bias=bias,
+        apply_load_balance=apply_load_balance,
+        sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
+        window_left=window_left,
+        window_right=window_right,
+        causal=causal,
+        q_blocksize=q_blocksize,
+        kv_blocksize=kv_blocksize,
+        bwd_q_blocksize=bwd_q_blocksize,
+        bwd_kv_blocksize=bwd_kv_blocksize,
+        logit_soft_cap=logit_soft_cap,
+        debug=False,
+        res=res,
+        dout=dout,
+    )
+
+
+_blocksparse_attention_bhtd.defvjp(_blocksparse_attention_bhtd_fwd, _blocksparse_attention_bhtd_bwd)
+
+
+@kernel_registry.register("blocksparse_attention", Platform.TRITON, Backend.GPU)
+@ejit(
+    static_argnames=(
+        "softmax_scale",
+        "mask_builder",
+        "sliding_window",
+        "chunk_size",
+        "causal",
+        "fused_backward",
+        "q_blocksize",
+        "kv_blocksize",
+        "bwd_q_blocksize",
+        "bwd_kv_blocksize",
+        "logit_soft_cap",
+    )
+)
+@jaxtyping.jaxtyped(typechecker=beartype)
+def blocksparse_attention(
+    query: Float[Array, "batch num_heads seq_len head_dim"],
+    key: Float[Array, "batch kv_num_heads kv_len head_dim"],
+    value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
+    q_segment_ids: Int[Array, "batch seq_len"] | None = None,
+    kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
+    q_positions: Int[Array, "batch seq_len"] | None = None,
+    kv_positions: Int[Array, "batch kv_len"] | None = None,
+    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads seq_len head_dim"]
+    | Bool[Array, "batch 1 seq_len head_dim"]
+    | Int[Array, "batch num_heads seq_len head_dim"]
+    | Int[Array, "batch 1 seq_len head_dim"]
+    | None = None,
+    sequence_parallelism_mesh_axis_name: str | None = None,
+    logit_soft_cap: float | None = None,
+    qkv_layouts: tuple["SparseMask"] | None = None,
+    q_blocksize: int | None = None,
+    kv_blocksize: int | None = None,
+    bwd_q_blocksize: int | None = None,
+    bwd_kv_blocksize: int | None = None,
+    softmax_scale: float | None = None,
+    mask_builder: typing.Callable[[int, int, int, int, int], "Mask"] | typing.Callable[[], "SparseMask"] | None = None,
+    sliding_window: int | tuple[int, int] | None = None,
+    chunk_size: int | None = None,
+    causal: bool = True,
+    fused_backward: bool = False,
+    debug: bool = False,
+) -> Float[Array, "batch num_heads seq_len head_dim"]:
+    """Triton block-sparse attention kernel implementation.
+
+    Computes attention over sparse block patterns using optimized Triton kernels for GPU execution.
+
+    Args:
+        query: Query tensor [batch, num_heads, seq_len, head_dim]
+        key: Key tensor [batch, kv_num_heads, kv_len, head_dim]
+        value: Value tensor [batch, kv_num_heads, kv_len, vhead_dim]
+        q_segment_ids: Optional segment IDs for queries [batch, seq_len].
+            If not provided and attention_mask is given, will be inferred from attention_mask.
+        kv_segment_ids: Optional segment IDs for keys/values [batch, kv_len].
+            If not provided and attention_mask is given, will be inferred from attention_mask.
+        q_positions: Optional position indices for queries [batch, seq_len]
+        kv_positions: Optional position indices for keys/values [batch, kv_len]
+        softmax_aux: Optional auxiliary softmax values (e.g., attention sinks)
+        bias: Optional attention bias [batch, num_heads, seq_len, head_dim]
+        attention_mask: Optional attention mask [batch, seq_len, kv_len] or [batch, num_heads, seq_len, kv_len].
+            Used to automatically infer q_segment_ids and kv_segment_ids if they are not provided.
+            Tokens with True/1 can attend to each other, False/0 indicates masking.
+            This provides a convenient way to use attention masks without manually creating segment IDs.
+        sequence_parallelism_mesh_axis_name: Optional axis name for sequence parallelism
+        logit_soft_cap: Optional soft capping value for attention logits. When specified,
+            applies tanh-based soft capping: logit_soft_cap * tanh(logits / logit_soft_cap).
+            This prevents attention scores from becoming too large, improving numerical
+            stability (Gemma-2 style). Gradients are computed with proper Jacobian.
+        qkv_layouts: Optional pre-computed attention mask layouts
+        q_blocksize: Forward pass query block size (default: 64)
+        kv_blocksize: Forward pass key/value block size (default: 64)
+        bwd_q_blocksize: Backward pass query block size (default: 64)
+        bwd_kv_blocksize: Backward pass key/value block size (default: 64)
+        softmax_scale: Attention score scaling factor (default: 1/sqrt(head_dim))
+        mask_builder: Function to build custom sparse mask patterns
+        sliding_window: Window size for local attention, int for symmetric or (left, right) tuple
+        chunk_size: Alternative to separate q_blocksize/kv_blocksize
+        causal: Whether to apply causal masking (default: True)
+        fused_backward: Use fused backward pass (default: False)
+        debug: Enable debug mode with mask printing (default: False)
+
+    Returns:
+        Attention output [batch, num_heads, seq_len, head_dim]
+
+    Examples:
+        >>> output = blocksparse_attention(q, k, v)
+    """
+    del fused_backward
+
+    qlen = query.shape[2]
+    kvlen = key.shape[2]
+
+    if mask_builder is not None and qkv_layouts is None:
+        qkv_layouts = mask_builder()
+
+    if q_blocksize is None:
+        q_blocksize = 64
+    if kv_blocksize is None:
+        kv_blocksize = q_blocksize
+    if bwd_q_blocksize is None:
+        bwd_q_blocksize = 64
+    if bwd_kv_blocksize is None:
+        bwd_kv_blocksize = bwd_q_blocksize
+
+    if sliding_window is None:
+        window_left = window_right = -1
+    else:
+        window_left, window_right = sliding_window
+    if softmax_scale is None:
+        softmax_scale = query.shape[-1] ** -0.5
+    if q_positions is None:
+        q_positions = jax.numpy.arange(0, qlen).reshape(1, -1).repeat(query.shape[0], 0)
+    if kv_positions is None:
+        kv_positions = jax.numpy.arange(0, kvlen).reshape(1, -1).repeat(key.shape[0], 0)
+
+    if attention_mask is not None and (q_segment_ids is None or kv_segment_ids is None):
+        from ejkernel.xla_utils import mask_to_segment_ids
+
+        inferred_q_seg, inferred_kv_seg = mask_to_segment_ids(attention_mask)
+        if q_segment_ids is None:
+            q_segment_ids = inferred_q_seg
+        if kv_segment_ids is None:
+            kv_segment_ids = inferred_kv_seg
+
+    if q_segment_ids is None:
+        q_segment_ids = jax.numpy.ones_like(q_positions)
+    if kv_segment_ids is None:
+        kv_segment_ids = jax.numpy.ones_like(kv_positions)
+    if qkv_layouts is None:
+        qkv_layouts = create_sparsity_mask(
+            q_blocksize=q_blocksize,
+            kv_blocksize=kv_blocksize,
+            kv_positions=kv_positions,
+            kv_segment_ids=kv_segment_ids,
+            q_positions=q_positions,
+            q_segment_ids=q_segment_ids,
+            causal=causal,
+            window_left=window_left,
+            window_right=window_right,
+        )
+    return _blocksparse_attention_bhtd(
+        query=query,
+        key=key,
+        value=value,
+        q_positions=q_positions,
+        q_segment_ids=q_segment_ids,
+        kv_positions=kv_positions,
+        kv_segment_ids=kv_segment_ids,
+        qkv_layouts=qkv_layouts,
+        softmax_scale=softmax_scale,
+        softmax_aux=softmax_aux,
+        bias=bias,
+        apply_load_balance=True,
+        sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
+        window_left=window_left,
+        window_right=window_right,
+        causal=causal,
+        q_blocksize=q_blocksize,
+        kv_blocksize=kv_blocksize,
+        bwd_q_blocksize=bwd_q_blocksize,
+        bwd_kv_blocksize=bwd_kv_blocksize,
+        logit_soft_cap=logit_soft_cap,
+        debug=debug,
+    )

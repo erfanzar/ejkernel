@@ -31,7 +31,7 @@ It incorporates the following enhancements:
 Note: While based on existing implementations, this version offers significant
 modifications to enhance its usability and performance in single-device and multi-host
 settings.
-- also adding softmax scale option to support custom scales
+- also adding softmax softmax_scale option to support custom scales
 """
 
 from functools import partial
@@ -52,7 +52,7 @@ from ._utils import SegmentIds
 
 @partial(
     jax.custom_vjp,
-    nondiff_argnums=(4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19),
+    nondiff_argnums=(4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20),
 )
 def _ring_attention(
     query: Array,
@@ -75,6 +75,7 @@ def _ring_attention(
     attention_sink_size: int,
     policy,
     softmax_scale,
+    causal: bool,
 ) -> chex.Array:
     """
     Computes ring attention using FlashAttention on TPU.
@@ -100,6 +101,7 @@ def _ring_attention(
         attention_sink_size,
         policy,
         softmax_scale,
+        causal,
     )
     return y
 
@@ -118,6 +120,7 @@ def ring_attention(
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     cache_idx=None,
+    attention_mask=None,
     axis_name: str | None = None,
     float32_logits: bool = True,
     softmax_scale: float | None = None,
@@ -134,6 +137,7 @@ def ring_attention(
     sliding_window: int | tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
     attention_sink_size: int = 0,
+    causal: bool = False,
 ) -> chex.Array:
     """
     Computes ring attention using FlashAttention on TPU.
@@ -152,7 +156,8 @@ def ring_attention(
         softmax_scale: Scale for softmax (default: dim_per_head ** -0.5).
         query_chunk_size: Size of query chunks.
         key_chunk_size: Size of key chunks.
-        causal_block_size: Size of causal blocks for block-wise causal masking.
+        causal_block_size: Size of causal blocks for block-wise causal masking. If None and causal=True,
+            defaults to query_chunk_size for efficient block-level causal attention.
         deterministic: Whether to apply dropout (False = apply dropout).
         dropout_rng: PRNG key for dropout.
         pdrop: Dropout probability.
@@ -160,12 +165,25 @@ def ring_attention(
             window or tuple (left_window, right_window) for asymmetric window.
         logit_soft_cap: Soft cap value for logits to prevent overflow (tanh capping).
         attention_sink_size: Number of initial tokens to always attend to (StreamingLLM).
+        causal: If True, applies causal masking where each position can only attend to previous positions.
+            Uses causal_block_size for efficient blockwise causal computation.
         policy: Checkpoint policy for gradient checkpointing.
         prevent_cse: Whether to prevent common subexpression elimination.
 
     Returns:
         Output array of shape (batch, q_len, num_heads, dim_per_head).
     """
+    del dtype, precision, prevent_cse
+
+    if attention_mask is not None:
+        if attention_mask.dtype != jnp.bool_:
+            attention_mask = attention_mask.astype(jnp.bool_)
+        mask_bias = jnp.where(attention_mask, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.float32)
+
+        if bias is None:
+            bias = mask_bias
+        else:
+            bias = bias + mask_bias
 
     if q_segment_ids is None and kv_segment_ids is None:
         segment_ids = None
@@ -175,8 +193,13 @@ def ring_attention(
         segment_ids = SegmentIds(query=kv_segment_ids, kv=kv_segment_ids)
     else:
         segment_ids = SegmentIds(query=q_segment_ids, kv=kv_segment_ids)
+
+    if causal and causal_block_size is None:
+        causal_block_size = query_chunk_size
+
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
+
     return _ring_attention(
         query,
         key,
@@ -198,4 +221,5 @@ def ring_attention(
         attention_sink_size,
         policy,
         softmax_scale,
+        causal,
     )

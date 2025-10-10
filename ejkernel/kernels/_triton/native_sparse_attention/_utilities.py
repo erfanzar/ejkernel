@@ -80,7 +80,7 @@ def nsa_block_mask(
         kernel=nsa_kernel_mask,
         grid=lambda META: (SEQUENCE, B, HEAD * SIZE),
         out_shape=outputs,
-        name="ejgpu:native_sparse_attention:nsa_kernel_mask",
+        name="ejkernel::triton::sparse_attn_mask",
         **metaparams,
     )
 

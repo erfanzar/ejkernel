@@ -31,7 +31,7 @@ custom document-structure-aware sparsity.
 
 from __future__ import annotations
 
-from typing import Literal
+import typing
 
 from jaxtyping import Array, Float, Int
 
@@ -82,16 +82,17 @@ class NativeSparseAttention(Kernel[KernelConfig, Array]):
 
     def run(
         self,
-        query: Float[Array, "batch seq_len num_heads head_dim"],
+        query: Float[Array, "batch seq_len num_q_heads head_dim"],
         key: Float[Array, "batch seq_len num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-        block_indices: Int[Array, "batch num_kv_heads num_query_blocks num_keys_blocks"] | None = None,
-        block_counts: Int[Array, "batch num_kv_heads num_query_blocks"] | int = 16,
+        g_cmp: Float[Array, "batch seq_len num_q_heads"] | None = None,
+        g_slc: Float[Array, "batch seq_len num_q_heads"] | None = None,
+        block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"] | None = None,
+        block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
         block_size: int = 64,
-        scale: float | None = None,
+        softmax_scale: float | None = None,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-        token_indices: Int[Array, "total_tokens"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
@@ -105,7 +106,7 @@ class NativeSparseAttention(Kernel[KernelConfig, Array]):
                 [batch, num_kv_heads, num_query_blocks, num_keys_blocks]
             block_counts: Number of key blocks per query block (can be int or array)
             block_size: Size of each attention block (default: 64)
-            scale: Optional scaling factor for attention scores
+            softmax_scale: Optional scaling factor for attention scores
             cu_seqlens: Cumulative sequence lengths for variable-length sequences
             token_indices: Optional token-level indices for fine-grained sparsity
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
@@ -138,9 +139,10 @@ class NativeSparseAttention(Kernel[KernelConfig, Array]):
             block_indices=block_indices,
             block_counts=block_counts,
             block_size=block_size,
-            scale=scale,
+            softmax_scale=softmax_scale,
             cu_seqlens=cu_seqlens,
-            token_indices=token_indices,
+            g_cmp=g_cmp,
+            g_slc=g_slc,
         )
 
     def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
@@ -157,11 +159,7 @@ class NativeSparseAttention(Kernel[KernelConfig, Array]):
 
     def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
         """Generate candidate configurations for autotuning."""
-        block_configs = [
-            (64, 64, 64, 4, 1),
-            (128, 64, 64, 4, 2),
-            (128, 128, 64, 8, 2),
-        ]
+        block_configs = [(64, 64, 64, 4, 1)]
 
         candidates = []
         for block_q, block_k, block_d, num_warps, num_stages in block_configs:
@@ -184,15 +182,17 @@ _sparse_executor = create_default_executor()
 
 
 def native_sparse_attention(
-    query: Float[Array, "batch seq_len num_heads head_dim"],
+    query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    block_indices: Int[Array, "batch num_kv_heads num_query_blocks num_keys_blocks"] | None = None,
-    block_counts: Int[Array, "batch num_kv_heads num_query_blocks"] | int = 16,
+    g_cmp: Float[Array, "batch seq_len num_q_heads"] | None = None,
+    g_slc: Float[Array, "batch seq_len num_q_heads"] | None = None,
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"] | None = None,
+    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
     block_size: int = 64,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-    token_indices: Int[Array, "total_tokens"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
 ) -> Float[Array, "batch seq_len num_heads head_dim"]:
     """Execute native sparse attention with automatic optimization.
 
@@ -206,9 +206,10 @@ def native_sparse_attention(
         block_indices: Indices of blocks to attend to
         block_counts: Number of blocks per query block (default: 16)
         block_size: Size of each attention block (default: 64)
-        scale: Scaling factor for attention
+        softmax_scale: Scaling factor for attention
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
         token_indices: Token indices for sparse patterns
+        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
 
     Returns:
         Attention output with same shape as query
@@ -221,7 +222,7 @@ def native_sparse_attention(
         >>> out = native_sparse_attention(query, key, value, block_size=128, block_counts=32)
         >>>
         >>>
-        >>> out = native_sparse_attention(query, key, value, block_indices=indices, block_size=64)
+        >>> out = native_sparse_attention(query, key, value, platform="triton")
     """
     return _sparse_executor(
         NativeSparseAttention(),
@@ -231,7 +232,9 @@ def native_sparse_attention(
         block_indices=block_indices,
         block_counts=block_counts,
         block_size=block_size,
-        scale=scale,
+        softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
-        token_indices=token_indices,
+        g_cmp=g_cmp,
+        g_slc=g_slc,
+        platform=platform,
     )

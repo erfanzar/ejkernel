@@ -325,29 +325,30 @@ def generate_block_indices(
 ) -> jax.Array:
     """Generate random block indices for sparse attention benchmarks.
 
-    This function generates a tensor of block indices where each query block attends to
+    This function generates a tensor of block indices where each token attends to
     a random selection of previous key blocks. The indices are sorted in ascending order.
+    Returns per-token format: each token in a query block gets the same block indices.
 
     Args:
         batch: Batch size.
         num_query_blocks: Number of query blocks.
         heads: Number of attention heads (typically kv_heads for GQA).
         selected_blocks: Number of key blocks each query block should attend to.
-        block_size: Size of each block (not used in calculation, kept for API compatibility).
+        block_size: Size of each block.
         seed: Random seed for reproducibility.
 
     Returns:
-        Array of shape (batch, num_query_blocks, heads, selected_blocks) containing sorted
-        block indices. Positions beyond available blocks are filled with -1.
+        Array of shape (batch, seq_len, heads, selected_blocks) containing sorted
+        block indices in per-token format. Positions beyond available blocks are filled with -1.
 
     Example:
         >>>
         >>> indices = generate_block_indices(batch=2, num_query_blocks=4, heads=8, selected_blocks=2, block_size=64)
         >>> indices.shape
-        (2, 4, 8, 2)
+        (2, 256, 8, 2)
     """
-
-    block_indices = jnp.full((batch, num_query_blocks, heads, selected_blocks), -1, dtype=jnp.int32)
+    seq_len = num_query_blocks * block_size
+    block_indices = jnp.full((batch, seq_len, heads, selected_blocks), -1, dtype=jnp.int32)
 
     key = jax.random.PRNGKey(seed)
 
@@ -363,9 +364,12 @@ def generate_block_indices(
                 if num_available_blocks < selected_blocks:
                     perm = jnp.pad(perm, (0, selected_blocks - num_available_blocks), constant_values=-1)
 
-                block_indices = block_indices.at[b, qb, h, :].set(perm)
+                perm_sorted = jnp.sort(perm)
 
-    block_indices = jnp.sort(block_indices, axis=-1)
+                token_start = qb * block_size
+                token_end = (qb + 1) * block_size
+                for t in range(token_start, token_end):
+                    block_indices = block_indices.at[b, t, h, :].set(perm_sorted)
 
     return block_indices
 

@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
+from jax.scipy.special import logsumexp
 from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -29,42 +30,40 @@ from ._xla_impl_fwd import _sparse_attention_fwd
 
 @partial(jax.custom_vjp, nondiff_argnums=(5, 6))
 def _sparse_attention_with_vjp(
-    query: Float[Array, "batch seq_len num_heads head_dim"],
-    key: Float[Array, "batch seq_len num_heads head_dim"],
-    value: Float[Array, "batch seq_len num_heads head_dim"],
-    block_indices: Int[Array, "batch num_heads num_query_blocks num_key_blocks"],
-    block_counts: Int[Array, "batch num_heads num_query_blocks"],
+    query: Float[Array, "batch seq_len num_q_heads head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"],
+    block_counts: Int[Array, "batch seq_len num_kv_heads"],
     block_size: int,
-    scale: float,
-) -> Float[Array, "batch seq_len num_heads head_dim"]:
-    """Sparse attention with custom VJP."""
-    return _sparse_attention_fwd(query, key, value, block_indices, block_counts, block_size, scale)
+    softmax_scale: float,
+) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
+    return _sparse_attention_fwd(query, key, value, block_indices, block_counts, block_size, softmax_scale)
 
 
 def _sparse_attention_fwd_vjp(
-    query: Float[Array, "batch seq_len num_heads head_dim"],
-    key: Float[Array, "batch seq_len num_heads head_dim"],
-    value: Float[Array, "batch seq_len num_heads head_dim"],
-    block_indices: Int[Array, "batch num_heads num_query_blocks num_key_blocks"],
-    block_counts: Int[Array, "batch num_heads num_query_blocks"],
+    query: Float[Array, "batch seq_len num_q_heads head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"],
+    block_counts: Int[Array, "batch seq_len num_kv_heads"],
     block_size: int,
-    scale: float,
-) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], tuple]:
-    """Forward pass storing residuals."""
-    output = _sparse_attention_fwd(query, key, value, block_indices, block_counts, block_size, scale)
-    residuals = (query, key, value, block_indices, block_counts)
+    softmax_scale: float,
+):
+    output = _sparse_attention_fwd(query, key, value, block_indices, block_counts, block_size, softmax_scale)
+    residuals = (query, key, value, block_indices, block_counts, block_size, softmax_scale)
     return output, residuals
 
 
 def _sparse_attention_bwd_vjp(
     block_size: int,
-    scale: float,
+    softmax_scale: float,
     residuals: tuple,
-    do: Float[Array, "batch seq_len num_heads head_dim"],
-) -> tuple:
-    """Backward pass with custom gradient computation."""
-    query, key, value, block_indices, block_counts = residuals
-    dq, dk, dv = _sparse_attention_bwd(query, key, value, block_indices, block_counts, block_size, scale, do)
+    do: Float[Array, "batch seq_len num_q_heads head_dim"],
+):
+    query, key, value, block_indices, block_counts, block_size_, softmax_scale_ = residuals
+    dq, dk, dv = _sparse_attention_bwd(query, key, value, block_indices, block_counts, block_size_, softmax_scale_, do)
+
     return (dq, dk, dv, None, None)
 
 
@@ -76,7 +75,7 @@ def _nsa_compression_xla(
     k_cmp: Float[Array, "batch num_blocks num_kv_heads head_dim"],
     v_cmp: Float[Array, "batch num_blocks num_kv_heads head_dim"],
     block_size: int,
-    scale: float,
+    softmax_scale: float,
 ) -> tuple[Float[Array, "batch seq_len num_q_heads head_dim"], Float[Array, "batch seq_len num_q_heads"]]:
     """
     Compute compressed attention over mean-pooled key/value blocks with GQA support.
@@ -86,7 +85,7 @@ def _nsa_compression_xla(
         k_cmp: Compressed (mean-pooled) keys [batch, num_blocks, num_kv_heads, head_dim]
         v_cmp: Compressed (mean-pooled) values [batch, num_blocks, num_kv_heads, head_dim]
         block_size: Size of each block
-        scale: Attention scaling factor
+        softmax_scale: Attention scaling factor
 
     Returns:
         Tuple of (output, log_sum_exp) where:
@@ -101,17 +100,30 @@ def _nsa_compression_xla(
     k_cmp_expanded = jnp.repeat(k_cmp, group_size, axis=2)
     v_cmp_expanded = jnp.repeat(v_cmp, group_size, axis=2)
 
-    scores = jnp.einsum("bsnd,bmnd->bsnm", query, k_cmp_expanded) * scale
+    scores = jnp.einsum("bsnd,bmnd->bsnm", query, k_cmp_expanded) * softmax_scale
 
-    token_block_idx = jnp.arange(seq_len) // block_size
-    block_mask = jnp.arange(num_blocks)[None, :] <= token_block_idx[:, None]
+    t_ids = jnp.arange(seq_len, dtype=jnp.int32)
+    s_completed = (t_ids + 1) // block_size
+    c_ids = jnp.arange(num_blocks, dtype=jnp.int32)
+
+    block_mask = c_ids[None, :] < s_completed[:, None]
     block_mask = block_mask[None, :, None, :]
-    scores = jnp.where(block_mask, scores, -1e9)
 
-    lse = jax.nn.logsumexp(scores, axis=-1)
+    scores_masked = jnp.where(block_mask, scores, -jnp.inf)
 
-    attn_weights = jax.nn.softmax(scores, axis=-1)
-    output = jnp.einsum("bsnm,bmnd->bsnd", attn_weights, v_cmp_expanded)
+    lse_raw = logsumexp(scores_masked, axis=-1)
+    lse = jnp.where(s_completed[None, :, None] > 0, lse_raw, 0.0)
+
+    p = jnp.exp(scores - lse[..., None])
+    p = jnp.where(block_mask, p, 0.0)
+
+    p_sum = p.sum(axis=-1)
+    o_num = jnp.einsum("bsnm,bmnd->bsnd", p, v_cmp_expanded)
+    output = jnp.where(
+        (p_sum > 0)[..., None],
+        o_num / jnp.maximum(p_sum, 1e-9)[..., None],
+        jnp.zeros_like(o_num),
+    )
 
     return output, lse
 
@@ -122,58 +134,44 @@ def _nsa_topk_xla(
     lse: Float[Array, "batch seq_len num_q_heads"],
     block_counts: int,
     block_size: int,
-    scale: float,
-) -> Int[Array, "batch num_kv_heads num_query_blocks num_selected_blocks"]:
+    softmax_scale: float,
+) -> Int[Array, "batch seq_len num_kv_heads num_selected_blocks"]:
     """
-    Select top-k key blocks for each query block based on compressed attention scores with GQA support.
-
-    Args:
-        query: Query tensor [batch, seq_len, num_q_heads, head_dim]
-        k_cmp: Compressed keys [batch, num_blocks, num_kv_heads, head_dim]
-        lse: Log-sum-exp from compressed attention [batch, seq_len, num_q_heads]
-        block_counts: Number of blocks to select (k)
-        block_size: Size of each block
-        scale: Attention scaling factor
-
-    Returns:
-        Block indices [batch, num_kv_heads, num_query_blocks, block_counts]
+    Per-token top-k selection matching Triton:
+    p = exp(score - lse), force-include current block (p=1.0), sum over groups G, top-k across blocks.
     """
-    batch, seq_len, num_q_heads, head_dim = query.shape
-    num_kv_heads = k_cmp.shape[2]
-    group_size = num_q_heads // num_kv_heads
-    num_key_blocks = k_cmp.shape[1]
-    num_query_blocks = (seq_len + block_size - 1) // block_size
+    B, T, HQ, _D = query.shape
+    C = k_cmp.shape[1]
+    H = k_cmp.shape[2]
+    G = HQ // H
 
-    pad_len = num_query_blocks * block_size - seq_len
-    if pad_len > 0:
-        query_padded = jnp.pad(query, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
-        lse = jnp.pad(lse, ((0, 0), (0, pad_len), (0, 0)), constant_values=-jnp.inf)
-    else:
-        query_padded = query
+    k_cmp_exp = jnp.repeat(k_cmp, G, axis=2)
+    k_cmp_exp = jnp.swapaxes(k_cmp_exp, 1, 2)
 
-    q_blocks = query_padded.reshape(batch, num_query_blocks, block_size, num_q_heads, head_dim)
-    q_blocks_avg = jnp.mean(q_blocks, axis=2)
+    scores = jnp.einsum("bthd,bhcd->bthc", query, k_cmp_exp) * softmax_scale
 
-    q_blocks_grouped = q_blocks_avg.reshape(batch, num_query_blocks, num_kv_heads, group_size, head_dim)
+    qb = jnp.arange(T, dtype=jnp.int32) // block_size
+    c_ids = jnp.arange(C, dtype=jnp.int32)
+    mask = c_ids[None, None, None, :] <= qb[None, :, None, None]
+    scores = jnp.where(mask, scores, -jnp.inf)
 
-    q_blocks_kv = jnp.mean(q_blocks_grouped, axis=3)
+    p = jnp.exp(scores - lse[..., None])
 
-    scores = jnp.einsum("bqnd,bmnd->bqnm", q_blocks_kv, k_cmp) * scale
+    one_hot_qb = jax.nn.one_hot(qb, C, dtype=p.dtype)
+    p = jnp.where(one_hot_qb[None, :, None, :] > 0, 1.0, p)
 
-    query_block_mask = (
-        jnp.arange(num_key_blocks)[None, None, None, :] <= jnp.arange(num_query_blocks)[None, :, None, None]
-    )
-    scores = jnp.where(query_block_mask, scores, -jnp.inf)
+    p_sum = p.reshape(B, T, H, G, C).sum(axis=3)
+    future_mask = jnp.arange(C, dtype=jnp.int32)[None, None, None, :] > qb[None, :, None, None]
+    p_sum = jnp.where(future_mask, -jnp.inf, p_sum)
 
-    scores = scores.transpose(0, 2, 1, 3)
-
-    _, top_indices = jax.lax.top_k(scores, min(block_counts, num_key_blocks))
-
-    if block_counts > num_key_blocks:
-        pad_size = block_counts - num_key_blocks
-        top_indices = jnp.pad(top_indices, ((0, 0), (0, 0), (0, 0), (0, pad_size)), constant_values=0)
-
-    return top_indices.astype(jnp.int32)
+    tie = (C - 1.0 - jnp.arange(C, dtype=p_sum.dtype)[None, None, None, :]) * jnp.array(1e-8, dtype=p_sum.dtype)
+    p_sum_adj = p_sum + tie
+    S = block_counts if isinstance(block_counts, int) else int(block_counts)
+    p_flat = p_sum_adj.reshape(B * T * H, C)
+    _, idx_flat = jax.lax.top_k(p_flat, S)
+    idx = idx_flat.reshape(B, T, H, S).astype(jnp.int32)
+    idx = jnp.minimum(idx, qb[None, :, None, None])
+    return idx
 
 
 @kernel_registry.register("apply_native_sparse_attention", Platform.XLA, Backend.ANY)
@@ -182,10 +180,10 @@ def apply_native_sparse_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    block_indices: Int[Array, "batch num_kv_heads num_query_blocks num_key_blocks"],
-    block_counts: Int[Array, "batch num_kv_heads num_query_blocks"] | int = 16,
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"],
+    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
     block_size: int = 64,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     token_indices: Int[Array, "total_tokens"] | None = None,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
@@ -207,7 +205,7 @@ def apply_native_sparse_attention(
             - int: uniform sparsity for all query blocks
             - tensor [batch, num_heads, num_query_blocks]: per-block sparsity
         block_size: Size of each block (both query and key blocks).
-        scale: Attention scaling factor. If None, defaults to 1/sqrt(head_dim).
+        softmax_scale: Attention scaling factor. If None, defaults to 1/sqrt(head_dim).
 
     Returns:
         Attention output of shape `(batch, seq_len, num_heads, head_dim)`.
@@ -261,16 +259,18 @@ def apply_native_sparse_attention(
     if token_indices is not None:
         raise NotImplementedError("token_indices is not supported in XLA apply_native_sparse_attention implementation")
 
-    if scale is None:
-        scale = 1.0 / jnp.sqrt(query.shape[-1])
+    if softmax_scale is None:
+        softmax_scale = float(1.0 / jnp.sqrt(query.shape[-1]))
+    else:
+        softmax_scale = float(softmax_scale)
 
     if isinstance(block_counts, int):
         batch = query.shape[0]
+        seq_len = query.shape[1]
         num_kv_heads = key.shape[2]
-        num_query_blocks = block_indices.shape[2]
-        block_counts = jnp.full((batch, num_kv_heads, num_query_blocks), block_counts, dtype=jnp.int32)
+        block_counts = jnp.full((batch, seq_len, num_kv_heads), block_counts, dtype=jnp.int32)
 
-    return _sparse_attention_with_vjp(query, key, value, block_indices, block_counts, block_size, scale)
+    return _sparse_attention_with_vjp(query, key, value, block_indices, block_counts, block_size, softmax_scale)
 
 
 @kernel_registry.register("native_sparse_attention", Platform.XLA, Backend.ANY)
@@ -279,12 +279,12 @@ def native_sparse_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    g_cmp: Float[Array, "batch seq_len hidden_dim"] | None = None,
-    g_slc: Float[Array, "batch seq_len hidden_dim"] | None = None,
-    block_indices: Int[Array, "batch num_kv_heads num_query_blocks num_keys_blocks"] | None = None,
-    block_counts: Int[Array, "batch num_kv_heads num_query_blocks"] | int = 16,
+    g_cmp: Float[Array, "batch seq_len num_q_heads"] | None = None,
+    g_slc: Float[Array, "batch seq_len num_q_heads"] | None = None,
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"] | None = None,
+    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
     block_size: int = 64,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """
@@ -317,7 +317,7 @@ def native_sparse_attention(
             - tensor [batch, num_heads, num_query_blocks]: per-block sparsity
             Defaults to 16.
         block_size: The size of each attention block. Defaults to 64.
-        scale: Scale factor for attention scores. Defaults to `1 / sqrt(head_dim)`.
+        softmax_scale: Scale factor for attention scores. Defaults to `1 / sqrt(head_dim)`.
         cu_seqlens: Cumulative sequence lengths of shape `(N+1)` for
             variable-length training. If provided, batch size must be 1.
             Note: Variable-length sequences are not yet fully supported in XLA version.
@@ -360,8 +360,10 @@ def native_sparse_attention(
         >>> output.shape
         (2, 1024, 8, 64)
     """
-    if scale is None:
-        scale = 1.0 / jnp.sqrt(query.shape[-1])
+    if softmax_scale is None:
+        softmax_scale = float(1.0 / jnp.sqrt(query.shape[-1]))
+    else:
+        softmax_scale = float(softmax_scale)
 
     if cu_seqlens is not None:
         batch_size = query.shape[0]
@@ -394,7 +396,7 @@ def native_sparse_attention(
             k_cmp=k_cmp,
             v_cmp=v_cmp,
             block_size=block_size,
-            scale=scale,
+            softmax_scale=softmax_scale,
         )
         if block_indices is not None:
             warnings.warn(
@@ -406,17 +408,12 @@ def native_sparse_attention(
             query=query,
             k_cmp=k_cmp,
             lse=lse_cmp,
-            block_counts=block_counts if isinstance(block_counts, int) else block_counts[0, 0, 0].item(),
+            block_counts=block_counts if isinstance(block_counts, int) else int(block_counts[0, 0, 0]),
             block_size=block_size,
-            scale=scale,
+            softmax_scale=softmax_scale,
         )
-
     if block_indices is None:
         raise ValueError("Either `g_cmp` must be provided or `block_indices` must be passed.")
-
-    if isinstance(block_counts, int):
-        num_query_blocks = block_indices.shape[2]
-        block_counts = jnp.full((batch, num_kv_heads, num_query_blocks), block_counts, dtype=jnp.int32)
 
     o_slc = apply_native_sparse_attention(
         query=query,
@@ -425,7 +422,7 @@ def native_sparse_attention(
         block_indices=block_indices,
         block_counts=block_counts,
         block_size=block_size,
-        scale=scale,
+        softmax_scale=softmax_scale,
     )
 
     o = o_slc

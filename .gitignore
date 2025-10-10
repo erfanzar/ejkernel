@@ -16,6 +16,7 @@ dist/
 tmp-files/
 downloads/
 eggs/
+log.txt
 .eggs/
 lib/
 lib64/

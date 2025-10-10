@@ -1,3 +1,17 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tests for XLA recurrent attention implementation."""
 
 import jax
@@ -41,14 +55,13 @@ class TestRecurrentAttention:
 
     def test_orthogonal_vectors(self):
         """Test with orthogonal query/key vectors."""
-        # For orthogonal q=k vectors, output should match value vectors
+
         q = jnp.array([[[[1.0, 0.0, 0.0, 0.0]], [[0.0, 1.0, 0.0, 0.0]], [[0.0, 0.0, 1.0, 0.0]]]])
         k = q
         v = jnp.array([[[[2.0, 0.0, 0.0, 0.0]], [[0.0, 3.0, 0.0, 0.0]], [[0.0, 0.0, 4.0, 0.0]]]])
 
-        output, _ = recurrent(q, k, v, scale=1.0)
+        output, _ = recurrent(q, k, v, softmax_scale=1.0)
 
-        # Each timestep should produce its corresponding value
         expected = jnp.array([[2.0, 0.0, 0.0, 0.0], [0.0, 3.0, 0.0, 0.0], [0.0, 0.0, 4.0, 0.0]])
         assert jnp.allclose(output[0, :, 0, :], expected, atol=1e-5)
 
@@ -65,7 +78,7 @@ class TestRecurrentAttention:
 
         assert output.shape == (batch, seq_len, num_heads, head_dim)
         assert final_state.shape == (batch, num_heads, head_dim, head_dim)
-        # Final state should be different from initial
+
         assert not jnp.allclose(final_state, initial_state)
 
     def test_reverse_mode(self):
@@ -79,7 +92,7 @@ class TestRecurrentAttention:
         output_rev, _ = recurrent(q, k, v, reverse=True)
 
         assert output_fwd.shape == output_rev.shape
-        # Outputs should be different when reversed
+
         assert not jnp.allclose(output_fwd, output_rev)
 
 
@@ -143,7 +156,6 @@ class TestLightningAttention:
         output_layer0, _ = lightning_attn(q, k, v, layer_idx=0, num_layers=12)
         output_layer11, _ = lightning_attn(q, k, v, layer_idx=11, num_layers=12)
 
-        # Different layers should have different decay rates
         assert not jnp.allclose(output_layer0, output_layer11)
 
     def test_gradient_shapes(self):

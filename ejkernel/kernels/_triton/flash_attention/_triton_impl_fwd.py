@@ -729,7 +729,7 @@ def _fwd_attention_kernel_call(
             kernel=_attn_fwd,
             out_shape=out_shape,
             grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch * nheads_q),
-            name="triton::ops::_attn_fwd_varlen",
+            name="ejkernel::triton::flash_attn_fwd_varlen",
             **metaparams,
         )
 
@@ -846,7 +846,7 @@ def _fwd_attention_kernel_call(
         kernel=_attn_fwd,
         out_shape=out_shape,
         grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch * nheads_q),
-        name="triton::ops::_attn_fwd",
+        name="ejkernel::triton::flash_attn_fwd",
         **metaparams,
     )
 

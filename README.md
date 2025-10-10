@@ -87,8 +87,13 @@ batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64
 key = jax.random.PRNGKey(0)
 q = k = v = jax.random.normal(key, (batch, seq_len, num_heads, head_dim))
 
-# Execute attention
-output = executor(attention, q, k, v, causal=True, dropout_prob=0.1)
+# Execute attention with logit soft capping (Gemma-2 style)
+output = executor(
+    attention, q, k, v,
+    causal=True,
+    dropout_prob=0.1,
+    logit_soft_cap=30.0  # Prevents attention scores from becoming too large
+)
 ```
 
 ### Using Kernel Registry Directly
@@ -125,7 +130,7 @@ context_lens = jnp.array([48, 32])
 output = page_attention(
     query, key_cache, value_cache,
     context_lens, block_tables,
-    scale=0.125, block_size=block_size
+    softmax_scale=0.125, block_size=block_size
 )
 ```
 
@@ -174,8 +179,9 @@ impl = kernel_registry.get("my_kernel")  # Selects best available
 - **Flash Attention v2**: Memory-efficient exact attention with O(N) memory complexity
   - Causal masking, dropout, sliding windows
   - Variable-length sequence support (cu_seqlens)
-  - Logits soft capping (Gemma-style)
+  - Logit soft capping with tanh activation (Gemma-2 style)
   - Multi-query (MQA) and grouped-query (GQA) attention
+  - Custom VJP with proper Jacobian for soft cap gradients
 - **Page Attention**: Optimized for inference with paged KV-cache
   - Block-wise memory management
   - Dynamic context lengths
@@ -183,9 +189,11 @@ impl = kernel_registry.get("my_kernel")  # Selects best available
 - **Ring Attention**: Distributed attention for sequence parallelism
   - Enables training on ultra-long sequences
   - Communication-computation overlap
-- **Native Sparse Attention**: Block-sparse patterns for efficiency
-  - Configurable sparsity patterns
+- **Block Sparse Attention**: Block-sparse patterns for efficiency
+  - Configurable sparsity patterns (causal, sliding window, segment masking)
   - Local + global attention combinations
+  - Logit soft capping support for stable training
+  - Separate forward/backward block sizes for performance tuning
 - **GLA (Gated Linear Attention)**: Linear complexity O(N) attention
   - Gated recurrent updates
   - Efficient for very long sequences

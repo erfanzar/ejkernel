@@ -25,148 +25,114 @@ def _sparse_attention_bwd(
     q: Float[Array, "batch seq_len num_q_heads head_dim"],
     k: Float[Array, "batch seq_len num_kv_heads head_dim"],
     v: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    block_indices: Int[Array, "batch num_kv_heads num_query_blocks num_key_blocks"],
-    block_counts: Int[Array, "batch num_kv_heads num_query_blocks"],
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"],
+    block_counts: Int[Array, "batch seq_len num_kv_heads"],
     block_size: int,
-    scale: float,
+    softmax_scale: float,
     do: Float[Array, "batch seq_len num_q_heads head_dim"],
 ) -> tuple[
     Float[Array, "batch seq_len num_q_heads head_dim"],
     Float[Array, "batch seq_len num_kv_heads head_dim"],
     Float[Array, "batch seq_len num_kv_heads head_dim"],
 ]:
-    """
-    Backward pass for sparse attention with GQA support.
+    B, T, HQ, D = q.shape
+    HKV = k.shape[2]
+    G = HQ // HKV
 
-    Args:
-        q: Query tensor [batch, seq_len, num_q_heads, head_dim]
-        k: Key tensor [batch, seq_len, num_kv_heads, head_dim]
-        v: Value tensor [batch, seq_len, num_kv_heads, head_dim]
-        block_indices: Sparsity pattern [batch, num_kv_heads, num_query_blocks, num_key_blocks]
-        block_counts: Number of valid blocks per query block
-        block_size: Size of each block
-        scale: Attention scale factor
-        do: Gradient of output [batch, seq_len, num_q_heads, head_dim]
+    NB = (T + block_size - 1) // block_size
+    pad_len = NB * block_size - T
+    if pad_len > 0:
+        k = jnp.pad(k, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        v = jnp.pad(v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
 
-    Returns:
-        Tuple of (dq, dk, dv)
-    """
-    batch, seq_len, num_q_heads, head_dim = q.shape
-    num_kv_heads = k.shape[2]
-    group_size = num_q_heads // num_kv_heads
-    num_query_blocks = seq_len // block_size
+    k_blocks = k.reshape(B, NB, block_size, HKV, D)
+    v_blocks = v.reshape(B, NB, block_size, HKV, D)
 
-    q_blocks = q.reshape(batch, num_query_blocks, block_size, num_q_heads, head_dim)
-    k_blocks = k.reshape(batch, num_query_blocks, block_size, num_kv_heads, head_dim)
-    v_blocks = v.reshape(batch, num_query_blocks, block_size, num_kv_heads, head_dim)
-    do_blocks = do.reshape(batch, num_query_blocks, block_size, num_q_heads, head_dim)
+    dq = jnp.zeros_like(q)
+    bs = jnp.arange(block_size)
 
-    q_blocks = q_blocks.transpose(0, 3, 1, 2, 4)
-    k_blocks = k_blocks.transpose(0, 3, 1, 2, 4)
-    v_blocks = v_blocks.transpose(0, 3, 1, 2, 4)
-    do_blocks = do_blocks.transpose(0, 3, 1, 2, 4)
+    def bkvh_backward(b, kvh):
+        hq_start = kvh * G
 
-    def backward_query_block(b_idx, q_h_idx, qb_idx):
-        """Compute gradients for a single query block."""
+        q_b = q[b]
+        do_b = do[b]
+        q_grp = jax.lax.dynamic_slice(q_b, start_indices=(0, hq_start, 0), slice_sizes=(T, G, D))
+        do_grp = jax.lax.dynamic_slice(do_b, start_indices=(0, hq_start, 0), slice_sizes=(T, G, D))
 
-        kv_h_idx = q_h_idx // group_size
+        inds_bt = block_indices[b, :, kvh, :]
+        cnt_bt = block_counts[b, :, kvh]
 
-        q_block = q_blocks[b_idx, q_h_idx, qb_idx]
-        do_block = do_blocks[b_idx, q_h_idx, qb_idx]
+        def token_bwd(t):
+            inds = inds_bt[t]
+            cnt = cnt_bt[t]
 
-        num_blocks_for_this_query = block_counts[b_idx, kv_h_idx, qb_idx]
-        all_key_block_indices = block_indices[b_idx, kv_h_idx, qb_idx]
+            k_sel = k_blocks[b, inds, :, kvh, :]
+            v_sel = v_blocks[b, inds, :, kvh, :]
 
-        def backward_key_block(kb_pos):
-            """Process backward for a single key block position."""
-            kb_idx = all_key_block_indices[kb_pos]
-            k_block = k_blocks[b_idx, kv_h_idx, kb_idx]
-            v_block = v_blocks[b_idx, kv_h_idx, kb_idx]
+            local_limit = t - inds * block_size
+            pos_mask = bs[None, :] <= local_limit[:, None]
+            s_ar = jnp.arange(inds.shape[0])
+            blk_mask = s_ar < cnt
+            valid_mask = pos_mask & blk_mask[:, None]
+            mask_flat = valid_mask.reshape(-1)
 
-            scores = jnp.einsum("qd,kd->qk", q_block, k_block) * scale
-            is_valid = kb_pos < num_blocks_for_this_query
-            scores = jnp.where(is_valid, scores, -1e9)
+            k_flat = k_sel.reshape(-1, D)
+            v_flat = v_sel.reshape(-1, D)
 
-            return scores, v_block, kb_idx, is_valid
+            def head_bwd(g):
+                q_vec = q_grp[t, g]
+                do_vec = do_grp[t, g]
 
-        max_num_key_blocks = all_key_block_indices.shape[0]
-        scores_list, v_list, kb_indices, is_valid_list = jax.vmap(backward_key_block)(jnp.arange(max_num_key_blocks))
+                scores = (k_flat @ q_vec) * softmax_scale
+                scores = jnp.where(mask_flat, scores, -1e9)
+                w = jax.nn.softmax(scores, axis=-1)
 
-        all_scores = scores_list.transpose(1, 0, 2).reshape(block_size, -1)
-        all_values = v_list.transpose(1, 0, 2).reshape(-1, head_dim)
+                z = v_flat @ do_vec
+                mu = (w * z).sum()
+                ds = w * (z - mu)
+                ds = jnp.where(mask_flat, ds, 0.0)
 
-        attn_weights = jax.nn.softmax(all_scores, axis=-1)
+                dQ = softmax_scale * (ds[:, None] * k_flat).sum(axis=0)
+                dK_flat = softmax_scale * (ds[:, None] * q_vec[None, :])
+                dV_flat = w[:, None] * do_vec[None, :]
 
-        dvalues = jnp.einsum("qk,qd->kd", attn_weights, do_block)
-        dattn_weights = jnp.einsum("qd,kd->qk", do_block, all_values)
+                dV_flat = jnp.where(mask_flat[:, None], dV_flat, 0.0)
 
-        dscores = attn_weights * (dattn_weights - jnp.sum(dattn_weights * attn_weights, axis=-1, keepdims=True))
+                return dQ, dK_flat.reshape(-1, block_size, D), dV_flat.reshape(-1, block_size, D)
 
-        dscores_blocks = dscores.reshape(block_size, max_num_key_blocks, block_size).transpose(1, 0, 2)
-        dvalues_blocks = dvalues.reshape(max_num_key_blocks, block_size, head_dim)
+            dQ_g, dK_sel_g, dV_sel_g = jax.vmap(head_bwd, in_axes=(0,), out_axes=(0, 0, 0))(jnp.arange(G))
 
-        def compute_grad_for_key_block(kb_pos):
-            kb_idx = kb_indices[kb_pos]
-            is_valid = is_valid_list[kb_pos]
-            k_block_kb = k_blocks[b_idx, kv_h_idx, kb_idx]
-            dscores_kb = dscores_blocks[kb_pos]
-            dvalues_kb = dvalues_blocks[kb_pos]
+            dK_sel_sum = dK_sel_g.sum(axis=0)
+            dV_sel_sum = dV_sel_g.sum(axis=0)
 
-            dscores_kb = jnp.where(is_valid, dscores_kb, 0.0)
-            dvalues_kb = jnp.where(is_valid, dvalues_kb, 0.0)
+            dk_upd = jnp.zeros((NB, block_size, D))
+            dv_upd = jnp.zeros((NB, block_size, D))
+            dk_upd = dk_upd.at[inds].add(dK_sel_sum)
+            dv_upd = dv_upd.at[inds].add(dV_sel_sum)
 
-            dq_contrib = jnp.einsum("qk,kd->qd", dscores_kb, k_block_kb) * scale
+            return dQ_g, dk_upd, dv_upd
 
-            dk_kb = jnp.einsum("qk,qd->kd", dscores_kb, q_block) * scale
+        dq_heads_t, dk_bt, dv_bt = jax.vmap(token_bwd, in_axes=(0,))(jnp.arange(T))
 
-            dv_kb = dvalues_kb
+        dq_b = jnp.zeros((T, HQ, D))
+        dq_b = jax.lax.dynamic_update_slice(dq_b, dq_heads_t, (0, hq_start, 0))
 
-            return dq_contrib, dk_kb, dv_kb, kb_idx
+        dk_b = dk_bt.sum(axis=0)
+        dv_b = dv_bt.sum(axis=0)
+        return dq_b, dk_b, dv_b
 
-        dq_contribs, dk_list, dv_list, kb_indices_out = jax.vmap(compute_grad_for_key_block)(
-            jnp.arange(max_num_key_blocks)
-        )
+    dq_b, dk_b, dv_b = jax.vmap(
+        jax.vmap(bkvh_backward, in_axes=(None, 0), out_axes=(0, 0, 0)),
+        in_axes=(0, None),
+        out_axes=(0, 0, 0),
+    )(jnp.arange(B), jnp.arange(HKV))
 
-        dq_block = jnp.sum(dq_contribs, axis=0)
+    dq = dq_b.sum(axis=1)
 
-        return dq_block, dk_list, dv_list, kb_indices_out
+    dk = dk_b.reshape(B, HKV, NB * block_size, D).transpose(0, 2, 1, 3)
+    dv = dv_b.reshape(B, HKV, NB * block_size, D).transpose(0, 2, 1, 3)
 
-    def process_head(b_idx, q_h_idx):
-        """Process backward for all query blocks in a query head."""
-
-        def process_query_block(qb_idx):
-            return backward_query_block(b_idx, q_h_idx, qb_idx)
-
-        dq_h, dk_h, dv_h, kb_indices_h = jax.vmap(process_query_block)(jnp.arange(num_query_blocks))
-
-        return dq_h, dk_h, dv_h, kb_indices_h, q_h_idx // group_size
-
-    def process_batch(b_idx):
-        """Process backward for all query heads in a batch."""
-        dq_b, dk_b, dv_b, kb_indices_b, kv_h_indices = jax.vmap(lambda h: process_head(b_idx, h))(
-            jnp.arange(num_q_heads)
-        )
-
-        return dq_b, dk_b, dv_b, kb_indices_b, kv_h_indices
-
-    dq_all, dk_all, dv_all, kb_indices_all, kv_h_indices_all = jax.vmap(process_batch)(jnp.arange(batch))
-
-    dq = dq_all.transpose(0, 2, 3, 1, 4).reshape(batch, seq_len, num_q_heads, head_dim)
-
-    dk = jnp.zeros((batch, num_kv_heads, num_query_blocks, block_size, head_dim))
-    dv = jnp.zeros((batch, num_kv_heads, num_query_blocks, block_size, head_dim))
-
-    for b in range(batch):
-        for q_h in range(num_q_heads):
-            kv_h = kv_h_indices_all[b, q_h]
-            for qb in range(num_query_blocks):
-                max_kb = block_indices[b, kv_h, qb].shape[0]
-                for kb_pos in range(max_kb):
-                    kb_idx = kb_indices_all[b, q_h, qb, kb_pos]
-                    dk = dk.at[b, kv_h, kb_idx].add(dk_all[b, q_h, qb, kb_pos])
-                    dv = dv.at[b, kv_h, kb_idx].add(dv_all[b, q_h, qb, kb_pos])
-
-    dk = dk.transpose(0, 2, 3, 1, 4).reshape(batch, seq_len, num_kv_heads, head_dim)
-    dv = dv.transpose(0, 2, 3, 1, 4).reshape(batch, seq_len, num_kv_heads, head_dim)
+    dk = dk[:, :T, :, :]
+    dv = dv[:, :T, :, :]
 
     return dq, dk, dv

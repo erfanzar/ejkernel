@@ -99,7 +99,7 @@ def scaled_dot_product_attention(
         mask=attention_mask,
         bias=bias,
         is_causal=causal,
-        scale=softmax_scale,
+        softmax_scale=softmax_scale,
         local_window_size=sliding_window,
         key_value_seq_lengths=cum_seqlens_k,
         query_seq_lengths=cum_seqlens_q,

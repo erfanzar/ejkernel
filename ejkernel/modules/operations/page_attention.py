@@ -13,7 +13,46 @@
 # limitations under the License.
 
 
-"""Page Attention modules with automatic optimization."""
+"""Page Attention module with automatic optimization.
+
+This module implements Page Attention, a specialized attention mechanism designed
+for efficient KV cache management in serving and inference workloads. Page Attention
+organizes the KV cache in fixed-size blocks (pages), enabling:
+    - Dynamic memory allocation without pre-allocating for max sequence length
+    - Efficient memory sharing across sequences (e.g., for beam search or prefix caching)
+    - Reduced memory fragmentation compared to contiguous allocation
+    - Better GPU memory utilization through page-level management
+
+Page Attention is particularly valuable for:
+    - LLM serving with variable-length sequences
+    - Batch inference with dynamic batching
+    - Memory-constrained deployment scenarios
+    - Systems requiring efficient KV cache sharing
+
+Key Concepts:
+    Pages: Fixed-size blocks holding a portion of KV cache (e.g., 16 or 32 tokens)
+    Block Tables: Mapping from logical sequence positions to physical page indices
+    Context Lengths: Actual sequence lengths (excluding padding)
+
+The paged approach enables:
+    - Near-zero memory waste (only last page per sequence may be partially filled)
+    - Easy insertion/deletion of sequences without memory reshuffling
+    - Natural support for prefix sharing in beam search
+
+Mathematical Foundation:
+    For query position i:
+        output[i] = sum_{j in valid_pages} softmax(Q[i] @ K[pages[j]].T) @ V[pages[j]]
+
+    Where valid_pages are determined by block_tables and context_lens.
+
+Memory Layout:
+    Instead of: [seq_len, num_heads, head_dim] (contiguous per sequence)
+    Use: [num_pages, page_size, num_heads, head_dim] (page-based allocation)
+
+References:
+    Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention"
+    https://arxiv.org/abs/2309.06180 (vLLM paper)
+"""
 
 from __future__ import annotations
 
@@ -39,14 +78,37 @@ class PageAttention(Kernel[KernelConfig, Array]):
         - Automatic partitioning for long contexts
         - Multi-split attention for improved throughput
         - Optimized for inference and serving workloads
+        - Logit soft capping for numerical stability
+        - Configurable pages per compute block
+        - TPU megacore mode support
+
+    The paged layout provides:
+        - O(1) insertion/deletion of sequences
+        - Efficient prefix sharing for beam search
+        - Minimal memory fragmentation
+        - Better batch utilization through dynamic allocation
     """
 
     def __init__(self):
-        """Initialize Page Attention module."""
+        """Initialize Page Attention module.
+
+        Sets up the kernel for paged KV cache attention computation
+        with automatic platform selection and optimization.
+        """
         super().__init__(op_id="page_attention")
 
     def get_impl(self, cfg: KernelConfig):
-        """Get kernel implementation from registry."""
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend preferences
+
+        Returns:
+            Callable kernel implementation for page attention
+
+        Raises:
+            ValueError: If no matching implementation is found for the configuration
+        """
         platform = detect_platform("page_attention", cfg.platform)
         return kernel_registry.get("page_attention", platform=platform, backend=cfg.backend)
 
@@ -69,7 +131,44 @@ class PageAttention(Kernel[KernelConfig, Array]):
         megacore_mode: str | None = None,
         inline_seq_dim: bool = True,
     ) -> Float[Array, "num_seqs num_heads head_dim"]:
-        """Execute page attention."""
+        """Execute page attention over paged KV cache.
+
+        Computes attention where the KV cache is organized in fixed-size pages,
+        with each sequence's tokens potentially scattered across non-contiguous pages.
+
+        Args:
+            query: Query tensor [num_seqs, num_heads, head_dim] for current decode step
+            key_cache: Paged key cache [num_blocks, num_kv_heads, block_size, head_dim]
+            value_cache: Paged value cache [num_blocks, num_kv_heads, block_size, head_dim]
+            context_lens: Actual context length per sequence [num_seqs]
+            block_tables: Page index mapping [num_seqs, max_blocks] where block_tables[i, j]
+                gives the physical page index for sequence i's jth logical block
+            attn_scale: Attention score scaling factor (default: 1/sqrt(head_dim))
+            max_context_len: Maximum context length across all sequences
+            num_splits: Number of splits for partitioned attention (0 = auto, 1 = no split)
+            mask_value: Value used for masked positions (default: -inf)
+            attn_logits_soft_cap: Optional soft cap for attention logits
+            pages_per_compute_block: Number of pages to process per compute block
+            megacore_mode: TPU-specific megacore execution mode
+            inline_seq_dim: Whether to inline the sequence dimension
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
+            cfg: Kernel configuration object
+
+        Returns:
+            Attention output [num_seqs, num_heads, head_dim]
+
+        Note:
+            Block tables define the mapping from logical to physical pages:
+                logical_page_idx = position // block_size
+                physical_page_idx = block_tables[seq_idx, logical_page_idx]
+
+        Example:
+            >>>
+            >>>
+            >>> block_tables = jnp.array([[3, 7, 0], [1, 5, 0]])
+            >>> context_lens = jnp.array([32, 24])
+            >>> out = page_attention(q, k_cache, v_cache, context_lens, block_tables)
+        """
 
         if platform is not None:
             cfg = KernelConfig(
@@ -99,7 +198,15 @@ class PageAttention(Kernel[KernelConfig, Array]):
         )
 
     def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
-        """Provide default configuration with block sizes."""
+        """Provide default configuration optimized for paged attention.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default KernelConfig with block sizes suitable for typical
+            serving workloads with variable context lengths
+        """
         return KernelConfig(
             block_q=64,
             block_k=64,
@@ -110,7 +217,21 @@ class PageAttention(Kernel[KernelConfig, Array]):
         )
 
     def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+        """Generate candidate configurations for autotuning.
+
+        Creates configurations optimized for different batch sizes and
+        context lengths commonly seen in serving scenarios.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of candidate configurations to benchmark during autotuning
+
+        Note:
+            Page attention performance is sensitive to the ratio of context_len
+            to page_size and the number of sequences in the batch.
+        """
         block_configs = [
             (32, 64, 4, 1),
             (64, 64, 4, 1),

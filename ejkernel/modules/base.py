@@ -43,17 +43,46 @@ def detect_platform(
 ) -> Platform:
     """Detect the best platform for a given algorithm.
 
+    Automatically selects the optimal platform based on:
+        1. Explicit platform request (if provided)
+        2. Available implementations for the algorithm
+        3. Current JAX backend (GPU/TPU/CPU)
+        4. Platform-specific optimizations
+
+    The selection priority:
+        - GPU backend + Triton available -> Triton (best GPU performance)
+        - GPU backend + no Triton -> XLA
+        - TPU backend -> Pallas (TPU-optimized) or XLA fallback
+        - CPU backend -> XLA
+
     Args:
-        algorithm: The algorithm name to check for availability
-        platform: Requested platform. If "auto" or None, auto-detect based on
-            JAX backend and algorithm availability.
+        algorithm: The algorithm name to check for availability (e.g., "flash_attention")
+        platform: Requested platform. Options:
+            - "triton": Triton GPU kernels (CUDA/ROCm)
+            - "pallas": Pallas kernels (TPU/GPU)
+            - "cuda": CUDA-specific implementations
+            - "xla": XLA compiler-based implementations
+            - "auto" or None: Automatic selection (default)
 
     Returns:
-        The selected platform
+        The selected Platform enum value
+
+    Raises:
+        ValueError: If the requested platform is not available for the algorithm
 
     Example:
+        >>>
         >>> platform = detect_platform("flash_attention", platform="auto")
         >>>
+        >>>
+        >>> platform = detect_platform("flash_attention", platform="triton")
+        >>>
+        >>>
+        >>> print(f"Selected: {detect_platform('ring_attention')}")
+
+    Note:
+        Triton is preferred on NVIDIA GPUs for best performance, but XLA provides
+        broader compatibility across hardware backends.
     """
     if platform not in ("auto", None):
         return Platform(platform) if isinstance(platform, str) else platform

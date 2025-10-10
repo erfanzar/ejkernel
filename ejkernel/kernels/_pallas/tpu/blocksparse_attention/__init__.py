@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+"""modified from google org impl"""
+
 from ._info import MaskInfo
 from ._kernel import (
     BlockSizes,

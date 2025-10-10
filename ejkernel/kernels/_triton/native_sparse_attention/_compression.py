@@ -13,6 +13,61 @@
 # limitations under the License.
 
 
+"""Compressed attention computation for Native Sparse Attention (NSA).
+
+This module implements the compressed attention component of Native Sparse
+Attention, where queries attend to mean-pooled (compressed) key-value blocks
+rather than individual tokens. This provides a coarse-grained global context
+that guides the selection of important blocks for fine-grained attention.
+
+Compressed Attention Process:
+-----------------------------
+1. Keys and values are mean-pooled into blocks (e.g., 64 tokens -> 1 block)
+2. Each query computes attention over these compressed representations
+3. The resulting attention scores indicate block importance
+4. Scores are used to select top-K blocks for detailed attention
+5. The compressed attention output can also be used directly (gated)
+
+The implementation uses custom Triton kernels for efficient GPU computation
+and supports both forward and backward passes with full autodifferentiation.
+
+Key benefits:
+- O(N²/B) complexity for block size B (much faster than O(N²))
+- Provides global context across entire sequence
+- Enables learned sparse attention patterns
+- Integrates with variable-length sequence processing
+
+The compressed attention output has two uses in NSA:
+1. As attention scores for block selection (via top-K)
+2. As a direct output pathway (gated with g_cmp)
+
+Functions:
+- nsa_compression: Main user-facing function with custom VJP
+- nsa_compression_fwd: Forward pass kernel wrapper
+- nsa_compression_bwd: Backward pass kernel wrapper
+- nsa_compression_fwd_kernel: Triton kernel for forward pass
+- nsa_compression_bwd_kernel_dq: Triton kernel for query gradients
+- nsa_compression_bwd_kernel_dkv: Triton kernel for key/value gradients
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.native_sparse_attention._compression import nsa_compression
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64
+    >>> block_size = 64
+    >>>
+    >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>>
+    >>> k_compressed = jnp.ones((batch, 16, num_heads, head_dim))
+    >>> v_compressed = jnp.ones((batch, 16, num_heads, head_dim))
+    >>>
+    >>> output, lse = nsa_compression(
+    ...     q, k_compressed, v_compressed,
+    ...     block_size=block_size,
+    ...     softmax_scale=head_dim ** -0.5
+    ... )
+"""
+
 from functools import partial
 
 import jax
@@ -34,7 +89,7 @@ def nsa_compression_fwd_kernel(
     q,
     k,
     v,
-    scale,
+    softmax_scale,
     cu_seqlens,
     token_indices,
     chunk_offsets,
@@ -74,7 +129,7 @@ def nsa_compression_fwd_kernel(
     )
 
     b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_q = (b_q * scale).to(b_q.dtype)
+    b_q = (b_q * softmax_scale).to(b_q.dtype)
 
     TC = tl.cdiv(SEQUENCE, BLOCKSIZE)
     NC = (i_t + 1) // BLOCKSIZE
@@ -150,7 +205,7 @@ def nsa_compression_bwd_kernel_dq(
     lse,
     delta,
     do,
-    scale,
+    softmax_scale,
     cu_seqlens,
     token_indices,
     chunk_offsets,
@@ -195,7 +250,7 @@ def nsa_compression_bwd_kernel_dq(
     )
 
     b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_q = (b_q * scale).to(b_q.dtype)
+    b_q = (b_q * softmax_scale).to(b_q.dtype)
 
     p_do = tl.make_block_ptr(
         do,
@@ -244,7 +299,7 @@ def nsa_compression_bwd_kernel_dq(
         b_dp = tl.dot(b_do, b_v)
         b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
         b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
-    b_dq *= scale
+    b_dq *= softmax_scale
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -283,7 +338,7 @@ def nsa_compression_bwd_kernel_dkv(
     cu_seqlens,
     chunk_indices,
     chunk_offsets,
-    scale,
+    softmax_scale,
     dk,
     dv,
     SEQUENCE: tl.constexpr,
@@ -364,7 +419,7 @@ def nsa_compression_bwd_kernel_dkv(
             (1, 0),
         )
         b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_q = (b_q * scale).to(b_q.dtype)
+        b_q = (b_q * softmax_scale).to(b_q.dtype)
 
         p_do = tl.make_block_ptr(
             do + (bos + i) * Q_HEADS * BLOCK_DIMV,
@@ -396,7 +451,7 @@ def nsa_compression_fwd(
     k: jax.Array,
     v: jax.Array,
     block_size: int,
-    scale: float,
+    softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
@@ -430,14 +485,14 @@ def nsa_compression_fwd(
         q,
         k,
         v,
-        scale,
+        softmax_scale,
         cu_seqlens if cu_seqlens is not None else 1,
         token_indices if token_indices is not None else 1,
         chunk_offsets if chunk_offsets is not None else 1,
         kernel=nsa_compression_fwd_kernel,
         grid=lambda META: (SEQUENCE, NumVBlocks, Z * KV_HEADS),
         out_shape=outputs,
-        name="ejgpu:native_sparse_attention:nsa_compression_fwd",
+        name="ejkernel::triton::sparse_attn_compression_fwd",
         **metaparams,
     )
     return o, lse
@@ -451,7 +506,7 @@ def nsa_compression_bwd(
     lse: jax.Array,
     do: jax.Array,
     block_size: int = 64,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
 ):
@@ -478,7 +533,7 @@ def nsa_compression_bwd(
         kernel=bwd_kernel_preprocess,
         grid=lambda META: (delta.numel(),),
         out_shape=[jax.ShapeDtypeStruct(o.shape[:-1], dtype="f4")],
-        name="ejgpu::bwd_kernel_preprocess",
+        name="ejkernel::triton::sparse_attn_compression_bwd_preprocess",
         Z=next_power_of_2(o.shape[-1]),
         BLOCK_DIMV=o.shape[-1],
     )
@@ -506,13 +561,13 @@ def nsa_compression_bwd(
         lse,
         delta,
         do,
-        scale,
+        softmax_scale,
         cu_seqlens if cu_seqlens is not None else 1,
         token_indices if token_indices is not None else 1,
         chunk_offsets if chunk_offsets is not None else 1,
         kernel=nsa_compression_bwd_kernel_dq,
         grid=lambda META: (SEQUENCE, NumVBlocks, Z * KV_HEADS),
-        name="ejgpu::native_sparse_attention:nsa_compression_bwd",
+        name="ejkernel::triton::sparse_attn_compression_bwd_dq",
         out_shape=outputs,
         **metaparams,
     )
@@ -532,10 +587,10 @@ def nsa_compression_bwd(
         cu_seqlens if cu_seqlens is not None else 1,
         chunk_indices if chunk_indices is not None else 1,
         chunk_offsets if chunk_offsets is not None else 1,
-        scale,
+        softmax_scale,
         kernel=nsa_compression_bwd_kernel_dkv,
         grid=lambda META: (NumVBlocks, NC, Z * KV_HEADS),
-        name="ejgpu::native_sparse_attention:nsa_compression_bwd_kernel_dkv",
+        name="ejkernel::triton::sparse_attn_compression_bwd_dkdv",
         out_shape=outputs,
         **metaparams,
     )
@@ -548,7 +603,7 @@ def _fwd_call(
     k: jax.Array,
     v: jax.Array,
     block_size: int,
-    scale: float,
+    softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
 ):
@@ -557,7 +612,7 @@ def _fwd_call(
         k=k,
         v=v,
         block_size=block_size,
-        scale=scale,
+        softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
     )
@@ -567,7 +622,7 @@ def _fwd_call(
 
 def _bwd_call(
     block_size: int,
-    scale: float,
+    softmax_scale: float,
     cu_seqlens: jax.Array | None,
     token_indices: jax.Array | None,
     residual: tuple[jax.Array],
@@ -582,7 +637,7 @@ def _bwd_call(
         lse=lse,
         do=do,
         block_size=block_size,
-        scale=scale,
+        softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
     )
@@ -596,7 +651,7 @@ def _nsa_compression(
     k: jax.Array,
     v: jax.Array,
     block_size: int,
-    scale: float,
+    softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
@@ -605,7 +660,7 @@ def _nsa_compression(
         k=k,
         v=v,
         block_size=block_size,
-        scale=scale,
+        softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
     )[0]
@@ -615,22 +670,84 @@ _nsa_compression.defvjp(_fwd_call, _bwd_call)
 
 
 def nsa_compression(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
     block_size: int,
-    scale: float,
+    softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
-) -> jax.Array:
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
+) -> tuple[jax.Array, jax.Array]:
+    """Compute compressed attention over mean-pooled key-value blocks.
+
+    This function implements the compressed attention pathway of Native Sparse
+    Attention, where each query token attends to compressed (mean-pooled)
+    representations of key-value blocks. This provides O(N²/B) complexity while
+    maintaining global context across the sequence.
+
+    The compressed attention serves two purposes:
+    1. Block selection: Attention scores indicate which blocks are important
+    2. Direct output: Can be used as a coarse-grained attention output (gated)
+
+    Args:
+        query: Query tensor of shape (batch, seq_len, num_heads, head_dim).
+            Each query attends to all compressed KV blocks.
+        key: Compressed key tensor of shape (batch, num_blocks, num_heads, head_dim).
+            Keys have been mean-pooled from blocks of size `block_size`.
+        value: Compressed value tensor of shape (batch, num_blocks, num_heads, head_dim).
+            Values have been mean-pooled from blocks of size `block_size`.
+        block_size: Size of each block in tokens. Keys/values should already be
+            compressed at this granularity.
+        softmax_scale: Attention score scaling factor, typically 1/sqrt(head_dim).
+        cu_seqlens: Optional cumulative sequence lengths for variable-length
+            sequences, shape (num_seqs + 1,). If provided, enables packed
+            variable-length processing.
+        token_indices: Optional token indices for variable-length sequences,
+            shape (total_tokens, 2). Each row contains [sequence_id, token_offset].
+
+    Returns:
+        A tuple containing:
+            - output: Compressed attention output, shape (batch, seq_len, num_heads, head_dim).
+            - lse: Log-sum-exp of attention scores, shape (batch, seq_len, num_heads).
+              Used for numerical stability and block selection.
+
+    Note:
+        The key and value tensors should already be mean-pooled to the block level.
+        Use mean_pooling(k, block_size) and mean_pooling(v, block_size) to prepare them.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from ejkernel.kernels._triton.mean_pooling import mean_pooling
+        >>> from ejkernel.kernels._triton.native_sparse_attention._compression import nsa_compression
+        >>>
+        >>> batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64
+        >>> block_size = 64
+        >>>
+        >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>>
+        >>>
+        >>> k_compressed = mean_pooling(k, block_size)
+        >>> v_compressed = mean_pooling(v, block_size)
+        >>>
+        >>>
+        >>> output, lse = nsa_compression(
+        ...     q, k_compressed, v_compressed,
+        ...     block_size=block_size,
+        ...     softmax_scale=head_dim ** -0.5
+        ... )
+        >>> print(output.shape)
+        >>> print(lse.shape)
+    """
+    if softmax_scale is None:
+        softmax_scale = key.shape[-1] ** -0.5
     return _nsa_compression(
-        q=q,
-        k=k,
-        v=v,
+        q=query,
+        k=key,
+        v=value,
         block_size=block_size,
-        scale=scale,
+        softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
     )

@@ -100,7 +100,7 @@ def nsa_kernel_topk(
     q,
     k,
     lse,
-    scale,
+    softmax_scale,
     cu_seqlens,
     token_indices,
     chunk_offsets,
@@ -134,7 +134,7 @@ def nsa_kernel_topk(
         (1, 0),
     )
     b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_q = (b_q * scale).to(b_q.dtype)
+    b_q = (b_q * softmax_scale).to(b_q.dtype)
     TC = tl.cdiv(SEQUENCE, BLOCKSIZE)
     NC = (i_t + 1) // BLOCKSIZE
     if lse is not None:
@@ -216,7 +216,7 @@ def nsa_fwd_kernel(
     q,
     k,
     v,
-    scale,
+    softmax_scale,
     block_indices,
     block_counts,
     cu_seqlens,
@@ -264,7 +264,7 @@ def nsa_fwd_kernel(
         (1, 0),
     )
     b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_q = (b_q * scale).to(b_q.dtype)
+    b_q = (b_q * softmax_scale).to(b_q.dtype)
 
     p_o = tl.make_block_ptr(
         o + (bos + i_t) * Q_HEADS * BLOCK_DIMV,
@@ -324,7 +324,7 @@ def nsa_topk(
     lse: jax.Array,
     block_counts: jax.Array | int,
     block_size: int = 64,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     cu_seqlens: jax.Array | None = None,
 ) -> jax.Array:
     Z, SEQUENCE, QHeads, BLOCK_DIMK = q.shape
@@ -333,7 +333,7 @@ def nsa_topk(
     IndSize = block_counts if isinstance(block_counts, int) else block_counts.max().item()
     IndSize = next_power_of_2(IndSize)
     BLOCKSIZE = block_size
-    BLOCKSIZE_K = next_power_of_2(BLOCK_DIMK)
+    BLOCKSIZE_K = min(128, next_power_of_2(BLOCK_DIMK))
     token_indices = prepare_token_indices(cu_seqlens) if cu_seqlens is not None else None
     chunk_offsets = prepare_chunk_offsets(cu_seqlens, block_size) if cu_seqlens is not None else None
     output_shape_and_dtype = [jax.ShapeDtypeStruct((Z, SEQUENCE, KV_HEADS, IndSize), dtype="i4")]
@@ -351,13 +351,13 @@ def nsa_topk(
         q,
         k,
         lse,
-        float(scale),
+        float(softmax_scale),
         cu_seqlens if cu_seqlens is not None else 1,
         token_indices if token_indices is not None else 1,
         chunk_offsets if chunk_offsets is not None else 1,
         grid=lambda META: (SEQUENCE, Z * KV_HEADS),
         kernel=nsa_kernel_topk,
-        name="ejgpu:native_sparse_attention:nsa_topk",
+        name="ejkernel::triton::sparse_attn_fwd_topk",
         out_shape=output_shape_and_dtype,
         **kernel_metaparams,
     )
@@ -372,7 +372,7 @@ def fwd_triton_impl(
     block_indices: jax.Array,
     block_counts: jax.Array | int,
     block_size: int,
-    scale: float,
+    softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
 ):
@@ -413,7 +413,7 @@ def fwd_triton_impl(
         q,
         k,
         v,
-        scale,
+        softmax_scale,
         block_indices if block_indices is not None else 1,
         block_counts if block_counts is not None else 1,
         cu_seqlens if cu_seqlens is not None else 1,
@@ -421,7 +421,7 @@ def fwd_triton_impl(
         kernel=nsa_fwd_kernel,
         grid=lambda META: (META["SEQUENCE"], num_v_blocks, batch_size * META["KV_HEADS"]),
         out_shape=output_shapes,
-        name="ejgpu:native_sparse_attention:nsa_fwd",
+        name="ejkernel::triton::sparse_attn_fwd",
         **kernel_metaparams,
     )
 

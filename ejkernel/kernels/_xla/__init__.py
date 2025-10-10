@@ -20,6 +20,7 @@ from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
 from .native_sparse_attention import apply_native_sparse_attention
 from .page_attention import page_attention
+from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention import ragged_page_attention
 from .recurrent import recurrent
 from .ring_attention import ring_attention
@@ -32,6 +33,7 @@ __all__ = [
     "lightning_attn",
     "mean_pooling",
     "page_attention",
+    "ragged_decode_attention",
     "ragged_page_attention",
     "recurrent",
     "recurrent_gla",

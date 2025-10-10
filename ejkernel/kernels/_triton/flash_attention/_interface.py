@@ -13,6 +13,62 @@
 # limitations under the License.
 
 
+"""Flash Attention implementation using Triton kernels.
+
+This module provides a highly optimized implementation of Flash Attention,
+an IO-aware exact attention algorithm that reduces memory usage from O(N²)
+to O(N) through tiling and recomputation strategies.
+
+Flash Attention is a breakthrough in efficient attention computation that
+maintains exact attention semantics while dramatically reducing memory footprint.
+The key insight is to split the attention computation into blocks and fuse
+operations to minimize memory reads/writes between GPU HBM and SRAM.
+
+Key advantages over standard attention:
+1. Subquadratic memory: O(N) instead of O(N²) for sequence length N
+2. Faster wall-clock time: Reduced memory I/O translates to speed improvements
+3. Exact attention: No approximation, produces identical results to standard attention
+4. Better scaling: Enables processing of much longer sequences
+
+Algorithm overview:
+- Query and key-value sequences are split into blocks
+- Attention is computed block-by-block using online softmax
+- Partial results are accumulated incrementally
+- No full attention matrix is ever materialized
+
+Supported features:
+- Causal and non-causal attention
+- Attention bias and masking
+- Dropout during training
+- Variable-length sequences (via cu_seqlens)
+- Sliding window attention for local patterns
+- Grouped-query attention (GQA) and multi-query attention (MQA)
+- Attention sinks via softmax_aux parameter
+- Logits soft capping for numerical stability
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.flash_attention import flash_attention
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 2048, 12, 64
+    >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>>
+    >>>
+    >>> output = flash_attention(q, k, v)
+    >>>
+    >>>
+    >>> output = flash_attention(q, k, v, causal=True)
+    >>>
+    >>>
+    >>> output = flash_attention(q, k, v, dropout_prob=0.1, dropout_seed=42)
+
+Reference:
+    FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness
+    https://arxiv.org/abs/2205.14135
+"""
+
 import functools
 
 import jax

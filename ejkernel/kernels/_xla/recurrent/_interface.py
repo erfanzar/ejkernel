@@ -32,22 +32,22 @@ def _recurrent_core(
     key: Float[Array, "batch seq_len num_heads head_dim"],
     value: Float[Array, "batch seq_len num_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    scale: float | None = None,
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    softmax_scale: float | None = None,
+    initial_state: Float[Array, "... num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
+) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "... num_heads head_dim head_dim"]]:
     """Core recurrent attention with custom VJP."""
     if cu_seqlens is not None:
         return _recurrent_attention_varlen_fwd(
-            query, key, value, cu_seqlens, g, g_gamma, gk, gv, scale, initial_state, reverse
+            query, key, value, cu_seqlens, g, g_gamma, gk, gv, softmax_scale, initial_state, reverse
         )
     else:
         output, _, final_state = _recurrent_attention_fwd(
-            query, key, value, g, g_gamma, gk, gv, scale, initial_state, reverse
+            query, key, value, g, g_gamma, gk, gv, softmax_scale, initial_state, reverse
         )
         return output, final_state
 
@@ -57,10 +57,10 @@ def _recurrent_fwd(
     key: Float[Array, "batch seq_len num_heads head_dim"],
     value: Float[Array, "batch seq_len num_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "batch num_heads"] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -70,8 +70,8 @@ def _recurrent_fwd(
 ]:
     """Forward with residuals for backward."""
 
-    if scale is None:
-        scale = 1.0 / jnp.sqrt(query.shape[-1]).astype(jnp.float32)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / jnp.sqrt(query.shape[-1]).astype(jnp.float32)
     if g is None:
         g = jnp.zeros_like(query)
     if g_gamma is None:
@@ -87,7 +87,7 @@ def _recurrent_fwd(
         raise NotImplementedError("Custom backward for varlen not yet implemented")
     else:
         o, hidden_states, final_state = _recurrent_attention_fwd(
-            query, key, value, g, g_gamma, gk, gv, scale, initial_state, reverse
+            query, key, value, g, g_gamma, gk, gv, softmax_scale, initial_state, reverse
         )
 
     residuals = (query, key, value, g, g_gamma, gk, gv, hidden_states, initial_state)
@@ -95,7 +95,7 @@ def _recurrent_fwd(
 
 
 def _recurrent_bwd(
-    g_gamma_nondiff: Float[Array, "batch num_heads"],
+    g_gamma_nondiff: Float[Array, "... num_heads"],
     scale_nondiff: float | None,
     reverse: bool,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
@@ -107,15 +107,15 @@ def _recurrent_bwd(
     do, dfinal_state = grads
 
     if scale_nondiff is None:
-        scale = 1.0 / jnp.sqrt(query.shape[-1]).astype(jnp.float32)
+        softmax_scale = 1.0 / jnp.sqrt(query.shape[-1]).astype(jnp.float32)
     else:
-        scale = scale_nondiff
+        softmax_scale = scale_nondiff
 
     if cu_seqlens is not None:
         raise NotImplementedError("Variable-length backward not yet implemented")
 
     dq, dk, dv, dg, dgk, dgv, dinitial_state = _recurrent_attention_bwd(
-        query, key, value, g, g_gamma, gk, gv, hidden_states, do, dfinal_state, scale, initial_state, reverse
+        query, key, value, g, g_gamma, gk, gv, hidden_states, do, dfinal_state, softmax_scale, initial_state, reverse
     )
 
     return (dq, dk, dv, dg, dgk, dgv, dinitial_state)
@@ -127,18 +127,18 @@ _recurrent_core.defvjp(_recurrent_fwd, _recurrent_bwd)
 @kernel_registry.register("recurrent", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def recurrent(
-    query: Float[Array, "batch seq_len num_heads head_dim"],
-    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "batch num_heads"] | None = None,
-    gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    scale: float | None = None,
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    query: Float[Array, "batch seq_len num_heads qk_head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads qk_head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads v_head_dim"],
+    g: Float[Array, "batch seq_len num_heads qk_head_dim"] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
+    gk: Float[Array, "batch seq_len num_heads qk_head_dim"] | None = None,
+    gv: Float[Array, "batch seq_len num_heads v_head_dim"] | None = None,
+    softmax_scale: float | None = None,
+    initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
+) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """
     Recurrent linear attention with O(N) complexity using JAX/XLA.
 
@@ -160,7 +160,7 @@ def recurrent(
         g_gamma: Optional per-head decay factor [num_heads] for Lightning attention
         gk: Optional gate applied to keys [batch, seq_len, num_heads, head_dim]
         gv: Optional gate applied to values [batch, seq_len, num_heads, head_dim]
-        scale: Query scaling factor. If None, defaults to 1/sqrt(head_dim)
+        softmax_scale: Query scaling factor. If None, defaults to 1/sqrt(head_dim)
         initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
         reverse: If True, process sequence in reverse order
         cu_seqlens: Cumulative sequence lengths for variable-length inputs [num_seqs+1]
@@ -198,4 +198,4 @@ def recurrent(
         >>> final_state.shape
         (3, 8, 64, 64)
     """
-    return _recurrent_core(query, key, value, g, g_gamma, gk, gv, scale, initial_state, reverse, cu_seqlens)
+    return _recurrent_core(query, key, value, g, g_gamma, gk, gv, softmax_scale, initial_state, reverse, cu_seqlens)

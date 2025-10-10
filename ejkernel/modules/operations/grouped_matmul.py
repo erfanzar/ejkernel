@@ -223,17 +223,13 @@ def grouped_matmul(
         >>>
         >>> out = grouped_matmul(lhs, rhs, group_sizes)
         >>>
-        >>>
         >>> out = grouped_matmul(lhs, rhs, group_sizes, tiling=(256, 256, 256))
-        >>>
         >>>
         >>> out = grouped_matmul(lhs, rhs_transposed, group_sizes, transpose_rhs=True)
         >>>
-        >>>
         >>> out = grouped_matmul(lhs, rhs, group_sizes, existing_out=prev_out)
-            >>>
         >>>
-        >>> out = grouped_matmul(..., platform="triton")
+        >>> out = grouped_matmul(..., platform="pallas")
     """
     return _grouped_matmul_executor(
         GroupedMatmul(),
@@ -247,4 +243,5 @@ def grouped_matmul(
         transpose_rhs=transpose_rhs,
         interpret=interpret,
         precision=precision,
+        platform=platform,
     )

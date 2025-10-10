@@ -60,6 +60,8 @@ def _chunk_attention_bias(
     query_offset = query_chunk_idx * query_chunk_size
     key_offset = key_chunk_idx * key_chunk_size
     chunk_bias = jnp.zeros((1, 1, 1, 1), dtype=dtype)
+    neg_inf = jnp.array(-jnp.inf, dtype=dtype)
+    zero = jnp.array(0.0, dtype=dtype)
     if bias is not None:
         chunk_bias = lax.dynamic_slice(
             bias,
@@ -82,24 +84,17 @@ def _chunk_attention_bias(
             start_indices=(0, key_offset),
             slice_sizes=(kv_segment_ids.shape[0], key_chunk_size),
         )
-        # Segment IDs interpretation:
-        # - When used for document boundaries: different segment IDs = different documents, mask attention between them
-        # - When segment_id=0: this is a padding/invalid token that should not participate in attention at all
 
-        # Mask where segments don't match (for document boundaries)
         segment_mismatch_mask = ~jnp.equal(q_seg_chunk[:, :, None], kv_seg_chunk[:, None, :])
 
-        # Also mask any interaction involving segment_id=0 (padding tokens)
-        # If either query or key has segment_id=0, mask the attention
         q_or_kv_is_zero = (q_seg_chunk[:, :, None] == 0) | (kv_seg_chunk[:, None, :] == 0)
 
-        # Final mask: mask if segments mismatch OR if either is padding (segment 0)
         segment_ids_mask = segment_mismatch_mask | q_or_kv_is_zero
 
         segment_ids_mask = segment_ids_mask[:, None]
-        segment_ids_bias = segment_ids_mask * jnp.finfo(dtype).min
-        # Add segment masking bias to existing bias (additive, not minimum)
-        # This way, valid positions keep their bias value, masked positions become -inf
+
+        segment_ids_bias = jnp.where(segment_ids_mask, neg_inf, zero)
+
         chunk_bias = chunk_bias + segment_ids_bias
 
     if causal_block_size is not None:
@@ -107,10 +102,9 @@ def _chunk_attention_bias(
         query_idx += query_offset
         key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
         key_idx += key_offset
-        query_idx //= causal_block_size
-        key_idx //= causal_block_size
-        causal_mask_value = (query_idx < key_idx) * jnp.finfo(dtype).min
-        # Add causal masking bias (additive, not minimum)
+
+        causal_mask_value = jnp.where(key_idx > query_idx, neg_inf, zero)
+
         chunk_bias = chunk_bias + causal_mask_value.reshape(1, 1, *causal_mask_value.shape)
 
     if sliding_window is not None:
@@ -131,8 +125,8 @@ def _chunk_attention_bias(
             sink_mask = key_idx < attention_sink_size
             window_mask = window_mask | sink_mask
 
-        window_mask_value = (~window_mask) * jnp.finfo(dtype).min
-        # Add sliding window masking bias (additive, not minimum)
+        window_mask_value = jnp.where(~window_mask, neg_inf, zero)
+
         chunk_bias = chunk_bias + window_mask_value.reshape(1, 1, *window_mask_value.shape)
 
     if not deterministic and pdrop > 0.0:
@@ -145,7 +139,7 @@ def _chunk_attention_bias(
                 min(attn_dropout.shape[-1], key_chunk_size),
             ),
         )
-        chunk_bias += attn_dropout_slice * jnp.finfo(dtype).min
+        chunk_bias = chunk_bias + jnp.where(attn_dropout_slice, neg_inf, zero)
     return chunk_bias.astype(dtype)
 
 

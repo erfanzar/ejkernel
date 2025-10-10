@@ -21,7 +21,7 @@ from jaxtyping import Array, Float, Int
 def _recurrent_attention_step(
     carry: tuple[Float[Array, "num_heads key_dim value_dim"]],
     inputs: tuple,
-    scale: float,
+    softmax_scale: float,
     use_g: bool,
     use_g_gamma: bool,
     use_gk: bool,
@@ -36,7 +36,7 @@ def _recurrent_attention_step(
     Args:
         carry: Hidden state (h,) where h is [num_heads, key_dim, value_dim]
         inputs: Tuple of (q, k, v, g, g_gamma, gk, gv) for current timestep
-        scale: Query scaling factor
+        softmax_scale: Query scaling factor
         use_g, use_g_gamma, use_gk, use_gv: Flags for gating mechanisms
 
     Returns:
@@ -63,7 +63,7 @@ def _recurrent_attention_step(
 
     h = h + k[:, :, None] * v[:, None, :]
 
-    q_scaled = q * scale
+    q_scaled = q * softmax_scale
     o = jnp.sum(h * q_scaled[:, :, None], axis=1)
 
     return (h,), o
@@ -77,7 +77,7 @@ def _recurrent_attention_fwd(
     g_gamma: Float[Array, "num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
 ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
@@ -92,7 +92,7 @@ def _recurrent_attention_fwd(
         g: Optional gate for GLA-style gating [batch, seq_len, num_heads, head_dim]
         g_gamma: Optional per-head decay factor [num_heads]
         gk, gv: Optional gates for keys/values [batch, seq_len, num_heads, head_dim]
-        scale: Query scaling factor
+        softmax_scale: Query scaling factor
         initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
         reverse: If True, process sequence in reverse
 
@@ -101,8 +101,8 @@ def _recurrent_attention_fwd(
     """
     batch, seq_len, num_heads, head_dim = q.shape
 
-    if scale is None:
-        scale = 1.0 / jnp.sqrt(head_dim).astype(jnp.float32)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / jnp.sqrt(head_dim).astype(jnp.float32)
 
     use_g = g is not None
     use_g_gamma = g_gamma is not None
@@ -136,7 +136,7 @@ def _recurrent_attention_fwd(
 
         def scan_fn(carry, inputs):
             (h,) = carry
-            (h_new,), o = _recurrent_attention_step((h,), inputs, scale, use_g, use_g_gamma, use_gk, use_gv)
+            (h_new,), o = _recurrent_attention_step((h,), inputs, softmax_scale, use_g, use_g_gamma, use_gk, use_gv)
 
             return (h_new,), (h_new, o)
 
@@ -169,7 +169,7 @@ def _recurrent_attention_varlen_fwd(
     g_gamma: Float[Array, "num_heads"] | None = None,
     gk: Float[Array, "total_tokens num_heads head_dim"] | None = None,
     gv: Float[Array, "total_tokens num_heads head_dim"] | None = None,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     initial_state: Float[Array, "num_seqs num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
 ) -> tuple[Float[Array, "total_tokens num_heads head_dim"], Float[Array, "num_seqs num_heads head_dim head_dim"]]:
@@ -187,8 +187,8 @@ def _recurrent_attention_varlen_fwd(
     num_seqs = len(cu_seqlens) - 1
     head_dim = q.shape[2]
 
-    if scale is None:
-        scale = 1.0 / jnp.sqrt(head_dim).astype(jnp.float32)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / jnp.sqrt(head_dim).astype(jnp.float32)
 
     def process_sequence(seq_idx):
         """Process a single variable-length sequence."""
@@ -221,7 +221,7 @@ def _recurrent_attention_varlen_fwd(
             g_gamma=g_gamma,
             gk=gk_batch,
             gv=gv_batch,
-            scale=scale,
+            softmax_scale=softmax_scale,
             initial_state=h0_batch,
             reverse=reverse,
         )

@@ -82,7 +82,7 @@ class LightningAttention(Kernel[KernelConfig, Array]):
         value: Float[Array, "batch seq_len num_kv_heads head_dim"],
         layer_idx: int,
         num_layers: int,
-        scale: float | None = None,
+        softmax_scale: float | None = None,
         initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -98,7 +98,7 @@ class LightningAttention(Kernel[KernelConfig, Array]):
             value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
             layer_idx: Index of current layer in the model (0-indexed)
             num_layers: Total number of layers in the model
-            scale: Optional scaling factor for attention scores
+            softmax_scale: Optional scaling factor for attention scores
             initial_state: Optional initial hidden state [batch, num_heads, head_dim, head_dim]
             reverse: If True, process sequence in reverse order
             cu_seqlens: Cumulative sequence lengths for variable-length sequences
@@ -130,7 +130,7 @@ class LightningAttention(Kernel[KernelConfig, Array]):
             value=value,
             layer_idx=layer_idx,
             num_layers=num_layers,
-            scale=scale,
+            softmax_scale=softmax_scale,
             initial_state=initial_state,
             reverse=reverse,
             cu_seqlens=cu_seqlens,
@@ -182,7 +182,7 @@ def lightning_attention(
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     layer_idx: int,
     num_layers: int,
-    scale: float | None = None,
+    softmax_scale: float | None = None,
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -199,7 +199,7 @@ def lightning_attention(
         value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
         layer_idx: Current layer index in the model
         num_layers: Total number of layers in the model
-        scale: Scaling factor for attention
+        softmax_scale: Scaling factor for attention
         initial_state: Initial state for recurrent computation
         reverse: Whether to process sequence in reverse
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
@@ -213,7 +213,7 @@ def lightning_attention(
         >>> out = lightning_attention(query, key, value, layer_idx=5, num_layers=32)
         >>>
         >>>
-        >>> out = lightning_attention(query, key, value, layer_idx=0, num_layers=24, scale=0.125)
+        >>> out = lightning_attention(query, key, value, layer_idx=0, num_layers=24, softmax_scale=0.125)
         >>>
         >>>
         >>> out = lightning_attention(query, key, value, layer_idx=10, num_layers=32, cu_seqlens=cu_seqs)
@@ -228,7 +228,7 @@ def lightning_attention(
         value=value,
         layer_idx=layer_idx,
         num_layers=num_layers,
-        scale=scale,
+        softmax_scale=softmax_scale,
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,

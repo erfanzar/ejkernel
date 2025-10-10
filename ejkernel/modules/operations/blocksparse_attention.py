@@ -37,6 +37,7 @@ from ..base import KernelConfig, create_default_executor, detect_platform
 
 if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
+    from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask
 
 
 class BlockSparseAttention(Kernel[KernelConfig, Array]):
@@ -52,8 +53,9 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
         - Support for causal masking and sliding windows
         - Automatic platform/backend selection
         - Optional autotuning for optimal block sizes
-        - Gradient support for training
-        - Logits soft capping for numerical stability
+        - Gradient support for training with custom VJP
+        - Logit soft capping with tanh activation for numerical stability (Gemma-2 style)
+        - Separate forward/backward block sizes for performance tuning
 
     The mask builder function defines which blocks to compute, enabling patterns like:
         - Local attention (nearby tokens only)
@@ -68,9 +70,9 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
         >>> executor = create_default_executor()
         >>> attn = BlockSparseAttention()
         >>>
-        >>> # Define a simple local attention mask builder
+        >>>
         >>> def local_mask(q_idx, k_idx, q_size, k_size, window):
-        ...     # Implementation that creates local attention mask
+        ...
         ...     pass
         >>>
         >>> output = executor(
@@ -110,16 +112,27 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
         value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
         q_segment_ids: Int[Array, "batch seq_len"] | None = None,
         kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
-        softmax_aux: Float[Array, "..."] | None = None,
+        q_positions: Int[Array, "batch seq_len"] | None = None,
+        kv_positions: Int[Array, "batch kv_len"] | None = None,
+        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
+        sequence_parallelism_mesh_axis_name: str | None = None,
         logit_soft_cap: float | None = None,
-        query_chunk_size: int = 128,
-        key_chunk_size: int = 128,
+        qkv_layouts: tuple["SparseMask"] | None = None,
+        q_blocksize: int | None = None,
+        kv_blocksize: int | None = None,
+        bwd_q_blocksize: int | None = None,
+        bwd_kv_blocksize: int | None = None,
         softmax_scale: float | None = None,
-        mask_builder: typing.Callable[[int, int, int, int, int], Mask] | None = None,
+        mask_builder: typing.Callable[[int, int, int, int, int], "Mask"]
+        | typing.Callable[[], "SparseMask"]
+        | None = None,
         sliding_window: int | tuple[int, int] | None = None,
         chunk_size: int | None = None,
         causal: bool = True,
         fused_backward: bool = False,
+        debug: bool = False,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
@@ -133,8 +146,6 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
             kv_segment_ids: Segment IDs for keys/values [batch, kv_len]
             softmax_aux: Auxiliary values added to attention scores (e.g., for attention sinks)
             logit_soft_cap: Optional soft cap value to bound attention logits
-            query_chunk_size: Size of query chunks for tiling (default: 128)
-            key_chunk_size: Size of key chunks for tiling (default: 128)
             softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
             mask_builder: Function that builds the sparse mask pattern. Takes (q_idx, k_idx,
                 q_size, k_size, window_size) and returns a Mask object
@@ -142,6 +153,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
             chunk_size: Overall chunk size (alternative to separate query/key chunk sizes)
             causal: Whether to apply causal masking (default: True)
             fused_backward: Use fused backward pass for improved gradient computation
+            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
             cfg: Configuration object specifying platform/backend and kernel parameters
 
         Returns:
@@ -151,6 +163,16 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
             The mask_builder function is critical for defining sparsity patterns.
             It should return a mask indicating which blocks to compute.
         """
+        if platform is not None:
+            cfg = KernelConfig(
+                block_q=cfg.block_q,
+                block_k=cfg.block_k,
+                block_d=cfg.block_d,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+                platform=platform,
+                backend=cfg.backend,
+            )
         impl = self.get_impl(cfg)
         return impl(
             query=query,
@@ -158,16 +180,24 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
             value=value,
             q_segment_ids=q_segment_ids,
             kv_segment_ids=kv_segment_ids,
+            q_positions=q_positions,
+            kv_positions=kv_positions,
             softmax_aux=softmax_aux,
             logit_soft_cap=logit_soft_cap,
-            query_chunk_size=query_chunk_size,
-            key_chunk_size=key_chunk_size,
+            bias=bias,
+            sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
+            qkv_layouts=qkv_layouts,
+            q_blocksize=q_blocksize,
+            kv_blocksize=kv_blocksize,
+            bwd_q_blocksize=bwd_q_blocksize,
+            bwd_kv_blocksize=bwd_kv_blocksize,
             softmax_scale=softmax_scale,
             mask_builder=mask_builder,
             sliding_window=sliding_window,
             chunk_size=chunk_size,
             causal=causal,
             fused_backward=fused_backward,
+            debug=debug,
         )
 
     def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
@@ -242,16 +272,25 @@ def blocksparse_attention(
     value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
     q_segment_ids: Int[Array, "batch seq_len"] | None = None,
     kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
-    softmax_aux: Float[Array, "..."] | None = None,
+    q_positions: Int[Array, "batch seq_len"] | None = None,
+    kv_positions: Int[Array, "batch kv_len"] | None = None,
+    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
+    sequence_parallelism_mesh_axis_name: str | None = None,
     logit_soft_cap: float | None = None,
-    query_chunk_size: int = 128,
-    key_chunk_size: int = 128,
+    qkv_layouts: tuple["SparseMask"] | None = None,
+    q_blocksize: int | None = None,
+    kv_blocksize: int | None = None,
+    bwd_q_blocksize: int | None = None,
+    bwd_kv_blocksize: int | None = None,
     softmax_scale: float | None = None,
-    mask_builder: typing.Callable[[int, int, int, int, int], Mask] | None = None,
+    mask_builder: typing.Callable[[int, int, int, int, int], "Mask"] | typing.Callable[[], "SparseMask"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
     causal: bool = True,
     fused_backward: bool = False,
+    debug: bool = False,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
 ) -> Float[Array, "batch kv_num_heads kv_len vhead_dim"]:
     """Execute block-sparse attention with automatic optimization.
 
@@ -276,6 +315,7 @@ def blocksparse_attention(
         chunk_size: Alternative to separate query_chunk_size/key_chunk_size
         causal: Apply causal masking (default: True)
         fused_backward: Use fused backward pass (default: False)
+        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
 
     Returns:
         Attention output [batch, kv_num_heads, kv_len, vhead_dim]
@@ -283,12 +323,12 @@ def blocksparse_attention(
     Example:
         >>> from ejkernel.modules.operations import blocksparse_attention
         >>>
-        >>> # Simple causal sparse attention
+        >>>
         >>> output = blocksparse_attention(query, key, value, causal=True)
         >>>
-        >>> # Custom sparse pattern with mask builder
+        >>>
         >>> def local_plus_global(q_idx, k_idx, q_size, k_size, window):
-        ...     # Create mask for local + global tokens
+        ...
         ...     return create_local_global_mask(q_idx, k_idx, window)
         >>>
         >>> output = blocksparse_attention(
@@ -297,11 +337,10 @@ def blocksparse_attention(
         ...     sliding_window=256
         ... )
         >>>
-        >>> # With logit soft capping for numerical stability
+        >>>
         >>> output = blocksparse_attention(
         ...     query, key, value,
-        ...     logit_soft_cap=50.0,
-        ...     softmax_scale=0.125
+        ...     platform="triton"
         ... )
 
     Note:
@@ -310,6 +349,7 @@ def blocksparse_attention(
         - Architectures with specific attention patterns (e.g., Longformer)
         - Scenarios where custom sparsity patterns are needed
     """
+
     return _executor(
         BlockSparseAttention(),
         query=query,
@@ -317,14 +357,23 @@ def blocksparse_attention(
         value=value,
         q_segment_ids=q_segment_ids,
         kv_segment_ids=kv_segment_ids,
+        q_positions=q_positions,
+        kv_positions=kv_positions,
         softmax_aux=softmax_aux,
         logit_soft_cap=logit_soft_cap,
-        query_chunk_size=query_chunk_size,
-        key_chunk_size=key_chunk_size,
+        bias=bias,
+        sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
+        qkv_layouts=qkv_layouts,
+        q_blocksize=q_blocksize,
+        kv_blocksize=kv_blocksize,
+        bwd_q_blocksize=bwd_q_blocksize,
+        bwd_kv_blocksize=bwd_kv_blocksize,
         softmax_scale=softmax_scale,
         mask_builder=mask_builder,
         sliding_window=sliding_window,
         chunk_size=chunk_size,
         causal=causal,
         fused_backward=fused_backward,
+        debug=debug,
+        platform=platform,
     )
