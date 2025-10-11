@@ -13,4 +13,6 @@
 # limitations under the License.
 
 
-"""Comparison tests between kernel implementations."""
+from ._interface import ragged_decode_attention
+
+__all__ = ("ragged_decode_attention",)

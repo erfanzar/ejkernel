@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Internal consistency tests for XLA implementations.
 
 These tests verify that XLA implementations are numerically stable,

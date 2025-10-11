@@ -40,9 +40,9 @@ def _to_token_block_indices(block_indices, seq_len: int, block_size: int):
     if block_indices.shape[1] == seq_len:
         return block_indices
     num_query_blocks = seq_len // block_size
-    assert (
-        block_indices.shape[1] == num_query_blocks
-    ), f"block_indices has unexpected shape {block_indices.shape}, expected second dim {num_query_blocks} or {seq_len}"
+    assert block_indices.shape[1] == num_query_blocks, (
+        f"block_indices has unexpected shape {block_indices.shape}, expected second dim {num_query_blocks} or {seq_len}"
+    )
 
     qb_map = jnp.arange(seq_len) // block_size
 

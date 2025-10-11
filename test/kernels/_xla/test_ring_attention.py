@@ -512,9 +512,9 @@ class TestMaskingComparison:
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
-        assert jnp.allclose(
-            vanilla_output, ring_output, atol=2e-2
-        ), f"Ring attention with causal_block_size differs from vanilla with causal mask! Max diff: {max_diff}"
+        assert jnp.allclose(vanilla_output, ring_output, atol=2e-2), (
+            f"Ring attention with causal_block_size differs from vanilla with causal mask! Max diff: {max_diff}"
+        )
 
     def test_padding_mask_vs_vanilla(self):
         """Compare padding masking with vanilla attention."""
@@ -557,9 +557,9 @@ class TestMaskingComparison:
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
-        assert jnp.allclose(
-            vanilla_output, ring_output, atol=0.3
-        ), f"Ring attention with segment IDs differs from vanilla with padding mask! Max diff: {max_diff}"
+        assert jnp.allclose(vanilla_output, ring_output, atol=0.3), (
+            f"Ring attention with segment IDs differs from vanilla with padding mask! Max diff: {max_diff}"
+        )
 
     def test_combined_causal_padding_mask_vs_vanilla(self):
         """Compare combined causal + padding masking with vanilla attention."""
@@ -615,9 +615,9 @@ class TestMaskingComparison:
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
-        assert jnp.allclose(
-            vanilla_valid, ring_valid, atol=5e-2
-        ), f"Ring attention with segment IDs + causal differs from vanilla with combined mask! Max diff: {max_diff}"
+        assert jnp.allclose(vanilla_valid, ring_valid, atol=5e-2), (
+            f"Ring attention with segment IDs + causal differs from vanilla with combined mask! Max diff: {max_diff}"
+        )
 
     def test_sliding_window_vs_vanilla(self):
         """Compare sliding window with vanilla attention."""
@@ -653,9 +653,9 @@ class TestMaskingComparison:
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
-        assert jnp.allclose(
-            vanilla_output, ring_output, atol=2e-2
-        ), f"Ring attention with sliding_window differs from vanilla! Max diff: {max_diff}"
+        assert jnp.allclose(vanilla_output, ring_output, atol=2e-2), (
+            f"Ring attention with sliding_window differs from vanilla! Max diff: {max_diff}"
+        )
 
     def test_asymmetric_sliding_window_vs_vanilla(self):
         """Compare asymmetric sliding window with vanilla attention."""
@@ -691,9 +691,9 @@ class TestMaskingComparison:
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
-        assert jnp.allclose(
-            vanilla_output, ring_output, atol=2e-2
-        ), f"Ring attention with asymmetric sliding_window differs from vanilla! Max diff: {max_diff}"
+        assert jnp.allclose(vanilla_output, ring_output, atol=2e-2), (
+            f"Ring attention with asymmetric sliding_window differs from vanilla! Max diff: {max_diff}"
+        )
 
     def test_bias_vs_vanilla(self):
         """Compare bias handling with vanilla attention."""
@@ -728,9 +728,9 @@ class TestMaskingComparison:
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
-        assert jnp.allclose(
-            vanilla_output, ring_output, atol=2e-2
-        ), f"Ring attention with bias differs from vanilla! Max diff: {max_diff}"
+        assert jnp.allclose(vanilla_output, ring_output, atol=2e-2), (
+            f"Ring attention with bias differs from vanilla! Max diff: {max_diff}"
+        )
 
     def test_softmax_scale_vs_vanilla(self):
         """Compare custom softmax_scale with vanilla attention."""
@@ -766,9 +766,9 @@ class TestMaskingComparison:
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
-        assert jnp.allclose(
-            vanilla_output, ring_output, atol=5e-2
-        ), f"Ring attention with softmax_scale differs from vanilla! Max diff: {max_diff}"
+        assert jnp.allclose(vanilla_output, ring_output, atol=5e-2), (
+            f"Ring attention with softmax_scale differs from vanilla! Max diff: {max_diff}"
+        )
 
     def test_bias_and_sliding_window_vs_vanilla(self):
         """Compare bias + sliding window combination with vanilla attention."""
@@ -806,9 +806,9 @@ class TestMaskingComparison:
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
-        assert jnp.allclose(
-            vanilla_output, ring_output, atol=1e-1
-        ), f"Ring attention with bias + sliding_window differs from vanilla! Max diff: {max_diff}"
+        assert jnp.allclose(vanilla_output, ring_output, atol=1e-1), (
+            f"Ring attention with bias + sliding_window differs from vanilla! Max diff: {max_diff}"
+        )
 
     def test_all_features_combined_vs_vanilla(self):
         """Compare all features combined with vanilla attention."""
@@ -874,9 +874,9 @@ class TestMaskingComparison:
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
-        assert (
-            mean_diff < 0.1
-        ), f"Ring attention with all features has high mean difference from vanilla! Mean diff: {mean_diff}"
+        assert mean_diff < 0.1, (
+            f"Ring attention with all features has high mean difference from vanilla! Mean diff: {mean_diff}"
+        )
 
 
 class TestGradients:

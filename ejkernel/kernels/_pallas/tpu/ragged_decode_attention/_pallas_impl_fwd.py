@@ -135,23 +135,41 @@ def ragged_flash_attention_kernel(
             right_bound = query_pos + sliding_window_right
             mask = mask & (ranges <= right_bound)
 
-        qk = jnp.where(mask, qk, jnp.finfo(qk.dtype).min)
+        sink_cols = lax.broadcasted_iota(jnp.int32, qk.shape, 1) >= block_size
+        mask_with_sinks = mask | sink_cols if has_softmax_aux else mask
+        qk = jnp.where(mask_with_sinks, qk, jnp.finfo(qk.dtype).min)
 
-        m_curr = qk.max(axis=-1)
-        s_curr = jnp.exp(qk - m_curr[..., None])
+        has_seq = jnp.any(mask[..., :block_size], axis=-1)
+
+        has_update = has_seq | has_softmax_aux
+
+        m_raw = qk.max(axis=-1)
+        m_curr = jnp.where(has_update, m_raw, m_prev)
+
+        s_curr = jnp.exp(jnp.where(has_update[..., None], qk - m_curr[..., None], -jnp.inf))
 
         s_curr_seq = s_curr[..., :block_size]
         o_curr_times_l_curr = jnp.dot(s_curr_seq, v)
 
-        m_curr = jax.lax.broadcast_in_dim(m_curr, m_prev.shape, (0,))
-        m_next = jnp.maximum(m_prev, m_curr)
-        alpha = jnp.exp(m_prev - m_next)
-        beta = jnp.exp(m_curr - m_next)
-        l_next = alpha * l_prev + beta * jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
+        sum_s = s_curr.sum(axis=-1)
+        has_update2 = (sum_s > 0) | (l_prev > 0)
+
+        m_next = jnp.where(has_update2, jnp.maximum(m_prev, m_curr), m_prev)
+        alpha = jnp.where(has_update2, jnp.exp(m_prev - m_next), 0.0)
+        beta = jnp.where(has_update2, jnp.exp(m_curr - m_next), 0.0)
+
+        sum_s_b = jax.lax.broadcast_in_dim(sum_s, l_prev.shape, (0,))
+        l_next = jnp.where(has_update2, alpha * l_prev + beta * sum_s_b, l_prev)
         l_next_safe = jnp.where(l_next == 0.0, 1.0, l_next)
 
+        o_new = jnp.where(
+            has_update2[..., None],
+            (l_prev * alpha)[..., None] * o_ref[...] + beta[..., None] * o_curr_times_l_curr,
+            o_ref[...],
+        )
+        o_ref[...] = (o_new / l_next_safe[..., None]).astype(o_ref.dtype)
+
         m_ref[...], l_ref[...] = m_next, l_next_safe
-        o_ref[...] = ((l_prev * alpha * o_ref[...] + beta * o_curr_times_l_curr) / l_next_safe).astype(o_ref.dtype)
 
 
 def ragged_decode_mqa(
@@ -231,16 +249,16 @@ def ragged_decode_mqa(
             ],
             out_specs=[
                 pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
-                pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
-                pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
+                pl.BlockSpec((None, num_heads), lambda b, i, *_: (b, 0)),
+                pl.BlockSpec((None, num_heads), lambda b, i, *_: (b, 0)),
             ],
-            grid=(batch_size, seq_len // block_size),
+            grid=(batch_size, (seq_len + block_size - 1) // block_size),
         ),
         compiler_params=pltpu.TPUCompilerParams(dimension_semantics=("parallel", "arbitrary")),
         out_shape=[
             jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
-            jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
-            jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
+            jax.ShapeDtypeStruct((batch_size, num_heads), jnp.float32),
+            jax.ShapeDtypeStruct((batch_size, num_heads), jnp.float32),
         ],
         cost_estimate=cost_estimate,
     )(sequence_start, sequence_end, query_tensor, key_tensor, value_tensor, softmax_aux)
@@ -313,7 +331,9 @@ def inner_decode_tpu(
             sliding_window_right=sliding_window_right,
             logit_soft_cap=logit_soft_cap_val,
         ),
-        in_axes=(1, 1, 1, None, None, None),
+        in_axes=(1, 1, 1, None, None, 0)
+        if (softmax_aux is not None and softmax_aux.ndim == 2)
+        else (1, 1, 1, None, None, None),
         out_axes=1,
     )(query_tensor, key_tensor, value_tensor, sequence_start, sequence_end, softmax_aux)
 
