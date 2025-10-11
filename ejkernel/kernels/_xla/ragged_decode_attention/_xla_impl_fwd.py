@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -44,44 +45,38 @@ def create_attention_mask(
     Returns:
         Boolean mask of shape [batch, q_len, 1, kv_len]
     """
-    # Create position indices
-    kv_positions = jnp.arange(kv_len)[None, None, :]  # [1, 1, kv_len]
 
-    # Basic ragged mask
-    start_expanded = sequence_start[:, None, None]  # [batch, 1, 1]
-    end_expanded = sequence_end[:, None, None]  # [batch, 1, 1]
+    kv_positions = jnp.arange(kv_len)[None, None, :]
+
+    start_expanded = sequence_start[:, None, None]
+    end_expanded = sequence_end[:, None, None]
 
     ragged_mask = (kv_positions >= start_expanded) & (kv_positions < end_expanded)
 
-    # Apply sliding window if specified
     if sliding_window is not None:
         window_left, window_right = sliding_window
-        # For decode (q_len=1), we're at the last position
+
         if q_len == 1:
-            # Use the end position minus 1 as the query position
             q_positions = end_expanded - 1
-            # Create window mask
+
             window_mask = (kv_positions >= q_positions - window_left) & (kv_positions <= q_positions + window_right)
-            # Combine with ragged mask
+
             ragged_mask = ragged_mask & window_mask
         else:
-            # For multiple query positions, each query attends to its local window
             q_positions = jnp.arange(q_len)[None, :, None] + start_expanded
             window_mask = (kv_positions >= q_positions - window_left) & (kv_positions <= q_positions + window_right)
             ragged_mask = ragged_mask[:, None, :] & window_mask
 
-    # Add attention sinks (first num_sinks tokens are always attendable within valid range)
     if num_sinks > 0:
         sink_positions = jnp.arange(kv_len)[None, None, :]
-        # Sinks are the first tokens within the valid sequence range
+
         sink_mask = (sink_positions >= start_expanded) & (sink_positions < start_expanded + num_sinks)
         ragged_mask = ragged_mask | sink_mask
 
-    # Ensure proper shape [batch, q_len, 1, kv_len]
     if ragged_mask.ndim == 3:
-        ragged_mask = ragged_mask[:, None, None, :]  # Add q_len dimension
+        ragged_mask = ragged_mask[:, None, None, :]
     elif ragged_mask.ndim == 4:
-        ragged_mask = ragged_mask[:, :, None, :]  # Add head dimension placeholder
+        ragged_mask = ragged_mask[:, :, None, :]
 
     return ragged_mask
 
@@ -121,26 +116,19 @@ def apply_attention_sinks_block(
 
     _batch_size, _q_len, heads, block_size_val = scores.shape
 
-    # Handle different sink_scores shapes
     if sink_scores.ndim == 1:
         sink_scores = jnp.broadcast_to(sink_scores[None, :], (heads, num_sinks))
 
-    # Create position indices for this block
     block_positions = jnp.arange(block_size_val) + block_offset
 
-    # Create sink biases for this block using gather
-    # Positions < num_sinks get their corresponding sink score, others get 0
     is_sink_position = block_positions < num_sinks
-    sink_indices = jnp.minimum(block_positions, num_sinks - 1)  # Clamp to valid range
+    sink_indices = jnp.minimum(block_positions, num_sinks - 1)
 
-    # Gather sink scores for each position
-    block_sink_biases = sink_scores[:, sink_indices]  # [heads, block_size]
+    block_sink_biases = sink_scores[:, sink_indices]
 
-    # Mask out non-sink positions
     block_sink_biases = jnp.where(is_sink_position[None, :], block_sink_biases, 0.0)
 
-    # Reshape for broadcasting
-    block_sink_biases = block_sink_biases[None, None, :, :]  # [1, 1, heads, block_size]
+    block_sink_biases = block_sink_biases[None, None, :, :]
 
     return scores + block_sink_biases
 
@@ -169,55 +157,42 @@ def flash_attention_block(
     o_prev, m_prev, l_prev = carry
     q, k_block, v_block, mask_block, block_offset = block_inputs
 
-    # Get shapes
     _batch_size, _q_len, q_heads, _head_dim = q.shape
     _, _block_size, kv_heads, _ = k_block.shape
 
-    # Handle MQA/GQA by repeating KV heads
     if kv_heads < q_heads:
         assert q_heads % kv_heads == 0, f"Query heads {q_heads} must be divisible by KV heads {kv_heads}"
         repeat_factor = q_heads // kv_heads
         k_block = jnp.repeat(k_block, repeat_factor, axis=2)
         v_block = jnp.repeat(v_block, repeat_factor, axis=2)
 
-    # Compute attention scores
     scores = jnp.einsum("...qhd,...khd->...qhk", q * softmax_scale, k_block)
 
-    # Apply logit soft capping if specified
     if logit_soft_cap is not None:
         scores = apply_logit_soft_cap(scores, logit_soft_cap)
 
-    # Apply attention sink biases if specified
     if sink_scores is not None and num_sinks > 0:
         scores = apply_attention_sinks_block(scores, sink_scores, num_sinks, block_offset)
 
-    # Broadcast mask to match scores shape
     mask_expanded = jnp.broadcast_to(mask_block, scores.shape)
 
-    # Apply mask
     scores = jnp.where(mask_expanded, scores, -jnp.inf)
 
-    # Compute new max and exp
     m_curr = jnp.max(scores, axis=-1, keepdims=True)
     m_new = jnp.maximum(m_prev, m_curr)
 
-    # Compute exp with numerical stability
     exp_scores = jnp.exp(scores - m_new)
     exp_scores = jnp.where(mask_expanded, exp_scores, 0.0)
 
-    # Update normalizer
     l_curr = jnp.sum(exp_scores, axis=-1, keepdims=True)
     correction_prev = jnp.exp(m_prev - m_new)
     l_new = correction_prev * l_prev + l_curr
 
-    # Prevent division by zero
     l_new_safe = jnp.where(l_new == 0, 1.0, l_new)
 
-    # Compute weighted values
     attn_weights = exp_scores / l_new_safe
     o_curr = jnp.einsum("...qhk,...khd->...qhd", attn_weights, v_block)
 
-    # Update output with proper rescaling
     o_new = (correction_prev * l_prev * o_prev + l_curr * o_curr) / l_new_safe
 
     return (o_new, m_new, l_new), None
@@ -258,7 +233,6 @@ def ragged_flash_attention_xla(
     if softmax_scale is None:
         softmax_scale = 1.0 / jnp.sqrt(head_dim)
 
-    # Determine number of sinks from softmax_aux
     num_sinks = 0
     sink_scores = None
     if softmax_aux is not None:
@@ -268,50 +242,41 @@ def ragged_flash_attention_xla(
             num_sinks = softmax_aux.shape[-1]
         sink_scores = softmax_aux
 
-    # Create comprehensive mask
     mask = create_attention_mask(
         batch_size, q_len, kv_len, sequence_start, sequence_end, sliding_window=sliding_window, num_sinks=num_sinks
     )
 
-    # Determine number of blocks
     num_blocks = (kv_len + block_size - 1) // block_size
 
-    # Initialize carry values
     output_init = jnp.zeros_like(query)
     max_logits_init = jnp.full((batch_size, q_len, num_heads, 1), -jnp.inf)
     normalizer_init = jnp.zeros((batch_size, q_len, num_heads, 1))
 
-    # Pad if necessary
     pad_len = num_blocks * block_size - kv_len
     if pad_len > 0:
-        # Ensure proper padding dimensions for 4D tensors
         key = jnp.pad(key, ((0, 0), (0, pad_len), (0, 0), (0, 0)), mode="constant")
         value = jnp.pad(value, ((0, 0), (0, pad_len), (0, 0), (0, 0)), mode="constant")
-        # Mask might have different dimensions depending on q_len
+
         if mask.ndim == 4:
             mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, pad_len)), mode="constant")
         elif mask.ndim == 5:
             mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 0), (0, 0), (0, pad_len)), mode="constant")
 
-    # Reshape into blocks
     key_blocks = key.reshape(batch_size, num_blocks, block_size, kv_heads, head_dim)
     value_blocks = value.reshape(batch_size, num_blocks, block_size, kv_heads, head_dim)
 
-    # Handle mask reshaping based on its dimensions
     if mask.ndim == 4:
         mask_blocks = mask.reshape(batch_size, q_len, 1, num_blocks, block_size)
     else:
         mask_blocks = mask.reshape(batch_size, q_len, mask.shape[2], num_blocks, block_size)
-    mask_blocks = jnp.transpose(mask_blocks, (0, 3, 1, 2, 4))  # [B, num_blocks, q_len, 1, block_size]
+    mask_blocks = jnp.transpose(mask_blocks, (0, 3, 1, 2, 4))
 
-    # Define scan function with enhanced features
     def scan_fn(carry, inputs):
         (block_idx,) = inputs
-        k_block = key_blocks[:, block_idx]  # [B, block_size, H_kv, D]
-        v_block = value_blocks[:, block_idx]  # [B, block_size, H_kv, D]
-        m_block = mask_blocks[:, block_idx]  # [B, q_len, 1, block_size]
+        k_block = key_blocks[:, block_idx]
+        v_block = value_blocks[:, block_idx]
+        m_block = mask_blocks[:, block_idx]
 
-        # Calculate block offset for sink handling
         block_offset = block_idx * block_size
 
         return flash_attention_block(
@@ -323,7 +288,6 @@ def ragged_flash_attention_xla(
             num_sinks=num_sinks,
         )
 
-    # Run scan over blocks
     (output, _, _), _ = lax.scan(scan_fn, (output_init, max_logits_init, normalizer_init), (jnp.arange(num_blocks),))
 
     return output
@@ -364,23 +328,18 @@ def ragged_decode_mqa_xla(
     if softmax_scale is None:
         softmax_scale = 1.0 / jnp.sqrt(head_dim)
 
-    # Reshape query for grouped query attention
     group_size = num_heads_q // num_heads_kv
     query = query.reshape(batch_size, num_heads_kv, group_size, head_dim)
 
-    # Transpose for vmap
-    query = jnp.transpose(query, (1, 0, 2, 3))  # [H_kv, B, group_size, D]
-    key = jnp.transpose(key, (2, 0, 1, 3))  # [H_kv, B, S, D]
-    value = jnp.transpose(value, (2, 0, 1, 3))  # [H_kv, B, S, D]
+    query = jnp.transpose(query, (1, 0, 2, 3))
+    key = jnp.transpose(key, (2, 0, 1, 3))
+    value = jnp.transpose(value, (2, 0, 1, 3))
 
-    # Process each KV head group
     def process_kv_head(q_group, k_head, v_head):
-        # Add dimensions for attention
-        k_head = k_head[:, :, None, :]  # [B, S, 1, D]
-        v_head = v_head[:, :, None, :]  # [B, S, 1, D]
-        q_group = q_group[:, None, :, :]  # [B, 1, group_size, D]
+        k_head = k_head[:, :, None, :]
+        v_head = v_head[:, :, None, :]
+        q_group = q_group[:, None, :, :]
 
-        # Run enhanced attention
         output = ragged_flash_attention_xla(
             q_group,
             k_head,
@@ -394,13 +353,11 @@ def ragged_decode_mqa_xla(
             softmax_aux=softmax_aux,
         )
 
-        return output[:, 0, :, :]  # [B, group_size, D]
+        return output[:, 0, :, :]
 
-    # Vectorize over KV heads
-    outputs = jax.vmap(process_kv_head)(query, key, value)  # [H_kv, B, group_size, D]
+    outputs = jax.vmap(process_kv_head)(query, key, value)
 
-    # Transpose and reshape back
-    outputs = jnp.transpose(outputs, (1, 0, 2, 3))  # [B, H_kv, group_size, D]
+    outputs = jnp.transpose(outputs, (1, 0, 2, 3))
     return outputs.reshape(batch_size, num_heads_q, head_dim)
 
 
@@ -436,23 +393,23 @@ def inner_decode_xla(
         Output tensor with same batch/head structure as query
 
     Examples:
-        # Basic usage
+
         output = inner_decode_xla(query, key, value, start, end)
 
-        # With sliding window (attend to 128 tokens left, 0 right for decode)
+
         output = inner_decode_xla(
             query, key, value, start, end,
             sliding_window=(128, 0)
         )
 
-        # With logit soft capping at 50.0
+
         output = inner_decode_xla(
             query, key, value, start, end,
             logit_soft_cap=50.0
         )
 
-        # With 4 attention sinks (learnable biases for first 4 tokens)
-        sink_biases = jnp.ones(4) * 0.1  # or jnp.ones((num_heads, 4))
+
+        sink_biases = jnp.ones(4) * 0.1
         output = inner_decode_xla(
             query, key, value, start, end,
             softmax_aux=sink_biases
@@ -462,15 +419,13 @@ def inner_decode_xla(
     num_heads_q = query.shape[-2]
     head_dim = query.shape[-1]
 
-    # Handle optional dimensions
     out_shape = (batch_size, 1, num_heads_q, head_dim)
     if query.ndim == 3:
         query = jnp.expand_dims(query, 1)
         out_shape = (batch_size, num_heads_q, head_dim)
 
-    # For single query position (decode), squeeze the query dimension
     if query.shape[1] == 1:
-        query = query[:, 0]  # [B, H_q, D]
+        query = query[:, 0]
         output = ragged_decode_mqa_xla(
             query,
             key,
@@ -484,11 +439,9 @@ def inner_decode_xla(
             softmax_aux=softmax_aux,
         )
     else:
-        # Full attention for multiple query positions
         _, _seq_len_q, _, _ = query.shape
         _, _seq_len_kv, num_heads_kv, _ = key.shape
 
-        # Expand KV heads to match Q heads if using MQA/GQA
         if num_heads_kv != num_heads_q:
             repeat_factor = num_heads_q // num_heads_kv
             key = jnp.repeat(key, repeat_factor, axis=2)
