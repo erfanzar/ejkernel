@@ -106,7 +106,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
         value: Float[Array, "batch seq_len num_kv_heads head_dim"],
         sequence_start: Int[Array, "batch"],
         sequence_end: Int[Array, "batch"],
-        softmax_scale: float | None = 1,
+        softmax_scale: float | None = None,
         block_size: int = 256,
         sliding_window: tuple[int, int] | None = None,
         logit_soft_cap: float | None = None,
@@ -171,7 +171,6 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
             sequence_start=sequence_start,
             sequence_end=sequence_end,
             block_size=block_size,
-            platform=platform,
         )
 
     def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
@@ -241,7 +240,7 @@ def ragged_decode_attention(
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
-    softmax_scale: float | None = 1,
+    softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,

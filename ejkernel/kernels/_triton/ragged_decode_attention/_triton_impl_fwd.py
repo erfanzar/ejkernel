@@ -240,7 +240,7 @@ def inner_decode_triton(
     value_tensor: Array,
     sequence_start: Array,
     sequence_end: Array,
-    softmax_scale: float | None = 1.0,
+    softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
@@ -254,6 +254,10 @@ def inner_decode_triton(
       - reshape back to [B, HQ, D]
     """
     B, HQ, D = query_tensor.shape
+
+    if softmax_scale is None:
+        softmax_scale = query_tensor.shape[-1] ** -0.5
+
     _S, HKV = key_tensor.shape[1], key_tensor.shape[2]
     assert HQ % HKV == 0, "GQA requires HQ divisible by HKV"
     G = HQ // HKV

@@ -122,7 +122,7 @@ def ragged_decode_mqa(
     value: chex.Array,
     sequence_start: chex.Array,
     sequence_end: chex.Array,
-    softmax_scale: float | None = 1,
+    softmax_scale: float | None = None,
     block_size: int = 256,
     cost_estimate: pl.CostEstimate | None = None,
 ) -> jax.Array:
@@ -153,6 +153,8 @@ def ragged_decode_mqa(
     assert sequence_end.dtype == jnp.int32
 
     seq_len = key.shape[1]
+    if softmax_scale is None:
+        softmax_scale = query.shape[-1] ** -0.5
 
     out, *_ = pl.pallas_call(
         functools.partial(
@@ -192,7 +194,7 @@ def inner_decode_tpu(
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
-    softmax_scale: float | None = 1,
+    softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
@@ -212,6 +214,9 @@ def inner_decode_tpu(
     Returns:
         chex.Array: Output tensor of shape [B, H, D].
     """
+
+    if softmax_scale is None:
+        softmax_scale = query.shape[-1] ** -0.5
     batch_size = query.shape[0]
     num_heads_q = query.shape[-2]
     head_dim = query.shape[-1]

@@ -508,5 +508,5 @@ def blocksparse_attention(
         bwd_q_blocksize=bwd_q_blocksize,
         bwd_kv_blocksize=bwd_kv_blocksize,
         logit_soft_cap=logit_soft_cap,
-        debug=debug,
+        debug=debug if isinstance(debug, bool) else False,
     )

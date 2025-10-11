@@ -179,6 +179,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
+
         return impl(
             query=query,
             key=key,
