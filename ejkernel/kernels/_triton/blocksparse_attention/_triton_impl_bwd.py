@@ -1107,7 +1107,6 @@ def blocksparse_attn_bwd(
 
 def _bwd_blocksparse_attn_call(
     softmax_scale: float,
-    bias: ArrayLike | None,
     apply_load_balance: bool,
     sequence_parallelism_mesh_axis_name: str | None,
     window_left: int,
@@ -1133,6 +1132,8 @@ def _bwd_blocksparse_attn_call(
         qkv_layouts,
         out,
         lse,
+        softmax_aux,  # noqa
+        bias,  # noqa
     ) = res
     qkv_layouts: tuple[SparseMask]
     dout = dout.transpose(0, 2, 1, 3)
@@ -1398,5 +1399,6 @@ def _bwd_blocksparse_attn_call(
             SparseMask(lower_bounds=None, upper_bounds=None, lower_full_bounds=None, upper_full_bounds=None),
             SparseMask(lower_bounds=None, upper_bounds=None, lower_full_bounds=None, upper_full_bounds=None),
         ),
+        None,
         None,
     )

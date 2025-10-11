@@ -36,11 +36,12 @@ This is particularly useful for:
 
 from __future__ import annotations
 
+import typing
 from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -100,7 +101,7 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
         initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
@@ -137,7 +138,7 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
         return impl(
@@ -206,7 +207,7 @@ def recurrent_attention(
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "batch seq_len num_heads head_dim"]:
     """Execute recurrent attention with automatic optimization.
 

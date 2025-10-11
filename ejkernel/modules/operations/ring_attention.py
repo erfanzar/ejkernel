@@ -68,7 +68,7 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -150,7 +150,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
         sliding_window: int | tuple[int, int] | None = None,
         logit_soft_cap: float | None = None,
         attention_sink_size: int = 0,
-        platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
@@ -212,7 +212,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
         return impl(
@@ -327,7 +327,7 @@ def ring_attention(
     sliding_window: int | tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
     attention_sink_size: int = 0,
-    platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute ring attention with automatic optimization.
 

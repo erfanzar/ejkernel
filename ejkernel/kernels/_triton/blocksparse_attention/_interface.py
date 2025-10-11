@@ -94,7 +94,7 @@ if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=[8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21])
+@functools.partial(jax.custom_vjp, nondiff_argnums=[8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21])
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -279,7 +279,6 @@ def _blocksparse_attention_bhtd_fwd(
 
 def _blocksparse_attention_bhtd_bwd(
     softmax_scale: float,
-    bias: ArrayLike | None,
     apply_load_balance: bool,
     sequence_parallelism_mesh_axis_name: str | None,
     window_left: int,
@@ -324,7 +323,6 @@ def _blocksparse_attention_bhtd_bwd(
     """
     return _bwd_blocksparse_attn_call(
         softmax_scale=softmax_scale,
-        bias=bias,
         apply_load_balance=apply_load_balance,
         sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
         window_left=window_left,

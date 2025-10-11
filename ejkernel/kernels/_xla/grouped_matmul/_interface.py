@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
 from __future__ import annotations
 
 import typing
@@ -113,10 +115,10 @@ def grouped_matmul(
         - Cost estimation helps XLA make scheduling decisions
     """
     return jax.lax.ragged_dot(
-        lhs,
-        rhs,
-        group_sizes,
-        precision,
-        preferred_element_type,
-        group_offset,
+        lhs=lhs,
+        rhs=rhs,
+        group_sizes=group_sizes,
+        precision=precision,
+        preferred_element_type=preferred_element_type,
+        group_offset=group_offset,
     )

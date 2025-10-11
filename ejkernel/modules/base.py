@@ -130,6 +130,10 @@ class KernelConfig:
     algorithm: str | None = None
     priority: int = 0
 
+    def __post_init__(self):
+        if self.platform == "xla":
+            self.backend = "any"
+
 
 def create_default_executor(
     persistent_cache_path: str | None = None,

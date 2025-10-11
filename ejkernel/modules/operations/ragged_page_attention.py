@@ -22,7 +22,7 @@ from typing import Literal
 from jax import numpy as jnp
 from jaxtyping import Array, DTypeLike, Float, Int
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -52,9 +52,7 @@ class RaggedPageAttention(Kernel[KernelConfig, Array]):
         block_tables: Int[Array, "num_seqs pages_per_seq"],
         query_start_loc: Int[Array, "num_seqs_plus_one"],
         num_seqs: Array | int,
-        platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
-        *,
-        cfg: KernelConfig,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         softmax_scale: float | None = None,
         logit_soft_cap: float | None = None,
         compute_dtype: DTypeLike = jnp.bfloat16,
@@ -65,6 +63,8 @@ class RaggedPageAttention(Kernel[KernelConfig, Array]):
         num_kv_pages_per_block: int | None = None,
         num_queries_per_block: int | None = None,
         vmem_limit_bytes: int | None = None,
+        *,
+        cfg: KernelConfig,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
         """Execute ragged page attention."""
 
@@ -76,7 +76,7 @@ class RaggedPageAttention(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
         return impl(
@@ -111,12 +111,7 @@ class RaggedPageAttention(Kernel[KernelConfig, Array]):
 
     def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
         """Generate candidate configurations for autotuning."""
-        block_configs = [
-            (32, 64, 4, 1),
-            (64, 64, 4, 1),
-            (64, 128, 8, 2),
-            (128, 128, 8, 2),
-        ]
+        block_configs = [(32, 64, 4, 1)]
 
         candidates = []
         for block_q, block_k, num_warps, num_stages in block_configs:
@@ -154,7 +149,7 @@ def ragged_page_attention(
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Execute ragged page attention with automatic optimization.
 
@@ -224,4 +219,5 @@ def ragged_page_attention(
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
+        platform=platform,
     )

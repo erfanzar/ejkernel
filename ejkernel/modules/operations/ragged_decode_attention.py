@@ -50,7 +50,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -111,7 +111,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
         sliding_window: tuple[int, int] | None = None,
         logit_soft_cap: float | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
@@ -157,7 +157,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
         return impl(
@@ -246,7 +246,7 @@ def ragged_decode_attention(
     sliding_window: tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Execute ragged decode attention with automatic optimization.
 

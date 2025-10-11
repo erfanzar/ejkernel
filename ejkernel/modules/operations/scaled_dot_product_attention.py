@@ -21,7 +21,7 @@ import typing
 
 from jaxtyping import Array, Bool, Float, Int
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -95,7 +95,7 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
         sliding_window: int | tuple[int, int] | None = None,
         cum_seqlens_q: Int[Array, "batch"] | None = None,
         cum_seqlens_k: Int[Array, "batch"] | None = None,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
@@ -133,7 +133,7 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
 
         impl = self.get_impl(cfg)
@@ -230,7 +230,7 @@ def scaled_dot_product_attention(
     sliding_window: int | tuple[int, int] | None = None,
     cum_seqlens_q: Int[Array, "batch"] | None = None,
     cum_seqlens_k: Int[Array, "batch"] | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute flash attention with automatic optimization.
 

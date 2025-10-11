@@ -60,7 +60,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -122,7 +122,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
         attn_scale: float | None = None,
         max_context_len: int | None = None,
         num_splits: int = 0,
-        platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: KernelConfig,
         mask_value: float = -2.381976426469702e38,
@@ -178,7 +178,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
         return impl(
@@ -272,7 +272,7 @@ def page_attention(
     pages_per_compute_block: int | None = None,
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
-    platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
     """Execute page attention with automatic optimization.
 

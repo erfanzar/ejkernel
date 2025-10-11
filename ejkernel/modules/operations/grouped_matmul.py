@@ -34,7 +34,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -92,7 +92,7 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
         transpose_rhs: bool = False,
         interpret: bool = False,
         precision=None,
-        platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "m n"]:
@@ -128,7 +128,7 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
         return impl(
@@ -195,7 +195,7 @@ def grouped_matmul(
     transpose_rhs: bool = False,
     interpret: bool = False,
     precision=None,
-    platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "m n"]:
     """Execute grouped matrix multiplication with automatic optimization.
 

@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import typing
 
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Bool, Float, Int
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -116,6 +116,11 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
         kv_positions: Int[Array, "batch kv_len"] | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
+        attention_mask: Bool[Array, "batch num_heads seq_len head_dim"]
+        | Bool[Array, "batch 1 seq_len head_dim"]
+        | Int[Array, "batch num_heads seq_len head_dim"]
+        | Int[Array, "batch 1 seq_len head_dim"]
+        | None = None,
         sequence_parallelism_mesh_axis_name: str | None = None,
         logit_soft_cap: float | None = None,
         qkv_layouts: tuple["SparseMask"] | None = None,
@@ -132,7 +137,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
         causal: bool = True,
         fused_backward: bool = False,
         debug: bool = False,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
@@ -171,7 +176,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
         return impl(
@@ -185,6 +190,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
             softmax_aux=softmax_aux,
             logit_soft_cap=logit_soft_cap,
             bias=bias,
+            attention_mask=attention_mask,
             sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
             qkv_layouts=qkv_layouts,
             q_blocksize=q_blocksize,
@@ -239,12 +245,7 @@ class BlockSparseAttention(Kernel[KernelConfig, Array]):
             the fastest one for the given input configuration.
         """
 
-        block_configs = [
-            (128, 128),
-            (128, 256),
-            (256, 128),
-            (256, 256),
-        ]
+        block_configs = [(128, 128)]
 
         candidates = []
         for block_q, block_k in block_configs:
@@ -276,6 +277,11 @@ def blocksparse_attention(
     kv_positions: Int[Array, "batch kv_len"] | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads seq_len head_dim"]
+    | Bool[Array, "batch 1 seq_len head_dim"]
+    | Int[Array, "batch num_heads seq_len head_dim"]
+    | Int[Array, "batch 1 seq_len head_dim"]
+    | None = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
     logit_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,
@@ -290,7 +296,7 @@ def blocksparse_attention(
     causal: bool = True,
     fused_backward: bool = False,
     debug: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "batch kv_num_heads kv_len vhead_dim"]:
     """Execute block-sparse attention with automatic optimization.
 
@@ -362,6 +368,7 @@ def blocksparse_attention(
         softmax_aux=softmax_aux,
         logit_soft_cap=logit_soft_cap,
         bias=bias,
+        attention_mask=attention_mask,
         sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
         qkv_layouts=qkv_layouts,
         q_blocksize=q_blocksize,

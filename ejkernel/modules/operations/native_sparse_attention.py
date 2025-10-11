@@ -35,7 +35,7 @@ import typing
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -92,7 +92,7 @@ class NativeSparseAttention(Kernel[KernelConfig, Array]):
         block_size: int = 64,
         softmax_scale: float | None = None,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch seq_len num_heads head_dim"]:
@@ -129,7 +129,7 @@ class NativeSparseAttention(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
         return impl(
@@ -192,7 +192,7 @@ def native_sparse_attention(
     block_size: int = 64,
     softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "batch seq_len num_heads head_dim"]:
     """Execute native sparse attention with automatic optimization.
 

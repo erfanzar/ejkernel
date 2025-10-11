@@ -140,7 +140,7 @@ class KernelRegistry:
     def get(
         self,
         algorithm: str,
-        platform: Platform | Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: Platform | Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         backend: Backend | Literal["gpu", "tpu", "cpu", "any"] | None = None,
     ) -> Callable:
         """Retrieve the best matching kernel implementation.
@@ -182,9 +182,10 @@ class KernelRegistry:
                 continue
             return spec.implementation
 
+        if platform == Platform.XLA:
+            return self.get(algorithm=algorithm, platform=platform, backend=Backend.ANY)
         if backend == Backend.ANY:
             return self.get(algorithm=algorithm, platform=platform, backend=jax.default_backend())
-
         raise ValueError(f"No implementation found for algorithm={algorithm}, platform={platform}, backend={backend}")
 
     def list_algorithms(self) -> list[str]:

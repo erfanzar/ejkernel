@@ -690,6 +690,8 @@ def _fwd_blocksparse_attn_call(
         qkv_layouts,
         out,
         lse,
+        softmax_aux,
+        bias,
     ]
 
     return out, outputs_for_bwd_pass

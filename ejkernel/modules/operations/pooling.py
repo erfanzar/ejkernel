@@ -32,7 +32,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import Invocation, Kernel
 
 from ..base import KernelConfig, create_default_executor, detect_platform
@@ -79,7 +79,7 @@ class MeanPooling(Kernel[KernelConfig, Array]):
         x: Float[Array, "batch seq_len hidden_dim"],
         chunk_size: int = 32,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: KernelConfig,
     ) -> Float[Array, "batch hidden_dim"]:
@@ -109,7 +109,7 @@ class MeanPooling(Kernel[KernelConfig, Array]):
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
-                backend=cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
         return impl(x=x, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
@@ -156,7 +156,7 @@ def mean_pooling(
     x: Float[Array, "batch seq_len hidden_dim"],
     chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
     """Execute mean pooling with automatic optimization.
 

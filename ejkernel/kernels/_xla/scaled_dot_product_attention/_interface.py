@@ -98,7 +98,7 @@ def scaled_dot_product_attention(
         value=value,
         mask=attention_mask,
         bias=bias,
-        is_causal=causal,
+        scale=causal,
         softmax_scale=softmax_scale,
         local_window_size=sliding_window,
         key_value_seq_lengths=cum_seqlens_k,
