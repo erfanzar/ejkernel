@@ -50,9 +50,21 @@ def _flash_attention_fwd(
     block_sizes,
     debug,
 ):
-    if save_residuals:
-        raise NotImplementedError("Higher-order AD not supported")
-    o, l, m = _flash_attention_impl(q, k, v, ab, segment_ids, True, causal, softmax_scale, block_sizes, debug)
+    o, l, m = _flash_attention_impl(
+        q,
+        k,
+        v,
+        ab,
+        segment_ids,
+        save_residuals,
+        causal,
+        softmax_scale,
+        block_sizes.block_b,
+        block_sizes.block_q,
+        block_sizes.block_k_major,
+        block_sizes.block_k,
+        debug,
+    )
     return o, (q, k, v, ab, segment_ids, o, l, m)
 
 

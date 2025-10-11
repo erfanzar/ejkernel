@@ -21,6 +21,8 @@ It wraps the low-level kernel implementations with JAX's custom VJP mechanism
 to provide gradient support.
 """
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 import jaxtyping
@@ -158,7 +160,7 @@ def grouped_matmul(
     group_sizes: Int[Array, "num_groups"],
     preferred_element_type: DTypeLike = jnp.float32,
     tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
-    group_offset: Int[Array, "1"] | None = None,
+    group_offset: Int[Array, "..."] | None = None,
     existing_out: Float[Array, "m n"] | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,

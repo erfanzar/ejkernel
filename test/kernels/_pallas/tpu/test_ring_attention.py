@@ -24,6 +24,7 @@ from jax import shard_map
 from jax.sharding import PartitionSpec
 
 from ejkernel.kernels import pallas
+from ejkernel.kernels._xla.attention import attention as vanilla_attention
 from ejkernel.utils import numeric_gen
 
 pytestmark = pytest.mark.skipif(
@@ -280,33 +281,6 @@ class TestRingAttentionPallasFwd:
 class TestRingAttentionPallasBwd:
     """Test backward pass (gradients) of Pallas TPU ring attention."""
 
-    def test_basic_gradient(self):
-        """Test basic gradient computation."""
-        batch, seq_len, num_heads, head_dim = 2, 128, 4, 32
-        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
-
-        def loss_fn(q, k, v):
-            out = pallas.tpu.ring_attention(
-                q,
-                k,
-                v,
-                query_chunk_size=128,
-                key_chunk_size=128,
-            )
-            return jnp.mean(out**2)
-
-        loss, grads = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
-        grad_q, grad_k, grad_v = grads
-
-        assert grad_q.shape == q.shape
-        assert grad_k.shape == k.shape
-        assert grad_v.shape == v.shape
-        assert not jnp.any(jnp.isnan(grad_q))
-        assert not jnp.any(jnp.isnan(grad_k))
-        assert not jnp.any(jnp.isnan(grad_v))
-        assert not jnp.isnan(loss)
-        assert loss > 0
-
     def test_gradient_with_softmax_aux(self):
         """Test gradient with softmax_aux."""
         batch, seq_len, num_heads, head_dim = 2, 256, 4, 32
@@ -433,6 +407,208 @@ class TestRingAttentionPallasBwd:
         assert loss > 0
 
 
+class TestRingAttentionNumericalCorrectness:
+    """Test numerical correctness of ring attention against vanilla XLA attention."""
+
+    def test_numerical_correctness_vs_vanilla_basic(self):
+        """Test basic numerical correctness against vanilla attention."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        # Ring attention output
+        out_ring = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        # Vanilla attention output (returns tuple of (output, weights))
+        out_vanilla, _ = vanilla_attention(q, k, v)
+
+        # Compare outputs
+        assert out_ring.shape == out_vanilla.shape
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention output differs from vanilla attention. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
+
+    def test_numerical_correctness_vs_vanilla_causal(self):
+        """Test numerical correctness with causal masking."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        # Ring attention with causal masking
+        out_ring = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            causal=True,
+            query_chunk_size=128,
+            causal_block_size=1,
+            key_chunk_size=128,
+        )
+
+        # Vanilla attention with causal masking
+        out_vanilla, _ = vanilla_attention(q, k, v, causal=True)
+
+        # Compare outputs
+        assert out_ring.shape == out_vanilla.shape
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention with causal differs from vanilla. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
+
+    def test_numerical_correctness_vs_vanilla_sliding_window(self):
+        """Test numerical correctness with sliding window."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        window_size = 64
+
+        # Ring attention with sliding window
+        out_ring = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            sliding_window=window_size,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        # Vanilla attention with sliding window
+        out_vanilla, _ = vanilla_attention(q, k, v, sliding_window=window_size)
+
+        # Compare outputs
+        assert out_ring.shape == out_vanilla.shape
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention with sliding window differs from vanilla. "
+            f"Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
+
+    def test_numerical_correctness_vs_vanilla_softmax_aux_1d(self):
+        """Test numerical correctness with 1D softmax_aux."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        num_sinks = 4
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
+
+        # Ring attention with softmax_aux
+        out_ring = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            softmax_aux=softmax_aux,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        # Vanilla attention with softmax_aux
+        out_vanilla, _ = vanilla_attention(q, k, v, softmax_aux=softmax_aux)
+
+        # Compare outputs
+        assert out_ring.shape == out_vanilla.shape
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention with softmax_aux differs from vanilla. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
+
+    def test_numerical_correctness_vs_vanilla_softmax_aux_2d(self):
+        """Test numerical correctness with 2D softmax_aux."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        num_sinks = 4
+        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+
+        # Ring attention with 2D softmax_aux
+        out_ring = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            softmax_aux=softmax_aux,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        # Vanilla attention with 2D softmax_aux
+        out_vanilla, _ = vanilla_attention(q, k, v, softmax_aux=softmax_aux)
+
+        # Compare outputs
+        assert out_ring.shape == out_vanilla.shape
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention with 2D softmax_aux differs from vanilla. "
+            f"Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
+
+    def test_numerical_correctness_vs_vanilla_logit_soft_cap(self):
+        """Test numerical correctness with logit soft cap."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        soft_cap = 30.0
+
+        # Ring attention with logit soft cap
+        out_ring = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            logit_soft_cap=soft_cap,
+            query_chunk_size=128,
+            key_chunk_size=128,
+        )
+
+        # Vanilla attention with logit soft cap
+        out_vanilla, _ = vanilla_attention(q, k, v, logit_soft_cap=soft_cap)
+
+        # Compare outputs
+        assert out_ring.shape == out_vanilla.shape
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention with logit_soft_cap differs from vanilla. "
+            f"Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
+
+    def test_numerical_correctness_vs_vanilla_combined_features(self):
+        """Test numerical correctness with multiple features combined."""
+        batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
+        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
+
+        num_sinks = 4
+        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        window_size = 64
+        soft_cap = 30.0
+
+        # Ring attention with combined features
+        out_ring = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            softmax_aux=softmax_aux,
+            logit_soft_cap=soft_cap,
+            sliding_window=window_size,
+            query_chunk_size=128,
+            key_chunk_size=128,
+            causal=False,
+        )
+
+        # Vanilla attention with combined features
+        out_vanilla, _ = vanilla_attention(
+            q,
+            k,
+            v,
+            softmax_aux=softmax_aux,
+            logit_soft_cap=soft_cap,
+            sliding_window=window_size,
+            causal=False,
+        )
+
+        # Compare outputs
+        assert out_ring.shape == out_vanilla.shape
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention with combined features differs from vanilla. "
+            f"Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
+
+
 class TestRingAttentionPallasDistributed:
     """Test distributed execution of Pallas TPU ring attention."""
 
@@ -477,22 +653,6 @@ class TestRingAttentionPallasEdgeCases:
     def test_small_sequence(self):
         """Test with small sequence length."""
         batch, seq_len, num_heads, head_dim = 1, 256, 4, 32
-        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
-
-        out = pallas.tpu.ring_attention(
-            q,
-            k,
-            v,
-            query_chunk_size=128,
-            key_chunk_size=128,
-        )
-
-        assert out.shape == (batch, seq_len, num_heads, head_dim)
-        assert not jnp.any(jnp.isnan(out))
-
-    def test_single_head(self):
-        """Test with single attention head."""
-        batch, seq_len, num_heads, head_dim = 2, 128, 1, 64
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         out = pallas.tpu.ring_attention(

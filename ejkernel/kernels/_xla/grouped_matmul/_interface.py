@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
+import typing
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +23,9 @@ from jaxtyping import Array, DTypeLike, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
 
+if typing.TYPE_CHECKING:
+    from ejkernel.kernels._pallas.tpu.grouped_matmul._interface import LutFn
+
 
 @kernel_registry.register("grouped_matmul", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
@@ -29,8 +34,8 @@ def grouped_matmul(
     rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
     group_sizes: Int[Array, "num_groups"],
     preferred_element_type: DTypeLike = jnp.float32,
-    tiling: tuple[int, int, int] | None = (128, 128, 128),
-    group_offset: Int[Array, "1"] | None = None,
+    tiling: tuple[int, int, int] | LutFn | None = (128, 128, 128),
+    group_offset: Int[Array, "..."] | None = None,
     existing_out: Float[Array, "m n"] | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,

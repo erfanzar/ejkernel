@@ -77,17 +77,16 @@ def flash_attention(
     if softmax_aux is not None:
         raise NotImplementedError("Attention sinks (softmax_aux) are not supported on TPU")
 
-    batch_size, num_heads, q_seq_len, d_model = query.shape
-    batch_size_k, num_heads_k, kv_seq_len, d_model_k = key.shape
-    batch_size_v, num_heads_v, kv_seq_len_v, d_model_v = value.shape
+    batch_size, q_seq_len, num_heads, d_model = query.shape
+    batch_size_k, kv_seq_len, num_heads_k, d_model_k = key.shape
+    batch_size_v, kv_seq_len_v, num_heads_v, d_model_v = value.shape
     if batch_size != batch_size_k or batch_size != batch_size_v:
         raise ValueError(
             f"Batch size mismatch: got {batch_size}, {batch_size_k} and {batch_size_v} (for query, key, v respectively)"
         )
     if num_heads != num_heads_k or num_heads != num_heads_v:
-        raise ValueError(
-            f"Head count mismatch: got {num_heads}, {num_heads_k}, {num_heads_v} (for query, key, v respectively)"
-        )
+        key = jnp.repeat(key, num_heads // num_heads_k, 2)
+        value = jnp.repeat(value, num_heads // num_heads_v, 2)
     if d_model != d_model_k:
         raise ValueError(f"Model dimension mismatch: got {d_model} and {d_model_k} (for q and k respectively)")
     if d_model != d_model_v:
@@ -127,7 +126,18 @@ def flash_attention(
     )
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
-    return _flash_attention(query, key, value, bias, segment_ids, False, causal, softmax_scale, block_sizes, debug)
+    return _flash_attention(
+        query.transpose(0, 2, 1, 3),
+        key.transpose(0, 2, 1, 3),
+        value.transpose(0, 2, 1, 3),
+        bias,
+        segment_ids,
+        False,
+        causal,
+        softmax_scale,
+        block_sizes,
+        debug,
+    ).transpose(0, 2, 1, 3)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=range(5, 10))
@@ -144,19 +154,19 @@ def _flash_attention(
     debug,
 ):
     return _flash_attention_impl(
-        query,
-        key,
-        value,
-        ab,
-        segment_ids,
-        save_residuals,
-        causal,
-        softmax_scale,
-        block_sizes.block_b,
-        block_sizes.block_q,
-        block_sizes.block_k_major,
-        block_sizes.block_k,
-        debug,
+        q=query,
+        k=key,
+        v=value,
+        ab=ab,
+        segment_ids=segment_ids,
+        save_residuals=save_residuals,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        block_b=block_sizes.block_b,
+        block_q=block_sizes.block_q,
+        block_k_major=block_sizes.block_k_major,
+        block_k=block_sizes.block_k,
+        debug=debug,
     )
 
 

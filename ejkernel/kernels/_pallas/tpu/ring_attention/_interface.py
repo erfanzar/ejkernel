@@ -194,8 +194,8 @@ def ring_attention(
     else:
         segment_ids = SegmentIds(query=q_segment_ids, kv=kv_segment_ids)
 
-    if causal and causal_block_size is None:
-        causal_block_size = query_chunk_size
+    if causal:
+        causal_block_size = 1
 
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5

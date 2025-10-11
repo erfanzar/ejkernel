@@ -16,6 +16,7 @@
 from .attention import attention
 from .flash_attention import flash_attention
 from .gla import recurrent_gla
+from .grouped_matmul import grouped_matmul
 from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
 from .native_sparse_attention import apply_native_sparse_attention
@@ -30,6 +31,7 @@ __all__ = [
     "apply_native_sparse_attention",
     "attention",
     "flash_attention",
+    "grouped_matmul",
     "lightning_attn",
     "mean_pooling",
     "page_attention",

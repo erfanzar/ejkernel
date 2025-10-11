@@ -13,3 +13,6 @@
 # limitations under the License.
 
 
+from ._interface import grouped_matmul
+
+__all__ = ("grouped_matmul",)
