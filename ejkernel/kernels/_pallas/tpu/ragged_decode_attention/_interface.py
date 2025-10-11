@@ -25,17 +25,17 @@ from ._pallas_impl_fwd import inner_decode_tpu
 @kernel_registry.register("ragged_decode_attention", Platform.PALLAS, Backend.TPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def ragged_decode_attention(
-    query: Float[Array, "batch num_heads head_dim"],
+    query: Float[Array, "batch num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
-    softmax_scale: float | None = 1,
+    softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-) -> Float[Array, "batch num_heads head_dim"]:
+) -> Float[Array, "batch num_q_heads head_dim"]:
     """Ragged MQA decoding entry point with TPU-accelerated Flash Attention.
 
     Args:
@@ -57,10 +57,12 @@ def ragged_decode_attention(
     Returns:
         Output tensor of shape [batch, num_heads, head_dim] after attention decoding.
     """
+    if softmax_scale is None:
+        softmax_scale = query.shape[-1] ** -0.5
     return inner_decode_tpu(
-        query_tensor=query,
-        key_tensor=key,
-        value_tensor=value,
+        query=query,
+        key=key,
+        value=value,
         sequence_start=sequence_start,
         sequence_end=sequence_end,
         softmax_scale=softmax_scale,

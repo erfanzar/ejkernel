@@ -19,23 +19,23 @@ from jax import Array
 from jaxtyping import Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._xla_impl_fwd import ragged_decode_attention_impl
+from ._xla_impl_fwd import ragged_decode_mqa_xla
 
 
 @kernel_registry.register("ragged_decode_attention", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def ragged_decode_attention(
-    query: Float[Array, "batch num_heads head_dim"],
+    query: Float[Array, "batch num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
-    softmax_scale: float | None = 1,
+    softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-) -> Float[Array, "batch num_heads head_dim"]:
+) -> Float[Array, "batch num_q_heads head_dim"]:
     """Ragged MQA/GQA decoding with standard XLA operations.
 
     This function implements ragged attention for decoding scenarios where different
@@ -104,7 +104,7 @@ def ragged_decode_attention(
         - Supports both MQA (num_kv_heads=1) and GQA (num_kv_heads < num_heads)
         - Query position is assumed to be at sequence_end - 1 (current decode position)
     """
-    return ragged_decode_attention_impl(
+    return ragged_decode_mqa_xla(
         query=query,
         key=key,
         value=value,

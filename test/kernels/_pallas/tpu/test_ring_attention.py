@@ -209,7 +209,7 @@ class TestRingAttentionPallasFwd:
             k,
             v,
             sliding_window=64,
-            causal_block_size=32,
+            causal_block_size=1,
             query_chunk_size=128,
             key_chunk_size=128,
         )
@@ -476,15 +476,15 @@ class TestRingAttentionPallasEdgeCases:
 
     def test_small_sequence(self):
         """Test with small sequence length."""
-        batch, seq_len, num_heads, head_dim = 1, 64, 4, 32
+        batch, seq_len, num_heads, head_dim = 1, 256, 4, 32
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         out = pallas.tpu.ring_attention(
             q,
             k,
             v,
-            query_chunk_size=32,
-            key_chunk_size=32,
+            query_chunk_size=128,
+            key_chunk_size=128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)

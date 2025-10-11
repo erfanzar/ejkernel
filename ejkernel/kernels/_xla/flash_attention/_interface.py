@@ -271,7 +271,6 @@ def _flash_attention_core(
 
 
 @kernel_registry.register("flash_attention", Platform.XLA, Backend.ANY)
-@jaxtyping.jaxtyped(typechecker=beartype)
 @ejit(
     static_argnames=[
         "softmax_scale",
@@ -288,6 +287,7 @@ def _flash_attention_core(
         "precision",
     ]
 )
+@jaxtyping.jaxtyped(typechecker=beartype)
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],

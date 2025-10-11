@@ -140,7 +140,7 @@ def _attention_reference(
     save_residuals: Literal[False],
     mask_value: float,
     custom_type: str,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
 ) -> jax.Array: ...
 
 
@@ -155,7 +155,7 @@ def _attention_reference(
     save_residuals: Literal[True],
     mask_value: float,
     custom_type: str,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
 ) -> tuple[jax.Array, tuple[jax.Array]]: ...
 
 
@@ -169,7 +169,7 @@ def _attention_reference(
     mask_value: float,
     save_residuals: bool,
     custom_type: str,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
 ):
     return _attention_reference_default(
         mask,
@@ -181,7 +181,7 @@ def _attention_reference(
         mask_value,
         save_residuals,
         custom_type,
-        attn_logits_soft_cap,
+        logits_soft_cap,
     )
 
 
@@ -195,7 +195,7 @@ def _attention_reference_default(
     mask_value: float,
     save_residuals: bool,
     custom_type: str,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
 ):
     del custom_type
     logits = jnp.einsum("sd,td->st", q.astype(jnp.float32), k.astype(jnp.float32))
@@ -203,9 +203,9 @@ def _attention_reference_default(
     if segment_ids is not None:
         mask = jnp.logical_and(mask, segment_ids.q[:, None] == segment_ids.kv[None, :])
 
-    if attn_logits_soft_cap is not None:
-        logits = jnp.tanh(logits / attn_logits_soft_cap)
-        logits = logits * attn_logits_soft_cap
+    if logits_soft_cap is not None:
+        logits = jnp.tanh(logits / logits_soft_cap)
+        logits = logits * logits_soft_cap
 
     logits = jnp.where(mask, logits, mask_value)
     m = logits.max(axis=-1)
@@ -234,7 +234,7 @@ def attention_reference(
     mask_value: float = DEFAULT_MASK_VALUE,
     save_residuals: bool = False,
     custom_type: str = "flash",
-    attn_logits_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
 ) -> SplashCustomReturnType:
     return _attention_reference(
         mask,
@@ -246,7 +246,7 @@ def attention_reference(
         mask_value=mask_value,
         save_residuals=save_residuals,
         custom_type=custom_type,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
     )
 
 
@@ -260,7 +260,7 @@ def _attention_reference_custom_fwd(
     mask_value: float,
     save_residuals: bool,
     custom_type: str,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
 ):
     if save_residuals:
         raise NotImplementedError("Higher-order AD not supported.")
@@ -275,7 +275,7 @@ def _attention_reference_custom_fwd(
         mask_value=mask_value,
         save_residuals=True,
         custom_type=custom_type,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
     )
     return o, (mask, q, k, v, segment_ids, sinks, o, lse)
 
@@ -284,7 +284,7 @@ def _attention_reference_custom_bwd(
     mask_value: float,
     save_residuals: bool,
     custom_type: str,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
     res,
     do: jax.Array,
 ) -> tuple[None, jax.Array, jax.Array, jax.Array, None, jax.Array | None]:
@@ -293,9 +293,9 @@ def _attention_reference_custom_bwd(
 
     uncapped_logits = jnp.einsum("qc,kc->qk", q, k, preferred_element_type=jnp.float32)
 
-    if attn_logits_soft_cap is not None:
-        logits = jnp.tanh(uncapped_logits / attn_logits_soft_cap)
-        logits = logits * attn_logits_soft_cap
+    if logits_soft_cap is not None:
+        logits = jnp.tanh(uncapped_logits / logits_soft_cap)
+        logits = logits * logits_soft_cap
     else:
         logits = uncapped_logits
 
@@ -313,8 +313,8 @@ def _attention_reference_custom_bwd(
     else:
         di = jnp.einsum("st,st->s", dp, p)[:, None]
     ds = (dp - di) * p
-    if attn_logits_soft_cap is not None:
-        normalized = uncapped_logits / attn_logits_soft_cap
+    if logits_soft_cap is not None:
+        normalized = uncapped_logits / logits_soft_cap
         d = jnp.tanh(normalized)
         g = ds * (1 - d)
         ds = g + g * d
@@ -328,7 +328,7 @@ def _attention_reference_custom_bwd(
 
 
 _attention_reference_custom = jax.custom_vjp(
-    _attention_reference, nondiff_argnames=("mask_value", "save_residuals", "custom_type", "attn_logits_soft_cap")
+    _attention_reference, nondiff_argnames=("mask_value", "save_residuals", "custom_type", "logits_soft_cap")
 )
 _attention_reference_custom.defvjp(_attention_reference_custom_fwd, _attention_reference_custom_bwd)
 
@@ -344,7 +344,7 @@ def attention_reference_custom(
     mask_value: float = DEFAULT_MASK_VALUE,
     save_residuals: bool = False,
     custom_type: str = "flash",
-    attn_logits_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
 ):
     return _attention_reference_custom(
         mask,
@@ -356,7 +356,7 @@ def attention_reference_custom(
         mask_value,
         save_residuals,
         custom_type=custom_type,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
     )
 
 
@@ -371,7 +371,7 @@ def make_attention_reference(
         static_argnames=[
             "mask_value",
             "save_residuals",
-            "attn_logits_soft_cap",
+            "logits_soft_cap",
         ],
     )
     def _wrapped(
@@ -384,7 +384,7 @@ def make_attention_reference(
         *,
         mask_value: float = DEFAULT_MASK_VALUE,
         save_residuals: bool = False,
-        attn_logits_soft_cap: float | None = None,
+        logits_soft_cap: float | None = None,
     ):
         if backward_impl == "custom":
             attn_impl = partial(
@@ -402,7 +402,7 @@ def make_attention_reference(
             attn_impl,
             mask_value=mask_value,
             save_residuals=save_residuals,
-            attn_logits_soft_cap=attn_logits_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             **params,
         )
 
@@ -584,7 +584,7 @@ def _apply_mask_and_soft_cap(
     q_segment_ids_ref,
     kv_segment_ids_ref,
     *,
-    attn_logits_soft_cap: float,
+    logits_soft_cap: float,
     k_slice: pl.Slice,
     k_offset: int | jax.Array,
     bq: int,
@@ -641,9 +641,9 @@ def _apply_mask_and_soft_cap(
         masks.append(q_ids == kv_ids)
 
     def cap_logits(logits):
-        if attn_logits_soft_cap is not None:
-            logits = jnp.tanh(qk / attn_logits_soft_cap)
-            return logits * attn_logits_soft_cap
+        if logits_soft_cap is not None:
+            logits = jnp.tanh(qk / logits_soft_cap)
+            return logits * logits_soft_cap
         else:
             return logits
 
@@ -683,7 +683,7 @@ def flash_attention_kernel(
     q_layout: QKVLayout,
     k_layout: QKVLayout,
     v_layout: QKVLayout,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
     mask_function: MaskFunctionType | None,
 ):
     float32 = jnp.float32
@@ -737,7 +737,7 @@ def flash_attention_kernel(
             q_sequence_ref,
             q_segment_ids_ref,
             kv_segment_ids_ref,
-            attn_logits_soft_cap=attn_logits_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             k_slice=slice_k,
             k_offset=global_kv_index * bkv + kv_compute_index * bkv_compute,
             bq=bq,
@@ -809,7 +809,7 @@ def _splash_attention_forward(
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
     save_residuals: Literal[False] = False,
-    attn_logits_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
 ) -> jax.Array: ...
 
 
@@ -827,7 +827,7 @@ def _splash_attention_forward(
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
     save_residuals: Literal[True],
-    attn_logits_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
 ) -> SplashCustomReturnType: ...
 
 
@@ -851,7 +851,7 @@ def _splash_attention_forward(
     residual_checkpoint_name: str | None,
     save_residuals: bool,
     mask_function: MaskFunctionType | None,
-    attn_logits_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     interpret: bool = False,
 ) -> SplashCustomReturnType:
     num_q_heads, q_seq_len, head_dim_qk = q.shape
@@ -1041,7 +1041,7 @@ def _splash_attention_forward(
                 q_layout=q_layout,
                 k_layout=k_layout,
                 v_layout=v_layout,
-                attn_logits_soft_cap=attn_logits_soft_cap,
+                logits_soft_cap=logits_soft_cap,
                 mask_function=mask_function,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1100,7 +1100,7 @@ def _splash_attention_forward(
         "block_sizes",
         "residual_checkpoint_name",
         "mask_function",
-        "attn_logits_soft_cap",
+        "logits_soft_cap",
         "interpret",
     ),
 )
@@ -1119,7 +1119,7 @@ def _splash_attention_custom(
     block_sizes: BlockSizes,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
-    attn_logits_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     interpret: bool = False,
 ) -> SplashCustomReturnType:
     del dq_mask_info, dkv_mask_info
@@ -1137,7 +1137,7 @@ def _splash_attention_custom(
         residual_checkpoint_name=residual_checkpoint_name,
         save_residuals=save_residuals,
         mask_function=mask_function,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         interpret=interpret,
     )
 
@@ -1157,7 +1157,7 @@ def _splash_attention_fwd(
     block_sizes: BlockSizes,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
-    attn_logits_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     interpret: bool = False,
 ) -> tuple[
     tuple[jax.Array],
@@ -1179,7 +1179,7 @@ def _splash_attention_fwd(
         residual_checkpoint_name=residual_checkpoint_name,
         save_residuals=True,
         mask_function=mask_function,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         interpret=interpret,
     )
     return out, (
@@ -1217,7 +1217,7 @@ def _flash_attention_dq_kernel(
     grid_width: int,
     bq: int,
     bkv: int,
-    attn_logits_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     q_layout: QKVLayout,
     k_layout: QKVLayout,
     v_layout: QKVLayout,
@@ -1258,7 +1258,7 @@ def _flash_attention_dq_kernel(
             q_sequence_ref,
             q_segment_ids_ref,
             kv_segment_ids_ref,
-            attn_logits_soft_cap=attn_logits_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             k_slice=pl.ds(0, bkv),
             k_offset=global_kv_index * bkv,
             bq=bq,
@@ -1273,8 +1273,8 @@ def _flash_attention_dq_kernel(
             preferred_element_type=jnp.float32,
         )
         ds = (dp - di) * p
-        if attn_logits_soft_cap is not None:
-            normalized = qk_uncapped / attn_logits_soft_cap
+        if logits_soft_cap is not None:
+            normalized = qk_uncapped / logits_soft_cap
             d = jnp.tanh(normalized)
             g = ds * (1 - d)
             ds = g + g * d
@@ -1308,7 +1308,7 @@ def _splash_attention_bwd_dq(
     is_mqa: bool,
     mask_info: mask_info_lib.MaskInfo,
     mask_value: float,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
     q_layout: QKVLayout,
     k_layout: QKVLayout,
     v_layout: QKVLayout,
@@ -1464,7 +1464,7 @@ def _splash_attention_bwd_dq(
         mask_value=mask_value,
         bq=bq,
         bkv=bkv,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         q_layout=q_layout,
         k_layout=k_layout,
         v_layout=v_layout,
@@ -1548,7 +1548,7 @@ def _flash_attention_dkv_kernel(
     bq: int,
     bkv_compute: int,
     is_mqa: bool,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
     q_layout: QKVLayout,
     k_layout: QKVLayout,
     v_layout: QKVLayout,
@@ -1615,7 +1615,7 @@ def _flash_attention_dkv_kernel(
             q_sequence_ref,
             q_segment_ids_ref,
             kv_segment_ids_ref,
-            attn_logits_soft_cap=attn_logits_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             k_slice=slice_k,
             k_offset=kv_index * bkv + i * bkv_compute,
             bq=bq,
@@ -1634,8 +1634,8 @@ def _flash_attention_dkv_kernel(
             preferred_element_type=jnp.float32,
         )
         ds = (dp - di) * p
-        if attn_logits_soft_cap is not None:
-            normalized = qk_uncapped / attn_logits_soft_cap
+        if logits_soft_cap is not None:
+            normalized = qk_uncapped / logits_soft_cap
             d = jnp.tanh(normalized)
             g = ds * (1 - d)
             ds = g + g * d
@@ -1703,7 +1703,7 @@ def _splash_attention_bwd_dkv(
     is_mqa: bool,
     mask_info: mask_info_lib.MaskInfo,
     mask_value: float,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
     use_fused_bwd_kernel: bool,
     q_layout: QKVLayout,
     k_layout: QKVLayout,
@@ -1985,7 +1985,7 @@ def _splash_attention_bwd_dkv(
         grid_width=grid_width,
         bq=bq,
         bkv_compute=bkv_compute,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         q_layout=q_layout,
         k_layout=k_layout,
         v_layout=v_layout,
@@ -2053,7 +2053,7 @@ def _splash_attention_bwd(
     block_sizes: BlockSizes,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
     interpret: bool,
     res: SplashResidualsType,
     do: jax.Array,
@@ -2105,7 +2105,7 @@ def _splash_attention_bwd(
         is_mqa=is_mqa,
         mask_info=dkv_mask_info,
         mask_value=mask_value,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         use_fused_bwd_kernel=use_fused_bwd_kernel,
         q_layout=block_sizes.q_layout,
         k_layout=block_sizes.k_layout,
@@ -2129,7 +2129,7 @@ def _splash_attention_bwd(
             is_mqa=is_mqa,
             mask_info=dq_mask_info,
             mask_value=mask_value,
-            attn_logits_soft_cap=attn_logits_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             q_layout=block_sizes.q_layout,
             k_layout=block_sizes.k_layout,
             v_layout=block_sizes.v_layout,
@@ -2164,7 +2164,7 @@ _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
         "block_sizes",
         "save_residuals",
         "mask_value",
-        "attn_logits_soft_cap",
+        "logits_soft_cap",
         "residual_checkpoint_name",
         "mask_function",
         "interpret",
@@ -2184,7 +2184,7 @@ def _splash_attention(
     block_sizes: BlockSizes | None,
     save_residuals: bool,
     mask_value: float,
-    attn_logits_soft_cap: float | None,
+    logits_soft_cap: float | None,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
     interpret: bool,
@@ -2221,7 +2221,7 @@ def _splash_attention(
         is_mqa=is_mqa,
         block_sizes=block_sizes,
         save_residuals=save_residuals,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         residual_checkpoint_name=residual_checkpoint_name,
         mask_function=mask_function,
         interpret=interpret,
@@ -2309,7 +2309,7 @@ def _make_splash_attention(
     is_mqa: bool,
     save_residuals: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
-    attn_logits_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     downcast_smem_data: bool = True,
     head_shards: int,
     q_seq_shards: int,
@@ -2377,7 +2377,7 @@ def _make_splash_attention(
         is_mqa=is_mqa,
         save_residuals=save_residuals,
         mask_value=mask_value,
-        attn_logits_soft_cap=attn_logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         residual_checkpoint_name=residual_checkpoint_name,
         mask_function=mask_function_fwd,
         interpret=interpret,
@@ -2496,11 +2496,11 @@ def blocksparse_attention(
     kv_length = value.shape[2]
 
     if q_blocksize is None:
-        q_blocksize = 128
+        q_blocksize = 512
     if kv_blocksize is None:
         kv_blocksize = q_blocksize
     if bwd_q_blocksize is None:
-        bwd_q_blocksize = 128
+        bwd_q_blocksize = 1024
     if bwd_kv_blocksize is None:
         bwd_kv_blocksize = bwd_q_blocksize
 
@@ -2557,26 +2557,33 @@ def blocksparse_attention(
     output_shape = (*query.shape[:-1], value.shape[-1])
     num_reps = query.shape[1] // key.shape[1]
     query = query.reshape((*query.shape[:-3], key.shape[-3], num_reps, query.shape[-2], query.shape[-1]))
-    fn = jax.vmap(
-        jax.vmap(
-            partial(
-                make_splash_mqa_single_device(
-                    mask=MultiHeadMask(
-                        [
-                            mask_builder(query_length, kv_length, query.shape[-3], ox, query.shape[-2])
-                            for ox in range(query.shape[-3])
-                        ]
-                    ),
-                    block_sizes=block_sizes,
-                ),
-                attn_logits_soft_cap=logit_soft_cap,
-            ),
-            in_axes=(0, 0, 0, None, None),
-        ),
-        in_axes=(0, 0, 0, 0, None),
+
+    mask = MultiHeadMask(
+        [mask_builder(query_length, kv_length, query.shape[-3], ox, query.shape[-2]) for ox in range(query.shape[-3])]
     )
-    m = None
+
+    def attn_static_fn(q, k, v, segment_ids, softmax_aux):
+        return make_splash_mqa_single_device(
+            mask=mask,
+            block_sizes=block_sizes,
+            logits_soft_cap=logit_soft_cap,
+        )(
+            q=q,
+            k=k,
+            v=v,
+            segment_ids=segment_ids,
+            sinks=softmax_aux,
+        )
+
+    attn_fn = jax.vmap(jax.vmap(attn_static_fn, in_axes=(0, 0, 0, None, None)), in_axes=(0, 0, 0, 0, None))
+    segment_ids = None
     if kv_segment_ids is not None:
-        m = SegmentIds(q_segment_ids, kv_segment_ids)
-    out = fn(query * softmax_scale, key, value, m, softmax_aux).reshape(output_shape)
-    return out
+        segment_ids = SegmentIds(q_segment_ids, kv_segment_ids)
+
+    return attn_fn(
+        query * softmax_scale,
+        key,
+        value,
+        segment_ids,
+        softmax_aux,
+    ).reshape(output_shape)

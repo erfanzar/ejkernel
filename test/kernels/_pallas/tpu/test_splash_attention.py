@@ -335,13 +335,13 @@ class TestPerformanceTuning:
         key_array = jax.random.normal(keys[1], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
-        for query_chunk_size, key_chunk_size in [(128, 128), (256, 256), (512, 512)]:
+        for q_blocksize, kv_blocksize in [(128, 128), (256, 256), (512, 512)]:
             output = blocksparse_attention(
                 query=query,
                 key=key_array,
                 value=value,
-                query_chunk_size=query_chunk_size,
-                key_chunk_size=key_chunk_size,
+                q_blocksize=q_blocksize,
+                kv_blocksize=kv_blocksize,
                 sliding_window=512,
                 causal=True,
             )

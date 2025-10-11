@@ -31,8 +31,8 @@ from ._utils import BlockSizes, SegmentIds
 
 
 @kernel_registry.register("flash_attention", Platform.PALLAS, Backend.TPU)
-@jaxtyping.jaxtyped(typechecker=beartype)
 @ejit(static_argnames=["causal", "softmax_scale", "debug", "dropout_prob", "sliding_window", "logits_soft_cap"])
+@jaxtyping.jaxtyped(typechecker=beartype)
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],

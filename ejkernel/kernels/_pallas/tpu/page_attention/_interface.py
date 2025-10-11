@@ -36,7 +36,6 @@ from ._pallas_impl_fwd import (
 
 
 @kernel_registry.register("page_attention", Platform.PALLAS, Backend.TPU)
-@jaxtyping.jaxtyped(typechecker=beartype)
 @ejit(
     static_argnames=[
         "pages_per_compute_block",
@@ -46,6 +45,7 @@ from ._pallas_impl_fwd import (
         "inline_seq_dim",
     ],
 )
+@jaxtyping.jaxtyped(typechecker=beartype)
 def page_attention(
     query: Float[Array, "num_seqs num_heads head_dim"],
     key_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],

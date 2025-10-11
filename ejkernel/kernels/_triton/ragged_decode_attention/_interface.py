@@ -30,7 +30,7 @@ def ragged_decode_attention(
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
-    softmax_scale: float | None = 1.0,
+    softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
     logit_soft_cap: float | None = None,
@@ -56,6 +56,10 @@ def ragged_decode_attention(
     Returns:
         Output: [B, HQ, D]
     """
+
+    if softmax_scale is None:
+        softmax_scale = query.shape[-1] ** -0.5
+
     return inner_decode_triton(
         query_tensor=query,
         key_tensor=key,
