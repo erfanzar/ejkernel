@@ -127,10 +127,10 @@ def get_cache_dir() -> Path:
     Example:
         >>> cache_dir = get_cache_dir()
         >>> print(cache_dir)
-        /home/user/.cache/eformer-cache
+        /home/user/.cache/ejkernel-cache
     """
     home_dir = Path.home()
-    app_name = "eformer-cache"
+    app_name = "ejkernel-cache"
     if os.name == "nt":
         cache_dir = Path(os.getenv("LOCALAPPDATA", home_dir / "AppData" / "Local")) / app_name
     elif os.name == "posix":

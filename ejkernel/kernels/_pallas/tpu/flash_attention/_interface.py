@@ -31,7 +31,7 @@ from ._utils import BlockSizes, SegmentIds
 
 
 @kernel_registry.register("flash_attention", Platform.PALLAS, Backend.TPU)
-@ejit(static_argnames=["causal", "softmax_scale", "debug", "dropout_prob", "sliding_window", "logits_soft_cap"])
+@ejit(static_argnames=["causal", "softmax_scale", "dropout_prob", "sliding_window", "logits_soft_cap"])
 @jaxtyping.jaxtyped(typechecker=beartype)
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
@@ -56,7 +56,6 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-    debug: bool = False,
 ):
     del normalize_output, precision, logits_dtype
 
@@ -136,11 +135,10 @@ def flash_attention(
         causal,
         softmax_scale,
         block_sizes,
-        debug,
     ).transpose(0, 2, 1, 3)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=range(5, 10))
+@functools.partial(jax.custom_vjp, nondiff_argnums=range(5, 9))
 def _flash_attention(
     query,
     key,
@@ -151,7 +149,6 @@ def _flash_attention(
     causal,
     softmax_scale,
     block_sizes,
-    debug,
 ):
     return _flash_attention_impl(
         q=query,
@@ -166,7 +163,6 @@ def _flash_attention(
         block_q=block_sizes.block_q,
         block_k_major=block_sizes.block_k_major,
         block_k=block_sizes.block_k,
-        debug=debug,
     )
 
 

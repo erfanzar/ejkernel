@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Utility functions and helpers for eformer.ops.
+"""Utility functions and helpers for ejkernel.ops.
 
 This module provides various utilities for device fingerprinting, serialization,
 metadata extraction, and other supporting functionality.

@@ -48,7 +48,6 @@ def _flash_attention_fwd(
     causal,
     softmax_scale,
     block_sizes,
-    debug,
 ):
     o, l, m = _flash_attention_impl(
         q,
@@ -63,7 +62,6 @@ def _flash_attention_fwd(
         block_sizes.block_q,
         block_sizes.block_k_major,
         block_sizes.block_k,
-        debug,
     )
     return o, (q, k, v, ab, segment_ids, o, l, m)
 
@@ -281,7 +279,6 @@ def _flash_attention_impl(
     block_q,
     block_k_major,
     block_k,
-    debug,
 ):
     batch_size, num_heads, q_seq_len, head_dim = q.shape
     _, _, kv_seq_len, _ = k.shape
@@ -427,7 +424,6 @@ def _flash_attention_impl(
             scratch_shapes=scratch_shapes,
         ),
         out_shape=out_shape,
-        debug=debug,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=(
                 "parallel",

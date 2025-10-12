@@ -152,7 +152,6 @@ def _ring_flash_attention_bwd_tpu(
             causal_block_size=causal_block_size,
             softmax_scale=softmax_scale,
             block_sizes=block_sizes,
-            debug=False,
             q_chunk_idx_start=q_chunk_idx_start,
             k_chunk_idx_start=k_chunk_idx_start,
             residuals=(q, k, v, attn_bias_slice, segment_ids_slice, softmax_aux_res, o, lse_, m),
@@ -184,7 +183,6 @@ def _flash_attention_bwd(
     causal_block_size: int | None,
     softmax_scale: float,
     block_sizes: BlockSizes,
-    debug: bool,
     q_chunk_idx_start,
     k_chunk_idx_start,
     residuals,
@@ -222,7 +220,6 @@ def _flash_attention_bwd(
         softmax_scale=softmax_scale,
         causal_block_size=causal_block_size,
         mask_value=DEFAULT_MASK_VALUE,
-        debug=debug,
         sliding_window=sliding_window,
         logit_soft_cap=logit_soft_cap,
         attention_sink_size=attention_sink_size,
@@ -247,7 +244,6 @@ def _flash_attention_bwd(
         softmax_scale=softmax_scale,
         causal_block_size=causal_block_size,
         mask_value=DEFAULT_MASK_VALUE,
-        debug=debug,
         sliding_window=sliding_window,
         logit_soft_cap=logit_soft_cap,
         attention_sink_size=attention_sink_size,
@@ -431,7 +427,6 @@ def _flash_attention_bwd_dkv(
     softmax_scale: float,
     causal_block_size: int | None = None,
     mask_value: float = DEFAULT_MASK_VALUE,
-    debug: bool = False,
     sliding_window=None,
     logit_soft_cap=None,
     attention_sink_size=0,
@@ -618,7 +613,6 @@ def _flash_attention_bwd_dkv(
                 out_specs=out_specs,
                 grid=grid,
             ),
-            debug=debug,
             compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")),
         )(
             q_chunk_idx_start,
@@ -818,7 +812,6 @@ def _flash_attention_bwd_dq(
     softmax_scale: float,
     causal_block_size: int | None,
     mask_value: float,
-    debug: bool,
     sliding_window=None,
     logit_soft_cap=None,
     attention_sink_size=0,
@@ -990,7 +983,6 @@ def _flash_attention_bwd_dq(
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=2, in_specs=in_specs, out_specs=out_specs, grid=grid
             ),
-            debug=debug,
             compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")),
         )(
             q_chunk_idx_start,

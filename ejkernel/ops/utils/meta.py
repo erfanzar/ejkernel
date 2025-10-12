@@ -21,13 +21,13 @@ identifiers and configuration mappings from compiled HLO code.
 
 Key Functions:
     label: Generate standardized labels for operations
-    extract_labels_from_hlo_text: Find all eformer labels in HLO text
+    extract_labels_from_hlo_text: Find all ejkernel labels in HLO text
     find_labels_in_lowered: Extract labels from lowered JAX computations
     labels_to_configs: Map found labels back to their configurations
 
 Label Format:
-    Labels follow the pattern: 'eformer_ops#operation@version:hash'
-    Example: 'eformer_ops#matmul@v1:1a2b3c4d5e6f7g8h'
+    Labels follow the pattern: 'ejkernel_ops#operation@version:hash'
+    Example: 'ejkernel_ops#matmul@v1:1a2b3c4d5e6f7g8h'
 
 These utilities enable:
     - Tracking which operations were compiled with which configurations
@@ -50,18 +50,19 @@ Example Usage:
 
 from __future__ import annotations
 
+import os
 import re
 
 from .fingerprint import device_fingerprint
 
-EFORMER_OPS_PREFIX = "eformer_ops#"
-LABEL_RE = re.compile(r"eformer_ops#(?P<op>[^:]+@v[0-9A-Za-z_.-]+):(?P<key>[0-9a-f]{16})")
+LABEL_PREFIXES = ("ejkernel_ops#", "ejkernel_ops#")
+LABEL_RE = re.compile(r"(?:ejkernel_ops|ejkernel_ops)#(?P<op>[^:]+@v[0-9A-Za-z_.-]+):(?P<key>[0-9a-f]{16})")
 
 
 def labels_to_configs(lowered, selector):
     """Extract labels from lowered computation and map them to configurations.
 
-    Finds all eformer operation labels in the compiled code and retrieves
+    Finds all ejkernel operation labels in the compiled code and retrieves
     their corresponding configurations from the cache system.
 
     Args:
@@ -91,7 +92,7 @@ def labels_to_configs(lowered, selector):
     return out
 
 
-def label(op_id: str, call_hash: str) -> str:
+def label(op_id: str, call_hash: str, prefix: str | None = None) -> str:
     """Generate a standardized label for an operation.
 
     Creates a label string that uniquely identifies an operation instance
@@ -102,20 +103,21 @@ def label(op_id: str, call_hash: str) -> str:
         call_hash: 16-character hash of the call signature
 
     Returns:
-        Formatted label string following eformer convention
+        Formatted label string following ejkernel convention
 
     Examples:
         >>> label('matmul@v1', '1a2b3c4d5e6f7g8h')
-        'eformer_ops#matmul@v1:1a2b3c4d5e6f7g8h'
+        'ejkernel_ops#matmul@v1:1a2b3c4d5e6f7g8h'
     """
-    return f"{EFORMER_OPS_PREFIX}{op_id}:{call_hash}"
+    chosen_prefix = prefix or os.getenv("EJKERNEL_OPS_PREFIX") or os.getenv("EJKERNEL_OPS_PREFIX") or "ejkernel_ops#"
+    return f"{chosen_prefix}{op_id}:{call_hash}"
 
 
 def extract_labels_from_hlo_text(hlo_text: str) -> list[str]:
-    """Find all eformer operation labels in HLO text.
+    """Find all ejkernel operation labels in HLO text.
 
     Searches through HLO (High Level Operations) text to find all
-    embedded eformer operation labels using regex pattern matching.
+    embedded ejkernel operation labels using regex pattern matching.
 
     Args:
         hlo_text: String containing HLO representation of compiled code
@@ -124,10 +126,10 @@ def extract_labels_from_hlo_text(hlo_text: str) -> list[str]:
         List of found label strings
 
     Note:
-        The regex pattern matches the standard eformer label format:
-        'eformer_ops#' + operation_name + ':' + 16-char hex hash
+        The regex pattern matches the standard ejkernel label format:
+        'ejkernel_ops#' + operation_name + ':' + 16-char hex hash
     """
-    pat = re.compile(rf"{EFORMER_OPS_PREFIX}[A-Za-z0-9_.@-]+:[0-9a-f]{{16}}")
+    pat = re.compile(r"(?:ejkernel_ops|ejkernel_ops)#[A-Za-z0-9_.@-]+:[0-9a-f]{16}")
     return pat.findall(hlo_text)
 
 
@@ -135,7 +137,7 @@ def find_labels_in_lowered(lowered) -> list[str]:
     """Extract operation labels from a JAX lowered computation.
 
     Converts the lowered computation to HLO text representation and
-    extracts all embedded eformer operation labels.
+    extracts all embedded ejkernel operation labels.
 
     Args:
         lowered: JAX lowered computation object

@@ -301,7 +301,6 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-    debug: bool = False,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention for efficient scaled dot-product attention.
 
@@ -325,7 +324,6 @@ def flash_attention(
         logits_soft_cap: Optional soft cap value for logits (e.g., 20.0 for Gemma)
         softmax_aux: Optional attention sink logits of shape [H, num_sinks] or [num_sinks]
         segment_ids: Not supported in Triton implementation (raises NotImplementedError)
-        debug: Not supported in Triton implementation (ignored)
 
     Returns:
         chex.Array: Attention output with shape [batch, seq_len, num_heads, head_dim]
@@ -340,7 +338,7 @@ def flash_attention(
         >>>
         >>> out = flash_attention(query, key, value, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
     """
-    del chunk_size_q, chunk_size_k, precision, logits_dtype, debug, normalize_output
+    del chunk_size_q, chunk_size_k, precision, logits_dtype, normalize_output
     if q_segment_ids is not None:
         raise NotImplementedError("`q_segment_ids` is not implemented in triton impl yet!")
     if kv_segment_ids is not None:

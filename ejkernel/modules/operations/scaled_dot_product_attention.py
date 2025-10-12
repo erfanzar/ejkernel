@@ -31,6 +31,7 @@ from ejkernel.ops import (
     Kernel,
     Tuner,
 )
+from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
 from .configs import AttentionConfig
@@ -128,7 +129,6 @@ class ScaledDotProductAttention(Kernel[AttentionConfig, Array]):
             cfg: Configuration object specifying platform/backend
             segment_ids: Segment IDs for grouped sequences (TPU-specific)
             block_sizes: Block sizes for kernel execution (TPU-specific)
-            debug: Enable debug mode
 
         Returns:
             ScaledDotProductAttention output [batch, seq_len_q, num_heads, head_dim]
@@ -204,8 +204,9 @@ class ScaledDotProductAttention(Kernel[AttentionConfig, Array]):
 _executor: Executor[AttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True),
-        tuner=Tuner(warmup=2, iters=5),
+        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        tuner=Tuner(warmup=5, iters=50),
+        persistent=PersistentCache("sdpa"),
     )
 )
 

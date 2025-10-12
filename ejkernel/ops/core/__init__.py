@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Core abstractions for the eformer.ops framework.
+"""Core abstractions for the ejkernel.ops framework.
 
 This module provides the fundamental building blocks for implementing JAX operations
 with automatic configuration management and performance optimization.

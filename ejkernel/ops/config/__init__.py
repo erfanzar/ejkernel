@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Configuration management and caching for eformer.ops.
+"""Configuration management and caching for ejkernel.ops.
 
 This module provides a comprehensive configuration selection and caching system
 with multiple fallback layers and automatic performance tuning capabilities.

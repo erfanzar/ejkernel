@@ -40,6 +40,7 @@ from ejkernel.ops import (
     Kernel,
     Tuner,
 )
+from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
 from .configs import BlockSparseAttentionConfig
@@ -141,7 +142,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         chunk_size: int | None = None,
         causal: bool = True,
         fused_backward: bool = False,
-        debug: bool = False,
         platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: BlockSparseAttentionConfig,
@@ -210,7 +210,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             chunk_size=chunk_size,
             causal=causal,
             fused_backward=fused_backward,
-            debug=debug,
         )
 
     def heuristic_cfg(self, inv: Invocation[BlockSparseAttentionConfig, Array]) -> BlockSparseAttentionConfig:
@@ -284,22 +283,20 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             Iterable of GPU-optimized candidate configurations
         """
         configs = []
-        for q_block in [256, 512]:
-            for kv_block in [256, 512]:
-                for num_warps in [4, 8]:
-                    for num_stages in [2, 3]:
-                        configs.append(
-                            BlockSparseAttentionConfig(
-                                q_blocksize=q_block,
-                                kv_blocksize=kv_block,
-                                bwd_q_blocksize=q_block // 2,
-                                bwd_kv_blocksize=kv_block // 2,
-                                num_warps=num_warps,
-                                num_stages=num_stages,
-                                platform="triton",
-                                backend="gpu",
-                            )
-                        )
+        for q_block in [32, 64, 128]:
+            for kv_block in [32, 64, 128]:
+                configs.append(
+                    BlockSparseAttentionConfig(
+                        q_blocksize=q_block,
+                        kv_blocksize=kv_block,
+                        bwd_q_blocksize=min(kv_block // 2, 32),
+                        bwd_kv_blocksize=min(kv_block // 2, 32),
+                        num_warps=None,
+                        num_stages=None,
+                        platform="triton",
+                        backend="gpu",
+                    )
+                )
         return configs
 
     def candidate_cfgs_tpu(self, inv: Invocation[BlockSparseAttentionConfig, Array]):
@@ -358,190 +355,14 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
                 )
         return configs
 
-    def fwd_with_residuals_gpu(
-        self,
-        query,
-        key,
-        value,
-        q_segment_ids=None,
-        kv_segment_ids=None,
-        q_positions=None,
-        kv_positions=None,
-        softmax_aux=None,
-        bias=None,
-        attention_mask=None,
-        sequence_parallelism_mesh_axis_name=None,
-        logit_soft_cap=None,
-        qkv_layouts=None,
-        softmax_scale=None,
-        mask_builder=None,
-        sliding_window=None,
-        chunk_size=None,
-        causal=True,
-        fused_backward=False,
-        debug=False,
-        platform=None,
-        *,
-        cfg: BlockSparseAttentionConfig,
-    ):
-        """GPU-specific forward pass with residuals using Triton kernels.
-
-        Args:
-            query: Query tensor [batch, num_heads, seq_len, head_dim]
-            key: Key tensor [batch, kv_num_heads, kv_len, head_dim]
-            value: Value tensor [batch, kv_num_heads, kv_len, vhead_dim]
-            (remaining args same as run method)
-            cfg: Configuration object specifying kernel parameters
-
-        Returns:
-            Tuple of (output, residuals) where residuals are needed for backward pass
-        """
-        import jax.numpy as jnp
-
-        from ejkernel.kernels._triton.blocksparse_attention import _blocksparse_attention_bhtd_fwd
-
-        qlen = query.shape[2]
-        kvlen = key.shape[2]
-
-        if mask_builder is not None and qkv_layouts is None:
-            qkv_layouts = mask_builder()
-
-        if sliding_window is None:
-            window_left = window_right = -1
-        else:
-            window_left, window_right = sliding_window
-
-        if softmax_scale is None:
-            softmax_scale = query.shape[-1] ** -0.5
-
-        if q_positions is None:
-            q_positions = jnp.arange(0, qlen).reshape(1, -1).repeat(query.shape[0], 0)
-        if kv_positions is None:
-            kv_positions = jnp.arange(0, kvlen).reshape(1, -1).repeat(key.shape[0], 0)
-
-        if attention_mask is not None and (q_segment_ids is None or kv_segment_ids is None):
-            from ejkernel.xla_utils import mask_to_segment_ids
-
-            inferred_q_seg, inferred_kv_seg = mask_to_segment_ids(attention_mask)
-            if q_segment_ids is None:
-                q_segment_ids = inferred_q_seg
-            if kv_segment_ids is None:
-                kv_segment_ids = inferred_kv_seg
-
-        if q_segment_ids is None:
-            q_segment_ids = jnp.ones_like(q_positions)
-        if kv_segment_ids is None:
-            kv_segment_ids = jnp.ones_like(kv_positions)
-
-        if qkv_layouts is None:
-            from ejkernel.kernels._triton.blocksparse_attention._mask import create_sparsity_mask
-
-            qkv_layouts = create_sparsity_mask(
-                q_blocksize=cfg.q_blocksize,
-                kv_blocksize=cfg.kv_blocksize,
-                kv_positions=kv_positions,
-                kv_segment_ids=kv_segment_ids,
-                q_positions=q_positions,
-                q_segment_ids=q_segment_ids,
-                causal=causal,
-                window_left=window_left,
-                window_right=window_right,
-            )
-        output, residuals = _blocksparse_attention_bhtd_fwd(
-            query=query,
-            key=key,
-            value=value,
-            q_positions=q_positions,
-            q_segment_ids=q_segment_ids,
-            kv_positions=kv_positions,
-            kv_segment_ids=kv_segment_ids,
-            qkv_layouts=qkv_layouts,
-            softmax_scale=softmax_scale,
-            softmax_aux=softmax_aux,
-            bias=bias,
-            apply_load_balance=True,
-            sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
-            window_left=window_left,
-            window_right=window_right,
-            causal=causal,
-            q_blocksize=cfg.q_blocksize,
-            kv_blocksize=cfg.kv_blocksize,
-            bwd_kv_blocksize=cfg.bwd_kv_blocksize,
-            bwd_q_blocksize=cfg.bwd_q_blocksize,
-            logit_soft_cap=logit_soft_cap,
-            debug=debug if isinstance(debug, bool) else False,
-        )
-
-        return output, residuals
-
-    def vjp_gpu(
-        self,
-        residuals,
-        output,
-        dO,
-        *args,
-        q_segment_ids=None,
-        kv_segment_ids=None,
-        q_positions=None,
-        kv_positions=None,
-        softmax_aux=None,
-        bias=None,
-        attention_mask=None,
-        sequence_parallelism_mesh_axis_name=None,
-        logit_soft_cap=None,
-        softmax_scale=None,
-        mask_builder=None,
-        sliding_window=None,
-        chunk_size=None,
-        causal=True,
-        fused_backward=False,
-        debug=False,
-        platform=None,
-        cfg=None,
-        **kwargs,
-    ):
-        """GPU-specific backward pass using Triton kernels.
-
-        Args:
-            residuals: Residuals saved from forward pass
-            output: Output from forward pass
-            dO: Gradient of loss with respect to output
-            (remaining args same as run method)
-
-        Returns:
-            Tuple of gradients (dq, dk, dv, ...) for all differentiable inputs
-        """
-        from ejkernel.kernels._triton.blocksparse_attention import _blocksparse_attention_gpu_bwd
-
-        if sliding_window is None:
-            window_left = window_right = -1
-        else:
-            window_left, window_right = sliding_window
-
-        return _blocksparse_attention_gpu_bwd(
-            softmax_scale=softmax_scale,
-            apply_load_balance=True,
-            sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
-            window_left=window_left,
-            window_right=window_right,
-            causal=causal,
-            q_blocksize=cfg.q_blocksize,
-            kv_blocksize=cfg.kv_blocksize,
-            bwd_kv_blocksize=cfg.bwd_kv_blocksize,
-            bwd_q_blocksize=cfg.bwd_q_blocksize,
-            logit_soft_cap=logit_soft_cap,
-            debug=debug if isinstance(debug, bool) else False,
-            res=residuals,
-            dout=dO,
-        )
-
 
 _executor: Executor[BlockSparseAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True),
-        tuner=Tuner(warmup=2, iters=5),
-    )
+        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        tuner=Tuner(warmup=5, iters=50),
+        persistent=PersistentCache("blocksparse"),
+    ),
 )
 
 
@@ -569,7 +390,6 @@ def blocksparse_attention(
     chunk_size: int | None = None,
     causal: bool = True,
     fused_backward: bool = False,
-    debug: bool = False,
     platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     *,
     cfg: BlockSparseAttentionConfig | None = None,
@@ -653,7 +473,6 @@ def blocksparse_attention(
         chunk_size=chunk_size,
         causal=causal,
         fused_backward=fused_backward,
-        debug=debug,
         platform=platform,
         _cfg=cfg,
     )

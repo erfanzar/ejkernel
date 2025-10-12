@@ -48,7 +48,9 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import tempfile
+from argparse import Namespace
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from typing import Any, Generic, TypeVar
@@ -77,7 +79,8 @@ class PersistentCache(Generic[Cfg]):
 
     def __init__(
         self,
-        path: str,
+        opname: str,
+        path: str | None = None,
         loader: Callable[[Any], Cfg] | None = None,
         dumper: Callable[[Cfg], Any] | None = None,
     ):
@@ -92,6 +95,11 @@ class PersistentCache(Generic[Cfg]):
             If loader/dumper are not provided, automatic serialization is attempted
             for dataclasses and Pydantic models. Raw values are stored as-is.
         """
+        if path is None:
+            path = str(pathlib.Path().home().expanduser() / "ejkernel-presistent-cache" / f"{opname}.json")
+
+        pathlib.Path(os.path.dirname(os.path.abspath(path)) or ".").mkdir(exist_ok=True, parents=True)
+
         self.path = path
         self.loader = loader
         self.dumper = dumper
@@ -130,7 +138,10 @@ class PersistentCache(Generic[Cfg]):
             the stored data. Otherwise, the raw JSON data is returned.
         """
         raw = self._data.get(self._key(device, op_id, call_key))
-        return None if raw is None else (self.loader(raw) if self.loader else raw)
+        out = None if raw is None else (self.loader(raw) if self.loader else raw)
+        if out is not None and isinstance(out, dict):
+            out = Namespace(**out)
+        return out
 
     def put(self, device: str, op_id: str, call_key: str, cfg: Cfg):
         """Store configuration in the cache with atomic file update.

@@ -58,6 +58,7 @@ import json
 from typing import Any
 
 import jax
+import jax.tree_util as jtu
 import numpy as np
 from pydantic import BaseModel
 
@@ -82,7 +83,10 @@ def sharding_fingerprint(x: Any) -> Any:
         try:
             return repr(x.sharding)
         except Exception:
-            return None
+            try:
+                return repr(getattr(jax.typeof(x), "sharding", None))
+            except Exception:
+                return None
     return None
 
 
@@ -106,12 +110,13 @@ def default_key_builder_with_sharding(inv) -> str:
         depending on how data is sharded across devices.
     """
 
-    shard_sig = jax.tree.map(sharding_fingerprint, inv.args)
+    shard_sig_args = jtu.tree_map(sharding_fingerprint, inv.args)
+    shard_sig_kwargs = jtu.tree_map(sharding_fingerprint, dict(inv.kwargs))
     spec = dict(
         args_spec=abstractify(inv.args),
         kwargs_spec=abstractify(dict(inv.kwargs)),
         batch_axes=inv.batch_axes,
-        sharding=shard_sig,
+        sharding=dict(args=shard_sig_args, kwargs=shard_sig_kwargs),
     )
     return short_hash(spec)
 
@@ -147,7 +152,7 @@ def device_fingerprint(dev: jax.Device | None = None) -> str:  # type:ignore
     return f"{kind}|{plat_ver}"
 
 
-def get_device_platform(dev: jax.Device | None = None) -> str:
+def get_device_platform(dev: jax.Device | None = None) -> str:  # type:ignore
     """Extract the platform identifier (gpu/tpu/cpu) from a JAX device.
 
     Args:
@@ -255,12 +260,22 @@ def stable_json(obj: Any) -> str:
             return o.model_dump()
         if dataclasses.is_dataclass(o):
             return dataclasses.asdict(o)
+
+        if isinstance(o, (jax.Array, np.ndarray)):
+            try:
+                dtype_name = getattr(o, "dtype", None)
+                dtype_name = getattr(dtype_name, "name", str(dtype_name))
+                shape = tuple(int(s) for s in np.shape(o))
+
+                return {"shape": shape, "dtype": dtype_name}
+            except Exception:
+                return repr(o)
         if isinstance(o, jax.ShapeDtypeStruct):
             dtype = getattr(o.dtype, "name", str(o.dtype))
             return {"shape": tuple(int(s) for s in o.shape), "dtype": dtype}
         if isinstance(o, np.dtype):
             return o.name
-        if isinstance(o, np.integer | np.floating | np.bool_):
+        if isinstance(o, (np.integer, np.floating, np.bool_)):
             return o.item()
         return repr(o)
 
@@ -320,9 +335,8 @@ def abstractify(pytree: Any) -> Any:
     """
 
     def leaf(x):
-        """Convert array leaf to ShapeDtypeStruct, leave other types unchanged."""
-        if isinstance(x, jax.Array | np.ndarray):
+        if isinstance(x, (jax.Array, np.ndarray)):
             return jax.ShapeDtypeStruct(np.shape(x), getattr(x, "dtype", None))
         return x
 
-    return jax.tree.map(leaf, pytree)
+    return jtu.tree_map(leaf, pytree)

@@ -41,8 +41,8 @@ Execution Flow:
     7. Record invocation for future optimization (if enabled)
 
 Environment Variables:
-    EFORMER_OPS_RECORD: Set to "1" to enable invocation recording
-    EFORMER_OPS_STAMP: Controls profiling metadata format:
+    EJKERNEL_OPS_RECORD: Set to "1" to enable invocation recording
+    EJKERNEL_OPS_STAMP: Controls profiling metadata format:
         - "hash": Use operation hash for labeling (default)
         - "json": Use full JSON payload for labeling
         - "none": Disable profiling metadata
@@ -67,10 +67,12 @@ from collections.abc import Callable
 from typing import Generic, Protocol
 
 import jax
+import jax.numpy as jnp
+import jax.tree_util as jtu
 
 from ..core import Invocation, Kernel, _get_platform_method, _has_custom_vjp
 from ..core.types import Cfg, Out
-from ..utils.fingerprint import device_fingerprint, get_device_platform, stable_json
+from ..utils.fingerprint import abstractify, device_fingerprint, get_device_platform, stable_json
 
 
 class ConfigChooser(Protocol):
@@ -114,7 +116,7 @@ class Executor(Generic[Cfg, Out]):
         stamp_prefix: Prefix for profiling metadata labels
     """
 
-    def __init__(self, chooser: ConfigChooser, stamp_prefix: str = "eformer_ops"):
+    def __init__(self, chooser: ConfigChooser, stamp_prefix: str = "ejkernel_ops"):
         """Initialize executor with configuration chooser and profiling settings.
 
         Args:
@@ -163,12 +165,13 @@ class Executor(Generic[Cfg, Out]):
             This mode provides more detailed information but may impact
             performance due to larger metadata payloads.
         """
+
         op_id_v = f"{kernel.op_id}@v{getattr(kernel, 'version', '0')}"
         payload = stable_json(
             dict(
                 op_id=op_id_v,
-                args=inv.args,
-                kwargs=dict(inv.kwargs),
+                args=abstractify(inv.args),
+                kwargs=abstractify(dict(inv.kwargs)),
                 cfg=cfg,
             )
         )
@@ -234,41 +237,82 @@ class Executor(Generic[Cfg, Out]):
         platform = get_device_platform()
 
         if _has_custom_vjp(kernel, platform):
-            closed_kwargs = dict(kwargs2)
-
             fwd_method = _get_platform_method(kernel, "fwd_with_residuals", platform) or kernel.fwd_with_residuals
             vjp_method = _get_platform_method(kernel, "vjp", platform) or kernel.vjp
 
-            def fwd_pos(*a):
-                return fwd_method(*a, cfg=chosen, **closed_kwargs)
+            full_leaves, treedef = jtu.tree_flatten((args2, kwargs2))
+            is_arr = [isinstance(x, jax.Array) for x in full_leaves]
 
-            def base(*a):
-                y, _ = fwd_pos(*a)
-                return y
+            const_leaves = [None if m else x for m, x in zip(is_arr, full_leaves, strict=False)]
 
-            def fwd_rule(*a):
-                y, res = fwd_pos(*a)
-                return y, (res, y, a)
+            def _restore_args_kwargs(array_leaves):
+                """Rebuild (args, kwargs) by merging dynamic array leaves into closed constants."""
+                it = iter(array_leaves)
+                merged = [next(it) if m else v for m, v in zip(is_arr, const_leaves, strict=False)]
+                return jtu.tree_unflatten(treedef, merged)
 
-            def bwd_rule(payload, dy):
-                res, y, a = payload
-                grads = vjp_method(res, y, dy, *a, cfg=chosen, **closed_kwargs)
+            def fwd_arrays(*array_leaves):
+                """Forward rule: takes only array leaves, rebuilds args/kwargs inside."""
+                (a, k) = _restore_args_kwargs(array_leaves)
+                y, res = fwd_method(*a, cfg=chosen, **k)
+                return y, (tuple(array_leaves), res)
+
+            def bwd_arrays(payload, dy):
+                """Backward rule: rebuild args/kwargs, call kernel.vjp, and map grads to array inputs."""
+                array_leaves, res = payload
+                (a, k) = _restore_args_kwargs(array_leaves)
+
+                grads = vjp_method(res, dy, *a, cfg=chosen, **k)
                 if isinstance(grads, dict):
                     raise TypeError("kernel.vjp must return a tuple of grads for positional args.")
-                return grads
+                grads = tuple(grads)
+                if len(grads) != len(a):
+                    raise TypeError(
+                        f"kernel.vjp must return one grad per positional arg; got {len(grads)} for {len(a)} args."
+                    )
 
-            g = jax.custom_vjp(base)
-            g.defvjp(fwd_rule, bwd_rule, optimize_remat=True)
+                def align_arg_grad(x, g):
+                    if g is None:
+                        return jtu.tree_map(lambda t: None, x)
+                    return jtu.tree_map(lambda _t, gg: gg, x, g)
 
-            def fn(*a, **_ignored_kwargs):
-                return g(*a)
+                aligned_args_grads = tuple(align_arg_grad(x, g) for x, g in zip(a, grads, strict=False))
+
+                zeros_kwargs = {
+                    name: jtu.tree_map(lambda t: jnp.zeros_like(t) if isinstance(t, jax.Array) else None, val)
+                    for name, val in k.items()
+                }
+
+                full_grads = (aligned_args_grads, zeros_kwargs)
+                flat_grads, _ = jtu.tree_flatten(full_grads)
+
+                grad_out = []
+                itg = iter(flat_grads)
+                for m in is_arr:
+                    gleaf = next(itg)
+                    if m:
+                        if gleaf is None:
+                            gleaf = 0.0
+                        grad_out.append(gleaf)
+                return tuple(grad_out)
+
+            def primal_only_arrays(*array_inputs):
+                return fwd_arrays(*array_inputs)[0]
+
+            g = jax.custom_vjp(primal_only_arrays)
+            g.defvjp(fwd_arrays, bwd_arrays)
+
+            def fn(*a, **k):
+                flat_call, _ = jtu.tree_flatten((a, k))
+                array_in = [x for x, m in zip(flat_call, is_arr, strict=False) if m]
+                return g(*array_in)
         else:
             run_method = _get_platform_method(kernel, "run", platform) or kernel.run
 
             def fn(*a, **k):
                 return run_method(*a, cfg=chosen, **k)
 
-        if os.getenv("EFORMER_OPS_RECORD", "0") == "1":
+        if os.getenv("EJKERNEL_OPS_RECORD", "0") == "1":
             try:
                 from ..registry import record_invocation
 
@@ -278,7 +322,7 @@ class Executor(Generic[Cfg, Out]):
             except Exception:
                 pass
         if stamp:
-            mode = os.getenv("EFORMER_OPS_STAMP", "none").lower()
+            mode = os.getenv("EJKERNEL_OPS_STAMP", "none").lower()
             if mode == "json":
                 fn = self._stamp_json(kernel, inv, fn, chosen)
             elif mode == "hash":

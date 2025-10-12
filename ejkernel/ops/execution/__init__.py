@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Execution engine and batch processing for eformer.ops.
+"""Execution engine and batch processing for ejkernel.ops.
 
 This module provides the main execution engine for running kernels with automatic
 configuration selection, as well as utilities for batch processing and autotuning.

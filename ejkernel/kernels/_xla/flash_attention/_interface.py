@@ -282,7 +282,6 @@ def _flash_attention_core(
         "chunk_size_k",
         "logits_soft_cap",
         "normalize_output",
-        "debug",
         "logits_dtype",
         "precision",
     ]
@@ -311,7 +310,6 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-    debug: bool = False,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """
     Flash attention with memory-efficient chunked computation and attention sinks.

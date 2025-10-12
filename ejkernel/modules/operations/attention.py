@@ -40,6 +40,7 @@ from ejkernel.ops import (
     Kernel,
     Tuner,
 )
+from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
 from .configs import AttentionConfig
@@ -198,8 +199,9 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
 _executor: Executor[AttentionConfig, tuple[Array, Array]] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True),
-        tuner=Tuner(warmup=2, iters=5),
+        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        tuner=Tuner(warmup=5, iters=50),
+        persistent=PersistentCache("attention"),
     )
 )
 

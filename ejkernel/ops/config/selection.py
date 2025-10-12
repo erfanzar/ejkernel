@@ -56,11 +56,16 @@ Example Usage:
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import tree_util as jtu
 
 from ..core import Invocation, Kernel, _get_platform_method
 from ..utils.fingerprint import device_fingerprint, get_device_platform
@@ -83,7 +88,8 @@ class AutotunePolicy:
 
     allow_autotune: bool = True
     allow_heuristics: bool = True
-    cache_miss_fallback: str = "heuristics"
+    cache_miss_fallback: Literal["autotune", "heuristics"] = "autotune"
+    validate_backward: bool = False
 
 
 class policy_override:
@@ -169,15 +175,93 @@ class Tuner(Generic[Cfg]):
         Returns:
             Average execution time per iteration in seconds
         """
-        c = jax.jit(fn).lower(*args, **kwargs).compile()
-        for _ in range(self.warmup):
-            _ = c(*args, **kwargs).block_until_ready()
-        import time
+        kw_array = {k: v for k, v in kwargs.items() if isinstance(v, (jax.Array, np.ndarray))}
+        kw_static = {k: v for k, v in kwargs.items() if k not in kw_array}
 
-        t0 = time.perf_counter()
-        for _ in range(self.iters):
-            _ = c(*args, **kwargs).block_until_ready()
-        return (time.perf_counter() - t0) / self.iters
+        kw_array_items = tuple(sorted(kw_array.items()))
+        kw_array_keys = tuple(k for k, _ in kw_array_items)
+        kw_array_vals = tuple(v for _, v in kw_array_items)
+
+        pos_len = len(args)
+        validate_bwd = bool(getattr(fn, "_ejk_validate_backward", False))
+
+        def _block_all(x):
+            return jtu.tree_map(
+                lambda t: t.block_until_ready() if hasattr(t, "block_until_ready") else t,
+                x,
+            )
+
+        if validate_bwd:
+            flat_arrays = args + kw_array_vals
+
+            def is_diff_array(x):
+                try:
+                    dt = np.dtype(getattr(x, "dtype", None))
+                    return np.issubdtype(dt, np.inexact)
+                except Exception:
+                    return False
+
+            diff_mask = tuple(is_diff_array(x) for x in flat_arrays)
+            diff_idx = tuple(i for i, m in enumerate(diff_mask) if m)
+            nondiff_idx = tuple(i for i, m in enumerate(diff_mask) if not m)
+
+            if not diff_idx:
+
+                def core(*flat):
+                    pos_args = flat[:pos_len]
+                    kw_vals = flat[pos_len:]
+                    call_kwargs = dict(zip(kw_array_keys, kw_vals, strict=True))
+                    call_kwargs.update(kw_static)
+                    return fn(*pos_args, **call_kwargs)
+
+                c = jax.jit(core)
+                for _ in range(self.warmup):
+                    _block_all(c(*(args + kw_array_vals)))
+                t0 = time.perf_counter()
+                for _ in range(self.iters):
+                    _block_all(c(*(args + kw_array_vals)))
+                return (time.perf_counter() - t0) / self.iters
+
+            def loss(theta, nondiff):
+                it_theta = iter(theta)
+                it_nondiff = iter(nondiff)
+                merged = [next(it_theta) if m else next(it_nondiff) for m in diff_mask]
+                pos_args = tuple(merged[:pos_len])
+                kw_vals = tuple(merged[pos_len:])
+                call_kwargs = dict(zip(kw_array_keys, kw_vals, strict=True))
+                call_kwargs.update(kw_static)
+                y = fn(*pos_args, **call_kwargs)
+                return jnp.sum(y)
+
+            grad_core = jax.jit(jax.grad(loss, argnums=0))
+
+            theta0 = tuple(flat_arrays[i] for i in diff_idx)
+            nondiff0 = tuple(flat_arrays[i] for i in nondiff_idx)
+
+            c = grad_core.lower(theta0, nondiff0).compile()
+            for _ in range(self.warmup):
+                _block_all(c(theta0, nondiff0))
+            t0 = time.perf_counter()
+            for _ in range(self.iters):
+                _block_all(c(theta0, nondiff0))
+            return (time.perf_counter() - t0) / self.iters
+
+        else:
+
+            def core(*flat):
+                pos_args = flat[:pos_len]
+                kw_vals = flat[pos_len:]
+                call_kwargs = dict(zip(kw_array_keys, kw_vals, strict=True))
+                call_kwargs.update(kw_static)
+                return fn(*pos_args, **call_kwargs)
+
+            c = jax.jit(core).lower(*(args + kw_array_vals)).compile()
+            for _ in range(self.warmup):
+                _block_all(c(*(args + kw_array_vals)))
+            t0 = time.perf_counter()
+            for _ in range(self.iters):
+                _block_all(c(*(args + kw_array_vals)))
+            return (time.perf_counter() - t0) / self.iters
 
     def autotune(self, make_fn, args, kwargs, candidates: Iterable[Cfg]) -> Cfg:
         """Benchmark all candidate configurations and return the fastest one.
@@ -198,12 +282,21 @@ class Tuner(Generic[Cfg]):
             RuntimeError: If no candidates are provided for testing
         """
         best_cfg, best_t = None, float("inf")
+        last_err = None
         for cfg in candidates:
-            t = self.measure(make_fn(cfg), *args, **kwargs)
+            try:
+                t = self.measure(make_fn(cfg), *args, **kwargs)
+                if os.getenv("EJKERNEL_LOG_AUTOTUNE", "0") == "1":
+                    print(cfg, t)
+            except Exception as e:
+                last_err = e
+                continue
             if t < best_t:
                 best_cfg, best_t = cfg, t
         if best_cfg is None:
-            raise RuntimeError("No candidates provided for autotuning.")
+            raise RuntimeError(f"All candidates failed during autotune: {last_err}")
+        if os.getenv("EJKERNEL_LOG_AUTOTUNE", "0") == "1":
+            print("Best Config", best_cfg, "Best Time", best_t)
         return best_cfg
 
 
@@ -330,6 +423,8 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                 def f(*a, **k):
                     return _run(*a, cfg=c, **(k | _static))
 
+                if self.policy.validate_backward:
+                    f._ejk_validate_backward = True
                 return f
 
             best = self.tuner.autotune(mk, inv.args, dyn_kwargs, candidates)

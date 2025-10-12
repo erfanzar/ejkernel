@@ -1117,7 +1117,6 @@ def _bwd_blocksparse_attn_call(
     bwd_q_blocksize: int,
     bwd_kv_blocksize: int,
     logit_soft_cap: float | None,
-    debug: bool,
     res: ArrayLike,
     dout: ArrayLike,
 ):

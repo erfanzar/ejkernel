@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Type definitions for the eFormer operations system.
+"""Type definitions for the ejkernel operations system.
 
 This module defines the core type variables used throughout the operations
 framework to provide type safety and generic programming support.

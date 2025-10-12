@@ -520,7 +520,6 @@ def _fwd_blocksparse_attn_call(
     q_blocksize: int = 64,
     kv_blocksize: int = 64,
     logit_soft_cap: float | None = None,
-    debug: bool = False,
 ) -> tuple[ArrayLike, Sequence[ArrayLike]]:
     if bias is not None:
         raise NotImplementedError("Bias is not supported in Flash multi head attention")

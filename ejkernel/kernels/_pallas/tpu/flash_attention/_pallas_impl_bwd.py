@@ -168,7 +168,6 @@ def _flash_attention_bwd_dkv(
     softmax_scale: float,
     causal: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
-    debug: bool = False,
 ):
     batch_size, num_heads, q_seq_len, head_dim = q.shape
     _, _, kv_seq_len, _ = k.shape
@@ -321,7 +320,6 @@ def _flash_attention_bwd_dkv(
                 scratch_shapes=scratch_shapes,
             ),
             out_shape=out_shapes,
-            debug=debug,
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=(
                     "parallel",
@@ -467,7 +465,6 @@ def _flash_attention_bwd_dq(
     softmax_scale: float,
     causal: bool,
     mask_value: float,
-    debug: bool,
 ):
     batch_size, num_heads, q_seq_len, head_dim = q.shape
     _, _, kv_seq_len, _ = k.shape
@@ -610,7 +607,6 @@ def _flash_attention_bwd_dq(
                 scratch_shapes=scratch_shapes,
             ),
             out_shape=out_shapes,
-            debug=debug,
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=(
                     "parallel",
@@ -629,7 +625,6 @@ def _flash_attention_bwd(
     causal: bool,
     softmax_scale: float,
     block_sizes: BlockSizes,
-    debug: bool,
     residuals,
     do,
 ):
@@ -659,7 +654,6 @@ def _flash_attention_bwd(
         softmax_scale=softmax_scale,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
-        debug=debug,
     )
 
     dq, ds = _flash_attention_bwd_dq(
@@ -678,6 +672,5 @@ def _flash_attention_bwd(
         softmax_scale=softmax_scale,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
-        debug=debug,
     )
     return dq, dk, dv, ds, None

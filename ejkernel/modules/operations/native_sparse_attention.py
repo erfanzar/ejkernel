@@ -45,6 +45,7 @@ from ejkernel.ops import (
     Kernel,
     Tuner,
 )
+from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
 from .configs import NativeSparseAttentionConfig
@@ -241,176 +242,13 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
             )
         return configs
 
-    def fwd_with_residuals_gpu(
-        self,
-        query,
-        key,
-        value,
-        g_cmp=None,
-        g_slc=None,
-        block_indices=None,
-        block_counts=16,
-        softmax_scale=None,
-        cu_seqlens=None,
-        platform=None,
-        *,
-        cfg: NativeSparseAttentionConfig,
-    ):
-        """GPU-specific forward pass with residuals using Triton kernels.
-
-        This implementation uses the low-level apply_native_sparse_attention
-        with custom VJP, handling the compression and selection logic separately.
-
-        Args:
-            query: Query tensor [batch, seq_len, num_heads, head_dim]
-            key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
-            value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
-            g_cmp: Optional compression gate
-            g_slc: Optional selection gate
-            block_indices: Explicit block indices or None to compute via compression
-            block_counts: Number of blocks per query (default: 16)
-            softmax_scale: Attention scaling factor
-            cu_seqlens: Cumulative sequence lengths for variable-length sequences
-            platform: Platform override
-            cfg: Configuration object
-
-        Returns:
-            Tuple of (output, residuals) for backward pass
-        """
-        import warnings
-
-        import jax.numpy as jnp
-
-        from ejkernel.kernels._triton.mean_pooling import mean_pooling
-        from ejkernel.kernels._triton.native_sparse_attention import native_sparse_attention_gpu_fwd
-        from ejkernel.kernels._triton.native_sparse_attention._compression import nsa_compression
-        from ejkernel.kernels._triton.native_sparse_attention._triton_impl_fwd import nsa_topk
-        from ejkernel.xla_utils import prepare_token_indices
-
-        block_size = cfg.block_size
-
-        if softmax_scale is None:
-            softmax_scale = key.shape[-1] ** -0.5
-
-        if cu_seqlens is not None:
-            assert query.shape[0] == 1, "batch size must be 1 when cu_seqlens are provided"
-
-        group_size = query.shape[2] // key.shape[2]
-        assert group_size % 16 == 0, f"Group size must be a multiple of 16 in NSA, got {group_size}"
-
-        token_indices = None
-        if cu_seqlens is not None:
-            token_indices = prepare_token_indices(cu_seqlens)
-
-        k_cmp = mean_pooling(key, block_size, cu_seqlens)
-        v_cmp = mean_pooling(value, block_size, cu_seqlens)
-        o_cmp = None
-
-        if g_cmp is not None:
-            o_cmp, lse_cmp = nsa_compression(
-                query=query,
-                key=k_cmp,
-                value=v_cmp,
-                block_size=block_size,
-                softmax_scale=softmax_scale,
-                cu_seqlens=cu_seqlens,
-            )
-            if block_indices is not None:
-                warnings.warn("`block_indices` will be ignored when `g_cmp` is provided", stacklevel=1)
-
-            block_indices = nsa_topk(
-                q=query,
-                k=k_cmp,
-                lse=lse_cmp,
-                block_counts=block_counts,
-                block_size=block_size,
-                softmax_scale=softmax_scale,
-                cu_seqlens=cu_seqlens,
-            )
-
-        assert block_indices is not None, "if `g_cmp` is not passed, `block_indices` must be provided."
-
-        o_slc, residual = native_sparse_attention_gpu_fwd(
-            query=query,
-            key=key,
-            value=value,
-            block_indices=block_indices,
-            block_counts=block_counts,
-            block_size=block_size,
-            softmax_scale=softmax_scale,
-            cu_seqlens=cu_seqlens,
-            token_indices=token_indices,
-        )
-
-        o = o_slc
-        if g_slc is not None:
-            o = o_slc * jnp.expand_dims(g_slc, -1)
-
-        if o_cmp is not None and g_cmp is not None:
-            o = o + o_cmp * jnp.expand_dims(g_cmp, -1)
-
-        full_residual = (residual, block_indices, block_counts, block_size, softmax_scale, cu_seqlens, token_indices)
-        return o, full_residual
-
-    def vjp_gpu(
-        self,
-        residuals,
-        output,
-        dO,
-        *args,
-        g_cmp=None,
-        g_slc=None,
-        block_indices=None,
-        block_counts=16,
-        softmax_scale=None,
-        cu_seqlens=None,
-        platform=None,
-        **kwargs,
-    ):
-        """GPU-specific backward pass using Triton kernels.
-
-        Args:
-            residuals: Residuals from forward pass
-            output: Output from forward pass
-            dO: Gradient of loss with respect to output
-            (remaining args same as fwd_with_residuals_gpu)
-
-        Returns:
-            Tuple of gradients (dq, dk, dv, ...)
-        """
-        from ejkernel.kernels._triton.native_sparse_attention import (
-            native_sparse_attention_gpu_bwd,
-        )
-
-        (
-            inner_residual,
-            block_indices_saved,
-            block_counts_saved,
-            block_size_saved,
-            softmax_scale_saved,
-            cu_seqlens_saved,
-            token_indices_saved,
-        ) = residuals
-
-        dq, dk, dv = native_sparse_attention_gpu_bwd(
-            block_indices=block_indices_saved,
-            block_counts=block_counts_saved,
-            block_size=block_size_saved,
-            softmax_scale=softmax_scale_saved,
-            cu_seqlens=cu_seqlens_saved,
-            token_indices=token_indices_saved,
-            residual=inner_residual,
-            do=dO,
-        )
-
-        return dq, dk, dv
-
 
 _sparse_executor: Executor[NativeSparseAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True),
-        tuner=Tuner(warmup=2, iters=5),
+        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        tuner=Tuner(warmup=5, iters=50),
+        persistent=PersistentCache("nsa"),
     )
 )
 

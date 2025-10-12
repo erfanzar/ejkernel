@@ -2436,7 +2436,6 @@ def blocksparse_attention(
     chunk_size: int | None = None,
     causal: bool = True,
     fused_backward: bool = False,
-    debug: bool = False,
 ) -> Float[Array, "batch num_heads seq_len vhead_dim"]:
     """Pallas TPU block-sparse attention kernel implementation.
 
@@ -2473,12 +2472,10 @@ def blocksparse_attention(
             - None: no chunking
         causal: Whether to use causal masking (default True)
         fused_backward: Whether to use fused backward kernel
-        debug: Enable debug mode (default: False)
 
     Returns:
         Attention output [batch num_heads seq_len vhead_dim]
     """
-    del debug
     if q_positions is not None:
         raise NotImplementedError("`q_positions` is not implemented for tpu-pallas (gpu-triton and xla only).")
     if kv_positions is not None:

@@ -94,7 +94,7 @@ if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=[8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21])
+@functools.partial(jax.custom_vjp, nondiff_argnums=[8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -110,7 +110,6 @@ if typing.TYPE_CHECKING:
         "bwd_q_blocksize",
         "bwd_kv_blocksize",
         "logit_soft_cap",
-        "debug",
     ],
 )
 def _blocksparse_attention_bhtd(
@@ -135,7 +134,6 @@ def _blocksparse_attention_bhtd(
     bwd_q_blocksize: int = 64,
     bwd_kv_blocksize: int = 64,
     logit_soft_cap: float | None = None,
-    debug: bool = False,
 ) -> ArrayLike:
     """Internal JIT-compiled block-sparse attention with custom VJP.
 
@@ -165,7 +163,6 @@ def _blocksparse_attention_bhtd(
         bwd_q_blocksize: Query block size for backward pass.
         bwd_kv_blocksize: Key/value block size for backward pass.
         logit_soft_cap: Optional soft capping value for attention logits.
-        debug: Whether to enable debug mode with mask printing.
 
     Returns:
         Attention output tensor with same shape as query.
@@ -190,7 +187,6 @@ def _blocksparse_attention_bhtd(
         q_blocksize=q_blocksize,
         kv_blocksize=kv_blocksize,
         logit_soft_cap=logit_soft_cap,
-        debug=debug,
     )[0]
 
     return result
@@ -218,7 +214,6 @@ def _blocksparse_attention_bhtd_fwd(
     bwd_q_blocksize: int,
     bwd_kv_blocksize: int,
     logit_soft_cap: float | None,
-    debug: bool,
 ):
     """Forward pass for block-sparse attention in custom VJP.
 
@@ -248,7 +243,6 @@ def _blocksparse_attention_bhtd_fwd(
         bwd_q_blocksize: Backward query block size.
         bwd_kv_blocksize: Backward key/value block size.
         logit_soft_cap: Optional soft capping value.
-        debug: Debug mode flag.
 
     Returns:
         Tuple of (output, lse) and residuals for backward pass.
@@ -273,7 +267,6 @@ def _blocksparse_attention_bhtd_fwd(
         q_blocksize=q_blocksize,
         kv_blocksize=kv_blocksize,
         logit_soft_cap=logit_soft_cap,
-        debug=debug,
     )
 
 
@@ -289,7 +282,6 @@ def _blocksparse_attention_bhtd_bwd(
     bwd_q_blocksize: int,
     bwd_kv_blocksize: int,
     logit_soft_cap: float | None,
-    debug: bool,
     res: ArrayLike,
     dout: ArrayLike,
 ):
@@ -312,7 +304,6 @@ def _blocksparse_attention_bhtd_bwd(
         bwd_q_blocksize: Backward query block size (non-differentiable).
         bwd_kv_blocksize: Backward key/value block size (non-differentiable).
         logit_soft_cap: Soft capping value (non-differentiable).
-        debug: Debug mode flag (non-differentiable).
         res: Residuals from forward pass containing intermediate values.
         dout: Gradient of loss with respect to the output.
 
@@ -333,7 +324,6 @@ def _blocksparse_attention_bhtd_bwd(
         bwd_q_blocksize=bwd_q_blocksize,
         bwd_kv_blocksize=bwd_kv_blocksize,
         logit_soft_cap=logit_soft_cap,
-        debug=False,
         res=res,
         dout=dout,
     )
@@ -387,7 +377,6 @@ def blocksparse_attention(
     chunk_size: int | None = None,
     causal: bool = True,
     fused_backward: bool = False,
-    debug: bool = False,
 ) -> Float[Array, "batch num_heads seq_len head_dim"]:
     """Triton block-sparse attention kernel implementation.
 
@@ -425,7 +414,6 @@ def blocksparse_attention(
         chunk_size: Alternative to separate q_blocksize/kv_blocksize
         causal: Whether to apply causal masking (default: True)
         fused_backward: Use fused backward pass (default: False)
-        debug: Enable debug mode with mask printing (default: False)
 
     Returns:
         Attention output [batch, num_heads, seq_len, head_dim]
@@ -508,5 +496,4 @@ def blocksparse_attention(
         bwd_q_blocksize=bwd_q_blocksize,
         bwd_kv_blocksize=bwd_kv_blocksize,
         logit_soft_cap=logit_soft_cap,
-        debug=debug if isinstance(debug, bool) else False,
     )

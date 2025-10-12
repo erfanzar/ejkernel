@@ -15,7 +15,7 @@
 
 """High-performance JAX operation framework with automatic configuration management.
 
-eformer.ops provides a sophisticated framework for implementing JAX operations with
+ejkernel.ops provides a sophisticated framework for implementing JAX operations with
 automatic performance tuning, configuration caching, and flexible execution strategies.
 
 Key Features:

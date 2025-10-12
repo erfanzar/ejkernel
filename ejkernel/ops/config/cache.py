@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Configuration caching system for eFormer operations.
+"""Configuration caching system for ejkernel operations.
 
 This module provides a thread-safe caching mechanism for storing and retrieving
 optimal kernel configurations. The cache system supports:
@@ -110,7 +110,7 @@ class ConfigCache(Generic[Cfg]):
 
 
 _cache_overlay: contextvars.ContextVar[list[dict[tuple[str, str, str], Any]]] = contextvars.ContextVar(
-    "eformer_ops_cache_overlay",
+    "ejkernel_ops_cache_overlay",
     default=[],  # noqa
 )
 

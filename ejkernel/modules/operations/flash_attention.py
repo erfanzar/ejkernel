@@ -33,6 +33,7 @@ from ejkernel.ops import (
     Kernel,
     Tuner,
 )
+from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
 from .configs import FlashAttentionConfig
@@ -142,7 +143,6 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             cfg: Configuration object specifying platform/backend
             segment_ids: Segment IDs for grouped sequences (TPU-specific)
             block_sizes: Block sizes for kernel execution (TPU-specific)
-            debug: Enable debug mode
 
         Returns:
             Attention output [batch, seq_len_q, num_heads, head_dim]
@@ -322,170 +322,13 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
                 )
         return configs
 
-    def fwd_with_residuals_gpu(
-        self,
-        query: Float[Array, "batch seq_len_q num_heads head_dim"],
-        key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-        softmax_scale: float | None = None,
-        dropout_prob: float = 0.0,
-        causal: bool = False,
-        dropout_seed: int | None = None,
-        cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
-        cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
-        sliding_window: int | tuple[int, int] | None = None,
-        logits_soft_cap: float | None = None,
-        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-        normalize_output: bool = True,
-        precision: lax.PrecisionLike = lax.Precision.DEFAULT,
-        logits_dtype: DTypeLike = jnp.float32,
-        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-        *,
-        cfg: FlashAttentionConfig,
-    ):
-        """GPU-specific forward pass with residuals using Triton kernels.
-
-        Computes flash attention output and saves intermediate values (residuals)
-        needed for the backward pass. This method is used by the VJP system
-        to enable efficient gradient computation on GPU devices.
-
-        Args:
-            query: Query tensor [batch, seq_len_q, num_heads, head_dim]
-            key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim]
-            value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim]
-            attention_mask: Optional attention mask
-            bias: Optional attention bias tensor
-            softmax_scale: Scaling factor for attention scores
-            dropout_prob: Dropout probability for attention weights
-            causal: Whether to apply causal masking
-            dropout_seed: Random seed for dropout
-            cum_seqlens_q: Cumulative sequence lengths for variable-length queries
-            cum_seqlens_k: Cumulative sequence lengths for variable-length keys
-            sliding_window: Window size for local attention
-            logits_soft_cap: Optional soft cap value for logits
-            softmax_aux: Optional attention sink logits
-            normalize_output: Whether to normalize the output
-            precision: JAX precision setting
-            logits_dtype: Data type for logits computation
-            q_segment_ids: Segment IDs for query sequences
-            kv_segment_ids: Segment IDs for key/value sequences
-            platform: Platform override
-            cfg: Configuration object
-
-        Returns:
-            tuple: (output, residuals) where output is the attention result
-                and residuals contains intermediate values for backward pass
-
-        Note:
-            This method uses Triton kernels optimized for NVIDIA GPUs.
-            Residuals include softmax statistics and intermediate activations
-            needed for gradient computation.
-        """
-
-        from ejkernel.kernels._triton.flash_attention import flash_attention_gpu_fwd
-
-        output, residuals = flash_attention_gpu_fwd(
-            query=query,
-            key=key,
-            value=value,
-            attention_mask=attention_mask,
-            bias=bias,
-            softmax_scale=softmax_scale,
-            dropout_prob=dropout_prob,
-            causal=causal,
-            dropout_seed=dropout_seed,
-            cum_seqlens_q=cum_seqlens_q,
-            cum_seqlens_k=cum_seqlens_k,
-            sliding_window=sliding_window,
-            logits_soft_cap=logits_soft_cap,
-            softmax_aux=softmax_aux,
-        )
-        return output, residuals
-
-    def vjp_gpu(
-        self,
-        residuals,
-        output,
-        dO: Float[Array, "batch seq_len_q num_heads head_dim"],
-        *args,
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
-        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-        softmax_scale: float | None = None,
-        dropout_prob: float = 0.0,
-        causal: bool = False,
-        dropout_seed: int | None = None,
-        cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
-        cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
-        sliding_window: int | tuple[int, int] | None = None,
-        logits_soft_cap: float | None = None,
-        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-        normalize_output: bool = True,
-        precision: lax.PrecisionLike = lax.Precision.DEFAULT,
-        logits_dtype: DTypeLike = jnp.float32,
-        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-        cfg: FlashAttentionConfig = None,
-    ):
-        """GPU-specific backward pass using Triton kernels.
-
-        Computes gradients with respect to query, key, and value tensors
-        using the output gradient and residuals from the forward pass.
-
-        Args:
-            residuals: Intermediate values from forward pass
-            output: Forward pass output (attention result)
-            dO: Gradient of loss with respect to output
-            args: Additional positional arguments
-            attention_mask: Optional attention mask
-            bias: Optional attention bias tensor
-            softmax_scale: Scaling factor for attention scores
-            dropout_prob: Dropout probability used in forward pass
-            causal: Whether causal masking was applied
-            dropout_seed: Random seed for dropout (must match forward pass)
-            cum_seqlens_q: Cumulative sequence lengths for queries
-            cum_seqlens_k: Cumulative sequence lengths for keys
-            sliding_window: Window size for local attention
-            logits_soft_cap: Soft cap value for logits
-            softmax_aux: Attention sink logits
-            normalize_output: Whether output normalization was applied
-            precision: JAX precision setting
-            logits_dtype: Data type for logits computation
-            q_segment_ids: Segment IDs for query sequences
-            kv_segment_ids: Segment IDs for key/value sequences
-            platform: Platform override
-            cfg: Configuration object
-
-        Returns:
-            tuple: (dQ, dK, dV) gradients with respect to query, key, and value
-
-        Note:
-            This method uses Triton kernels optimized for NVIDIA GPUs.
-            The backward pass recomputes softmax statistics for memory efficiency.
-        """
-
-        from ejkernel.kernels._triton.flash_attention import flash_attention_gpu_bwd
-
-        return flash_attention_gpu_bwd(
-            softmax_scale=softmax_scale,
-            dropout_prob=dropout_prob,
-            causal=causal,
-            sliding_window=sliding_window,
-            logits_soft_cap=logits_soft_cap,
-            residual=residuals,
-            dO=dO,
-        )
-
 
 _flash_executor: Executor[FlashAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True),
-        tuner=Tuner(warmup=2, iters=5),
+        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        tuner=Tuner(warmup=5, iters=50),
+        persistent=PersistentCache("flash-attn"),
     )
 )
 
