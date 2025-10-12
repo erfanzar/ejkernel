@@ -62,8 +62,8 @@ from typing import Generic, TypeVar
 
 import jax
 
-from ..core import Invocation, Kernel
-from ..utils.fingerprint import device_fingerprint
+from ..core import Invocation, Kernel, _get_platform_method
+from ..utils.fingerprint import device_fingerprint, get_device_platform
 from .cache import ConfigCache, _cache_overlay
 from .persistent import PersistentCache
 
@@ -303,14 +303,30 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
         if self.policy.cache_miss_fallback == "autotune" and self.policy.allow_autotune:
             if self.forbid_reautotune and (dev, op_id, call_key) in self._autotuned_keys:
                 raise RuntimeError(f"Re-autotune requested for {(dev, op_id, call_key)}")
-            candidates = tuple(kernel.candidate_cfgs(inv))
-            self._emit("autotune_start", device=dev, op_id=op_id, call_key=call_key, candidates=len(candidates))
+
+            platform = get_device_platform()
+            candidate_cfgs_method = _get_platform_method(kernel, "candidate_cfgs", platform)
+            if candidate_cfgs_method:
+                candidates = tuple(candidate_cfgs_method(inv))
+            else:
+                candidates = tuple(kernel.candidate_cfgs(inv))
+
+            self._emit(
+                "autotune_start",
+                device=dev,
+                op_id=op_id,
+                call_key=call_key,
+                candidates=len(candidates),
+                platform=platform,
+            )
 
             kw = dict(inv.kwargs)
             static_fun_kwargs = {k: v for k, v in kw.items() if callable(v)}
             dyn_kwargs = {k: v for k, v in kw.items() if k not in static_fun_kwargs}
 
-            def mk(c, _run=kernel.run, _static=static_fun_kwargs):
+            run_method = _get_platform_method(kernel, "run", platform) or kernel.run
+
+            def mk(c, _run=run_method, _static=static_fun_kwargs):
                 def f(*a, **k):
                     return _run(*a, cfg=c, **(k | _static))
 
@@ -321,12 +337,17 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
             self.cache.put(dev, op_id, call_key, best)
             if self.persistent is not None and self.persist_autotune:
                 self.persistent.put(dev, op_id, call_key, best)
-            self._emit("autotune_finish", device=dev, op_id=op_id, call_key=call_key, cfg=best)
+            self._emit("autotune_finish", device=dev, op_id=op_id, call_key=call_key, cfg=best, platform=platform)
             return best
 
         if self.policy.allow_heuristics:
-            cfg = kernel.heuristic_cfg(inv)
-            self._emit("heuristics", device=dev, op_id=op_id, call_key=call_key, cfg=cfg)
+            platform = get_device_platform()
+            heuristic_cfg_method = _get_platform_method(kernel, "heuristic_cfg", platform)
+            if heuristic_cfg_method:
+                cfg = heuristic_cfg_method(inv)
+            else:
+                cfg = kernel.heuristic_cfg(inv)
+            self._emit("heuristics", device=dev, op_id=op_id, call_key=call_key, cfg=cfg, platform=platform)
 
             self.cache.put(dev, op_id, call_key, cfg)
             if self.persistent is not None and self.persist_autotune:

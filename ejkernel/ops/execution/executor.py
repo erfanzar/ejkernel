@@ -68,9 +68,9 @@ from typing import Generic, Protocol
 
 import jax
 
-from ..core import Invocation, Kernel, _has_custom_vjp
+from ..core import Invocation, Kernel, _get_platform_method, _has_custom_vjp
 from ..core.types import Cfg, Out
-from ..utils.fingerprint import device_fingerprint, stable_json
+from ..utils.fingerprint import device_fingerprint, get_device_platform, stable_json
 
 
 class ConfigChooser(Protocol):
@@ -223,15 +223,24 @@ class Executor(Generic[Cfg, Out]):
             VJP implementations. Custom gradients are automatically detected and
             properly integrated with JAX's differentiation system.
         """
+
+        if "_cfg" in kwargs:
+            cfg = kwargs.pop("_cfg")
+
         args2, kwargs2 = kernel.prepare(*args, **kwargs)
         inv = Invocation(op_id=kernel.op_id, args=args2, kwargs=kwargs2, override_cfg=cfg, stamp=stamp)
         chosen = self.chooser.choose(inv, kernel)
 
-        if _has_custom_vjp(kernel):
+        platform = get_device_platform()
+
+        if _has_custom_vjp(kernel, platform):
             closed_kwargs = dict(kwargs2)
 
+            fwd_method = _get_platform_method(kernel, "fwd_with_residuals", platform) or kernel.fwd_with_residuals
+            vjp_method = _get_platform_method(kernel, "vjp", platform) or kernel.vjp
+
             def fwd_pos(*a):
-                return kernel.fwd_with_residuals(*a, cfg=chosen, **closed_kwargs)
+                return fwd_method(*a, cfg=chosen, **closed_kwargs)
 
             def base(*a):
                 y, _ = fwd_pos(*a)
@@ -243,7 +252,7 @@ class Executor(Generic[Cfg, Out]):
 
             def bwd_rule(payload, dy):
                 res, y, a = payload
-                grads = kernel.vjp(res, y, dy, *a, cfg=chosen, **closed_kwargs)
+                grads = vjp_method(res, y, dy, *a, cfg=chosen, **closed_kwargs)
                 if isinstance(grads, dict):
                     raise TypeError("kernel.vjp must return a tuple of grads for positional args.")
                 return grads
@@ -254,9 +263,10 @@ class Executor(Generic[Cfg, Out]):
             def fn(*a, **_ignored_kwargs):
                 return g(*a)
         else:
+            run_method = _get_platform_method(kernel, "run", platform) or kernel.run
 
             def fn(*a, **k):
-                return kernel.run(*a, cfg=chosen, **k)
+                return run_method(*a, cfg=chosen, **k)
 
         if os.getenv("EFORMER_OPS_RECORD", "0") == "1":
             try:
@@ -293,6 +303,10 @@ class Executor(Generic[Cfg, Out]):
         Returns:
             Configuration that would be selected for this invocation
         """
+
+        if "_cfg" in kwargs:
+            cfg = kwargs.pop("_cfg")
+
         args2, kwargs2 = kernel.prepare(*args, **kwargs)
         inv = Invocation(op_id=kernel.op_id, args=args2, kwargs=kwargs2, override_cfg=cfg, stamp=False)
         return self.chooser.choose(inv, kernel)
@@ -318,6 +332,10 @@ class Executor(Generic[Cfg, Out]):
             >>>
             >>> result = compiled_matmul(x_actual, y_actual)
         """
+
+        if "_cfg" in example_kwargs:
+            cfg = example_kwargs.pop("_cfg")
+
         chosen = self.choose_config(kernel, *example_args, cfg=cfg, **example_kwargs)
 
         def run(*a, **k):

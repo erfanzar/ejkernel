@@ -14,5 +14,11 @@
 
 
 from ._interface import ring_attention
+from ._pallas_impl_bwd import _ring_flash_attention_bwd_tpu as ring_attention_tpu_bwd
+from ._pallas_impl_fwd import _ring_flash_attention_fwd_tpu as ring_attention_tpu_fwd
 
-__all__ = ("ring_attention",)
+__all__ = (
+    "ring_attention",
+    "ring_attention_tpu_bwd",
+    "ring_attention_tpu_fwd",
+)

@@ -6,6 +6,7 @@ ejkernel.modules.operations package
 
    modules/operations/attention
    modules/operations/blocksparse_attention
+   modules/operations/configs
    modules/operations/flash_attention
    modules/operations/gated_linear_attention
    modules/operations/grouped_matmul

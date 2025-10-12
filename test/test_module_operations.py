@@ -197,7 +197,7 @@ class TestSparseAttention:
     def test_native_sparse_attention(self, basic_shapes):
         """Test native sparse attention with proper group size."""
         key = jax.random.PRNGKey(0)
-        k1, k2, k3 = jax.random.split(key, 3)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
 
         batch = basic_shapes["batch"]
         seq_len = basic_shapes["seq_len"]
@@ -210,7 +210,11 @@ class TestSparseAttention:
         key_tensor = jax.random.normal(k2, (batch, seq_len, num_kv_heads, head_dim), dtype=jnp.bfloat16)
         value = jax.random.normal(k3, (batch, seq_len, num_kv_heads, head_dim), dtype=jnp.bfloat16)
 
-        output = native_sparse_attention(query, key_tensor, value, block_counts=8, platform="xla")
+        # Provide g_cmp to enable compressed attention (shape: batch, seq_len, num_q_heads)
+        g_cmp = jax.random.normal(k4, (batch, seq_len, num_q_heads), dtype=jnp.bfloat16)
+
+        # block_counts must be <= seq_len // block_size (128 // 64 = 2)
+        output = native_sparse_attention(query, key_tensor, value, g_cmp=g_cmp, block_counts=2, platform="xla")
 
         expected_shape = (batch, seq_len, num_q_heads, head_dim)
         assert output.shape == expected_shape

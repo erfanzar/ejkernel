@@ -195,6 +195,10 @@ def flash_attention_block(
 
     o_new = (correction_prev * l_prev * o_prev + l_curr * o_curr) / l_new_safe
 
+    o_new = o_new.astype(o_prev.dtype)
+    m_new = m_new.astype(m_prev.dtype)
+    l_new = l_new.astype(l_prev.dtype)
+
     return (o_new, m_new, l_new), None
 
 
@@ -248,9 +252,9 @@ def ragged_flash_attention_xla(
 
     num_blocks = (kv_len + block_size - 1) // block_size
 
-    output_init = jnp.zeros_like(query)
-    max_logits_init = jnp.full((batch_size, q_len, num_heads, 1), -jnp.inf)
-    normalizer_init = jnp.zeros((batch_size, q_len, num_heads, 1))
+    output_init = jnp.zeros_like(query, dtype=query.dtype)
+    max_logits_init = jnp.full((batch_size, q_len, num_heads, 1), -jnp.inf, dtype=query.dtype)
+    normalizer_init = jnp.zeros((batch_size, q_len, num_heads, 1), dtype=query.dtype)
 
     pad_len = num_blocks * block_size - kv_len
     if pad_len > 0:

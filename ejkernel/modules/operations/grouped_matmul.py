@@ -35,12 +35,21 @@ from typing import Literal
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import GroupedMatmulConfig
 
 
-class GroupedMatmul(Kernel[KernelConfig, Array]):
+class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
     """Grouped Matrix Multiplication with custom optimization logic.
 
     Performs efficient matrix multiplication for grouped inputs, where each group
@@ -65,7 +74,7 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
         """Initialize Grouped Matmul module."""
         super().__init__(op_id="grouped_matmul")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: GroupedMatmulConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -94,7 +103,7 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
         precision=None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
+        cfg: GroupedMatmulConfig,
     ) -> Float[Array, "m n"]:
         """Execute grouped matrix multiplication.
 
@@ -121,7 +130,7 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
+            cfg = GroupedMatmulConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
@@ -144,9 +153,9 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
             precision=precision,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
+    def heuristic_cfg(self, inv: Invocation[GroupedMatmulConfig, Array]) -> GroupedMatmulConfig:
         """Provide default configuration with block sizes."""
-        return KernelConfig(
+        return GroupedMatmulConfig(
             block_q=128,
             block_k=128,
             block_d=128,
@@ -156,7 +165,7 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[GroupedMatmulConfig, Array]):
         """Generate candidate configurations for autotuning."""
         block_configs = [
             (64, 64, 64, 4, 1),
@@ -167,7 +176,7 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
         candidates = []
         for block_q, block_k, block_d, num_warps, num_stages in block_configs:
             candidates.append(
-                KernelConfig(
+                GroupedMatmulConfig(
                     block_q=block_q,
                     block_k=block_k,
                     block_d=block_d,
@@ -181,7 +190,13 @@ class GroupedMatmul(Kernel[KernelConfig, Array]):
         return candidates
 
 
-_grouped_matmul_executor = create_default_executor()
+_grouped_matmul_executor: Executor[GroupedMatmulConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def grouped_matmul(
@@ -196,6 +211,8 @@ def grouped_matmul(
     interpret: bool = False,
     precision=None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    *,
+    cfg: GroupedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
     """Execute grouped matrix multiplication with automatic optimization.
 
@@ -244,4 +261,5 @@ def grouped_matmul(
         interpret=interpret,
         precision=precision,
         platform=platform,
+        _cfg=cfg,
     )

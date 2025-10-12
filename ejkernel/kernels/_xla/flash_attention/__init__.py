@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
-from ._interface import flash_attention
+from ._interface import (
+    _make_core_func,
+    flash_attention,
+)
 
-__all__ = ["flash_attention"]
+__all__ = [
+    "_make_core_func",
+    "flash_attention",
+]

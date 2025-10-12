@@ -69,12 +69,21 @@ from jax import numpy as jnp
 from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import RingAttentionConfig
 
 
-class RingAttention(Kernel[KernelConfig, Array]):
+class RingAttention(Kernel[RingAttentionConfig, Array]):
     """Ring Attention with custom optimization logic.
 
     Implements distributed attention using ring communication topology for
@@ -109,7 +118,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
         """
         super().__init__(op_id="ring_attention")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: RingAttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -152,7 +161,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
         attention_sink_size: int = 0,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
+        cfg: RingAttentionConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
         """Execute ring attention with distributed KV processing.
 
@@ -205,7 +214,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
+            cfg = RingAttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
@@ -242,7 +251,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
             attention_sink_size=attention_sink_size,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
+    def heuristic_cfg(self, inv: Invocation[RingAttentionConfig, Array]) -> RingAttentionConfig:
         """Provide default configuration optimized for ring attention.
 
         Args:
@@ -252,7 +261,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
             Default KernelConfig with block sizes balanced for communication
             and computation overlap in distributed settings
         """
-        return KernelConfig(
+        return RingAttentionConfig(
             block_q=128,
             block_k=128,
             num_warps=4,
@@ -261,7 +270,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[RingAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Creates configurations optimized for different sequence lengths and
@@ -286,7 +295,7 @@ class RingAttention(Kernel[KernelConfig, Array]):
         candidates = []
         for block_q, block_k, num_warps, num_stages in block_configs:
             candidates.append(
-                KernelConfig(
+                RingAttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
                     num_warps=num_warps,
@@ -298,8 +307,343 @@ class RingAttention(Kernel[KernelConfig, Array]):
 
         return candidates
 
+    def fwd_with_residuals_xla(
+        self,
+        query,
+        key,
+        value,
+        bias=None,
+        q_segment_ids=None,
+        kv_segment_ids=None,
+        softmax_aux=None,
+        cache_idx=None,
+        axis_name=None,
+        float32_logits=True,
+        softmax_scale=None,
+        query_chunk_size=512,
+        key_chunk_size=512,
+        causal_block_size=None,
+        deterministic=True,
+        dropout_rng=None,
+        pdrop=0.0,
+        dtype=None,
+        policy=None,
+        precision=None,
+        prevent_cse=True,
+        sliding_window=None,
+        logit_soft_cap=None,
+        attention_sink_size=0,
+        platform=None,
+        *,
+        cfg: RingAttentionConfig,
+    ):
+        """XLA-specific forward pass with residuals using XLA kernels.
 
-_ring_executor = create_default_executor()
+        Args:
+            query: Query tensor [batch, seq_len_q, num_heads, head_dim]
+            key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim]
+            value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim]
+            (remaining args same as run method)
+            cfg: Configuration object
+
+        Returns:
+            Tuple of (output, residuals) for backward pass
+        """
+        import jax.lax
+        import jax.numpy as jnp
+
+        from ejkernel.kernels._xla.ring_attention import ring_attention_xla_fwd
+
+        if dtype is None:
+            dtype = jnp.float32
+        if policy is None:
+            policy = jax.checkpoint_policies.nothing_saveable
+        if precision is None:
+            precision = jax.lax.Precision.DEFAULT
+
+        if q_segment_ids is None and kv_segment_ids is not None:
+            q_segment_ids = kv_segment_ids
+        elif kv_segment_ids is None and q_segment_ids is not None:
+            kv_segment_ids = q_segment_ids
+
+        causal = causal_block_size is not None
+        if causal and causal_block_size is None:
+            causal_block_size = query_chunk_size
+
+        (y, residuals) = ring_attention_xla_fwd(
+            query=query,
+            key=key,
+            value=value,
+            bias=bias,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
+            softmax_aux=softmax_aux,
+            axis_name=axis_name,
+            float32_logits=float32_logits,
+            softmax_scale=softmax_scale,
+            query_chunk_size=query_chunk_size,
+            key_chunk_size=key_chunk_size,
+            causal_block_size=causal_block_size,
+            deterministic=deterministic,
+            dropout_rng=dropout_rng,
+            pdrop=pdrop,
+            dtype=dtype,
+            policy=policy,
+            precision=precision,
+            prevent_cse=prevent_cse,
+            sliding_window=sliding_window,
+            logit_soft_cap=logit_soft_cap,
+            attention_sink_size=attention_sink_size,
+            causal=causal,
+        )
+
+        return y, (
+            residuals,
+            axis_name,
+            float32_logits,
+            softmax_scale,
+            query_chunk_size,
+            key_chunk_size,
+            causal_block_size,
+            deterministic,
+            pdrop,
+            dtype,
+            policy,
+            precision,
+            prevent_cse,
+            sliding_window,
+            logit_soft_cap,
+            attention_sink_size,
+            causal,
+        )
+
+    def vjp_xla(self, residuals, output, dO, *args, **kwargs):
+        """XLA-specific backward pass using XLA kernels.
+
+        Args:
+            residuals: Residuals from forward pass
+            output: Output from forward pass
+            dO: Gradient of loss with respect to output
+
+        Returns:
+            Tuple of gradients (dq, dk, dv, ...)
+        """
+        from ejkernel.kernels._xla.ring_attention import ring_attention_xla_bwd
+
+        (
+            fwd_residuals,
+            axis_name,
+            float32_logits,
+            softmax_scale,
+            query_chunk_size,
+            key_chunk_size,
+            causal_block_size,
+            deterministic,
+            pdrop,
+            dtype,
+            policy,
+            precision,
+            prevent_cse,
+            sliding_window,
+            logit_soft_cap,
+            attention_sink_size,
+            causal,
+        ) = residuals
+
+        grads = ring_attention_xla_bwd(
+            axis_name=axis_name,
+            float32_logits=float32_logits,
+            softmax_scale=softmax_scale,
+            query_chunk_size=query_chunk_size,
+            key_chunk_size=key_chunk_size,
+            causal_block_size=causal_block_size,
+            deterministic=deterministic,
+            dropout_rng=None,
+            pdrop=pdrop,
+            dtype=dtype,
+            policy=policy,
+            precision=precision,
+            prevent_cse=prevent_cse,
+            sliding_window=sliding_window,
+            logit_soft_cap=logit_soft_cap,
+            attention_sink_size=attention_sink_size,
+            causal=causal,
+            res=fwd_residuals,
+            do=dO,
+        )
+
+        return grads
+
+    def fwd_with_residuals_tpu(
+        self,
+        query,
+        key,
+        value,
+        bias=None,
+        q_segment_ids=None,
+        kv_segment_ids=None,
+        softmax_aux=None,
+        cache_idx=None,
+        axis_name=None,
+        float32_logits=True,
+        softmax_scale=None,
+        query_chunk_size=512,
+        key_chunk_size=512,
+        causal_block_size=None,
+        deterministic=True,
+        dropout_rng=None,
+        pdrop=0.0,
+        dtype=None,
+        policy=None,
+        precision=None,
+        prevent_cse=True,
+        sliding_window=None,
+        logit_soft_cap=None,
+        attention_sink_size=0,
+        platform=None,
+        *,
+        cfg: RingAttentionConfig,
+    ):
+        """TPU-specific forward pass with residuals using Pallas kernels.
+
+        Args:
+            (same as fwd_with_residuals_xla)
+
+        Returns:
+            Tuple of (output, residuals) for backward pass
+        """
+        import jax.lax
+        import jax.numpy as jnp
+
+        from ejkernel.kernels._pallas.tpu.ring_attention import ring_attention_tpu_fwd
+        from ejkernel.kernels._pallas.tpu.ring_attention._utils import SegmentIds
+
+        if dtype is None:
+            dtype = jnp.float32
+        if policy is None:
+            policy = jax.checkpoint_policies.nothing_saveable
+        if softmax_scale is None:
+            softmax_scale = query.shape[-1] ** -0.5
+
+        if q_segment_ids is None and kv_segment_ids is None:
+            segment_ids = None
+        elif q_segment_ids is not None and kv_segment_ids is None:
+            segment_ids = SegmentIds(query=q_segment_ids, kv=q_segment_ids)
+        elif q_segment_ids is None and kv_segment_ids is not None:
+            segment_ids = SegmentIds(query=kv_segment_ids, kv=kv_segment_ids)
+        else:
+            segment_ids = SegmentIds(query=q_segment_ids, kv=kv_segment_ids)
+
+        causal = causal_block_size is not None
+        if causal:
+            causal_block_size = 1
+
+        (y, residuals) = ring_attention_tpu_fwd(
+            query=query,
+            key=key,
+            value=value,
+            attn_bias=bias,
+            segment_ids=segment_ids,
+            softmax_aux=softmax_aux,
+            cache_idx=cache_idx,
+            axis_name=axis_name,
+            float32_logits=float32_logits,
+            query_chunk_size=query_chunk_size,
+            key_chunk_size=key_chunk_size,
+            causal_block_size=causal_block_size,
+            deterministic=deterministic,
+            dropout_rng=dropout_rng,
+            pdrop=pdrop,
+            sliding_window=sliding_window,
+            logit_soft_cap=logit_soft_cap,
+            attention_sink_size=attention_sink_size,
+            policy=policy,
+            softmax_scale=softmax_scale,
+            causal=causal,
+        )
+
+        return y, (
+            residuals,
+            segment_ids,
+            cache_idx,
+            axis_name,
+            float32_logits,
+            query_chunk_size,
+            key_chunk_size,
+            causal_block_size,
+            deterministic,
+            pdrop,
+            sliding_window,
+            logit_soft_cap,
+            attention_sink_size,
+            policy,
+            softmax_scale,
+            causal,
+        )
+
+    def vjp_tpu(self, residuals, output, dO, *args, **kwargs):
+        """TPU-specific backward pass using Pallas kernels.
+
+        Args:
+            residuals: Residuals from forward pass
+            output: Output from forward pass
+            dO: Gradient of loss with respect to output
+
+        Returns:
+            Tuple of gradients (dq, dk, dv, ...)
+        """
+        from ejkernel.kernels._pallas.tpu.ring_attention import ring_attention_tpu_bwd
+
+        (
+            fwd_residuals,
+            segment_ids,
+            cache_idx,
+            axis_name,
+            float32_logits,
+            query_chunk_size,
+            key_chunk_size,
+            causal_block_size,
+            deterministic,
+            pdrop,
+            sliding_window,
+            logit_soft_cap,
+            attention_sink_size,
+            policy,
+            softmax_scale,
+            causal,
+        ) = residuals
+
+        grads = ring_attention_tpu_bwd(
+            segment_ids=segment_ids,
+            cache_idx=cache_idx,
+            axis_name=axis_name,
+            float32_logits=float32_logits,
+            query_chunk_size=query_chunk_size,
+            key_chunk_size=key_chunk_size,
+            causal_block_size=causal_block_size,
+            deterministic=deterministic,
+            dropout_rng=None,
+            pdrop=pdrop,
+            sliding_window=sliding_window,
+            logit_soft_cap=logit_soft_cap,
+            attention_sink_size=attention_sink_size,
+            policy=policy,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            res=fwd_residuals,
+            do=dO,
+        )
+
+        return grads
+
+
+_ring_executor: Executor[RingAttentionConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def ring_attention(
@@ -328,6 +672,8 @@ def ring_attention(
     logit_soft_cap: float | None = None,
     attention_sink_size: int = 0,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    *,
+    cfg: RingAttentionConfig | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute ring attention with automatic optimization.
 
@@ -416,4 +762,5 @@ def ring_attention(
         logit_soft_cap=logit_soft_cap,
         attention_sink_size=attention_sink_size,
         platform=platform,
+        _cfg=cfg,
     )

@@ -31,12 +31,21 @@ from typing import Literal
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import RecurrentAttentionConfig
 
 
-class LightningAttention(Kernel[KernelConfig, Array]):
+class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
     """Lightning Attention with custom optimization logic.
 
     Implements a layer-aware attention mechanism optimized for deep transformer
@@ -57,10 +66,14 @@ class LightningAttention(Kernel[KernelConfig, Array]):
     """
 
     def __init__(self):
-        """Initialize Lightning Attention module."""
+        """Initialize Lightning Attention module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="lightning_attn")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: RecurrentAttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -86,10 +99,14 @@ class LightningAttention(Kernel[KernelConfig, Array]):
         initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+        return_state: bool = False,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
-    ) -> Float[Array, "batch seq_len num_heads head_dim"]:
+        cfg: RecurrentAttentionConfig,
+    ) -> (
+        Float[Array, "batch seq_len num_heads head_dim"]
+        | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
+    ):
         """Execute lightning attention with layer-specific optimization.
 
         Args:
@@ -102,11 +119,14 @@ class LightningAttention(Kernel[KernelConfig, Array]):
             initial_state: Optional initial hidden state [batch, num_heads, head_dim, head_dim]
             reverse: If True, process sequence in reverse order
             cu_seqlens: Cumulative sequence lengths for variable-length sequences
+            return_state: If True, return tuple (output, final_state) instead of just output
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
             cfg: Kernel configuration object
 
         Returns:
-            Attention output [batch, seq_len, num_heads, head_dim]
+            If return_state=False: Attention output [batch, seq_len, num_heads, head_dim]
+            If return_state=True: Tuple of (output, final_state) where final_state
+                is [batch, num_heads, head_dim, head_dim]
 
         Note:
             The layer_idx and num_layers parameters enable layer-specific
@@ -114,7 +134,7 @@ class LightningAttention(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
+            cfg = RecurrentAttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 block_d=cfg.block_d,
@@ -124,7 +144,7 @@ class LightningAttention(Kernel[KernelConfig, Array]):
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
-        return impl(
+        result = impl(
             query=query,
             key=key,
             value=value,
@@ -136,9 +156,24 @@ class LightningAttention(Kernel[KernelConfig, Array]):
             cu_seqlens=cu_seqlens,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
-        """Provide default configuration with block sizes."""
-        return KernelConfig(
+        if isinstance(result, tuple):
+            if return_state:
+                return result
+            else:
+                return result[0]
+        return result
+
+    def heuristic_cfg(self, inv: Invocation[RecurrentAttentionConfig, Array]) -> RecurrentAttentionConfig:
+        """Provide default configuration with block sizes.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default configuration with conservative block sizes suitable for
+            typical lightning attention workloads across various layer depths
+        """
+        return RecurrentAttentionConfig(
             block_q=64,
             block_k=64,
             block_d=64,
@@ -148,8 +183,19 @@ class LightningAttention(Kernel[KernelConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+    def candidate_cfgs(self, inv: Invocation[RecurrentAttentionConfig, Array]):
+        """Generate candidate configurations for autotuning.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of candidate configurations to benchmark during autotuning
+
+        Note:
+            Lightning attention's layer-aware design means performance may vary
+            across layer depths. Candidates cover a range of block sizes.
+        """
         block_configs = [
             (64, 64, 64, 4, 1),
             (128, 64, 64, 4, 2),
@@ -159,7 +205,7 @@ class LightningAttention(Kernel[KernelConfig, Array]):
         candidates = []
         for block_q, block_k, block_d, num_warps, num_stages in block_configs:
             candidates.append(
-                KernelConfig(
+                RecurrentAttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
                     block_d=block_d,
@@ -173,7 +219,13 @@ class LightningAttention(Kernel[KernelConfig, Array]):
         return candidates
 
 
-_lightning_executor = create_default_executor()
+_lightning_executor: Executor[RecurrentAttentionConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def lightning_attention(
@@ -186,8 +238,14 @@ def lightning_attention(
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    return_state: bool = False,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-) -> Float[Array, "batch seq_len num_heads head_dim"]:
+    *,
+    cfg: RecurrentAttentionConfig | None = None,
+) -> (
+    Float[Array, "batch seq_len num_heads head_dim"]
+    | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
+):
     """Execute lightning attention with automatic optimization.
 
     Lightning attention is an efficient attention mechanism that uses
@@ -203,10 +261,12 @@ def lightning_attention(
         initial_state: Initial state for recurrent computation
         reverse: Whether to process sequence in reverse
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
+        return_state: If True, return tuple (output, final_state) instead of just output
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
 
     Returns:
-        Attention output with same shape as query
+        If return_state=False: Attention output with same shape as query
+        If return_state=True: Tuple of (output, final_state)
 
     Example:
         >>>
@@ -232,5 +292,7 @@ def lightning_attention(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        return_state=return_state,
         platform=platform,
+        _cfg=cfg,
     )

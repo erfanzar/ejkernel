@@ -30,7 +30,7 @@ Functions:
     _has_custom_vjp: Utility to detect custom VJP implementations
 """
 
-from .kernel import Invocation, Kernel, _has_custom_vjp
+from .kernel import Invocation, Kernel, _get_platform_method, _has_custom_vjp
 from .types import Cfg, Out
 
-__all__ = ("Cfg", "Invocation", "Kernel", "Out", "_has_custom_vjp")
+__all__ = ("Cfg", "Invocation", "Kernel", "Out", "_get_platform_method", "_has_custom_vjp")

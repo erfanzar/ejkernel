@@ -346,13 +346,69 @@ class Kernel(Generic[Cfg, Out]):
         raise NotImplementedError
 
 
-def _has_custom_vjp(k: Kernel) -> bool:
+def _has_custom_vjp(k: Kernel, platform: str | None = None) -> bool:
     """Check if a kernel has implemented custom VJP (vector-Jacobian product) methods.
 
     Returns True if both fwd_with_residuals and vjp methods have been overridden
-    from the base Kernel class.
+    from the base Kernel class. Supports platform-specific methods (e.g., fwd_with_residuals_gpu).
+
+    Args:
+        k: Kernel instance to check
+        platform: Optional platform identifier (e.g., 'gpu', 'tpu', 'cpu')
+                 If provided, checks for platform-specific methods first
+
+    Returns:
+        True if kernel has custom VJP implementation (generic or platform-specific)
     """
     try:
+        if platform:
+            platform_fwd = f"fwd_with_residuals_{platform}"
+            platform_vjp = f"vjp_{platform}"
+
+            has_platform_fwd = hasattr(type(k), platform_fwd) and getattr(type(k), platform_fwd) is not getattr(
+                Kernel, platform_fwd, None
+            )
+            has_platform_vjp = hasattr(type(k), platform_vjp) and getattr(type(k), platform_vjp) is not getattr(
+                Kernel, platform_vjp, None
+            )
+
+            if has_platform_fwd and has_platform_vjp:
+                return True
+
         return type(k).fwd_with_residuals is not Kernel.fwd_with_residuals and type(k).vjp is not Kernel.vjp
     except AttributeError:
         return False
+
+
+def _get_platform_method(k: Kernel, method_name: str, platform: str | None = None) -> Callable | None:
+    """Get platform-specific method from kernel, falling back to generic method.
+
+    Args:
+        k: Kernel instance
+        method_name: Base method name (e.g., 'run', 'candidate_cfgs', 'fwd_with_residuals')
+        platform: Optional platform identifier (e.g., 'gpu', 'tpu', 'cpu')
+
+    Returns:
+        Platform-specific method if available, otherwise generic method, or None if neither exists
+
+    Example:
+        >>>
+        >>>
+        >>> method = _get_platform_method(kernel, 'run', 'gpu')
+    """
+    if platform:
+        platform_method_name = f"{method_name}_{platform}"
+        if hasattr(k, platform_method_name):
+            method = getattr(k, platform_method_name)
+
+            base_method = getattr(Kernel, platform_method_name, None)
+            if method is not base_method:
+                return method
+
+    if hasattr(k, method_name):
+        method = getattr(k, method_name)
+        base_method = getattr(Kernel, method_name, None)
+        if method is not base_method:
+            return method
+
+    return None

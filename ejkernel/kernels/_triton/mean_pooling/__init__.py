@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
-from ._interface import mean_pooling
+from ._interface import (
+    _bwd_call as mean_pooling_gpu_bwd,
+)
+from ._interface import (
+    _fwd_call as mean_pooling_gpu_fwd,
+)
+from ._interface import (
+    mean_pooling,
+)
 
-__all__ = ["mean_pooling"]
+__all__ = [
+    "mean_pooling",
+    "mean_pooling_gpu_bwd",
+    "mean_pooling_gpu_fwd",
+]

@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
-from ._interface import recurrent
+from ._interface import (
+    _bwd_call as recurrent_gpu_bwd,
+)
+from ._interface import (
+    _fwd_call as recurrent_gpu_fwd,
+)
+from ._interface import (
+    recurrent,
+)
 
-__all__ = ["recurrent"]
+__all__ = [
+    "recurrent",
+    "recurrent_gpu_bwd",
+    "recurrent_gpu_fwd",
+]

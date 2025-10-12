@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
-from ._interface import recurrent
+from ._interface import (
+    _recurrent_bwd as recurrent_xla_bwd,
+)
+from ._interface import (
+    _recurrent_fwd as recurrent_xla_fwd,
+)
+from ._interface import (
+    recurrent,
+)
 
-__all__ = ["recurrent"]
+__all__ = [
+    "recurrent",
+    "recurrent_xla_bwd",
+    "recurrent_xla_fwd",
+]

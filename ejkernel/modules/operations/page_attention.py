@@ -61,12 +61,21 @@ from typing import Literal
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import PageAttentionConfig
 
 
-class PageAttention(Kernel[KernelConfig, Array]):
+class PageAttention(Kernel[PageAttentionConfig, Array]):
     """Page Attention with custom optimization logic.
 
     Efficient attention over paged KV cache for serving workloads.
@@ -97,7 +106,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
         """
         super().__init__(op_id="page_attention")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: PageAttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -124,7 +133,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
         num_splits: int = 0,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
+        cfg: PageAttentionConfig,
         mask_value: float = -2.381976426469702e38,
         attn_logits_soft_cap: float | None = None,
         pages_per_compute_block: int | None = None,
@@ -171,7 +180,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
+            cfg = PageAttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
@@ -197,7 +206,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
             inline_seq_dim=inline_seq_dim,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
+    def heuristic_cfg(self, inv: Invocation[PageAttentionConfig, Array]) -> PageAttentionConfig:
         """Provide default configuration optimized for paged attention.
 
         Args:
@@ -207,7 +216,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
             Default KernelConfig with block sizes suitable for typical
             serving workloads with variable context lengths
         """
-        return KernelConfig(
+        return PageAttentionConfig(
             block_q=64,
             block_k=64,
             num_warps=4,
@@ -216,7 +225,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[PageAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Creates configurations optimized for different batch sizes and
@@ -242,7 +251,7 @@ class PageAttention(Kernel[KernelConfig, Array]):
         candidates = []
         for block_q, block_k, num_warps, num_stages in block_configs:
             candidates.append(
-                KernelConfig(
+                PageAttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
                     num_warps=num_warps,
@@ -255,7 +264,13 @@ class PageAttention(Kernel[KernelConfig, Array]):
         return candidates
 
 
-_page_attention_executor = create_default_executor()
+_page_attention_executor: Executor[PageAttentionConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def page_attention(
@@ -273,6 +288,8 @@ def page_attention(
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    *,
+    cfg: PageAttentionConfig | None = None,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
     """Execute page attention with automatic optimization.
 
@@ -333,4 +350,6 @@ def page_attention(
         pages_per_compute_block=pages_per_compute_block,
         megacore_mode=megacore_mode,
         inline_seq_dim=inline_seq_dim,
+        platform=platform,
+        _cfg=cfg,
     )

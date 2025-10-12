@@ -18,6 +18,11 @@
 Provides shared configuration infrastructure for kernel execution,
 but does NOT provide a base Kernel class. Each kernel module should
 implement its own custom Kernel subclass tailored to its specific needs.
+
+Note:
+    The ``create_default_executor()`` function is deprecated. Use
+    ``Executor(ConfigSelectorChain(...))`` directly instead. See the
+    function documentation for migration examples.
 """
 
 from __future__ import annotations
@@ -143,6 +148,10 @@ def create_default_executor(
 ) -> Executor[KernelConfig, jax.Array | tuple[jax.Array, jax.Array]]:
     """Create a default executor with standard configuration.
 
+    .. deprecated::
+        Use ``Executor(ConfigSelectorChain(...))`` directly instead of ``create_default_executor()``.
+        This function will be removed in a future version.
+
     Sets up an executor with in-memory and optional persistent caching,
     and autotuning enabled by default.
 
@@ -159,13 +168,34 @@ def create_default_executor(
 
     Example:
         >>>
+        >>>
         >>> executor = create_default_executor("/tmp/kernel_cache")
         >>>
+        >>>
+        >>> from ejkernel.ops import Executor, ConfigSelectorChain, ConfigCache, AutotunePolicy, Tuner, PersistentCache
+        >>> executor = Executor(
+        ...     ConfigSelectorChain(
+        ...         cache=ConfigCache(),
+        ...         policy=AutotunePolicy(allow_autotune=True),
+        ...         tuner=Tuner(warmup=2, iters=5),
+        ...         persistent=PersistentCache("/tmp/kernel_cache")
+        ...     )
+        ... )
         >>>
         >>> from ejkernel.modules import FlashAttention
         >>> attn = FlashAttention()
         >>> output = executor(attn, q, k, v, causal=True)
     """
+    import warnings
+
+    warnings.warn(
+        "create_default_executor() is deprecated. "
+        "Use Executor(ConfigSelectorChain(...)) directly instead. "
+        "See the documentation for migration examples.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     from ejkernel.ops import AutotunePolicy, Tuner
 
     return Executor[KernelConfig, jax.Array | tuple[jax.Array, jax.Array]](

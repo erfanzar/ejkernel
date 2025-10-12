@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+from ._interface import _jax_bwd_attention_call as flash_attention_gpu_bwd
+from ._interface import _jax_fwd_attention_call as flash_attention_gpu_fwd
 from ._interface import flash_attention
 
-__all__ = ("flash_attention",)
+__all__ = (
+    "flash_attention",
+    "flash_attention_gpu_bwd",
+    "flash_attention_gpu_fwd",
+)

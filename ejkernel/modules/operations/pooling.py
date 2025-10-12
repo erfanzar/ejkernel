@@ -33,12 +33,21 @@ from typing import Literal
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import MeanPoolingConfig
 
 
-class MeanPooling(Kernel[KernelConfig, Array]):
+class MeanPooling(Kernel[MeanPoolingConfig, Array]):
     """Mean Pooling with custom optimization logic.
 
     Computes the mean of sequence elements along the sequence dimension, with
@@ -59,7 +68,7 @@ class MeanPooling(Kernel[KernelConfig, Array]):
         """Initialize Mean Pooling module."""
         super().__init__(op_id="mean_pooling")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: MeanPoolingConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -81,7 +90,7 @@ class MeanPooling(Kernel[KernelConfig, Array]):
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
+        cfg: MeanPoolingConfig,
     ) -> Float[Array, "batch hidden_dim"]:
         """Execute mean pooling over sequence dimension.
 
@@ -102,10 +111,8 @@ class MeanPooling(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
-                block_q=cfg.block_q,
-                block_k=cfg.block_k,
-                block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
+            cfg = MeanPoolingConfig(
+                block_size=cfg.block_size,
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
@@ -114,31 +121,32 @@ class MeanPooling(Kernel[KernelConfig, Array]):
         impl = self.get_impl(cfg)
         return impl(x=x, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
+    def heuristic_cfg(self, inv: Invocation[MeanPoolingConfig, Array]) -> MeanPoolingConfig:
         """Provide default configuration with block sizes."""
-        return KernelConfig(
-            block_q=32,
-            block_k=32,
+        return MeanPoolingConfig(
+            block_size=64,
             num_warps=4,
             num_stages=1,
             platform="auto",
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+    def candidate_cfgs(self, inv: Invocation[MeanPoolingConfig, Array]):
+        """Generate candidate configurations for autotuning.
+
+        Mean pooling has tunable block_size for chunked processing.
+        """
         block_configs = [
-            (16, 16, 4, 1),
-            (32, 32, 4, 1),
-            (64, 64, 8, 2),
+            (32, 4, 1),
+            (64, 4, 1),
+            (128, 8, 2),
         ]
 
         candidates = []
-        for block_q, block_k, num_warps, num_stages in block_configs:
+        for block_size, num_warps, num_stages in block_configs:
             candidates.append(
-                KernelConfig(
-                    block_q=block_q,
-                    block_k=block_k,
+                MeanPoolingConfig(
+                    block_size=block_size,
                     num_warps=num_warps,
                     num_stages=num_stages,
                     platform="auto",
@@ -149,7 +157,13 @@ class MeanPooling(Kernel[KernelConfig, Array]):
         return candidates
 
 
-_mean_pooling_executor = create_default_executor()
+_mean_pooling_executor: Executor[MeanPoolingConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def mean_pooling(
@@ -157,6 +171,8 @@ def mean_pooling(
     chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    *,
+    cfg: MeanPoolingConfig | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
     """Execute mean pooling with automatic optimization.
 
@@ -192,4 +208,5 @@ def mean_pooling(
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         platform=platform,
+        _cfg=cfg,
     )

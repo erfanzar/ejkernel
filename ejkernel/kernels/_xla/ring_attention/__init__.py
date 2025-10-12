@@ -14,5 +14,11 @@
 
 
 from ._interface import ring_attention
+from ._xla_impl_bwd import _ring_attention_bwd as ring_attention_xla_bwd
+from ._xla_impl_fwd import _ring_attention_fwd as ring_attention_xla_fwd
 
-__all__ = ["ring_attention"]
+__all__ = [
+    "ring_attention",
+    "ring_attention_xla_bwd",
+    "ring_attention_xla_fwd",
+]

@@ -13,6 +13,20 @@
 # limitations under the License.
 
 
-from ._interface import apply_native_sparse_attention, native_sparse_attention
+from ._interface import (
+    _bwd_call as native_sparse_attention_gpu_bwd,
+)
+from ._interface import (
+    _fwd_call as native_sparse_attention_gpu_fwd,
+)
+from ._interface import (
+    apply_native_sparse_attention,
+    native_sparse_attention,
+)
 
-__all__ = ("apply_native_sparse_attention", "native_sparse_attention")
+__all__ = (
+    "apply_native_sparse_attention",
+    "native_sparse_attention",
+    "native_sparse_attention_gpu_bwd",
+    "native_sparse_attention_gpu_fwd",
+)

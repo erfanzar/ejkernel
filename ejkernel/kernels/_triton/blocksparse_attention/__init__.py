@@ -20,6 +20,14 @@ custom JAX gradients and Triton acceleration. Supports various sparsity
 patterns including local attention and vertical stride patterns.
 """
 
-from ._interface import blocksparse_attention
+from ._interface import (
+    _blocksparse_attention_bhtd_bwd,
+    _blocksparse_attention_bhtd_fwd,
+    blocksparse_attention,
+)
 
-__all__ = ["blocksparse_attention"]
+__all__ = [
+    "_blocksparse_attention_bhtd_bwd",
+    "_blocksparse_attention_bhtd_fwd",
+    "blocksparse_attention",
+]

@@ -51,12 +51,21 @@ from typing import Literal
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import PageAttentionConfig
 
 
-class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
+class RaggedDecodeAttention(Kernel[PageAttentionConfig, Array]):
     """Ragged Decode Attention with custom optimization logic.
 
     Implements efficient attention for variable-length sequences during inference decode phase.
@@ -84,7 +93,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
         """
         super().__init__(op_id="ragged_decode_attention")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: PageAttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -113,7 +122,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
+        cfg: PageAttentionConfig,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
         """Execute ragged decode attention with variable-length sequences.
 
@@ -150,7 +159,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
+            cfg = PageAttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
@@ -173,7 +182,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
             block_size=block_size,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
+    def heuristic_cfg(self, inv: Invocation[PageAttentionConfig, Array]) -> PageAttentionConfig:
         """Provide default configuration optimized for decode attention.
 
         Args:
@@ -183,7 +192,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
             Default KernelConfig with conservative block sizes suitable for
             typical decode scenarios (small query sizes, variable KV lengths)
         """
-        return KernelConfig(
+        return PageAttentionConfig(
             block_q=64,
             block_k=64,
             num_warps=4,
@@ -192,7 +201,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[PageAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Creates multiple configurations optimized for different decode scenarios,
@@ -218,7 +227,7 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
         candidates = []
         for block_q, block_k, num_warps, num_stages in block_configs:
             candidates.append(
-                KernelConfig(
+                PageAttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
                     num_warps=num_warps,
@@ -231,7 +240,13 @@ class RaggedDecodeAttention(Kernel[KernelConfig, Array]):
         return candidates
 
 
-_ragged_decode_attention_executor = create_default_executor()
+_ragged_decode_attention_executor: Executor[PageAttentionConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def ragged_decode_attention(
@@ -246,6 +261,8 @@ def ragged_decode_attention(
     logit_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    *,
+    cfg: PageAttentionConfig | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Execute ragged decode attention with automatic optimization.
 
@@ -307,4 +324,5 @@ def ragged_decode_attention(
         sequence_end=sequence_end,
         block_size=block_size,
         platform=platform,
+        _cfg=cfg,
     )

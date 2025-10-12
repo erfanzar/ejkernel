@@ -147,6 +147,45 @@ def device_fingerprint(dev: jax.Device | None = None) -> str:  # type:ignore
     return f"{kind}|{plat_ver}"
 
 
+def get_device_platform(dev: jax.Device | None = None) -> str:
+    """Extract the platform identifier (gpu/tpu/cpu) from a JAX device.
+
+    Args:
+        dev: JAX device, uses default device if None
+
+    Returns:
+        Platform string: 'gpu', 'tpu', 'cpu', or 'unknown'
+
+    Examples:
+        >>> get_device_platform()
+        'gpu'
+        >>> get_device_platform(jax.devices('tpu')[0])
+        'tpu'
+
+    Note:
+        This is used for platform-specific method dispatch in kernels.
+    """
+    d = dev or jax.devices()[0]
+
+    platform = getattr(d, "platform", "").lower()
+    if platform in ["gpu", "cuda"]:
+        return "gpu"
+    elif platform == "tpu":
+        return "tpu"
+    elif platform == "cpu":
+        return "cpu"
+
+    kind = getattr(d, "device_kind", "unknown").lower()
+    if "gpu" in kind or "cuda" in kind or "nvidia" in kind or "geforce" in kind or "rtx" in kind:
+        return "gpu"
+    elif "tpu" in kind:
+        return "tpu"
+    elif "cpu" in kind:
+        return "cpu"
+
+    return "unknown"
+
+
 def device_kind() -> str:
     """Get the device kind (gpu, cpu, tpu) for the default device.
 

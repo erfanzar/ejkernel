@@ -31,12 +31,21 @@ from typing import Literal
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import RecurrentAttentionConfig
 
 
-class GLAttention(Kernel[KernelConfig, Array]):
+class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
     """Gated Linear Attention with custom optimization logic.
 
     Implements gated linear attention combining the efficiency of linear attention
@@ -56,10 +65,14 @@ class GLAttention(Kernel[KernelConfig, Array]):
     """
 
     def __init__(self):
-        """Initialize GLA module."""
+        """Initialize GLA module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="gla")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: RecurrentAttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -85,10 +98,14 @@ class GLAttention(Kernel[KernelConfig, Array]):
         initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+        return_state: bool = False,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
-    ) -> Float[Array, "batch seq_len num_heads head_dim"]:
+        cfg: RecurrentAttentionConfig,
+    ) -> (
+        Float[Array, "batch seq_len num_heads head_dim"]
+        | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
+    ):
         """Execute gated linear attention computation.
 
         Args:
@@ -101,11 +118,14 @@ class GLAttention(Kernel[KernelConfig, Array]):
             initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
             reverse: If True, process sequence in reverse order
             cu_seqlens: Cumulative sequence lengths for variable-length sequences
+            return_state: If True, return tuple (output, final_state) instead of just output
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
             cfg: Kernel configuration object
 
         Returns:
-            Gated attention output [batch, seq_len, num_heads, head_dim]
+            If return_state=False: Gated attention output [batch, seq_len, num_heads, head_dim]
+            If return_state=True: Tuple of (output, final_state) where final_state
+                is [batch, num_heads, head_dim, head_dim]
 
         Note:
             Both g and g_gamma are optional. When provided, they enable more
@@ -113,7 +133,7 @@ class GLAttention(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
+            cfg = RecurrentAttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 block_d=cfg.block_d,
@@ -124,7 +144,7 @@ class GLAttention(Kernel[KernelConfig, Array]):
             )
         impl = self.get_impl(cfg)
 
-        return impl(
+        result = impl(
             query=query,
             key=key,
             value=value,
@@ -136,9 +156,24 @@ class GLAttention(Kernel[KernelConfig, Array]):
             cu_seqlens=cu_seqlens,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
-        """Provide default configuration with block sizes."""
-        return KernelConfig(
+        if isinstance(result, tuple):
+            if return_state:
+                return result
+            else:
+                return result[0]
+        return result
+
+    def heuristic_cfg(self, inv: Invocation[RecurrentAttentionConfig, Array]) -> RecurrentAttentionConfig:
+        """Provide default configuration with block sizes.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default configuration with conservative block sizes suitable for
+            typical gated linear attention workloads
+        """
+        return RecurrentAttentionConfig(
             block_q=64,
             block_k=64,
             block_d=64,
@@ -148,14 +183,25 @@ class GLAttention(Kernel[KernelConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+    def candidate_cfgs(self, inv: Invocation[RecurrentAttentionConfig, Array]):
+        """Generate candidate configurations for autotuning.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of candidate configurations to benchmark during autotuning
+
+        Note:
+            GLA performance depends on the gating mechanism effectiveness and
+            sequence length. Candidates are chosen for typical configurations.
+        """
         block_configs = [(64, 64, 64, 4, 1)]
 
         candidates = []
         for block_q, block_k, block_d, num_warps, num_stages in block_configs:
             candidates.append(
-                KernelConfig(
+                RecurrentAttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
                     block_d=block_d,
@@ -169,7 +215,13 @@ class GLAttention(Kernel[KernelConfig, Array]):
         return candidates
 
 
-_gla_executor = create_default_executor()
+_gla_executor: Executor[RecurrentAttentionConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def gla_attention(
@@ -182,8 +234,14 @@ def gla_attention(
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    return_state: bool = False,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-) -> Float[Array, "batch seq_len num_heads head_dim"]:
+    *,
+    cfg: RecurrentAttentionConfig | None = None,
+) -> (
+    Float[Array, "batch seq_len num_heads head_dim"]
+    | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
+):
     """Execute gated linear attention with automatic optimization.
 
     Convenience function that uses a default executor and GLA module.
@@ -198,10 +256,12 @@ def gla_attention(
         initial_state: Initial state for recurrent computation
         reverse: Whether to process sequence in reverse
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
+        return_state: If True, return tuple (output, final_state) instead of just output
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
 
     Returns:
-        Attention output with same shape as query
+        If return_state=False: Attention output with same shape as query
+        If return_state=True: Tuple of (output, final_state)
 
     Example:
         >>>
@@ -227,5 +287,7 @@ def gla_attention(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        return_state=return_state,
         platform=platform,
+        _cfg=cfg,
     )

@@ -65,6 +65,16 @@ Note:
 
 from .attention import Attention, attention
 from .blocksparse_attention import BlockSparseAttention, blocksparse_attention
+from .configs import (
+    AttentionConfig,
+    BlockSparseAttentionConfig,
+    FlashAttentionConfig,
+    GroupedMatmulConfig,
+    NativeSparseAttentionConfig,
+    PageAttentionConfig,
+    RecurrentAttentionConfig,
+    RingAttentionConfig,
+)
 from .flash_attention import FlashAttention, flash_attention
 from .gated_linear_attention import GLAttention, gla_attention
 from .grouped_matmul import GroupedMatmul, grouped_matmul
@@ -95,6 +105,9 @@ __all__ = (
     "RecurrentAttention",
     "RingAttention",
     "ScaledDotProductAttention",
+)
+
+__all__ += (
     "attention",
     "blocksparse_attention",
     "flash_attention",
@@ -110,4 +123,15 @@ __all__ = (
     "recurrent_attention",
     "ring_attention",
     "scaled_dot_product_attention",
+)
+
+__all__ += (
+    "AttentionConfig",
+    "BlockSparseAttentionConfig",
+    "FlashAttentionConfig",
+    "GroupedMatmulConfig",
+    "NativeSparseAttentionConfig",
+    "PageAttentionConfig",
+    "RecurrentAttentionConfig",
+    "RingAttentionConfig",
 )

@@ -38,12 +38,21 @@ from typing import Literal
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import AttentionConfig
 
 
-class FlashMLA(Kernel[KernelConfig, Array]):
+class FlashMLA(Kernel[AttentionConfig, Array]):
     """Flash Multi-head Latent Attention with custom optimization logic.
 
     Combines flash attention's memory efficiency with MLA's low-rank KV compression.
@@ -64,10 +73,14 @@ class FlashMLA(Kernel[KernelConfig, Array]):
     """
 
     def __init__(self):
-        """Initialize Flash MLA module."""
+        """Initialize Flash MLA module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="flash_mla")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: AttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -95,7 +108,7 @@ class FlashMLA(Kernel[KernelConfig, Array]):
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
+        cfg: AttentionConfig,
     ) -> Float[Array, "batch seq_len q_heads head_dim"]:
         """Execute flash multi-head latent attention.
 
@@ -121,10 +134,9 @@ class FlashMLA(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
+            cfg = AttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
-                block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
@@ -143,33 +155,50 @@ class FlashMLA(Kernel[KernelConfig, Array]):
             cu_seqlens=cu_seqlens,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
-        """Provide default configuration with block sizes."""
-        return KernelConfig(
+    def heuristic_cfg(self, inv: Invocation[AttentionConfig, Array]) -> AttentionConfig:
+        """Provide default configuration with block sizes.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default configuration optimized for MLA's low-rank decompression
+            and on-the-fly reconstruction requirements
+        """
+        return AttentionConfig(
             block_q=128,
             block_k=128,
-            block_d=64,
             num_warps=4,
             num_stages=2,
             platform="auto",
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+    def candidate_cfgs(self, inv: Invocation[AttentionConfig, Array]):
+        """Generate candidate configurations for autotuning.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of candidate configurations to benchmark during autotuning
+
+        Note:
+            MLA performance depends on the compression rank and decompression
+            overhead. Candidates balance memory efficiency with compute cost.
+        """
         block_configs = [
-            (64, 64, 64, 4, 1),
-            (128, 128, 64, 4, 2),
-            (128, 128, 128, 8, 2),
+            (64, 64, 4, 1),
+            (128, 128, 4, 2),
+            (256, 256, 8, 2),
         ]
 
         candidates = []
-        for block_q, block_k, block_d, num_warps, num_stages in block_configs:
+        for block_q, block_k, num_warps, num_stages in block_configs:
             candidates.append(
-                KernelConfig(
+                AttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
-                    block_d=block_d,
                     num_warps=num_warps,
                     num_stages=num_stages,
                     platform="auto",
@@ -180,7 +209,13 @@ class FlashMLA(Kernel[KernelConfig, Array]):
         return candidates
 
 
-_mla_executor = create_default_executor()
+_mla_executor: Executor[AttentionConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def mla_attention(
@@ -194,6 +229,8 @@ def mla_attention(
     causal: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    *,
+    cfg: AttentionConfig | None = None,
 ) -> Float[Array, "batch seq_len q_heads head_dim"]:
     """Execute flash multi-head latent attention with automatic optimization.
 
@@ -210,8 +247,8 @@ def mla_attention(
         softmax_scale: Scaling factor for attention scores
         causal: Whether to apply causal masking
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
-
-            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        cfg: Optional kernel configuration override
 
     Returns:
         Attention output with same shape as query
@@ -240,4 +277,6 @@ def mla_attention(
         softmax_scale=softmax_scale,
         causal=causal,
         cu_seqlens=cu_seqlens,
+        platform=platform,
+        _cfg=cfg,
     )

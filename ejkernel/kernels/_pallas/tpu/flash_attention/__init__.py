@@ -13,6 +13,12 @@
 # limitations under the License.
 
 
+from ._interface import _flash_attention_bwd as flash_attention_tpu_bwd
+from ._interface import _flash_attention_fwd as flash_attention_tpu_fwd
 from ._interface import flash_attention
 
-__all__ = ("flash_attention",)
+__all__ = (
+    "flash_attention",
+    "flash_attention_tpu_bwd",
+    "flash_attention_tpu_fwd",
+)

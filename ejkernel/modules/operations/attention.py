@@ -31,12 +31,21 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, PRNGKeyArray
 
 from ejkernel.kernels._registry import kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import AttentionConfig
 
 
-class Attention(Kernel[KernelConfig, tuple[Array, Array]]):
+class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
     """Attention with custom optimization logic.
 
     Supports causal masking, dropout, sliding windows, and variable-length sequences.
@@ -73,7 +82,7 @@ class Attention(Kernel[KernelConfig, tuple[Array, Array]]):
         """Initialize  Attention module."""
         super().__init__(op_id="attention")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: AttentionConfig):
         """Get kernel implementation from registry based on configuration.
 
         Args:
@@ -108,7 +117,7 @@ class Attention(Kernel[KernelConfig, tuple[Array, Array]]):
         dropout_prob: float = 0.0,
         sliding_window: int | tuple[int, int] | None = None,
         *,
-        cfg: KernelConfig,
+        cfg: AttentionConfig,
     ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
         """Execute flash attention with the given configuration.
 
@@ -145,7 +154,7 @@ class Attention(Kernel[KernelConfig, tuple[Array, Array]]):
             softmax_aux=softmax_aux,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
+    def heuristic_cfg(self, inv: Invocation[AttentionConfig, Array]) -> AttentionConfig:
         """Provide default configuration based on invocation context.
 
         Selects optimal block sizes based on sequence length and head dimension.
@@ -157,58 +166,42 @@ class Attention(Kernel[KernelConfig, tuple[Array, Array]]):
             Default configuration with block sizes
         """
 
-        return KernelConfig(
+        return AttentionConfig(
             block_q=128,
             block_k=128,
-            block_d=64,
             num_warps=4,
             num_stages=2,
             platform="auto",
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[AttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
-        Creates multiple block size configurations for benchmarking to find
-        the optimal tiling parameters for the given input shapes.
+        This operation uses XLA primitives directly without tunable block sizes,
+        so autotuning provides no benefit. Returns empty list to skip autotuning.
 
         Args:
             inv: Invocation object with arguments and metadata
 
         Returns:
-            Iterable of candidate configurations to test during autotuning
+            Empty list - no candidates to autotune since XLA handles optimization
 
         Note:
-            The autotuning system will benchmark each candidate and select
-            the fastest one for the given input configuration.
+            XLA's attention primitive is not parameterized by block sizes,
+            so there are no meaningful configurations to benchmark.
         """
 
-        block_configs = [
-            (128, 128),
-            (128, 256),
-            (256, 128),
-            (256, 256),
-        ]
-
-        candidates = []
-        for block_q, block_k in block_configs:
-            candidates.append(
-                KernelConfig(
-                    block_q=block_q,
-                    block_k=block_k,
-                    block_d=None,
-                    num_warps=None,
-                    num_stages=None,
-                    platform="auto",
-                    backend="any",
-                )
-            )
-
-        return candidates
+        return []
 
 
-_executor = create_default_executor()
+_executor: Executor[AttentionConfig, tuple[Array, Array]] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def attention(

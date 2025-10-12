@@ -24,12 +24,21 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import FlashAttentionConfig
 
 
-class FlashAttention(Kernel[KernelConfig, Array]):
+class FlashAttention(Kernel[FlashAttentionConfig, Array]):
     """Flash Attention with custom optimization logic.
 
     Memory-efficient exact attention with O(N) memory complexity.
@@ -69,7 +78,7 @@ class FlashAttention(Kernel[KernelConfig, Array]):
         """Initialize Flash Attention module."""
         super().__init__(op_id="flash_attention")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: FlashAttentionConfig):
         """Get kernel implementation from registry based on configuration.
 
         Args:
@@ -110,7 +119,7 @@ class FlashAttention(Kernel[KernelConfig, Array]):
         *,
         q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-        cfg: KernelConfig,
+        cfg: FlashAttentionConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
         """Execute flash attention with the given configuration.
 
@@ -140,10 +149,9 @@ class FlashAttention(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
-                block_q=cfg.block_q,
-                block_k=cfg.block_k,
-                block_d=cfg.block_d,
+            cfg = FlashAttentionConfig(
+                chunk_size_q=cfg.chunk_size_q,
+                chunk_size_k=cfg.chunk_size_k,
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
@@ -170,11 +178,11 @@ class FlashAttention(Kernel[KernelConfig, Array]):
             logits_dtype=logits_dtype,
             q_segment_ids=q_segment_ids,
             kv_segment_ids=kv_segment_ids,
-            chunk_size_q=cfg.block_q,
-            chunk_size_k=cfg.block_k,
+            chunk_size_q=cfg.chunk_size_q,
+            chunk_size_k=cfg.chunk_size_k,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
+    def heuristic_cfg(self, inv: Invocation[FlashAttentionConfig, Array]) -> FlashAttentionConfig:
         """Provide default configuration based on invocation context.
 
         Selects optimal block sizes based on sequence length and head dimension.
@@ -186,17 +194,16 @@ class FlashAttention(Kernel[KernelConfig, Array]):
             Default configuration with block sizes
         """
 
-        return KernelConfig(
-            block_q=128,
-            block_k=128,
-            block_d=64,
+        return FlashAttentionConfig(
+            chunk_size_q=128,
+            chunk_size_k=128,
             num_warps=4,
             num_stages=2,
             platform="auto",
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[FlashAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Creates multiple block size configurations for benchmarking to find
@@ -221,14 +228,13 @@ class FlashAttention(Kernel[KernelConfig, Array]):
         ]
 
         candidates = []
-        for block_q, block_k in block_configs:
+        for chunk_q, chunk_k in block_configs:
             candidates.append(
-                KernelConfig(
-                    block_q=block_q,
-                    block_k=block_k,
-                    block_d=None,
-                    num_warps=None,
-                    num_stages=None,
+                FlashAttentionConfig(
+                    chunk_size_q=chunk_q,
+                    chunk_size_k=chunk_k,
+                    num_warps=4,
+                    num_stages=2,
                     platform="auto",
                     backend="any",
                 )
@@ -236,8 +242,252 @@ class FlashAttention(Kernel[KernelConfig, Array]):
 
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[FlashAttentionConfig, Array]):
+        """Generate GPU-optimized candidate configurations for autotuning.
 
-_flash_executor = create_default_executor()
+        GPU/Triton kernels benefit from smaller blocks with more warps and stages.
+
+        Args:
+            inv: Invocation object with arguments and metadata
+
+        Returns:
+            Iterable of GPU-optimized candidate configurations
+        """
+        configs = []
+        for chunk_q in [128, 256]:
+            for chunk_k in [128, 256]:
+                for num_warps in [4, 8]:
+                    for num_stages in [2, 3]:
+                        configs.append(
+                            FlashAttentionConfig(
+                                chunk_size_q=chunk_q,
+                                chunk_size_k=chunk_k,
+                                num_warps=num_warps,
+                                num_stages=num_stages,
+                                platform="triton",
+                                backend="gpu",
+                            )
+                        )
+        return configs
+
+    def candidate_cfgs_tpu(self, inv: Invocation[FlashAttentionConfig, Array]):
+        """Generate TPU-optimized candidate configurations for autotuning.
+
+        TPU/Pallas kernels benefit from larger blocks with fewer stages.
+
+        Args:
+            inv: Invocation object with arguments and metadata
+
+        Returns:
+            Iterable of TPU-optimized candidate configurations
+        """
+        configs = []
+        for chunk_q in [256, 512]:
+            for chunk_k in [256, 512]:
+                configs.append(
+                    FlashAttentionConfig(
+                        chunk_size_q=chunk_q,
+                        chunk_size_k=chunk_k,
+                        num_warps=4,
+                        num_stages=1,
+                        platform="pallas",
+                        backend="tpu",
+                    )
+                )
+        return configs
+
+    def candidate_cfgs_xla(self, inv: Invocation[FlashAttentionConfig, Array]):
+        """Generate XLA-optimized candidate configurations for autotuning.
+
+        XLA implementations use medium blocks with moderate parallelism.
+
+        Args:
+            inv: Invocation object with arguments and metadata
+
+        Returns:
+            Iterable of XLA-optimized candidate configurations
+        """
+        configs = []
+        for chunk_q in [128, 256]:
+            for chunk_k in [128, 256]:
+                configs.append(
+                    FlashAttentionConfig(
+                        chunk_size_q=chunk_q,
+                        chunk_size_k=chunk_k,
+                        num_warps=4,
+                        num_stages=2,
+                        platform="xla",
+                        backend="any",
+                    )
+                )
+        return configs
+
+    def fwd_with_residuals_gpu(
+        self,
+        query: Float[Array, "batch seq_len_q num_heads head_dim"],
+        key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+        value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+        softmax_scale: float | None = None,
+        dropout_prob: float = 0.0,
+        causal: bool = False,
+        dropout_seed: int | None = None,
+        cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+        cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+        sliding_window: int | tuple[int, int] | None = None,
+        logits_soft_cap: float | None = None,
+        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        normalize_output: bool = True,
+        precision: lax.PrecisionLike = lax.Precision.DEFAULT,
+        logits_dtype: DTypeLike = jnp.float32,
+        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        *,
+        cfg: FlashAttentionConfig,
+    ):
+        """GPU-specific forward pass with residuals using Triton kernels.
+
+        Computes flash attention output and saves intermediate values (residuals)
+        needed for the backward pass. This method is used by the VJP system
+        to enable efficient gradient computation on GPU devices.
+
+        Args:
+            query: Query tensor [batch, seq_len_q, num_heads, head_dim]
+            key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim]
+            value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim]
+            attention_mask: Optional attention mask
+            bias: Optional attention bias tensor
+            softmax_scale: Scaling factor for attention scores
+            dropout_prob: Dropout probability for attention weights
+            causal: Whether to apply causal masking
+            dropout_seed: Random seed for dropout
+            cum_seqlens_q: Cumulative sequence lengths for variable-length queries
+            cum_seqlens_k: Cumulative sequence lengths for variable-length keys
+            sliding_window: Window size for local attention
+            logits_soft_cap: Optional soft cap value for logits
+            softmax_aux: Optional attention sink logits
+            normalize_output: Whether to normalize the output
+            precision: JAX precision setting
+            logits_dtype: Data type for logits computation
+            q_segment_ids: Segment IDs for query sequences
+            kv_segment_ids: Segment IDs for key/value sequences
+            platform: Platform override
+            cfg: Configuration object
+
+        Returns:
+            tuple: (output, residuals) where output is the attention result
+                and residuals contains intermediate values for backward pass
+
+        Note:
+            This method uses Triton kernels optimized for NVIDIA GPUs.
+            Residuals include softmax statistics and intermediate activations
+            needed for gradient computation.
+        """
+
+        from ejkernel.kernels._triton.flash_attention import flash_attention_gpu_fwd
+
+        output, residuals = flash_attention_gpu_fwd(
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            bias=bias,
+            softmax_scale=softmax_scale,
+            dropout_prob=dropout_prob,
+            causal=causal,
+            dropout_seed=dropout_seed,
+            cum_seqlens_q=cum_seqlens_q,
+            cum_seqlens_k=cum_seqlens_k,
+            sliding_window=sliding_window,
+            logits_soft_cap=logits_soft_cap,
+            softmax_aux=softmax_aux,
+        )
+        return output, residuals
+
+    def vjp_gpu(
+        self,
+        residuals,
+        output,
+        dO: Float[Array, "batch seq_len_q num_heads head_dim"],
+        *args,
+        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+        softmax_scale: float | None = None,
+        dropout_prob: float = 0.0,
+        causal: bool = False,
+        dropout_seed: int | None = None,
+        cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+        cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+        sliding_window: int | tuple[int, int] | None = None,
+        logits_soft_cap: float | None = None,
+        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        normalize_output: bool = True,
+        precision: lax.PrecisionLike = lax.Precision.DEFAULT,
+        logits_dtype: DTypeLike = jnp.float32,
+        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        cfg: FlashAttentionConfig = None,
+    ):
+        """GPU-specific backward pass using Triton kernels.
+
+        Computes gradients with respect to query, key, and value tensors
+        using the output gradient and residuals from the forward pass.
+
+        Args:
+            residuals: Intermediate values from forward pass
+            output: Forward pass output (attention result)
+            dO: Gradient of loss with respect to output
+            args: Additional positional arguments
+            attention_mask: Optional attention mask
+            bias: Optional attention bias tensor
+            softmax_scale: Scaling factor for attention scores
+            dropout_prob: Dropout probability used in forward pass
+            causal: Whether causal masking was applied
+            dropout_seed: Random seed for dropout (must match forward pass)
+            cum_seqlens_q: Cumulative sequence lengths for queries
+            cum_seqlens_k: Cumulative sequence lengths for keys
+            sliding_window: Window size for local attention
+            logits_soft_cap: Soft cap value for logits
+            softmax_aux: Attention sink logits
+            normalize_output: Whether output normalization was applied
+            precision: JAX precision setting
+            logits_dtype: Data type for logits computation
+            q_segment_ids: Segment IDs for query sequences
+            kv_segment_ids: Segment IDs for key/value sequences
+            platform: Platform override
+            cfg: Configuration object
+
+        Returns:
+            tuple: (dQ, dK, dV) gradients with respect to query, key, and value
+
+        Note:
+            This method uses Triton kernels optimized for NVIDIA GPUs.
+            The backward pass recomputes softmax statistics for memory efficiency.
+        """
+
+        from ejkernel.kernels._triton.flash_attention import flash_attention_gpu_bwd
+
+        return flash_attention_gpu_bwd(
+            softmax_scale=softmax_scale,
+            dropout_prob=dropout_prob,
+            causal=causal,
+            sliding_window=sliding_window,
+            logits_soft_cap=logits_soft_cap,
+            residual=residuals,
+            dO=dO,
+        )
+
+
+_flash_executor: Executor[FlashAttentionConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def flash_attention(
@@ -261,6 +511,8 @@ def flash_attention(
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    *,
+    cfg: FlashAttentionConfig | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute flash attention with automatic optimization.
 
@@ -321,4 +573,5 @@ def flash_attention(
         q_segment_ids=q_segment_ids,
         kv_segment_ids=kv_segment_ids,
         platform=platform,
+        _cfg=cfg,
     )

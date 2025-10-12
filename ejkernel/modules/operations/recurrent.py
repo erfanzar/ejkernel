@@ -42,12 +42,21 @@ from typing import Literal
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import RecurrentAttentionConfig
 
 
-class RecurrentAttention(Kernel[KernelConfig, Array]):
+class RecurrentAttention(Kernel[RecurrentAttentionConfig, Array]):
     """Recurrent Attention with custom optimization logic.
 
     Implements attention with recurrent state updates, enabling linear-time complexity
@@ -70,10 +79,14 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
     """
 
     def __init__(self):
-        """Initialize Recurrent Attention module."""
+        """Initialize Recurrent Attention module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="recurrent")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: RecurrentAttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -101,10 +114,14 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
         initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+        return_state: bool = False,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
-    ) -> Float[Array, "batch seq_len num_heads head_dim"]:
+        cfg: RecurrentAttentionConfig,
+    ) -> (
+        Float[Array, "batch seq_len num_heads head_dim"]
+        | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
+    ):
         """Execute recurrent attention with stateful computation.
 
         Args:
@@ -119,11 +136,14 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
             initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
             reverse: If True, process sequence in reverse order
             cu_seqlens: Cumulative sequence lengths for variable-length sequences
+            return_state: If True, return tuple (output, final_state) instead of just output
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
             cfg: Kernel configuration object
 
         Returns:
-            Attention output [batch, seq_len, num_heads, head_dim]
+            If return_state=False: Attention output [batch, seq_len, num_heads, head_dim]
+            If return_state=True: Tuple of (output, final_state) where final_state
+                is [batch, num_heads, head_dim, head_dim]
 
         Note:
             All gating parameters (g, gk, gv, g_gamma) are optional. When provided,
@@ -131,7 +151,7 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
+            cfg = RecurrentAttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
@@ -141,7 +161,7 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
-        return impl(
+        result = impl(
             query=query,
             key=key,
             value=value,
@@ -155,9 +175,24 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
             cu_seqlens=cu_seqlens,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
-        """Provide default configuration with block sizes."""
-        return KernelConfig(
+        if isinstance(result, tuple):
+            if return_state:
+                return result
+            else:
+                return result[0]
+        return result
+
+    def heuristic_cfg(self, inv: Invocation[RecurrentAttentionConfig, Array]) -> RecurrentAttentionConfig:
+        """Provide default configuration with block sizes.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default configuration with conservative block sizes suitable for
+            typical recurrent attention workloads with stateful computation
+        """
+        return RecurrentAttentionConfig(
             block_q=64,
             block_k=64,
             block_d=64,
@@ -167,8 +202,19 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+    def candidate_cfgs(self, inv: Invocation[RecurrentAttentionConfig, Array]):
+        """Generate candidate configurations for autotuning.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of candidate configurations to benchmark during autotuning
+
+        Note:
+            Recurrent attention performance is sensitive to state update patterns.
+            Candidates are chosen to balance sequential processing efficiency.
+        """
         block_configs = [
             (64, 64, 64, 4, 1),
             (128, 64, 64, 4, 2),
@@ -178,7 +224,7 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
         candidates = []
         for block_q, block_k, block_d, num_warps, num_stages in block_configs:
             candidates.append(
-                KernelConfig(
+                RecurrentAttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
                     block_d=block_d,
@@ -191,8 +237,216 @@ class RecurrentAttention(Kernel[KernelConfig, Array]):
 
         return candidates
 
+    def fwd_with_residuals_gpu(
+        self,
+        query,
+        key,
+        value,
+        g=None,
+        g_gamma=None,
+        gk=None,
+        gv=None,
+        softmax_scale=None,
+        initial_state=None,
+        reverse=False,
+        cu_seqlens=None,
+        platform=None,
+        *,
+        cfg: RecurrentAttentionConfig,
+    ):
+        """GPU-specific forward pass with residuals using Triton kernels.
 
-_recurrent_executor = create_default_executor()
+        Args:
+            query: Query tensor [batch, seq_len, num_heads, head_dim]
+            key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
+            value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
+            g: Query-level gating tensor
+            g_gamma: Layer-level gating parameter
+            gk: Key-level gating tensor
+            gv: Value-level gating tensor
+            softmax_scale: Attention scaling factor
+            initial_state: Initial hidden state
+            reverse: Process sequence in reverse
+            cu_seqlens: Cumulative sequence lengths
+            platform: Platform override
+            cfg: Configuration object
+
+        Returns:
+            Tuple of ((output, final_state), residuals) for backward pass
+        """
+        from ejkernel.kernels._triton.recurrent import recurrent_gpu_fwd
+
+        if softmax_scale is None:
+            softmax_scale = key.shape[-1] ** -0.5
+
+        (o, ht), residual = recurrent_gpu_fwd(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            g_gamma=g_gamma,
+            gk=gk,
+            gv=gv,
+            softmax_scale=softmax_scale,
+            initial_state=initial_state,
+            reverse=reverse,
+            cu_seqlens=cu_seqlens,
+        )
+
+        return o, (residual, ht, g_gamma, softmax_scale, reverse, cu_seqlens)
+
+    def vjp_gpu(
+        self,
+        residuals,
+        output,
+        dO,
+        *args,
+        g=None,
+        g_gamma=None,
+        gk=None,
+        gv=None,
+        softmax_scale=None,
+        initial_state=None,
+        reverse=False,
+        cu_seqlens=None,
+        platform=None,
+        **kwargs,
+    ):
+        """GPU-specific backward pass using Triton kernels.
+
+        Args:
+            residuals: Residuals from forward pass
+            output: Output from forward pass
+            dO: Gradient of loss with respect to output
+            (remaining args same as fwd_with_residuals_gpu)
+
+        Returns:
+            Tuple of gradients (dq, dk, dv, dg, dgk, dgv, dh0)
+        """
+        from ejkernel.kernels._triton.recurrent import recurrent_gpu_bwd
+
+        inner_residual, ht, g_gamma_saved, softmax_scale_saved, reverse_saved, cu_seqlens_saved = residuals
+
+        import jax.numpy as jnp
+
+        dht = jnp.zeros_like(ht)
+
+        dq, dk, dv, dg, dgk, dgv, dh0 = recurrent_gpu_bwd(
+            g_gamma=g_gamma_saved,
+            softmax_scale=softmax_scale_saved,
+            reverse=reverse_saved,
+            cu_seqlens=cu_seqlens_saved,
+            residual=inner_residual,
+            dout=(dO, dht),
+        )
+
+        return dq, dk, dv, dg, dgk, dgv, dh0
+
+    def fwd_with_residuals_xla(
+        self,
+        query,
+        key,
+        value,
+        g=None,
+        g_gamma=None,
+        gk=None,
+        gv=None,
+        softmax_scale=None,
+        initial_state=None,
+        reverse=False,
+        cu_seqlens=None,
+        platform=None,
+        *,
+        cfg: RecurrentAttentionConfig,
+    ):
+        """XLA-specific forward pass with residuals using XLA kernels.
+
+        Args:
+            (same as fwd_with_residuals_gpu)
+
+        Returns:
+            Tuple of ((output, final_state), residuals) for backward pass
+        """
+        from ejkernel.kernels._xla.recurrent import recurrent_xla_fwd
+
+        (o, final_state), residuals = recurrent_xla_fwd(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            g_gamma=g_gamma,
+            gk=gk,
+            gv=gv,
+            softmax_scale=softmax_scale,
+            initial_state=initial_state,
+            reverse=reverse,
+            cu_seqlens=cu_seqlens,
+        )
+
+        return o, (residuals, final_state, g_gamma, softmax_scale, reverse, cu_seqlens)
+
+    def vjp_xla(
+        self,
+        residuals,
+        output,
+        dO,
+        *args,
+        g=None,
+        g_gamma=None,
+        gk=None,
+        gv=None,
+        softmax_scale=None,
+        initial_state=None,
+        reverse=False,
+        cu_seqlens=None,
+        platform=None,
+        **kwargs,
+    ):
+        """XLA-specific backward pass using XLA kernels.
+
+        Args:
+            residuals: Residuals from forward pass
+            output: Output from forward pass
+            dO: Gradient of loss with respect to output
+            (remaining args same as fwd_with_residuals_xla)
+
+        Returns:
+            Tuple of gradients (dq, dk, dv, dg, dgk, dgv, dh0)
+        """
+        from ejkernel.kernels._xla.recurrent import recurrent_xla_bwd
+
+        (
+            inner_residual,
+            final_state,
+            g_gamma_saved,
+            softmax_scale_saved,
+            reverse_saved,
+            cu_seqlens_saved,
+        ) = residuals
+
+        import jax.numpy as jnp
+
+        dfinal_state = jnp.zeros_like(final_state)
+
+        dq, dk, dv, dg, dgk, dgv, dinitial_state = recurrent_xla_bwd(
+            g_gamma_nondiff=g_gamma_saved,
+            scale_nondiff=softmax_scale_saved,
+            reverse=reverse_saved,
+            cu_seqlens=cu_seqlens_saved,
+            residuals=inner_residual,
+            grads=(dO, dfinal_state),
+        )
+
+        return dq, dk, dv, dg, dgk, dgv, dinitial_state
+
+
+_recurrent_executor: Executor[RecurrentAttentionConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def recurrent_attention(
@@ -207,8 +461,14 @@ def recurrent_attention(
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    return_state: bool = False,
     platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-) -> Float[Array, "batch seq_len num_heads head_dim"]:
+    *,
+    cfg: RecurrentAttentionConfig | None = None,
+) -> (
+    Float[Array, "batch seq_len num_heads head_dim"]
+    | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
+):
     """Execute recurrent attention with automatic optimization.
 
     Recurrent attention processes sequences with stateful computation,
@@ -226,10 +486,12 @@ def recurrent_attention(
         initial_state: Initial hidden state
         reverse: Whether to process sequence in reverse
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
+        return_state: If True, return tuple (output, final_state) instead of just output
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
 
     Returns:
-        Attention output with same shape as query
+        If return_state=False: Attention output with same shape as query
+        If return_state=True: Tuple of (output, final_state)
 
     Example:
         >>>
@@ -254,5 +516,7 @@ def recurrent_attention(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        return_state=return_state,
         platform=platform,
+        _cfg=cfg,
     )

@@ -22,12 +22,21 @@ import typing
 from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
-from ejkernel.ops import Invocation, Kernel
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+)
 
-from ..base import KernelConfig, create_default_executor, detect_platform
+from ..base import detect_platform
+from .configs import AttentionConfig
 
 
-class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
+class ScaledDotProductAttention(Kernel[AttentionConfig, Array]):
     """ScaledDotProductAttention with custom optimization logic.
 
     Supports causal masking, dropout, sliding windows, and variable-length sequences.
@@ -64,7 +73,7 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
         """Initialize  ScaledDotProductAttention module."""
         super().__init__(op_id="scaled_dot_product_attention")
 
-    def get_impl(self, cfg: KernelConfig):
+    def get_impl(self, cfg: AttentionConfig):
         """Get kernel implementation from registry based on configuration.
 
         Args:
@@ -97,7 +106,7 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
         cum_seqlens_k: Int[Array, "batch"] | None = None,
         platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: KernelConfig,
+        cfg: AttentionConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
         """Execute scaled_dot_product_attention with the given configuration.
 
@@ -126,10 +135,9 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
         """
 
         if platform is not None:
-            cfg = KernelConfig(
+            cfg = AttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
-                block_d=cfg.block_d,
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
@@ -152,7 +160,7 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
             cum_seqlens_k=cum_seqlens_k,
         )
 
-    def heuristic_cfg(self, inv: Invocation[KernelConfig, Array]) -> KernelConfig:
+    def heuristic_cfg(self, inv: Invocation[AttentionConfig, Array]) -> AttentionConfig:
         """Provide default configuration based on invocation context.
 
         Selects optimal block sizes based on sequence length and head dimension.
@@ -164,58 +172,42 @@ class ScaledDotProductAttention(Kernel[KernelConfig, Array]):
             Default configuration with block sizes
         """
 
-        return KernelConfig(
+        return AttentionConfig(
             block_q=128,
             block_k=128,
-            block_d=64,
             num_warps=4,
             num_stages=2,
             platform="auto",
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[KernelConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[AttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
-        Creates multiple block size configurations for benchmarking to find
-        the optimal tiling parameters for the given input shapes.
+        This operation uses XLA primitives directly without tunable block sizes,
+        so autotuning provides no benefit. Returns empty list to skip autotuning.
 
         Args:
             inv: Invocation object with arguments and metadata
 
         Returns:
-            Iterable of candidate configurations to test during autotuning
+            Empty list - no candidates to autotune since XLA handles optimization
 
         Note:
-            The autotuning system will benchmark each candidate and select
-            the fastest one for the given input configuration.
+            XLA's scaled_dot_product_attention primitive is not parameterized by
+            block sizes, so there are no meaningful configurations to benchmark.
         """
 
-        block_configs = [
-            (128, 128),
-            (128, 256),
-            (256, 128),
-            (256, 256),
-        ]
-
-        candidates = []
-        for block_q, block_k in block_configs:
-            candidates.append(
-                KernelConfig(
-                    block_q=block_q,
-                    block_k=block_k,
-                    block_d=None,
-                    num_warps=None,
-                    num_stages=None,
-                    platform="auto",
-                    backend="any",
-                )
-            )
-
-        return candidates
+        return []
 
 
-_executor = create_default_executor()
+_executor: Executor[AttentionConfig, Array] = Executor(
+    ConfigSelectorChain(
+        cache=ConfigCache(),
+        policy=AutotunePolicy(allow_autotune=True),
+        tuner=Tuner(warmup=2, iters=5),
+    )
+)
 
 
 def scaled_dot_product_attention(
