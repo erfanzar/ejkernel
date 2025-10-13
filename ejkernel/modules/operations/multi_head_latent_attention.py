@@ -156,7 +156,7 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
             cu_seqlens=cu_seqlens,
         )
 
-    def heuristic_cfg(self, inv: Invocation[FlashMLAConfig, Array]) -> AttentionConfig:
+    def heuristic_cfg(self, inv: Invocation[FlashMLAConfig, Array]) -> FlashMLAConfig:
         """Provide default configuration with block sizes.
 
         Args:

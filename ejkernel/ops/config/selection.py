@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import os
 import time
+import traceback
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Generic, Literal, TypeVar
@@ -291,6 +292,7 @@ class Tuner(Generic[Cfg]):
             if t < best_t:
                 best_cfg, best_t = cfg, t
         if best_cfg is None:
+            traceback.print_exception(last_err)
             raise RuntimeError(f"All candidates failed during autotune: {last_err}")
         if os.getenv("EJKERNEL_LOG_AUTOTUNE", "0") == "1":
             print("Best Config", best_cfg, "Best Time", best_t)

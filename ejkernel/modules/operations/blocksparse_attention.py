@@ -289,8 +289,8 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
                     BlockSparseAttentionConfig(
                         q_blocksize=q_block,
                         kv_blocksize=kv_block,
-                        bwd_q_blocksize=min(kv_block // 2, 32),
-                        bwd_kv_blocksize=min(kv_block // 2, 32),
+                        bwd_q_blocksize=max(min(kv_block // 2, 64), 32),
+                        bwd_kv_blocksize=max(min(kv_block // 2, 64), 32),
                         num_warps=None,
                         num_stages=None,
                         platform="triton",
