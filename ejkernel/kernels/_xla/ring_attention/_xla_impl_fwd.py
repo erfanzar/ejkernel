@@ -48,7 +48,7 @@ def _blockwise_attention_fwd(
     precision: lax.PrecisionLike,
     prevent_cse: bool,
     sliding_window: int | tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     attention_sink_size: int = 0,
     causal: bool = False,
 ):
@@ -76,7 +76,7 @@ def _blockwise_attention_fwd(
             precision: Precision of the computation.
             prevent_cse: Whether to prevent common subexpression elimination.
             sliding_window: Size of sliding window for local attention. Can be int or tuple (left_window, right_window).
-            logit_soft_cap: Soft cap value for logits to prevent overflow.
+            logits_soft_cap: Soft cap value for logits to prevent overflow.
             attention_sink_size: Number of initial tokens to always attend to (attention sink).
             causal: If True, applies causal masking.
 
@@ -136,8 +136,8 @@ def _blockwise_attention_fwd(
 
             attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / softmax_scale
 
-            if logit_soft_cap is not None:
-                attn_weights = jnp.tanh(attn_weights / logit_soft_cap) * logit_soft_cap
+            if logits_soft_cap is not None:
+                attn_weights = jnp.tanh(attn_weights / logits_soft_cap) * logits_soft_cap
 
             bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
             attn_weights = attn_weights + bias_chunk
@@ -274,7 +274,7 @@ def _ring_attention_fwd(
     precision: lax.PrecisionLike,
     prevent_cse: bool,
     sliding_window: int | tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     attention_sink_size: int = 0,
     causal: bool = False,
 ):
@@ -301,7 +301,7 @@ def _ring_attention_fwd(
             precision: Precision of the computation.
             prevent_cse: Whether to prevent common subexpression elimination.
             sliding_window: Size of sliding window for local attention. Can be int or tuple (left_window, right_window).
-            logit_soft_cap: Soft cap value for logits to prevent overflow.
+            logits_soft_cap: Soft cap value for logits to prevent overflow.
             attention_sink_size: Number of initial tokens to always attend to (attention sink).
             causal: If True, applies causal masking.
 
@@ -347,7 +347,7 @@ def _ring_attention_fwd(
             precision=precision,
             prevent_cse=prevent_cse,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             attention_sink_size=attention_sink_size,
             causal=causal,
         )

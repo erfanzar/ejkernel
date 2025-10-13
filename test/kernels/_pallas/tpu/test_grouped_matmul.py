@@ -47,10 +47,8 @@ def naive_grouped_matmul_reference(
     num_groups = group_sizes.shape[0]
 
     if transpose_rhs:
-        # rhs is [num_groups, n, k]
         n = rhs.shape[1]
     else:
-        # rhs is [num_groups, k, n]
         n = rhs.shape[2]
 
     output = jnp.zeros((m, n), dtype=lhs.dtype)
@@ -61,14 +59,14 @@ def naive_grouped_matmul_reference(
         if group_size == 0:
             continue
 
-        lhs_slice = lhs[row_offset : row_offset + group_size, :]  # [group_size, k]
+        lhs_slice = lhs[row_offset : row_offset + group_size, :]
 
         if transpose_rhs:
-            rhs_matrix = rhs[group_idx].T  # [n, k] -> [k, n]
+            rhs_matrix = rhs[group_idx].T
         else:
-            rhs_matrix = rhs[group_idx]  # [k, n]
+            rhs_matrix = rhs[group_idx]
 
-        result = jnp.dot(lhs_slice, rhs_matrix)  # [group_size, n]
+        result = jnp.dot(lhs_slice, rhs_matrix)
         output = output.at[row_offset : row_offset + group_size, :].set(result)
 
         row_offset += group_size
@@ -106,7 +104,7 @@ class TestGroupedMatMulTPU:
 
     def test_multiple_groups(self):
         """Test with multiple groups."""
-        m = 384  # Must be divisible by tile size (128)
+        m = 384
         k = 128
         n = 64
         num_groups = 3
@@ -117,7 +115,6 @@ class TestGroupedMatMulTPU:
         lhs = jax.random.normal(k1, (m, k), dtype=jnp.float32)
         rhs = jax.random.normal(k2, (num_groups, k, n), dtype=jnp.float32)
 
-        # Three groups of 128 each
         group_sizes = jnp.array([128, 128, 128], dtype=jnp.int32)
 
         output = grouped_matmul(
@@ -140,7 +137,7 @@ class TestGroupedMatMulTPU:
         key, k1, k2 = jax.random.split(key, 3)
 
         lhs = jax.random.normal(k1, (m, k), dtype=jnp.float32)
-        # RHS is [num_groups, n, k] when transpose_rhs=True
+
         rhs = jax.random.normal(k2, (num_groups, n, k), dtype=jnp.float32)
         group_sizes = jnp.array([64] * num_groups, dtype=jnp.int32)
 
@@ -174,7 +171,6 @@ class TestGroupedMatMulTPU:
             group_sizes=group_sizes,
         )
 
-        # Compare with standard matmul
         expected = jnp.dot(lhs, rhs[0])
 
         assert output.shape == (m, n)
@@ -186,7 +182,7 @@ class TestGroupedMatMulTPU:
         k = 128
         n = 64
         num_groups = 4
-        group_size = m // num_groups  # 128 each
+        group_size = m // num_groups
 
         key = jax.random.PRNGKey(1000)
         key, k1, k2 = jax.random.split(key, 3)
@@ -207,9 +203,9 @@ class TestGroupedMatMulTPU:
     def test_different_dimensions(self):
         """Test with various dimension combinations."""
         configs = [
-            (256, 128, 128, 2),  # Small: m=256, k=128, n=128, 2 groups
-            (512, 128, 128, 4),  # Medium: m=512, k=128, n=128, 4 groups
-            (512, 256, 256, 2),  # Large: m=512, k=256, n=256, 2 groups
+            (256, 128, 128, 2),
+            (512, 128, 128, 4),
+            (512, 256, 256, 2),
         ]
 
         for m, k, n, num_groups in configs:
@@ -345,7 +341,7 @@ class TestGroupedMatMulTPU:
 
     def test_numerical_correctness_multiple_groups_vs_xla(self):
         """Test numerical correctness with multiple groups against XLA."""
-        m = 384  # Must be divisible by tile size (128)
+        m = 384
         k = 128
         n = 64
         num_groups = 3
@@ -374,7 +370,7 @@ class TestGroupedMatMulTPU:
 
     def test_numerical_correctness_multiple_groups_with_naive_reference(self):
         """Test numerical correctness with multiple groups against naive reference."""
-        m = 384  # Must be divisible by tile size (128)
+        m = 384
         k = 128
         n = 64
         num_groups = 3
@@ -424,7 +420,6 @@ class TestGroupedMatMulTPU:
 
         grads = jax.grad(loss_fn, argnums=(0, 1))(lhs, rhs)
 
-        # Check that gradients exist and are finite
         assert len(grads) == 2
         assert grads[0].shape == lhs.shape
         assert grads[1].shape == rhs.shape
@@ -475,7 +470,6 @@ class TestGroupedMatMulTPU:
         rhs = jax.random.normal(k2, (num_groups, k, n), dtype=jnp.float32)
         group_sizes = jnp.array([64] * num_groups, dtype=jnp.int32)
 
-        # Process only groups starting from offset
         group_offset = jnp.array(0, dtype=jnp.int32)
 
         output = grouped_matmul(
@@ -490,7 +484,7 @@ class TestGroupedMatMulTPU:
 
     def test_multiple_equal_groups(self):
         """Test with multiple equal-sized groups (4 groups of 64)."""
-        m = 256  # Must be divisible by tile size (128)
+        m = 256
         k = 128
         n = 64
         num_groups = 4
@@ -501,7 +495,6 @@ class TestGroupedMatMulTPU:
         lhs = jax.random.normal(k1, (m, k), dtype=jnp.float32)
         rhs = jax.random.normal(k2, (num_groups, k, n), dtype=jnp.float32)
 
-        # Even groups (TPU requires m divisible by tile size)
         group_sizes = jnp.array([64, 64, 64, 64], dtype=jnp.int32)
 
         output = grouped_matmul(

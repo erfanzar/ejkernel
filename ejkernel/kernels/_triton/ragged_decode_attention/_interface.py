@@ -33,7 +33,7 @@ def ragged_decode_attention(
     softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
 ) -> Float[Array, "batch num_q_heads head_dim"]:
     """
@@ -48,7 +48,7 @@ def ragged_decode_attention(
         softmax_scale: logits scale
         block_size: tile size along sequence axis
         sliding_window: optional (left, right) window; None => full attention
-        logit_soft_cap: optional tanh-cap for logits
+        logits_soft_cap: optional tanh-cap for logits
         softmax_aux: optional sinks:
             - [HKV, NS] (per kv head), or
             - [NS] (broadcast to each kv head)
@@ -69,6 +69,6 @@ def ragged_decode_attention(
         softmax_scale=softmax_scale,
         block_size=block_size,
         sliding_window=sliding_window,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         softmax_aux=softmax_aux,
     )

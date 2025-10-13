@@ -71,7 +71,7 @@ def _ring_attention(
     dropout_rng: PRNGKeyArray | None,
     pdrop: float,
     sliding_window: int | tuple[int, int] | None,
-    logit_soft_cap: float | None,
+    logits_soft_cap: float | None,
     attention_sink_size: int,
     policy,
     softmax_scale,
@@ -97,7 +97,7 @@ def _ring_attention(
         dropout_rng,
         pdrop,
         sliding_window,
-        logit_soft_cap,
+        logits_soft_cap,
         attention_sink_size,
         policy,
         softmax_scale,
@@ -135,7 +135,7 @@ def ring_attention(
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     prevent_cse: bool = True,
     sliding_window: int | tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     attention_sink_size: int = 0,
     causal: bool = False,
 ) -> chex.Array:
@@ -163,7 +163,7 @@ def ring_attention(
         pdrop: Dropout probability.
         sliding_window: Size of sliding window for local attention. Can be int for symmetric
             window or tuple (left_window, right_window) for asymmetric window.
-        logit_soft_cap: Soft cap value for logits to prevent overflow (tanh capping).
+        logits_soft_cap: Soft cap value for logits to prevent overflow (tanh capping).
         attention_sink_size: Number of initial tokens to always attend to (StreamingLLM).
         causal: If True, applies causal masking where each position can only attend to previous positions.
             Uses causal_block_size for efficient blockwise causal computation.
@@ -217,7 +217,7 @@ def ring_attention(
         dropout_rng,
         pdrop,
         sliding_window,
-        logit_soft_cap,
+        logits_soft_cap,
         attention_sink_size,
         policy,
         softmax_scale,

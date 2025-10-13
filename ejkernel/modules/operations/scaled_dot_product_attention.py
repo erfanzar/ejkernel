@@ -207,12 +207,14 @@ def scaled_dot_product_attention(
     value: Float[Array, "batch kv_len num_kv_heads head_dim"],
     attention_mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+    cum_seqlens_q: Int[Array, "batch"] | None = None,
+    cum_seqlens_k: Int[Array, "batch"] | None = None,
+    /,
+    *,
     init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     softmax_scale: float | None = None,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
-    cum_seqlens_q: Int[Array, "batch"] | None = None,
-    cum_seqlens_k: Int[Array, "batch"] | None = None,
     platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute flash attention with automatic optimization.

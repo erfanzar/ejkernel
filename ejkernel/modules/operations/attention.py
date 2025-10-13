@@ -25,7 +25,7 @@ leverages XLA's compiler optimizations for straightforward attention computation
 
 from __future__ import annotations
 
-import typing
+import typing as tp
 
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, PRNGKeyArray
@@ -108,14 +108,16 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         value: Float[Array, "batch kv_len num_kv_heads head_dim"],
         attention_mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-        init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = True,
         dropout_rng: PRNGKeyArray | None = None,
-        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         softmax_scale: float | None = None,
+        logits_soft_cap: float | None = None,
         dtype: DTypeLike | None = jnp.bfloat16,
         softmax_dtype: DTypeLike | None = None,
         dropout_prob: float = 0.0,
+        causal: bool = False,
         sliding_window: int | tuple[int, int] | None = None,
         *,
         cfg: AttentionConfig,
@@ -145,6 +147,7 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
             attention_mask=attention_mask,
             bias=bias,
             softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
             dropout_prob=dropout_prob,
             init_bias=init_bias,
             deterministic=deterministic,
@@ -153,6 +156,7 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
             softmax_dtype=softmax_dtype,
             sliding_window=sliding_window,
             softmax_aux=softmax_aux,
+            causal=causal,
         )
 
     def heuristic_cfg(self, inv: Invocation[AttentionConfig, Array]) -> AttentionConfig:
@@ -212,14 +216,18 @@ def attention(
     value: Float[Array, "batch kv_len num_kv_heads head_dim"],
     attention_mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-    init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
-    deterministic: bool = True,
     dropout_rng: PRNGKeyArray | None = None,
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    /,
+    *,
+    init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+    deterministic: bool = True,
     softmax_scale: float | None = None,
+    logits_soft_cap: float | None = None,
     dtype: DTypeLike | None = jnp.bfloat16,
     softmax_dtype: DTypeLike | None = None,
     dropout_prob: float = 0.0,
+    causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute flash attention with automatic optimization.
@@ -259,6 +267,7 @@ def attention(
         attention_mask=attention_mask,
         bias=bias,
         softmax_scale=softmax_scale,
+        logits_soft_cap=logits_soft_cap,
         dropout_prob=dropout_prob,
         init_bias=init_bias,
         deterministic=deterministic,
@@ -267,4 +276,5 @@ def attention(
         softmax_dtype=softmax_dtype,
         sliding_window=sliding_window,
         softmax_aux=softmax_aux,
+        causal=causal,
     )

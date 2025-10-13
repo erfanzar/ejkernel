@@ -31,6 +31,7 @@ custom document-structure-aware sparsity.
 
 from __future__ import annotations
 
+import os
 import typing
 
 from jaxtyping import Array, Float, Int
@@ -190,7 +191,8 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
     def candidate_cfgs_gpu(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
         """Generate GPU-optimized candidate configurations for autotuning."""
         configs = []
-        for block_size in [64, 128]:
+
+        for block_size in [32, 64, 128]:
             for num_warps in [4, 8]:
                 configs.append(
                     NativeSparseAttentionConfig(
@@ -242,11 +244,19 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
             )
         return configs
 
+    candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
+    candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
+    candidate_cfgs_shard_map_xla = candidate_cfgs_xla
+
 
 _sparse_executor: Executor[NativeSparseAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=True,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("nsa"),
     )
@@ -261,10 +271,11 @@ def native_sparse_attention(
     g_slc: Float[Array, "batch seq_len num_q_heads"] | None = None,
     block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"] | None = None,
     block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
-    softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    /,
     *,
+    softmax_scale: float | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: NativeSparseAttentionConfig | None = None,
 ) -> Float[Array, "batch seq_len num_heads head_dim"]:
     """Execute native sparse attention with automatic optimization.

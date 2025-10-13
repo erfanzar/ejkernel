@@ -519,7 +519,7 @@ def _fwd_blocksparse_attn_call(
     causal: bool = True,
     q_blocksize: int = 64,
     kv_blocksize: int = 64,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
 ) -> tuple[ArrayLike, Sequence[ArrayLike]]:
     if bias is not None:
         raise NotImplementedError("Bias is not supported in Flash multi head attention")
@@ -617,11 +617,11 @@ def _fwd_blocksparse_attn_call(
 
     qk_head_dim_pad = next_power_of_2(qk_head_dim)
 
-    if logit_soft_cap is None:
+    if logits_soft_cap is None:
         logits_soft_cap_val = 0.0
         softcap_flag = False
     else:
-        logits_soft_cap_val = float(logit_soft_cap)
+        logits_soft_cap_val = float(logits_soft_cap)
         softcap_flag = True
 
     metaparams = dict(

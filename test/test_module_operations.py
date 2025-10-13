@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Comprehensive tests for all ejkernel module operations.
 
 This test suite covers all operations in ejkernel.modules with various scenarios:
@@ -57,11 +58,6 @@ def rand_tensors(B, Nq, Nk, Hq, Hkv, D, dtype=jnp.float16, key=0):
     k = jax.random.normal(k2, (B, Nk, Hkv, D), dtype=dtype)
     v = jax.random.normal(k3, (B, Nk, Hkv, D), dtype=dtype)
     return q, k, v
-
-
-# ============================================================================
-# FlashAttention Tests
-# ============================================================================
 
 
 class TestFlashAttention:
@@ -137,7 +133,7 @@ class TestFlashAttention:
 
     def test_flash_attention_gradient(self):
         """Test flash attention gradient computation."""
-        B, N, H, D = 2, 512, 8, 128  # Fixed: increased seq_len to avoid block size errors
+        B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
 
         def loss_fn(q, k, v):
@@ -149,11 +145,6 @@ class TestFlashAttention:
         assert grads[0].shape == q.shape
         assert grads[1].shape == k.shape
         assert grads[2].shape == v.shape
-
-
-# ============================================================================
-# Attention Tests
-# ============================================================================
 
 
 class TestAttention:
@@ -205,11 +196,6 @@ class TestAttention:
         assert len(grads) == 3
 
 
-# ============================================================================
-# BlockSparseAttention Tests
-# ============================================================================
-
-
 class TestBlockSparseAttention:
     """Test suite for BlockSparseAttention operation."""
 
@@ -220,7 +206,7 @@ class TestBlockSparseAttention:
         """Test basic block sparse attention."""
         head_dim = 128
         q, k, v = rand_tensors(batch_size, seq_len, seq_len, num_heads, num_heads, head_dim, dtype=jnp.bfloat16)
-        # Need to transpose for blocksparse attention (B, H, N, D)
+
         q_t = q.transpose(0, 2, 1, 3)
         k_t = k.transpose(0, 2, 1, 3)
         v_t = v.transpose(0, 2, 1, 3)
@@ -253,11 +239,6 @@ class TestBlockSparseAttention:
         assert output.shape == (B, H, N, D)
 
 
-# ============================================================================
-# ScaledDotProductAttention Tests
-# ============================================================================
-
-
 class TestScaledDotProductAttention:
     """Test suite for ScaledDotProductAttention operation."""
 
@@ -283,7 +264,7 @@ class TestScaledDotProductAttention:
         B, N, H, D = 2, 256, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
         mask = jax.random.randint(jax.random.PRNGKey(0), (B, 1, N, N), 0, 2).astype(bool)
-        output = scaled_dot_product_attention(q, k, v, attention_mask=mask)  # Fixed: attn_mask -> attention_mask
+        output = scaled_dot_product_attention(q, k, v, attention_mask=mask)
         assert output.shape == (B, N, H, D)
 
     def test_sdpa_gradient(self):
@@ -292,16 +273,11 @@ class TestScaledDotProductAttention:
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
 
         def loss_fn(q, k, v):
-            output = scaled_dot_product_attention(q, k, v, causal=True)  # Fixed: is_causal -> causal
+            output = scaled_dot_product_attention(q, k, v, causal=True)
             return jnp.mean(output)
 
         grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
         assert len(grads) == 3
-
-
-# ============================================================================
-# PageAttention Tests
-# ============================================================================
 
 
 class TestPageAttention:
@@ -312,9 +288,9 @@ class TestPageAttention:
         num_seqs, H, D = 2, 8, 128
         page_size = 16
         num_pages = 8
-        # Fixed: PageAttention needs 3D query [num_seqs, num_heads, head_dim]
+
         q = jax.random.normal(jax.random.PRNGKey(0), (num_seqs, H, D), dtype=jnp.bfloat16)
-        # Generate paged KV cache [num_blocks, num_kv_heads, block_size, head_dim]
+
         k_cache = jax.random.normal(jax.random.PRNGKey(1), (num_pages, H, page_size, D), dtype=jnp.bfloat16)
         v_cache = jax.random.normal(jax.random.PRNGKey(2), (num_pages, H, page_size, D), dtype=jnp.bfloat16)
         block_tables = jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32)
@@ -328,7 +304,7 @@ class TestPageAttention:
         num_seqs, H, D = 4, 8, 128
         page_size = 16
         num_pages = 16
-        # Fixed: PageAttention needs 3D query [num_seqs, num_heads, head_dim]
+
         q = jax.random.normal(jax.random.PRNGKey(0), (num_seqs, H, D), dtype=jnp.bfloat16)
         k_cache = jax.random.normal(jax.random.PRNGKey(1), (num_pages, H, page_size, D), dtype=jnp.bfloat16)
         v_cache = jax.random.normal(jax.random.PRNGKey(2), (num_pages, H, page_size, D), dtype=jnp.bfloat16)
@@ -337,11 +313,6 @@ class TestPageAttention:
 
         output = page_attention(q, k_cache, v_cache, context_lens, block_tables)
         assert output.shape == (num_seqs, H, D)
-
-
-# ============================================================================
-# RaggedPageAttention Tests
-# ============================================================================
 
 
 class TestRaggedPageAttention:
@@ -354,24 +325,17 @@ class TestRaggedPageAttention:
         page_size = 16
         num_pages = 16
 
-        # Fixed: RaggedPageAttention needs 3D query [total_tokens, num_heads, head_dim]
         q = jax.random.normal(jax.random.PRNGKey(0), (total_q_len, H, D), dtype=jnp.bfloat16)
-        # KV cache: [num_pages, num_kv_heads, page_size, head_dim]
+
         k_cache = jax.random.normal(jax.random.PRNGKey(1), (num_pages, H, page_size, D), dtype=jnp.bfloat16)
         v_cache = jax.random.normal(jax.random.PRNGKey(2), (num_pages, H, page_size, D), dtype=jnp.bfloat16)
 
-        # Create ragged batch: 3 sequences with lengths [64, 128, 64]
         cu_seqlens_q = jnp.array([0, 64, 192, 256], dtype=jnp.int32)
         block_tables = jnp.array([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]], dtype=jnp.int32)
         _context_lens = jnp.array([48, 96, 64], dtype=jnp.int32)
 
         output = ragged_page_attention(q, k_cache, v_cache, block_tables, cu_seqlens_q, num_seqs=3)
         assert output.shape == (total_q_len, H, D)
-
-
-# ============================================================================
-# RaggedDecodeAttention Tests
-# ============================================================================
 
 
 class TestRaggedDecodeAttention:
@@ -384,23 +348,16 @@ class TestRaggedDecodeAttention:
         max_kv_len = 512
         num_seqs = 4
 
-        # Fixed: RaggedDecodeAttention needs 3D tensors [total_tokens, num_heads, head_dim]
         q = jax.random.normal(jax.random.PRNGKey(0), (total_tokens, H, D), dtype=jnp.bfloat16)
-        # K, V need to be [num_seqs, max_kv_len, num_heads, head_dim]
+
         k = jax.random.normal(jax.random.PRNGKey(1), (num_seqs, max_kv_len, H, D), dtype=jnp.bfloat16)
         v = jax.random.normal(jax.random.PRNGKey(2), (num_seqs, max_kv_len, H, D), dtype=jnp.bfloat16)
 
-        # Create ragged batch: 4 sequences
         cu_seqlens = jnp.array([0, 32, 64, 96, 128], dtype=jnp.int32)
         kv_lengths = jnp.array([256, 384, 128, 512], dtype=jnp.int32)
 
         output = ragged_decode_attention(q, k, v, cu_seqlens, kv_lengths)
         assert output.shape == (total_tokens, H, D)
-
-
-# ============================================================================
-# RingAttention Tests
-# ============================================================================
 
 
 class TestRingAttention:
@@ -419,14 +376,9 @@ class TestRingAttention:
         """Test ring attention with causal masking."""
         B, N, H, D = 2, 1024, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-        # Note: causal masking in ring attention is done via causal_block_size, not causal param
+
         output = ring_attention(q, k, v, axis_name="batch", causal_block_size=512)
         assert output.shape == (B, N, H, D)
-
-
-# ============================================================================
-# RecurrentAttention Tests
-# ============================================================================
 
 
 class TestRecurrentAttention:
@@ -448,11 +400,6 @@ class TestRecurrentAttention:
         assert output.shape == (B, N, H, D)
 
 
-# ============================================================================
-# GLAttention Tests
-# ============================================================================
-
-
 class TestGLAttention:
     """Test suite for Gated Linear Attention operation."""
 
@@ -460,7 +407,7 @@ class TestGLAttention:
         """Test basic gated linear attention."""
         B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-        # GLA requires gates
+
         g = jax.random.normal(jax.random.PRNGKey(42), (B, N, H, D), dtype=jnp.bfloat16)
         output = gla_attention(q, k, v, g)
         assert output.shape == (B, N, H, D)
@@ -475,11 +422,6 @@ class TestGLAttention:
         assert output.shape == (B, N, H, D)
 
 
-# ============================================================================
-# LightningAttention Tests
-# ============================================================================
-
-
 class TestLightningAttention:
     """Test suite for LightningAttention operation."""
 
@@ -487,7 +429,7 @@ class TestLightningAttention:
         """Test basic lightning attention."""
         B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-        # Fixed: LightningAttention requires layer_idx and num_layers parameters
+
         output = lightning_attention(q, k, v, layer_idx=0, num_layers=1)
         assert output.shape == (B, N, H, D)
 
@@ -495,33 +437,9 @@ class TestLightningAttention:
         """Test lightning attention with custom scale."""
         B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-        # Fixed: Added required layer_idx and num_layers parameters
+
         output = lightning_attention(q, k, v, layer_idx=5, num_layers=12, softmax_scale=0.125)
         assert output.shape == (B, N, H, D)
-
-
-# ============================================================================
-# FlashMLA Tests
-# ============================================================================
-
-
-# class TestFlashMLA:
-#     """Test suite for Multi-head Latent Attention operation."""
-
-#     def test_mla_attention_basic(self):
-#         """Test basic multi-head latent attention."""
-#         B, N, H, D = 2, 512, 8, 128
-#         latent_dim = 64
-#         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-#         # MLA compresses KV to latent space
-#         kv_proj = jax.random.normal(jax.random.PRNGKey(42), (B, N, latent_dim), dtype=jnp.bfloat16)
-#         output = mla_attention(q, k, v, kv_proj)
-#         assert output.shape == (B, N, H, D)
-
-
-# ============================================================================
-# NativeSparseAttention Tests
-# ============================================================================
 
 
 class TestNativeSparseAttention:
@@ -531,8 +449,7 @@ class TestNativeSparseAttention:
         """Test basic native sparse attention."""
         B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-        # Fixed: Don't pass block_size as parameter, it's passed via config internally
-        # Just use block_counts to control sparsity
+
         output = native_sparse_attention(q, k, v, block_counts=16)
         assert output.shape == (B, N, H, D)
 
@@ -540,14 +457,9 @@ class TestNativeSparseAttention:
         """Test native sparse attention with explicit block indices."""
         B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-        # Fixed: Use block_counts parameter instead of block_size
+
         output = native_sparse_attention(q, k, v, block_counts=32, softmax_scale=0.125)
         assert output.shape == (B, N, H, D)
-
-
-# ============================================================================
-# GroupedMatmul Tests
-# ============================================================================
 
 
 class TestGroupedMatmul:
@@ -587,11 +499,6 @@ class TestGroupedMatmul:
         assert output.shape == (M, N)
 
 
-# ============================================================================
-# MeanPooling Tests
-# ============================================================================
-
-
 class TestMeanPooling:
     """Test suite for MeanPooling operation."""
 
@@ -609,7 +516,7 @@ class TestMeanPooling:
         """Test mean pooling with variable sequence lengths."""
         batch_size, seq_len, hidden_dim = 4, 512, 768
         x = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, 8, hidden_dim), dtype=jnp.bfloat16)
-        # Create cumulative sequence lengths
+
         cu_seqlens = jnp.array([0, 128, 256, 384, 512], dtype=jnp.int32)
         output = mean_pooling(x, cu_seqlens=cu_seqlens)
         assert output.shape == (batch_size, hidden_dim)
@@ -635,11 +542,6 @@ class TestMeanPooling:
         assert grad.shape == x.shape
 
 
-# ============================================================================
-# Integration Tests
-# ============================================================================
-
-
 class TestIntegration:
     """Integration tests combining multiple operations."""
 
@@ -648,11 +550,9 @@ class TestIntegration:
         B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
 
-        # Apply flash attention
         attn_output = flash_attention(q, k, v, causal=True)
         assert attn_output.shape == (B, N, H, D)
 
-        # Reshape and pool
         pooled = attn_output.reshape(B, N, H * D)
         output = mean_pooling(pooled)
         assert output.shape == (B, H * D)
@@ -662,7 +562,6 @@ class TestIntegration:
         B, N, H, D = 2, 256, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
 
-        # Test multiple variants - Fixed: is_causal -> causal
         flash_out = flash_attention(q, k, v, causal=True)
         sdpa_out = scaled_dot_product_attention(q, k, v, causal=True)
 
@@ -676,7 +575,6 @@ class TestIntegration:
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
 
         def loss_fn(q, k, v):
-            # Attention + pooling + loss
             attn_out = flash_attention(q, k, v, causal=True)
             pooled = attn_out.reshape(B, N, H * D)
             pooled_out = mean_pooling(pooled)

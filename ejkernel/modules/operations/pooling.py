@@ -28,6 +28,7 @@ lengths, enabling efficient batched processing of sequences with different lengt
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 from jaxtyping import Array, Float, Int
@@ -161,7 +162,11 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
 _mean_pooling_executor: Executor[MeanPoolingConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=True,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("pooling"),
     )
@@ -170,10 +175,11 @@ _mean_pooling_executor: Executor[MeanPoolingConfig, Array] = Executor(
 
 def mean_pooling(
     x: Float[Array, "batch seq_len hidden_dim"],
-    chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    /,
     *,
+    chunk_size: int = 32,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: MeanPoolingConfig | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
     """Execute mean pooling with automatic optimization.

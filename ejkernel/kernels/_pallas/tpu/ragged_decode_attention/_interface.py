@@ -33,7 +33,7 @@ def ragged_decode_attention(
     softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
 ) -> Float[Array, "batch num_q_heads head_dim"]:
     """Ragged MQA decoding entry point with TPU-accelerated Flash Attention.
@@ -48,8 +48,8 @@ def ragged_decode_attention(
         block_size: Block size used for kernel tiling. Default is 256.
         sliding_window: Optional (left, right) sliding window sizes.
             If specified, limits attention to tokens within the window. None means full attention.
-        logit_soft_cap: Optional soft capping value for attention logits.
-            Applies tanh-based soft capping: logit_soft_cap * tanh(logits / logit_soft_cap).
+        logits_soft_cap: Optional soft capping value for attention logits.
+            Applies tanh-based soft capping: logits_soft_cap * tanh(logits / logits_soft_cap).
         softmax_aux: Optional auxiliary logits for attention sinks.
             Shape [num_heads, num_sinks] or [num_sinks]. Concatenated to attention logits
             before softmax to create attention sink behavior.
@@ -68,6 +68,6 @@ def ragged_decode_attention(
         softmax_scale=softmax_scale,
         block_size=block_size,
         sliding_window=sliding_window,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         softmax_aux=softmax_aux,
     )

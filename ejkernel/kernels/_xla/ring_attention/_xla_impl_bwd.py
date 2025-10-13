@@ -49,7 +49,7 @@ def _blockwise_attention_bwd(
     precision: lax.PrecisionLike,
     prevent_cse: bool,
     sliding_window: int | tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     attention_sink_size: int = 0,
     causal: bool = False,
 ):
@@ -78,7 +78,7 @@ def _blockwise_attention_bwd(
             precision: Precision of the computation.
             prevent_cse: Whether to prevent common subexpression elimination.
             sliding_window: Size of sliding window for local attention.
-            logit_soft_cap: Soft cap value for logits to prevent overflow.
+            logits_soft_cap: Soft cap value for logits to prevent overflow.
             causal: If True, applies causal masking.
 
     Returns:
@@ -149,9 +149,9 @@ def _blockwise_attention_bwd(
             dq_chunk = carry
             attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / softmax_scale
 
-            if logit_soft_cap is not None:
+            if logits_soft_cap is not None:
                 attn_weights_uncapped = attn_weights
-                attn_weights = jnp.tanh(attn_weights / logit_soft_cap) * logit_soft_cap
+                attn_weights = jnp.tanh(attn_weights / logits_soft_cap) * logits_soft_cap
 
             bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
             attn_weights = attn_weights + bias_chunk
@@ -165,8 +165,8 @@ def _blockwise_attention_bwd(
             ds = jnp.einsum("bqhd,bkhd->bhqk", g_chunk, value_chunk)
             dl = (ds - dl_part) * exp_weights
 
-            if logit_soft_cap is not None:
-                sech2 = 1 - jnp.tanh(attn_weights_uncapped / logit_soft_cap) ** 2
+            if logits_soft_cap is not None:
+                sech2 = 1 - jnp.tanh(attn_weights_uncapped / logits_soft_cap) ** 2
                 dl = dl * sech2
             dq_chunk = dq_chunk + jnp.einsum("bhqk,bkhd->bqhd", dl, k_chunk) / softmax_scale
             dk_chunk = jnp.einsum("bqhd,bhqk->bkhd", q_chunk, dl) / softmax_scale
@@ -252,7 +252,7 @@ def _ring_attention_bwd(
     precision: lax.PrecisionLike,
     prevent_cse: bool,
     sliding_window: int | tuple[int, int] | None,
-    logit_soft_cap: float | None,
+    logits_soft_cap: float | None,
     attention_sink_size: int,
     causal: bool,
     res,
@@ -275,7 +275,7 @@ def _ring_attention_bwd(
             precision: Precision of the computation.
             prevent_cse: Whether to prevent common subexpression elimination.
             sliding_window: Size of sliding window for local attention.
-            logit_soft_cap: Soft cap value for logits to prevent overflow.
+            logits_soft_cap: Soft cap value for logits to prevent overflow.
             res: Tuple of intermediate values from the forward pass.
             g: Gradient of the output.
 
@@ -336,7 +336,7 @@ def _ring_attention_bwd(
             precision=precision,
             prevent_cse=prevent_cse,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             attention_sink_size=attention_sink_size,
             causal=causal,
         )

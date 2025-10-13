@@ -147,9 +147,9 @@ class TestFlashAttentionTPU:
         head_dim = 128
 
         configs = [
-            (256, 256),  # Equal lengths
-            (128, 256),  # Shorter Q
-            (512, 256),  # Longer Q
+            (256, 256),
+            (128, 256),
+            (512, 256),
         ]
 
         for seq_len_q, seq_len_k in configs:
@@ -279,7 +279,6 @@ class TestFlashAttentionTPU:
         key_tensor = jax.random.normal(kk, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
         value = jax.random.normal(kv, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
 
-        # Test with different scales
         for scale in [0.1, 0.5, 1.0]:
             output = flash_attention(
                 query=query,
@@ -305,7 +304,6 @@ class TestFlashAttentionTPU:
         key_tensor = jax.random.normal(kk, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
         value = jax.random.normal(kv, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
 
-        # Create segment IDs (e.g., two documents per batch)
         q_segment_ids = jnp.concatenate(
             [
                 jnp.zeros((batch_size, seq_len // 2), dtype=jnp.int32),
@@ -336,7 +334,6 @@ class TestFlashAttentionTPU:
         key = jax.random.PRNGKey(7000)
         key, kq, kk, kv = jax.random.split(key, 4)
 
-        # TPU format: (batch, seq_len, num_heads, head_dim)
         query_tpu = jax.random.normal(kq, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
         key_tpu = jax.random.normal(kk, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
         value_tpu = jax.random.normal(kv, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
@@ -366,7 +363,6 @@ class TestFlashAttentionTPU:
         key = jax.random.PRNGKey(8000)
         key, kq, kk, kv = jax.random.split(key, 4)
 
-        # TPU format: (batch, seq_len, num_heads, head_dim)
         query_tpu = jax.random.normal(kq, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
         key_tpu = jax.random.normal(kk, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
         value_tpu = jax.random.normal(kv, (batch_size, seq_len, num_heads, head_dim), dtype=jnp.float32)
@@ -408,7 +404,6 @@ class TestFlashAttentionTPU:
 
         grads = jax.grad(loss_fn, argnums=(0, 1, 2))(query, key_tensor, value)
 
-        # Check that gradients exist and are finite
         assert len(grads) == 3
         for grad in grads:
             assert grad.shape in [query.shape, key_tensor.shape, value.shape]

@@ -38,7 +38,7 @@ def ragged_decode_mqa_fwd_kernel(
     m_ptr,
     l_ptr,
     softmax_scale,
-    logit_soft_cap,
+    logits_soft_cap,
     NSINKS: tl.constexpr,
     HAS_AUX: tl.constexpr,
     SL_LEFT: tl.constexpr,
@@ -106,13 +106,13 @@ def ragged_decode_mqa_fwd_kernel(
             acc_qk += tl.sum(k_block * q_vec[None, :], axis=1)
 
         acc_qk = acc_qk * softmax_scale
-        if logit_soft_cap > 0:
-            x = acc_qk / logit_soft_cap
+        if logits_soft_cap > 0:
+            x = acc_qk / logits_soft_cap
 
             ax = tl.where(x >= 0, x, -x)
             z = tl.exp(-2.0 * ax)
             tanh_x = tl.where(x >= 0, (1 - z) / (1 + z), -(1 - z) / (1 + z))
-            acc_qk = logit_soft_cap * tanh_x
+            acc_qk = logits_soft_cap * tanh_x
 
         if HAS_AUX and NSINKS > 0:
             aux_off = g * NSINKS if G > 1 else 0
@@ -184,7 +184,7 @@ def ragged_decode_mqa_triton(
     softmax_scale: float,
     block_size: int,
     sliding_window: tuple[int, int] | None,
-    logit_soft_cap: float,
+    logits_soft_cap: float,
     aux: Array | None,
 ) -> Array:
     B, G, D = q.shape
@@ -216,7 +216,7 @@ def ragged_decode_mqa_triton(
             jax.ShapeDtypeStruct((B, G), dtype=jnp.float32),
         ],
         softmax_scale=float(softmax_scale),
-        logit_soft_cap=float(logit_soft_cap),
+        logits_soft_cap=float(logits_soft_cap),
         NSINKS=NS,
         HAS_AUX=HAS_AUX,
         SL_LEFT=int(sliding_window[0]) if sliding_window is not None else -1,
@@ -243,7 +243,7 @@ def inner_decode_triton(
     softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     softmax_aux: Array | None = None,
 ) -> Array:
     """
@@ -292,7 +292,7 @@ def inner_decode_triton(
             softmax_scale=(1.0 if softmax_scale is None else float(softmax_scale)),
             block_size=int(block_size),
             sliding_window=sliding_window,
-            logit_soft_cap=(0.0 if logit_soft_cap is None else float(logit_soft_cap)),
+            logits_soft_cap=(0.0 if logits_soft_cap is None else float(logits_soft_cap)),
             aux=aux_h,
         )
         outs.append(out_h)

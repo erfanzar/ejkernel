@@ -36,6 +36,7 @@ This is particularly useful for:
 
 from __future__ import annotations
 
+import os
 import typing
 from typing import Literal
 
@@ -242,7 +243,11 @@ class RecurrentAttention(Kernel[RecurrentAttentionConfig, Array]):
 _recurrent_executor: Executor[RecurrentAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=True,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("recurrent"),
     )
@@ -257,13 +262,14 @@ def recurrent_attention(
     g_gamma: Float[Array, "batch num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    softmax_scale: float | None = None,
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
-    reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    /,
+    *,
+    softmax_scale: float | None = None,
+    reverse: bool = False,
     return_state: bool = False,
     platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: RecurrentAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads head_dim"]

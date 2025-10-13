@@ -79,7 +79,6 @@ class TestRaggedDecodeAttentionTPU:
         k = jax.random.normal(kk, (B, S, HKV, D), dtype=jnp.float32)
         v = jax.random.normal(kv, (B, S, HKV, D), dtype=jnp.float32)
 
-        # Different lengths: short, medium, long
         starts = jnp.array([0, 50, 200], dtype=jnp.int32)
         ends = jnp.array([128, 300, 800], dtype=jnp.int32)
 
@@ -132,7 +131,6 @@ class TestRaggedDecodeAttentionTPU:
         B, S, D = 2, 512, 128
         key = jax.random.PRNGKey(789)
 
-        # MQA: 1 KV head, 8 Q heads
         HQ_mqa, HKV_mqa = 8, 1
         kq, kk, kv = jax.random.split(key, 3)
         q_mqa = jax.random.normal(kq, (B, HQ_mqa, D), dtype=jnp.float32)
@@ -146,7 +144,6 @@ class TestRaggedDecodeAttentionTPU:
         assert out_mqa.shape == (B, HQ_mqa, D)
         assert jnp.isfinite(out_mqa).all()
 
-        # GQA: 4 KV heads, 16 Q heads
         HQ_gqa, HKV_gqa = 16, 4
         key2 = jax.random.PRNGKey(790)
         kq2, kk2, kv2 = jax.random.split(key2, 3)
@@ -211,14 +208,11 @@ class TestRaggedDecodeAttentionTPU:
         out_tpu = ragged_decode_tpu(q, k, v, starts, ends, softmax_scale=1.0, block_size=128)
         out_ref = ragged_decode_attention(q, k, v, starts, ends, softmax_scale=1.0)
 
-        # Check shape
         assert out_tpu.shape == out_ref.shape
 
-        # Check numerical accuracy
         max_diff = jnp.max(jnp.abs(out_tpu - out_ref))
         assert max_diff < 0.15, f"Max difference {max_diff} exceeds tolerance"
 
-        # Check relative error
         assert jnp.allclose(out_tpu, out_ref, rtol=0, atol=0.125)
 
 

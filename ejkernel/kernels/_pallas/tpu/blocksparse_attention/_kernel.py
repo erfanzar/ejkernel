@@ -2404,7 +2404,7 @@ make_splash_mqa_single_device = partial(make_splash_mha, is_mqa=True, head_shard
         "kv_blocksize",
         "bwd_q_blocksize",
         "bwd_kv_blocksize",
-        "logit_soft_cap",
+        "logits_soft_cap",
     )
 )
 @jaxtyping.jaxtyped(typechecker=beartype)
@@ -2424,7 +2424,7 @@ def blocksparse_attention(
     | Int[Array, "batch 1 seq_len kv_len"]
     | None = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,
     q_blocksize: int | None = None,
     kv_blocksize: int | None = None,
@@ -2452,8 +2452,8 @@ def blocksparse_attention(
         softmax_aux: Optional auxiliary softmax values for attention sinks
         bias: Optional attention bias [batch num_heads seq_len head_dim]
         sequence_parallelism_mesh_axis_name: Optional mesh axis name for sequence parallelism
-        logit_soft_cap: Optional soft capping value for attention logits. When specified,
-            applies tanh-based soft capping: logit_soft_cap * tanh(logits / logit_soft_cap).
+        logits_soft_cap: Optional soft capping value for attention logits. When specified,
+            applies tanh-based soft capping: logits_soft_cap * tanh(logits / logits_soft_cap).
             This prevents attention scores from becoming too large, improving numerical
             stability (Gemma-2 style). Gradients are computed with proper Jacobian.
         qkv_layouts: Optional pre-computed attention mask layouts
@@ -2563,7 +2563,7 @@ def blocksparse_attention(
         return make_splash_mqa_single_device(
             mask=mask,
             block_sizes=block_sizes,
-            logits_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
         )(
             q=q,
             k=k,

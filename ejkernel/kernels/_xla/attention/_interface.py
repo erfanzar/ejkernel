@@ -37,7 +37,7 @@ def attention(
     dropout_rng: PRNGKeyArray | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     softmax_scale: float | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     dtype: DTypeLike | None = jnp.bfloat16,
     softmax_dtype: DTypeLike | None = None,
     dropout_prob: float = 0.0,
@@ -71,8 +71,8 @@ def attention(
             and dropout_prob > 0 in metadata.
         softmax_aux: Optional auxiliary tensor for softmax computation.
         softmax_scale: Optional float for scaling attention scores. If None, uses 1/sqrt(head_dim).
-        logit_soft_cap: Optional float for capping attention logits using tanh.
-            When specified, applies: logit_soft_cap * tanh(logits / logit_soft_cap).
+        logits_soft_cap: Optional float for capping attention logits using tanh.
+            When specified, applies: logits_soft_cap * tanh(logits / logits_soft_cap).
             This prevents attention scores from becoming too large.
         dtype: Data type for computation. Defaults to bfloat16.
         softmax_dtype: Data type for softmax computation. Defaults to float32.
@@ -114,8 +114,8 @@ def attention(
 
     aw = jnp.einsum("bskhd,bmkd->bkhsm", query * softmax_scale, key, optimize=True)
 
-    if logit_soft_cap is not None:
-        aw = logit_soft_cap * jnp.tanh(aw / logit_soft_cap)
+    if logits_soft_cap is not None:
+        aw = logits_soft_cap * jnp.tanh(aw / logits_soft_cap)
 
     if sliding_window is not None:
         if isinstance(sliding_window, int):

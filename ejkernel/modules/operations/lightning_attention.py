@@ -26,6 +26,7 @@ sequence processing for improved efficiency in recurrent-style computation.
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 from jaxtyping import Array, Float, Int
@@ -223,7 +224,11 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
 _lightning_executor: Executor[LightningAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=True,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("lightning-attention"),
     )
@@ -234,15 +239,16 @@ def lightning_attention(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
+    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    /,
+    *,
     layer_idx: int,
     num_layers: int,
     softmax_scale: float | None = None,
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
-    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     return_state: bool = False,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: LightningAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads head_dim"]

@@ -53,7 +53,7 @@ def _ring_attention(
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     prevent_cse: bool = True,
     sliding_window: int | tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     attention_sink_size: int = 0,
     causal: bool = False,
 ):
@@ -88,7 +88,7 @@ def _ring_attention(
             prevent_cse: Whether to prevent common subexpression elimination.
             sliding_window: Size of sliding window for local attention. Can be int for symmetric window
                 or tuple (left_window, right_window) for asymmetric window.
-            logit_soft_cap: Soft cap value for logits to prevent overflow.
+            logits_soft_cap: Soft cap value for logits to prevent overflow.
             attention_sink_size: Number of initial tokens to always attend to (StreamingLLM-style attention sink).
             causal: If True, applies causal masking where each position can only attend to previous positions.
                 Uses causal_block_size for efficient blockwise causal computation.
@@ -127,7 +127,7 @@ def _ring_attention(
         precision,
         prevent_cse,
         sliding_window,
-        logit_soft_cap,
+        logits_soft_cap,
         attention_sink_size,
         causal,
     )
@@ -164,7 +164,7 @@ def ring_attention(
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     prevent_cse: bool = True,
     sliding_window: int | tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     attention_sink_size: int = 0,
     causal: bool = False,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
@@ -206,7 +206,7 @@ def ring_attention(
         precision,
         prevent_cse,
         sliding_window,
-        logit_soft_cap,
+        logits_soft_cap,
         attention_sink_size,
         causal,
     )

@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
-from jax import lax
+from jax import lax, shard_map
 from jax import numpy as jnp
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -79,6 +81,109 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         """Initialize Flash Attention module."""
         super().__init__(op_id="flash_attention")
 
+    def create_shard_map_wrapper(
+        self,
+        query: Float[Array, "batch seq_len_q num_heads head_dim"],
+        key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+        value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+        softmax_scale: float | None = None,
+        dropout_prob: float = 0.0,
+        causal: bool = False,
+        dropout_seed: int | None = None,
+        cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+        cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+        sliding_window: int | tuple[int, int] | None = None,
+        logits_soft_cap: float | None = None,
+        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        normalize_output: bool = True,
+        precision: lax.PrecisionLike = lax.Precision.DEFAULT,
+        logits_dtype: DTypeLike = jnp.float32,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        cfg: FlashAttentionConfig | None = None,
+        mesh: Mesh | None = None,
+        in_specs: tuple[PartitionSpec, ...] | None = None,
+        out_specs: PartitionSpec | None = None,
+        check_vma: bool = False,
+    ):
+        """Create a shard_map wrapper specifically for flash attention.
+
+        Args:
+            query, key, value: Input tensors to be sharded
+            mesh: JAX device mesh
+            in_specs: Input partition specs (for q, k, v, and optionally mask/bias)
+            out_specs: Output partition spec
+            All other args: Flash attention parameters to be fixed via partial
+
+        Returns:
+            Tuple of (shard_map_fn, call_args)
+        """
+        assert mesh is not None, "mesh must be provided for shard_map execution"
+        assert in_specs is not None, "in_specs must be provided for shard_map execution"
+        assert out_specs is not None, "out_specs must be provided for shard_map execution"
+
+        def _wraped_flash_attn(
+            query: Float[Array, "batch num_heads seq_len head_dim"],
+            key: Float[Array, "batch kv_num_heads kv_len head_dim"],
+            value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
+            attention_mask: Int[Array, "batch num_heads seq_len kv_len"] | None = None,
+            bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+            softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+            cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+            cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+            q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+            kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        ) -> Float[Array, "batch num_heads seq_len head_dim"]:
+            return self.run(
+                query=query,
+                key=key,
+                value=value,
+                bias=bias,
+                softmax_aux=softmax_aux,
+                cum_seqlens_k=cum_seqlens_k,
+                cum_seqlens_q=cum_seqlens_q,
+                attention_mask=attention_mask,
+                softmax_scale=softmax_scale,
+                dropout_prob=dropout_prob,
+                causal=causal,
+                dropout_seed=dropout_seed,
+                sliding_window=sliding_window,
+                logits_soft_cap=logits_soft_cap,
+                normalize_output=normalize_output,
+                precision=precision,
+                logits_dtype=logits_dtype,
+                kv_segment_ids=kv_segment_ids,
+                q_segment_ids=q_segment_ids,
+                platform=platform,
+                cfg=cfg,
+            )
+
+        call_args = (
+            query,
+            key,
+            value,
+            attention_mask,
+            bias,
+            softmax_aux,
+            cum_seqlens_q,
+            cum_seqlens_k,
+            q_segment_ids,
+            kv_segment_ids,
+        )
+        assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+        shard_map_fn = shard_map(
+            _wraped_flash_attn,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
+        )
+
+        return shard_map_fn, call_args
+
     def get_impl(self, cfg: FlashAttentionConfig):
         """Get kernel implementation from registry based on configuration.
 
@@ -102,7 +207,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch seq_len"] | None = None,
+        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         softmax_scale: float | None = None,
         dropout_prob: float = 0.0,
@@ -254,8 +359,9 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             Iterable of GPU-optimized candidate configurations
         """
         configs = []
-        for chunk_q in [128, 256]:
-            for chunk_k in [128, 256]:
+
+        for chunk_q in [32, 64, 128]:
+            for chunk_k in [32, 64, 128]:
                 configs.append(
                     FlashAttentionConfig(
                         chunk_size_q=chunk_q,
@@ -320,11 +426,19 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
                 )
         return configs
 
+    candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
+    candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
+    candidate_cfgs_shard_map_xla = candidate_cfgs_xla
+
 
 _flash_executor: Executor[FlashAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=True,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("flash-attn"),
     )
@@ -335,25 +449,29 @@ def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch seq_len"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    /,
+    *,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
-    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
-    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,
-    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: FlashAttentionConfig | None = None,
+    mesh: Mesh | None = None,
+    in_specs: tuple[PartitionSpec | None, ...] | None = None,
+    out_specs: PartitionSpec | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute flash attention with automatic optimization.
 
@@ -374,6 +492,10 @@ def flash_attention(
         sliding_window: Window size for local attention (int or (left, right) tuple)
         logits_soft_cap: Optional soft cap value for logits
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        cfg: Optional configuration override
+        mesh: JAX device mesh for shard_map execution (optional)
+        in_specs: Input partition specs for shard_map (optional)
+        out_specs: Output partition spec for shard_map (optional)
 
     Returns:
         Attention output with same shape as query
@@ -391,6 +513,10 @@ def flash_attention(
         >>>
         >>> out = flash_attention(query, key, value, platform="triton")
     """
+
+    method = None
+    if mesh is not None and in_specs is not None and out_specs is not None:
+        method = "shard_map"
 
     return _flash_executor(
         FlashAttention(),
@@ -414,5 +540,9 @@ def flash_attention(
         q_segment_ids=q_segment_ids,
         kv_segment_ids=kv_segment_ids,
         platform=platform,
+        method=method,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
         _cfg=cfg,
     )

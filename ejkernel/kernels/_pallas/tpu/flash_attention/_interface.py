@@ -50,7 +50,7 @@ def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch seq_len"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -70,14 +70,8 @@ def flash_attention(
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ):
-    del normalize_output, precision, logits_dtype
+    del normalize_output, precision, logits_dtype, dropout_prob, dropout_seed
 
-    if attention_mask is not None:
-        raise NotImplementedError("attention_mask parameter is not supported on TPU. Use bias instead.")
-    if dropout_prob != 0.0:
-        raise NotImplementedError("Dropout is not supported on TPU flash attention")
-    if dropout_seed is not None:
-        raise NotImplementedError("dropout_seed parameter is not supported on TPU")
     if cum_seqlens_q is not None:
         raise NotImplementedError("Variable-length sequences (cum_seqlens_q) are not supported on TPU")
     if cum_seqlens_k is not None:
@@ -88,6 +82,15 @@ def flash_attention(
         raise NotImplementedError("Logits soft cap is not supported on TPU")
     if softmax_aux is not None:
         raise NotImplementedError("Attention sinks (softmax_aux) are not supported on TPU")
+
+    if attention_mask is not None and (q_segment_ids is None or kv_segment_ids is None):
+        from ejkernel.xla_utils import mask_to_segment_ids
+
+        inferred_q_seg, inferred_kv_seg = mask_to_segment_ids(attention_mask)
+        if q_segment_ids is None:
+            q_segment_ids = inferred_q_seg
+        if kv_segment_ids is None:
+            kv_segment_ids = inferred_kv_seg
 
     batch_size, q_seq_len, num_heads, d_model = query.shape
     batch_size_k, kv_seq_len, num_heads_k, d_model_k = key.shape

@@ -64,10 +64,11 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from typing import Generic, Protocol
+from typing import Generic, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
+import jax.sharding
 import jax.tree_util as jtu
 
 from ..core import Invocation, Kernel, _get_platform_method, _has_custom_vjp
@@ -204,7 +205,19 @@ class Executor(Generic[Cfg, Out]):
 
         return wrapped
 
-    def __call__(self, kernel: Kernel[Cfg, Out], *args, cfg: Cfg | None = None, stamp=True, **kwargs) -> Out:
+    def __call__(
+        self,
+        kernel: Kernel[Cfg, Out],
+        *args,
+        cfg: Cfg | None = None,
+        stamp: bool = True,
+        method: Literal["shard_map"] | None = None,
+        mesh: jax.sharding.Mesh | None = None,
+        in_specs: tuple[jax.sharding.PartitionSpec, ...] | None = None,
+        out_specs: jax.sharding.PartitionSpec | None = None,
+        check_vma: bool = False,
+        **kwargs,
+    ) -> Out:
         """Execute kernel with automatic configuration selection and management.
 
         This is the main execution method that orchestrates the complete execution
@@ -216,6 +229,11 @@ class Executor(Generic[Cfg, Out]):
             *args: Positional arguments for the kernel
             cfg: Optional configuration override (bypasses selection if provided)
             stamp: Whether to add profiling metadata to the operation
+            method: Execution method - "shard_map" for distributed execution
+            mesh: JAX device mesh for shard_map (required if method="shard_map")
+            in_specs: Input partition specs for shard_map (required if method="shard_map")
+            out_specs: Output partition spec for shard_map (required if method="shard_map")
+            check_vma: Whether to check replication for shard_map
             **kwargs: Keyword arguments for the kernel
 
         Returns:
@@ -225,20 +243,45 @@ class Executor(Generic[Cfg, Out]):
             This method handles both regular operations and kernels with custom
             VJP implementations. Custom gradients are automatically detected and
             properly integrated with JAX's differentiation system.
+
+            When method="shard_map", the execution will be wrapped with shard_map
+            for distributed computation across the specified mesh.
         """
 
         if "_cfg" in kwargs:
             cfg = kwargs.pop("_cfg")
 
+        if method == "shard_map":
+            if mesh is None:
+                raise ValueError("mesh must be provided when method='shard_map'")
+            if in_specs is None:
+                raise ValueError("in_specs must be provided when method='shard_map'")
+            if out_specs is None:
+                raise ValueError("out_specs must be provided when method='shard_map'")
+
         args2, kwargs2 = kernel.prepare(*args, **kwargs)
-        inv = Invocation(op_id=kernel.op_id, args=args2, kwargs=kwargs2, override_cfg=cfg, stamp=stamp)
+        inv = Invocation(
+            op_id=kernel.op_id,
+            args=args2,
+            kwargs=kwargs2,
+            override_cfg=cfg,
+            stamp=stamp,
+            method=method,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
+        )
         chosen = self.chooser.choose(inv, kernel)
 
         platform = get_device_platform()
+        context = "shard_map" if method == "shard_map" else None
 
-        if _has_custom_vjp(kernel, platform):
-            fwd_method = _get_platform_method(kernel, "fwd_with_residuals", platform) or kernel.fwd_with_residuals
-            vjp_method = _get_platform_method(kernel, "vjp", platform) or kernel.vjp
+        if _has_custom_vjp(kernel, platform, context):
+            fwd_method = (
+                _get_platform_method(kernel, "fwd_with_residuals", platform, context) or kernel.fwd_with_residuals
+            )
+            vjp_method = _get_platform_method(kernel, "vjp", platform, context) or kernel.vjp
 
             full_leaves, treedef = jtu.tree_flatten((args2, kwargs2))
             is_arr = [isinstance(x, jax.Array) for x in full_leaves]
@@ -307,7 +350,7 @@ class Executor(Generic[Cfg, Out]):
                 array_in = [x for x, m in zip(flat_call, is_arr, strict=False) if m]
                 return g(*array_in)
         else:
-            run_method = _get_platform_method(kernel, "run", platform) or kernel.run
+            run_method = _get_platform_method(kernel, "run", platform, context) or kernel.run
 
             def fn(*a, **k):
                 return run_method(*a, cfg=chosen, **k)
@@ -329,6 +372,21 @@ class Executor(Generic[Cfg, Out]):
                 fn = self._stamp_hash(kernel, inv, fn, chosen)
             elif mode == "none":
                 pass
+
+        if method == "shard_map":
+            if not hasattr(kernel, "create_shard_map_wrapper"):
+                raise AttributeError(f"Kernel {kernel.op_id} does not implement create_shard_map_wrapper")
+
+            shard_map_fn, call_args = kernel.create_shard_map_wrapper(
+                *args2,
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=check_vma,
+                cfg=chosen,
+                **kwargs2,
+            )
+            return shard_map_fn(*call_args)
 
         return fn(*args2, **kwargs2)
 
@@ -352,7 +410,14 @@ class Executor(Generic[Cfg, Out]):
             cfg = kwargs.pop("_cfg")
 
         args2, kwargs2 = kernel.prepare(*args, **kwargs)
-        inv = Invocation(op_id=kernel.op_id, args=args2, kwargs=kwargs2, override_cfg=cfg, stamp=False)
+        inv = Invocation(
+            op_id=kernel.op_id,
+            args=args2,
+            kwargs=kwargs2,
+            override_cfg=cfg,
+            stamp=False,
+            method=kwargs.get("_method", None),
+        )
         return self.chooser.choose(inv, kernel)
 
     def compile(self, kernel: Kernel[Cfg, Out], *example_args, cfg: Cfg | None = None, **example_kwargs):

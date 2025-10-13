@@ -53,9 +53,12 @@ This is the most memory-efficient attention variant for serving workloads.
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 from jax import numpy as jnp
+from jax import shard_map
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, DTypeLike, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -108,6 +111,102 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         """
         super().__init__(op_id="ragged_page_attention")
 
+    def create_shard_map_wrapper(
+        self,
+        queries: Float[Array, "total_tokens num_q_heads head_dim"],
+        kv_pages: Float[Array, "num_pages page_size num_combined_kv_heads head_dim"],
+        context_lens: Int[Array, "num_seqs"],
+        block_tables: Int[Array, "num_seqs pages_per_seq"],
+        query_start_loc: Int[Array, "num_seqs_plus_one"],
+        num_seqs: Array | int,
+        softmax_scale: float | None = None,
+        logits_soft_cap: float | None = None,
+        compute_dtype: DTypeLike = jnp.bfloat16,
+        optimized: bool = False,
+        sliding_window: int | None = None,
+        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        mask_value: float | None = None,
+        vmem_limit_bytes: int | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        cfg: RaggedPageAttentionConfig | None = None,
+        mesh: Mesh | None = None,
+        in_specs: tuple[PartitionSpec, ...] | None = None,
+        out_specs: PartitionSpec | None = None,
+        check_vma: bool = False,
+    ):
+        """Create a shard_map wrapper specifically for ragged page attention.
+
+        Ragged page attention handles variable-length sequences with paged KV cache,
+        ideal for serving scenarios.
+
+        Args:
+            queries: Flattened queries [total_tokens, num_q_heads, head_dim]
+            kv_pages: Paged KV cache [num_pages, page_size, num_combined_kv_heads, head_dim]
+            context_lens: Context lengths [num_seqs]
+            block_tables: Block mapping [num_seqs, pages_per_seq]
+            query_start_loc: Start locations [num_seqs + 1]
+            num_seqs: Number of sequences
+            All other args: Ragged page attention parameters to be fixed
+            mesh: JAX device mesh
+            in_specs: Input partition specs
+                (for queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs, softmax_aux)
+            out_specs: Output partition spec
+
+        Returns:
+            Tuple of (shard_map_fn, call_args)
+        """
+        assert mesh is not None, "mesh must be provided for shard_map execution"
+        assert in_specs is not None, "in_specs must be provided for shard_map execution"
+        assert out_specs is not None, "out_specs must be provided for shard_map execution"
+
+        def _wrapped_ragged_page_attn(
+            queries: Float[Array, "total_tokens num_q_heads head_dim"],
+            kv_pages: Float[Array, "num_pages page_size num_combined_kv_heads head_dim"],
+            context_lens: Int[Array, "num_seqs"],
+            block_tables: Int[Array, "num_seqs pages_per_seq"],
+            query_start_loc: Int[Array, "num_seqs_plus_one"],
+            num_seqs: Array | int,
+            softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
+            return self.run(
+                queries=queries,
+                kv_pages=kv_pages,
+                context_lens=context_lens,
+                block_tables=block_tables,
+                query_start_loc=query_start_loc,
+                num_seqs=num_seqs,
+                softmax_scale=softmax_scale,
+                logits_soft_cap=logits_soft_cap,
+                compute_dtype=compute_dtype,
+                optimized=optimized,
+                sliding_window=sliding_window,
+                softmax_aux=softmax_aux,
+                mask_value=mask_value,
+                vmem_limit_bytes=vmem_limit_bytes,
+                platform=platform,
+                cfg=cfg,
+            )
+
+        call_args = (
+            queries,
+            kv_pages,
+            context_lens,
+            block_tables,
+            query_start_loc,
+            num_seqs,
+            softmax_aux,
+        )
+        assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+        shard_map_fn = shard_map(
+            _wrapped_ragged_page_attn,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
+        )
+
+        return shard_map_fn, call_args
+
     def get_impl(self, cfg: RaggedPageAttentionConfig):
         """Get kernel implementation from registry.
 
@@ -133,7 +232,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         num_seqs: Array | int,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         softmax_scale: float | None = None,
-        logit_soft_cap: float | None = None,
+        logits_soft_cap: float | None = None,
         compute_dtype: DTypeLike = jnp.bfloat16,
         optimized: bool = False,
         sliding_window: int | None = None,
@@ -160,7 +259,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
                 query_start_loc[i] to query_start_loc[i+1] defines sequence i
             num_seqs: Number of sequences in the batch
             softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
-            logit_soft_cap: Optional soft cap to bound attention logits
+            logits_soft_cap: Optional soft cap to bound attention logits
             compute_dtype: Data type for computation (default: bfloat16)
             optimized: Use optimized kernel implementation
             sliding_window: Window size for local attention (None for full attention)
@@ -205,7 +304,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             query_start_loc=query_start_loc,
             num_seqs=num_seqs,
             softmax_scale=softmax_scale,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             compute_dtype=compute_dtype,
             optimized=optimized,
             sliding_window=sliding_window,
@@ -274,11 +373,59 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
 
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[RaggedPageAttentionConfig, Array]):
+        """Generate candidate configurations for autotuning.
+
+        Creates configurations optimized for ragged attention scenarios with
+        various batch sizes and sequence lengths.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of candidate configurations to benchmark during autotuning
+
+        Note:
+            Ragged attention performance depends on the distribution of sequence
+            lengths and the page size. Candidates are chosen to work well across
+            common serving scenarios.
+        """
+
+        block_configs = [
+            (None),
+            (1),
+            (2),
+            (4),
+            (8),
+            (16),
+        ]
+
+        candidates = []
+        for num_kv_pages in block_configs:
+            candidates.append(
+                RaggedPageAttentionConfig(
+                    num_kv_pages_per_block=num_kv_pages,
+                    num_queries_per_block=None,
+                    num_warps=None,
+                    num_stages=None,
+                    platform="triton",
+                    backend="any",
+                )
+            )
+
+        return candidates
+
+    candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
+
 
 _ragged_page_attention_executor: Executor[RaggedPageAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=False),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=False,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("ragged-page-attention"),
     )
@@ -292,17 +439,21 @@ def ragged_page_attention(
     block_tables: Int[Array, "num_seqs pages_per_seq"],
     query_start_loc: Int[Array, "num_seqs_plus_one"],
     num_seqs: Array | int,
+    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    /,
+    *,
     softmax_scale: float | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     compute_dtype: DTypeLike = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     mask_value: float | None = None,
     vmem_limit_bytes: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: RaggedPageAttentionConfig | None = None,
+    mesh: Mesh | None = None,
+    in_specs: tuple[PartitionSpec | None, ...] | None = None,
+    out_specs: PartitionSpec | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Execute ragged page attention with automatic optimization.
 
@@ -317,7 +468,7 @@ def ragged_page_attention(
         query_start_loc: Start locations for each sequence [num_seqs + 1]
         num_seqs: Number of sequences in the batch
         softmax_scale: Softmax scaling factor
-        logit_soft_cap: Soft capping value for logits
+        logits_soft_cap: Soft capping value for logits
         compute_dtype: Computation dtype (default: bfloat16)
         optimized: Use optimized implementation
         sliding_window: Sliding window size for local attention
@@ -326,6 +477,9 @@ def ragged_page_attention(
         vmem_limit_bytes: Memory limit in bytes
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
         cfg: Optional config override (num_kv_pages_per_block and num_queries_per_block are set via cfg)
+        mesh: JAX device mesh for shard_map execution (optional)
+        in_specs: Input partition specs for shard_map (optional)
+        out_specs: Output partition spec for shard_map (optional)
 
     Returns:
         Attention output [total_tokens, num_q_heads, head_dim]
@@ -346,12 +500,17 @@ def ragged_page_attention(
         >>>
         >>> out = ragged_page_attention(
         ...     queries, kv_pages, context_lens, block_tables,
-        ...     query_start_loc, num_seqs, optimized=True, logit_soft_cap=50.0
+        ...     query_start_loc, num_seqs, optimized=True, logits_soft_cap=50.0
         ... )
         >>>
         >>>
         >>> out = ragged_page_attention(..., platform="triton")
     """
+
+    method = None
+    if mesh is not None and in_specs is not None and out_specs is not None:
+        method = "shard_map"
+
     return _ragged_page_attention_executor(
         RaggedPageAttention(),
         queries=queries,
@@ -361,7 +520,7 @@ def ragged_page_attention(
         query_start_loc=query_start_loc,
         num_seqs=num_seqs,
         softmax_scale=softmax_scale,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         compute_dtype=compute_dtype,
         optimized=optimized,
         sliding_window=sliding_window,
@@ -369,5 +528,9 @@ def ragged_page_attention(
         mask_value=mask_value,
         vmem_limit_bytes=vmem_limit_bytes,
         platform=platform,
+        method=method,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
         _cfg=cfg,
     )

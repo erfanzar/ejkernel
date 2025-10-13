@@ -61,11 +61,13 @@ References:
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 import jax
-from jax import lax
+from jax import lax, shard_map
 from jax import numpy as jnp
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -119,6 +121,126 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         """
         super().__init__(op_id="ring_attention")
 
+    def create_shard_map_wrapper(
+        self,
+        query: Float[Array, "batch seq_len_q num_heads head_dim"],
+        key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+        value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+        q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+        kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        cache_idx=None,
+        axis_name: str | None = None,
+        float32_logits: bool = True,
+        softmax_scale: float | None = None,
+        query_chunk_size: int = 512,
+        key_chunk_size: int = 512,
+        causal_block_size: int | None = None,
+        deterministic: bool = True,
+        dropout_rng: PRNGKeyArray | None = None,
+        pdrop: float = 0.0,
+        dtype: DTypeLike = jnp.float32,
+        policy=jax.checkpoint_policies.nothing_saveable,
+        precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
+        prevent_cse: bool = True,
+        sliding_window: int | tuple[int, int] | None = None,
+        logits_soft_cap: float | None = None,
+        attention_sink_size: int = 0,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        cfg: RingAttentionConfig | None = None,
+        mesh: Mesh | None = None,
+        in_specs: tuple[PartitionSpec, ...] | None = None,
+        out_specs: PartitionSpec | None = None,
+        check_vma: bool = False,
+    ):
+        """Create a shard_map wrapper specifically for ring attention.
+
+        Ring attention naturally works with distributed execution, using
+        collective communication across devices.
+
+        Args:
+            query: Query tensor to be sharded
+            key: Key tensor to be sharded
+            value: Value tensor to be sharded
+            bias: Optional bias tensor
+            q_segment_ids: Optional query segment IDs
+            kv_segment_ids: Optional KV segment IDs
+            softmax_aux: Optional auxiliary softmax values
+            cache_idx: Optional cache index
+            axis_name: Axis name for ring communication
+            All other args: Ring attention parameters to be fixed
+            mesh: JAX device mesh
+            in_specs: Input partition specs (for q, k, v, and optional bias/segment_ids/etc)
+            out_specs: Output partition spec
+
+        Returns:
+            Tuple of (shard_map_fn, call_args)
+        """
+        assert mesh is not None, "mesh must be provided for shard_map execution"
+        assert in_specs is not None, "in_specs must be provided for shard_map execution"
+        assert out_specs is not None, "out_specs must be provided for shard_map execution"
+
+        def _wrapped_ring_attn(
+            query: Float[Array, "batch seq_len_q num_heads head_dim"],
+            key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+            value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+            bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+            q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+            kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+            softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+            dropout_rng: PRNGKeyArray | None = None,
+        ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+            return self.run(
+                query=query,
+                key=key,
+                value=value,
+                bias=bias,
+                q_segment_ids=q_segment_ids,
+                kv_segment_ids=kv_segment_ids,
+                softmax_aux=softmax_aux,
+                cache_idx=cache_idx,
+                axis_name=axis_name,
+                float32_logits=float32_logits,
+                softmax_scale=softmax_scale,
+                query_chunk_size=query_chunk_size,
+                key_chunk_size=key_chunk_size,
+                causal_block_size=causal_block_size,
+                deterministic=deterministic,
+                dropout_rng=dropout_rng,
+                pdrop=pdrop,
+                dtype=dtype,
+                policy=policy,
+                precision=precision,
+                prevent_cse=prevent_cse,
+                sliding_window=sliding_window,
+                logits_soft_cap=logits_soft_cap,
+                attention_sink_size=attention_sink_size,
+                platform=platform,
+                cfg=cfg,
+            )
+
+        call_args = (
+            query,
+            key,
+            value,
+            bias,
+            q_segment_ids,
+            kv_segment_ids,
+            softmax_aux,
+            dropout_rng,
+        )
+        assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+        shard_map_fn = shard_map(
+            _wrapped_ring_attn,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
+        )
+
+        return shard_map_fn, call_args
+
     def get_impl(self, cfg: RingAttentionConfig):
         """Get kernel implementation from registry.
 
@@ -158,7 +280,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         prevent_cse: bool = True,
         sliding_window: int | tuple[int, int] | None = None,
-        logit_soft_cap: float | None = None,
+        logits_soft_cap: float | None = None,
         attention_sink_size: int = 0,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
@@ -192,7 +314,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             precision: Matrix multiplication precision setting
             prevent_cse: Prevent common subexpression elimination (default: True)
             sliding_window: Window size for local attention (int or (left, right) tuple)
-            logit_soft_cap: Soft cap value to bound attention logits
+            logits_soft_cap: Soft cap value to bound attention logits
             attention_sink_size: Number of sink tokens for attention stability
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
             cfg: Kernel configuration object
@@ -248,7 +370,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             precision=precision,
             prevent_cse=prevent_cse,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             attention_sink_size=attention_sink_size,
         )
 
@@ -308,11 +430,82 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
 
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[RingAttentionConfig, Array]):
+        """Generate GPU-optimized candidate configurations for autotuning.
+
+        GPU/Triton kernels benefit from smaller blocks for ring attention.
+
+        Args:
+            inv: Invocation object with arguments and metadata
+
+        Returns:
+            Iterable of GPU-optimized candidate configurations
+        """
+        block_configs = [
+            (32, 32, 4, 1),
+            (64, 64, 4, 1),
+            (128, 128, 8, 2),
+        ]
+
+        candidates = []
+        for block_q, block_k, num_warps, num_stages in block_configs:
+            candidates.append(
+                RingAttentionConfig(
+                    block_q=block_q,
+                    block_k=block_k,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    platform="triton",
+                    backend="gpu",
+                )
+            )
+
+        return candidates
+
+    def candidate_cfgs_tpu(self, inv: Invocation[RingAttentionConfig, Array]):
+        """Generate TPU-optimized candidate configurations for autotuning.
+
+        TPU/Pallas kernels benefit from larger blocks for ring attention.
+
+        Args:
+            inv: Invocation object with arguments and metadata
+
+        Returns:
+            Iterable of TPU-optimized candidate configurations
+        """
+        block_configs = [
+            (128, 128, 4, 1),
+            (256, 256, 8, 2),
+            (512, 512, 8, 2),
+        ]
+
+        candidates = []
+        for block_q, block_k, num_warps, num_stages in block_configs:
+            candidates.append(
+                RingAttentionConfig(
+                    block_q=block_q,
+                    block_k=block_k,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    platform="pallas",
+                    backend="tpu",
+                )
+            )
+
+        return candidates
+
+    candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
+    candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
+
 
 _ring_executor: Executor[RingAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=True,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("ring-attention"),
     )
@@ -327,6 +520,9 @@ def ring_attention(
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    dropout_rng: PRNGKeyArray | None = None,
+    /,
+    *,
     cache_idx=None,
     axis_name: str | None = None,
     float32_logits: bool = True,
@@ -335,18 +531,19 @@ def ring_attention(
     key_chunk_size: int = 512,
     causal_block_size: int | None = None,
     deterministic: bool = True,
-    dropout_rng: PRNGKeyArray | None = None,
     pdrop: float = 0.0,
     dtype: DTypeLike = jnp.float32,
     policy=jax.checkpoint_policies.nothing_saveable,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     prevent_cse: bool = True,
     sliding_window: int | tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     attention_sink_size: int = 0,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: RingAttentionConfig | None = None,
+    mesh: Mesh | None = None,
+    in_specs: tuple[PartitionSpec | None, ...] | None = None,
+    out_specs: PartitionSpec | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Execute ring attention with automatic optimization.
 
@@ -377,10 +574,13 @@ def ring_attention(
         precision: Computation precision
         prevent_cse: Prevent common subexpression elimination
         sliding_window: Window size for local attention
-        logit_soft_cap: Soft capping value for logits
+        logits_soft_cap: Soft capping value for logits
         attention_sink_size: Size of attention sink
-
-            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        cfg: Optional configuration override
+        mesh: JAX device mesh for shard_map execution (optional)
+        in_specs: Input partition specs for shard_map (optional)
+        out_specs: Output partition spec for shard_map (optional)
 
     Returns:
         Attention output with same shape as query
@@ -408,6 +608,11 @@ def ring_attention(
         >>>
         >>> out = ring_attention(..., platform="triton")
     """
+
+    method = None
+    if mesh is not None and in_specs is not None and out_specs is not None:
+        method = "shard_map"
+
     return _ring_executor(
         RingAttention(),
         query=query,
@@ -432,8 +637,12 @@ def ring_attention(
         precision=precision,
         prevent_cse=prevent_cse,
         sliding_window=sliding_window,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         attention_sink_size=attention_sink_size,
         platform=platform,
+        method=method,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
         _cfg=cfg,
     )

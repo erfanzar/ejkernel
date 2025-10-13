@@ -97,7 +97,7 @@ def ragged_page_attention(
     num_seqs: Array | int,
     *,
     softmax_scale: float | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     compute_dtype: DTypeLike = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
@@ -138,8 +138,8 @@ def ragged_page_attention(
         num_seqs: Number of sequences in the batch. Can be an integer or a
             scalar JAX array.
         softmax_scale: Attention scaling factor. If None, defaults to 1/sqrt(head_dim).
-        logit_soft_cap: Optional soft capping value for attention logits. When specified,
-            applies tanh-based soft capping: logit_soft_cap * tanh(logits / logit_soft_cap).
+        logits_soft_cap: Optional soft capping value for attention logits. When specified,
+            applies tanh-based soft capping: logits_soft_cap * tanh(logits / logits_soft_cap).
             Helps with numerical stability (e.g., Gemma-2 uses 20.0).
         compute_dtype: Computation dtype (ignored in Triton implementation).
         optimized: Optimization flag (ignored in Triton implementation).
@@ -211,8 +211,8 @@ def ragged_page_attention(
     if mask_value is None:
         mask_value = -2.381976426469702e38
 
-    use_soft_cap = logit_soft_cap is not None
-    soft_cap_value = logit_soft_cap if use_soft_cap else 1.0
+    use_soft_cap = logits_soft_cap is not None
+    soft_cap_value = logits_soft_cap if use_soft_cap else 1.0
 
     use_sliding_window = sliding_window is not None
     sliding_window_size = sliding_window if use_sliding_window else 0

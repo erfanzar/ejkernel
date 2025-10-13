@@ -109,7 +109,7 @@ if typing.TYPE_CHECKING:
         "kv_blocksize",
         "bwd_q_blocksize",
         "bwd_kv_blocksize",
-        "logit_soft_cap",
+        "logits_soft_cap",
     ],
 )
 def _blocksparse_attention_bhtd(
@@ -133,7 +133,7 @@ def _blocksparse_attention_bhtd(
     kv_blocksize: int = 64,
     bwd_q_blocksize: int = 64,
     bwd_kv_blocksize: int = 64,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
 ) -> ArrayLike:
     """Internal JIT-compiled block-sparse attention with custom VJP.
 
@@ -162,7 +162,7 @@ def _blocksparse_attention_bhtd(
         kv_blocksize: Key/value block size for forward pass.
         bwd_q_blocksize: Query block size for backward pass.
         bwd_kv_blocksize: Key/value block size for backward pass.
-        logit_soft_cap: Optional soft capping value for attention logits.
+        logits_soft_cap: Optional soft capping value for attention logits.
 
     Returns:
         Attention output tensor with same shape as query.
@@ -186,7 +186,7 @@ def _blocksparse_attention_bhtd(
         causal=causal,
         q_blocksize=q_blocksize,
         kv_blocksize=kv_blocksize,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
     )[0]
 
     return result
@@ -213,7 +213,7 @@ def _blocksparse_attention_bhtd_fwd(
     kv_blocksize: int,
     bwd_q_blocksize: int,
     bwd_kv_blocksize: int,
-    logit_soft_cap: float | None,
+    logits_soft_cap: float | None,
 ):
     """Forward pass for block-sparse attention in custom VJP.
 
@@ -242,7 +242,7 @@ def _blocksparse_attention_bhtd_fwd(
         kv_blocksize: Key/value block size.
         bwd_q_blocksize: Backward query block size.
         bwd_kv_blocksize: Backward key/value block size.
-        logit_soft_cap: Optional soft capping value.
+        logits_soft_cap: Optional soft capping value.
 
     Returns:
         Tuple of (output, lse) and residuals for backward pass.
@@ -266,7 +266,7 @@ def _blocksparse_attention_bhtd_fwd(
         causal=causal,
         q_blocksize=q_blocksize,
         kv_blocksize=kv_blocksize,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
     )
 
 
@@ -281,7 +281,7 @@ def _blocksparse_attention_bhtd_bwd(
     kv_blocksize: int,
     bwd_q_blocksize: int,
     bwd_kv_blocksize: int,
-    logit_soft_cap: float | None,
+    logits_soft_cap: float | None,
     res: ArrayLike,
     dout: ArrayLike,
 ):
@@ -303,7 +303,7 @@ def _blocksparse_attention_bhtd_bwd(
         kv_blocksize: Key/value block size (non-differentiable).
         bwd_q_blocksize: Backward query block size (non-differentiable).
         bwd_kv_blocksize: Backward key/value block size (non-differentiable).
-        logit_soft_cap: Soft capping value (non-differentiable).
+        logits_soft_cap: Soft capping value (non-differentiable).
         res: Residuals from forward pass containing intermediate values.
         dout: Gradient of loss with respect to the output.
 
@@ -323,7 +323,7 @@ def _blocksparse_attention_bhtd_bwd(
         kv_blocksize=kv_blocksize,
         bwd_q_blocksize=bwd_q_blocksize,
         bwd_kv_blocksize=bwd_kv_blocksize,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         res=res,
         dout=dout,
     )
@@ -345,7 +345,7 @@ _blocksparse_attention_bhtd.defvjp(_blocksparse_attention_bhtd_fwd, _blocksparse
         "kv_blocksize",
         "bwd_q_blocksize",
         "bwd_kv_blocksize",
-        "logit_soft_cap",
+        "logits_soft_cap",
     )
 )
 @jaxtyping.jaxtyped(typechecker=beartype)
@@ -365,7 +365,7 @@ def blocksparse_attention(
     | Int[Array, "batch 1 seq_len kv_len"]
     | None = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,
     q_blocksize: int | None = None,
     kv_blocksize: int | None = None,
@@ -399,8 +399,8 @@ def blocksparse_attention(
             Tokens with True/1 can attend to each other, False/0 indicates masking.
             This provides a convenient way to use attention masks without manually creating segment IDs.
         sequence_parallelism_mesh_axis_name: Optional axis name for sequence parallelism
-        logit_soft_cap: Optional soft capping value for attention logits. When specified,
-            applies tanh-based soft capping: logit_soft_cap * tanh(logits / logit_soft_cap).
+        logits_soft_cap: Optional soft capping value for attention logits. When specified,
+            applies tanh-based soft capping: logits_soft_cap * tanh(logits / logits_soft_cap).
             This prevents attention scores from becoming too large, improving numerical
             stability (Gemma-2 style). Gradients are computed with proper Jacobian.
         qkv_layouts: Optional pre-computed attention mask layouts
@@ -495,5 +495,5 @@ def blocksparse_attention(
         kv_blocksize=kv_blocksize,
         bwd_q_blocksize=bwd_q_blocksize,
         bwd_kv_blocksize=bwd_kv_blocksize,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
     )

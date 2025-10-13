@@ -92,7 +92,7 @@ output = executor(
     attention, q, k, v,
     causal=True,
     dropout_prob=0.1,
-    logit_soft_cap=30.0  # Prevents attention scores from becoming too large
+    logits_soft_cap=30.0  # Prevents attention scores from becoming too large
 )
 ```
 

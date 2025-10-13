@@ -30,6 +30,7 @@ grouped matmul handles variable-sized groups efficiently by:
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 from jaxtyping import Array, Float, Int
@@ -194,7 +195,11 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
 _grouped_matmul_executor: Executor[GroupedMatmulConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=True,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("grouped-matmul"),
     )
@@ -205,15 +210,16 @@ def grouped_matmul(
     lhs: Float[Array, "m k"],
     rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
     group_sizes: Int[Array, "num_groups"],
-    preferred_element_type=None,
-    tiling: tuple[int, int, int] | None = (128, 128, 128),
     group_offset: Int[Array, "..."] | None = None,
     existing_out: Float[Array, "m n"] | None = None,
+    /,
+    *,
+    preferred_element_type=None,
+    tiling: tuple[int, int, int] | None = (128, 128, 128),
     transpose_rhs: bool = False,
     interpret: bool = False,
     precision=None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: GroupedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
     """Execute grouped matrix multiplication with automatic optimization.

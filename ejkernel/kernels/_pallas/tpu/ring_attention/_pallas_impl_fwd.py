@@ -54,7 +54,7 @@ def _ring_flash_attention_fwd_tpu(
     dropout_rng,
     pdrop,
     sliding_window,
-    logit_soft_cap,
+    logits_soft_cap,
     attention_sink_size,
     policy,
     softmax_scale,
@@ -165,7 +165,7 @@ def _ring_flash_attention_fwd_tpu(
             softmax_scale=softmax_scale,
             block_sizes=block_sizes,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             attention_sink_size=attention_sink_size,
         )
         if axis_name is not None:
@@ -196,7 +196,7 @@ def _flash_attention(
     softmax_scale,
     block_sizes,
     sliding_window=None,
-    logit_soft_cap=None,
+    logits_soft_cap=None,
     attention_sink_size=0,
 ):
     return _flash_attention_impl(
@@ -217,7 +217,7 @@ def _flash_attention(
         block_sizes.block_k_major,
         block_sizes.block_k,
         sliding_window,
-        logit_soft_cap,
+        logits_soft_cap,
         attention_sink_size,
     )
 
@@ -237,7 +237,7 @@ def _flash_attention_fwd(
     softmax_scale,
     block_sizes,
     sliding_window=None,
-    logit_soft_cap=None,
+    logits_soft_cap=None,
     attention_sink_size=0,
 ):
     if save_residuals:
@@ -257,7 +257,7 @@ def _flash_attention_fwd(
         softmax_scale,
         block_sizes,
         sliding_window,
-        logit_soft_cap,
+        logits_soft_cap,
         attention_sink_size,
     )
     return o, lse_, m
@@ -289,7 +289,7 @@ def _flash_attention_kernel(
     mask_value,
     block_q,
     sliding_window,
-    logit_soft_cap,
+    logits_soft_cap,
     attention_sink_size,
 ):
     block_b = q_tile_ref.shape[0]
@@ -325,7 +325,7 @@ def _flash_attention_kernel(
             mask_value=mask_value,
             block_q=block_q,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             attention_sink_size=attention_sink_size,
         )
 
@@ -358,7 +358,7 @@ def _flash_attention_kernel_single_batch(
     mask_value,
     block_q,
     sliding_window,
-    logit_soft_cap,
+    logits_soft_cap,
     attention_sink_size,
 ):
     block_k_major = k_tile_ref.shape[2]
@@ -418,10 +418,10 @@ def _flash_attention_kernel_single_batch(
             if softmax_scale != 1.0:
                 s *= softmax_scale
 
-            if logit_soft_cap is not None:
-                s = s / logit_soft_cap
+            if logits_soft_cap is not None:
+                s = s / logits_soft_cap
                 s = jnp.tanh(s)
-                s = s * logit_soft_cap
+                s = s * logits_soft_cap
 
             mask = None
             if q_segment_ids_tile_ref is not None:
@@ -550,7 +550,7 @@ def _flash_attention_impl(
     block_k_major,
     block_k,
     sliding_window,
-    logit_soft_cap,
+    logits_soft_cap,
     attention_sink_size,
 ):
     if causal_block_size is not None:
@@ -635,7 +635,7 @@ def _flash_attention_impl(
         kv_seq_len=kv_seq_len,
         block_q=block_q,
         sliding_window=sliding_window,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         attention_sink_size=attention_sink_size,
     )
     out_shape = [jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)]

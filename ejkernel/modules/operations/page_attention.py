@@ -56,8 +56,11 @@ References:
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
+from jax import shard_map
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -243,11 +246,115 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
         """
         return []
 
+    def create_shard_map_wrapper(
+        self,
+        query: Float[Array, "num_seqs num_heads head_dim"],
+        key_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],
+        value_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],
+        context_lens: Int[Array, "num_seqs"],
+        block_tables: Int[Array, "num_seqs max_blocks"],
+        attn_scale: float | None = None,
+        max_context_len: int | None = None,
+        num_splits: int = 0,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        *,
+        cfg: PageAttentionConfig | None = None,
+        mask_value: float = -2.381976426469702e38,
+        attn_logits_soft_cap: float | None = None,
+        pages_per_compute_block: int | None = None,
+        megacore_mode: str | None = None,
+        inline_seq_dim: bool = True,
+        mesh: Mesh | None = None,
+        in_specs: tuple[PartitionSpec, ...] | None = None,
+        out_specs: PartitionSpec | None = None,
+        check_vma: bool = False,
+    ):
+        """Create a shard_map wrapper for distributed execution.
+
+        Creates a wrapper function that applies shard_map to distribute the page attention
+        computation across devices according to the provided sharding specifications.
+
+        Args:
+            query: Query tensor [num_seqs, num_heads, head_dim]
+            key_cache: Paged key cache [num_blocks, num_kv_heads, block_size, head_dim]
+            value_cache: Paged value cache [num_blocks, num_kv_heads, block_size, head_dim]
+            context_lens: Context length per sequence [num_seqs]
+            block_tables: Block mapping table [num_seqs, max_blocks]
+            attn_scale: Attention scaling factor
+            max_context_len: Maximum context length across all sequences
+            num_splits: Number of splits for partitioned attention
+            platform: Platform to use for execution
+            cfg: Configuration for the kernel
+            mask_value: Value for masked positions
+            attn_logits_soft_cap: Soft cap value for attention logits
+            pages_per_compute_block: Pages per compute block
+            megacore_mode: Megacore execution mode
+            inline_seq_dim: Whether to inline sequence dimension
+            mesh: JAX mesh for distributed execution
+            in_specs: Partition specifications for input tensors
+            out_specs: Partition specifications for output tensor
+            check_vma: Whether to check for valid memory access patterns
+
+        Returns:
+            Tuple of (shard_map_fn, call_args) where shard_map_fn is the wrapped
+            function and call_args are the arguments to pass to it.
+        """
+        assert mesh is not None, "mesh must be provided for shard_map execution"
+        assert in_specs is not None, "in_specs must be provided for shard_map execution"
+        assert out_specs is not None, "out_specs must be provided for shard_map execution"
+
+        def _wrapper(
+            query,
+            key_cache,
+            value_cache,
+            context_lens,
+            block_tables,
+        ):
+            return self.run(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                context_lens=context_lens,
+                block_tables=block_tables,
+                attn_scale=attn_scale,
+                max_context_len=max_context_len,
+                num_splits=num_splits,
+                platform=platform,
+                cfg=cfg or self.heuristic_cfg(None),
+                mask_value=mask_value,
+                attn_logits_soft_cap=attn_logits_soft_cap,
+                pages_per_compute_block=pages_per_compute_block,
+                megacore_mode=megacore_mode,
+                inline_seq_dim=inline_seq_dim,
+            )
+
+        shard_map_fn = shard_map(
+            _wrapper,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=check_vma,
+        )
+
+        call_args = (
+            query,
+            key_cache,
+            value_cache,
+            context_lens,
+            block_tables,
+        )
+
+        return shard_map_fn, call_args
+
 
 _page_attention_executor: Executor[PageAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=False),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=False,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("page-attention"),
     )
@@ -260,6 +367,8 @@ def page_attention(
     value_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],
     context_lens: Int[Array, "num_seqs"],
     block_tables: Int[Array, "num_seqs max_blocks"],
+    /,
+    *,
     attn_scale: float | None = None,
     max_context_len: int | None = None,
     num_splits: int = 0,
@@ -269,7 +378,6 @@ def page_attention(
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: PageAttentionConfig | None = None,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
     """Execute page attention with automatic optimization.
@@ -291,8 +399,8 @@ def page_attention(
         pages_per_compute_block: Pages per compute block
         megacore_mode: Megacore execution mode
         inline_seq_dim: Whether to inline sequence dimension
-
-            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        cfg: Optional configuration override
 
     Returns:
         Attention output [num_seqs, num_heads, head_dim]

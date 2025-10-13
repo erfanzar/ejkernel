@@ -34,7 +34,7 @@ def ragged_decode_ref(
     softmax_scale=1.0,
     block_size=256,
     sliding_window=None,
-    logit_soft_cap=None,
+    logits_soft_cap=None,
     softmax_aux=None,
 ):
     """
@@ -75,8 +75,8 @@ def ragged_decode_ref(
             v_b = value[b, :, kvh, :]
 
             logits = jnp.einsum("d,sd->s", q_vec, k_b) * float(softmax_scale)
-            if logit_soft_cap is not None and logit_soft_cap > 0:
-                cap = float(logit_soft_cap)
+            if logits_soft_cap is not None and logits_soft_cap > 0:
+                cap = float(logits_soft_cap)
                 logits = cap * jnp.tanh(logits / cap)
 
             logits_seq = jnp.where(mask, logits, -jnp.inf)
@@ -127,7 +127,7 @@ class TestRaggedDecodeAttentionTriton:
         assert jnp.isfinite(out).all()
 
     @pytest.mark.parametrize(
-        "sliding_window,logit_soft_cap",
+        "sliding_window,logits_soft_cap",
         [
             (None, None),
             ((128, 0), None),
@@ -136,7 +136,7 @@ class TestRaggedDecodeAttentionTriton:
             ((128, 64), 20.0),
         ],
     )
-    def test_against_reference(self, sliding_window, logit_soft_cap):
+    def test_against_reference(self, sliding_window, logits_soft_cap):
         B, S, HQ, HKV, D = 2, 384, 16, 2, 64
 
         key = jax.random.PRNGKey(1)
@@ -158,7 +158,7 @@ class TestRaggedDecodeAttentionTriton:
             softmax_scale=1.0,
             block_size=128,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             softmax_aux=None,
         )
 
@@ -171,7 +171,7 @@ class TestRaggedDecodeAttentionTriton:
             softmax_scale=1.0,
             block_size=128,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             softmax_aux=None,
         )
 
@@ -204,7 +204,7 @@ class TestRaggedDecodeAttentionTriton:
             softmax_scale=0.75,
             block_size=64,
             sliding_window=(128, 16),
-            logit_soft_cap=25.0,
+            logits_soft_cap=25.0,
             softmax_aux=aux_per_kv,
         )
         out_ref = ragged_decode_ref(
@@ -216,7 +216,7 @@ class TestRaggedDecodeAttentionTriton:
             softmax_scale=0.75,
             block_size=64,
             sliding_window=(128, 16),
-            logit_soft_cap=25.0,
+            logits_soft_cap=25.0,
             softmax_aux=aux_per_kv,
         )
         assert jnp.allclose(out_tri, out_ref, rtol=2e-4, atol=2e-5)
@@ -230,7 +230,7 @@ class TestRaggedDecodeAttentionTriton:
             softmax_scale=1.25,
             block_size=128,
             sliding_window=None,
-            logit_soft_cap=None,
+            logits_soft_cap=None,
             softmax_aux=aux_shared,
         )
         out_ref2 = ragged_decode_ref(
@@ -242,7 +242,7 @@ class TestRaggedDecodeAttentionTriton:
             softmax_scale=1.25,
             block_size=128,
             sliding_window=None,
-            logit_soft_cap=None,
+            logits_soft_cap=None,
             softmax_aux=aux_shared,
         )
         assert jnp.allclose(out_tri2, out_ref2, rtol=2e-4, atol=2e-5)

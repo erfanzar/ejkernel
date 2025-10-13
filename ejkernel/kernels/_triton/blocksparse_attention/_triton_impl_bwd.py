@@ -1116,7 +1116,7 @@ def _bwd_blocksparse_attn_call(
     kv_blocksize: int,
     bwd_q_blocksize: int,
     bwd_kv_blocksize: int,
-    logit_soft_cap: float | None,
+    logits_soft_cap: float | None,
     res: ArrayLike,
     dout: ArrayLike,
 ):
@@ -1235,11 +1235,11 @@ def _bwd_blocksparse_attn_call(
         delta_padded = delta
         dout_padded = dout
 
-    if logit_soft_cap is None:
+    if logits_soft_cap is None:
         logits_soft_cap_val = 0.0
         softcap_flag = False
     else:
-        logits_soft_cap_val = float(logit_soft_cap)
+        logits_soft_cap_val = float(logits_soft_cap)
         softcap_flag = True
 
     metaparams = dict(

@@ -69,6 +69,10 @@ import dataclasses
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Generic
 
+import jax
+import jax.sharding
+from jax import shard_map
+
 from ..utils.fingerprint import abstractify, short_hash
 from .types import Cfg, Out
 
@@ -87,6 +91,11 @@ class Invocation(Generic[Cfg, Out]):
         batch_axes: Optional mapping of parameter names to batch axes for vmapping
         override_cfg: Optional configuration to use instead of cached/computed ones
         stamp: Whether to add profiling metadata to the operation
+        method: Execution method (e.g., "shard_map" or None for standard)
+        mesh: JAX mesh for shard_map execution
+        in_specs: Input partition specs for shard_map
+        out_specs: Output partition spec for shard_map
+        check_vma: Whether to check for valid memory access in shard_map
     """
 
     op_id: str
@@ -95,6 +104,11 @@ class Invocation(Generic[Cfg, Out]):
     batch_axes: Mapping[str, int] | None = None
     override_cfg: Cfg | None = None
     stamp: bool = True
+    method: str | None = None
+    mesh: jax.sharding.Mesh | None = None
+    in_specs: tuple[jax.sharding.PartitionSpec, ...] | None = None
+    out_specs: jax.sharding.PartitionSpec | None = None
+    check_vma: bool = False
 
     @property
     def call_key(self) -> str:
@@ -109,13 +123,14 @@ class Invocation(Generic[Cfg, Out]):
 
         Note:
             The hash includes argument shapes/types, keyword argument shapes/types,
-            and batch axes information. Array values are not included, allowing
-            the same configuration to be reused for arrays with the same structure.
+            batch axes information, and execution method. Array values are not included,
+            allowing the same configuration to be reused for arrays with the same structure.
         """
         spec = dict(
             args_spec=abstractify(self.args),
             kwargs_spec=abstractify(dict(self.kwargs)),
             batch_axes=self.batch_axes,
+            method=self.method,
         )
         return short_hash(spec)
 
@@ -141,6 +156,7 @@ class Invocation(Generic[Cfg, Out]):
             args_spec=abstractify(self.args),
             kwargs_spec=abstractify(dict(self.kwargs)),
             batch_axes=self.batch_axes,
+            method=self.method,
         )
         return short_hash(spec)
 
@@ -161,6 +177,19 @@ class Kernel(Generic[Cfg, Out]):
         candidate_cfgs: Provide alternative configurations for autotuning
         fwd_with_residuals: Forward pass with residuals for custom VJP
         vjp: Backward pass for custom VJP
+        run_shard_map: Specialized execution for shard_map contexts
+        fwd_with_residuals_shard_map: Forward pass with residuals for shard_map
+        vjp_shard_map: Backward pass for shard_map
+
+    Method Naming Convention:
+        - Platform-specific: {method}_{platform} (e.g., run_gpu, run_tpu)
+        - Context-specific: {method}_{context} (e.g., run_shard_map)
+        - Composite: {method}_{context}_{platform} (e.g., run_shard_map_gpu)
+
+        Platforms: 'gpu', 'tpu', 'cpu' (hardware backends)
+        Contexts: 'shard_map' (execution modes/environments)
+
+        Priority: composite > context > platform > generic
 
     Attributes:
         op_id: Unique identifier for this operation
@@ -345,22 +374,223 @@ class Kernel(Generic[Cfg, Out]):
         """
         raise NotImplementedError
 
+    def run_shard_map(self, *args, cfg: Cfg, **kwargs) -> Out:
+        """Execute the operation within a shard_map context. Optional override.
 
-def _has_custom_vjp(k: Kernel, platform: str | None = None) -> bool:
+        This method can be implemented to provide a specialized version of the
+        operation that runs efficiently within JAX's shard_map context. If not
+        implemented, the regular run() method will be used as fallback.
+
+        Args:
+            *args: Positional arguments (after prepare() preprocessing)
+            cfg: Configuration object specifying how to execute the operation
+            **kwargs: Keyword arguments (after prepare() preprocessing)
+
+        Returns:
+            Result of the operation
+
+        Raises:
+            NotImplementedError: Only implement if providing shard_map-specific execution
+
+        Example:
+            >>> def run_shard_map(self, x, y, cfg: MatMulConfig) -> jax.Array:
+            ...
+            ...     return custom_sharded_matmul(x, y, cfg)
+
+        Note:
+            This method is automatically detected by _get_platform_method() and
+            used when 'shard_map' is specified as the platform.
+        """
+        raise NotImplementedError
+
+    def fwd_with_residuals_shard_map(self, *args, cfg: Cfg, **kwargs) -> tuple[Out, Any]:
+        """Forward pass with residuals for shard_map context. Optional override.
+
+        Specialized forward pass for shard_map contexts that returns both the
+        result and residuals needed for the backward pass.
+
+        Args:
+            *args: Positional arguments for the operation
+            cfg: Configuration object
+            **kwargs: Keyword arguments for the operation
+
+        Returns:
+            Tuple of (operation_result, residuals)
+            - operation_result: Same as run_shard_map() method output
+            - residuals: Any values needed for the backward pass
+
+        Raises:
+            NotImplementedError: Only implement if providing custom gradients for shard_map
+
+        Note:
+            Must be implemented together with vjp_shard_map() method for custom
+            gradients in shard_map contexts.
+        """
+        raise NotImplementedError
+
+    def vjp_shard_map(self, residuals: Any, y: Out, dy: Out, *args, cfg: Cfg, **kwargs):
+        """Backward pass for shard_map context. Optional override.
+
+        Specialized backward pass for shard_map contexts that computes gradients
+        with respect to positional arguments.
+
+        Args:
+            residuals: Values returned from fwd_with_residuals_shard_map()
+            y: Forward pass output (from fwd_with_residuals_shard_map())
+            dy: Incoming gradients (cotangents) with respect to y
+            *args: Original positional arguments
+            cfg: Configuration object
+            **kwargs: Original keyword arguments
+
+        Returns:
+            Tuple of gradients for each positional argument
+            (None for arguments that don't need gradients)
+
+        Raises:
+            NotImplementedError: Only implement if providing custom gradients for shard_map
+
+        Note:
+            Must be implemented together with fwd_with_residuals_shard_map() method.
+        """
+        raise NotImplementedError
+
+    def run_shard_map_gpu(self, *args, cfg: Cfg, **kwargs) -> Out:
+        """Execute operation in shard_map context on GPU. Optional override.
+
+        Most specific implementation combining shard_map execution context with
+        GPU platform optimizations.
+
+        Example:
+            >>> def run_shard_map_gpu(self, x, y, cfg: MyConfig) -> jax.Array:
+            ...
+            ...     return gpu_sharded_operation(x, y, cfg)
+        """
+        raise NotImplementedError
+
+    def fwd_with_residuals_shard_map_gpu(self, *args, cfg: Cfg, **kwargs) -> tuple[Out, Any]:
+        """Forward pass with residuals for shard_map on GPU. Optional override."""
+        raise NotImplementedError
+
+    def vjp_shard_map_gpu(self, residuals: Any, y: Out, dy: Out, *args, cfg: Cfg, **kwargs):
+        """Backward pass for shard_map on GPU. Optional override."""
+        raise NotImplementedError
+
+    def create_shard_map_wrapper(
+        self,
+        fn: Callable,
+        *args,
+        mesh: jax.sharding.Mesh,
+        in_specs: tuple[jax.sharding.PartitionSpec, ...],
+        out_specs: jax.sharding.PartitionSpec,
+        check_vma: bool = False,
+        **kwargs,
+    ) -> tuple[Callable, tuple]:
+        """Create a shard_map wrapper around a function with fixed kwargs.
+
+        This helper method simplifies the pattern of wrapping functions with shard_map
+        by handling the functools.partial and shard_map setup automatically.
+
+        Args:
+            fn: Function to wrap with shard_map (e.g., flash_attention)
+            *args: Positional arguments that will be passed through shard_map
+            mesh: JAX device mesh for distributed execution
+            in_specs: Partition specs for input arguments (must match len(args))
+            out_specs: Partition spec for output
+            check_vma: Whether to check replication in shard_map
+            **kwargs: Keyword arguments to fix via functools.partial
+
+        Returns:
+            Tuple of (shard_map_wrapped_function, call_arguments)
+            - shard_map_wrapped_function: Function that takes positional args
+            - call_arguments: Tuple of args to pass to the wrapped function
+
+        Example:
+            >>> from ejkernel.modules.operations import flash_attention
+            >>> attn = FlashAttention()
+            >>>
+            >>>
+            >>> shard_map_fn, call_args = attn.create_shard_map_wrapper(
+            ...     flash_attention,
+            ...     query, key, value,
+            ...     mesh=my_mesh,
+            ...     in_specs=(q_spec, k_spec, v_spec),
+            ...     out_specs=out_spec,
+            ...     causal=True,
+            ...     softmax_scale=0.125
+            ... )
+            >>>
+            >>>
+            >>> output = shard_map_fn(*call_args)
+
+        Note:
+            This follows the EasyDeL pattern where attention operations are wrapped
+            with shard_map for distributed execution. The function `fn` is called
+            with the positional args and fixed kwargs inside the shard_map context.
+        """
+
+        def _wrapped(*call_args):
+            return fn(*call_args, **kwargs)
+
+        shard_map_fn = shard_map(
+            _wrapped,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
+        )
+
+        return shard_map_fn, args
+
+
+def _has_custom_vjp(
+    k: Kernel,
+    platform: str | None = None,
+    context: str | None = None,
+) -> bool:
     """Check if a kernel has implemented custom VJP (vector-Jacobian product) methods.
 
     Returns True if both fwd_with_residuals and vjp methods have been overridden
-    from the base Kernel class. Supports platform-specific methods (e.g., fwd_with_residuals_gpu).
+    from the base Kernel class. Supports context and platform-specific methods
+    (e.g., fwd_with_residuals_shard_map_gpu).
 
     Args:
         k: Kernel instance to check
         platform: Optional platform identifier (e.g., 'gpu', 'tpu', 'cpu')
-                 If provided, checks for platform-specific methods first
+        context: Optional execution context (e.g., 'shard_map')
 
     Returns:
-        True if kernel has custom VJP implementation (generic or platform-specific)
+        True if kernel has custom VJP implementation (generic, context-specific,
+        platform-specific, or composite)
     """
     try:
+        if context and platform:
+            composite_fwd = f"fwd_with_residuals_{context}_{platform}"
+            composite_vjp = f"vjp_{context}_{platform}"
+
+            has_composite_fwd = hasattr(type(k), composite_fwd) and getattr(type(k), composite_fwd) is not getattr(
+                Kernel, composite_fwd, None
+            )
+            has_composite_vjp = hasattr(type(k), composite_vjp) and getattr(type(k), composite_vjp) is not getattr(
+                Kernel, composite_vjp, None
+            )
+
+            if has_composite_fwd and has_composite_vjp:
+                return True
+
+        if context:
+            context_fwd = f"fwd_with_residuals_{context}"
+            context_vjp = f"vjp_{context}"
+
+            has_context_fwd = hasattr(type(k), context_fwd) and getattr(type(k), context_fwd) is not getattr(
+                Kernel, context_fwd, None
+            )
+            has_context_vjp = hasattr(type(k), context_vjp) and getattr(type(k), context_vjp) is not getattr(
+                Kernel, context_vjp, None
+            )
+
+            if has_context_fwd and has_context_vjp:
+                return True
+
         if platform:
             platform_fwd = f"fwd_with_residuals_{platform}"
             platform_vjp = f"vjp_{platform}"
@@ -380,27 +610,55 @@ def _has_custom_vjp(k: Kernel, platform: str | None = None) -> bool:
         return False
 
 
-def _get_platform_method(k: Kernel, method_name: str, platform: str | None = None) -> Callable | None:
-    """Get platform-specific method from kernel, falling back to generic method.
+def _get_platform_method(
+    k: Kernel,
+    method_name: str,
+    platform: str | None = None,
+    context: str | None = None,
+) -> Callable | None:
+    """Get context and platform-specific method from kernel, with fallback hierarchy.
+
+    Supports execution contexts (like 'shard_map') combined with hardware platforms
+    (like 'gpu', 'tpu', 'cpu'). The lookup follows this priority:
+    1. {method}_{context}_{platform} (e.g., run_shard_map_gpu)
+    2. {method}_{context} (e.g., run_shard_map)
+    3. {method}_{platform} (e.g., run_gpu)
+    4. {method} (e.g., run)
 
     Args:
         k: Kernel instance
         method_name: Base method name (e.g., 'run', 'candidate_cfgs', 'fwd_with_residuals')
         platform: Optional platform identifier (e.g., 'gpu', 'tpu', 'cpu')
+        context: Optional execution context (e.g., 'shard_map')
 
     Returns:
-        Platform-specific method if available, otherwise generic method, or None if neither exists
+        Most specific available method, or None if no override exists
 
     Example:
         >>>
-        >>>
-        >>> method = _get_platform_method(kernel, 'run', 'gpu')
+        >>> method = _get_platform_method(kernel, 'run', platform='gpu', context='shard_map')
     """
+
+    if context and platform:
+        composite_name = f"{method_name}_{context}_{platform}"
+        if hasattr(k, composite_name):
+            method = getattr(k, composite_name)
+            base_method = getattr(Kernel, composite_name, None)
+            if method is not base_method:
+                return method
+
+    if context:
+        context_method_name = f"{method_name}_{context}"
+        if hasattr(k, context_method_name):
+            method = getattr(k, context_method_name)
+            base_method = getattr(Kernel, context_method_name, None)
+            if method is not base_method:
+                return method
+
     if platform:
         platform_method_name = f"{method_name}_{platform}"
         if hasattr(k, platform_method_name):
             method = getattr(k, platform_method_name)
-
             base_method = getattr(Kernel, platform_method_name, None)
             if method is not base_method:
                 return method

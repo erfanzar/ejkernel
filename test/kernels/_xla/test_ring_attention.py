@@ -257,7 +257,7 @@ class TestLogitSoftCap:
             v,
             query_chunk_size=64,
             key_chunk_size=64,
-            logit_soft_cap=30.0,
+            logits_soft_cap=30.0,
         )
 
         assert output_with_cap.shape == q.shape
@@ -286,7 +286,7 @@ class TestLogitSoftCap:
             v,
             query_chunk_size=64,
             key_chunk_size=64,
-            logit_soft_cap=30.0,
+            logits_soft_cap=30.0,
         )
 
         assert jnp.all(jnp.isfinite(output)), "Soft cap should prevent overflow"
@@ -391,7 +391,7 @@ class TestCombinedFeatures:
             query_chunk_size=64,
             key_chunk_size=64,
             sliding_window=64,
-            logit_soft_cap=30.0,
+            logits_soft_cap=30.0,
         )
 
         assert output.shape == q.shape
@@ -447,7 +447,7 @@ class TestCombinedFeatures:
             causal_block_size=64,
             sliding_window=(32, 96),
             attention_sink_size=4,
-            logit_soft_cap=30.0,
+            logits_soft_cap=30.0,
         )
 
         assert output.shape == q.shape
@@ -933,7 +933,7 @@ class TestGradients:
                 query_chunk_size=32,
                 key_chunk_size=32,
                 sliding_window=32,
-                logit_soft_cap=30.0,
+                logits_soft_cap=30.0,
                 attention_sink_size=2,
             )
             return jnp.mean(output**2)

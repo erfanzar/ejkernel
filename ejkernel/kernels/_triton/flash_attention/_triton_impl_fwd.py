@@ -580,7 +580,7 @@ def _fwd_attention_kernel_call(
     q: Float[Array, "batch seq_len_q num_heads head_dim"] | None,
     k: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
     v: Float[Array, "batch seq_len_k num_heads head_dim"] | None,
-    attention_mask: Bool[Array, "batch seq_len"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,

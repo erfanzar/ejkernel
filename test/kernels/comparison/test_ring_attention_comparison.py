@@ -144,18 +144,18 @@ class TestRingAttentionComparison:
             err_msg="Ring attention with 2D softmax_aux outputs don't match",
         )
 
-    def test_with_logit_soft_cap(self):
+    def test_with_logits_soft_cap(self):
         """Test ring attention with logit soft cap."""
         batch, seq_len, num_heads, head_dim = 2, 512, 8, 64
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        logit_soft_cap = 30.0
+        logits_soft_cap = 30.0
 
         out_xla = xla.ring_attention(
             q,
             k,
             v,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             query_chunk_size=128,
             key_chunk_size=128,
         )
@@ -164,7 +164,7 @@ class TestRingAttentionComparison:
             q,
             k,
             v,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             query_chunk_size=128,
             key_chunk_size=128,
         )
@@ -174,7 +174,7 @@ class TestRingAttentionComparison:
             out_pallas,
             rtol=self.rtol,
             atol=self.atol,
-            err_msg="Ring attention with logit_soft_cap outputs don't match",
+            err_msg="Ring attention with logits_soft_cap outputs don't match",
         )
 
     def test_with_sliding_window_symmetric(self):
@@ -357,7 +357,7 @@ class TestRingAttentionComparison:
         num_sinks = 4
         softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
 
-        logit_soft_cap = 30.0
+        logits_soft_cap = 30.0
         sliding_window = (64, 128)
         attention_sink_size = 8
         causal_block_size = 64
@@ -367,7 +367,7 @@ class TestRingAttentionComparison:
             k,
             v,
             softmax_aux=softmax_aux,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             sliding_window=sliding_window,
             attention_sink_size=attention_sink_size,
             causal_block_size=causal_block_size,
@@ -380,7 +380,7 @@ class TestRingAttentionComparison:
             k,
             v,
             softmax_aux=softmax_aux,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             sliding_window=sliding_window,
             attention_sink_size=attention_sink_size,
             causal_block_size=causal_block_size,
@@ -589,20 +589,20 @@ class TestRingAttentionGradientComparison:
             err_msg="Value gradients with 2D softmax_aux don't match",
         )
 
-    def test_gradient_with_logit_soft_cap(self):
+    def test_gradient_with_logits_soft_cap(self):
         """Test gradient computation with logit soft cap."""
         batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        logit_soft_cap = 30.0
+        logits_soft_cap = 30.0
 
         def xla_loss_fn(q, k, v):
-            out = xla.ring_attention(q, k, v, logit_soft_cap=logit_soft_cap, query_chunk_size=128, key_chunk_size=128)
+            out = xla.ring_attention(q, k, v, logits_soft_cap=logits_soft_cap, query_chunk_size=128, key_chunk_size=128)
             return jnp.mean(out**2)
 
         def pallas_loss_fn(q, k, v):
             out = pallas.tpu.ring_attention(
-                q, k, v, logit_soft_cap=logit_soft_cap, query_chunk_size=128, key_chunk_size=128
+                q, k, v, logits_soft_cap=logits_soft_cap, query_chunk_size=128, key_chunk_size=128
             )
             return jnp.mean(out**2)
 
@@ -617,21 +617,21 @@ class TestRingAttentionGradientComparison:
             dq_pallas,
             rtol=self.grad_rtol,
             atol=self.grad_atol,
-            err_msg="Query gradients with logit_soft_cap don't match",
+            err_msg="Query gradients with logits_soft_cap don't match",
         )
         np.testing.assert_allclose(
             dk_xla,
             dk_pallas,
             rtol=self.grad_rtol,
             atol=self.grad_atol,
-            err_msg="Key gradients with logit_soft_cap don't match",
+            err_msg="Key gradients with logits_soft_cap don't match",
         )
         np.testing.assert_allclose(
             dv_xla,
             dv_pallas,
             rtol=self.grad_rtol,
             atol=self.grad_atol,
-            err_msg="Value gradients with logit_soft_cap don't match",
+            err_msg="Value gradients with logits_soft_cap don't match",
         )
 
     def test_gradient_with_combined_features(self):
@@ -641,17 +641,29 @@ class TestRingAttentionGradientComparison:
 
         num_sinks = 4
         softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
-        logit_soft_cap = 30.0
+        logits_soft_cap = 30.0
 
         def xla_loss_fn(q, k, v):
             out = xla.ring_attention(
-                q, k, v, softmax_aux=softmax_aux, logit_soft_cap=logit_soft_cap, query_chunk_size=128, key_chunk_size=128
+                q,
+                k,
+                v,
+                softmax_aux=softmax_aux,
+                logits_soft_cap=logits_soft_cap,
+                query_chunk_size=128,
+                key_chunk_size=128,
             )
             return jnp.mean(out**2)
 
         def pallas_loss_fn(q, k, v):
             out = pallas.tpu.ring_attention(
-                q, k, v, softmax_aux=softmax_aux, logit_soft_cap=logit_soft_cap, query_chunk_size=128, key_chunk_size=128
+                q,
+                k,
+                v,
+                softmax_aux=softmax_aux,
+                logits_soft_cap=logits_soft_cap,
+                query_chunk_size=128,
+                key_chunk_size=128,
             )
             return jnp.mean(out**2)
 

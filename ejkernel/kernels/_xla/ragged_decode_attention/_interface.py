@@ -33,7 +33,7 @@ def ragged_decode_attention(
     softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
 ) -> Float[Array, "batch num_q_heads head_dim"]:
     """Ragged MQA/GQA decoding with standard XLA operations.
@@ -57,8 +57,8 @@ def ragged_decode_attention(
         sliding_window: Optional (left, right) window sizes for local attention.
             Limits attention to tokens within the window around the query position.
             None means full attention to all valid tokens.
-        logit_soft_cap: Optional soft capping value for attention logits.
-            Applies tanh-based soft capping: logit_soft_cap * tanh(logits / logit_soft_cap).
+        logits_soft_cap: Optional soft capping value for attention logits.
+            Applies tanh-based soft capping: logits_soft_cap * tanh(logits / logits_soft_cap).
             This prevents attention scores from becoming too large.
         softmax_aux: Optional auxiliary logits for attention sinks.
             Shape [num_heads, num_sinks] or [num_sinks]. Concatenated to attention logits
@@ -94,7 +94,7 @@ def ragged_decode_attention(
         ...     sequence_start, sequence_end,
         ...     softmax_scale=1.0 / jnp.sqrt(head_dim),
         ...     sliding_window=(256, 256),
-        ...     logit_soft_cap=30.0,
+        ...     logits_soft_cap=30.0,
         ...     softmax_aux=sinks
         ... )
 
@@ -112,6 +112,6 @@ def ragged_decode_attention(
         sequence_end=sequence_end,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         softmax_aux=softmax_aux,
     )

@@ -49,7 +49,7 @@ class TestRaggedPageAttentionTPU:
         num_pages = 32
         pages_per_seq = 8
         num_seqs = 4
-        num_combined_kv_heads = num_kv_heads * 2  # Combined K and V
+        num_combined_kv_heads = num_kv_heads * 2
 
         key = jax.random.PRNGKey(42)
         key, k1, k2, k3, k4 = jax.random.split(key, 5)
@@ -59,7 +59,6 @@ class TestRaggedPageAttentionTPU:
         context_lens = jax.random.randint(k3, (num_seqs,), 32, 128, dtype=jnp.int32)
         block_tables = jax.random.randint(k4, (num_seqs, pages_per_seq), 0, num_pages, dtype=jnp.int32)
 
-        # Create query_start_loc as cumulative sum
         tokens_per_seq = total_tokens // num_seqs
         query_start_loc = jnp.arange(0, (num_seqs + 1) * tokens_per_seq, tokens_per_seq, dtype=jnp.int32)
 
@@ -80,7 +79,7 @@ class TestRaggedPageAttentionTPU:
 
     def test_mixed_prefill_and_decode(self):
         """Test mixed prefill and decode scenarios."""
-        # Simulate a batch with some prefill (longer) and some decode (single token)
+
         total_tokens = 200
         num_q_heads = 8
         num_kv_heads = 2
@@ -97,11 +96,9 @@ class TestRaggedPageAttentionTPU:
         queries = jax.random.normal(k1, (total_tokens, num_q_heads, head_dim), dtype=jnp.float32)
         kv_pages = jax.random.normal(k2, (num_pages, page_size, num_combined_kv_heads, head_dim), dtype=jnp.float32)
 
-        # Mix of different context lengths
         context_lens = jnp.array([128, 64, 192, 96], dtype=jnp.int32)
         block_tables = jax.random.randint(k4, (num_seqs, pages_per_seq), 0, num_pages, dtype=jnp.int32)
 
-        # Variable query lengths: [100, 50, 40, 10]
         query_start_loc = jnp.array([0, 100, 150, 190, 200], dtype=jnp.int32)
 
         output = ragged_page_attention(
@@ -164,9 +161,9 @@ class TestRaggedPageAttentionTPU:
         head_dim = 128
 
         configs = [
-            (8, 2),  # 4:1 ratio
-            (16, 4),  # 4:1 ratio
-            (32, 8),  # 4:1 ratio
+            (8, 2),
+            (16, 4),
+            (32, 8),
         ]
 
         for num_q_heads, num_kv_heads in configs:
@@ -205,9 +202,9 @@ class TestRaggedPageAttentionTPU:
         num_combined_kv_heads = num_kv_heads * 2
 
         page_configs = [
-            (8, 64, 16),  # page_size=8, num_pages=64, pages_per_seq=16
-            (16, 32, 8),  # page_size=16, num_pages=32, pages_per_seq=8
-            (32, 16, 4),  # page_size=32, num_pages=16, pages_per_seq=4
+            (8, 64, 16),
+            (16, 32, 8),
+            (32, 16, 4),
         ]
 
         for page_size, num_pages, pages_per_seq in page_configs:
@@ -334,9 +331,9 @@ class TestRaggedPageAttentionTPU:
         query_start_loc = jnp.array([0, 128, 256], dtype=jnp.int32)
 
         block_configs = [
-            (2, 32),  # 2 kv pages per block, 32 queries per block
-            (4, 64),  # 4 kv pages per block, 64 queries per block
-            (1, 16),  # 1 kv page per block, 16 queries per block
+            (2, 32),
+            (4, 64),
+            (1, 16),
         ]
 
         for num_kv_pages_per_block, num_queries_per_block in block_configs:
@@ -365,7 +362,7 @@ class TestRaggedPageAttentionTPU:
         num_combined_kv_heads = num_kv_heads * 2
 
         for num_seqs in [1, 2, 4, 8]:
-            total_tokens = num_seqs * 64  # 64 tokens per sequence
+            total_tokens = num_seqs * 64
 
             key = jax.random.PRNGKey(5000 + num_seqs)
             key, k1, k2 = jax.random.split(key, 3)
@@ -394,7 +391,7 @@ class TestRaggedPageAttentionTPU:
     def test_decode_only_scenario(self):
         """Test decode-only scenario (1 token per sequence)."""
         num_seqs = 8
-        total_tokens = num_seqs  # 1 token per sequence
+        total_tokens = num_seqs
         num_q_heads = 8
         num_kv_heads = 2
         head_dim = 128
@@ -409,11 +406,9 @@ class TestRaggedPageAttentionTPU:
         queries = jax.random.normal(k1, (total_tokens, num_q_heads, head_dim), dtype=jnp.float32)
         kv_pages = jax.random.normal(k2, (num_pages, page_size, num_combined_kv_heads, head_dim), dtype=jnp.float32)
 
-        # Each sequence has different KV cache length
         context_lens = jnp.array([64, 80, 96, 48, 72, 88, 56, 100], dtype=jnp.int32)
         block_tables = jax.random.randint(key, (num_seqs, pages_per_seq), 0, num_pages, dtype=jnp.int32)
 
-        # Each sequence contributes 1 query token
         query_start_loc = jnp.arange(0, num_seqs + 1, dtype=jnp.int32)
 
         output = ragged_page_attention(
@@ -449,7 +444,6 @@ class TestRaggedPageAttentionTPU:
         queries = jax.random.normal(k1, (total_tokens, num_q_heads, head_dim), dtype=jnp.float32)
         kv_pages = jax.random.normal(k2, (num_pages, page_size, num_combined_kv_heads, head_dim), dtype=jnp.float32)
 
-        # Full prefill: context length equals query length
         context_lens = jnp.array([tokens_per_seq, tokens_per_seq], dtype=jnp.int32)
         block_tables = jax.random.randint(key, (num_seqs, pages_per_seq), 0, num_pages, dtype=jnp.int32)
         query_start_loc = jnp.array([0, tokens_per_seq, total_tokens], dtype=jnp.int32)
@@ -531,11 +525,9 @@ class TestRaggedPageAttentionTPU:
         queries = jax.random.normal(k1, (total_tokens, num_q_heads, head_dim), dtype=jnp.float32)
         kv_pages = jax.random.normal(k2, (num_pages, page_size, num_combined_kv_heads, head_dim), dtype=jnp.float32)
 
-        # Mix of different context lengths
         context_lens = jnp.array([128, 64, 192, 96], dtype=jnp.int32)
         block_tables = jax.random.randint(key, (num_seqs, pages_per_seq), 0, num_pages, dtype=jnp.int32)
 
-        # Variable query lengths: [100, 50, 40, 10]
         query_start_loc = jnp.array([0, 100, 150, 190, 200], dtype=jnp.int32)
 
         output_tpu = ragged_page_attention(

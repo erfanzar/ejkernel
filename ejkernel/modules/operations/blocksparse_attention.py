@@ -26,8 +26,11 @@ attention, local attention patterns, and sparse attention architectures.
 
 from __future__ import annotations
 
+import os
 import typing
 
+from jax import shard_map
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -97,6 +100,121 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         """Initialize BlockSparseAttention module."""
         super().__init__(op_id="blocksparse_attention")
 
+    def create_shard_map_wrapper(
+        self,
+        query: Float[Array, "batch num_heads seq_len head_dim"],
+        key: Float[Array, "batch kv_num_heads kv_len head_dim"],
+        value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
+        q_segment_ids: Int[Array, "batch seq_len"] | None = None,
+        kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
+        q_positions: Int[Array, "batch seq_len"] | None = None,
+        kv_positions: Int[Array, "batch kv_len"] | None = None,
+        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
+        attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
+        | Bool[Array, "batch 1 seq_len kv_len"]
+        | Int[Array, "batch num_heads seq_len kv_len"]
+        | Int[Array, "batch 1 seq_len kv_len"]
+        | None = None,
+        sequence_parallelism_mesh_axis_name: str | None = None,
+        logits_soft_cap: float | None = None,
+        qkv_layouts: tuple["SparseMask"] | None = None,
+        softmax_scale: float | None = None,
+        mask_builder: typing.Callable[[int, int, int, int, int], "Mask"]
+        | typing.Callable[[], "SparseMask"]
+        | None = None,
+        sliding_window: int | tuple[int, int] | None = None,
+        chunk_size: int | None = None,
+        causal: bool = True,
+        fused_backward: bool = False,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        cfg: BlockSparseAttentionConfig | None = None,
+        mesh: Mesh | None = None,
+        in_specs: tuple[PartitionSpec, ...] | None = None,
+        out_specs: PartitionSpec | None = None,
+        check_vma: bool = False,
+    ):
+        """Create a shard_map wrapper specifically for blocksparse attention.
+
+        Args:
+            mesh: JAX device mesh
+            in_specs: Input partition specs (must match length of tensor args)
+            out_specs: Output partition spec
+            query, key, value: Input tensors to be sharded
+            All other args: Blocksparse attention parameters
+
+        Returns:
+            Tuple of (shard_map_fn, call_args)
+        """
+        assert mesh is not None, "mesh must be provided for shard_map execution"
+        assert in_specs is not None, "in_specs must be provided for shard_map execution"
+        assert out_specs is not None, "out_specs must be provided for shard_map execution"
+
+        def _wrapped_blocksparse_attn(
+            query: Float[Array, "batch num_heads seq_len head_dim"],
+            key: Float[Array, "batch kv_num_heads kv_len head_dim"],
+            value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
+            q_segment_ids: Int[Array, "batch seq_len"] | None,
+            kv_segment_ids: Int[Array, "batch kv_len"] | None,
+            q_positions: Int[Array, "batch seq_len"] | None,
+            kv_positions: Int[Array, "batch kv_len"] | None,
+            softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None,
+            bias: Float[Array, "batch num_heads seq_len head_dim"] | None,
+            attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
+            | Bool[Array, "batch 1 seq_len kv_len"]
+            | Int[Array, "batch num_heads seq_len kv_len"]
+            | Int[Array, "batch 1 seq_len kv_len"]
+            | None,
+        ) -> Float[Array, "batch seq_len num_heads head_dim"]:
+            return self.run(
+                query=query,
+                key=key,
+                value=value,
+                q_segment_ids=q_segment_ids,
+                kv_segment_ids=kv_segment_ids,
+                q_positions=q_positions,
+                kv_positions=kv_positions,
+                softmax_aux=softmax_aux,
+                bias=bias,
+                attention_mask=attention_mask,
+                sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
+                logits_soft_cap=logits_soft_cap,
+                qkv_layouts=qkv_layouts,
+                softmax_scale=softmax_scale,
+                mask_builder=mask_builder,
+                sliding_window=sliding_window,
+                chunk_size=chunk_size,
+                causal=causal,
+                fused_backward=fused_backward,
+                platform=platform,
+                cfg=cfg or self.heuristic_cfg(None),
+            )
+
+        call_args = (
+            query,
+            key,
+            value,
+            q_segment_ids,
+            kv_segment_ids,
+            q_positions,
+            kv_positions,
+            softmax_aux,
+            bias,
+            attention_mask,
+        )
+
+        assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+
+        shard_map_fn = shard_map(
+            _wrapped_blocksparse_attn,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
+        )
+
+        return shard_map_fn, call_args
+
     def get_impl(self, cfg: BlockSparseAttentionConfig):
         """Get kernel implementation from registry based on configuration.
 
@@ -132,7 +250,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         | Int[Array, "batch 1 seq_len kv_len"]
         | None = None,
         sequence_parallelism_mesh_axis_name: str | None = None,
-        logit_soft_cap: float | None = None,
+        logits_soft_cap: float | None = None,
         qkv_layouts: tuple["SparseMask"] | None = None,
         softmax_scale: float | None = None,
         mask_builder: typing.Callable[[int, int, int, int, int], "Mask"]
@@ -155,7 +273,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             q_segment_ids: Segment IDs for queries to handle multiple sequences [batch, seq_len]
             kv_segment_ids: Segment IDs for keys/values [batch, kv_len]
             softmax_aux: Auxiliary values added to attention scores (e.g., for attention sinks)
-            logit_soft_cap: Optional soft cap value to bound attention logits
+            logits_soft_cap: Optional soft cap value to bound attention logits
             softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
             mask_builder: Function that builds the sparse mask pattern. Takes (q_idx, k_idx,
                 q_size, k_size, window_size) and returns a Mask object
@@ -195,7 +313,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             q_positions=q_positions,
             kv_positions=kv_positions,
             softmax_aux=softmax_aux,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             bias=bias,
             attention_mask=attention_mask,
             sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
@@ -355,11 +473,19 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
                 )
         return configs
 
+    candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
+    candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
+    candidate_cfgs_shard_map_xla = candidate_cfgs_xla
+
 
 _executor: Executor[BlockSparseAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=True,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("blocksparse"),
     ),
@@ -381,8 +507,10 @@ def blocksparse_attention(
     | Int[Array, "batch num_heads seq_len kv_len"]
     | Int[Array, "batch 1 seq_len kv_len"]
     | None = None,
+    /,
+    *,
     sequence_parallelism_mesh_axis_name: str | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,
     softmax_scale: float | None = None,
     mask_builder: typing.Callable[[int, int, int, int, int], "Mask"] | typing.Callable[[], "SparseMask"] | None = None,
@@ -391,8 +519,10 @@ def blocksparse_attention(
     causal: bool = True,
     fused_backward: bool = False,
     platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: BlockSparseAttentionConfig | None = None,
+    mesh: Mesh | None = None,
+    in_specs: tuple[PartitionSpec | None, ...] | None = None,
+    out_specs: PartitionSpec | None = None,
 ) -> Float[Array, "batch kv_num_heads kv_len vhead_dim"]:
     """Execute block-sparse attention with automatic optimization.
 
@@ -407,7 +537,7 @@ def blocksparse_attention(
         q_segment_ids: Optional segment IDs for queries [batch, seq_len]
         kv_segment_ids: Optional segment IDs for keys/values [batch, kv_len]
         softmax_aux: Optional auxiliary attention values (e.g., attention sinks)
-        logit_soft_cap: Optional soft capping for attention logits
+        logits_soft_cap: Optional soft capping for attention logits
         query_chunk_size: Query chunk size for block tiling (default: 128)
         key_chunk_size: Key chunk size for block tiling (default: 128)
         softmax_scale: Attention score scaling factor (default: 1/sqrt(head_dim))
@@ -418,6 +548,10 @@ def blocksparse_attention(
         causal: Apply causal masking (default: True)
         fused_backward: Use fused backward pass (default: False)
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        cfg: Optional configuration override
+        mesh: JAX device mesh for shard_map execution (optional)
+        in_specs: Input partition specs for shard_map (optional)
+        out_specs: Output partition spec for shard_map (optional)
 
     Returns:
         Attention output [batch, kv_num_heads, kv_len, vhead_dim]
@@ -452,6 +586,10 @@ def blocksparse_attention(
         - Scenarios where custom sparsity patterns are needed
     """
 
+    method = None
+    if mesh is not None and in_specs is not None and out_specs is not None:
+        method = "shard_map"
+
     return _executor(
         BlockSparseAttention(),
         query=query,
@@ -462,7 +600,7 @@ def blocksparse_attention(
         q_positions=q_positions,
         kv_positions=kv_positions,
         softmax_aux=softmax_aux,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         bias=bias,
         attention_mask=attention_mask,
         sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
@@ -474,5 +612,9 @@ def blocksparse_attention(
         causal=causal,
         fused_backward=fused_backward,
         platform=platform,
+        method=method,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
         _cfg=cfg,
     )

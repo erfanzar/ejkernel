@@ -46,8 +46,11 @@ Mathematical Foundation:
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
+from jax import shard_map
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -118,7 +121,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         sequence_end: Int[Array, "batch"],
         softmax_scale: float | None = None,
         sliding_window: tuple[int, int] | None = None,
-        logit_soft_cap: float | None = None,
+        logits_soft_cap: float | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
@@ -137,7 +140,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             sequence_end: End indices (exclusive) for valid KV range per sequence [batch]
             softmax_scale: Scaling factor for attention scores (default: 1.0)
             sliding_window: Optional (left, right) window sizes for local attention
-            logit_soft_cap: Optional soft cap to bound attention logits
+            logits_soft_cap: Optional soft cap to bound attention logits
             softmax_aux: Optional attention sink logits for improved long-context performance
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
             cfg: Kernel configuration object containing block_size parameter
@@ -171,7 +174,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             key=key,
             value=value,
             softmax_scale=softmax_scale,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             sliding_window=sliding_window,
             softmax_aux=softmax_aux,
             sequence_start=sequence_start,
@@ -233,11 +236,105 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
 
         return candidates
 
+    def create_shard_map_wrapper(
+        self,
+        query: Float[Array, "batch num_heads head_dim"],
+        key: Float[Array, "batch seq_len num_kv_heads head_dim"],
+        value: Float[Array, "batch seq_len num_kv_heads head_dim"],
+        sequence_start: Int[Array, "batch"],
+        sequence_end: Int[Array, "batch"],
+        softmax_scale: float | None = None,
+        sliding_window: tuple[int, int] | None = None,
+        logits_soft_cap: float | None = None,
+        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        *,
+        cfg: RaggedDecodeAttentionConfig | None = None,
+        mesh: Mesh | None = None,
+        in_specs: tuple[PartitionSpec, ...] | None = None,
+        out_specs: PartitionSpec | None = None,
+        check_vma: bool = False,
+    ):
+        """Create a shard_map wrapper for distributed execution.
+
+        Creates a wrapper function that applies shard_map to distribute the ragged decode attention
+        computation across devices according to the provided sharding specifications.
+
+        Args:
+            query: Query tensor [batch, num_heads, head_dim]
+            key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
+            value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
+            sequence_start: Start indices for valid KV range per sequence [batch]
+            sequence_end: End indices for valid KV range per sequence [batch]
+            softmax_scale: Scaling factor for attention scores
+            sliding_window: Optional (left, right) window sizes for local attention
+            logits_soft_cap: Optional soft cap to bound attention logits
+            softmax_aux: Optional attention sink logits
+            platform: Platform to use for execution
+            cfg: Configuration for the kernel
+            mesh: JAX mesh for distributed execution
+            in_specs: Partition specifications for input tensors
+            out_specs: Partition specifications for output tensor
+            check_vma: Whether to check for valid memory access patterns
+
+        Returns:
+            Tuple of (shard_map_fn, call_args) where shard_map_fn is the wrapped
+            function and call_args are the arguments to pass to it.
+        """
+        assert mesh is not None, "mesh must be provided for shard_map execution"
+        assert in_specs is not None, "in_specs must be provided for shard_map execution"
+        assert out_specs is not None, "out_specs must be provided for shard_map execution"
+
+        def _wrapper(
+            query,
+            key,
+            value,
+            sequence_start,
+            sequence_end,
+            softmax_aux,
+        ):
+            return self.run(
+                query=query,
+                key=key,
+                value=value,
+                sequence_start=sequence_start,
+                sequence_end=sequence_end,
+                softmax_scale=softmax_scale,
+                sliding_window=sliding_window,
+                logits_soft_cap=logits_soft_cap,
+                softmax_aux=softmax_aux,
+                platform=platform,
+                cfg=cfg or self.heuristic_cfg(None),
+            )
+
+        shard_map_fn = shard_map(
+            _wrapper,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=check_vma,
+        )
+
+        call_args = (
+            query,
+            key,
+            value,
+            sequence_start,
+            sequence_end,
+            softmax_aux,
+        )
+
+        return shard_map_fn, call_args
+
 
 _ragged_decode_attention_executor: Executor[RaggedDecodeAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=False),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=False,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("ragged-decode-attention"),
     )
@@ -250,12 +347,13 @@ def ragged_decode_attention(
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
+    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    /,
+    *,
     softmax_scale: float | None = None,
     sliding_window: tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    logits_soft_cap: float | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: RaggedDecodeAttentionConfig | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Execute ragged decode attention with automatic optimization.
@@ -271,7 +369,7 @@ def ragged_decode_attention(
         sequence_end: End index (exclusive) of valid KV range per sequence [batch]
         softmax_scale: Attention score scaling factor (default: 1.0)
         sliding_window: Optional (left, right) window sizes for local attention
-        logit_soft_cap: Optional soft cap for attention logits (improves stability)
+        logits_soft_cap: Optional soft cap for attention logits (improves stability)
         softmax_aux: Optional attention sink values for long-context handling
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
         cfg: Optional config override (block_size is set via cfg)
@@ -295,7 +393,7 @@ def ragged_decode_attention(
         >>>
         >>> out = ragged_decode_attention(
         ...     q, k, v, starts, ends,
-        ...     logit_soft_cap=50.0,
+        ...     logits_soft_cap=50.0,
         ...     softmax_scale=0.125
         ... )
         >>>
@@ -313,7 +411,7 @@ def ragged_decode_attention(
         key=key,
         value=value,
         softmax_scale=softmax_scale,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         sliding_window=sliding_window,
         softmax_aux=softmax_aux,
         sequence_start=sequence_start,

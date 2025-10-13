@@ -48,7 +48,7 @@ def _ring_flash_attention_bwd_tpu(
     dropout_rng,
     pdrop,
     sliding_window,
-    logit_soft_cap,
+    logits_soft_cap,
     attention_sink_size,
     policy,
     softmax_scale,
@@ -157,7 +157,7 @@ def _ring_flash_attention_bwd_tpu(
             residuals=(q, k, v, attn_bias_slice, segment_ids_slice, softmax_aux_res, o, lse_, m),
             do=g,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             attention_sink_size=attention_sink_size,
         )
         dq += dq_i
@@ -188,7 +188,7 @@ def _flash_attention_bwd(
     residuals,
     do,
     sliding_window=None,
-    logit_soft_cap=None,
+    logits_soft_cap=None,
     attention_sink_size=0,
 ):
     """VJP rule for FlashAttention."""
@@ -221,7 +221,7 @@ def _flash_attention_bwd(
         causal_block_size=causal_block_size,
         mask_value=DEFAULT_MASK_VALUE,
         sliding_window=sliding_window,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         attention_sink_size=attention_sink_size,
     )
 
@@ -245,7 +245,7 @@ def _flash_attention_bwd(
         causal_block_size=causal_block_size,
         mask_value=DEFAULT_MASK_VALUE,
         sliding_window=sliding_window,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         attention_sink_size=attention_sink_size,
     )
     return dq, dk, dv
@@ -277,7 +277,7 @@ def _flash_attention_dkv_kernel(
     block_q: int,
     block_k: int,
     sliding_window,
-    logit_soft_cap,
+    logits_soft_cap,
     attention_sink_size,
 ):
     _, _, block_q_major, _ = q_tile_ref.shape
@@ -316,10 +316,10 @@ def _flash_attention_dkv_kernel(
             if softmax_scale != 1.0:
                 capped_logits *= softmax_scale
 
-            if logit_soft_cap is not None:
-                capped_logits = capped_logits / logit_soft_cap
+            if logits_soft_cap is not None:
+                capped_logits = capped_logits / logits_soft_cap
                 capped_logits = jnp.tanh(capped_logits)
-                capped_logits = capped_logits * logit_soft_cap
+                capped_logits = capped_logits * logits_soft_cap
 
             mask = None
             if q_segment_ids_tile_ref is not None:
@@ -428,7 +428,7 @@ def _flash_attention_bwd_dkv(
     causal_block_size: int | None = None,
     mask_value: float = DEFAULT_MASK_VALUE,
     sliding_window=None,
-    logit_soft_cap=None,
+    logits_soft_cap=None,
     attention_sink_size=0,
 ):
     batch_size, num_heads, q_seq_len, head_dim = q.shape
@@ -599,7 +599,7 @@ def _flash_attention_bwd_dkv(
         mask_value=mask_value,
         q_seq_len=q_seq_len,
         sliding_window=sliding_window,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         attention_sink_size=attention_sink_size,
     )
     name_scope = f"flash_mha_bwd_dkv_{block_q_major=}_{block_q=}_{block_k_major=}_{block_k=}"
@@ -658,7 +658,7 @@ def _flash_attention_dq_kernel(
     kv_seq_len: int,
     block_k: int,
     sliding_window,
-    logit_soft_cap,
+    logits_soft_cap,
     attention_sink_size,
 ):
     _, _, block_k_major, _ = k_tile_ref.shape
@@ -693,10 +693,10 @@ def _flash_attention_dq_kernel(
         if softmax_scale != 1.0:
             capped_logits *= softmax_scale
 
-        if logit_soft_cap is not None:
-            capped_logits = capped_logits / logit_soft_cap
+        if logits_soft_cap is not None:
+            capped_logits = capped_logits / logits_soft_cap
             capped_logits = jnp.tanh(capped_logits)
-            capped_logits = capped_logits * logit_soft_cap
+            capped_logits = capped_logits * logits_soft_cap
 
         mask = None
         if q_segment_ids_tile_ref is not None:
@@ -813,7 +813,7 @@ def _flash_attention_bwd_dq(
     causal_block_size: int | None,
     mask_value: float,
     sliding_window=None,
-    logit_soft_cap=None,
+    logits_soft_cap=None,
     attention_sink_size=0,
 ):
     batch_size, num_heads, q_seq_len, head_dim = q.shape
@@ -972,7 +972,7 @@ def _flash_attention_bwd_dq(
         block_k=block_k,
         kv_seq_len=kv_seq_len,
         sliding_window=sliding_window,
-        logit_soft_cap=logit_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         attention_sink_size=attention_sink_size,
     )
     name_scope = f"flash_mha_bwd_dq_{block_q_major=}_{block_k_major=}_{block_k=}"

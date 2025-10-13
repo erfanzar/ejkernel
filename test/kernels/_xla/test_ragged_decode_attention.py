@@ -194,7 +194,7 @@ class TestLogitSoftCap:
             value=value,
             sequence_start=sequence_start,
             sequence_end=sequence_end,
-            logit_soft_cap=30.0,
+            logits_soft_cap=30.0,
         )
 
         assert output.shape == (batch, num_heads, head_dim)
@@ -218,7 +218,7 @@ class TestLogitSoftCap:
                 value=value,
                 sequence_start=sequence_start,
                 sequence_end=sequence_end,
-                logit_soft_cap=cap_value,
+                logits_soft_cap=cap_value,
             )
 
             assert output.shape == (batch, num_heads, head_dim)
@@ -331,7 +331,7 @@ class TestCombinedFeatures:
             sequence_end=sequence_end,
             softmax_scale=float(1.0 / jnp.sqrt(head_dim)),
             sliding_window=(256, 256),
-            logit_soft_cap=30.0,
+            logits_soft_cap=30.0,
             softmax_aux=softmax_aux,
         )
 
@@ -356,7 +356,7 @@ class TestCombinedFeatures:
             sequence_start=sequence_start,
             sequence_end=sequence_end,
             sliding_window=(128, 128),
-            logit_soft_cap=30.0,
+            logits_soft_cap=30.0,
         )
 
         assert output.shape == (batch, num_heads, head_dim)
@@ -408,7 +408,7 @@ class TestJITCompilation:
                 sequence_start=start,
                 sequence_end=end,
                 sliding_window=(128, 128),
-                logit_soft_cap=30.0,
+                logits_soft_cap=30.0,
                 softmax_aux=softmax_aux,
             )
 

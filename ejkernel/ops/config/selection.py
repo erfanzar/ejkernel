@@ -66,6 +66,7 @@ from typing import Generic, Literal, TypeVar
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import core as jcore
 from jax import tree_util as jtu
 
 from ..core import Invocation, Kernel, _get_platform_method
@@ -176,9 +177,12 @@ class Tuner(Generic[Cfg]):
         Returns:
             Average execution time per iteration in seconds
         """
-        kw_array = {k: v for k, v in kwargs.items() if isinstance(v, (jax.Array, np.ndarray))}
-        kw_static = {k: v for k, v in kwargs.items() if k not in kw_array}
 
+        def _is_arrayish(x) -> bool:
+            return isinstance(x, (jax.Array, np.ndarray)) or isinstance(x, jcore.Tracer)
+
+        kw_array = {k: v for k, v in kwargs.items() if _is_arrayish(v)}
+        kw_static = {k: v for k, v in kwargs.items() if k not in kw_array}
         kw_array_items = tuple(sorted(kw_array.items()))
         kw_array_keys = tuple(k for k, _ in kw_array_items)
         kw_array_vals = tuple(v for _, v in kw_array_items)
@@ -187,10 +191,33 @@ class Tuner(Generic[Cfg]):
         validate_bwd = bool(getattr(fn, "_ejk_validate_backward", False))
 
         def _block_all(x):
-            return jtu.tree_map(lambda t: t.block_until_ready() if hasattr(t, "block_until_ready") else t, x)
+            return jtu.tree_map(
+                lambda t: t.block_until_ready() if hasattr(t, "block_until_ready") else t,
+                x,
+            )
+
+        def _to_concrete(x):
+            if isinstance(x, (jax.Array, np.ndarray)):
+                return x
+
+            shape = getattr(x, "shape", None)
+            dtype = getattr(x, "dtype", None)
+            aval = getattr(x, "aval", None)
+            if (shape is None or dtype is None) and aval is not None:
+                shape = getattr(aval, "shape", None)
+                dtype = getattr(aval, "dtype", None)
+            if shape is not None and dtype is not None:
+                return jnp.zeros(shape, dtype)
+            try:
+                return jnp.asarray(x)
+            except Exception as e:
+                raise TypeError(f"Cannot convert argument to concrete array for autotune: {type(x)}") from e
+
+        args_conc = tuple(_to_concrete(a) for a in args)
+        kw_array_vals_conc = tuple(_to_concrete(v) for v in kw_array_vals)
 
         if validate_bwd:
-            flat_arrays = args + kw_array_vals
+            flat_arrays = args_conc + kw_array_vals_conc
 
             def is_diff_array(x):
                 try:
@@ -212,12 +239,12 @@ class Tuner(Generic[Cfg]):
                     call_kwargs.update(kw_static)
                     return fn(*pos_args, **call_kwargs)
 
-                c = jax.jit(core).lower(*(args + kw_array_vals)).compile()
+                c = jax.jit(core).lower(*(args_conc + kw_array_vals_conc)).compile()
                 for _ in range(self.warmup):
-                    _block_all(c(*(args + kw_array_vals)))
+                    _block_all(c(*(args_conc + kw_array_vals_conc)))
                 t0 = time.perf_counter()
                 for _ in range(self.iters):
-                    _block_all(c(*(args + kw_array_vals)))
+                    _block_all(c(*(args_conc + kw_array_vals_conc)))
                 return (time.perf_counter() - t0) / self.iters
 
             def loss(theta, nondiff):
@@ -253,12 +280,12 @@ class Tuner(Generic[Cfg]):
                 call_kwargs.update(kw_static)
                 return fn(*pos_args, **call_kwargs)
 
-            c = jax.jit(core).lower(*(args + kw_array_vals)).compile()
+            c = jax.jit(core).lower(*(args_conc + kw_array_vals_conc)).compile()
             for _ in range(self.warmup):
-                _block_all(c(*(args + kw_array_vals)))
+                _block_all(c(*(args_conc + kw_array_vals_conc)))
             t0 = time.perf_counter()
             for _ in range(self.iters):
-                _block_all(c(*(args + kw_array_vals)))
+                _block_all(c(*(args_conc + kw_array_vals_conc)))
             return (time.perf_counter() - t0) / self.iters
 
     def autotune(self, make_fn, args, kwargs, candidates: Iterable[Cfg]) -> Cfg:
@@ -382,12 +409,26 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                 return cfg
 
         if (cfg := self.cache.get(dev, op_id, call_key)) is not None:
-            self._emit("cache_hit", level="memory", device=dev, op_id=op_id, call_key=call_key, cfg=cfg)
+            self._emit(
+                "cache_hit",
+                level="memory",
+                device=dev,
+                op_id=op_id,
+                call_key=call_key,
+                cfg=cfg,
+            )
             return cfg
 
         if self.persistent is not None:
             if (cfg := self.persistent.get(dev, op_id, call_key)) is not None:
-                self._emit("cache_hit", level="persistent", device=dev, op_id=op_id, call_key=call_key, cfg=cfg)
+                self._emit(
+                    "cache_hit",
+                    level="persistent",
+                    device=dev,
+                    op_id=op_id,
+                    call_key=call_key,
+                    cfg=cfg,
+                )
 
                 self.cache.put(dev, op_id, call_key, cfg)
                 return cfg
@@ -397,7 +438,9 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                 raise RuntimeError(f"Re-autotune requested for {(dev, op_id, call_key)}")
 
             platform = get_device_platform()
-            candidate_cfgs_method = _get_platform_method(kernel, "candidate_cfgs", platform)
+            context = "shard_map" if inv.method == "shard_map" else None
+
+            candidate_cfgs_method = _get_platform_method(kernel, "candidate_cfgs", platform, context)
             if candidate_cfgs_method:
                 candidates = tuple(candidate_cfgs_method(inv))
             else:
@@ -410,38 +453,84 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                 call_key=call_key,
                 candidates=len(candidates),
                 platform=platform,
+                method=inv.method,
             )
 
             kw = dict(inv.kwargs)
+
+            def _is_arrayish(x) -> bool:
+                return isinstance(x, (jax.Array, np.ndarray)) or isinstance(x, jcore.Tracer)
+
             static_fun_kwargs = {k: v for k, v in kw.items() if callable(v)}
-            dyn_kwargs = {k: v for k, v in kw.items() if isinstance(v, (jax.Array, np.ndarray))}
+            dyn_kwargs = {k: v for k, v in kw.items() if _is_arrayish(v)}
 
-            run_method = _get_platform_method(kernel, "run", platform) or kernel.run
+            if inv.method == "shard_map":
+                if not hasattr(kernel, "create_shard_map_wrapper"):
+                    raise RuntimeError(
+                        f"Kernel {kernel.op_id} does not implement create_shard_map_wrapper for shard_map benchmarking"
+                    )
 
-            def mk(c, _run=run_method, _static=static_fun_kwargs):
-                def f(*a, **k):
-                    return _run(*a, cfg=c, **(k | _static))
+                def mk(c, _static=static_fun_kwargs):
+                    def f(*a, **k):
+                        shard_map_fn, call_args = kernel.create_shard_map_wrapper(
+                            *a,
+                            cfg=c,
+                            mesh=inv.mesh,
+                            in_specs=inv.in_specs,
+                            out_specs=inv.out_specs,
+                            check_vma=inv.check_vma,
+                            **(k | _static),
+                        )
+                        return shard_map_fn(*call_args)
 
-                if self.policy.validate_backward:
-                    f._ejk_validate_backward = True
-                return f
+                    if self.policy.validate_backward:
+                        f._ejk_validate_backward = True
+                    return f
+            else:
+                run_method = _get_platform_method(kernel, "run", platform, context) or kernel.run
+
+                def mk(c, _run=run_method, _static=static_fun_kwargs):
+                    def f(*a, **k):
+                        return _run(*a, cfg=c, **(k | _static))
+
+                    if self.policy.validate_backward:
+                        f._ejk_validate_backward = True
+                    return f
 
             best = self.tuner.autotune(mk, inv.args, dyn_kwargs, candidates)
             self._autotuned_keys.add((dev, op_id, call_key))
             self.cache.put(dev, op_id, call_key, best)
             if self.persistent is not None and self.persist_autotune:
                 self.persistent.put(dev, op_id, call_key, best)
-            self._emit("autotune_finish", device=dev, op_id=op_id, call_key=call_key, cfg=best, platform=platform)
+            self._emit(
+                "autotune_finish",
+                device=dev,
+                op_id=op_id,
+                call_key=call_key,
+                cfg=best,
+                platform=platform,
+                method=inv.method,
+            )
             return best
 
         if self.policy.allow_heuristics:
             platform = get_device_platform()
-            heuristic_cfg_method = _get_platform_method(kernel, "heuristic_cfg", platform)
+            context = "shard_map" if inv.method == "shard_map" else None
+
+            heuristic_cfg_method = _get_platform_method(kernel, "heuristic_cfg", platform, context)
             if heuristic_cfg_method:
                 cfg = heuristic_cfg_method(inv)
             else:
                 cfg = kernel.heuristic_cfg(inv)
-            self._emit("heuristics", device=dev, op_id=op_id, call_key=call_key, cfg=cfg, platform=platform)
+            self._emit(
+                "heuristics",
+                device=dev,
+                op_id=op_id,
+                call_key=call_key,
+                cfg=cfg,
+                platform=platform,
+                method=inv.method,
+            )
 
             self.cache.put(dev, op_id, call_key, cfg)
             if self.persistent is not None and self.persist_autotune:

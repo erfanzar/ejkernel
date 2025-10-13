@@ -55,7 +55,6 @@ class TestPageAttentionTPU:
         key_cache = jax.random.normal(k2, (num_kv_heads, num_blocks, block_size, head_dim), dtype=jnp.float32)
         value_cache = jax.random.normal(k3, (num_kv_heads, num_blocks, block_size, head_dim), dtype=jnp.float32)
 
-        # Create context lengths and block tables
         context_lens = jnp.array([256, 256, 128, 384], dtype=jnp.int32)
         block_tables = jnp.array(
             [
@@ -155,9 +154,9 @@ class TestPageAttentionTPU:
         head_dim = 128
 
         configs = [
-            (8, 2),  # 4:1 ratio
-            (16, 4),  # 4:1 ratio
-            (32, 8),  # 4:1 ratio
+            (8, 2),
+            (16, 4),
+            (32, 8),
         ]
 
         for num_q_heads, num_kv_heads in configs:
@@ -199,7 +198,6 @@ class TestPageAttentionTPU:
         key_cache = jax.random.normal(k2, (num_kv_heads, num_blocks, block_size, head_dim), dtype=jnp.float32)
         value_cache = jax.random.normal(k3, (num_kv_heads, num_blocks, block_size, head_dim), dtype=jnp.float32)
 
-        # Different lengths: 128, 256, 384, 512
         context_lens = jnp.array([128, 256, 384, 512], dtype=jnp.int32)
         block_tables = jnp.array(
             [
@@ -272,7 +270,6 @@ class TestPageAttentionTPU:
         key_cache = jax.random.normal(k2, (num_kv_heads, num_blocks, block_size, head_dim), dtype=jnp.float32)
         value_cache = jax.random.normal(k3, (num_kv_heads, num_blocks, block_size, head_dim), dtype=jnp.float32)
 
-        # Sequence 0: 256 tokens = 2 pages, Sequence 1: 512 tokens = 4 pages
         context_lens = jnp.array([256, 512], dtype=jnp.int32)
         block_tables = jnp.array([[0, 1, 0, 0], [2, 3, 4, 5]], dtype=jnp.int32)
 
@@ -313,12 +310,9 @@ class TestPageAttentionTPU:
         key_cache = jax.random.normal(k2, (num_kv_heads, num_blocks, block_size, head_dim), dtype=jnp.float32)
         value_cache = jax.random.normal(k3, (num_kv_heads, num_blocks, block_size, head_dim), dtype=jnp.float32)
 
-        # block_tables has shape [4, 3], so pages_per_sequence = 3
-        # pages_per_compute_block = 2, and 3 % 2 != 0, should raise error
         context_lens = jnp.array([128, 256, 128, 384], dtype=jnp.int32)
         block_tables = jnp.array([[0, 0, 0], [1, 2, 0], [3, 0, 0], [4, 5, 6]], dtype=jnp.int32)
 
-        # Test with pages_per_compute_block that doesn't divide pages_per_sequence
         with pytest.raises(ValueError, match="pages_per_compute_block must be divisible"):
             page_attention(
                 query=query,

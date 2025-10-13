@@ -61,10 +61,10 @@ class TestSoftCapComparison:
         k_f16 = k_f32.astype(jnp.float16)
         v_f16 = v_f32.astype(jnp.float16)
 
-        logit_soft_cap = 20.0
+        logits_soft_cap = 20.0
 
-        out_xla = flash_attention_xla(q_f32, k_f32, v_f32, logits_soft_cap=logit_soft_cap)
-        out_triton = flash_attention_triton(q_f16, k_f16, v_f16, logits_soft_cap=logit_soft_cap)
+        out_xla = flash_attention_xla(q_f32, k_f32, v_f32, logits_soft_cap=logits_soft_cap)
+        out_triton = flash_attention_triton(q_f16, k_f16, v_f16, logits_soft_cap=logits_soft_cap)
 
         assert jnp.allclose(out_xla, out_triton.astype(jnp.float32), rtol=2e-2, atol=1e-3)
 

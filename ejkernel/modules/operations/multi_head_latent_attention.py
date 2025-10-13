@@ -33,6 +33,7 @@ This is particularly beneficial for:
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 from jaxtyping import Array, Float, Int
@@ -213,7 +214,11 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
 _mla_executor: Executor[FlashMLAConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+        policy=AutotunePolicy(
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
+            validate_backward=True,
+        ),
         tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("mla"),
     )
@@ -227,11 +232,12 @@ def mla_attention(
     w_vc: Float[Array, "kv_lora_rank kv_heads head_dim"],
     b_q: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
     b_k: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    /,
+    *,
     softmax_scale: float | None = None,
     causal: bool = False,
-    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    *,
     cfg: FlashMLAConfig | None = None,
 ) -> Float[Array, "batch seq_len q_heads head_dim"]:
     """Execute flash multi-head latent attention with automatic optimization.

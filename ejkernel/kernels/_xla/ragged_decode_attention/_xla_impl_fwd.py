@@ -81,7 +81,7 @@ def create_attention_mask(
     return ragged_mask
 
 
-def apply_logit_soft_cap(scores: Float[Array, "... seq_len"], soft_cap: float) -> Float[Array, "... seq_len"]:
+def apply_logits_soft_cap(scores: Float[Array, "... seq_len"], soft_cap: float) -> Float[Array, "... seq_len"]:
     """Applies soft capping to attention logits.
 
     Args:
@@ -137,7 +137,7 @@ def flash_attention_block(
     carry: tuple[Array, Array, Array],
     block_inputs: tuple[Array, Array, Array, Array, int],
     softmax_scale: float,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     sink_scores: Array | None = None,
     num_sinks: int = 0,
 ) -> tuple[tuple[Array, Array, Array], None]:
@@ -147,7 +147,7 @@ def flash_attention_block(
         carry: Tuple of (output, max_logits, normalizer)
         block_inputs: Tuple of (queries, keys_block, values_block, mask_block, block_offset)
         softmax_scale: Scaling factor for attention
-        logit_soft_cap: Optional soft capping value
+        logits_soft_cap: Optional soft capping value
         sink_scores: Optional attention sink biases
         num_sinks: Number of sink tokens
 
@@ -168,8 +168,8 @@ def flash_attention_block(
 
     scores = jnp.einsum("...qhd,...khd->...qhk", q * softmax_scale, k_block)
 
-    if logit_soft_cap is not None:
-        scores = apply_logit_soft_cap(scores, logit_soft_cap)
+    if logits_soft_cap is not None:
+        scores = apply_logits_soft_cap(scores, logits_soft_cap)
 
     if sink_scores is not None and num_sinks > 0:
         scores = apply_attention_sinks_block(scores, sink_scores, num_sinks, block_offset)
@@ -211,7 +211,7 @@ def ragged_flash_attention_xla(
     softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "..."] | None = None,
 ) -> Float[Array, "batch q_len num_heads head_dim"]:
     """Enhanced XLA-compatible ragged flash attention with sliding window, soft cap, and sinks.
@@ -225,7 +225,7 @@ def ragged_flash_attention_xla(
         softmax_scale: Optional scaling factor for attention
         block_size: Size of blocks for chunked computation
         sliding_window: Optional (left, right) window for local attention
-        logit_soft_cap: Optional soft capping for logits
+        logits_soft_cap: Optional soft capping for logits
         softmax_aux: Optional attention sink biases [H, num_sinks] or [num_sinks]
 
     Returns:
@@ -287,7 +287,7 @@ def ragged_flash_attention_xla(
             carry,
             (query, k_block, v_block, m_block, block_offset),
             softmax_scale,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             sink_scores=sink_scores,
             num_sinks=num_sinks,
         )
@@ -306,7 +306,7 @@ def ragged_decode_mqa_xla(
     softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "..."] | None = None,
 ) -> Float[Array, "batch num_q_heads head_dim"]:
     """Enhanced XLA-compatible ragged MQA decoding.
@@ -320,7 +320,7 @@ def ragged_decode_mqa_xla(
         softmax_scale: Optional scaling factor
         block_size: Block size for computation
         sliding_window: Optional sliding window parameters
-        logit_soft_cap: Optional soft capping for logits
+        logits_soft_cap: Optional soft capping for logits
         softmax_aux: Optional attention sink biases
 
     Returns:
@@ -353,7 +353,7 @@ def ragged_decode_mqa_xla(
             softmax_scale=softmax_scale,
             block_size=block_size,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             softmax_aux=softmax_aux,
         )
 
@@ -365,7 +365,7 @@ def ragged_decode_mqa_xla(
     return outputs.reshape(batch_size, num_heads_q, head_dim)
 
 
-@ejit(static_argnames=["block_size", "softmax_scale", "logit_soft_cap", "sliding_window"])
+@ejit(static_argnames=["block_size", "softmax_scale", "logits_soft_cap", "sliding_window"])
 def inner_decode_xla(
     query: Float[Array, "batch num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -375,7 +375,7 @@ def inner_decode_xla(
     softmax_scale: float | None = None,
     block_size: int = 256,
     sliding_window: tuple[int, int] | None = None,
-    logit_soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "..."] | None = None,
 ) -> chex.Array:
     """Enhanced JIT-compiled XLA implementation of ragged MQA Flash Attention.
@@ -389,7 +389,7 @@ def inner_decode_xla(
         softmax_scale: Scaling factor for attention logits
         block_size: Block size for attention computation
         sliding_window: Optional (left, right) window for local attention
-        logit_soft_cap: Optional soft capping for logits (e.g., 50.0)
+        logits_soft_cap: Optional soft capping for logits (e.g., 50.0)
         softmax_aux: Optional attention sink biases [H, num_sinks] or [num_sinks]
                      First few tokens become "attention sinks" with learnable biases
 
@@ -409,7 +409,7 @@ def inner_decode_xla(
 
         output = inner_decode_xla(
             query, key, value, start, end,
-            logit_soft_cap=50.0
+            logits_soft_cap=50.0
         )
 
 
@@ -439,7 +439,7 @@ def inner_decode_xla(
             softmax_scale=softmax_scale,
             block_size=block_size,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             softmax_aux=softmax_aux,
         )
     else:
@@ -460,7 +460,7 @@ def inner_decode_xla(
             softmax_scale=softmax_scale,
             block_size=block_size,
             sliding_window=sliding_window,
-            logit_soft_cap=logit_soft_cap,
+            logits_soft_cap=logits_soft_cap,
             softmax_aux=softmax_aux,
         )
 
