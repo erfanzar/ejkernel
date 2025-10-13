@@ -199,8 +199,8 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
 _executor: Executor[AttentionConfig, tuple[Array, Array]] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
-        tuner=Tuner(warmup=5, iters=50),
+        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="heuristics", validate_backward=True),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("attention"),
     )
 )

@@ -256,18 +256,16 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         configs = []
         for chunk_q in [128, 256]:
             for chunk_k in [128, 256]:
-                for num_warps in [4, 8]:
-                    for num_stages in [2, 3]:
-                        configs.append(
-                            FlashAttentionConfig(
-                                chunk_size_q=chunk_q,
-                                chunk_size_k=chunk_k,
-                                num_warps=num_warps,
-                                num_stages=num_stages,
-                                platform="triton",
-                                backend="gpu",
-                            )
-                        )
+                configs.append(
+                    FlashAttentionConfig(
+                        chunk_size_q=chunk_q,
+                        chunk_size_k=chunk_k,
+                        num_warps=None,
+                        num_stages=None,
+                        platform="triton",
+                        backend="gpu",
+                    )
+                )
         return configs
 
     def candidate_cfgs_tpu(self, inv: Invocation[FlashAttentionConfig, Array]):
@@ -282,14 +280,14 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             Iterable of TPU-optimized candidate configurations
         """
         configs = []
-        for chunk_q in [256, 512]:
-            for chunk_k in [256, 512]:
+        for chunk_q in [128, 256, 512]:
+            for chunk_k in [128, 256, 512]:
                 configs.append(
                     FlashAttentionConfig(
                         chunk_size_q=chunk_q,
                         chunk_size_k=chunk_k,
-                        num_warps=4,
-                        num_stages=1,
+                        num_warps=None,
+                        num_stages=None,
                         platform="pallas",
                         backend="tpu",
                     )
@@ -314,8 +312,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
                     FlashAttentionConfig(
                         chunk_size_q=chunk_q,
                         chunk_size_k=chunk_k,
-                        num_warps=4,
-                        num_stages=2,
+                        num_warps=None,
+                        num_stages=None,
                         platform="xla",
                         backend="any",
                     )
@@ -327,7 +325,7 @@ _flash_executor: Executor[FlashAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
-        tuner=Tuner(warmup=5, iters=50),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("flash-attn"),
     )
 )

@@ -34,10 +34,10 @@ from ejkernel.ops import (
 from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
-from .configs import AttentionConfig
+from .configs import ScaledDotProductAttentionConfig
 
 
-class ScaledDotProductAttention(Kernel[AttentionConfig, Array]):
+class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
     """ScaledDotProductAttention with custom optimization logic.
 
     Supports causal masking, dropout, sliding windows, and variable-length sequences.
@@ -74,7 +74,7 @@ class ScaledDotProductAttention(Kernel[AttentionConfig, Array]):
         """Initialize  ScaledDotProductAttention module."""
         super().__init__(op_id="scaled_dot_product_attention")
 
-    def get_impl(self, cfg: AttentionConfig):
+    def get_impl(self, cfg: ScaledDotProductAttentionConfig):
         """Get kernel implementation from registry based on configuration.
 
         Args:
@@ -107,7 +107,7 @@ class ScaledDotProductAttention(Kernel[AttentionConfig, Array]):
         cum_seqlens_k: Int[Array, "batch"] | None = None,
         platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: AttentionConfig,
+        cfg: ScaledDotProductAttentionConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
         """Execute scaled_dot_product_attention with the given configuration.
 
@@ -135,11 +135,7 @@ class ScaledDotProductAttention(Kernel[AttentionConfig, Array]):
         """
 
         if platform is not None:
-            cfg = AttentionConfig(
-                block_q=cfg.block_q,
-                block_k=cfg.block_k,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
+            cfg = ScaledDotProductAttentionConfig(
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
@@ -160,28 +156,22 @@ class ScaledDotProductAttention(Kernel[AttentionConfig, Array]):
             cum_seqlens_k=cum_seqlens_k,
         )
 
-    def heuristic_cfg(self, inv: Invocation[AttentionConfig, Array]) -> AttentionConfig:
+    def heuristic_cfg(self, inv: Invocation[ScaledDotProductAttentionConfig, Array]) -> ScaledDotProductAttentionConfig:
         """Provide default configuration based on invocation context.
-
-        Selects optimal block sizes based on sequence length and head dimension.
 
         Args:
             inv: Invocation object with arguments and metadata
 
         Returns:
-            Default configuration with block sizes
+            Default configuration for platform/backend selection
         """
 
-        return AttentionConfig(
-            block_q=128,
-            block_k=128,
-            num_warps=4,
-            num_stages=2,
+        return ScaledDotProductAttentionConfig(
             platform="auto",
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[AttentionConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[ScaledDotProductAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         This operation uses XLA primitives directly without tunable block sizes,
@@ -201,11 +191,11 @@ class ScaledDotProductAttention(Kernel[AttentionConfig, Array]):
         return []
 
 
-_executor: Executor[AttentionConfig, Array] = Executor(
+_executor: Executor[ScaledDotProductAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
-        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
-        tuner=Tuner(warmup=5, iters=50),
+        policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="heuristics", validate_backward=True),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("sdpa"),
     )
 )

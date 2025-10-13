@@ -71,10 +71,10 @@ from ejkernel.ops import (
 from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
-from .configs import PageAttentionConfig
+from .configs import RaggedPageAttentionConfig
 
 
-class RaggedPageAttention(Kernel[PageAttentionConfig, Array]):
+class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
     """Ragged Page Attention with custom optimization logic.
 
     Combines ragged (variable-length) sequence processing with paged KV cache
@@ -108,7 +108,7 @@ class RaggedPageAttention(Kernel[PageAttentionConfig, Array]):
         """
         super().__init__(op_id="ragged_page_attention")
 
-    def get_impl(self, cfg: PageAttentionConfig):
+    def get_impl(self, cfg: RaggedPageAttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -139,11 +139,9 @@ class RaggedPageAttention(Kernel[PageAttentionConfig, Array]):
         sliding_window: int | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         mask_value: float | None = None,
-        num_kv_pages_per_block: int | None = None,
-        num_queries_per_block: int | None = None,
         vmem_limit_bytes: int | None = None,
         *,
-        cfg: PageAttentionConfig,
+        cfg: RaggedPageAttentionConfig,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
         """Execute ragged page attention over variable-length sequences.
 
@@ -168,11 +166,9 @@ class RaggedPageAttention(Kernel[PageAttentionConfig, Array]):
             sliding_window: Window size for local attention (None for full attention)
             softmax_aux: Optional attention sink logits for long-context handling
             mask_value: Value to use for masked positions (default: -inf)
-            num_kv_pages_per_block: Number of KV pages to process per compute block
-            num_queries_per_block: Number of queries to process per compute block
             vmem_limit_bytes: Memory limit for vector memory in bytes (TPU-specific)
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
-            cfg: Kernel configuration object
+            cfg: Kernel configuration object containing num_kv_pages_per_block and num_queries_per_block
 
         Returns:
             Attention output [total_tokens, num_q_heads, head_dim] in ragged format
@@ -192,10 +188,9 @@ class RaggedPageAttention(Kernel[PageAttentionConfig, Array]):
         """
 
         if platform is not None:
-            cfg = PageAttentionConfig(
-                block_q=cfg.block_q,
-                block_k=cfg.block_k,
-                block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
+            cfg = RaggedPageAttentionConfig(
+                num_kv_pages_per_block=cfg.num_kv_pages_per_block,
+                num_queries_per_block=cfg.num_queries_per_block,
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
@@ -216,12 +211,12 @@ class RaggedPageAttention(Kernel[PageAttentionConfig, Array]):
             sliding_window=sliding_window,
             softmax_aux=softmax_aux,
             mask_value=mask_value,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
+            num_kv_pages_per_block=cfg.num_kv_pages_per_block,
+            num_queries_per_block=cfg.num_queries_per_block,
             vmem_limit_bytes=vmem_limit_bytes,
         )
 
-    def heuristic_cfg(self, inv: Invocation[PageAttentionConfig, Array]) -> PageAttentionConfig:
+    def heuristic_cfg(self, inv: Invocation[RaggedPageAttentionConfig, Array]) -> RaggedPageAttentionConfig:
         """Provide default configuration optimized for ragged page attention.
 
         Args:
@@ -231,16 +226,16 @@ class RaggedPageAttention(Kernel[PageAttentionConfig, Array]):
             Default configuration with conservative block sizes suitable for
             typical ragged attention workloads with variable sequence lengths
         """
-        return PageAttentionConfig(
-            block_q=64,
-            block_k=64,
+        return RaggedPageAttentionConfig(
+            num_kv_pages_per_block=None,
+            num_queries_per_block=None,
             num_warps=4,
             num_stages=1,
             platform="auto",
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[PageAttentionConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[RaggedPageAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Creates configurations optimized for ragged attention scenarios with
@@ -257,14 +252,19 @@ class RaggedPageAttention(Kernel[PageAttentionConfig, Array]):
             lengths and the page size. Candidates are chosen to work well across
             common serving scenarios.
         """
-        block_configs = [(32, 64, 4, 1)]
+
+        block_configs = [
+            (None, None, None, None),
+            (1, 64, None, None),
+            (2, 128, None, None),
+        ]
 
         candidates = []
-        for block_q, block_k, num_warps, num_stages in block_configs:
+        for num_kv_pages, num_queries, num_warps, num_stages in block_configs:
             candidates.append(
-                PageAttentionConfig(
-                    block_q=block_q,
-                    block_k=block_k,
+                RaggedPageAttentionConfig(
+                    num_kv_pages_per_block=num_kv_pages,
+                    num_queries_per_block=num_queries,
                     num_warps=num_warps,
                     num_stages=num_stages,
                     platform="auto",
@@ -275,11 +275,11 @@ class RaggedPageAttention(Kernel[PageAttentionConfig, Array]):
         return candidates
 
 
-_ragged_page_attention_executor: Executor[PageAttentionConfig, Array] = Executor(
+_ragged_page_attention_executor: Executor[RaggedPageAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=False),
-        tuner=Tuner(warmup=5, iters=50),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("ragged-page-attention"),
     )
 )
@@ -299,12 +299,10 @@ def ragged_page_attention(
     sliding_window: int | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     mask_value: float | None = None,
-    num_kv_pages_per_block: int | None = None,
-    num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     *,
-    cfg: PageAttentionConfig | None = None,
+    cfg: RaggedPageAttentionConfig | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Execute ragged page attention with automatic optimization.
 
@@ -325,11 +323,9 @@ def ragged_page_attention(
         sliding_window: Sliding window size for local attention
         softmax_aux: Attention sink logits
         mask_value: Value for masked positions
-        num_kv_pages_per_block: Number of KV pages per compute block
-        num_queries_per_block: Number of queries per compute block
         vmem_limit_bytes: Memory limit in bytes
-
-            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        cfg: Optional config override (num_kv_pages_per_block and num_queries_per_block are set via cfg)
 
     Returns:
         Attention output [total_tokens, num_q_heads, head_dim]
@@ -371,8 +367,6 @@ def ragged_page_attention(
         sliding_window=sliding_window,
         softmax_aux=softmax_aux,
         mask_value=mask_value,
-        num_kv_pages_per_block=num_kv_pages_per_block,
-        num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
         platform=platform,
         _cfg=cfg,

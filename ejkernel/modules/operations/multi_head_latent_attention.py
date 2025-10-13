@@ -50,10 +50,10 @@ from ejkernel.ops import (
 from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
-from .configs import AttentionConfig
+from .configs import FlashMLAConfig
 
 
-class FlashMLA(Kernel[AttentionConfig, Array]):
+class FlashMLA(Kernel[FlashMLAConfig, Array]):
     """Flash Multi-head Latent Attention with custom optimization logic.
 
     Combines flash attention's memory efficiency with MLA's low-rank KV compression.
@@ -81,7 +81,7 @@ class FlashMLA(Kernel[AttentionConfig, Array]):
         """
         super().__init__(op_id="flash_mla")
 
-    def get_impl(self, cfg: AttentionConfig):
+    def get_impl(self, cfg: FlashMLAConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -109,7 +109,7 @@ class FlashMLA(Kernel[AttentionConfig, Array]):
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: AttentionConfig,
+        cfg: FlashMLAConfig,
     ) -> Float[Array, "batch seq_len q_heads head_dim"]:
         """Execute flash multi-head latent attention.
 
@@ -135,7 +135,7 @@ class FlashMLA(Kernel[AttentionConfig, Array]):
         """
 
         if platform is not None:
-            cfg = AttentionConfig(
+            cfg = FlashMLAConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 num_warps=cfg.num_warps,
@@ -156,7 +156,7 @@ class FlashMLA(Kernel[AttentionConfig, Array]):
             cu_seqlens=cu_seqlens,
         )
 
-    def heuristic_cfg(self, inv: Invocation[AttentionConfig, Array]) -> AttentionConfig:
+    def heuristic_cfg(self, inv: Invocation[FlashMLAConfig, Array]) -> AttentionConfig:
         """Provide default configuration with block sizes.
 
         Args:
@@ -166,7 +166,7 @@ class FlashMLA(Kernel[AttentionConfig, Array]):
             Default configuration optimized for MLA's low-rank decompression
             and on-the-fly reconstruction requirements
         """
-        return AttentionConfig(
+        return FlashMLAConfig(
             block_q=128,
             block_k=128,
             num_warps=4,
@@ -175,7 +175,7 @@ class FlashMLA(Kernel[AttentionConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[AttentionConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[FlashMLAConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Args:
@@ -197,7 +197,7 @@ class FlashMLA(Kernel[AttentionConfig, Array]):
         candidates = []
         for block_q, block_k, num_warps, num_stages in block_configs:
             candidates.append(
-                AttentionConfig(
+                FlashMLAConfig(
                     block_q=block_q,
                     block_k=block_k,
                     num_warps=num_warps,
@@ -210,11 +210,11 @@ class FlashMLA(Kernel[AttentionConfig, Array]):
         return candidates
 
 
-_mla_executor: Executor[AttentionConfig, Array] = Executor(
+_mla_executor: Executor[FlashMLAConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
-        tuner=Tuner(warmup=5, iters=50),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("mla"),
     )
 )
@@ -232,7 +232,7 @@ def mla_attention(
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     *,
-    cfg: AttentionConfig | None = None,
+    cfg: FlashMLAConfig | None = None,
 ) -> Float[Array, "batch seq_len q_heads head_dim"]:
     """Execute flash multi-head latent attention with automatic optimization.
 

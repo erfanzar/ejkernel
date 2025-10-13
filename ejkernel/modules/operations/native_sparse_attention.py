@@ -247,7 +247,7 @@ _sparse_executor: Executor[NativeSparseAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
-        tuner=Tuner(warmup=5, iters=50),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("nsa"),
     )
 )

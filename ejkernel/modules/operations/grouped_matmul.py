@@ -132,9 +132,9 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
 
         if platform is not None:
             cfg = GroupedMatmulConfig(
-                block_q=cfg.block_q,
+                block_m=cfg.block_m,
+                block_n=cfg.block_n,
                 block_k=cfg.block_k,
-                block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
@@ -157,9 +157,9 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
     def heuristic_cfg(self, inv: Invocation[GroupedMatmulConfig, Array]) -> GroupedMatmulConfig:
         """Provide default configuration with block sizes."""
         return GroupedMatmulConfig(
-            block_q=128,
+            block_m=128,
+            block_n=128,
             block_k=128,
-            block_d=128,
             num_warps=4,
             num_stages=2,
             platform="auto",
@@ -175,12 +175,12 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         ]
 
         candidates = []
-        for block_q, block_k, block_d, num_warps, num_stages in block_configs:
+        for block_m, block_n, block_k, num_warps, num_stages in block_configs:
             candidates.append(
                 GroupedMatmulConfig(
-                    block_q=block_q,
+                    block_m=block_m,
+                    block_n=block_n,
                     block_k=block_k,
-                    block_d=block_d,
                     num_warps=num_warps,
                     num_stages=num_stages,
                     platform="auto",
@@ -195,7 +195,7 @@ _grouped_matmul_executor: Executor[GroupedMatmulConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
-        tuner=Tuner(warmup=5, iters=50),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("grouped-matmul"),
     )
 )

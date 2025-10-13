@@ -182,9 +182,8 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
 
         if platform is not None:
             cfg = PageAttentionConfig(
-                block_q=cfg.block_q,
-                block_k=cfg.block_k,
-                block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
+                num_splits=cfg.num_splits,
+                pages_per_compute_block=cfg.pages_per_compute_block,
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
@@ -218,8 +217,8 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
             serving workloads with variable context lengths
         """
         return PageAttentionConfig(
-            block_q=64,
-            block_k=64,
+            num_splits=0,
+            pages_per_compute_block=None,
             num_warps=4,
             num_stages=1,
             platform="auto",
@@ -239,37 +238,17 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
             List of candidate configurations to benchmark during autotuning
 
         Note:
-            Page attention performance is sensitive to the ratio of context_len
-            to page_size and the number of sequences in the batch.
+            Page attention doesn't have tunable block sizes in the traditional sense.
+            The num_splits and pages_per_compute_block are auto-determined.
         """
-        block_configs = [
-            (32, 64, 4, 1),
-            (64, 64, 4, 1),
-            (64, 128, 8, 2),
-            (128, 128, 8, 2),
-        ]
-
-        candidates = []
-        for block_q, block_k, num_warps, num_stages in block_configs:
-            candidates.append(
-                PageAttentionConfig(
-                    block_q=block_q,
-                    block_k=block_k,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                    platform="auto",
-                    backend="any",
-                )
-            )
-
-        return candidates
+        return []
 
 
 _page_attention_executor: Executor[PageAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=False),
-        tuner=Tuner(warmup=5, iters=50),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("page-attention"),
     )
 )

@@ -215,3 +215,115 @@ class MeanPoolingConfig(BaseOperationConfig):
     block_size: int = 64
     num_warps: int = 4
     num_stages: int = 1
+
+
+@dataclass
+class RaggedDecodeAttentionConfig(BaseOperationConfig):
+    """Configuration for Ragged Decode Attention operation.
+
+    Args:
+        block_size: Block size for computation tiling (default: 256)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_size: int = 256
+    num_warps: int = 4
+    num_stages: int = 1
+
+
+@dataclass
+class RaggedPageAttentionConfig(BaseOperationConfig):
+    """Configuration for Ragged Page Attention operation.
+
+    Args:
+        num_kv_pages_per_block: Number of KV pages to process per compute block (default: None for auto)
+        num_queries_per_block: Number of queries to process per compute block (default: None for auto)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+
+@dataclass
+class GLAttentionConfig(BaseOperationConfig):
+    """Configuration for Gated Linear Attention operation.
+
+    Args:
+        block_q: Query block size (default: 64)
+        block_k: Key block size (default: 64)
+        block_d: Head dimension block size (default: 64)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 64
+    block_k: int = 64
+    block_d: int = 64
+    num_warps: int = 4
+    num_stages: int = 1
+
+
+@dataclass
+class LightningAttentionConfig(BaseOperationConfig):
+    """Configuration for Lightning Attention operation.
+
+    Args:
+        block_q: Query block size (default: 64)
+        block_k: Key block size (default: 64)
+        block_d: Head dimension block size (default: 64)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 64
+    block_k: int = 64
+    block_d: int = 64
+    num_warps: int = 4
+    num_stages: int = 1
+
+
+@dataclass
+class FlashMLAConfig(BaseOperationConfig):
+    """Configuration for Flash Multi-head Latent Attention operation.
+
+    Args:
+        block_q: Query block size (default: 128)
+        block_k: Key block size (default: 128)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 2)
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_q: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+
+
+@dataclass
+class ScaledDotProductAttentionConfig(BaseOperationConfig):
+    """Configuration for Scaled Dot Product Attention operation.
+
+    Note: This operation uses XLA primitives directly without tunable block sizes.
+    The config exists primarily for platform/backend selection.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    pass

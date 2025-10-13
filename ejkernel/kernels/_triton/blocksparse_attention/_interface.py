@@ -359,10 +359,10 @@ def blocksparse_attention(
     kv_positions: Int[Array, "batch kv_len"] | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
-    attention_mask: Bool[Array, "batch num_heads seq_len head_dim"]
-    | Bool[Array, "batch 1 seq_len head_dim"]
-    | Int[Array, "batch num_heads seq_len head_dim"]
-    | Int[Array, "batch 1 seq_len head_dim"]
+    attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
+    | Bool[Array, "batch 1 seq_len kv_len"]
+    | Int[Array, "batch num_heads seq_len kv_len"]
+    | Int[Array, "batch 1 seq_len kv_len"]
     | None = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
     logit_soft_cap: float | None = None,

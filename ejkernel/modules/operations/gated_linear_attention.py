@@ -43,10 +43,10 @@ from ejkernel.ops import (
 from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
-from .configs import RecurrentAttentionConfig
+from .configs import GLAttentionConfig
 
 
-class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
+class GLAttention(Kernel[GLAttentionConfig, Array]):
     """Gated Linear Attention with custom optimization logic.
 
     Implements gated linear attention combining the efficiency of linear attention
@@ -73,7 +73,7 @@ class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
         """
         super().__init__(op_id="gla")
 
-    def get_impl(self, cfg: RecurrentAttentionConfig):
+    def get_impl(self, cfg: GLAttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -102,7 +102,7 @@ class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
         return_state: bool = False,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: RecurrentAttentionConfig,
+        cfg: GLAttentionConfig,
     ) -> (
         Float[Array, "batch seq_len num_heads head_dim"]
         | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
@@ -134,7 +134,7 @@ class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
         """
 
         if platform is not None:
-            cfg = RecurrentAttentionConfig(
+            cfg = GLAttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 block_d=cfg.block_d,
@@ -164,7 +164,7 @@ class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
                 return result[0]
         return result
 
-    def heuristic_cfg(self, inv: Invocation[RecurrentAttentionConfig, Array]) -> RecurrentAttentionConfig:
+    def heuristic_cfg(self, inv: Invocation[GLAttentionConfig, Array]) -> GLAttentionConfig:
         """Provide default configuration with block sizes.
 
         Args:
@@ -174,7 +174,7 @@ class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
             Default configuration with conservative block sizes suitable for
             typical gated linear attention workloads
         """
-        return RecurrentAttentionConfig(
+        return GLAttentionConfig(
             block_q=64,
             block_k=64,
             block_d=64,
@@ -184,7 +184,7 @@ class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[RecurrentAttentionConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[GLAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Args:
@@ -202,7 +202,7 @@ class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
         candidates = []
         for block_q, block_k, block_d, num_warps, num_stages in block_configs:
             candidates.append(
-                RecurrentAttentionConfig(
+                GLAttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
                     block_d=block_d,
@@ -216,11 +216,11 @@ class GLAttention(Kernel[RecurrentAttentionConfig, Array]):
         return candidates
 
 
-_gla_executor: Executor[RecurrentAttentionConfig, Array] = Executor(
+_gla_executor: Executor[GLAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
-        tuner=Tuner(warmup=5, iters=50),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("gla"),
     )
 )
@@ -239,7 +239,7 @@ def gla_attention(
     return_state: bool = False,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     *,
-    cfg: RecurrentAttentionConfig | None = None,
+    cfg: GLAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads head_dim"]
     | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]

@@ -126,10 +126,10 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         kv_positions: Int[Array, "batch kv_len"] | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
-        attention_mask: Bool[Array, "batch num_heads seq_len head_dim"]
-        | Bool[Array, "batch 1 seq_len head_dim"]
-        | Int[Array, "batch num_heads seq_len head_dim"]
-        | Int[Array, "batch 1 seq_len head_dim"]
+        attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
+        | Bool[Array, "batch 1 seq_len kv_len"]
+        | Int[Array, "batch num_heads seq_len kv_len"]
+        | Int[Array, "batch 1 seq_len kv_len"]
         | None = None,
         sequence_parallelism_mesh_axis_name: str | None = None,
         logit_soft_cap: float | None = None,
@@ -311,16 +311,16 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             Iterable of TPU-optimized candidate configurations
         """
         configs = []
-        for q_block in [512, 1024]:
-            for kv_block in [512, 1024]:
+        for q_block in [128, 256, 512, 1024]:
+            for kv_block in [128, 256, 512, 1024]:
                 configs.append(
                     BlockSparseAttentionConfig(
                         q_blocksize=q_block,
                         kv_blocksize=kv_block,
-                        bwd_q_blocksize=q_block // 2,
-                        bwd_kv_blocksize=kv_block // 2,
-                        num_warps=4,
-                        num_stages=1,
+                        bwd_q_blocksize=min(q_block // 2, 128),
+                        bwd_kv_blocksize=min(kv_block // 2, 128),
+                        num_warps=None,
+                        num_stages=None,
                         platform="pallas",
                         backend="tpu",
                     )
@@ -360,7 +360,7 @@ _executor: Executor[BlockSparseAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
-        tuner=Tuner(warmup=5, iters=50),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("blocksparse"),
     ),
 )
@@ -376,10 +376,10 @@ def blocksparse_attention(
     kv_positions: Int[Array, "batch kv_len"] | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
-    attention_mask: Bool[Array, "batch num_heads seq_len head_dim"]
-    | Bool[Array, "batch 1 seq_len head_dim"]
-    | Int[Array, "batch num_heads seq_len head_dim"]
-    | Int[Array, "batch 1 seq_len head_dim"]
+    attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
+    | Bool[Array, "batch 1 seq_len kv_len"]
+    | Int[Array, "batch num_heads seq_len kv_len"]
+    | Int[Array, "batch 1 seq_len kv_len"]
     | None = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
     logit_soft_cap: float | None = None,

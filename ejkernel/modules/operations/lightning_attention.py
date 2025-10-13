@@ -43,10 +43,10 @@ from ejkernel.ops import (
 from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
-from .configs import RecurrentAttentionConfig
+from .configs import LightningAttentionConfig
 
 
-class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
+class LightningAttention(Kernel[LightningAttentionConfig, Array]):
     """Lightning Attention with custom optimization logic.
 
     Implements a layer-aware attention mechanism optimized for deep transformer
@@ -74,7 +74,7 @@ class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
         """
         super().__init__(op_id="lightning_attn")
 
-    def get_impl(self, cfg: RecurrentAttentionConfig):
+    def get_impl(self, cfg: LightningAttentionConfig):
         """Get kernel implementation from registry.
 
         Args:
@@ -103,7 +103,7 @@ class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
         return_state: bool = False,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
-        cfg: RecurrentAttentionConfig,
+        cfg: LightningAttentionConfig,
     ) -> (
         Float[Array, "batch seq_len num_heads head_dim"]
         | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
@@ -135,7 +135,7 @@ class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
         """
 
         if platform is not None:
-            cfg = RecurrentAttentionConfig(
+            cfg = LightningAttentionConfig(
                 block_q=cfg.block_q,
                 block_k=cfg.block_k,
                 block_d=cfg.block_d,
@@ -164,7 +164,7 @@ class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
                 return result[0]
         return result
 
-    def heuristic_cfg(self, inv: Invocation[RecurrentAttentionConfig, Array]) -> RecurrentAttentionConfig:
+    def heuristic_cfg(self, inv: Invocation[LightningAttentionConfig, Array]) -> LightningAttentionConfig:
         """Provide default configuration with block sizes.
 
         Args:
@@ -174,7 +174,7 @@ class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
             Default configuration with conservative block sizes suitable for
             typical lightning attention workloads across various layer depths
         """
-        return RecurrentAttentionConfig(
+        return LightningAttentionConfig(
             block_q=64,
             block_k=64,
             block_d=64,
@@ -184,7 +184,7 @@ class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[RecurrentAttentionConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[LightningAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Args:
@@ -206,7 +206,7 @@ class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
         candidates = []
         for block_q, block_k, block_d, num_warps, num_stages in block_configs:
             candidates.append(
-                RecurrentAttentionConfig(
+                LightningAttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
                     block_d=block_d,
@@ -220,11 +220,11 @@ class LightningAttention(Kernel[RecurrentAttentionConfig, Array]):
         return candidates
 
 
-_lightning_executor: Executor[RecurrentAttentionConfig, Array] = Executor(
+_lightning_executor: Executor[LightningAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
-        tuner=Tuner(warmup=5, iters=50),
+        tuner=Tuner(warmup=5, iters=100),
         persistent=PersistentCache("lightning-attention"),
     )
 )
@@ -243,7 +243,7 @@ def lightning_attention(
     return_state: bool = False,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     *,
-    cfg: RecurrentAttentionConfig | None = None,
+    cfg: LightningAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads head_dim"]
     | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]

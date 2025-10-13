@@ -69,11 +69,17 @@ from .configs import (
     AttentionConfig,
     BlockSparseAttentionConfig,
     FlashAttentionConfig,
+    FlashMLAConfig,
+    GLAttentionConfig,
     GroupedMatmulConfig,
+    LightningAttentionConfig,
     NativeSparseAttentionConfig,
     PageAttentionConfig,
+    RaggedDecodeAttentionConfig,
+    RaggedPageAttentionConfig,
     RecurrentAttentionConfig,
     RingAttentionConfig,
+    ScaledDotProductAttentionConfig,
 )
 from .flash_attention import FlashAttention, flash_attention
 from .gated_linear_attention import GLAttention, gla_attention
@@ -129,9 +135,15 @@ __all__ += (
     "AttentionConfig",
     "BlockSparseAttentionConfig",
     "FlashAttentionConfig",
+    "FlashMLAConfig",
+    "GLAttentionConfig",
     "GroupedMatmulConfig",
+    "LightningAttentionConfig",
     "NativeSparseAttentionConfig",
     "PageAttentionConfig",
+    "RaggedDecodeAttentionConfig",
+    "RaggedPageAttentionConfig",
     "RecurrentAttentionConfig",
     "RingAttentionConfig",
+    "ScaledDotProductAttentionConfig",
 )

@@ -186,10 +186,7 @@ class Tuner(Generic[Cfg]):
         validate_bwd = bool(getattr(fn, "_ejk_validate_backward", False))
 
         def _block_all(x):
-            return jtu.tree_map(
-                lambda t: t.block_until_ready() if hasattr(t, "block_until_ready") else t,
-                x,
-            )
+            return jtu.tree_map(lambda t: t.block_until_ready() if hasattr(t, "block_until_ready") else t, x)
 
         if validate_bwd:
             flat_arrays = args + kw_array_vals
@@ -214,7 +211,7 @@ class Tuner(Generic[Cfg]):
                     call_kwargs.update(kw_static)
                     return fn(*pos_args, **call_kwargs)
 
-                c = jax.jit(core)
+                c = jax.jit(core).lower(*(args + kw_array_vals)).compile()
                 for _ in range(self.warmup):
                     _block_all(c(*(args + kw_array_vals)))
                 t0 = time.perf_counter()
@@ -415,7 +412,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
 
             kw = dict(inv.kwargs)
             static_fun_kwargs = {k: v for k, v in kw.items() if callable(v)}
-            dyn_kwargs = {k: v for k, v in kw.items() if k not in static_fun_kwargs}
+            dyn_kwargs = {k: v for k, v in kw.items() if isinstance(v, (jax.Array, np.ndarray))}
 
             run_method = _get_platform_method(kernel, "run", platform) or kernel.run
 
