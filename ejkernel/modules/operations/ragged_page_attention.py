@@ -391,14 +391,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             common serving scenarios.
         """
 
-        block_configs = [
-            (None),
-            (1),
-            (2),
-            (4),
-            (8),
-            (16),
-        ]
+        block_configs = [(1), (2)]
 
         candidates = []
         for num_kv_pages in block_configs:

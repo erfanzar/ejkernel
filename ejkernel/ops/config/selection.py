@@ -164,15 +164,23 @@ class Tuner(Generic[Cfg]):
         self.warmup, self.iters = warmup, iters
 
     def measure(self, fn, *args, **kwargs) -> float:
-        """Measure the average execution time of a function over multiple iterations.
+        """Measure average execution time with optional backward validation.
 
-        Compiles the function with JAX and measures execution time with
-        proper warmup to ensure stable performance measurements.
+        Deep-flatten (args, kwargs) so only array-like leaves are dynamic:
+        - Arrays or JAX tracers become dynamic parameters to the jitted function.
+        - Everything else (dtype, strings, bools, callables, nested containers)
+          is captured as Python constants in the closure.
+        - Tracer-like arrays (e.g., ShardMapTracer, DynamicJaxprTracer) are converted
+          to concrete zeros of the same shape/dtype before compile and timing.
+        - If _ejk_validate_backward=True, we differentiate a scalar loss w.r.t.
+          float/complex array leaves only; others are treated as non-diff.
+        - If a kernel uses precompiled functions that can't be transformed, we fall back
+          to forward-only timing, and if needed, to non-jitted forward timing.
 
         Args:
-            fn: Function to measure
-            *args: Positional arguments for the function
-            **kwargs: Keyword arguments for the function
+            fn: Function to measure (possibly tagged with _ejk_validate_backward)
+            *args: Positional arguments
+            **kwargs: Keyword arguments
 
         Returns:
             Average execution time per iteration in seconds
@@ -181,25 +189,9 @@ class Tuner(Generic[Cfg]):
         def _is_arrayish(x) -> bool:
             return isinstance(x, (jax.Array, np.ndarray)) or isinstance(x, jcore.Tracer)
 
-        kw_array = {k: v for k, v in kwargs.items() if _is_arrayish(v)}
-        kw_static = {k: v for k, v in kwargs.items() if k not in kw_array}
-        kw_array_items = tuple(sorted(kw_array.items()))
-        kw_array_keys = tuple(k for k, _ in kw_array_items)
-        kw_array_vals = tuple(v for _, v in kw_array_items)
-
-        pos_len = len(args)
-        validate_bwd = bool(getattr(fn, "_ejk_validate_backward", False))
-
-        def _block_all(x):
-            return jtu.tree_map(
-                lambda t: t.block_until_ready() if hasattr(t, "block_until_ready") else t,
-                x,
-            )
-
         def _to_concrete(x):
             if isinstance(x, (jax.Array, np.ndarray)):
                 return x
-
             shape = getattr(x, "shape", None)
             dtype = getattr(x, "dtype", None)
             aval = getattr(x, "aval", None)
@@ -213,80 +205,104 @@ class Tuner(Generic[Cfg]):
             except Exception as e:
                 raise TypeError(f"Cannot convert argument to concrete array for autotune: {type(x)}") from e
 
-        args_conc = tuple(_to_concrete(a) for a in args)
-        kw_array_vals_conc = tuple(_to_concrete(v) for v in kw_array_vals)
+        def _block_all(x):
+            return jtu.tree_map(lambda t: t.block_until_ready() if hasattr(t, "block_until_ready") else t, x)
+
+        full_tree = (args, kwargs)
+        leaves, treedef = jtu.tree_flatten(full_tree)
+        is_arr = [_is_arrayish(x) for x in leaves]
+        const_leaves = [None if m else x for m, x in zip(is_arr, leaves, strict=False)]
+        arr_leaves = [x for m, x in zip(is_arr, leaves, strict=False) if m]
+
+        arr0 = tuple(_to_concrete(x) for x in arr_leaves)
+
+        def _restore_args_kwargs(array_leaves):
+            it = iter(array_leaves)
+            merged = [next(it) if m else v for m, v in zip(is_arr, const_leaves, strict=False)]
+            return jtu.tree_unflatten(treedef, merged)
+
+        validate_bwd = bool(getattr(fn, "_ejk_validate_backward", False))
+
+        def _time_forward(jitted: bool = True) -> float:
+            def core(*arrs):
+                (aa, kk) = _restore_args_kwargs(arrs)
+                return fn(*aa, **kk)
+
+            if jitted:
+                c = jax.jit(core).lower(*arr0).compile()
+                for _ in range(self.warmup):
+                    _block_all(c(*arr0))
+                t0 = time.perf_counter()
+                for _ in range(self.iters):
+                    _block_all(c(*arr0))
+                return (time.perf_counter() - t0) / self.iters
+            else:
+                for _ in range(self.warmup):
+                    _block_all(core(*arr0))
+                t0 = time.perf_counter()
+                for _ in range(self.iters):
+                    _block_all(core(*arr0))
+                return (time.perf_counter() - t0) / self.iters
 
         if validate_bwd:
-            flat_arrays = args_conc + kw_array_vals_conc
 
-            def is_diff_array(x):
+            def _is_diff(x):
                 try:
                     dt = np.dtype(getattr(x, "dtype", None))
                     return np.issubdtype(dt, np.inexact)
                 except Exception:
                     return False
 
-            diff_mask = tuple(is_diff_array(x) for x in flat_arrays)
-            diff_idx = tuple(i for i, m in enumerate(diff_mask) if m)
-            nondiff_idx = tuple(i for i, m in enumerate(diff_mask) if not m)
+            diff_mask = [_is_diff(x) for x in arr0]
+            has_diff = any(diff_mask)
 
-            if not diff_idx:
+            if not has_diff:
+                try:
+                    return _time_forward(jitted=True)
+                except Exception:
+                    return _time_forward(jitted=False)
 
-                def core(*flat):
-                    pos_args = flat[:pos_len]
-                    kw_vals = flat[pos_len:]
-                    call_kwargs = dict(zip(kw_array_keys, kw_vals, strict=True))
-                    call_kwargs.update(kw_static)
-                    return fn(*pos_args, **call_kwargs)
+            def _split(arrs):
+                theta, nondiff = [], []
+                for m, v in zip(diff_mask, arrs, strict=False):
+                    (theta if m else nondiff).append(v)
+                return tuple(theta), tuple(nondiff)
 
-                c = jax.jit(core).lower(*(args_conc + kw_array_vals_conc)).compile()
-                for _ in range(self.warmup):
-                    _block_all(c(*(args_conc + kw_array_vals_conc)))
-                t0 = time.perf_counter()
-                for _ in range(self.iters):
-                    _block_all(c(*(args_conc + kw_array_vals_conc)))
-                return (time.perf_counter() - t0) / self.iters
+            def _merge(theta, nondiff):
+                it_t, it_n = iter(theta), iter(nondiff)
+                out = [next(it_t) if m else next(it_n) for m in diff_mask]
+                return tuple(out)
 
             def loss(theta, nondiff):
-                it_theta = iter(theta)
-                it_nondiff = iter(nondiff)
-                merged = [next(it_theta) if m else next(it_nondiff) for m in diff_mask]
-                pos_args = tuple(merged[:pos_len])
-                kw_vals = tuple(merged[pos_len:])
-                call_kwargs = dict(zip(kw_array_keys, kw_vals, strict=True))
-                call_kwargs.update(kw_static)
-                y = fn(*pos_args, **call_kwargs)
+                arrs = _merge(theta, nondiff)
+                (aa, kk) = _restore_args_kwargs(arrs)
+                y = fn(*aa, **kk)
                 return jnp.sum(y)
 
-            grad_core = jax.jit(jax.grad(loss, argnums=0))
+            try:
+                grad_core = jax.jit(jax.grad(loss, argnums=0))
+                theta0, nondiff0 = _split(arr0)
+                c = grad_core.lower(theta0, nondiff0).compile()
+                for _ in range(self.warmup):
+                    _block_all(c(theta0, nondiff0))
+                t0 = time.perf_counter()
+                for _ in range(self.iters):
+                    _block_all(c(theta0, nondiff0))
+                return (time.perf_counter() - t0) / self.iters
+            except Exception as e:
+                msg = str(e)
+                if "Cannot apply JAX transformations" in msg or "lowered and compiled" in msg:
+                    try:
+                        return _time_forward(jitted=True)
+                    except Exception:
+                        return _time_forward(jitted=False)
 
-            theta0 = tuple(flat_arrays[i] for i in diff_idx)
-            nondiff0 = tuple(flat_arrays[i] for i in nondiff_idx)
+                raise
 
-            c = grad_core.lower(theta0, nondiff0).compile()
-            for _ in range(self.warmup):
-                _block_all(c(theta0, nondiff0))
-            t0 = time.perf_counter()
-            for _ in range(self.iters):
-                _block_all(c(theta0, nondiff0))
-            return (time.perf_counter() - t0) / self.iters
-
-        else:
-
-            def core(*flat):
-                pos_args = flat[:pos_len]
-                kw_vals = flat[pos_len:]
-                call_kwargs = dict(zip(kw_array_keys, kw_vals, strict=True))
-                call_kwargs.update(kw_static)
-                return fn(*pos_args, **call_kwargs)
-
-            c = jax.jit(core).lower(*(args_conc + kw_array_vals_conc)).compile()
-            for _ in range(self.warmup):
-                _block_all(c(*(args_conc + kw_array_vals_conc)))
-            t0 = time.perf_counter()
-            for _ in range(self.iters):
-                _block_all(c(*(args_conc + kw_array_vals_conc)))
-            return (time.perf_counter() - t0) / self.iters
+        try:
+            return _time_forward(jitted=True)
+        except Exception:
+            return _time_forward(jitted=False)
 
     def autotune(self, make_fn, args, kwargs, candidates: Iterable[Cfg]) -> Cfg:
         """Benchmark all candidate configurations and return the fastest one.
@@ -462,7 +478,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                 return isinstance(x, (jax.Array, np.ndarray)) or isinstance(x, jcore.Tracer)
 
             static_fun_kwargs = {k: v for k, v in kw.items() if callable(v)}
-            dyn_kwargs = {k: v for k, v in kw.items() if _is_arrayish(v)}
+            dyn_kwargs = kw
 
             if inv.method == "shard_map":
                 if not hasattr(kernel, "create_shard_map_wrapper"):

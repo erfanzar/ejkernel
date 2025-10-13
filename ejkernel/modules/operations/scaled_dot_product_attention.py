@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import typing
 
+import jax
+from jax import shard_map
 from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -156,6 +158,95 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
             cum_seqlens_k=cum_seqlens_k,
         )
 
+    def create_shard_map_wrapper(
+        self,
+        query: Float[Array, "batch seq_len num_q_heads head_dim"],
+        key: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        value: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        attention_mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
+        cum_seqlens_q: Int[Array, "batch"] | None = None,
+        cum_seqlens_k: Int[Array, "batch"] | None = None,
+        *,
+        mesh: jax.sharding.Mesh,
+        in_specs: tuple[jax.sharding.PartitionSpec, ...],
+        out_specs: jax.sharding.PartitionSpec,
+        check_vma: bool = False,
+        cfg: ScaledDotProductAttentionConfig,
+        init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+        sliding_window: int | tuple[int, int] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    ):
+        """Create a shard_map wrapper for distributed ScaledDotProductAttention execution.
+
+        Args:
+            query: Query tensor
+            key: Key tensor
+            value: Value tensor
+            attention_mask: Optional attention mask
+            bias: Optional attention bias
+            cum_seqlens_q: Cumulative sequence lengths for queries
+            cum_seqlens_k: Cumulative sequence lengths for keys
+            mesh: JAX mesh for distributed execution
+            in_specs: Partition specs for input tensors
+            out_specs: Partition spec for output tensor
+            check_vma: Whether to check for VMA
+            cfg: Configuration object
+            init_bias: Optional bias initialization function
+            softmax_scale: Scaling factor for attention scores
+            causal: Whether to apply causal masking
+            sliding_window: Window size for local attention
+
+        Returns:
+            Tuple of (shard_map function, call args)
+        """
+        impl = self.get_impl(cfg)
+
+        def _wrapped_sdpa(
+            query,
+            key,
+            value,
+            attention_mask,
+            bias,
+            cum_seqlens_q,
+            cum_seqlens_k,
+        ):
+            return impl(
+                query=query,
+                key=key,
+                value=value,
+                attention_mask=attention_mask,
+                bias=bias,
+                cum_seqlens_q=cum_seqlens_q,
+                cum_seqlens_k=cum_seqlens_k,
+                init_bias=init_bias,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                sliding_window=sliding_window,
+            )
+
+        call_args = (
+            query,
+            key,
+            value,
+            attention_mask,
+            bias,
+            cum_seqlens_q,
+            cum_seqlens_k,
+        )
+        assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+        shard_map_fn = shard_map(
+            _wrapped_sdpa,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
+        )
+
+        return shard_map_fn, call_args
+
     def heuristic_cfg(self, inv: Invocation[ScaledDotProductAttentionConfig, Array]) -> ScaledDotProductAttentionConfig:
         """Provide default configuration based on invocation context.
 
@@ -216,8 +307,11 @@ def scaled_dot_product_attention(
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
     platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    mesh: jax.sharding.Mesh | None = None,
+    in_specs: tuple[jax.sharding.PartitionSpec, ...] | None = None,
+    out_specs: jax.sharding.PartitionSpec | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    """Execute flash attention with automatic optimization.
+    """Execute scaled dot product attention with automatic optimization.
 
     Convenience function that uses a default executor and flash attention module.
 
@@ -235,6 +329,9 @@ def scaled_dot_product_attention(
         cum_seqlens_k: Cumulative sequence lengths for variable-length keys
         sliding_window: Window size for local attention (int or (left, right) tuple)
         logits_soft_cap: Optional soft cap value for logits
+        mesh: JAX device mesh for shard_map execution (optional)
+        in_specs: Input partition specs for shard_map (optional)
+        out_specs: Output partition spec for shard_map (optional)
 
     Returns:
         ScaledDotProductAttention output with same shape as query
@@ -250,6 +347,10 @@ def scaled_dot_product_attention(
         >>> out = scaled_dot_product_attention(query, key, value, cum_seqlens_q=cu_q, cum_seqlens_k=cu_k)
     """
 
+    method = None
+    if mesh is not None and in_specs is not None and out_specs is not None:
+        method = "shard_map"
+
     return _executor(
         ScaledDotProductAttention(),
         query=query,
@@ -264,4 +365,8 @@ def scaled_dot_product_attention(
         cum_seqlens_q=cum_seqlens_q,
         cum_seqlens_k=cum_seqlens_k,
         platform=platform,
+        method=method,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
     )
