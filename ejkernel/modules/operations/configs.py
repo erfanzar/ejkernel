@@ -23,7 +23,7 @@ and autotuning.
 from dataclasses import dataclass
 from typing import Literal
 
-from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
+from ejkernel.ops import BwdParams, FwdParams
 
 
 @dataclass
@@ -231,9 +231,11 @@ class RaggedDecodeAttentionConfig(BaseOperationConfig):
         backend: Backend specification (default: "any")
     """
 
-    block_size: int = 256
-    num_warps: int = 4
-    num_stages: int = 1
+    fwd_params: FwdParams | None = None
+
+    def __post_init__(self):
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
 
 
 @dataclass

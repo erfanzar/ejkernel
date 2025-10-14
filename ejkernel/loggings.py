@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Logging utilities for ejKernel with colored output and progress tracking.
+
+This module provides enhanced logging capabilities including:
+- Colored console output with level-specific formatting
+- Lazy logger initialization for multi-process JAX environments
+- Progress tracking with ETAs and progress bars
+- JAX profiler integration with Perfetto support
+
+The logging system automatically adjusts for distributed training scenarios,
+suppressing output from non-primary processes to avoid clutter.
+"""
+
 from __future__ import annotations
 
 import datetime
@@ -71,7 +83,24 @@ _LOGGING_LEVELS: dict[str, int] = {
 
 
 class ColorFormatter(logging.Formatter):
+    """Custom formatter that adds colors and timestamps to log messages.
+
+    This formatter applies ANSI color codes based on log level and formats
+    multi-line messages with proper indentation and timestamps.
+
+    Methods:
+        format: Formats a log record with colors and timestamps.
+    """
+
     def format(self, record: logging.LogRecord) -> str:
+        """Format a log record with colors and timestamp.
+
+        Args:
+            record: The log record to format.
+
+        Returns:
+            Formatted string with ANSI color codes and timestamp.
+        """
         orig_levelname = record.levelname
         color = LEVEL_COLORS.get(record.levelname, COLORS["RESET"])
         record.levelname = f"{color}{record.levelname:<8}{COLORS['RESET']}"
@@ -87,7 +116,28 @@ class ColorFormatter(logging.Formatter):
 
 
 class LazyLogger:
+    """Lazy-initialized logger that defers creation until first use.
+
+    This logger automatically adjusts its level in distributed JAX environments,
+    suppressing output from non-primary processes to avoid clutter. It provides
+    colored output and lazy initialization to avoid JAX runtime issues.
+
+    Attributes:
+        name: Logger name.
+        level: Current logging level.
+
+    Example:
+        >>> logger = LazyLogger("MyModule")
+        >>> logger.info("This message only appears on process 0")
+    """
+
     def __init__(self, name: str, level: int | None = None):
+        """Initialize a lazy logger.
+
+        Args:
+            name: Name for the logger.
+            level: Logging level (uses LOGGING_LEVEL_ED env var if None).
+        """
         if level is None:
             level = _LOGGING_LEVELS[os.getenv("LOGGING_LEVEL_ED", "INFO")]
         if isinstance(level, str):
@@ -99,13 +149,20 @@ class LazyLogger:
 
     @property
     def level(self):
+        """Get the current logging level."""
         return self._level
 
     @property
     def name(self):
+        """Get the logger name."""
         return self._name
 
     def _ensure_initialized(self) -> None:
+        """Initialize the underlying logger if not already done.
+
+        Automatically adjusts log level for distributed processes,
+        setting non-primary processes to WARNING level.
+        """
         if self._logger is not None:
             return
 
@@ -131,6 +188,17 @@ class LazyLogger:
         self._logger = logger
 
     def __getattr__(self, name: str) -> tp.Callable:
+        """Dynamically provide logging methods.
+
+        Args:
+            name: Method name to access (e.g., 'info', 'debug', 'error').
+
+        Returns:
+            Wrapped logging method that ensures initialization.
+
+        Raises:
+            AttributeError: If the requested attribute is not a logging method.
+        """
         if name in _LOGGING_LEVELS or name.upper() in _LOGGING_LEVELS or name in ("exception", "log"):
 
             @wraps(getattr(logging.Logger, name))
@@ -143,15 +211,22 @@ class LazyLogger:
 
 
 def get_logger(name: str, level: int | None = None) -> LazyLogger:
-    """
-    Function to create a lazy logger that only initializes when first used.
+    """Create a lazy logger that only initializes when first used.
+
+    This is the primary factory function for creating loggers in ejKernel.
+    The logger defers initialization to avoid JAX runtime issues and automatically
+    adjusts for distributed training scenarios.
 
     Args:
-        name (str): The name of the logger.
-        level (Optional[int]): The logging level. Defaults to environment variable LOGGING_LEVEL_ED or "INFO".
+        name: The name of the logger, typically the module name.
+        level: The logging level. Defaults to environment variable LOGGING_LEVEL_ED or "INFO".
 
     Returns:
-        LazyLogger: A lazy logger instance that initializes on first use.
+        A lazy logger instance that initializes on first use.
+
+    Example:
+        >>> logger = get_logger(__name__)
+        >>> logger.info("Module initialized")
     """
     return LazyLogger(name, level)
 
@@ -328,7 +403,10 @@ def create_step_profiler(
     from ejkernel.utils import barrier_sync
 
     class ProfilerState:
+        """State tracker for profiler lifecycle management."""
+
         def __init__(self):
+            """Initialize profiler state as inactive."""
             self.active = False
             self.completed = False
 

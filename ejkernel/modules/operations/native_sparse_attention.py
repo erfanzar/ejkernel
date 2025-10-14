@@ -155,7 +155,17 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         )
 
     def heuristic_cfg(self, inv: Invocation[NativeSparseAttentionConfig, Array]) -> NativeSparseAttentionConfig:
-        """Provide default configuration with block sizes."""
+        """Provide default configuration with block sizes.
+
+        Selects balanced block sizes that work well for typical sparse patterns.
+        The default configuration uses uniform block sizes for simplicity.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default configuration with block_size=64 for balanced performance
+        """
         return NativeSparseAttentionConfig(
             block_q=64,
             block_k=64,
@@ -168,7 +178,17 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         )
 
     def candidate_cfgs(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+        """Generate candidate configurations for autotuning.
+
+        Creates a basic set of candidates for platform-agnostic tuning.
+        Sparse attention benefits from consistent block sizes across dimensions.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List with single configuration using block_size=64 as baseline
+        """
         block_configs = [(64, 64, 64)]
 
         candidates = []
@@ -189,7 +209,18 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
-        """Generate GPU-optimized candidate configurations for autotuning."""
+        """Generate GPU-optimized candidate configurations for autotuning.
+
+        Creates configurations tailored for GPU execution with Triton backend.
+        Tests various block sizes (32, 64, 128) and warp counts (4, 8) to find
+        optimal configuration for the specific GPU architecture.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of GPU-specific configurations with varying block sizes and warps
+        """
         configs = []
 
         for block_size in [32, 64, 128]:
@@ -209,7 +240,17 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         return configs
 
     def candidate_cfgs_tpu(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
-        """Generate TPU-optimized candidate configurations for autotuning."""
+        """Generate TPU-optimized candidate configurations for autotuning.
+
+        Creates configurations tailored for TPU execution with Pallas backend.
+        TPUs prefer larger block sizes (64, 128) for better vectorization.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of TPU-specific configurations optimized for matrix units
+        """
         configs = []
         for block_size in [64, 128]:
             configs.append(
@@ -227,7 +268,18 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         return configs
 
     def candidate_cfgs_xla(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
-        """Generate XLA-optimized candidate configurations for autotuning."""
+        """Generate XLA-optimized candidate configurations for autotuning.
+
+        Creates configurations for XLA compiler backend. XLA handles optimization
+        internally, so we provide conservative block sizes that work well across
+        different hardware targets.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of XLA-compatible configurations with standard block sizes
+        """
         configs = []
         for block_size in [64, 128]:
             configs.append(

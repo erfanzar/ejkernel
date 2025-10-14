@@ -156,7 +156,18 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         )
 
     def heuristic_cfg(self, inv: Invocation[GroupedMatmulConfig, Array]) -> GroupedMatmulConfig:
-        """Provide default configuration with block sizes."""
+        """Provide default configuration with block sizes.
+
+        Selects balanced block sizes suitable for typical grouped matmul workloads.
+        The default 128x128x128 tiling provides good cache utilization for most
+        problem sizes.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default configuration with 128x128x128 blocks, 4 warps, 2 stages
+        """
         return GroupedMatmulConfig(
             block_m=128,
             block_n=128,
@@ -168,7 +179,23 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         )
 
     def candidate_cfgs(self, inv: Invocation[GroupedMatmulConfig, Array]):
-        """Generate candidate configurations for autotuning."""
+        """Generate candidate configurations for autotuning.
+
+        Creates configurations with different block sizes to explore the
+        performance space. Grouped matmul benefits from various tile sizes
+        depending on group size distribution and matrix dimensions.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            List of candidate configurations with block sizes from 64 to 256
+
+        Note:
+            - Smaller blocks (64x64) work better for many small groups
+            - Larger blocks (256x256) are efficient for fewer, larger groups
+            - The k dimension blocking affects memory bandwidth utilization
+        """
         block_configs = [
             (64, 64, 64, 4, 1),
             (128, 128, 128, 4, 2),

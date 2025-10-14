@@ -13,6 +13,20 @@
 # limitations under the License.
 
 
+"""Calling library for Triton and JAX interoperability.
+
+This module provides utilities for integrating Triton kernels with JAX,
+including JIT compilation decorators, type conversions, and helper functions
+for kernel development. It bridges the gap between Triton's GPU programming
+model and JAX's functional array programming paradigm.
+
+Key Components:
+    - ejit: Enhanced JIT decorator for JAX functions
+    - triton_call: Interface for calling Triton kernels from JAX
+    - Type conversion utilities for Triton/JAX compatibility
+    - Mathematical helper functions for kernel development
+"""
+
 from ._ejit import ejit
 from ._triton_call import get_triton_type, triton_call
 from ._utils import cdiv, next_power_of_2, strides_from_shape

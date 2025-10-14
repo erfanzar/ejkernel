@@ -13,6 +13,24 @@
 # limitations under the License.
 
 
+"""Utility functions for the callib module.
+
+This module provides common utility functions used across the callib package,
+including mathematical operations, array shape calculations, system utilities,
+and environment configuration helpers.
+
+Key Functions:
+    - cdiv: Ceiling division for integers and JAX arrays
+    - strides_from_shape: Calculate strides for contiguous arrays
+    - next_power_of_2: Find next power of 2
+    - get_cache_dir: Get platform-specific cache directory
+    - quiet: Context manager for suppressing output
+    - check_bool_flag: Parse boolean environment variables
+
+Protocols:
+    - ShapeDtype: Protocol for array-like objects with shape and dtype
+"""
+
 from __future__ import annotations
 
 import os

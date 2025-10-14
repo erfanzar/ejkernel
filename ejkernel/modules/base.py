@@ -45,6 +45,7 @@ from ..kernels._registry import Backend, Platform, kernel_registry
 def detect_platform(
     algorithm: str,
     platform: Platform | Literal["triton", "pallas", "cuda", "xla", "auto"] | None = "auto",
+    maybe_pallas: bool = False,
 ) -> Platform:
     """Detect the best platform for a given algorithm.
 
@@ -99,6 +100,10 @@ def detect_platform(
 
     specs = kernel_registry.list_implementations(algorithm)
     has_triton = any(spec.platform == Platform.TRITON for spec in specs)
+    has_pallas = any(spec.platform == Platform.PALLAS for spec in specs)
+
+    if has_pallas and jax_backend in ("gpu") and maybe_pallas:
+        return Platform.PALLAS
 
     if has_triton and jax_backend in ("gpu", "cuda"):
         return Platform.TRITON

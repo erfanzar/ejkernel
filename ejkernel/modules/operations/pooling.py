@@ -124,7 +124,18 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
         return impl(x=x, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
 
     def heuristic_cfg(self, inv: Invocation[MeanPoolingConfig, Array]) -> MeanPoolingConfig:
-        """Provide default configuration with block sizes."""
+        """Provide default configuration with block sizes.
+
+        Selects default block size and warp configuration based on typical
+        sequence pooling workloads. These defaults work well for most cases
+        but can be overridden via autotuning.
+
+        Args:
+            inv: Invocation object with arguments and metadata
+
+        Returns:
+            Default configuration with block_size=64, num_warps=4, num_stages=1
+        """
         return MeanPoolingConfig(
             block_size=64,
             num_warps=4,
@@ -136,7 +147,20 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
     def candidate_cfgs(self, inv: Invocation[MeanPoolingConfig, Array]):
         """Generate candidate configurations for autotuning.
 
-        Mean pooling has tunable block_size for chunked processing.
+        Mean pooling has tunable block_size for chunked processing. Generates
+        configurations with varying block sizes to find optimal performance
+        for the specific hardware and input dimensions.
+
+        Args:
+            inv: Invocation object with arguments and metadata
+
+        Returns:
+            List of candidate configurations with different block sizes (32, 64, 128)
+            and corresponding warp/stage configurations
+
+        Note:
+            Smaller block sizes (32) reduce memory usage but may have lower throughput.
+            Larger block sizes (128) improve throughput for large sequences.
         """
         block_configs = [
             (32, 4, 1),

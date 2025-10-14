@@ -13,7 +13,40 @@
 # limitations under the License.
 
 
-"""Flash Attention module with automatic optimization."""
+"""Flash Attention module with automatic optimization.
+
+This module implements Flash Attention, a memory-efficient attention mechanism
+that uses tiling and recomputation to achieve O(N) memory complexity instead
+of the standard O(N²) for sequence length N.
+
+Key features of Flash Attention:
+    - Memory-efficient: Uses tiling to process attention in blocks
+    - IO-aware: Minimizes HBM (high bandwidth memory) accesses
+    - Exact: Produces numerically identical results to standard attention
+    - Fast: Often faster than standard attention despite recomputation
+
+The algorithm works by:
+    1. Splitting Q, K, V into blocks along sequence dimension
+    2. Computing attention block-by-block with on-the-fly softmax
+    3. Using online softmax correction for numerical stability
+    4. Fusing operations to minimize memory transfers
+
+Supports:
+    - Causal and non-causal masking
+    - Variable sequence lengths via cumulative sequence lengths
+    - Dropout (during training)
+    - Sliding window attention
+    - Multi-query and grouped-query attention patterns
+    - Attention biasing and soft capping
+
+Mathematical formulation:
+    Standard: Attention(Q,K,V) = softmax(QK^T/√d)V
+    Flash: Same output, but computed in O(N) memory via tiling
+
+Reference:
+    FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness
+    (Dao et al., 2022) https://arxiv.org/abs/2205.14135
+"""
 
 from __future__ import annotations
 
@@ -29,15 +62,16 @@ from jaxtyping import Array, Bool, DTypeLike, Float, Int
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
+    BwdParams,
     ConfigCache,
     ConfigSelectorChain,
     Executor,
+    FwdParams,
     Invocation,
     Kernel,
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
-from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
 
 from ..base import detect_platform
 from .configs import FlashAttentionConfig

@@ -20,6 +20,7 @@ from jax import Array, lax
 from jaxtyping import Float, Int
 
 from ejkernel.callib import ejit
+from ejkernel.ops import FwdParams
 
 
 def create_attention_mask(
@@ -304,7 +305,7 @@ def ragged_decode_mqa_xla(
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
     softmax_scale: float | None = None,
-    block_size: int = 256,
+    fwd_params: FwdParams | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "..."] | None = None,
@@ -351,7 +352,7 @@ def ragged_decode_mqa_xla(
             sequence_start,
             sequence_end,
             softmax_scale=softmax_scale,
-            block_size=block_size,
+            block_size=fwd_params.kv_blocksize,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
             softmax_aux=softmax_aux,

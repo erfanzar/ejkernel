@@ -13,7 +13,26 @@
 # limitations under the License.
 
 
-"""ScaledDotProductAttention module with automatic optimization."""
+"""Scaled Dot Product Attention module with automatic optimization.
+
+This module implements the standard scaled dot-product attention mechanism,
+which is the fundamental building block of transformer architectures. It computes:
+
+    Attention(Q,K,V) = softmax((Q @ K^T) / sqrt(d_k)) @ V
+
+where Q, K, V are the query, key, and value matrices, and d_k is the key dimension.
+
+This implementation provides:
+    - Automatic platform selection (XLA, Triton, Pallas, CUDA)
+    - Support for various attention patterns (causal, sliding window)
+    - Variable-length sequence handling
+    - Distributed execution via shard_map
+    - Attention biasing and masking
+    - Numerical stability through soft capping
+
+Unlike FlashAttention which uses tiling for memory efficiency, this implementation
+relies on platform-specific optimizations (e.g., XLA's attention primitive).
+"""
 
 from __future__ import annotations
 
@@ -73,7 +92,11 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
     """
 
     def __init__(self):
-        """Initialize  ScaledDotProductAttention module."""
+        """Initialize ScaledDotProductAttention module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="scaled_dot_product_attention")
 
     def get_impl(self, cfg: ScaledDotProductAttentionConfig):
@@ -181,26 +204,37 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
     ):
         """Create a shard_map wrapper for distributed ScaledDotProductAttention execution.
 
+        Enables efficient distributed execution of attention across multiple devices
+        using JAX's shard_map functionality. This is particularly useful for model
+        parallelism and handling very large attention computations.
+
         Args:
-            query: Query tensor
-            key: Key tensor
-            value: Value tensor
-            attention_mask: Optional attention mask
-            bias: Optional attention bias
-            cum_seqlens_q: Cumulative sequence lengths for queries
-            cum_seqlens_k: Cumulative sequence lengths for keys
-            mesh: JAX mesh for distributed execution
-            in_specs: Partition specs for input tensors
-            out_specs: Partition spec for output tensor
-            check_vma: Whether to check for VMA
-            cfg: Configuration object
-            init_bias: Optional bias initialization function
+            query: Query tensor [batch, seq_len, num_q_heads, head_dim]
+            key: Key tensor [batch, kv_len, num_kv_heads, head_dim]
+            value: Value tensor [batch, kv_len, num_kv_heads, head_dim]
+            attention_mask: Optional attention mask [batch, 1, seq_len, kv_len]
+            bias: Optional attention bias [batch, num_heads, seq_len, kv_len]
+            cum_seqlens_q: Cumulative sequence lengths for queries [batch]
+            cum_seqlens_k: Cumulative sequence lengths for keys [batch]
+            mesh: JAX mesh defining device topology for distributed execution
+            in_specs: Partition specifications for each input tensor
+            out_specs: Partition specification for output tensor
+            check_vma: Whether to check for virtual memory access patterns
+            cfg: Configuration object specifying platform/backend
+            init_bias: Optional callable to initialize bias on-device
             softmax_scale: Scaling factor for attention scores
             causal: Whether to apply causal masking
             sliding_window: Window size for local attention
+            platform: Optional platform override
 
         Returns:
-            Tuple of (shard_map function, call args)
+            Tuple of (shard_map function, call args) where:
+                - shard_map function: Callable for distributed execution
+                - call args: Tuple of arguments to pass to the shard_map function
+
+        Note:
+            The shard_map wrapper handles device placement and communication
+            automatically based on the provided mesh and partition specs.
         """
         impl = self.get_impl(cfg)
 

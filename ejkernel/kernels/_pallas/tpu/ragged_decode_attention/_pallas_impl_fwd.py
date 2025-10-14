@@ -25,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Float, Int
 
 from ejkernel.callib import ejit
+from ejkernel.ops import FwdParams
 
 
 def get_mha_cost_estimate(shape_dtype):
@@ -187,7 +188,7 @@ def ragged_decode_mqa(
     return out
 
 
-@ejit(static_argnames=["block_size", "softmax_scale", "logits_soft_cap"])
+@ejit(static_argnames=["fwd_params", "softmax_scale", "logits_soft_cap"])
 def inner_decode_tpu(
     query: Float[Array, "batch num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -195,7 +196,7 @@ def inner_decode_tpu(
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
     softmax_scale: float | None = None,
-    block_size: int = 256,
+    fwd_params: FwdParams | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
@@ -235,7 +236,7 @@ def inner_decode_tpu(
     o = jax.vmap(
         functools.partial(
             ragged_decode_mqa,
-            block_size=block_size,
+            block_size=fwd_params.kv_blocksize,
             cost_estimate=cost_estimate,
             softmax_scale=softmax_scale,
         ),

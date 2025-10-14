@@ -20,6 +20,7 @@ import triton.language as tl
 from jax import Array
 
 from ejkernel.callib import next_power_of_2, triton_call
+from ejkernel.ops import FwdParams
 
 
 @triton.autotune(
@@ -241,7 +242,7 @@ def inner_decode_triton(
     sequence_start: Array,
     sequence_end: Array,
     softmax_scale: float | None = None,
-    block_size: int = 256,
+    fwd_params: FwdParams | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Array | None = None,
@@ -290,7 +291,7 @@ def inner_decode_triton(
             starts=sequence_start,
             ends=sequence_end,
             softmax_scale=(1.0 if softmax_scale is None else float(softmax_scale)),
-            block_size=int(block_size),
+            block_size=int(fwd_params.kv_blocksize),
             sliding_window=sliding_window,
             logits_soft_cap=(0.0 if logits_soft_cap is None else float(logits_soft_cap)),
             aux=aux_h,

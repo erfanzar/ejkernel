@@ -13,6 +13,41 @@
 # limitations under the License.
 
 
+"""Kernel implementations for various platforms and backends.
+
+This module provides a unified interface to kernel implementations across
+different hardware platforms (GPU, TPU) and implementation frameworks
+(Triton, Pallas, XLA, CUDA).
+
+The kernel system supports:
+- Multi-platform implementations with automatic selection
+- Priority-based kernel selection
+- Hardware-specific optimizations
+- Unified API across different backends
+
+Submodules:
+    cuda: CUDA-specific kernel implementations
+    pallas: Pallas kernel implementations for TPU/GPU
+    triton: Triton kernel implementations for GPU
+    xla: XLA-based kernel implementations
+
+Key Components:
+    Backend: Enumeration of supported hardware backends
+    Platform: Enumeration of supported implementation platforms
+    kernel_registry: Central registry for kernel registration and lookup
+
+Example:
+    >>> from ejkernel.kernels import kernel_registry, Platform, Backend
+    >>>
+    >>> kernel = kernel_registry.get(
+    ...     "flash_attention",
+    ...     platform=Platform.TRITON,
+    ...     backend=Backend.GPU
+    ... )
+    >>>
+    >>> output = kernel(query, key, value)
+"""
+
 from . import _cuda as cuda
 from . import _pallas as pallas
 from . import _triton as triton

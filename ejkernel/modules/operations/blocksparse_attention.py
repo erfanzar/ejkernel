@@ -38,15 +38,16 @@ from jaxtyping import Array, Bool, Float, Int
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
+    BwdParams,
     ConfigCache,
     ConfigSelectorChain,
     Executor,
+    FwdParams,
     Invocation,
     Kernel,
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
-from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
 
 from ..base import detect_platform
 from .configs import BlockSparseAttentionConfig
@@ -436,15 +437,15 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             return int(base * stage_factor * fudge)
 
         if head_dim <= 64:
-            q_opts = [32, 64, 96, 128]
+            q_opts = [32, 64, 128]
         elif head_dim <= 128:
-            q_opts = [32, 64, 128, 192]
+            q_opts = [32, 64, 128]
         elif head_dim <= 192:
-            q_opts = [32, 64, 96, 128]
+            q_opts = [32, 64, 128]
         else:
-            q_opts = [32, 48, 64, 96]
+            q_opts = [32, 64, 96]
 
-        base_kv = [32, 64, 96, 128, 192, 256]
+        base_kv = [32, 64, 128, 256]
         if win is not None:
             target = max(32, min(256, 1 << (int(math.log2(max(32, win))) if win > 0 else 5)))
             kv_opts = sorted(set([32, 64, min(96, target), min(128, target), min(192, target), min(256, target)]))

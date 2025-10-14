@@ -24,7 +24,7 @@ from jaxtyping import Array, Bool, Float, Int
 from triton import Config
 
 from ejkernel.callib import triton_call
-from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
+from ejkernel.ops import BwdParams, FwdParams
 from ejkernel.utils import dtype_index, get_strides
 
 from ._utilities import (

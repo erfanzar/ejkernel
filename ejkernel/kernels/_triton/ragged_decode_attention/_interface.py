@@ -15,8 +15,9 @@
 
 import jaxtyping
 from beartype import beartype
-from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Array, Float, Int
+
+from ejkernel.ops import FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_fwd import inner_decode_triton
@@ -31,7 +32,7 @@ def ragged_decode_attention(
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
     softmax_scale: float | None = None,
-    block_size: int = 256,
+    fwd_params: FwdParams | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
@@ -67,7 +68,7 @@ def ragged_decode_attention(
         sequence_start=sequence_start,
         sequence_end=sequence_end,
         softmax_scale=softmax_scale,
-        block_size=block_size,
+        fwd_params=fwd_params,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
         softmax_aux=softmax_aux,

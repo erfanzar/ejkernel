@@ -46,9 +46,11 @@ Mathematical Foundation:
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Literal
 
+from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
@@ -59,6 +61,7 @@ from ejkernel.ops import (
     ConfigCache,
     ConfigSelectorChain,
     Executor,
+    FwdParams,
     Invocation,
     Kernel,
     Tuner,
@@ -109,7 +112,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         Raises:
             ValueError: If no matching implementation is found for the configuration
         """
-        platform = detect_platform("ragged_decode_attention", cfg.platform)
+        platform = detect_platform("ragged_decode_attention", cfg.platform, maybe_pallas=True)
         return kernel_registry.get("ragged_decode_attention", platform=platform, backend=cfg.backend)
 
     def run(
@@ -162,9 +165,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
 
         if platform is not None:
             cfg = RaggedDecodeAttentionConfig(
-                block_size=cfg.block_size,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
+                fwd_params=cfg.fwd_params,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
@@ -179,7 +180,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             softmax_aux=softmax_aux,
             sequence_start=sequence_start,
             sequence_end=sequence_end,
-            block_size=cfg.block_size,
+            fwd_params=cfg.fwd_params,
         )
 
     def heuristic_cfg(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]) -> RaggedDecodeAttentionConfig:
@@ -193,12 +194,172 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             typical decode scenarios (small query sizes, variable KV lengths)
         """
         return RaggedDecodeAttentionConfig(
-            block_size=256,
-            num_warps=4,
-            num_stages=1,
+            fwd_params=FwdParams(
+                blocksize_heads=16,
+                num_key_splits=16,
+                kv_blocksize=128,
+                num_warps=4,
+                num_stages=2,
+            ),
             platform="auto",
             backend="any",
         )
+
+    def candidate_cfgs_gpu(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]):
+        """GPU/Triton candidates for ragged decode attention (bigger blocks + higher warps).
+
+        - Explores kv_blocksize up to 256 (when split_len allows)
+        - Tries blocksize_heads in {4, 8, 16} if grouped-heads permit
+        - Warps up to 8 (depending on kv_block/head_dim)
+        - Stages in {1, 2, 3} (kept low; smem-guarded)
+        - Prefers split_len near {128, 256, 512}; ensures split_len % kv_blocksize == 0
+        """
+        q = inv.kwargs["query"]  # [B, Hq, Dh]
+        k = inv.kwargs["key"]  # [B, K, Hk, Dh]
+        v = inv.kwargs["value"]  # [B, K, Hk, Dh]
+
+        seq_len = int(k.shape[1])
+        num_q_heads = int(q.shape[1])
+        num_kv_heads = int(k.shape[2])
+        head_dim = int(q.shape[-1])
+        dtype = q.dtype
+
+        assert num_kv_heads == int(v.shape[2])
+        assert head_dim == int(k.shape[-1]) == int(v.shape[-1])
+        assert num_q_heads % num_kv_heads == 0, "q_heads must be divisible by kv_heads"
+
+        grouped_heads = num_q_heads // num_kv_heads  # heads per KV group processed by kernel
+
+        # Preferred split lengths (small first for one-iteration blocks)
+        preferred_split_lens = (64, 128, 256, 512)
+
+        def best_splits(n: int, targets=preferred_split_lens, min_len=32, max_len=8192):
+            # Returns list of (num_key_splits, split_len) sorted by proximity to targets
+            divs = set()
+            r = int(math.sqrt(n))
+            for d in range(1, r + 1):
+                if n % d == 0:
+                    divs.add(d)
+                    divs.add(n // d)
+            valid = []
+            for s in sorted(divs):
+                sl = n // s
+                if min_len <= sl <= max_len:
+                    valid.append((s, sl))
+
+            def score(sl):
+                return min(abs(sl - t) for t in targets)
+
+            valid.sort(key=lambda x: (score(x[1]), -x[1]))
+            return valid
+
+        split_candidates = best_splits(seq_len)
+
+        # Head tile options: prefer 4 (your best), expand to 8 if possible.
+        head_opts = [h for h in (4, 8) if h <= grouped_heads] or [min(grouped_heads, 4)]
+
+        # kv block candidates, prefer 64; include 128 (and 96 if split_len wants it)
+        kv_block_opts = [64, 128, 96]
+
+        # SMEM guard (conservative)
+        smem_limit = int(os.getenv("EJKERNEL_TRITON_SMEM_LIMIT", str(99 * 1024)))  # ~99 KiB
+        elem_bytes = 2 if dtype in (jnp.float16, jnp.bfloat16) else 4
+
+        def next_pow2_ge(x, min_val=16):
+            return max(min_val, 1 << math.ceil(math.log2(max(1, x))))
+
+        block_headdim = next_pow2_ge(head_dim, 16)
+
+        def smem_est_bytes(block_heads: int, block_k: int, num_stages: int) -> int:
+            # K/V tiles + small Q piece, staging buffer factor, and fudge
+            kv_bytes = 2 * block_k * block_headdim * elem_bytes
+            q_bytes = int(0.25 * block_heads * block_headdim * elem_bytes)
+            stage_factor = 1.0 + 0.5 * max(0, num_stages - 2)
+            fudge = 2.5
+            return int((kv_bytes + q_bytes) * stage_factor * fudge)
+
+        # Schedules: keep stages low; warps up to 8 only if head_dim large
+        def warp_options(block_heads: int, block_k: int) -> list[int]:
+            opts = [2, 4]
+            if head_dim >= 128 or block_k >= 128:
+                opts.append(8)
+            return opts
+
+        def stage_options(block_k: int) -> list[int]:
+            # 1 is great for 64; try 2 for 128
+            return [1] if block_k <= 64 else [1, 2]
+
+        # Seeds (biased by your best): try to hit split_len=64 first if divisible,
+        # otherwise the top few split candidates.
+        seeds = []
+        if seq_len % 64 == 0:
+            seeds.append((seq_len // 64, 64))
+        for s, sl in split_candidates[:6]:
+            if (s, sl) not in seeds:
+                seeds.append((s, sl))
+
+        max_candidates = int(os.getenv("EJKERNEL_RDA_MAX_CANDIDATES", "32"))
+        configs: list[RaggedDecodeAttentionConfig] = []
+        seen = set()
+
+        def try_add(H, K, s, sl):
+            # Ensure divisibility
+            if K > sl or sl % K != 0:
+                return False
+            for W in warp_options(H, K):
+                for S in stage_options(K):
+                    if smem_est_bytes(H, K, S) > smem_limit:
+                        continue
+                    key = (H, K, s, W, S)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    configs.append(
+                        RaggedDecodeAttentionConfig(
+                            fwd_params=FwdParams(
+                                blocksize_heads=H,
+                                num_key_splits=s,
+                                kv_blocksize=K,
+                                num_warps=W,
+                                num_stages=S,
+                            ),
+                            platform="pallas",
+                            backend="gpu",
+                        )
+                    )
+                    if len(configs) >= max_candidates:
+                        return True
+            return False
+
+        # 1) Strong seeds: blocksize_heads=4, kv=64 around top splits (including your best path)
+        for s, sl in seeds:
+            if try_add(4 if 4 in head_opts else head_opts[0], 64, s, sl):
+                return configs
+
+        # 2) Neighborhood: H in head_opts, K in {64, 128, 96} over seeds
+        for s, sl in seeds:
+            for H in head_opts:
+                for K in kv_block_opts:
+                    if try_add(H, K, s, sl):
+                        return configs
+
+        # 3) Broader grid (limited breadth): scan more splits
+        for s, sl in split_candidates[:12]:
+            for H in head_opts:
+                for K in kv_block_opts:
+                    if try_add(H, K, s, sl):
+                        return configs
+
+        # Fallback (shouldn't hit)
+        if not configs:
+            H = min(4, grouped_heads) if grouped_heads >= 4 else grouped_heads
+            s = max(1, seq_len // 64)
+            s = s if seq_len % s == 0 else 1
+            sl = seq_len // s
+            K = 64 if sl % 64 == 0 else (32 if sl % 32 == 0 else 16)
+            try_add(H, K, s, sl)
+
+        return configs
 
     def candidate_cfgs(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
@@ -226,9 +387,13 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         for block_size, num_warps, num_stages in block_configs:
             candidates.append(
                 RaggedDecodeAttentionConfig(
-                    block_size=block_size,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
+                    fwd_params=FwdParams(
+                        blocksize_heads=16,
+                        num_key_splits=16,
+                        kv_blocksize=block_size,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                    ),
                     platform="auto",
                     backend="any",
                 )
@@ -312,7 +477,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             mesh=mesh,
             in_specs=in_specs,
             out_specs=out_specs,
-            check_rep=check_vma,
+            check_vma=check_vma,
         )
 
         call_args = (
@@ -336,13 +501,13 @@ _ragged_decode_attention_executor: Executor[RaggedDecodeAttentionConfig, Array] 
             validate_backward=False,
         ),
         tuner=Tuner(warmup=5, iters=100),
-        persistent=PersistentCache("ragged-decode-attention"),
+        persistent=PersistentCache("ragged-decode-attention", cfg_type=RaggedDecodeAttentionConfig),
     )
 )
 
 
 def ragged_decode_attention(
-    query: Float[Array, "batch num_heads head_dim"],
+    query: Float[Array, "batch num_heads head_dim"] | Float[Array, "batch 1 num_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     sequence_start: Int[Array, "batch"],
@@ -355,6 +520,9 @@ def ragged_decode_attention(
     logits_soft_cap: float | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: RaggedDecodeAttentionConfig | None = None,
+    mesh: Mesh | None = None,
+    in_specs: tuple[PartitionSpec | None, ...] | None = None,
+    out_specs: PartitionSpec | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Execute ragged decode attention with automatic optimization.
 
@@ -405,7 +573,14 @@ def ragged_decode_attention(
         (typically batch_size) and KV length varies per sequence. For prefill phase
         with large queries, consider using standard flash_attention instead.
     """
-    return _ragged_decode_attention_executor(
+
+    method = None
+    if mesh is not None and in_specs is not None and out_specs is not None:
+        method = "shard_map"
+    was4d = query.ndim == 4
+    if was4d:
+        query = query[:, -1, :, :]
+    out = _ragged_decode_attention_executor(
         RaggedDecodeAttention(),
         query=query,
         key=key,
@@ -417,5 +592,12 @@ def ragged_decode_attention(
         sequence_start=sequence_start,
         sequence_end=sequence_end,
         platform=platform,
+        method=method,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
         _cfg=cfg,
     )
+    if was4d:
+        out = jnp.expand_dims(out, 1)
+    return out

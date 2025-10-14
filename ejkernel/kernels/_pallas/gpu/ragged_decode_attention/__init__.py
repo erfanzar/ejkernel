@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-from .ragged_decode_attention import ragged_decode_attention
-from .scaled_dot_product_attention import scaled_dot_product_attention
+from ._interface import ragged_decode_attention
 
-__all__ = ("ragged_decode_attention", "scaled_dot_product_attention")
+__all__ = ("ragged_decode_attention",)

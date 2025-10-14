@@ -18,15 +18,69 @@
 from __future__ import annotations
 
 import inspect
+import re
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 import jax
 
 F = TypeVar("F", bound=Callable)
+
+
+def _normalize_type_string(type_annotation: Any) -> str:
+    """Normalize type annotation string for comparison.
+
+    Handles cases where the same type is imported differently:
+    - 'jaxtyping.Float' -> 'Float'
+    - 'ejkernel.ops.utils.datacarrier.FwdParams' -> 'FwdParams'
+
+    Args:
+        type_annotation: The type annotation to normalize
+
+    Returns:
+        Normalized string representation of the type
+    """
+    if type_annotation is inspect._empty:
+        return "inspect._empty"
+
+    type_str = str(type_annotation)
+
+    type_str = re.sub(r"<class '(.+)'>", r"\1", type_str)
+
+    type_str = re.sub(r"\bjaxtyping\.", "", type_str)
+
+    type_str = re.sub(r"\bejkernel\.[\w\.]+\.(\w+)", r"\1", type_str)
+
+    return type_str
+
+
+def _types_are_equivalent(type1: Any, type2: Any) -> bool:
+    """Check if two type annotations are equivalent.
+
+    This handles cases where the same type might be imported differently
+    in different modules, e.g., 'Float' vs 'jaxtyping.Float'.
+
+    Args:
+        type1: First type annotation
+        type2: Second type annotation
+
+    Returns:
+        True if types are equivalent, False otherwise
+    """
+
+    if type1 is inspect._empty and type2 is inspect._empty:
+        return True
+
+    if (type1 is inspect._empty) != (type2 is inspect._empty):
+        return False
+
+    normalized1 = _normalize_type_string(type1)
+    normalized2 = _normalize_type_string(type2)
+
+    return normalized1 == normalized2
 
 
 class Platform(str, Enum):
@@ -306,7 +360,7 @@ class KernelRegistry:
                     )
                     all_match = False
 
-                if str(ref_param.annotation) != str(param.annotation):
+                if not _types_are_equivalent(ref_param.annotation, param.annotation):
                     warnings.warn(
                         f"Signature mismatch for algorithm '{algorithm}' parameter '{ref_param.name}':\n"
                         f"  Reference ({reference_spec.platform}/{reference_spec.backend}): "

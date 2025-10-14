@@ -333,7 +333,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
             mesh=mesh,
             in_specs=in_specs,
             out_specs=out_specs,
-            check_rep=check_vma,
+            check_vma=check_vma,
         )
 
         call_args = (

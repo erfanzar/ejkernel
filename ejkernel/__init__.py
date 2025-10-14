@@ -13,6 +13,31 @@
 # limitations under the License.
 
 
+"""ejKernel: High-performance kernel library for JAX.
+
+This module provides a comprehensive collection of optimized kernels for various
+deep learning operations, with support for multiple backends (XLA, Triton, Pallas)
+and platforms (TPU, GPU). The library focuses on efficient attention mechanisms,
+matrix operations, and other performance-critical computations.
+
+Key Features:
+    - Multi-backend support (XLA, Triton, Pallas) for optimal performance
+    - Platform-specific optimizations for TPU and GPU
+    - Extensive collection of attention mechanisms (Flash, Sparse, Ring, etc.)
+    - Automatic kernel selection and registration
+    - Modular architecture for easy extension
+
+Example:
+    >>> import ejkernel
+    >>> from ejkernel import Backend, Platform
+    >>>
+    >>> kernel = ejkernel.kernel_registry.get_kernel(
+    ...     name="flash_attention",
+    ...     backend=Backend.TRITON,
+    ...     platform=Platform.GPU
+    ... )
+"""
+
 __version__ = "0.1.0"
 
 from . import kernels, modules

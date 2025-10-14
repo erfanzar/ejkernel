@@ -13,6 +13,16 @@
 # limitations under the License.
 
 
+"""Utility functions for ejKernel library.
+
+This module provides a comprehensive collection of utility functions for kernel
+development, including mathematical operations, array manipulation, hardware
+detection, performance testing, and distributed synchronization utilities.
+
+The utilities are designed to support both Triton and JAX-based kernel implementations
+with focus on GPU architectures (CDNA, RDNA) and distributed training scenarios.
+"""
+
 import functools
 import typing as tp
 from typing import Literal, overload
@@ -84,6 +94,15 @@ def strides_from_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def get_stride(shape: tuple[int, ...] | jax.Array, index=0) -> int:
+    """Get the stride at a specific dimension index.
+
+    Args:
+        shape: Shape of the array or the array itself.
+        index: The dimension index to get the stride for. Defaults to 0.
+
+    Returns:
+        The stride value at the specified index.
+    """
     return get_strides(shape)[index]
 
 
@@ -115,8 +134,33 @@ def safe_autotune(
     warmup=None,
     rep=None,
 ) -> tp.Callable[[F], F]:
-    """
-    Applies `triton.autotune` safely. Falls back to the original function if autotuning fails.
+    """Safely apply Triton autotuning with fallback on failure.
+
+    Wraps a function with Triton's autotuning capability, gracefully falling back
+    to the original function if autotuning fails. This ensures kernel execution
+    continues even if autotuning encounters issues.
+
+    Args:
+        configs: List of triton.Config objects to test during autotuning.
+        key: List of argument names whose values define the autotuning key.
+        prune_configs_by: Optional dict mapping metric names to pruning functions.
+        reset_to_zero: List of argument names to reset to zero between runs.
+        restore_value: List of argument names to restore after autotuning.
+        pre_hook: Optional function to call before each autotuning run.
+        post_hook: Optional function to call after each autotuning run.
+        warmup: Number of warmup runs before measuring performance.
+        rep: Number of repetitions for each configuration.
+
+    Returns:
+        A decorator that applies autotuning to the wrapped function.
+
+    Example:
+        >>> @safe_autotune(
+        ...     configs=[triton.Config({'BLOCK_SIZE': 128})],
+        ...     key=['n_elements']
+        ... )
+        ... def kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        ...     pass
     """
     try:
         from triton.runtime.autotuner import Autotuner
@@ -150,6 +194,23 @@ def safe_autotune(
 
 
 def dtype_index(x: jnp.array) -> int:
+    """Get numeric index for array dtype.
+
+    Maps JAX array dtypes to numeric indices for use in kernel dispatch
+    and configuration.
+
+    Args:
+        x: JAX array whose dtype to index.
+
+    Returns:
+        Integer index corresponding to the dtype:
+            1 for float16
+            2 for bfloat16
+            3 for float32
+
+    Raises:
+        ValueError: If the dtype is not supported.
+    """
     if x.dtype == jnp.float16:
         return 1
     if x.dtype == jnp.bfloat16:
@@ -191,12 +252,44 @@ def get_strides(shape: tuple[int, ...] | jax.Array) -> tuple[int, ...]:
 
 
 def get_padded_headsize(size):
+    """Calculate padded head size for optimal memory alignment.
+
+    Rounds up the head size to the next power of 2 with a minimum of 16
+    for better memory access patterns in attention kernels.
+
+    Args:
+        size: Original head size.
+
+    Returns:
+        Padded head size as the next power of 2, minimum 16.
+
+    Example:
+        >>> get_padded_headsize(13)
+        >>> get_padded_headsize(20)
+    """
     padded_d_model = 1 << (size - 1).bit_length()
     padded_d_model = max(padded_d_model, 16)
     return padded_d_model
 
 
 def kw_strides(x: Array | None, *stride_names: str):
+    """Generate stride keyword arguments for kernel calls.
+
+    Creates a dictionary mapping stride names to their corresponding values
+    for use as keyword arguments in kernel invocations.
+
+    Args:
+        x: JAX array to get strides from, or None for zero strides.
+        *stride_names: Names for each dimension's stride.
+
+    Returns:
+        Dictionary mapping "stride_{name}" to stride values.
+
+    Example:
+        >>> arr = jnp.ones((2, 3, 4))
+        >>> kw_strides(arr, 'batch', 'seq', 'head')
+        {'stride_batch': 12, 'stride_seq': 4, 'stride_head': 1}
+    """
     if x is None:
         return {f"stride_{s}": 0 for i, s in enumerate(stride_names)}
 
@@ -205,12 +298,40 @@ def kw_strides(x: Array | None, *stride_names: str):
 
 
 def narrow(x, dim: int, start: int, length: int):
+    """Narrow a tensor along a specific dimension.
+
+    Extracts a contiguous slice of length `length` starting at `start`
+    along the specified dimension, similar to PyTorch's narrow operation.
+
+    Args:
+        x: Input array to narrow.
+        dim: Dimension along which to narrow.
+        start: Starting index of the slice.
+        length: Length of the slice to extract.
+
+    Returns:
+        Narrowed array with reduced size along the specified dimension.
+
+    Example:
+        >>> x = jnp.arange(20).reshape(4, 5)
+        >>> narrow(x, dim=1, start=1, length=3).shape
+        (4, 3)
+    """
     slices = [slice(None)] * x.ndim
     slices[dim] = slice(start, start + length)
     return x[tuple(slices)]
 
 
 def get_input_shapes():
+    """Generate test input shapes for benchmarking and testing.
+
+    Creates a list of input shape configurations with varying batch sizes
+    and sequence lengths for comprehensive kernel testing.
+
+    Returns:
+        List of tuples containing (batch, ?, seq_len, ?, ?, ?) dimensions
+        for testing various input configurations.
+    """
     cases = [(max(1, 2 ** (16 - i)), 1, 2**i, 16, 1, 128) for i in range(8, 18)] + [
         (max(1, 2 ** (16 - i)), 1, 2**i, 16, 2, 128) for i in range(8, 18)
     ]
@@ -219,6 +340,11 @@ def get_input_shapes():
 
 @functools.cache
 def is_hip():
+    """Check if running on AMD HIP backend.
+
+    Returns:
+        True if the current Triton target uses HIP backend, False otherwise.
+    """
     try:
         return triton.runtime.driver.active.get_current_target().backend == "hip"
     except Exception:
@@ -227,6 +353,13 @@ def is_hip():
 
 @functools.cache
 def is_cdna():
+    """Check if running on AMD CDNA architecture.
+
+    CDNA (Compute DNA) architectures include MI100, MI200 series GPUs.
+
+    Returns:
+        True if running on CDNA architecture (gfx940, gfx941, etc.), False otherwise.
+    """
     try:
         return is_hip() and triton.runtime.driver.active.get_current_target().arch in CDNA_ARCHS
     except Exception:
@@ -235,6 +368,13 @@ def is_cdna():
 
 @functools.cache
 def is_rdna():
+    """Check if running on AMD RDNA architecture.
+
+    RDNA (Radeon DNA) architectures include RX 6000, 7000 series GPUs.
+
+    Returns:
+        True if running on RDNA architecture (gfx1030, gfx1100, etc.), False otherwise.
+    """
     try:
         return is_hip() and triton.runtime.driver.active.get_current_target().arch in RDNA_ARCHS
     except Exception:
@@ -242,6 +382,26 @@ def is_rdna():
 
 
 def calculate_blocksize_and_wraps(n):
+    """Calculate optimal block size and number of warps for Triton kernels.
+
+    Determines the appropriate block size (as power of 2) and number of warps
+    based on the input size, with architecture-specific adjustments for HIP.
+
+    Args:
+        n: Input size to calculate block configuration for.
+
+    Returns:
+        Tuple of (block_size, num_warps) optimized for the input size.
+
+    Raises:
+        RuntimeError: If the required block size exceeds MAX_FUSED_SIZE (65536).
+
+    Example:
+        >>> calculate_blocksize_and_wraps(1024)
+        (1024, 4)
+        >>> calculate_blocksize_and_wraps(10000)
+        (16384, 16)
+    """
     MAX_FUSED_SIZE = 65536
     BLOCK_SIZE = triton.next_power_of_2(n)
     if BLOCK_SIZE > MAX_FUSED_SIZE:
@@ -257,6 +417,27 @@ def calculate_blocksize_and_wraps(n):
 
 
 def numeric_gen(*shape, dtype: str | jnp.dtype = jnp.float16, method: str = "normal"):
+    """Generate random numeric arrays for testing and debugging.
+
+    Creates random arrays using JAX's random number generation with a global
+    debug RNG state for reproducibility.
+
+    Args:
+        *shape: Dimensions of the array to generate.
+        dtype: Data type of the generated array. Defaults to float16.
+        method: Random generation method from jax.random. Defaults to "normal".
+
+    Returns:
+        Random JAX array with specified shape and dtype.
+
+    Raises:
+        AssertionError: If the specified method is not available in jax.random.
+
+    Example:
+        >>> arr = numeric_gen(2, 3, 4, dtype=jnp.float32, method="uniform")
+        >>> arr.shape
+        (2, 3, 4)
+    """
     global DEBUG_GLOBAL_RNG
     if DEBUG_GLOBAL_RNG is None:
         DEBUG_GLOBAL_RNG = jax.random.PRNGKey(0)
@@ -267,16 +448,57 @@ def numeric_gen(*shape, dtype: str | jnp.dtype = jnp.float16, method: str = "nor
 
 
 def get_abs_err(x, y):
+    """Calculate maximum absolute error between two arrays.
+
+    Args:
+        x: First array.
+        y: Second array.
+
+    Returns:
+        Maximum absolute difference between the arrays.
+    """
     return (x.detach() - y.detach()).flatten().abs().max().item()
 
 
 def get_err_ratio(x, y):
+    """Calculate relative error ratio between two arrays.
+
+    Computes the root mean square error normalized by the RMS of the reference.
+
+    Args:
+        x: Reference array.
+        y: Array to compare against reference.
+
+    Returns:
+        Relative error ratio (RMSE / RMS of reference).
+    """
     err = (x.detach() - y.detach()).flatten().square().mean().sqrt().item()
     base = (x.detach()).flatten().square().mean().sqrt().item()
     return err / (base + 1e-8)
 
 
 def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
+    """Assert that two arrays are close within tolerance.
+
+    Compares arrays using both absolute and relative error thresholds,
+    with options for warnings vs assertions.
+
+    Args:
+        prefix: Message prefix for error reporting.
+        ref: Reference array for comparison.
+        tri: Array to test against reference.
+        ratio: Maximum allowed error ratio.
+        warning: If True, issue warning instead of assertion on failure.
+        err_atol: Absolute tolerance threshold. Defaults to 1e-6.
+
+    Raises:
+        AssertionError: If arrays differ beyond tolerance and warning=False.
+
+    Example:
+        >>> ref = jnp.ones((10,))
+        >>> test = ref + 1e-7
+        >>> assert_close("Test", ref, test, ratio=0.01)
+    """
     abs_atol = get_abs_err(ref, tri)
     msg = f"{prefix} diff: {abs_atol:.6f} ratio: {get_err_ratio(ref, tri):.6f}"
     print(msg)
@@ -293,6 +515,17 @@ def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
 
 
 def is_fp8(x):
+    """Check if an array uses FP8 dtype and if hardware supports it.
+
+    Args:
+        x: Array to check for FP8 dtype.
+
+    Returns:
+        True if array is FP8 and hardware supports it, False if not FP8.
+
+    Raises:
+        RuntimeError: If array is FP8 but hardware doesn't support it.
+    """
     if x.dtype in {jnp.float8_e4m3fnuz, jnp.float8_e4m3fn, jnp.float8_e5m2, jnp.float8_e5m2fnuz}:
         if arch_supports_fp8():
             return True
@@ -312,6 +545,11 @@ def get_gpu_arch() -> str:
 
 
 def arch_supports_fp8():
+    """Check if current GPU architecture supports FP8 operations.
+
+    Returns:
+        True if running on AMD gfx942 architecture with FP8 support, False otherwise.
+    """
     return is_hip() and get_gpu_arch() in ("gfx942")
 
 
