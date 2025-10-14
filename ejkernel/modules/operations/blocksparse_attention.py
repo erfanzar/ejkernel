@@ -530,23 +530,16 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         return configs
 
     def candidate_cfgs_tpu(self, inv: Invocation[BlockSparseAttentionConfig, Array]):
-        """Generate TPU-optimized candidate configurations for autotuning (Pallas).
-
-        Heuristics:
-        - Favor moderate Q blocks (32-128) and KV blocks (64-256)
-        - If sliding_window is set, prefer kv blocks ≲ window
-        - Backward tiles are smaller to save VMEM/regs
-        """
+        """Generate TPU-optimized candidate configurations for autotuning (Pallas)."""
         q = inv.kwargs["query"]
         k = inv.kwargs["key"]
-        head_dim = int(q.shape[-1])
         q_len = int(q.shape[-2])
         k_len = int(k.shape[-2])
 
         sliding_window = inv.kwargs.get("sliding_window", None)
         causal = bool(inv.kwargs.get("causal", True))
 
-        def window_total(sw):
+        def win_span(sw):
             if sw is None:
                 return None
             if isinstance(sw, int):
@@ -555,39 +548,36 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             wl, wr = sw
             return wl + wr + 1
 
-        win = window_total(sliding_window)
+        def nearest_128_from_set(x: int, allowed=(128, 256, 512, 1024)) -> int:
+            return min(allowed, key=lambda v: (abs(v - x), v))
 
-        if head_dim <= 64:
-            q_opts = [32, 64, 96, 128]
-        elif head_dim <= 128:
-            q_opts = [32, 64, 128]
-        elif head_dim <= 192:
-            q_opts = [32, 64, 96]
-        else:
-            q_opts = [32, 48, 64]
+        allowed = (128, 256, 512, 1024)
+        win = win_span(sliding_window)
 
-        base_kv = [64, 96, 128, 192, 256]
+        q_opts = [b for b in allowed if b <= max(128, q_len)] or [128]
+        kv_opts = [b for b in allowed if b <= max(128, k_len)] or [128]
+
         if win is not None:
-            target = max(64, min(256, 1 << (int(math.log2(max(32, win))) if win > 0 else 6)))
-            kv_opts = sorted(set([64, min(96, target), min(128, target), min(192, target), min(256, target)]))
-        else:
-            kv_opts = base_kv
+            t = nearest_128_from_set(max(128, min(1024, win)), allowed)
+            kv_opts = sorted(set([*kv_opts, t, min(1024, 2 * t)]))
 
-        if k_len < 128:
-            kv_opts = [x for x in kv_opts if x <= 128] or [64, 128]
-        if q_len < 128:
-            q_opts = [x for x in q_opts if x <= 128] or [64, 128]
+        q_opts = sorted(set(q_opts))
+        kv_opts = sorted(set(kv_opts))
 
-        def bwd_block(x: int, cap: int = 128) -> int:
-            return max(32, min(cap, x // 2 if x >= 64 else x))
+        def bwd_tile(x: int) -> int:
+            return 128 if x <= 256 else 256
 
-        hv_pairs = []
-        preferred = [(32, 128), (64, 128), (64, 192), (64, 256), (128, 128)]
+        hv_pairs: list[tuple[int, int]] = []
         if win is not None:
-            preferred.insert(0, (32, min(128, max(64, win))))
-        for qb, kb in preferred:
-            if qb in q_opts and kb in kv_opts:
-                hv_pairs.append((qb, kb))
+            t = nearest_128_from_set(max(128, min(1024, win)), allowed)
+            for qb in (128, 256):
+                if qb in q_opts and t in kv_opts:
+                    hv_pairs.append((qb, t))
+            if 2 * t <= 1024 and (128 in q_opts) and (2 * t in kv_opts):
+                hv_pairs.append((128, 2 * t))
+        hv_pairs += [(128, 128), (128, 256), (256, 256), (256, 512)]
+
+        hv_pairs = [(qb, kb) for (qb, kb) in hv_pairs if qb in q_opts and kb in kv_opts]
 
         grid_pairs = []
         for qb in q_opts:
@@ -596,13 +586,13 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
                     grid_pairs.append((qb, kb))
 
         max_candidates = 16
-        pairs = []
+        pairs: list[tuple[int, int]] = []
         seen = set()
-        for pair in hv_pairs + grid_pairs:
-            if pair in seen:
+        for qb, kb in hv_pairs + grid_pairs:
+            if (qb, kb) in seen:
                 continue
-            seen.add(pair)
-            pairs.append(pair)
+            seen.add((qb, kb))
+            pairs.append((qb, kb))
             if len(pairs) >= max_candidates:
                 break
 
@@ -617,8 +607,8 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
                         num_stages=None,
                     ),
                     bwd_params=BwdParams(
-                        q_blocksize=bwd_block(qb),
-                        kv_blocksize=bwd_block(kb),
+                        q_blocksize=bwd_tile(qb),
+                        kv_blocksize=bwd_tile(kb),
                         num_warps=None,
                         num_stages=None,
                     ),
@@ -631,40 +621,81 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
     def candidate_cfgs_xla(self, inv: Invocation[BlockSparseAttentionConfig, Array]):
         q = inv.kwargs["query"]
         k = inv.kwargs["key"]
-        head_dim = int(q.shape[-1])
         q_len = int(q.shape[-2])
         k_len = int(k.shape[-2])
 
-        q_opts = [128, 192, 256] if head_dim <= 128 else [96, 128, 192]
-        kv_opts = [128, 192, 256]
-        if q_len < 192:
-            q_opts = [x for x in q_opts if x <= 128] or [128]
-        if k_len < 192:
-            kv_opts = [x for x in kv_opts if x <= 128] or [128]
+        sliding_window = inv.kwargs.get("sliding_window", None)
+        causal = bool(inv.kwargs.get("causal", True))
 
-        def bwd_block(x: int, cap: int = 128) -> int:
-            return max(32, min(cap, x // 2 if x >= 64 else x))
+        def win_span(sw):
+            if sw is None:
+                return None
+            if isinstance(sw, int):
+                right = 0 if causal else sw
+                return sw + right + 1
+            wl, wr = sw
+            return wl + wr + 1
 
-        pairs = []
+        def nearest_128_from_set(x: int, allowed=(128, 256, 512, 1024)) -> int:
+            return min(allowed, key=lambda v: (abs(v - x), v))
+
+        allowed = (128, 256, 512, 1024)
+        win = win_span(sliding_window)
+
+        q_opts = [b for b in allowed if b <= max(128, q_len)] or [128]
+        kv_opts = [b for b in allowed if b <= max(128, k_len)] or [128]
+
+        if win is not None:
+            t = nearest_128_from_set(max(128, min(1024, win)), allowed)
+            kv_opts = sorted(set([*kv_opts, t, min(1024, 2 * t)]))
+
+        q_opts = sorted(set(q_opts))
+        kv_opts = sorted(set(kv_opts))
+
+        def bwd_tile(x: int) -> int:
+            return 128 if x <= 256 else 256
+
+        hv_pairs: list[tuple[int, int]] = []
+        if win is not None:
+            t = nearest_128_from_set(max(128, min(1024, win)), allowed)
+            for qb in (128, 256):
+                if qb in q_opts and t in kv_opts:
+                    hv_pairs.append((qb, t))
+        hv_pairs += [(128, 128), (128, 256), (256, 256), (256, 128)]
+        hv_pairs = [(qb, kb) for (qb, kb) in hv_pairs if qb in q_opts and kb in kv_opts]
+
+        grid_pairs = []
         for qb in q_opts:
             for kb in kv_opts:
-                pairs.append((qb, kb))
+                if (qb, kb) not in hv_pairs:
+                    grid_pairs.append((qb, kb))
+
+        max_candidates = 12
+        pairs: list[tuple[int, int]] = []
+        seen = set()
+        for qb, kb in hv_pairs + grid_pairs:
+            if (qb, kb) in seen:
+                continue
+            seen.add((qb, kb))
+            pairs.append((qb, kb))
+            if len(pairs) >= max_candidates:
+                break
 
         configs: list[BlockSparseAttentionConfig] = []
-        for qb, kb in pairs[:12]:
+        for qb, kb in pairs:
             configs.append(
                 BlockSparseAttentionConfig(
                     fwd_params=FwdParams(
                         q_blocksize=qb,
                         kv_blocksize=kb,
-                        num_warps=4,
-                        num_stages=2,
+                        num_warps=None,
+                        num_stages=None,
                     ),
                     bwd_params=BwdParams(
-                        q_blocksize=bwd_block(qb),
-                        kv_blocksize=bwd_block(kb),
-                        num_warps=4,
-                        num_stages=2,
+                        q_blocksize=bwd_tile(qb),
+                        kv_blocksize=bwd_tile(kb),
+                        num_warps=None,
+                        num_stages=None,
                     ),
                     platform="xla",
                     backend="any",
