@@ -100,7 +100,7 @@ def calc_bias_strides(
         KSeq: Key sequence length
 
     Returns:
-        tuple: (stride_bz, stride_bh, stride_bm, stride_bn) memory strides
+        tuple: (stride_bz, stride_bh, stride_bm) memory strides
 
     Raises:
         ValueError: If bias dimensions are incompatible with expected shapes

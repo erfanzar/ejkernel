@@ -214,9 +214,9 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         - Stages in {1, 2, 3} (kept low; smem-guarded)
         - Prefers split_len near {128, 256, 512}; ensures split_len % kv_blocksize == 0
         """
-        q = inv.kwargs["query"]  # [B, Hq, Dh]
-        k = inv.kwargs["key"]  # [B, K, Hk, Dh]
-        v = inv.kwargs["value"]  # [B, K, Hk, Dh]
+        q = inv.kwargs["query"]
+        k = inv.kwargs["key"]
+        v = inv.kwargs["value"]
 
         seq_len = int(k.shape[1])
         num_q_heads = int(q.shape[1])
@@ -228,13 +228,11 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         assert head_dim == int(k.shape[-1]) == int(v.shape[-1])
         assert num_q_heads % num_kv_heads == 0, "q_heads must be divisible by kv_heads"
 
-        grouped_heads = num_q_heads // num_kv_heads  # heads per KV group processed by kernel
+        grouped_heads = num_q_heads // num_kv_heads
 
-        # Preferred split lengths (small first for one-iteration blocks)
         preferred_split_lens = (64, 128, 256, 512)
 
         def best_splits(n: int, targets=preferred_split_lens, min_len=32, max_len=8192):
-            # Returns list of (num_key_splits, split_len) sorted by proximity to targets
             divs = set()
             r = int(math.sqrt(n))
             for d in range(1, r + 1):
@@ -255,14 +253,11 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
 
         split_candidates = best_splits(seq_len)
 
-        # Head tile options: prefer 4 (your best), expand to 8 if possible.
         head_opts = [h for h in (4, 8) if h <= grouped_heads] or [min(grouped_heads, 4)]
 
-        # kv block candidates, prefer 64; include 128 (and 96 if split_len wants it)
         kv_block_opts = [64, 128, 96]
 
-        # SMEM guard (conservative)
-        smem_limit = int(os.getenv("EJKERNEL_TRITON_SMEM_LIMIT", str(99 * 1024)))  # ~99 KiB
+        smem_limit = int(os.getenv("EJKERNEL_TRITON_SMEM_LIMIT", str(99 * 1024)))
         elem_bytes = 2 if dtype in (jnp.float16, jnp.bfloat16) else 4
 
         def next_pow2_ge(x, min_val=16):
@@ -271,14 +266,12 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         block_headdim = next_pow2_ge(head_dim, 16)
 
         def smem_est_bytes(block_heads: int, block_k: int, num_stages: int) -> int:
-            # K/V tiles + small Q piece, staging buffer factor, and fudge
             kv_bytes = 2 * block_k * block_headdim * elem_bytes
             q_bytes = int(0.25 * block_heads * block_headdim * elem_bytes)
             stage_factor = 1.0 + 0.5 * max(0, num_stages - 2)
             fudge = 2.5
             return int((kv_bytes + q_bytes) * stage_factor * fudge)
 
-        # Schedules: keep stages low; warps up to 8 only if head_dim large
         def warp_options(block_heads: int, block_k: int) -> list[int]:
             opts = [2, 4]
             if head_dim >= 128 or block_k >= 128:
@@ -286,11 +279,8 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             return opts
 
         def stage_options(block_k: int) -> list[int]:
-            # 1 is great for 64; try 2 for 128
             return [1] if block_k <= 64 else [1, 2]
 
-        # Seeds (biased by your best): try to hit split_len=64 first if divisible,
-        # otherwise the top few split candidates.
         seeds = []
         if seq_len % 64 == 0:
             seeds.append((seq_len // 64, 64))
@@ -303,7 +293,6 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         seen = set()
 
         def try_add(H, K, s, sl):
-            # Ensure divisibility
             if K > sl or sl % K != 0:
                 return False
             for W in warp_options(H, K):
@@ -331,26 +320,22 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
                         return True
             return False
 
-        # 1) Strong seeds: blocksize_heads=4, kv=64 around top splits (including your best path)
         for s, sl in seeds:
             if try_add(4 if 4 in head_opts else head_opts[0], 64, s, sl):
                 return configs
 
-        # 2) Neighborhood: H in head_opts, K in {64, 128, 96} over seeds
         for s, sl in seeds:
             for H in head_opts:
                 for K in kv_block_opts:
                     if try_add(H, K, s, sl):
                         return configs
 
-        # 3) Broader grid (limited breadth): scan more splits
         for s, sl in split_candidates[:12]:
             for H in head_opts:
                 for K in kv_block_opts:
                     if try_add(H, K, s, sl):
                         return configs
 
-        # Fallback (shouldn't hit)
         if not configs:
             H = min(4, grouped_heads) if grouped_heads >= 4 else grouped_heads
             s = max(1, seq_len // 64)

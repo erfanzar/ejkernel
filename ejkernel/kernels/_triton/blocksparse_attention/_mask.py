@@ -450,7 +450,7 @@ def create_sparsity_mask(
     window_right: int = -1,
 ) -> tuple[SparseMask, ...]:
     """
-    Creates attention masks for forward and (optionally) backward flash attention
+    Creates attention masks for forward and (optionally) backward block-sparse attention
     kernels.
 
     This function generates the required attention masks based on the query and

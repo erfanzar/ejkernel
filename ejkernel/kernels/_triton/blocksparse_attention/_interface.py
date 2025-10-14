@@ -100,7 +100,6 @@ if typing.TYPE_CHECKING:
     jax.jit,
     static_argnames=[
         "softmax_scale",
-        "bias",
         "apply_load_balance",
         "sequence_parallelism_mesh_axis_name",
         "window_left",
@@ -350,7 +349,7 @@ def blocksparse_attention(
     chunk_size: int | None = None,
     causal: bool = True,
     fused_backward: bool = False,
-) -> Float[Array, "batch num_heads seq_len head_dim"]:
+) -> Float[Array, "batch num_heads seq_len vhead_dim"]:
     """Triton block-sparse attention kernel implementation.
 
     Computes attention over sparse block patterns using optimized Triton kernels for GPU execution.
@@ -405,6 +404,8 @@ def blocksparse_attention(
 
     if sliding_window is None:
         window_left = window_right = -1
+    elif isinstance(sliding_window, int):
+        window_left = window_right = sliding_window
     else:
         window_left, window_right = sliding_window
     if softmax_scale is None:

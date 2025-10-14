@@ -137,12 +137,12 @@ def _blocksparse_attn_fwd_inner(
                 mask = window_mask
 
         if SOFTCAP:
-            LN2: tl.constexpr = 0.6931471824645996
-            qk_natural = attn_weights * (softmax_scale / LN2)
-            x = qk_natural / logits_soft_cap
+            LOG2_CONST: tl.constexpr = 1.4426950408889634
+            softmax_scale_e = softmax_scale / LOG2_CONST
+            x = (attn_weights * softmax_scale_e) / logits_soft_cap
             exp_2x = tl.exp(2.0 * x)
             tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
-            attn_weights = (logits_soft_cap * tanh_x) * LN2
+            attn_weights = (logits_soft_cap * tanh_x) * LOG2_CONST
         else:
             if USE_SEGMENT_MASK or USE_CAUSAL or USE_SLIDING_WINDOW:
                 attn_weights = tl.where(mask, attn_weights * softmax_scale, BIG_NEG)
@@ -308,7 +308,8 @@ def blocksparse_attn_fwd(
     out_offset = batch_heads_size_id * stride_oh
 
     if USE_SINKS:
-        aux_offset = batch_heads_size_id * stride_aux_heads
+        head_id = batch_heads_size_id - batch_size_id * NUM_HEADS
+        aux_offset = head_id * stride_aux_heads
         softmax_aux_ptrs = softmax_aux + aux_offset
     else:
         softmax_aux_ptrs = softmax_aux
@@ -368,9 +369,7 @@ def blocksparse_attn_fwd(
         tl.store(M + logsumexp_offset, l)
         return
 
-    q_scale = softmax_scale
-    q_scale *= LOG2_CONST
-    q_scale = q_scale.to(tl.float32)
+    q_scale = (softmax_scale * LOG2_CONST).to(tl.float32)
 
     if EVEN_QK_HEAD_DIMS:
         query_block = tl.load(query_block_ptr)
@@ -512,7 +511,7 @@ def _fwd_blocksparse_attn_call(
     logits_soft_cap: float | None = None,
 ) -> tuple[ArrayLike, Sequence[ArrayLike]]:
     if bias is not None:
-        raise NotImplementedError("Bias is not supported in Flash multi head attention")
+        raise NotImplementedError("Bias is not supported in block-sparse attention")
 
     possible_hid_dim_vals = [16, 32, 64, 128, 192, 256]
     chex.assert_axis_dimension_comparator(
@@ -546,7 +545,15 @@ def _fwd_blocksparse_attn_call(
             softmax_aux_tensor = jnp.broadcast_to(softmax_aux[None, :], (num_heads, num_sinks_val))
         elif softmax_aux.ndim == 2:
             num_sinks_val = softmax_aux.shape[1]
-            softmax_aux_tensor = softmax_aux
+            if softmax_aux.shape[0] == num_kv_heads:
+                softmax_aux_tensor = jnp.repeat(softmax_aux, repeats=(num_heads // num_kv_heads), axis=0)
+            elif softmax_aux.shape[0] == num_heads:
+                softmax_aux_tensor = softmax_aux
+            else:
+                raise ValueError(
+                    f"softmax_aux first dim must be num_kv_heads ({num_kv_heads}) or num_heads"
+                    f" ({num_heads}), got {softmax_aux.shape[0]}"
+                )
         else:
             raise ValueError(f"softmax_aux must be 1D or 2D, got shape {softmax_aux.shape}")
 

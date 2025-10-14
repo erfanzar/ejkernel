@@ -379,11 +379,6 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         """Generate candidate configurations for autotuning on GPU (Triton).
 
         Heuristics:
-        - For small head_dim, larger BLOCK_M is fine (64-128).
-        - For large head_dim (>=160), prefer smaller BLOCK_M (32-64).
-        - More KV pages per block helps small page_size (<=32). Limit S_block=page_size*npages <= 256.
-        - num_warps: 4 baseline; 8 when BLOCK_M>=96 or head_dim>=128; 2 when head_dim<=64 and BLOCK_M<=64.
-        - num_stages: 2 for npages<=2; 3-4 for npages>=4 to hide memory latency.
         """
         q = inv.kwargs["queries"]
         kv = inv.kwargs["kv_pages"]
@@ -398,13 +393,13 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         assert num_q_heads % num_kv_heads == 0
 
         if head_dim <= 64:
-            m_opts = [32, 64, 96, 128]
+            m_opts = [32, 64, 128]
         elif head_dim <= 128:
             m_opts = [32, 64, 128]
         elif head_dim <= 192:
-            m_opts = [32, 64, 96]
+            m_opts = [32, 64]
         else:
-            m_opts = [32, 48, 64]
+            m_opts = [32, 64]
 
         if page_size <= 16:
             p_opts = [2, 4, 8]
@@ -451,7 +446,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             hv_core += [(64, 1), (128, 1)]
 
         if head_dim >= 160:
-            hv_core += [(32, 2), (48, 2), (64, 1)]
+            hv_core += [(32, 2), (64, 1)]
 
         seen_hv = set()
         for m, p in hv_core:
@@ -535,7 +530,6 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             add(m, p)
 
         add(16, 4)
-        add(48, 4)
         if pages_per_seq >= 3:
             add(32, 3)
 
