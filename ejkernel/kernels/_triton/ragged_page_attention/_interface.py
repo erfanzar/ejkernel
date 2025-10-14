@@ -72,16 +72,13 @@ Reference:
     https://arxiv.org/abs/2309.06180
 """
 
-import jax
 import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, DTypeLike, Float, Int
 
-from ejkernel.callib import cdiv, triton_call
-
 from ..._registry import Backend, Platform, kernel_registry
-from ._triton_impl_fwd import _ragged_paged_attn_prefetch_kernel_combined
+from ._triton_impl_fwd import ragged_paged_attention_triton_call
 
 DEFAULT_MASK_VALUE = -2.381976426469702e38
 
@@ -106,6 +103,8 @@ def ragged_page_attention(
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Compute ragged paged attention for variable-length sequences.
 
@@ -193,98 +192,19 @@ def ragged_page_attention(
         ... )
         >>> print(output.shape)
     """
-    del compute_dtype, optimized
-    T, QH, D = queries.shape
-    if softmax_aux is not None:
-        raise NotImplementedError("`softmax_aux` is not implemented in triton impl yet!")
 
-    if num_queries_per_block is not None:
-        raise NotImplementedError("num_queries_per_block is TPU-specific and not supported on GPU")
-    if vmem_limit_bytes is not None:
-        raise NotImplementedError("vmem_limit_bytes is TPU-specific and not supported on GPU")
-
-    if softmax_scale is None:
-        softmax_scale = 1.0 / (D**0.5)
-
-    kv_pages_per_block = num_kv_pages_per_block if num_kv_pages_per_block is not None else 8
-
-    if mask_value is None:
-        mask_value = -2.381976426469702e38
-
-    use_soft_cap = logits_soft_cap is not None
-    soft_cap_value = logits_soft_cap if use_soft_cap else 1.0
-
-    use_sliding_window = sliding_window is not None
-    sliding_window_size = sliding_window if use_sliding_window else 0
-    _P, PS, C, Dk = kv_pages.shape
-    assert D == Dk, "head_size mismatch"
-    assert C % 2 == 0, "combined kv heads must be even"
-    KVH = C // 2
-    assert QH % KVH == 0
-    QHG = QH // KVH
-    pages_per_seq_max = int(block_tables.shape[1])
-
-    q4 = queries.reshape(T, KVH, QHG, D)
-    T_padded = max(T, 1)
-    if T_padded > T:
-        pad = jnp.zeros((T_padded - T, KVH, QHG, D), dtype=q4.dtype)
-        q4 = jnp.concatenate([q4, pad], axis=0)
-
-    starts = query_start_loc[:-1]
-    ends = query_start_loc[1:]
-    q_lens = (ends - starts).astype(jnp.int32)
-
-    t_idx = jnp.arange(T_padded, dtype=jnp.int32)
-    t_clamped = jnp.minimum(t_idx, jnp.int32(max(T - 1, 0)))
-    row_seq = jnp.searchsorted(ends, t_clamped, side="right").astype(jnp.int32)
-
-    row_start = starts[row_seq]
-    row_qlen = q_lens[row_seq]
-    row_kvlen = context_lens[row_seq]
-    row_qoff = t_idx - row_start
-    row_firstk = (row_kvlen - row_qlen + row_qoff).astype(jnp.int32)
-
-    ns_dev = jnp.asarray(num_seqs, dtype=jnp.int32)
-    row_valid = (t_idx < T) & (row_seq < ns_dev)
-
-    KV_PAGES_PER_BLOCK = int(kv_pages_per_block)
-    MAX_KV_SUPERBLOCKS = cdiv(pages_per_seq_max, KV_PAGES_PER_BLOCK)
-
-    out_shape = jax.ShapeDtypeStruct((T_padded, KVH, QHG, D), jnp.float32)
-
-    def grid(meta):
-        return (T_padded, KVH, QHG)
-
-    metaparams = dict(
-        grid=grid,
-        T=T_padded,
-        KVH=KVH,
-        QHG=QHG,
-        D=D,
-        PS=PS,
-        PAGES_PER_SEQ_MAX=pages_per_seq_max,
-        KV_PAGES_PER_BLOCK=KV_PAGES_PER_BLOCK,
-        MAX_KV_SUPERBLOCKS=int(MAX_KV_SUPERBLOCKS),
-        SCALE=softmax_scale,
-        SOFT_CAP=soft_cap_value,
-        USE_SOFT_CAP=use_soft_cap,
-        SLIDING_WINDOW_SIZE=sliding_window_size,
-        USE_SLIDING_WINDOW=use_sliding_window,
-        MASK_VALUE=mask_value,
-    )
-
-    out4_padded = triton_call(
-        q4,
-        kv_pages,
-        block_tables.astype(jnp.int32),
-        row_seq.astype(jnp.int32),
-        row_firstk.astype(jnp.int32),
-        row_kvlen.astype(jnp.int32),
-        row_valid.astype(jnp.bool_),
-        kernel=_ragged_paged_attn_prefetch_kernel_combined,
-        out_shape=out_shape,
-        name="ejkernel::triton::ragged_page_attn",
-        **metaparams,
-    )
-
-    return out4_padded[:T].reshape(T, QH, D).astype(queries.dtype)
+    return ragged_paged_attention_triton_call(
+        queries=queries,
+        kv_pages=kv_pages,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        cu_q_lens=query_start_loc,
+        block_m=num_queries_per_block,
+        block_npages=num_kv_pages_per_block,
+        causal=True,
+        logits_soft_cap=logits_soft_cap,
+        sliding_window=sliding_window,
+        softmax_scale=softmax_scale,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    ).astype(queries.dtype)

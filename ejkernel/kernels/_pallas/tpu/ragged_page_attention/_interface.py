@@ -196,6 +196,8 @@ def ragged_page_attention(
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Ragged paged attention that supports mixed prefill and decode.
 

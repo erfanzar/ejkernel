@@ -313,6 +313,8 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             num_kv_pages_per_block=cfg.num_kv_pages_per_block,
             num_queries_per_block=cfg.num_queries_per_block,
             vmem_limit_bytes=vmem_limit_bytes,
+            num_warps=cfg.num_warps,
+            num_stages=cfg.num_stages,
         )
 
     def heuristic_cfg(self, inv: Invocation[RaggedPageAttentionConfig, Array]) -> RaggedPageAttentionConfig:
@@ -374,38 +376,121 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedPageAttentionConfig, Array]):
-        """Generate candidate configurations for autotuning.
+        """Generate candidate configurations for autotuning on GPU (Triton).
 
-        Creates configurations optimized for ragged attention scenarios with
-        various batch sizes and sequence lengths.
-
-        Args:
-            inv: Invocation object containing arguments and metadata
-
-        Returns:
-            List of candidate configurations to benchmark during autotuning
-
-        Note:
-            Ragged attention performance depends on the distribution of sequence
-            lengths and the page size. Candidates are chosen to work well across
-            common serving scenarios.
+        Heuristics:
+        - For small head_dim, larger BLOCK_M is fine (64-128).
+        - For large head_dim (>=160), prefer smaller BLOCK_M (32-64).
+        - More KV pages per block helps small page_size (<=32). Limit S_block=page_size*npages <= 256.
+        - num_warps: 4 baseline; 8 when BLOCK_M>=96 or head_dim>=128; 2 when head_dim<=64 and BLOCK_M<=64.
+        - num_stages: 2 for npages<=2; 3-4 for npages>=4 to hide memory latency.
         """
+        q = inv.kwargs["queries"]
+        kv = inv.kwargs["kv_pages"]
+        block_tables = inv.kwargs["block_tables"]
 
-        block_configs = [(1), (2)]
+        _total_tokens, num_q_heads, head_dim = map(int, q.shape)
+        page_size = int(kv.shape[1])
+        pages_per_seq = int(block_tables.shape[1])
+        combined_kv_heads = int(kv.shape[2])
+        assert combined_kv_heads % 2 == 0
+        num_kv_heads = combined_kv_heads // 2
+        assert num_q_heads % num_kv_heads == 0
 
-        candidates = []
-        for num_kv_pages in block_configs:
-            candidates.append(
-                RaggedPageAttentionConfig(
-                    num_kv_pages_per_block=num_kv_pages,
-                    num_queries_per_block=None,
-                    num_warps=None,
-                    num_stages=None,
-                    platform="triton",
-                    backend="any",
-                )
+        if head_dim <= 64:
+            m_opts = [32, 64, 96, 128]
+        elif head_dim <= 128:
+            m_opts = [32, 64, 128]
+        elif head_dim <= 192:
+            m_opts = [32, 64, 96]
+        else:
+            m_opts = [32, 48, 64]
+
+        if page_size <= 16:
+            p_opts = [2, 4, 8]
+        elif page_size <= 32:
+            p_opts = [1, 2, 4]
+        elif page_size <= 64:
+            p_opts = [1, 2]
+        else:
+            p_opts = [1]
+
+        max_S_block = 256
+        p_opts = [p for p in p_opts if p * page_size <= max_S_block]
+
+        p_opts = [p for p in p_opts if p <= pages_per_seq]
+        if not p_opts:
+            p_opts = [min(2, pages_per_seq)]
+
+        def pick_warps_stages(block_m: int, npages: int) -> tuple[int, int]:
+            if head_dim <= 64:
+                warps = 2 if block_m <= 64 else 4
+            elif head_dim <= 128:
+                warps = 4 if block_m <= 64 else 8
+            else:
+                warps = 4 if block_m <= 64 else 8
+
+            if npages >= 4:
+                stages = 4
+            elif npages == 2:
+                stages = 3 if page_size <= 32 else 2
+            else:
+                stages = 2
+            return warps, stages
+
+        high_value: list[tuple[int, int, int | None, int | None]] = []
+
+        hv_core = [(64, 2), (128, 2)]
+
+        if page_size <= 32 and pages_per_seq >= 4:
+            hv_core += [(64, 4)]
+            if page_size <= 16 and pages_per_seq >= 8:
+                hv_core += [(128, 4), (64, 8)]
+
+        if page_size >= 64:
+            hv_core += [(64, 1), (128, 1)]
+
+        if head_dim >= 160:
+            hv_core += [(32, 2), (48, 2), (64, 1)]
+
+        seen_hv = set()
+        for m, p in hv_core:
+            if p in p_opts and m in m_opts and (m, p) not in seen_hv:
+                w, s = pick_warps_stages(m, p)
+                high_value.append((m, p, w, s))
+                seen_hv.add((m, p))
+
+        grid: list[tuple[int, int, int | None, int | None]] = []
+        for m in m_opts:
+            for p in p_opts:
+                if (m, p) in seen_hv:
+                    continue
+                w, s = pick_warps_stages(m, p)
+                grid.append((m, p, w, s))
+
+        block_configs: list[tuple[int, int, int | None, int | None]] = []
+        seen = set()
+        for tup in high_value + grid:
+            m, p, w, s = tup
+            if (m, p) in seen:
+                continue
+            seen.add((m, p))
+            block_configs.append((m, p, w, s))
+
+        max_candidates = 18
+        block_configs = block_configs[:max_candidates]
+
+        candidates = [
+            RaggedPageAttentionConfig(
+                num_kv_pages_per_block=npages,
+                num_queries_per_block=block_m,
+                num_warps=warps,
+                num_stages=stages,
+                platform="triton",
+                backend="any",
             )
-
+            for (block_m, npages, warps, stages) in block_configs
+        ]
         return candidates
 
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
