@@ -79,6 +79,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
 from ejkernel.callib import ejit
+from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_bwd import _bwd_attention_kernel_call
@@ -95,6 +96,8 @@ def _jax_fwd_attention_call(
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
@@ -136,6 +139,8 @@ def _jax_fwd_attention_call(
         dropout_prob=dropout_prob,
         causal=causal,
         dropout_seed=dropout_seed,
+        fwd_params=fwd_params,
+        bwd_params=bwd_params,
         cum_seqlens_q=cum_seqlens_q,
         cum_seqlens_k=cum_seqlens_k,
         sliding_window=sliding_window,
@@ -150,6 +155,8 @@ def _jax_bwd_attention_call(
     softmax_scale: float | None,
     dropout_prob: float,
     causal: bool,
+    fwd_params: FwdParams | None,
+    bwd_params: BwdParams | None,
     sliding_window: int | tuple[int, int] | None,
     logits_soft_cap: float | None,
     residual: tuple[Float[Array, "..."], ...],
@@ -195,6 +202,8 @@ def _jax_bwd_attention_call(
         M=lse,
         dropout_prob=dropout_prob,
         causal=causal,
+        fwd_params=fwd_params,
+        bwd_params=bwd_params,
         dropout_seed=dropout_seed,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
@@ -205,8 +214,8 @@ def _jax_bwd_attention_call(
     return dq, dk, dv, None, None, None, None, None, None
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 11, 12))
-@ejit(static_argnums=(5, 6, 7, 11, 12))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 9, 10, 13, 14))
+@ejit(static_argnums=(5, 6, 7, 9, 10, 13, 14))
 def flash_attention_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
@@ -217,6 +226,8 @@ def flash_attention_call(
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
@@ -262,6 +273,8 @@ def flash_attention_call(
         dropout_prob=dropout_prob,
         causal=causal,
         dropout_seed=dropout_seed,
+        fwd_params=fwd_params,
+        bwd_params=bwd_params,
         cum_seqlens_q=cum_seqlens_q,
         cum_seqlens_k=cum_seqlens_k,
         sliding_window=sliding_window,
@@ -270,10 +283,7 @@ def flash_attention_call(
     )[0]
 
 
-flash_attention_call.defvjp(
-    _jax_fwd_attention_call,
-    _jax_bwd_attention_call,
-)
+flash_attention_call.defvjp(_jax_fwd_attention_call, _jax_bwd_attention_call)
 
 
 @kernel_registry.register("flash_attention", Platform.TRITON, Backend.GPU)
@@ -291,8 +301,8 @@ def flash_attention(
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
-    chunk_size_q: int = 128,
-    chunk_size_k: int = 128,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     normalize_output: bool = True,
@@ -338,7 +348,7 @@ def flash_attention(
         >>>
         >>> out = flash_attention(query, key, value, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
     """
-    del chunk_size_q, chunk_size_k, precision, logits_dtype, normalize_output
+    del precision, logits_dtype, normalize_output
     if q_segment_ids is not None:
         raise NotImplementedError("`q_segment_ids` is not implemented in triton impl yet!")
     if kv_segment_ids is not None:
@@ -352,6 +362,8 @@ def flash_attention(
         softmax_scale=softmax_scale,
         dropout_prob=dropout_prob,
         causal=causal,
+        fwd_params=fwd_params,
+        bwd_params=bwd_params,
         dropout_seed=dropout_seed,
         cum_seqlens_q=cum_seqlens_q,
         cum_seqlens_k=cum_seqlens_k,

@@ -24,6 +24,7 @@ from jaxtyping import Array, Bool, Float, Int
 from triton import Config
 
 from ejkernel.callib import triton_call
+from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
 from ejkernel.utils import dtype_index, get_strides
 
 from ._utilities import (
@@ -224,46 +225,6 @@ def _attn_fwd_inner(
     return m_i, me_i, acc_o.to(tl.bfloat16)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=2, num_stages=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=2, num_stages=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=2, num_stages=4),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=2, num_stages=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=8, num_stages=4),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=8, num_stages=1),
-    ],
-    key=[
-        "CKSeq",
-        "CQSeq",
-        "DRuntime",
-        "VARLEN",
-        "USE_DROPOUT",
-        "IS_CAUSAL",
-        "BIAS_ON",
-        "BLOCK_HEADDIM",
-        "SLIDING",
-    ],
-    prune_configs_by={"early_config_prune": config_prune_kernel},
-)
 @triton.heuristics(
     {
         "EVEN_M": lambda args: args["QSeq"] % args["BLOCK_M"] == 0,
@@ -586,6 +547,8 @@ def _fwd_attention_kernel_call(
     dropout_prob: float = 0.0,
     causal: bool = False,
     dropout_seed: int | None = None,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
@@ -680,6 +643,10 @@ def _fwd_attention_kernel_call(
             BOOL_BIAS=BOOL_BIAS,
             BLOCK_HEADDIM=BLOCK_HEADDIM,
             PADDED_HEADS=PADDED_HEADS,
+            BLOCK_N=fwd_params.kv_blocksize,
+            BLOCK_M=fwd_params.q_blocksize,
+            num_warps=fwd_params.num_warps,
+            num_stages=fwd_params.num_stages,
         )
 
         out_shape = [
@@ -797,6 +764,10 @@ def _fwd_attention_kernel_call(
         BOOL_BIAS=BOOL_BIAS,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         PADDED_HEADS=PADDED_HEADS,
+        BLOCK_N=fwd_params.kv_blocksize,
+        BLOCK_M=fwd_params.q_blocksize,
+        num_warps=fwd_params.num_warps,
+        num_stages=fwd_params.num_stages,
     )
 
     out_shape = [

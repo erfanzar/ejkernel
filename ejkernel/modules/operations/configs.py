@@ -23,6 +23,8 @@ and autotuning.
 from dataclasses import dataclass
 from typing import Literal
 
+from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
+
 
 @dataclass
 class BaseOperationConfig:
@@ -45,10 +47,8 @@ class FlashAttentionConfig(BaseOperationConfig):
         backend: Backend specification (default: "any")
     """
 
-    chunk_size_q: int = 128
-    chunk_size_k: int = 128
-    num_warps: int = 4
-    num_stages: int = 2
+    fwd_params: FwdParams | None = None
+    bwd_params: BwdParams | None = None
 
 
 @dataclass
@@ -56,22 +56,12 @@ class BlockSparseAttentionConfig(BaseOperationConfig):
     """Configuration for Block Sparse Attention operation.
 
     Args:
-        q_blocksize: Query block size for forward pass (default: 512)
-        kv_blocksize: Key/value block size for forward pass (default: 512)
-        bwd_q_blocksize: Query block size for backward pass (default: 1024)
-        bwd_kv_blocksize: Key/value block size for backward pass (default: 1024)
-        num_warps: Number of warps for Triton kernels (default: 4)
-        num_stages: Number of pipeline stages (default: 2)
         platform: Target platform (triton/pallas/cuda/xla/auto)
         backend: Backend specification (default: "any")
     """
 
-    q_blocksize: int = 512
-    kv_blocksize: int = 512
-    bwd_q_blocksize: int = 1024
-    bwd_kv_blocksize: int = 1024
-    num_warps: int = 4
-    num_stages: int = 2
+    fwd_params: FwdParams | None = None
+    bwd_params: BwdParams | None = None
 
 
 @dataclass

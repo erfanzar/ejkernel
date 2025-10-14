@@ -36,6 +36,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.callib import ejit
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
+from ejkernel.ops import BwdParams, FwdParams
 
 from . import _info as mask_info_lib
 from . import _masks as mask_lib
@@ -2400,10 +2401,8 @@ make_splash_mqa_single_device = partial(make_splash_mha, is_mqa=True, head_shard
         "chunk_size",
         "causal",
         "fused_backward",
-        "q_blocksize",
-        "kv_blocksize",
-        "bwd_q_blocksize",
-        "bwd_kv_blocksize",
+        "fwd_params",
+        "bwd_params",
         "logits_soft_cap",
     )
 )
@@ -2426,11 +2425,9 @@ def blocksparse_attention(
     sequence_parallelism_mesh_axis_name: str | None = None,
     logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,
-    q_blocksize: int | None = None,
-    kv_blocksize: int | None = None,
-    bwd_q_blocksize: int | None = None,
-    bwd_kv_blocksize: int | None = None,
     softmax_scale: float | None = None,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     mask_builder: typing.Callable[[int, int, int, int, int], "Mask"] | typing.Callable[[], "SparseMask"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
@@ -2457,10 +2454,6 @@ def blocksparse_attention(
             This prevents attention scores from becoming too large, improving numerical
             stability (Gemma-2 style). Gradients are computed with proper Jacobian.
         qkv_layouts: Optional pre-computed attention mask layouts
-        q_blocksize: Forward pass query block size (default: 64)
-        kv_blocksize: Forward pass key/value block size (default: 64)
-        bwd_q_blocksize: Backward pass query block size (default: 64)
-        bwd_kv_blocksize: Backward pass key/value block size (default: 64)
         softmax_scale: Attention score scaling factor (default: 1/sqrt(head_dim))
         mask_builder: Custom mask builder function
         sliding_window: Sliding window size. Can be:
@@ -2491,15 +2484,10 @@ def blocksparse_attention(
 
     query_length = query.shape[2]
     kv_length = value.shape[2]
-
-    if q_blocksize is None:
-        q_blocksize = 512
-    if kv_blocksize is None:
-        kv_blocksize = q_blocksize
-    if bwd_q_blocksize is None:
-        bwd_q_blocksize = 1024
-    if bwd_kv_blocksize is None:
-        bwd_kv_blocksize = bwd_q_blocksize
+    if fwd_params is None:
+        fwd_params = FwdParams(q_blocksize=512, kv_blocksize=512, num_stages=2, num_warps=4)
+    if bwd_params is None:
+        bwd_params = BwdParams(q_blocksize=1024, kv_blocksize=1024, num_stages=2, num_warps=4)
 
     if attention_mask is not None and (q_segment_ids is None or kv_segment_ids is None):
         from ejkernel.xla_utils import mask_to_segment_ids
@@ -2536,14 +2524,14 @@ def blocksparse_attention(
                 return FullMask((q_len, kv_len))
 
     block_sizes = BlockSizes(
-        block_q=min(q_blocksize, query_length),
-        block_kv_compute=min(kv_blocksize, kv_length),
-        block_kv=min(kv_blocksize, kv_length),
-        block_q_dkv=min(bwd_kv_blocksize, query_length),
-        block_kv_dkv=min(bwd_kv_blocksize, kv_length),
-        block_kv_dkv_compute=min(bwd_kv_blocksize, kv_length),
-        block_q_dq=min(bwd_kv_blocksize, query_length),
-        block_kv_dq=min(bwd_kv_blocksize, kv_length),
+        block_q=min(fwd_params.q_blocksize, query_length),
+        block_kv_compute=min(fwd_params.kv_blocksize, kv_length),
+        block_kv=min(fwd_params.kv_blocksize, kv_length),
+        block_q_dkv=min(bwd_params.kv_blocksize, query_length),
+        block_kv_dkv=min(bwd_params.kv_blocksize, kv_length),
+        block_kv_dkv_compute=min(bwd_params.kv_blocksize, kv_length),
+        block_q_dq=min(bwd_params.kv_blocksize, query_length),
+        block_kv_dq=min(bwd_params.kv_blocksize, kv_length),
         use_fused_bwd_kernel=fused_backward,
     )
     if softmax_scale is None:

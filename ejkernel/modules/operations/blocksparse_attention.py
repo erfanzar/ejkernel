@@ -26,9 +26,11 @@ attention, local attention patterns, and sparse attention architectures.
 
 from __future__ import annotations
 
+import math
 import os
 import typing
 
+from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, Float, Int
@@ -44,6 +46,7 @@ from ejkernel.ops import (
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
 
 from ..base import detect_platform
 from .configs import BlockSparseAttentionConfig
@@ -253,6 +256,8 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         logits_soft_cap: float | None = None,
         qkv_layouts: tuple["SparseMask"] | None = None,
         softmax_scale: float | None = None,
+        fwd_params: FwdParams | None = None,
+        bwd_params: BwdParams | None = None,
         mask_builder: typing.Callable[[int, int, int, int, int], "Mask"]
         | typing.Callable[[], "SparseMask"]
         | None = None,
@@ -293,12 +298,8 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         """
         if platform is not None:
             cfg = BlockSparseAttentionConfig(
-                q_blocksize=cfg.q_blocksize,
-                kv_blocksize=cfg.kv_blocksize,
-                bwd_q_blocksize=cfg.bwd_q_blocksize,
-                bwd_kv_blocksize=cfg.bwd_kv_blocksize,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
+                fwd_params=cfg.fwd_params,
+                bwd_params=cfg.bwd_params,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
@@ -318,10 +319,8 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             attention_mask=attention_mask,
             sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
             qkv_layouts=qkv_layouts,
-            q_blocksize=cfg.q_blocksize,
-            kv_blocksize=cfg.kv_blocksize,
-            bwd_q_blocksize=cfg.bwd_q_blocksize,
-            bwd_kv_blocksize=cfg.bwd_kv_blocksize,
+            fwd_params=cfg.fwd_params,
+            bwd_params=cfg.bwd_params,
             softmax_scale=softmax_scale,
             mask_builder=mask_builder,
             sliding_window=sliding_window,
@@ -390,87 +389,287 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[BlockSparseAttentionConfig, Array]):
-        """Generate GPU-optimized candidate configurations for autotuning.
+        """Generate GPU-optimized candidate configurations for autotuning (Triton).
 
-        GPU/Triton kernels benefit from medium blocks with more warps and stages.
-
-        Args:
-            inv: Invocation object with arguments and metadata
-
-        Returns:
-            Iterable of GPU-optimized candidate configurations
+        Heuristics:
+        - q/kv blocks in {32, 64, 96, 128, 192, 256} depending on head_dim
+        - If sliding_window is set, favor kv blocks ≲ window size (rounded)
+        - num_warps: 2-8 based on head_dim and block sizes
+        - num_stages: 2-4 (bigger when kv block is large)
+        - Backward block sizes smaller to reduce register pressure
         """
-        configs = []
-        for q_block in [32, 64, 128]:
-            for kv_block in [32, 64, 128]:
-                configs.append(
-                    BlockSparseAttentionConfig(
-                        q_blocksize=q_block,
-                        kv_blocksize=kv_block,
-                        bwd_q_blocksize=max(min(kv_block // 2, 64), 32),
-                        bwd_kv_blocksize=max(min(kv_block // 2, 64), 32),
-                        num_warps=None,
-                        num_stages=None,
-                        platform="triton",
-                        backend="gpu",
-                    )
+        q = inv.kwargs["query"]
+        k = inv.kwargs["key"]
+        head_dim = int(q.shape[-1])
+        q_len = int(q.shape[-2])
+        k_len = int(k.shape[-2])
+        dtype = q.dtype
+
+        sliding_window = inv.kwargs.get("sliding_window", None)
+        causal = bool(inv.kwargs.get("causal", True))
+
+        def window_total(sw):
+            if sw is None:
+                return None
+            if isinstance(sw, int):
+                right = 0 if causal else sw
+                return sw + right + 1
+            wl, wr = sw
+            return wl + wr + 1
+
+        win = window_total(sliding_window)
+
+        smem_limit = int(os.getenv("EJKERNEL_TRITON_SMEM_LIMIT", str(99 * 1024)))
+
+        block_headdim = max(1 << max(4, math.ceil(math.log2(max(1, head_dim)))), 16)
+        elem_bytes = 2 if dtype in (jnp.float16, jnp.bfloat16) else 4
+
+        def smem_est_bytes(qb: int, kb: int, num_stages: int) -> int:
+            kv_bytes = 2 * kb * block_headdim * elem_bytes
+
+            q_bytes = int(0.5 * qb * block_headdim * elem_bytes)
+            base = kv_bytes + q_bytes
+
+            stage_factor = 1.0 + 0.5 * max(0, num_stages - 2)
+
+            fudge = 3.0
+            return int(base * stage_factor * fudge)
+
+        if head_dim <= 64:
+            q_opts = [32, 64, 96, 128]
+        elif head_dim <= 128:
+            q_opts = [32, 64, 128, 192]
+        elif head_dim <= 192:
+            q_opts = [32, 64, 96, 128]
+        else:
+            q_opts = [32, 48, 64, 96]
+
+        base_kv = [32, 64, 96, 128, 192, 256]
+        if win is not None:
+            target = max(32, min(256, 1 << (int(math.log2(max(32, win))) if win > 0 else 5)))
+            kv_opts = sorted(set([32, 64, min(96, target), min(128, target), min(192, target), min(256, target)]))
+        else:
+            kv_opts = base_kv
+
+        if k_len < 128:
+            kv_opts = [x for x in kv_opts if x <= 128] or [64, 128]
+        if q_len < 128:
+            q_opts = [x for x in q_opts if x <= 128] or [64, 128]
+
+        def pick_warps_stages(qb: int, kb: int, dh: int) -> tuple[int, int]:
+            if dh <= 64:
+                warps = 2 if max(qb, kb) <= 64 else 4
+            elif dh <= 128:
+                warps = 4 if max(qb, kb) <= 128 else 8
+            else:
+                warps = 8 if max(qb, kb) >= 128 else 4
+
+            if kb >= 256:
+                stages = 3
+            elif kb >= 128:
+                stages = 2
+            else:
+                stages = 2
+            return warps, stages
+
+        def bwd_block(x: int, cap: int = 128) -> int:
+            return max(32, min(cap, x // 2 if x >= 64 else x))
+
+        hv_pairs = []
+        preferred = [(32, 64), (64, 64), (64, 128), (128, 64)]
+        if win is not None:
+            preferred.insert(0, (32, min(128, max(64, win))))
+        for qb, kb in preferred:
+            if qb in q_opts and kb in kv_opts:
+                hv_pairs.append((qb, kb))
+
+        grid_pairs = []
+        for qb in q_opts:
+            for kb in kv_opts:
+                if (qb, kb) not in hv_pairs:
+                    grid_pairs.append((qb, kb))
+
+        max_candidates = 18
+        pairs = []
+        seen = set()
+        for qb, kb in hv_pairs + grid_pairs:
+            if (qb, kb) in seen:
+                continue
+            w, s = pick_warps_stages(qb, kb, head_dim)
+            if smem_est_bytes(qb, kb, s) <= smem_limit:
+                seen.add((qb, kb))
+                pairs.append((qb, kb, w, s))
+                if len(pairs) >= max_candidates:
+                    break
+
+        if not pairs:
+            qb, kb = 32, 64
+            w, s = pick_warps_stages(qb, kb, head_dim)
+            pairs = [(qb, kb, w, s)]
+
+        configs: list[BlockSparseAttentionConfig] = []
+        for qb, kb, w, s in pairs:
+            configs.append(
+                BlockSparseAttentionConfig(
+                    fwd_params=FwdParams(
+                        q_blocksize=qb,
+                        kv_blocksize=kb,
+                        num_warps=w,
+                        num_stages=s,
+                    ),
+                    bwd_params=BwdParams(
+                        q_blocksize=bwd_block(qb),
+                        kv_blocksize=bwd_block(kb),
+                        num_warps=w,
+                        num_stages=max(2, s - 0),
+                    ),
+                    platform="triton",
+                    backend="gpu",
                 )
+            )
         return configs
 
     def candidate_cfgs_tpu(self, inv: Invocation[BlockSparseAttentionConfig, Array]):
-        """Generate TPU-optimized candidate configurations for autotuning.
+        """Generate TPU-optimized candidate configurations for autotuning (Pallas).
 
-        TPU/Pallas kernels benefit from larger blocks with fewer stages.
-
-        Args:
-            inv: Invocation object with arguments and metadata
-
-        Returns:
-            Iterable of TPU-optimized candidate configurations
+        Heuristics:
+        - Favor moderate Q blocks (32-128) and KV blocks (64-256)
+        - If sliding_window is set, prefer kv blocks ≲ window
+        - Backward tiles are smaller to save VMEM/regs
         """
-        configs = []
-        for q_block in [128, 256, 512, 1024]:
-            for kv_block in [128, 256, 512, 1024]:
-                configs.append(
-                    BlockSparseAttentionConfig(
-                        q_blocksize=q_block,
-                        kv_blocksize=kv_block,
-                        bwd_q_blocksize=min(q_block // 2, 128),
-                        bwd_kv_blocksize=min(kv_block // 2, 128),
+        q = inv.kwargs["query"]
+        k = inv.kwargs["key"]
+        head_dim = int(q.shape[-1])
+        q_len = int(q.shape[-2])
+        k_len = int(k.shape[-2])
+
+        sliding_window = inv.kwargs.get("sliding_window", None)
+        causal = bool(inv.kwargs.get("causal", True))
+
+        def window_total(sw):
+            if sw is None:
+                return None
+            if isinstance(sw, int):
+                right = 0 if causal else sw
+                return sw + right + 1
+            wl, wr = sw
+            return wl + wr + 1
+
+        win = window_total(sliding_window)
+
+        if head_dim <= 64:
+            q_opts = [32, 64, 96, 128]
+        elif head_dim <= 128:
+            q_opts = [32, 64, 128]
+        elif head_dim <= 192:
+            q_opts = [32, 64, 96]
+        else:
+            q_opts = [32, 48, 64]
+
+        base_kv = [64, 96, 128, 192, 256]
+        if win is not None:
+            target = max(64, min(256, 1 << (int(math.log2(max(32, win))) if win > 0 else 6)))
+            kv_opts = sorted(set([64, min(96, target), min(128, target), min(192, target), min(256, target)]))
+        else:
+            kv_opts = base_kv
+
+        if k_len < 128:
+            kv_opts = [x for x in kv_opts if x <= 128] or [64, 128]
+        if q_len < 128:
+            q_opts = [x for x in q_opts if x <= 128] or [64, 128]
+
+        def bwd_block(x: int, cap: int = 128) -> int:
+            return max(32, min(cap, x // 2 if x >= 64 else x))
+
+        hv_pairs = []
+        preferred = [(32, 128), (64, 128), (64, 192), (64, 256), (128, 128)]
+        if win is not None:
+            preferred.insert(0, (32, min(128, max(64, win))))
+        for qb, kb in preferred:
+            if qb in q_opts and kb in kv_opts:
+                hv_pairs.append((qb, kb))
+
+        grid_pairs = []
+        for qb in q_opts:
+            for kb in kv_opts:
+                if (qb, kb) not in hv_pairs:
+                    grid_pairs.append((qb, kb))
+
+        max_candidates = 16
+        pairs = []
+        seen = set()
+        for pair in hv_pairs + grid_pairs:
+            if pair in seen:
+                continue
+            seen.add(pair)
+            pairs.append(pair)
+            if len(pairs) >= max_candidates:
+                break
+
+        configs: list[BlockSparseAttentionConfig] = []
+        for qb, kb in pairs:
+            configs.append(
+                BlockSparseAttentionConfig(
+                    fwd_params=FwdParams(
+                        q_blocksize=qb,
+                        kv_blocksize=kb,
                         num_warps=None,
                         num_stages=None,
-                        platform="pallas",
-                        backend="tpu",
-                    )
+                    ),
+                    bwd_params=BwdParams(
+                        q_blocksize=bwd_block(qb),
+                        kv_blocksize=bwd_block(kb),
+                        num_warps=None,
+                        num_stages=None,
+                    ),
+                    platform="pallas",
+                    backend="tpu",
                 )
+            )
         return configs
 
     def candidate_cfgs_xla(self, inv: Invocation[BlockSparseAttentionConfig, Array]):
-        """Generate XLA-optimized candidate configurations for autotuning.
+        q = inv.kwargs["query"]
+        k = inv.kwargs["key"]
+        head_dim = int(q.shape[-1])
+        q_len = int(q.shape[-2])
+        k_len = int(k.shape[-2])
 
-        XLA implementations use medium blocks with moderate parallelism.
+        q_opts = [128, 192, 256] if head_dim <= 128 else [96, 128, 192]
+        kv_opts = [128, 192, 256]
+        if q_len < 192:
+            q_opts = [x for x in q_opts if x <= 128] or [128]
+        if k_len < 192:
+            kv_opts = [x for x in kv_opts if x <= 128] or [128]
 
-        Args:
-            inv: Invocation object with arguments and metadata
+        def bwd_block(x: int, cap: int = 128) -> int:
+            return max(32, min(cap, x // 2 if x >= 64 else x))
 
-        Returns:
-            Iterable of XLA-optimized candidate configurations
-        """
-        configs = []
-        for q_block in [256, 512]:
-            for kv_block in [256, 512]:
-                configs.append(
-                    BlockSparseAttentionConfig(
-                        q_blocksize=q_block,
-                        kv_blocksize=kv_block,
-                        bwd_q_blocksize=q_block * 2,
-                        bwd_kv_blocksize=kv_block * 2,
+        pairs = []
+        for qb in q_opts:
+            for kb in kv_opts:
+                pairs.append((qb, kb))
+
+        configs: list[BlockSparseAttentionConfig] = []
+        for qb, kb in pairs[:12]:
+            configs.append(
+                BlockSparseAttentionConfig(
+                    fwd_params=FwdParams(
+                        q_blocksize=qb,
+                        kv_blocksize=kb,
                         num_warps=4,
                         num_stages=2,
-                        platform="xla",
-                        backend="any",
-                    )
+                    ),
+                    bwd_params=BwdParams(
+                        q_blocksize=bwd_block(qb),
+                        kv_blocksize=bwd_block(kb),
+                        num_warps=4,
+                        num_stages=2,
+                    ),
+                    platform="xla",
+                    backend="any",
                 )
+            )
         return configs
 
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
@@ -507,8 +706,6 @@ def blocksparse_attention(
     | Int[Array, "batch num_heads seq_len kv_len"]
     | Int[Array, "batch 1 seq_len kv_len"]
     | None = None,
-    /,
-    *,
     sequence_parallelism_mesh_axis_name: str | None = None,
     logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,

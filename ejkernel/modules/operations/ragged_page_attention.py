@@ -493,6 +493,78 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         ]
         return candidates
 
+    def candidate_cfgs_tpu(self, inv: Invocation[RaggedPageAttentionConfig, Array]):
+        """Generate candidate configurations for autotuning on TPU (Pallas backend).
+
+        Heuristics:
+        - For small head_dim, larger BLOCK_M is fine (64-128).
+        - For large head_dim (>=160), prefer smaller BLOCK_M (32-64).
+        - More KV pages per block helps small page_size (<=32).
+        - Constrain S_block = page_size * num_kv_pages_per_block <= 256 to keep tiles reasonable.
+        """
+        kv = inv.kwargs["kv_pages"]
+        block_tables = inv.kwargs["block_tables"]
+
+        page_size = int(kv.shape[1])
+        pages_per_seq = int(block_tables.shape[1])
+        headroom = 128
+        seeds: list[tuple[int, int]] = [
+            (32, 2),
+            (64, 2),
+            (128, 2),
+            (32, 4),
+            (64, 4),
+            (128, 4),
+        ]
+
+        block_pairs: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+
+        def add(block_m: int, npages: int, *, require_headroom: bool = False):
+            if npages > pages_per_seq:
+                return
+            if require_headroom and page_size * npages > headroom:
+                return
+            key = (block_m, npages)
+            if key in seen:
+                return
+            seen.add(key)
+            block_pairs.append(key)
+
+        for m, p in seeds:
+            add(m, p)
+
+        add(16, 4)
+        add(48, 4)
+        if pages_per_seq >= 3:
+            add(32, 3)
+
+        if pages_per_seq >= 5:
+            add(32, 5, require_headroom=True)
+
+        if pages_per_seq >= 6:
+            add(32, 6, require_headroom=True)
+
+        if page_size == 16 and pages_per_seq >= 8:
+            add(32, 8)
+
+        if page_size == 32 and pages_per_seq >= 3:
+            add(32, 3, require_headroom=True)
+
+        candidates = [
+            RaggedPageAttentionConfig(
+                num_kv_pages_per_block=npages,
+                num_queries_per_block=block_m,
+                num_warps=None,
+                num_stages=None,
+                platform="pallas",
+                backend="tpu",
+            )
+            for (block_m, npages) in block_pairs
+        ]
+        return candidates
+
+    candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
 
 

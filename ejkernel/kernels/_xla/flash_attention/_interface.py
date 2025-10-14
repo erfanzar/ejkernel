@@ -24,6 +24,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int, PRNGKeyArray
 
 from ejkernel.callib._ejit import ejit
+from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_bwd import _flash_attention_bwd
@@ -278,8 +279,8 @@ def _flash_attention_core(
         "causal",
         "dropout_seed",
         "sliding_window",
-        "chunk_size_q",
-        "chunk_size_k",
+        "fwd_params",
+        "bwd_params",
         "logits_soft_cap",
         "normalize_output",
         "logits_dtype",
@@ -300,8 +301,8 @@ def flash_attention(
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
-    chunk_size_q: int = 128,
-    chunk_size_k: int = 128,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     normalize_output: bool = True,
@@ -362,8 +363,8 @@ def flash_attention(
         window_tuple,
         scale_val,
         logits_soft_cap,
-        int(chunk_size_q),
-        int(chunk_size_k),
+        int(fwd_params.q_blocksize),
+        int(fwd_params.kv_blocksize),
         bool(normalize_output),
         precision_code,
         logits_dtype_code,

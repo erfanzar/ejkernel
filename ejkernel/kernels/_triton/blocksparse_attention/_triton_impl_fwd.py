@@ -24,6 +24,7 @@ from jaxtyping import ArrayLike
 
 from ejkernel.callib import cdiv, next_power_of_2, strides_from_shape, triton_call
 from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask
+from ejkernel.ops import BwdParams, FwdParams
 
 from ._utilities import make_causal_mask, make_segment_mask, make_sliding_window_mask, pad_to_block_size
 
@@ -184,17 +185,6 @@ def _blocksparse_attn_fwd_inner(
     return acc, l, m
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=4, num_stages=4),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=4),
-    ],
-    key=["Q_SEQ_LEN", "KV_SEQ_LEN", "QK_HEAD_DIM", "V_HEAD_DIM", "BLOCK_M", "BLOCK_N"],
-)
 @triton.jit
 def blocksparse_attn_fwd(
     q,
@@ -517,8 +507,8 @@ def _fwd_blocksparse_attn_call(
     window_left: int = -1,
     window_right: int = -1,
     causal: bool = True,
-    q_blocksize: int = 64,
-    kv_blocksize: int = 64,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
 ) -> tuple[ArrayLike, Sequence[ArrayLike]]:
     if bias is not None:
@@ -563,11 +553,11 @@ def _fwd_blocksparse_attn_call(
     using_sequence_parallelism = sequence_parallelism_mesh_axis_name is not None
     if using_sequence_parallelism:
         query_chunk_idx = jax.lax.axis_index(sequence_parallelism_mesh_axis_name)
-        chex.assert_is_divisible(query_seq_len, q_blocksize)
+        chex.assert_is_divisible(query_seq_len, fwd_params.q_blocksize)
 
         if apply_load_balance:
             axis_size = jax.lax.psum(1, sequence_parallelism_mesh_axis_name)
-            query_global_offset_arange = jnp.zeros((query_seq_len // 2 // q_blocksize), dtype=jnp.int32)
+            query_global_offset_arange = jnp.zeros((query_seq_len // 2 // fwd_params.q_blocksize), dtype=jnp.int32)
             query_global_offset_first_part = query_chunk_idx * query_seq_len // 2 + query_global_offset_arange
             query_global_offset_second_part = (
                 2 * axis_size - query_chunk_idx - 1
@@ -579,16 +569,16 @@ def _fwd_blocksparse_attn_call(
             )
         else:
             query_global_offset = (
-                jnp.ones((query_seq_len // q_blocksize), dtype=jnp.int32) * query_chunk_idx * query_seq_len
+                jnp.ones((query_seq_len // fwd_params.q_blocksize), dtype=jnp.int32) * query_chunk_idx * query_seq_len
             )
     else:
-        query_global_offset = jnp.zeros((query_seq_len // q_blocksize), dtype=jnp.int32)
+        query_global_offset = jnp.zeros((query_seq_len // fwd_params.q_blocksize), dtype=jnp.int32)
 
     (query,), q_positions, q_segment_ids = pad_to_block_size(
         inputs=(query,),
         indexs=q_positions,
         segment_ids=q_segment_ids,
-        block_size=q_blocksize,
+        block_size=fwd_params.q_blocksize,
         pos_fill_value=-1,
         transposed_inputs=True,
     )
@@ -596,7 +586,7 @@ def _fwd_blocksparse_attn_call(
         inputs=(key, value),
         indexs=kv_positions,
         segment_ids=kv_segment_ids,
-        block_size=kv_blocksize,
+        block_size=fwd_params.kv_blocksize,
         pos_fill_value=jnp.iinfo(jnp.int32).max,
         transposed_inputs=True,
     )
@@ -604,7 +594,7 @@ def _fwd_blocksparse_attn_call(
     query_seq_len = query.shape[2]
     kv_seq_len = key.shape[2]
 
-    num_query_blocks = cdiv(orig_query_seq_len, q_blocksize)
+    num_query_blocks = cdiv(orig_query_seq_len, fwd_params.q_blocksize)
 
     grid = (num_query_blocks, batch_size * num_heads)
 
@@ -632,8 +622,8 @@ def _fwd_blocksparse_attn_call(
         QK_HEAD_DIM_PAD=qk_head_dim_pad,
         EVEN_QK_HEAD_DIMS=qk_head_dim_pad == qk_head_dim,
         V_HEAD_DIM=value_head_dim,
-        BLOCK_M=q_blocksize,
-        BLOCK_N=kv_blocksize,
+        BLOCK_M=fwd_params.q_blocksize,
+        BLOCK_N=fwd_params.kv_blocksize,
         IS_CONTEXT_PARALLELISM=using_sequence_parallelism,
         NUM_GROUPS=num_groups,
         WINDOW_LEFT=window_left,
@@ -642,6 +632,8 @@ def _fwd_blocksparse_attn_call(
         USE_SINKS=use_sinks,
         NUM_SINKS=num_sinks_val,
         SOFTCAP=softcap_flag,
+        num_stages=fwd_params.num_stages,
+        num_warps=fwd_params.num_warps,
     )
 
     out_shape = (batch_size, num_heads, query_seq_len, value_head_dim)

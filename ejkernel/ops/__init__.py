@@ -86,6 +86,8 @@ from .execution import (
 )
 from .registry import get_invocations, record_invocation
 from .utils import (
+    BwdParams,
+    FwdParams,
     abstractify,
     default_key_builder_with_sharding,
     device_fingerprint,
@@ -107,6 +109,7 @@ __all__ = (
     "AutotunePolicy",
     "Autotuner",
     "AutotuningResult",
+    "BwdParams",
     "Cfg",
     "ConfigCache",
     "ConfigChooser",
@@ -114,6 +117,7 @@ __all__ = (
     "Entry",
     "Executor",
     "FNAutotuner",
+    "FwdParams",
     "Invocation",
     "Kernel",
     "Measurement",

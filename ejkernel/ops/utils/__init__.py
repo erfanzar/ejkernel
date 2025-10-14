@@ -38,6 +38,7 @@ Functions:
     from_json: Deserialize object from JSON string
 """
 
+from .datacarrier import BwdParams, FwdParams
 from .fingerprint import (
     abstractify,
     default_key_builder_with_sharding,
@@ -52,6 +53,8 @@ from .meta import extract_labels_from_hlo_text, find_labels_in_lowered, label, l
 from .serialize import from_json, to_json
 
 __all__ = (
+    "BwdParams",
+    "FwdParams",
     "abstractify",
     "default_key_builder_with_sharding",
     "device_fingerprint",

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Literal
 
@@ -36,6 +37,7 @@ from ejkernel.ops import (
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
 
 from ..base import detect_platform
 from .configs import FlashAttentionConfig
@@ -255,10 +257,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
 
         if platform is not None:
             cfg = FlashAttentionConfig(
-                chunk_size_q=cfg.chunk_size_q,
-                chunk_size_k=cfg.chunk_size_k,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
+                fwd_params=cfg.fwd_params,
+                bwd_params=cfg.bwd_params,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
@@ -283,8 +283,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             logits_dtype=logits_dtype,
             q_segment_ids=q_segment_ids,
             kv_segment_ids=kv_segment_ids,
-            chunk_size_q=cfg.chunk_size_q,
-            chunk_size_k=cfg.chunk_size_k,
+            fwd_params=cfg.fwd_params,
+            bwd_params=cfg.bwd_params,
         )
 
     def heuristic_cfg(self, inv: Invocation[FlashAttentionConfig, Array]) -> FlashAttentionConfig:
@@ -300,10 +300,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         """
 
         return FlashAttentionConfig(
-            chunk_size_q=128,
-            chunk_size_k=128,
-            num_warps=4,
-            num_stages=2,
+            fwd_params=FwdParams(q_blocksize=128, kv_blocksize=128, num_warps=4, num_stages=2),
+            bwd_params=BwdParams(q_blocksize=64, kv_blocksize=64, num_warps=4, num_stages=2),
             platform="auto",
             backend="any",
         )
@@ -336,8 +334,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         for chunk_q, chunk_k in block_configs:
             candidates.append(
                 FlashAttentionConfig(
-                    chunk_size_q=chunk_q,
-                    chunk_size_k=chunk_k,
+                    fwd_params=FwdParams(q_blocksize=chunk_q, kv_blocksize=chunk_k, num_warps=4, num_stages=2),
+                    bwd_params=BwdParams(q_blocksize=chunk_q // 2, kv_blocksize=chunk_k // 2, num_warps=4, num_stages=2),
                     num_warps=4,
                     num_stages=2,
                     platform="auto",
@@ -348,82 +346,300 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[FlashAttentionConfig, Array]):
-        """Generate GPU-optimized candidate configurations for autotuning.
+        """Generate GPU-optimized candidate configurations for autotuning (Triton).
 
-        GPU/Triton kernels benefit from smaller blocks with more warps and stages.
-
-        Args:
-            inv: Invocation object with arguments and metadata
-
-        Returns:
-            Iterable of GPU-optimized candidate configurations
+        Heuristics:
+        - q/kv blocks adapt to head_dim and sequence lengths.
+        - If sliding_window is set, kv blocks are capped near the window span.
+        - num_warps: 2-8 based on head_dim and block sizes.
+        - num_stages: 2-3 (kept low to reduce SMEM pressure).
+        - Conservative shared-memory guard to avoid CUDA errors.
+        - Backward blocks smaller to reduce register pressure.
         """
-        configs = []
 
-        for chunk_q in [32, 64, 128]:
-            for chunk_k in [32, 64, 128]:
-                configs.append(
-                    FlashAttentionConfig(
-                        chunk_size_q=chunk_q,
-                        chunk_size_k=chunk_k,
-                        num_warps=None,
-                        num_stages=None,
-                        platform="triton",
-                        backend="gpu",
-                    )
+        q = inv.kwargs["query"]
+        k = inv.kwargs["key"]
+        head_dim = int(q.shape[-1])
+        q_len = int(q.shape[-2])
+        k_len = int(k.shape[-2])
+        dtype = q.dtype
+
+        sliding_window = inv.kwargs.get("sliding_window", None)
+        causal = bool(inv.kwargs.get("causal", True))
+
+        def window_total(sw):
+            if sw is None:
+                return None
+            if isinstance(sw, int):
+                right = 0 if causal else sw
+                return sw + right + 1
+            wl, wr = sw
+            return wl + wr + 1
+
+        win = window_total(sliding_window)
+
+        smem_limit = int(os.getenv("EJKERNEL_TRITON_SMEM_LIMIT", str(99 * 1024)))
+
+        def next_pow2_ge(x: int, min_val: int = 16) -> int:
+            return max(min_val, 1 << math.ceil(math.log2(max(1, x))))
+
+        block_headdim = next_pow2_ge(head_dim, 16)
+        elem_bytes = 2 if dtype in (jnp.float16, jnp.bfloat16) else 4
+
+        def smem_est_bytes(qb: int, kb: int, num_stages: int) -> int:
+            kv_bytes = 2 * kb * block_headdim * elem_bytes
+            q_bytes = int(0.25 * qb * block_headdim * elem_bytes)
+            base = kv_bytes + q_bytes
+            stage_factor = 1.0 + 0.5 * max(0, num_stages - 2)
+            fudge = 2.5
+            return int(base * stage_factor * fudge)
+
+        if head_dim <= 64:
+            q_opts = [32, 64, 96, 128]
+        elif head_dim <= 128:
+            q_opts = [32, 64, 128, 192]
+        elif head_dim <= 192:
+            q_opts = [32, 64, 96, 128]
+        else:
+            q_opts = [32, 48, 64, 96]
+
+        base_kv = [32, 64, 96, 128, 192, 256]
+        if win is not None:
+            target = max(32, min(256, 1 << (int(math.log2(max(32, win))) if win > 0 else 5)))
+            kv_opts = sorted(set([32, 64, min(96, target), min(128, target), min(192, target), min(256, target)]))
+        else:
+            kv_opts = base_kv
+
+        if k_len < 128:
+            kv_opts = [x for x in kv_opts if x <= 128] or [64, 128]
+        if q_len < 128:
+            q_opts = [x for x in q_opts if x <= 128] or [64, 128]
+
+        def pick_warps_stages(qb: int, kb: int, dh: int) -> tuple[int, int]:
+            if dh <= 64:
+                warps = 2 if max(qb, kb) <= 64 else 4
+            elif dh <= 128:
+                warps = 4 if max(qb, kb) <= 128 else 8
+            else:
+                warps = 8 if max(qb, kb) >= 128 else 4
+
+            stages = 3 if kb >= 128 else 2
+            return warps, stages
+
+        def bwd_block(x: int, cap: int = 128) -> int:
+            return max(32, min(cap, x // 2 if x >= 64 else x))
+
+        hv_pairs = []
+        preferred = [(64, 64), (128, 64), (64, 128), (128, 128)]
+        if win is not None:
+            preferred.insert(0, (64, min(128, max(64, win))))
+            preferred.insert(0, (32, min(128, max(64, win))))
+        for qb, kb in preferred:
+            if qb in q_opts and kb in kv_opts:
+                hv_pairs.append((qb, kb))
+
+        grid_pairs = []
+        for qb in q_opts:
+            for kb in kv_opts:
+                if (qb, kb) not in hv_pairs:
+                    grid_pairs.append((qb, kb))
+
+        max_candidates = 18
+        pairs = []
+        seen = set()
+        for qb, kb in hv_pairs + grid_pairs:
+            if (qb, kb) in seen:
+                continue
+            w, s = pick_warps_stages(qb, kb, head_dim)
+            if smem_est_bytes(qb, kb, s) <= smem_limit:
+                seen.add((qb, kb))
+                pairs.append((qb, kb, w, s))
+                if len(pairs) >= max_candidates:
+                    break
+
+        if not pairs:
+            qb, kb = 64, 64
+            w, s = pick_warps_stages(qb, kb, head_dim)
+            pairs = [(qb, kb, w, s)]
+
+        configs: list[FlashAttentionConfig] = []
+        for qb, kb, w, s in pairs:
+            configs.append(
+                FlashAttentionConfig(
+                    fwd_params=FwdParams(q_blocksize=qb, kv_blocksize=kb, num_warps=w, num_stages=s),
+                    bwd_params=BwdParams(q_blocksize=bwd_block(qb), kv_blocksize=bwd_block(kb)),
+                    platform="triton",
+                    backend="gpu",
                 )
+            )
         return configs
 
     def candidate_cfgs_tpu(self, inv: Invocation[FlashAttentionConfig, Array]):
-        """Generate TPU-optimized candidate configurations for autotuning.
+        """Generate TPU-optimized candidate configurations for autotuning (Pallas).
 
-        TPU/Pallas kernels benefit from larger blocks with fewer stages.
-
-        Args:
-            inv: Invocation object with arguments and metadata
-
-        Returns:
-            Iterable of TPU-optimized candidate configurations
+        Heuristics:
+        - Favor moderate Q blocks (32-128) and KV blocks (64-256/384/512).
+        - If sliding_window is set, prefer kv blocks ≲ window span.
+        - Slightly smaller backward blocks to reduce VMEM/regs.
+        - Keep the candidate list compact and ordered for fast convergence.
         """
-        configs = []
-        for chunk_q in [128, 256, 512]:
-            for chunk_k in [128, 256, 512]:
-                configs.append(
-                    FlashAttentionConfig(
-                        chunk_size_q=chunk_q,
-                        chunk_size_k=chunk_k,
-                        num_warps=None,
-                        num_stages=None,
-                        platform="pallas",
-                        backend="tpu",
-                    )
+
+        q = inv.kwargs["query"]
+        k = inv.kwargs["key"]
+        q_len = int(q.shape[-2])
+        k_len = int(k.shape[-2])
+
+        sliding_window = inv.kwargs.get("sliding_window", None)
+        causal = bool(inv.kwargs.get("causal", True))
+
+        def win_span(sw):
+            if sw is None:
+                return None
+            if isinstance(sw, int):
+                right = 0 if causal else sw
+                return sw + right + 1
+            wl, wr = sw
+            return wl + wr + 1
+
+        def round128(x: int | float) -> int:
+            return 128 * max(1, round(float(x) / 128.0))
+
+        win = win_span(sliding_window)
+
+        q_opts = [128, 256]
+        kv_opts = [128, 256, 384, 512]
+
+        if win is not None:
+            target = max(128, min(512, round128(win)))
+            kv_opts = sorted(set([*kv_opts, target, min(512, 2 * target)]))
+
+        if q_len < 256:
+            q_opts = [x for x in q_opts if x <= 256] or [128]
+        if k_len < 256:
+            kv_opts = [x for x in kv_opts if x <= 256] or [128, 256]
+
+        def bwd_tile(_x: int) -> int:
+            return 128
+
+        hv_pairs: list[tuple[int, int]] = []
+        if win is not None:
+            t1 = max(128, min(512, round128(win)))
+            hv_pairs += [(128, t1), (256, t1), (128, min(512, 2 * t1))]
+        hv_pairs += [(128, 128), (128, 256), (256, 256), (256, 384)]
+
+        selected: list[tuple[int, int]] = []
+        seen = set()
+        for qb, kb in hv_pairs:
+            if qb in q_opts and kb in kv_opts and (qb, kb) not in seen:
+                selected.append((qb, kb))
+                seen.add((qb, kb))
+
+        for qb in q_opts:
+            for kb in kv_opts:
+                if (qb, kb) not in seen:
+                    selected.append((qb, kb))
+                    seen.add((qb, kb))
+                if len(selected) >= 16:
+                    break
+            if len(selected) >= 16:
+                break
+
+        configs: list[FlashAttentionConfig] = []
+        for qb, kb in selected:
+            configs.append(
+                FlashAttentionConfig(
+                    fwd_params=FwdParams(q_blocksize=qb, kv_blocksize=kb, num_warps=None, num_stages=None),
+                    bwd_params=BwdParams(
+                        q_blocksize=bwd_tile(qb), kv_blocksize=bwd_tile(kb), num_warps=None, num_stages=None
+                    ),
+                    platform="pallas",
+                    backend="tpu",
                 )
+            )
         return configs
 
     def candidate_cfgs_xla(self, inv: Invocation[FlashAttentionConfig, Array]):
         """Generate XLA-optimized candidate configurations for autotuning.
 
-        XLA implementations use medium blocks with moderate parallelism.
-
-        Args:
-            inv: Invocation object with arguments and metadata
-
-        Returns:
-            Iterable of XLA-optimized candidate configurations
+        Heuristics:
+        - Medium blocks (128-256; optionally 192) tend to be robust.
+        - If sliding_window is set, keep kv blocks near window span.
+        - Backward tiles are smaller.
+        - Keep list small and ordered by likely winners.
         """
-        configs = []
-        for chunk_q in [128, 256]:
-            for chunk_k in [128, 256]:
-                configs.append(
-                    FlashAttentionConfig(
-                        chunk_size_q=chunk_q,
-                        chunk_size_k=chunk_k,
-                        num_warps=None,
-                        num_stages=None,
-                        platform="xla",
-                        backend="any",
-                    )
+
+        q = inv.kwargs["query"]
+        k = inv.kwargs["key"]
+        q_len = int(q.shape[-2])
+        k_len = int(k.shape[-2])
+
+        sliding_window = inv.kwargs.get("sliding_window", None)
+        causal = bool(inv.kwargs.get("causal", True))
+
+        def win_span(sw):
+            if sw is None:
+                return None
+            if isinstance(sw, int):
+                right = 0 if causal else sw
+                return sw + right + 1
+            wl, wr = sw
+            return wl + wr + 1
+
+        def round128(x: int | float) -> int:
+            return 128 * max(1, round(float(x) / 128.0))
+
+        win = win_span(sliding_window)
+
+        q_opts = [128, 256]
+        kv_opts = [128, 256, 384]
+
+        if win is not None:
+            target = max(128, min(384, round128(win)))
+            kv_opts = sorted(set([*kv_opts, target, min(384, 2 * target)]))
+
+        if q_len < 256:
+            q_opts = [x for x in q_opts if x <= 256] or [128]
+        if k_len < 256:
+            kv_opts = [x for x in kv_opts if x <= 256] or [128, 256]
+
+        def bwd_tile(_x: int) -> int:
+            return 128
+
+        hv_pairs: list[tuple[int, int]] = []
+        if win is not None:
+            t1 = max(128, min(384, round128(win)))
+            hv_pairs += [(128, t1), (256, t1)]
+        hv_pairs += [(128, 128), (128, 256), (256, 256), (256, 128)]
+
+        selected: list[tuple[int, int]] = []
+        seen = set()
+        for qb, kb in hv_pairs:
+            if qb in q_opts and kb in kv_opts and (qb, kb) not in seen:
+                selected.append((qb, kb))
+                seen.add((qb, kb))
+
+        for qb in q_opts:
+            for kb in kv_opts:
+                if (qb, kb) not in seen:
+                    selected.append((qb, kb))
+                    seen.add((qb, kb))
+                if len(selected) >= 12:
+                    break
+            if len(selected) >= 12:
+                break
+
+        configs: list[FlashAttentionConfig] = []
+        for qb, kb in selected:
+            configs.append(
+                FlashAttentionConfig(
+                    fwd_params=FwdParams(q_blocksize=qb, kv_blocksize=kb, num_warps=None, num_stages=None),
+                    bwd_params=BwdParams(
+                        q_blocksize=bwd_tile(qb), kv_blocksize=bwd_tile(kb), num_warps=None, num_stages=None
+                    ),
+                    platform="xla",
+                    backend="any",
                 )
+            )
         return configs
 
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu

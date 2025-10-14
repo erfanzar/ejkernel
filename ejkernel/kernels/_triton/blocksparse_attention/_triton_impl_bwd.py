@@ -22,6 +22,7 @@ from jaxtyping import ArrayLike
 
 from ejkernel.callib import cdiv, next_power_of_2, strides_from_shape, triton_call
 from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask
+from ejkernel.ops import BwdParams, FwdParams
 
 from ._utilities import make_causal_mask, make_segment_mask
 
@@ -367,17 +368,6 @@ def _blocksparse_attn_bwd_dq_inner(
     return dq
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=4, num_stages=4),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=4),
-    ],
-    key=["Q_SEQ_LEN", "KV_SEQ_LEN", "QK_HEAD_DIM", "V_HEAD_DIM", "BLOCK_M", "BLOCK_N"],
-)
 @triton.jit
 def blocksparse_attn_bwd_dq(
     q,
@@ -620,17 +610,6 @@ def blocksparse_attn_bwd_dq(
         )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=4, num_stages=4),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=4),
-    ],
-    key=["Q_SEQ_LEN", "KV_SEQ_LEN", "QK_HEAD_DIM", "V_HEAD_DIM", "BLOCK_M", "BLOCK_N"],
-)
 @triton.jit
 def blocksparse_attn_bwd_dkdv(
     q,
@@ -1112,10 +1091,8 @@ def _bwd_blocksparse_attn_call(
     window_left: int,
     window_right: int,
     causal: bool,
-    q_blocksize: int,
-    kv_blocksize: int,
-    bwd_q_blocksize: int,
-    bwd_kv_blocksize: int,
+    fwd_params: FwdParams,
+    bwd_params: BwdParams,
     logits_soft_cap: float | None,
     res: ArrayLike,
     dout: ArrayLike,
@@ -1137,10 +1114,10 @@ def _bwd_blocksparse_attn_call(
     qkv_layouts: tuple[SparseMask]
     dout = dout.transpose(0, 2, 1, 3)
 
-    BLOCK_M_DKDV = bwd_q_blocksize
-    BLOCK_N_DKDV = bwd_kv_blocksize
-    BLOCK_M_DQ = bwd_q_blocksize
-    BLOCK_N_DQ = bwd_kv_blocksize
+    BLOCK_M_DKDV = bwd_params.q_blocksize
+    BLOCK_N_DKDV = bwd_params.kv_blocksize
+    BLOCK_M_DQ = bwd_params.q_blocksize
+    BLOCK_N_DQ = bwd_params.kv_blocksize
 
     chex.assert_rank([query, key, value, out, dout], 4)
 
@@ -1150,9 +1127,9 @@ def _bwd_blocksparse_attn_call(
 
     num_groups = num_heads // num_kv_heads
 
-    chex.assert_is_divisible(query_seq_len, bwd_q_blocksize)
-    chex.assert_is_divisible(kv_seq_len, bwd_kv_blocksize)
-    chex.assert_is_divisible(kv_seq_len, bwd_kv_blocksize)
+    chex.assert_is_divisible(query_seq_len, bwd_params.q_blocksize)
+    chex.assert_is_divisible(kv_seq_len, bwd_params.kv_blocksize)
+    chex.assert_is_divisible(kv_seq_len, bwd_params.kv_blocksize)
 
     num_query_blocks = query_seq_len // BLOCK_M_DQ
     num_kv_blocks = kv_seq_len // BLOCK_N_DKDV
@@ -1250,6 +1227,8 @@ def _bwd_blocksparse_attn_call(
         V_HEAD_DIM=value_head_dim,
         NUM_GROUPS=num_groups,
         SOFTCAP=softcap_flag,
+        num_stages=bwd_params.num_stages,
+        num_warps=bwd_params.num_warps,
     )
 
     dk_shape = (batch_size, num_kv_heads, kv_seq_len, qk_head_dim)

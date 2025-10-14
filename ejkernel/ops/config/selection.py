@@ -57,6 +57,7 @@ Example Usage:
 from __future__ import annotations
 
 import os
+import pprint
 import time
 import traceback
 from collections.abc import Iterable
@@ -200,20 +201,15 @@ class Tuner(Generic[Cfg]):
                 dtype = getattr(aval, "dtype", None)
             if shape is not None and dtype is not None:
                 return jnp.zeros(shape, dtype)
-            try:
-                return jnp.asarray(x)
-            except Exception as e:
-                raise TypeError(f"Cannot convert argument to concrete array for autotune: {type(x)}") from e
+            return jnp.asarray(x)
 
         def _block_all(x):
             return jtu.tree_map(lambda t: t.block_until_ready() if hasattr(t, "block_until_ready") else t, x)
 
-        full_tree = (args, kwargs)
-        leaves, treedef = jtu.tree_flatten(full_tree)
+        leaves, treedef = jtu.tree_flatten((args, kwargs))
         is_arr = [_is_arrayish(x) for x in leaves]
         const_leaves = [None if m else x for m, x in zip(is_arr, leaves, strict=False)]
         arr_leaves = [x for m, x in zip(is_arr, leaves, strict=False) if m]
-
         arr0 = tuple(_to_concrete(x) for x in arr_leaves)
 
         def _restore_args_kwargs(array_leaves):
@@ -221,7 +217,11 @@ class Tuner(Generic[Cfg]):
             merged = [next(it) if m else v for m, v in zip(is_arr, const_leaves, strict=False)]
             return jtu.tree_unflatten(treedef, merged)
 
+        method = getattr(fn, "_ejk_method", "regular")
         validate_bwd = bool(getattr(fn, "_ejk_validate_backward", False))
+
+        if method == "shard_map" and not getattr(fn, "_ejk_validate_backward", False):
+            validate_bwd = False
 
         def _time_forward(jitted: bool = True) -> float:
             def core(*arrs):
@@ -255,7 +255,6 @@ class Tuner(Generic[Cfg]):
 
             diff_mask = [_is_diff(x) for x in arr0]
             has_diff = any(diff_mask)
-
             if not has_diff:
                 try:
                     return _time_forward(jitted=True)
@@ -270,8 +269,7 @@ class Tuner(Generic[Cfg]):
 
             def _merge(theta, nondiff):
                 it_t, it_n = iter(theta), iter(nondiff)
-                out = [next(it_t) if m else next(it_n) for m in diff_mask]
-                return tuple(out)
+                return tuple(next(it_t) if m else next(it_n) for m in diff_mask)
 
             def loss(theta, nondiff):
                 arrs = _merge(theta, nondiff)
@@ -291,12 +289,11 @@ class Tuner(Generic[Cfg]):
                 return (time.perf_counter() - t0) / self.iters
             except Exception as e:
                 msg = str(e)
-                if "Cannot apply JAX transformations" in msg or "lowered and compiled" in msg:
+                if ("Cannot apply JAX transformations" in msg) or ("Leaked trace" in msg):
                     try:
                         return _time_forward(jitted=True)
                     except Exception:
                         return _time_forward(jitted=False)
-
                 raise
 
         try:
@@ -328,7 +325,7 @@ class Tuner(Generic[Cfg]):
             try:
                 t = self.measure(make_fn(cfg), *args, **kwargs)
                 if os.getenv("EJKERNEL_LOG_AUTOTUNE", "0") == "1":
-                    print(cfg, t)
+                    pprint.pprint({"config": cfg, "time": t})
             except Exception as e:
                 last_err = e
                 continue
@@ -338,7 +335,7 @@ class Tuner(Generic[Cfg]):
             traceback.print_exception(last_err)
             raise RuntimeError(f"All candidates failed during autotune: {last_err}")
         if os.getenv("EJKERNEL_LOG_AUTOTUNE", "0") == "1":
-            print("Best Config", best_cfg, "Best Time", best_t)
+            pprint.pprint({"best_config": best_cfg, "best_time": best_t})
         return best_cfg
 
 
@@ -499,7 +496,9 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                         )
                         return shard_map_fn(*call_args)
 
-                    if self.policy.validate_backward:
+                    f._ejk_method = "shard_map"
+
+                    if self.policy.validate_backward and getattr(kernel, "supports_grad_validation", False):
                         f._ejk_validate_backward = True
                     return f
             else:
@@ -509,6 +508,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                     def f(*a, **k):
                         return _run(*a, cfg=c, **(k | _static))
 
+                    f._ejk_method = "regular"
                     if self.policy.validate_backward:
                         f._ejk_validate_backward = True
                     return f

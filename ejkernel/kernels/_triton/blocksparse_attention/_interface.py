@@ -85,6 +85,7 @@ from jaxtyping import Array, ArrayLike, Bool, Float, Int
 
 from ejkernel.callib import ejit
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
+from ejkernel.ops import BwdParams, FwdParams
 
 from ._mask import SparseMask, create_sparsity_mask
 from ._triton_impl_bwd import _bwd_blocksparse_attn_call
@@ -94,7 +95,7 @@ if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=[8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
+@functools.partial(jax.custom_vjp, nondiff_argnums=[8, 11, 12, 13, 14, 15, 16, 17, 18])
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -105,10 +106,8 @@ if typing.TYPE_CHECKING:
         "window_left",
         "window_right",
         "causal",
-        "q_blocksize",
-        "kv_blocksize",
-        "bwd_q_blocksize",
-        "bwd_kv_blocksize",
+        "fwd_params",
+        "bwd_params",
         "logits_soft_cap",
     ],
 )
@@ -129,10 +128,8 @@ def _blocksparse_attention_bhtd(
     window_left: int = -1,
     window_right: int = -1,
     causal: bool = True,
-    q_blocksize: int = 64,
-    kv_blocksize: int = 64,
-    bwd_q_blocksize: int = 64,
-    bwd_kv_blocksize: int = 64,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
 ) -> ArrayLike:
     """Internal JIT-compiled block-sparse attention with custom VJP.
@@ -158,10 +155,6 @@ def _blocksparse_attention_bhtd(
         window_left: Left window size for sliding window attention (-1 for no limit).
         window_right: Right window size for sliding window attention (-1 for no limit).
         causal: Whether to apply causal masking.
-        q_blocksize: Query block size for forward pass.
-        kv_blocksize: Key/value block size for forward pass.
-        bwd_q_blocksize: Query block size for backward pass.
-        bwd_kv_blocksize: Key/value block size for backward pass.
         logits_soft_cap: Optional soft capping value for attention logits.
 
     Returns:
@@ -184,8 +177,7 @@ def _blocksparse_attention_bhtd(
         window_left=window_left,
         window_right=window_right,
         causal=causal,
-        q_blocksize=q_blocksize,
-        kv_blocksize=kv_blocksize,
+        fwd_params=fwd_params,
         logits_soft_cap=logits_soft_cap,
     )[0]
 
@@ -209,10 +201,8 @@ def _blocksparse_attention_bhtd_fwd(
     window_left: int,
     window_right: int,
     causal: bool,
-    q_blocksize: int,
-    kv_blocksize: int,
-    bwd_q_blocksize: int,
-    bwd_kv_blocksize: int,
+    fwd_params: FwdParams,
+    bwd_params: BwdParams,
     logits_soft_cap: float | None,
 ):
     """Forward pass for block-sparse attention in custom VJP.
@@ -238,10 +228,6 @@ def _blocksparse_attention_bhtd_fwd(
         window_left: Left window size.
         window_right: Right window size.
         causal: Whether to apply causal masking.
-        q_blocksize: Query block size.
-        kv_blocksize: Key/value block size.
-        bwd_q_blocksize: Backward query block size.
-        bwd_kv_blocksize: Backward key/value block size.
         logits_soft_cap: Optional soft capping value.
 
     Returns:
@@ -264,8 +250,7 @@ def _blocksparse_attention_bhtd_fwd(
         window_left=window_left,
         window_right=window_right,
         causal=causal,
-        q_blocksize=q_blocksize,
-        kv_blocksize=kv_blocksize,
+        fwd_params=fwd_params,
         logits_soft_cap=logits_soft_cap,
     )
 
@@ -277,10 +262,8 @@ def _blocksparse_attention_bhtd_bwd(
     window_left: int,
     window_right: int,
     causal: bool,
-    q_blocksize: int,
-    kv_blocksize: int,
-    bwd_q_blocksize: int,
-    bwd_kv_blocksize: int,
+    fwd_params: FwdParams,
+    bwd_params: BwdParams,
     logits_soft_cap: float | None,
     res: ArrayLike,
     dout: ArrayLike,
@@ -299,10 +282,6 @@ def _blocksparse_attention_bhtd_bwd(
         window_left: Left window size (non-differentiable).
         window_right: Right window size (non-differentiable).
         causal: Causal masking flag (non-differentiable).
-        q_blocksize: Query block size (non-differentiable).
-        kv_blocksize: Key/value block size (non-differentiable).
-        bwd_q_blocksize: Backward query block size (non-differentiable).
-        bwd_kv_blocksize: Backward key/value block size (non-differentiable).
         logits_soft_cap: Soft capping value (non-differentiable).
         res: Residuals from forward pass containing intermediate values.
         dout: Gradient of loss with respect to the output.
@@ -319,10 +298,8 @@ def _blocksparse_attention_bhtd_bwd(
         window_left=window_left,
         window_right=window_right,
         causal=causal,
-        q_blocksize=q_blocksize,
-        kv_blocksize=kv_blocksize,
-        bwd_q_blocksize=bwd_q_blocksize,
-        bwd_kv_blocksize=bwd_kv_blocksize,
+        fwd_params=fwd_params,
+        bwd_params=bwd_params,
         logits_soft_cap=logits_soft_cap,
         res=res,
         dout=dout,
@@ -341,10 +318,8 @@ _blocksparse_attention_bhtd.defvjp(_blocksparse_attention_bhtd_fwd, _blocksparse
         "chunk_size",
         "causal",
         "fused_backward",
-        "q_blocksize",
-        "kv_blocksize",
-        "bwd_q_blocksize",
-        "bwd_kv_blocksize",
+        "fwd_params",
+        "bwd_params",
         "logits_soft_cap",
     )
 )
@@ -367,11 +342,9 @@ def blocksparse_attention(
     sequence_parallelism_mesh_axis_name: str | None = None,
     logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,
-    q_blocksize: int | None = None,
-    kv_blocksize: int | None = None,
-    bwd_q_blocksize: int | None = None,
-    bwd_kv_blocksize: int | None = None,
     softmax_scale: float | None = None,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     mask_builder: typing.Callable[[int, int, int, int, int], "Mask"] | typing.Callable[[], "SparseMask"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
@@ -404,10 +377,6 @@ def blocksparse_attention(
             This prevents attention scores from becoming too large, improving numerical
             stability (Gemma-2 style). Gradients are computed with proper Jacobian.
         qkv_layouts: Optional pre-computed attention mask layouts
-        q_blocksize: Forward pass query block size (default: 64)
-        kv_blocksize: Forward pass key/value block size (default: 64)
-        bwd_q_blocksize: Backward pass query block size (default: 64)
-        bwd_kv_blocksize: Backward pass key/value block size (default: 64)
         softmax_scale: Attention score scaling factor (default: 1/sqrt(head_dim))
         mask_builder: Function to build custom sparse mask patterns
         sliding_window: Window size for local attention, int for symmetric or (left, right) tuple
@@ -429,14 +398,10 @@ def blocksparse_attention(
     if mask_builder is not None and qkv_layouts is None:
         qkv_layouts = mask_builder()
 
-    if q_blocksize is None:
-        q_blocksize = 64
-    if kv_blocksize is None:
-        kv_blocksize = q_blocksize
-    if bwd_q_blocksize is None:
-        bwd_q_blocksize = 64
-    if bwd_kv_blocksize is None:
-        bwd_kv_blocksize = bwd_q_blocksize
+    if fwd_params is None:
+        fwd_params = FwdParams(q_blocksize=64, kv_blocksize=64, num_stages=2, num_warps=4)
+    if bwd_params is None:
+        bwd_params = BwdParams(q_blocksize=32, kv_blocksize=32, num_stages=2, num_warps=4)
 
     if sliding_window is None:
         window_left = window_right = -1
@@ -464,8 +429,8 @@ def blocksparse_attention(
         kv_segment_ids = jax.numpy.ones_like(kv_positions)
     if qkv_layouts is None:
         qkv_layouts = create_sparsity_mask(
-            q_blocksize=q_blocksize,
-            kv_blocksize=kv_blocksize,
+            q_blocksize=fwd_params.q_blocksize,
+            kv_blocksize=fwd_params.kv_blocksize,
             kv_positions=kv_positions,
             kv_segment_ids=kv_segment_ids,
             q_positions=q_positions,
@@ -491,9 +456,7 @@ def blocksparse_attention(
         window_left=window_left,
         window_right=window_right,
         causal=causal,
-        q_blocksize=q_blocksize,
-        kv_blocksize=kv_blocksize,
-        bwd_q_blocksize=bwd_q_blocksize,
-        bwd_kv_blocksize=bwd_kv_blocksize,
+        fwd_params=fwd_params,
+        bwd_params=bwd_params,
         logits_soft_cap=logits_soft_cap,
     )

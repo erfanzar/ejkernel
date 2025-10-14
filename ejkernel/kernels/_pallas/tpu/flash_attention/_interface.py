@@ -23,6 +23,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
 from ejkernel.callib import ejit
+from ejkernel.ops.utils.datacarrier import BwdParams, FwdParams
 
 from ...._registry import Backend, Platform, kernel_registry
 from ._pallas_impl_bwd import _flash_attention_bwd
@@ -41,8 +42,8 @@ from ._utils import BlockSizes, SegmentIds
         "logits_dtype",
         "precision",
         "normalize_output",
-        "chunk_size_q",
-        "chunk_size_k",
+        "fwd_params",
+        "bwd_params",
     ]
 )
 @jaxtyping.jaxtyped(typechecker=beartype)
@@ -59,8 +60,8 @@ def flash_attention(
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
-    chunk_size_q: int = 128,
-    chunk_size_k: int = 128,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     normalize_output: bool = True,
@@ -127,17 +128,17 @@ def flash_attention(
             )
         segment_ids = SegmentIds(q=q_segment_ids, kv=kv_segment_ids)
     block_sizes = BlockSizes(
-        block_q=chunk_size_q,
-        block_k_major=chunk_size_k,
-        block_k=chunk_size_k,
+        block_q=fwd_params.q_blocksize,
+        block_k_major=fwd_params.kv_blocksize,
+        block_k=fwd_params.kv_blocksize,
         block_b=1,
-        block_q_major_dkv=chunk_size_q,
-        block_k_major_dkv=chunk_size_k,
-        block_k_dkv=chunk_size_k,
-        block_q_dkv=chunk_size_q,
-        block_k_major_dq=chunk_size_k,
-        block_k_dq=chunk_size_k,
-        block_q_dq=chunk_size_q,
+        block_q_major_dkv=bwd_params.q_blocksize,
+        block_k_major_dkv=bwd_params.kv_blocksize,
+        block_k_dkv=bwd_params.kv_blocksize,
+        block_q_dkv=bwd_params.q_blocksize,
+        block_k_major_dq=bwd_params.kv_blocksize,
+        block_k_dq=bwd_params.kv_blocksize,
+        block_q_dq=bwd_params.q_blocksize,
     )
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
