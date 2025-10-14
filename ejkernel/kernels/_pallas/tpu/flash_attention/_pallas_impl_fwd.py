@@ -55,7 +55,7 @@ def _flash_attention_fwd(
         v,
         ab,
         segment_ids,
-        save_residuals,
+        True,
         causal,
         softmax_scale,
         block_sizes.block_b,

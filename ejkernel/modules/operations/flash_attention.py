@@ -656,7 +656,7 @@ _flash_executor: Executor[FlashAttentionConfig, Array] = Executor(
             validate_backward=True,
         ),
         tuner=Tuner(warmup=5, iters=100),
-        persistent=PersistentCache("flash-attn"),
+        persistent=PersistentCache("flash-attn", cfg_type=FlashAttentionConfig),
     )
 )
 

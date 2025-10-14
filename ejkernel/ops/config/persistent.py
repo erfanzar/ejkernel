@@ -83,6 +83,7 @@ class PersistentCache(Generic[Cfg]):
         path: str | None = None,
         loader: Callable[[Any], Cfg] | None = None,
         dumper: Callable[[Cfg], Any] | None = None,
+        cfg_type: type[Cfg] | None = None,
     ):
         """Initialize persistent cache with file path and optional serializers.
 
@@ -103,6 +104,7 @@ class PersistentCache(Generic[Cfg]):
         self.path = path
         self.loader = loader
         self.dumper = dumper
+        self.cfg_type = cfg_type
         try:
             with open(path, "r") as f:
                 self._data = json.load(f)
@@ -140,7 +142,10 @@ class PersistentCache(Generic[Cfg]):
         raw = self._data.get(self._key(device, op_id, call_key))
         out = None if raw is None else (self.loader(raw) if self.loader else raw)
         if out is not None and isinstance(out, dict):
-            out = Namespace(**out)
+            if self.cfg_type is None:
+                out = Namespace(**out)
+            else:
+                out = self.cfg_type(**out)
         return out
 
     def put(self, device: str, op_id: str, call_key: str, cfg: Cfg):

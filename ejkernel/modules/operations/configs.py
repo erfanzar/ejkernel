@@ -50,6 +50,12 @@ class FlashAttentionConfig(BaseOperationConfig):
     fwd_params: FwdParams | None = None
     bwd_params: BwdParams | None = None
 
+    def __post_init__(self):
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+        if isinstance(self.bwd_params, dict):
+            self.bwd_params = BwdParams(**self.bwd_params)
+
 
 @dataclass
 class BlockSparseAttentionConfig(BaseOperationConfig):
@@ -62,6 +68,12 @@ class BlockSparseAttentionConfig(BaseOperationConfig):
 
     fwd_params: FwdParams | None = None
     bwd_params: BwdParams | None = None
+
+    def __post_init__(self):
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+        if isinstance(self.bwd_params, dict):
+            self.bwd_params = BwdParams(**self.bwd_params)
 
 
 @dataclass

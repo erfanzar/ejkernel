@@ -717,7 +717,7 @@ _executor: Executor[BlockSparseAttentionConfig, Array] = Executor(
             validate_backward=True,
         ),
         tuner=Tuner(warmup=5, iters=100),
-        persistent=PersistentCache("blocksparse"),
+        persistent=PersistentCache("blocksparse", cfg_type=BlockSparseAttentionConfig),
     ),
 )
 
