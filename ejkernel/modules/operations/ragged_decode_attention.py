@@ -255,7 +255,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
 
         head_opts = [h for h in (4, 8) if h <= grouped_heads] or [min(grouped_heads, 4)]
 
-        kv_block_opts = [64, 128, 96]
+        kv_block_opts = [64, 128]
 
         smem_limit = int(os.getenv("EJKERNEL_TRITON_SMEM_LIMIT", str(99 * 1024)))
         elem_bytes = 2 if dtype in (jnp.float16, jnp.bfloat16) else 4

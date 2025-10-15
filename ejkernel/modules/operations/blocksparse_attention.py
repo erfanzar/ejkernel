@@ -393,7 +393,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         """Generate GPU-optimized candidate configurations for autotuning (Triton).
 
         Heuristics:
-        - q/kv blocks in {32, 64, 96, 128, 192, 256} depending on head_dim
+        - q/kv blocks in {32, 64, 128, 256} depending on head_dim
         - If sliding_window is set, favor kv blocks ≲ window size (rounded)
         - num_warps: 2-8 based on head_dim and block sizes
         - num_stages: 2-4 (bigger when kv block is large)
@@ -443,12 +443,12 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         elif head_dim <= 192:
             q_opts = [32, 64, 128]
         else:
-            q_opts = [32, 64, 96]
+            q_opts = [32, 64, 128]
 
         base_kv = [32, 64, 128, 256]
         if win is not None:
             target = max(32, min(256, 1 << (int(math.log2(max(32, win))) if win > 0 else 5)))
-            kv_opts = sorted(set([32, 64, min(96, target), min(128, target), min(192, target), min(256, target)]))
+            kv_opts = sorted(set([32, 64, min(128, target), min(256, target)]))
         else:
             kv_opts = base_kv
 

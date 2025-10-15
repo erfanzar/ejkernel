@@ -429,18 +429,18 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             return int(base * stage_factor * fudge)
 
         if head_dim <= 64:
-            q_opts = [32, 64, 96, 128]
+            q_opts = [32, 64, 128]
         elif head_dim <= 128:
-            q_opts = [32, 64, 128, 192]
+            q_opts = [32, 64, 128]
         elif head_dim <= 192:
-            q_opts = [32, 64, 96, 128]
+            q_opts = [32, 64, 128]
         else:
-            q_opts = [32, 48, 64, 96]
+            q_opts = [32, 64]
 
-        base_kv = [32, 64, 96, 128, 192, 256]
+        base_kv = [32, 64, 128, 256]
         if win is not None:
             target = max(32, min(256, 1 << (int(math.log2(max(32, win))) if win > 0 else 5)))
-            kv_opts = sorted(set([32, 64, min(96, target), min(128, target), min(192, target), min(256, target)]))
+            kv_opts = sorted(set([32, 64, min(128, target), min(256, target)]))
         else:
             kv_opts = base_kv
 
@@ -512,7 +512,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         """Generate TPU-optimized candidate configurations for autotuning (Pallas).
 
         Heuristics:
-        - Favor moderate Q blocks (32-128) and KV blocks (64-256/384/512).
+        - Favor moderate Q blocks (32-128) and KV blocks (64-256/512).
         - If sliding_window is set, prefer kv blocks ≲ window span.
         - Slightly smaller backward blocks to reduce VMEM/regs.
         - Keep the candidate list compact and ordered for fast convergence.
@@ -541,7 +541,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         win = win_span(sliding_window)
 
         q_opts = [128, 256]
-        kv_opts = [128, 256, 384, 512]
+        kv_opts = [128, 256, 512]
 
         if win is not None:
             target = max(128, min(512, round128(win)))
@@ -559,7 +559,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         if win is not None:
             t1 = max(128, min(512, round128(win)))
             hv_pairs += [(128, t1), (256, t1), (128, min(512, 2 * t1))]
-        hv_pairs += [(128, 128), (128, 256), (256, 256), (256, 384)]
+        hv_pairs += [(128, 128), (128, 256), (256, 256), (256, 512)]
 
         selected: list[tuple[int, int]] = []
         seen = set()
@@ -596,7 +596,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         """Generate XLA-optimized candidate configurations for autotuning.
 
         Heuristics:
-        - Medium blocks (128-256; optionally 192) tend to be robust.
+        - Medium blocks (128-256) tend to be robust.
         - If sliding_window is set, keep kv blocks near window span.
         - Backward tiles are smaller.
         - Keep list small and ordered by likely winners.
@@ -625,11 +625,11 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         win = win_span(sliding_window)
 
         q_opts = [128, 256]
-        kv_opts = [128, 256, 384]
+        kv_opts = [128, 256, 512]
 
         if win is not None:
-            target = max(128, min(384, round128(win)))
-            kv_opts = sorted(set([*kv_opts, target, min(384, 2 * target)]))
+            target = max(128, min(512, round128(win)))
+            kv_opts = sorted(set([*kv_opts, target, min(512, 2 * target)]))
 
         if q_len < 256:
             q_opts = [x for x in q_opts if x <= 256] or [128]
@@ -641,7 +641,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
 
         hv_pairs: list[tuple[int, int]] = []
         if win is not None:
-            t1 = max(128, min(384, round128(win)))
+            t1 = max(128, min(512, round128(win)))
             hv_pairs += [(128, t1), (256, t1)]
         hv_pairs += [(128, 128), (128, 256), (256, 256), (256, 128)]
 
