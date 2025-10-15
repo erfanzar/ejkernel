@@ -221,7 +221,7 @@ def _compute_sparse_mask(
     outer_max_seg_id = tl.max(outer_segments_block)
     outer_min_seg_id = tl.min(outer_segments_block)
     outer_same_segment = outer_max_seg_id == outer_min_seg_id
-    if outer_same_segment and outer_min_seg_id == PADDING_SEGMENT_ID:
+    if (outer_same_segment) & (outer_min_seg_id == PADDING_SEGMENT_ID):
         tl.store(lower_block_ptr, 0)
         tl.store(upper_block_ptr, 0)
         tl.store(lower_full_block_ptr, 0)
@@ -246,8 +246,8 @@ def _compute_sparse_mask(
 
         inner_same_segment = inner_max_seg_id == inner_min_seg_id
 
-        should_attend_segments = inner_min_seg_id <= outer_max_seg_id and outer_min_seg_id <= inner_max_seg_id
-        full_block_segments = outer_same_segment and inner_same_segment
+        should_attend_segments = (inner_min_seg_id <= outer_max_seg_id) & (outer_min_seg_id <= inner_max_seg_id)
+        full_block_segments = outer_same_segment & inner_same_segment
 
         min_inner_position = tl.min(inner_positions_block)
         max_inner_position = tl.max(inner_positions_block)
@@ -277,8 +277,8 @@ def _compute_sparse_mask(
                     window_attend_right = True
                     window_full_right = True
 
-                should_attend_positions = should_attend_positions and window_attend_left and window_attend_right
-                full_block_positions = full_block_positions and window_full_left and window_full_right
+                should_attend_positions = should_attend_positions & window_attend_left & window_attend_right
+                full_block_positions = full_block_positions & window_full_left & window_full_right
         else:
             if CAUSAL:
                 should_attend_positions = max_inner_position >= min_outer_position
@@ -302,18 +302,18 @@ def _compute_sparse_mask(
                     window_attend_right = True
                     window_full_right = True
 
-                should_attend_positions = should_attend_positions and window_attend_left and window_attend_right
-                full_block_positions = full_block_positions and window_full_left and window_full_right
+                should_attend_positions = should_attend_positions & window_attend_left & window_attend_right
+                full_block_positions = full_block_positions & window_full_left & window_full_right
 
         if USE_SEGMENT_MASK:
-            should_attend = should_attend_positions and should_attend_segments
+            should_attend = should_attend_positions & should_attend_segments
         else:
             should_attend = should_attend_positions
 
         is_pad_tokens = inner_min_seg_id == PADDING_SEGMENT_ID
-        should_attend = should_attend and not is_pad_tokens
+        should_attend = should_attend & (~is_pad_tokens)
 
-        should_not_attend = not should_attend
+        should_not_attend = 1 - should_attend
 
         upper_block_to_attend = tl.maximum(upper_block_to_attend, should_attend * (inner_idx + 1))
 
@@ -322,9 +322,8 @@ def _compute_sparse_mask(
             should_attend * inner_idx + should_not_attend * lower_block_to_attend,
         )
 
-        full_block = (full_block_segments and full_block_positions) and should_attend
-        not_full_block = not full_block
-
+        full_block = (full_block_segments & full_block_positions) & should_attend
+        not_full_block = 1 - full_block
         upper_full_block = tl.maximum(upper_full_block, full_block * (inner_idx + 1))
 
         lower_full_block = tl.minimum(
@@ -411,9 +410,17 @@ def define_sparse_mask_fn(
             **common_params,
         )
 
-        lower_block = jnp.where(lower_block == num_query_blocks, upper_block, lower_block)
-        lower_full_block = jnp.where(lower_full_block == num_query_blocks, upper_block, lower_full_block)
-        upper_full_block = jnp.where(upper_full_block < lower_full_block, lower_full_block, upper_full_block)
+        lower_block = jnp.clip(lower_block, 0, num_query_blocks)
+        upper_block = jnp.clip(upper_block, 0, num_query_blocks)
+        lower_block = jnp.minimum(lower_block, upper_block)
+
+        lower_full_block = jnp.clip(lower_full_block, 0, num_query_blocks)
+        lower_full_block = jnp.maximum(lower_full_block, lower_block)
+
+        upper_full_block = jnp.clip(upper_full_block, 0, num_query_blocks)
+        upper_full_block = jnp.maximum(upper_full_block, lower_full_block)
+        upper_full_block = jnp.minimum(upper_full_block, upper_block)
+
         return lower_block, upper_block, lower_full_block, upper_full_block
 
     lower_block, upper_block, lower_full_block, upper_full_block = triton_call(
@@ -431,9 +438,14 @@ def define_sparse_mask_fn(
         **common_params,
     )
 
-    lower_block = jnp.where(lower_block == num_kv_blocks, upper_block, lower_block)
-    lower_full_block = jnp.where(lower_full_block == num_kv_blocks, lower_block, lower_full_block)
-    upper_full_block = jnp.where(upper_full_block < lower_full_block, lower_full_block, upper_full_block)
+    lower_block = jnp.clip(lower_block, 0, num_kv_blocks)
+    upper_block = jnp.clip(upper_block, 0, num_kv_blocks)
+    lower_block = jnp.minimum(lower_block, upper_block)
+    lower_full_block = jnp.clip(lower_full_block, 0, num_kv_blocks)
+    lower_full_block = jnp.maximum(lower_full_block, lower_block)
+    upper_full_block = jnp.clip(upper_full_block, 0, num_kv_blocks)
+    upper_full_block = jnp.maximum(upper_full_block, lower_full_block)
+    upper_full_block = jnp.minimum(upper_full_block, upper_block)
     return lower_block, upper_block, lower_full_block, upper_full_block
 
 

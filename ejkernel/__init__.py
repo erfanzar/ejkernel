@@ -38,7 +38,7 @@ Example:
     ... )
 """
 
-__version__ = "0.1.0"
+__version__ = "0.0.1"
 
 from . import kernels, modules
 from .kernels import Backend, Platform, kernel_registry

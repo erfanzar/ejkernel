@@ -36,7 +36,7 @@ def scaled_dot_product_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch kv_len num_kv_heads head_dim"],
     value: Float[Array, "batch kv_len num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch 1 seq_len kv_len"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     softmax_scale: float | None = None,

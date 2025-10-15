@@ -198,13 +198,13 @@ def _blocksparse_attn_bwd_dkdv_inner(
                 mask = causal_mask
 
         if SOFTCAP:
-            LN2: tl.constexpr = 0.6931471824645996
+            LOG2_CONST: tl.constexpr = 1.4426950408889634
             s = attn_weights_transpose * softmax_scale
             x = s / logits_soft_cap
             exp_2x = tl.exp(2.0 * x)
             tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
-            qk_after = (logits_soft_cap * tanh_x) * LN2
-            jac = softmax_scale * (1.0 - tanh_x * tanh_x)
+            qk_after = (logits_soft_cap * tanh_x) * LOG2_CONST
+            jac = (softmax_scale * LOG2_CONST) * (1.0 - tanh_x * tanh_x)
         else:
             qk_after = (attn_weights_transpose * qk_scale).to(tl.float32)
             jac = qk_scale
@@ -341,13 +341,13 @@ def _blocksparse_attn_bwd_dq_inner(
                 mask = causal_mask
 
         if SOFTCAP:
-            LN2: tl.constexpr = 0.6931471824645996
-            s = attention_weights * softmax_scale
+            LOG2_CONST: tl.constexpr = 1.4426950408889634
+            s = attention_weights / LOG2_CONST
             x = s / logits_soft_cap
             exp_2x = tl.exp(2.0 * x)
             tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
-            qk_after = (logits_soft_cap * tanh_x) * LN2
-            jac = softmax_scale * (1.0 - tanh_x * tanh_x)
+            qk_after = (logits_soft_cap * tanh_x) * LOG2_CONST
+            jac = (softmax_scale * LOG2_CONST) * (1.0 - tanh_x * tanh_x)
         else:
             qk_after = attention_weights
             jac = 1.0
@@ -1112,7 +1112,6 @@ def _bwd_blocksparse_attn_call(
         bias,  # noqa
     ) = res
     qkv_layouts: tuple[SparseMask]
-    dout = dout.transpose(0, 2, 1, 3)
 
     BLOCK_M_DKDV = bwd_params.q_blocksize
     BLOCK_N_DKDV = bwd_params.kv_blocksize
@@ -1205,7 +1204,6 @@ def _bwd_blocksparse_attn_call(
 
         lse_padded = jnp.pad(lse, ((0, 0), (0, 0), (0, pad_len)), constant_values=0.0)
         delta_padded = jnp.pad(delta, ((0, 0), (0, 0), (0, pad_len)), constant_values=0.0)
-
         dout_padded = jnp.pad(dout, ((0, 0), (0, 0), (0, pad_len), (0, 0)), constant_values=0.0)
     else:
         lse_padded = lse

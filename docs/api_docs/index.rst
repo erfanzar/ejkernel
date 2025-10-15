@@ -9,5 +9,6 @@ ejkernel API Reference
    modules/index
    ops/index
    xla_utils/index
+   benchmarks
    loggings
    utils

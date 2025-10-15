@@ -342,83 +342,6 @@ def segment_ids_to_qkv_masks(
     return segment_ids_to_mask((q_segment_ids, kv_segment_ids), dtype=dtype, return_separate_masks=True)
 
 
-def mask_to_segment_ids(attention_mask: Array) -> tuple[Int[Array, "batch q_len"], Int[Array, "batch kv_len"]]:
-    """
-    Converts an attention mask to query and key-value segment IDs.
-
-    This function analyzes the attention mask pattern to infer segment boundaries.
-    It uses a simplified approach that identifies contiguous blocks of valid attention
-    and assigns segment IDs accordingly. This is JAX-compatible and works with JIT.
-
-    Args:
-        attention_mask: Attention mask of shape:
-            - (batch_size, seq_len, seq_len) for self-attention
-            - (batch_size, q_len, kv_len) for cross-attention
-            - (batch_size, num_heads, q_len, kv_len) - will use first head
-            Values: True/1 for valid attention, False/0 for masked
-
-    Returns:
-        Tuple of (q_segment_ids, kv_segment_ids):
-        - q_segment_ids: (batch_size, q_len) - Segment IDs for queries (-1 for padding)
-        - kv_segment_ids: (batch_size, kv_len) - Segment IDs for keys/values (-1 for padding)
-
-    Examples:
-        >>>
-        >>> mask = jnp.array([
-        ...     [[True, True, False, False],
-        ...      [True, True, False, False],
-        ...      [False, False, True, True],
-        ...      [False, False, True, True]]
-        ... ])
-        >>> q_seg, kv_seg = mask_to_segment_ids(mask)
-        >>>
-        >>>
-
-        >>>
-        >>> mask_with_pad = jnp.array([
-        ...     [[True, True, False, False],
-        ...      [True, True, False, False],
-        ...      [False, False, True, False],
-        ...      [False, False, False, False]]
-        ... ])
-        >>> q_seg, kv_seg = mask_to_segment_ids(mask_with_pad)
-        >>>
-
-    Notes:
-        - This is a JAX-compatible, JIT-safe implementation
-        - Works well for simple patterns (padding, contiguous segments)
-        - Padding tokens (no valid attention) are assigned segment ID -1
-        - Segment IDs are 1-indexed (1, 2, 3, ...) to distinguish from padding
-        - For complex patterns, consider providing explicit segment IDs directly
-        - Uses cumulative sum approach to identify segment boundaries
-    """
-
-    if attention_mask.ndim == 4:
-        mask_bool = attention_mask[:, 0, :, :].astype(jnp.bool_)
-    else:
-        mask_bool = attention_mask.astype(jnp.bool_)
-
-    q_is_valid = jnp.any(mask_bool, axis=-1)
-    kv_is_valid = jnp.any(mask_bool, axis=-2)
-
-    q_pattern_changes = jnp.concatenate(
-        [jnp.ones_like(q_is_valid[:, :1]), jnp.any(mask_bool[:, 1:, :] != mask_bool[:, :-1, :], axis=-1)], axis=1
-    )
-
-    q_segment_ids = jnp.cumsum(q_pattern_changes, axis=1, dtype=jnp.int32)
-
-    q_segment_ids = jnp.where(q_is_valid, q_segment_ids, -1)
-
-    kv_pattern_changes = jnp.concatenate(
-        [jnp.ones_like(kv_is_valid[:, :1]), jnp.any(mask_bool[:, :, 1:] != mask_bool[:, :, :-1], axis=-2)], axis=1
-    )
-
-    kv_segment_ids = jnp.cumsum(kv_pattern_changes, axis=1, dtype=jnp.int32)
-    kv_segment_ids = jnp.where(kv_is_valid, kv_segment_ids, -1)
-
-    return q_segment_ids, kv_segment_ids
-
-
 def identity_dtype_convert(dtype: jnp.dtype):
     @jax.custom_vjp
     def identity_fn(x):
@@ -433,3 +356,93 @@ def identity_dtype_convert(dtype: jnp.dtype):
     identity_fn.defvjp(identity_fn_fwd, identity_fn_bwd)
 
     return identity_fn
+
+
+def _compress_ids_from_anchors(anchors: jnp.ndarray, pad_mask: jnp.ndarray) -> jnp.ndarray:
+    """
+    Convert 'anchors' (min representative index per element) into contiguous segment IDs [0..G-1],
+    with -1 for padded entries indicated by pad_mask.
+    """
+    n = anchors.shape[0]
+    sentinel = n + 1
+    vals = jnp.where(pad_mask, sentinel, anchors)
+    idx_sorted = jnp.argsort(vals)
+    vals_sorted = vals[idx_sorted]
+    valid_sorted = vals_sorted != sentinel
+
+    head = valid_sorted[:1]
+    rest_new = (vals_sorted[1:] != vals_sorted[:-1]) & valid_sorted[1:]
+    is_new_sorted = jnp.concatenate([head, rest_new], axis=0).astype(jnp.int32)
+
+    gid_sorted = jnp.cumsum(is_new_sorted) - 1
+    gid_sorted = jnp.where(valid_sorted, gid_sorted, -1)
+
+    gid = jnp.zeros_like(gid_sorted)
+    gid = gid.at[idx_sorted].set(gid_sorted)
+    return gid
+
+
+def _mask_to_segments_single(m: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    m: (Q, K) boolean mask
+    Returns:
+      q_segment_ids: (Q,) int32 in [0..Gq-1], -1 for all-zero rows
+      kv_segment_ids: (K,) int32 in [0..Gk-1], -1 for all-zero cols
+    """
+    m = m.astype(jnp.bool_)
+    Q, K = m.shape
+
+    q_pad = ~jnp.any(m, axis=-1)
+    kv_pad = ~jnp.any(m, axis=0)
+
+    row_bytes = jnp.packbits(m, axis=-1)
+    row_equal = jnp.all(row_bytes[:, None, :] == row_bytes[None, :, :], axis=-1)
+    idxs_q = jnp.arange(Q, dtype=jnp.int32)[None, :]
+    q_anchors = jnp.min(jnp.where(row_equal, idxs_q, Q), axis=-1)
+    q_segment_ids = _compress_ids_from_anchors(q_anchors, q_pad)
+
+    col_bytes = jnp.packbits(m.T, axis=-1)
+    col_equal = jnp.all(col_bytes[:, None, :] == col_bytes[None, :, :], axis=-1)
+    idxs_k = jnp.arange(K, dtype=jnp.int32)[None, :]
+    kv_anchors = jnp.min(jnp.where(col_equal, idxs_k, K), axis=-1)
+    kv_segment_ids = _compress_ids_from_anchors(kv_anchors, kv_pad)
+
+    return q_segment_ids, kv_segment_ids
+
+
+def mask_to_segment_ids(mask: jnp.ndarray, per_head: bool = False):
+    """
+    JIT-friendly mask → (q_segment_ids, kv_segment_ids) for rectangular masks.
+
+    Input shapes:
+      - (Q, K)
+      - (B, Q, K)
+      - (B, H, Q, K)
+
+    Returns:
+      - If (Q, K): (Q,), (K,)
+      - If (B, Q, K): (B, Q), (B, K)
+      - If (B, H, Q, K) and per_head=False: (B, Q), (B, K)
+      - If (B, H, Q, K) and per_head=True:  (B, H, Q), (B, H, K)
+
+    Padded rows/cols (all-zero) receive segment id -1.
+    """
+    m = mask.astype(jnp.bool_)
+
+    if m.ndim == 2:
+        q_ids, kv_ids = _mask_to_segments_single(m)
+        return q_ids, kv_ids
+
+    if m.ndim == 3:
+        q_ids, kv_ids = jax.vmap(_mask_to_segments_single, in_axes=0)(m)
+        return q_ids, kv_ids
+
+    if m.ndim == 4:
+        if per_head:
+            q_ids, kv_ids = jax.vmap(jax.vmap(_mask_to_segments_single, in_axes=0), in_axes=0)(m)
+            return q_ids, kv_ids
+        else:
+            q_ids, kv_ids = jax.vmap(_mask_to_segments_single, in_axes=0)(m[:, 0, :, :])
+            return q_ids, kv_ids
+
+    raise ValueError(f"mask must be (Q,K), (B,Q,K), or (B,H,Q,K); got {m.shape}")
