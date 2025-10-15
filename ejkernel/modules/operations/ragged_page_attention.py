@@ -482,7 +482,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
                 num_warps=warps,
                 num_stages=stages,
                 platform="triton",
-                backend="any",
+                backend="gpu",
             )
             for (block_m, npages, warps, stages) in block_configs
         ]
