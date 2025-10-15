@@ -13,6 +13,7 @@ run_test.py
 build/
 develop-eggs/
 dist/
+attention_plots/*
 tmp-files/
 downloads/
 eggs/
