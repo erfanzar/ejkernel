@@ -3,8 +3,8 @@ import sys
 
 sys.path.insert(0, os.path.abspath(".."))
 
-project = "EasyDeL"
-copyright = "2023, Erfan Zare Chavoshi - EasyDeL"  # noqa: A001
+project = "ejkernel"
+copyright = "2023, Erfan Zare Chavoshi - ejkernel"  # noqa: A001
 author = "Erfan Zare Chavoshi"
 
 extensions = [

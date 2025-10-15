@@ -59,11 +59,11 @@ def main():
     algorithms = create_attention_algorithms()
     configs = [
         {"batch": b, "seq": s, "qheads": qh, "kvheads": kvh, "dim": dim, "causal": iscausal, "sliding": sliding_window}
-        for b in [1, 4, 8]
+        for b in [4]
         for s in [1024, 2048, 4096, 8192]
-        for qh in [8, 16, 32]
-        for kvh in [2, 4, 8]
-        for dim in [64, 128]
+        for qh in [8, 16]
+        for kvh in [8]
+        for dim in [128]
         for iscausal in [True, False]
         for sliding_window in [None, (256, 256)]
     ]
