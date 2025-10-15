@@ -381,17 +381,6 @@ class TransformerBlock(nn.Module):
 
 ## Performance
 
-### Benchmarks
-
-Performance comparisons on NVIDIA A100 (80GB):
-
-| Operation | Sequence Length | ejKernel | PyTorch | Speedup |
-|-----------|----------------|----------|---------|---------|
-| Flash Attention (FP16) | 2048 | 2.3ms | 3.1ms | 1.35x |
-| Flash Attention (FP16) | 4096 | 8.7ms | 12.4ms | 1.43x |
-| Flash Attention (FP16) | 8192 | 34.2ms | OOM | N/A |
-| Ring Attention (8 GPUs) | 65536 | 287ms | OOM | N/A |
-
 ## Development
 
 ### Setting Up Development Environment
