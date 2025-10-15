@@ -12,22 +12,22 @@ The architecture follows a clean layered design with clear separation of concern
 
 ```md
 ┌─────────────────────────────────────────────────────┐
-│                   User API Layer                     │
-│         (Simple functions with auto-optimization)    │
+│                   User API Layer                    │
+│         (Simple functions with auto-optimization)   │
 ├─────────────────────────────────────────────────────┤
-│                Module Operations Layer               │
+│                Module Operations Layer              │
 │     (High-level interfaces, configuration mgmt)     │
 ├─────────────────────────────────────────────────────┤
-│                  Ops System Layer                    │
+│                  Ops System Layer                   │
 │    (Execution orchestration, autotuning, caching)   │
 ├─────────────────────────────────────────────────────┤
-│                 Kernel Registry Layer                │
-│      (Platform detection, implementation routing)    │
+│                 Kernel Registry Layer               │
+│      (Platform detection, implementation routing)   │
 ├─────────────────────────────────────────────────────┤
-│               Kernel Implementation Layer            │
-│        (Platform-specific optimized kernels)         │
+│               Kernel Implementation Layer           │
+│        (Platform-specific optimized kernels)        │
 ├─────────────────────────────────────────────────────┤
-│                  Hardware Abstraction                │
+│                  Hardware Abstraction               │
 │            (Triton, Pallas, XLA, CUDA)              │
 └─────────────────────────────────────────────────────┘
 ```
