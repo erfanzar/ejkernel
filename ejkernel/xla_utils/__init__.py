@@ -16,6 +16,7 @@
 from .cumsum import chunk_global_cumsum, chunk_local_cumsum
 from .utils import (
     cdiv,
+    identity_dtype_convert,
     mask_to_segment_ids,
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -33,6 +34,7 @@ __all__ = [
     "cdiv",
     "chunk_global_cumsum",
     "chunk_local_cumsum",
+    "identity_dtype_convert",
     "mask_to_segment_ids",
     "prepare_chunk_indices",
     "prepare_chunk_offsets",

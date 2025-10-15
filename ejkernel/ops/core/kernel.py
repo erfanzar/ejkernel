@@ -640,33 +640,32 @@ def _get_platform_method(
     """
 
     if context and platform:
-        composite_name = f"{method_name}_{context}_{platform}"
-        if hasattr(k, composite_name):
-            method = getattr(k, composite_name)
-            base_method = getattr(Kernel, composite_name, None)
-            if method is not base_method:
+        name = f"{method_name}_{context}_{platform}"
+        if hasattr(k, name):
+            method = getattr(k, name)
+            base = getattr(Kernel, name, None)
+            if method is not base:
                 return method
 
     if context:
-        context_method_name = f"{method_name}_{context}"
-        if hasattr(k, context_method_name):
-            method = getattr(k, context_method_name)
-            base_method = getattr(Kernel, context_method_name, None)
-            if method is not base_method:
+        name = f"{method_name}_{context}"
+        if hasattr(k, name):
+            method = getattr(k, name)
+            base = getattr(Kernel, name, None)
+            if method is not base:
                 return method
 
     if platform:
-        platform_method_name = f"{method_name}_{platform}"
-        if hasattr(k, platform_method_name):
-            method = getattr(k, platform_method_name)
-            base_method = getattr(Kernel, platform_method_name, None)
-            if method is not base_method:
+        name = f"{method_name}_{platform}"
+        if hasattr(k, name):
+            method = getattr(k, name)
+            base = getattr(Kernel, name, None)
+            if method is not base:
                 return method
 
     if hasattr(k, method_name):
         method = getattr(k, method_name)
-        base_method = getattr(Kernel, method_name, None)
-        if method is not base_method:
+        base = getattr(Kernel, method_name, None)
+        if method is not base:
             return method
-
     return None

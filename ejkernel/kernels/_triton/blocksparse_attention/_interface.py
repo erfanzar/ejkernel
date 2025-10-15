@@ -86,6 +86,7 @@ from jaxtyping import Array, ArrayLike, Bool, Float, Int
 from ejkernel.callib import ejit
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import BwdParams, FwdParams
+from ejkernel.xla_utils import identity_dtype_convert
 
 from ._mask import SparseMask, create_sparsity_mask
 from ._triton_impl_bwd import _bwd_blocksparse_attn_call
@@ -333,10 +334,8 @@ def blocksparse_attention(
     kv_positions: Int[Array, "batch kv_len"] | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
-    attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
-    | Bool[Array, "batch 1 seq_len kv_len"]
-    | Int[Array, "batch num_heads seq_len kv_len"]
-    | Int[Array, "batch 1 seq_len kv_len"]
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
+    | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
     | None = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
     logits_soft_cap: float | None = None,
@@ -393,7 +392,9 @@ def blocksparse_attention(
 
     qlen = query.shape[2]
     kvlen = key.shape[2]
-
+    ifn = identity_dtype_convert(query.dtype)
+    key = ifn(key)
+    value = ifn(value)
     if mask_builder is not None and qkv_layouts is None:
         qkv_layouts = mask_builder()
 

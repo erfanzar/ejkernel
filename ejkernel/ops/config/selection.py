@@ -294,6 +294,7 @@ class Tuner(Generic[Cfg]):
                         return _time_forward(jitted=True)
                     except Exception:
                         return _time_forward(jitted=False)
+
                 raise
 
         try:
@@ -497,7 +498,6 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                         return shard_map_fn(*call_args)
 
                     f._ejk_method = "shard_map"
-
                     if self.policy.validate_backward and getattr(kernel, "supports_grad_validation", False):
                         f._ejk_validate_backward = True
                     return f

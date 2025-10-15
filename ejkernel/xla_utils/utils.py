@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import jax
 import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, DTypeLike, Int
@@ -416,3 +417,19 @@ def mask_to_segment_ids(attention_mask: Array) -> tuple[Int[Array, "batch q_len"
     kv_segment_ids = jnp.where(kv_is_valid, kv_segment_ids, -1)
 
     return q_segment_ids, kv_segment_ids
+
+
+def identity_dtype_convert(dtype: jnp.dtype):
+    @jax.custom_vjp
+    def identity_fn(x):
+        return x
+
+    def identity_fn_fwd(x):
+        return x, None
+
+    def identity_fn_bwd(res, g):
+        return (g.astype(dtype),)
+
+    identity_fn.defvjp(identity_fn_fwd, identity_fn_bwd)
+
+    return identity_fn

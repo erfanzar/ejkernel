@@ -80,6 +80,7 @@ from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
 from ejkernel.callib import ejit
 from ejkernel.ops import BwdParams, FwdParams
+from ejkernel.xla_utils import identity_dtype_convert
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_bwd import _bwd_attention_kernel_call
@@ -90,7 +91,9 @@ def _jax_fwd_attention_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -220,7 +223,9 @@ def flash_attention_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -292,7 +297,9 @@ def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -353,6 +360,11 @@ def flash_attention(
         raise NotImplementedError("`q_segment_ids` is not implemented in triton impl yet!")
     if kv_segment_ids is not None:
         raise NotImplementedError("`kv_segment_ids` is not implemented in triton impl yet!")
+
+    ifn = identity_dtype_convert(query.dtype)
+    key = ifn(key)
+    value = ifn(value)
+
     return flash_attention_call(
         query=query,
         key=key,

@@ -1471,8 +1471,8 @@ def _bwd_attention_kernel_call(
         ),
         out_shape=[
             jax.ShapeDtypeStruct(shape=q.shape, dtype="f4", sharding=get_sharding(q)),
-            jax.ShapeDtypeStruct(shape=(k.shape[0], k.shape[1], q.shape[2], k.shape[3]), dtype=k.dtype),
-            jax.ShapeDtypeStruct(shape=(v.shape[0], v.shape[1], q.shape[2], v.shape[3]), dtype=v.dtype),
+            jax.ShapeDtypeStruct(shape=(k.shape[0], k.shape[1], q.shape[2], k.shape[3]), dtype="f4"),
+            jax.ShapeDtypeStruct(shape=(v.shape[0], v.shape[1], q.shape[2], v.shape[3]), dtype="f4"),
         ],
         name="ejkernel::triton::flash_attn_bwd",
     )

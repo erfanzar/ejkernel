@@ -122,7 +122,9 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
+        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         softmax_scale: float | None = None,
         dropout_prob: float = 0.0,
@@ -243,7 +245,9 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
+        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         softmax_scale: float | None = None,
         dropout_prob: float = 0.0,
@@ -699,7 +703,9 @@ def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"] | None = None,
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
