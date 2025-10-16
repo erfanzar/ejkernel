@@ -67,6 +67,8 @@ def _ragged_paged_attn_fwd(
     MAX_NUM_SEQS: tl.constexpr,
     PAGES_PER_SEQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    PAGE_SIZE_TILE: tl.constexpr,
+    COMPUTE_LSE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -100,6 +102,20 @@ def _ragged_paged_attn_fwd(
         row_pos = offs_m - q_start
         row_idx = (kv_len - q_len) + row_pos
 
+        if SLIDING:
+            left_bound = tl.maximum(row_idx - window_left, 0)
+            if IS_CAUSAL:
+                right_bound = row_idx
+            else:
+                rb = tl.minimum(row_idx + window_right, tl.maximum(kv_len - 1, 0))
+                right_bound = rb
+        else:
+            left_bound = tl.zeros_like(row_idx)
+            if IS_CAUSAL:
+                right_bound = row_idx
+            else:
+                right_bound = tl.full_like(row_idx, tl.maximum(kv_len - 1, 0))
+
         end_pages = (kv_len + PAGE_SIZE - 1) // PAGE_SIZE
 
         for p_blk in tl.static_range(0, PAGES_PER_SEQ, BLOCK_NPAGES):
@@ -110,53 +126,49 @@ def _ragged_paged_attn_fwd(
                 page_id_ptr = block_tables_ptr + seq_idx * bt_stride_s + p_ind * bt_stride_p
                 page_id = tl.load(page_id_ptr, mask=page_active, other=0)
 
-                k_in_page = tl.arange(0, PAGE_SIZE)
-                k_abs = p_ind * PAGE_SIZE + k_in_page
+                k_in_tile = tl.arange(0, PAGE_SIZE_TILE)
+                k_mask_page = k_in_tile < PAGE_SIZE
+
+                k_abs = p_ind * PAGE_SIZE + k_in_tile
                 k_valid = k_abs < kv_len
 
-                if SLIDING:
-                    left_bound = tl.maximum(row_idx - window_left, 0)
-                    if IS_CAUSAL:
-                        right_bound = row_idx
-                    else:
-                        rb = tl.minimum(row_idx + window_right, kv_len - 1)
-                        right_bound = rb
-                else:
-                    left_bound = tl.zeros_like(row_idx)
-                    if IS_CAUSAL:
-                        right_bound = row_idx
-                    else:
-                        right_bound = tl.full_like(row_idx, kv_len - 1)
-
                 allowed = (k_abs[None, :] >= left_bound[:, None]) & (k_abs[None, :] <= right_bound[:, None])
-                s_mask = row_mask[:, None] & page_active & k_valid[None, :] & allowed
+                s_mask = row_mask[:, None] & page_active & k_valid[None, :] & allowed & k_mask_page[None, :]
 
                 base_page = kv_pages_ptr + page_id * kv_stride_p
                 k_ptrs = (
                     base_page
-                    + k_in_page[:, None] * kv_stride_s
+                    + k_in_tile[:, None] * kv_stride_s
                     + (k_combined_idx) * kv_stride_c
                     + offs_d[None, :] * kv_stride_d
                 )
                 v_ptrs = (
                     base_page
-                    + k_in_page[:, None] * kv_stride_s
+                    + k_in_tile[:, None] * kv_stride_s
                     + (v_combined_idx) * kv_stride_c
                     + offs_d[None, :] * kv_stride_d
                 )
 
-                k_tile = tl.load(k_ptrs, mask=(k_valid[:, None] & d_mask[None, :] & page_active), other=0.0).to(
-                    tl.float32
-                )
-                v_tile = tl.load(v_ptrs, mask=(k_valid[:, None] & d_mask[None, :] & page_active), other=0.0).to(
-                    tl.float32
-                )
+                k_tile = tl.load(
+                    k_ptrs,
+                    mask=(k_mask_page[:, None] & d_mask[None, :] & page_active),
+                    other=0.0,
+                ).to(tl.float32)
+                v_tile = tl.load(
+                    v_ptrs,
+                    mask=(k_mask_page[:, None] & d_mask[None, :] & page_active),
+                    other=0.0,
+                ).to(tl.float32)
 
                 qk = tl.dot(q, tl.trans(k_tile)) * softmax_scale
 
                 if SOFTCAP:
-                    inv_cap = 1.0 / logits_soft_cap
-                    qk = logits_soft_cap * tl.tanh(qk * inv_cap)
+                    LOG2_CONST: tl.constexpr = 1.4426950408889634
+                    softmax_scale_e = softmax_scale / LOG2_CONST
+                    x = (qk * softmax_scale_e) / logits_soft_cap
+                    exp_2x = tl.exp(2.0 * x)
+                    tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
+                    qk = (logits_soft_cap * tanh_x) * LOG2_CONST
 
                 neg_large = -1.0e30
                 qk_masked = tl.where(s_mask, qk, neg_large)
@@ -189,10 +201,11 @@ def _ragged_paged_attn_fwd(
     o_ptrs = o_ptr + offs_m[:, None] * o_stride_m + pid_h * o_stride_h + offs_d[None, :] * o_stride_d
     tl.store(o_ptrs, acc, mask=mask_m[:, None] & d_mask[None, :])
 
-    lse_vals = m_i + tl.log(l_i)
-    lse_ptrs = lse_ptr + pid_h * lse_stride_h + offs_m * lse_stride_m
-    lse_mask = offs_m < total_tokens_rounded
-    tl.store(lse_ptrs, lse_vals, mask=lse_mask)
+    if COMPUTE_LSE:
+        lse_vals = m_i + tl.log(l_i)
+        lse_ptrs = lse_ptr + pid_h * lse_stride_h + offs_m * lse_stride_m
+        lse_mask = offs_m < total_tokens_rounded
+        tl.store(lse_ptrs, lse_vals, mask=lse_mask)
 
 
 def _contig_strides_3(shape):
@@ -203,6 +216,270 @@ def _contig_strides_3(shape):
 def _contig_strides_4(shape):
     _P, S, C, D = shape
     return (S * C * D, C * D, D, 1)
+
+
+@triton.jit
+def _cdiv_fn(x, y):
+    return (x + y - 1) // y
+
+
+@triton.jit
+def _find_seq_idx(query_start_len_ptr, target_idx, num_seqs, BLOCK_Q: tl.constexpr):
+    left = 0
+    right = num_seqs
+    while left < right:
+        mid = (left + right) // 2
+        val = tl.load(query_start_len_ptr + mid)
+        mid_val = val // BLOCK_Q + mid
+        if mid_val <= target_idx:
+            left = mid + 1
+        else:
+            right = mid
+    return left - 1
+
+
+@triton.jit
+def _ragged_paged_attn_qblock_fwd(
+    q_ptr,
+    kv_pages_ptr,
+    block_tables_ptr,
+    seq_lens_ptr,
+    cu_q_lens_ptr,
+    softmax_scale,
+    logits_soft_cap,
+    num_seqs,
+    num_q_heads,
+    num_kv_heads,
+    pages_per_seq,
+    page_size,
+    head_dim,
+    q_stride_m,
+    q_stride_h,
+    q_stride_d,
+    kv_stride_p,
+    kv_stride_s,
+    kv_stride_c,
+    kv_stride_d,
+    bt_stride_s,
+    bt_stride_p,
+    o_stride_m,
+    o_stride_h,
+    o_stride_d,
+    o_ptr,
+    NUM_REPEATS: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SLIDING: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    q_block_global_idx = tl.program_id(0)
+    q_head_idx = tl.program_id(1)
+
+    seq_idx = _find_seq_idx(cu_q_lens_ptr, q_block_global_idx, num_seqs, BLOCK_Q)
+
+    q_block_start_idx = tl.load(cu_q_lens_ptr + seq_idx) // BLOCK_Q + seq_idx
+    q_block_local_idx = q_block_global_idx - q_block_start_idx
+
+    q_seq_start = tl.load(cu_q_lens_ptr + seq_idx)
+    q_seq_end = tl.load(cu_q_lens_ptr + seq_idx + 1)
+    q_len = q_seq_end - q_seq_start
+
+    if q_block_local_idx * BLOCK_Q >= q_len:
+        return
+
+    offs_m = tl.arange(0, BLOCK_Q)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_t = tl.arange(0, TILE_SIZE)
+
+    qpos = q_block_local_idx * BLOCK_Q + offs_m
+    row_mask = qpos < q_len
+    d_mask = offs_d < head_dim
+
+    q_m_offset = (q_seq_start + qpos)[:, None] * q_stride_m
+    q_h_offset = q_head_idx * q_stride_h
+    q_d_offset = offs_d[None, :] * q_stride_d
+    q_ptrs = q_ptr + q_m_offset + q_h_offset + q_d_offset
+    Q = tl.load(q_ptrs, mask=row_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+
+    kv_head = q_head_idx // NUM_REPEATS
+    k_combined_idx = 2 * kv_head
+    v_combined_idx = 2 * kv_head + 1
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    context_len = seq_len - q_len
+
+    M = tl.full([BLOCK_Q], -float("inf"), tl.float32)
+    L = tl.full([BLOCK_Q], 1.0, tl.float32)
+    ACC = tl.zeros([BLOCK_Q, HEAD_SIZE_PADDED], tl.float32)
+
+    qpos_hi = tl.minimum(qpos[-1], q_len - 1)
+    max_seq_prefix_len = context_len + qpos_hi + 1
+
+    num_tiles = _cdiv_fn(max_seq_prefix_len, TILE_SIZE)
+    tile_start = 0
+    tile_end = num_tiles
+
+    if SLIDING:
+        qpos_lo = q_block_local_idx * BLOCK_Q
+        qpos_hi2 = tl.minimum(qpos_lo + BLOCK_Q - 1, q_len - 1)
+        first_allowed_key = context_len + qpos_lo
+        if IS_CAUSAL:
+            last_allowed_key = context_len + qpos_hi2
+        else:
+            last_allowed_key = context_len + qpos_hi2
+
+        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
+        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
+
+    for j in range(tile_start, tile_end):
+        seq_offset = j * TILE_SIZE + offs_t
+        tile_mask = seq_offset < max_seq_prefix_len
+
+        page_ids = tl.load(block_tables_ptr + seq_idx * bt_stride_s + (seq_offset // page_size), mask=tile_mask, other=0)
+        page_ids = page_ids.to(tl.int32)
+
+        k_in_page = (seq_offset % page_size).to(tl.int32)
+
+        base_k = (
+            kv_pages_ptr
+            + page_ids[None, :] * kv_stride_p
+            + k_in_page[None, :] * kv_stride_s
+            + k_combined_idx * kv_stride_c
+            + offs_d[:, None] * kv_stride_d
+        )
+        base_v = (
+            kv_pages_ptr
+            + page_ids[:, None] * kv_stride_p
+            + k_in_page[:, None] * kv_stride_s
+            + v_combined_idx * kv_stride_c
+            + offs_d[None, :] * kv_stride_d
+        )
+
+        K = tl.load(base_k, mask=d_mask[:, None] & tile_mask[None, :], other=0.0).to(tl.float32)
+        V = tl.load(base_v, mask=tile_mask[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+
+        S = tl.dot(Q, K) * softmax_scale
+
+        if SOFTCAP:
+            inv_cap = 1.0 / logits_soft_cap
+            S = logits_soft_cap * tl.tanh(S * inv_cap)
+
+        seq_mask = seq_offset[None, :] < (context_len + qpos[:, None] + 1)
+        S = tl.where(row_mask[:, None] & tile_mask[None, :] & seq_mask, S, float("-inf"))
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+        P = tl.exp(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.exp(M - m_j)
+
+        ACC = ACC * alpha[:, None]
+        L = L * alpha + l_j
+        M = m_j
+
+        ACC += tl.dot(P, V)
+
+    ACC = ACC / L[:, None]
+    o_ptrs = o_ptr + (q_seq_start + qpos)[:, None] * o_stride_m + q_head_idx * o_stride_h + offs_d[None, :] * o_stride_d
+    tl.store(o_ptrs, ACC, mask=row_mask[:, None] & d_mask[None, :])
+
+
+def ragged_paged_attention_triton_call_qblock(
+    queries: jax.Array,
+    kv_pages: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    softmax_scale: float | None = None,
+    logits_soft_cap: float | None = None,
+    causal: bool = True,
+    block_q: int = 64,
+    tile_size: int = 32,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+):
+    assert queries.ndim == 3 and kv_pages.ndim == 4
+    assert queries.dtype in (jnp.float16, jnp.bfloat16) and kv_pages.dtype == queries.dtype
+    assert context_lens.dtype == jnp.int32 and block_tables.dtype == jnp.int32 and cu_q_lens.dtype == jnp.int32
+
+    total_tokens, num_q_heads, head_dim = map(int, queries.shape)
+    _num_pages, page_size, combined_kv_heads, head_dim_kv = map(int, kv_pages.shape)
+    assert head_dim == head_dim_kv and combined_kv_heads % 2 == 0
+    num_kv_heads = combined_kv_heads // 2
+    assert num_q_heads % num_kv_heads == 0
+    num_repeats = num_q_heads // num_kv_heads
+
+    num_seqs, pages_per_seq = map(int, block_tables.shape)
+    assert context_lens.shape[0] == num_seqs and cu_q_lens.shape[0] == num_seqs + 1
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    softcap_flag = logits_soft_cap is not None
+    logits_soft_cap_val = float(logits_soft_cap or 0.0)
+
+    BLOCK_Q = int(block_q)
+    TILE_SIZE = int(tile_size)
+    HEAD_SIZE_PADDED = max(((head_dim + 15) // 16) * 16, 16)
+
+    total_num_q_blocks = total_tokens // BLOCK_Q + num_seqs
+
+    q_sm, q_sh, q_sd = _contig_strides_3(queries.shape)
+    kv_sp, kv_ss, kv_sc, kv_sd = _contig_strides_4(kv_pages.shape)
+    bt_ss, bt_sp = pages_per_seq, 1
+    o_sm, o_sh, o_sd = _contig_strides_3(queries.shape)
+
+    out_shape = [jax.ShapeDtypeStruct(queries.shape, queries.dtype)]
+
+    metaparams = dict(
+        NUM_REPEATS=num_repeats,
+        IS_CAUSAL=bool(causal),
+        SLIDING=True,
+        SOFTCAP=bool(softcap_flag),
+        BLOCK_Q=BLOCK_Q,
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    (out,) = triton_call(
+        queries,
+        kv_pages,
+        block_tables,
+        context_lens,
+        cu_q_lens,
+        float(softmax_scale),
+        float(logits_soft_cap_val),
+        int(num_seqs),
+        int(num_q_heads),
+        int(num_kv_heads),
+        int(pages_per_seq),
+        int(page_size),
+        int(head_dim),
+        int(q_sm),
+        int(q_sh),
+        int(q_sd),
+        int(kv_sp),
+        int(kv_ss),
+        int(kv_sc),
+        int(kv_sd),
+        int(bt_ss),
+        int(bt_sp),
+        int(o_sm),
+        int(o_sh),
+        int(o_sd),
+        kernel=_ragged_paged_attn_qblock_fwd,
+        out_shape=out_shape,
+        grid=lambda META: (int(total_num_q_blocks), num_q_heads),
+        name="ejkernel::triton::ragged_page_attn_qblock",
+        **metaparams,
+    )
+    return out
 
 
 def ragged_paged_attention_triton_call(
@@ -220,6 +497,7 @@ def ragged_paged_attention_triton_call(
     block_npages: int = 2,
     num_warps: int | None = None,
     num_stages: int | None = None,
+    compute_lse: bool = False,
 ):
     assert queries.ndim == 3 and kv_pages.ndim == 4
     assert queries.dtype in (jnp.float16, jnp.bfloat16) and kv_pages.dtype == queries.dtype
@@ -227,6 +505,8 @@ def ragged_paged_attention_triton_call(
 
     total_tokens, num_q_heads, head_dim = map(int, queries.shape)
     _num_pages, page_size, combined_kv_heads, head_dim_kv = map(int, kv_pages.shape)
+
+    page_size_tile = ((page_size + 15) // 16) * 16
     assert head_dim == head_dim_kv and combined_kv_heads % 2 == 0
     num_kv_heads = combined_kv_heads // 2
 
@@ -287,6 +567,8 @@ def ragged_paged_attention_triton_call(
         MAX_NUM_SEQS=num_seqs,
         PAGES_PER_SEQ=pages_per_seq,
         PAGE_SIZE=page_size,
+        PAGE_SIZE_TILE=page_size_tile,
+        COMPUTE_LSE=bool(compute_lse),
         num_warps=num_warps,
         num_stages=num_stages,
     )

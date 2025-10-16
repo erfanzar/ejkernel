@@ -78,7 +78,7 @@ from beartype import beartype
 from jaxtyping import Array, DTypeLike, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._triton_impl_fwd import ragged_paged_attention_triton_call
+from ._triton_impl_fwd import ragged_paged_attention_triton_call, ragged_paged_attention_triton_call_qblock
 
 DEFAULT_MASK_VALUE = -2.381976426469702e38
 
@@ -193,18 +193,34 @@ def ragged_page_attention(
         >>> print(output.shape)
     """
 
-    return ragged_paged_attention_triton_call(
-        queries=queries,
-        kv_pages=kv_pages,
-        context_lens=context_lens,
-        block_tables=block_tables,
-        cu_q_lens=query_start_loc,
-        block_m=num_queries_per_block,
-        block_npages=num_kv_pages_per_block,
-        causal=True,
-        logits_soft_cap=logits_soft_cap,
-        sliding_window=sliding_window,
-        softmax_scale=softmax_scale,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    ).astype(queries.dtype)
+    if optimized:
+        return ragged_paged_attention_triton_call_qblock(
+            queries=queries,
+            kv_pages=kv_pages,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            cu_q_lens=query_start_loc,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            causal=True,
+            block_q=num_queries_per_block or 64,
+            tile_size=32,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        ).astype(queries.dtype)
+    else:
+        return ragged_paged_attention_triton_call(
+            queries=queries,
+            kv_pages=kv_pages,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            cu_q_lens=query_start_loc,
+            block_m=num_queries_per_block,
+            block_npages=num_kv_pages_per_block,
+            causal=True,
+            logits_soft_cap=logits_soft_cap,
+            sliding_window=sliding_window,
+            softmax_scale=softmax_scale,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        ).astype(queries.dtype)

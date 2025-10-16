@@ -325,6 +325,64 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             bwd_params=cfg.bwd_params,
         )
 
+    def heuristic_cfg_gpu(self, inv: Invocation[FlashAttentionConfig, Array]) -> FlashAttentionConfig:
+        """Provide default configuration based on invocation context.
+
+        Selects optimal block sizes based on sequence length and head dimension.
+
+        Args:
+            inv: Invocation object with arguments and metadata
+
+        Returns:
+            Default configuration with block sizes
+        """
+
+        return FlashAttentionConfig(
+            fwd_params=FwdParams(
+                q_blocksize=64,
+                kv_blocksize=128,
+                num_warps=4,
+                num_stages=2,
+            ),
+            bwd_params=BwdParams(
+                q_blocksize=32,
+                kv_blocksize=32,
+                num_warps=4,
+                num_stages=2,
+            ),
+            platform="triton",
+            backend="gpu",
+        )
+
+    def heuristic_cfg_tpu(self, inv: Invocation[FlashAttentionConfig, Array]) -> FlashAttentionConfig:
+        """Provide default configuration based on invocation context.
+
+        Selects optimal block sizes based on sequence length and head dimension.
+
+        Args:
+            inv: Invocation object with arguments and metadata
+
+        Returns:
+            Default configuration with block sizes
+        """
+
+        return FlashAttentionConfig(
+            fwd_params=FwdParams(
+                q_blocksize=128,
+                kv_blocksize=128,
+                num_warps=None,
+                num_stages=None,
+            ),
+            bwd_params=BwdParams(
+                q_blocksize=128,
+                kv_blocksize=128,
+                num_warps=None,
+                num_stages=None,
+            ),
+            platform="pallas",
+            backend="tpu",
+        )
+
     def heuristic_cfg(self, inv: Invocation[FlashAttentionConfig, Array]) -> FlashAttentionConfig:
         """Provide default configuration based on invocation context.
 
@@ -338,8 +396,18 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         """
 
         return FlashAttentionConfig(
-            fwd_params=FwdParams(q_blocksize=128, kv_blocksize=128, num_warps=4, num_stages=2),
-            bwd_params=BwdParams(q_blocksize=64, kv_blocksize=64, num_warps=4, num_stages=2),
+            fwd_params=FwdParams(
+                q_blocksize=128,
+                kv_blocksize=128,
+                num_warps=None,
+                num_stages=None,
+            ),
+            bwd_params=BwdParams(
+                q_blocksize=128,
+                kv_blocksize=128,
+                num_warps=None,
+                num_stages=None,
+            ),
             platform="auto",
             backend="any",
         )

@@ -5,7 +5,6 @@ import jax
 from jax import numpy as jnp
 
 from ejkernel.benchmarks import Benchmark
-from ejkernel.kernels import xla
 from ejkernel.modules import operations
 
 
@@ -13,13 +12,28 @@ def create_attention_algorithms():
     """Create dictionary of attention algorithm implementations."""
 
     def xla_page(queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs):
-        return operations.ragged_page_attention(queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs)
+        return operations.ragged_page_attention(
+            queries,
+            kv_pages,
+            context_lens,
+            block_tables,
+            query_start_loc,
+            num_seqs,
+        )
 
     def ejk_page(queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs):
-        return xla.ragged_page_attention(queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs)
+        return operations.ragged_page_attention(
+            queries,
+            kv_pages,
+            context_lens,
+            block_tables,
+            query_start_loc,
+            num_seqs,
+            optimized=True,
+        )
 
     return {
-        # "xla": xla_page,
+        "eop": xla_page,
         "ejk": ejk_page,
     }
 
