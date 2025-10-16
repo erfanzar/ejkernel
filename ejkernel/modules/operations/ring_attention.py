@@ -81,6 +81,7 @@ from ejkernel.ops import (
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.types.mask import MaskInfo
 
 from ..base import detect_platform
 from .configs import RingAttentionConfig
@@ -186,10 +187,10 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
             value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
             bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-            q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-            kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
             softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
             dropout_rng: PRNGKeyArray | None = None,
+            q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+            kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
             return self.run(
                 query=query,
@@ -225,10 +226,10 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             key,
             value,
             bias,
-            q_segment_ids,
-            kv_segment_ids,
             softmax_aux,
             dropout_rng,
+            q_segment_ids,
+            kv_segment_ids,
         )
         assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
         shard_map_fn = shard_map(
@@ -517,12 +518,11 @@ def ring_attention(
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     dropout_rng: PRNGKeyArray | None = None,
     /,
     *,
+    mask_info: MaskInfo | None = None,
     cache_idx=None,
     axis_name: str | None = None,
     float32_logits: bool = True,
@@ -555,9 +555,8 @@ def ring_attention(
         query: Query tensor [batch, seq_len_q, num_heads, head_dim]
         key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim]
         value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim]
+        mask_info: Optional MaskInfo containing attention mask and/or segment IDs
         bias: Optional attention bias tensor
-        q_segment_ids: Segment IDs for queries
-        kv_segment_ids: Segment IDs for keys/values
         softmax_aux: Auxiliary softmax values
         cache_idx: Cache index for inference
         axis_name: Name of the axis for collective operations
@@ -609,10 +608,21 @@ def ring_attention(
         >>> out = ring_attention(..., platform="triton")
     """
 
+    q_segment_ids = None
+    kv_segment_ids = None
+
+    if mask_info is not None:
+        q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids()
+
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
-
+        if mask_info is None:
+            in_specs = (*in_specs, None, None)
+        else:
+            shardings = mask_info.get_shardings(True, mesh=mesh)
+            in_specs = (*in_specs, shardings.q_segment_ids, shardings.kv_segment_ids)
+            assert mask_info.sequence_axis_name == axis_name, "missmatch between two sequence axis names!."
     return _ring_executor(
         RingAttention(),
         query=query,

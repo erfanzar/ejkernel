@@ -5,4 +5,5 @@ ejkernel.xla_utils package
    :maxdepth: 2
 
    xla_utils/cumsum
+   xla_utils/shardings
    xla_utils/utils

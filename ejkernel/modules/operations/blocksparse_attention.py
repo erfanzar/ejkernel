@@ -48,6 +48,7 @@ from ejkernel.ops import (
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.types.mask import MaskInfo
 
 from ..base import detect_platform
 from .configs import BlockSparseAttentionConfig
@@ -109,10 +110,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         query: Float[Array, "batch num_heads seq_len head_dim"],
         key: Float[Array, "batch kv_num_heads kv_len head_dim"],
         value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-        q_segment_ids: Int[Array, "batch seq_len"] | None = None,
-        kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
-        q_positions: Int[Array, "batch seq_len"] | None = None,
-        kv_positions: Int[Array, "batch kv_len"] | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
         attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
@@ -120,6 +117,10 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         | Int[Array, "batch num_heads seq_len kv_len"]
         | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
         | None = None,
+        q_segment_ids: Int[Array, "batch seq_len"] | None = None,
+        kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
+        q_positions: Int[Array, "batch seq_len"] | None = None,
+        kv_positions: Int[Array, "batch kv_len"] | None = None,
         sequence_parallelism_mesh_axis_name: str | None = None,
         logits_soft_cap: float | None = None,
         qkv_layouts: tuple["SparseMask"] | None = None,
@@ -158,12 +159,12 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             query: Float[Array, "batch num_heads seq_len head_dim"],
             key: Float[Array, "batch kv_num_heads kv_len head_dim"],
             value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
+            softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None,
+            bias: Float[Array, "batch num_heads seq_len head_dim"] | None,
             q_segment_ids: Int[Array, "batch seq_len"] | None,
             kv_segment_ids: Int[Array, "batch kv_len"] | None,
             q_positions: Int[Array, "batch seq_len"] | None,
             kv_positions: Int[Array, "batch kv_len"] | None,
-            softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None,
-            bias: Float[Array, "batch num_heads seq_len head_dim"] | None,
             attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
             | Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
             | Int[Array, "batch num_heads seq_len kv_len"]
@@ -198,12 +199,12 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             query,
             key,
             value,
+            softmax_aux,
+            bias,
             q_segment_ids,
             kv_segment_ids,
             q_positions,
             kv_positions,
-            softmax_aux,
-            bias,
             attention_mask,
         )
 
@@ -242,10 +243,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         query: Float[Array, "batch num_heads seq_len head_dim"],
         key: Float[Array, "batch kv_num_heads kv_len head_dim"],
         value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-        q_segment_ids: Int[Array, "batch seq_len"] | None = None,
-        kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
-        q_positions: Int[Array, "batch seq_len"] | None = None,
-        kv_positions: Int[Array, "batch kv_len"] | None = None,
         softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
         attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
@@ -253,12 +250,14 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         | Int[Array, "batch num_heads seq_len kv_len"]
         | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
         | None = None,
+        q_segment_ids: Int[Array, "batch seq_len"] | None = None,
+        kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
+        q_positions: Int[Array, "batch seq_len"] | None = None,
+        kv_positions: Int[Array, "batch kv_len"] | None = None,
         sequence_parallelism_mesh_axis_name: str | None = None,
         logits_soft_cap: float | None = None,
         qkv_layouts: tuple["SparseMask"] | None = None,
         softmax_scale: float | None = None,
-        fwd_params: FwdParams | None = None,
-        bwd_params: BwdParams | None = None,
         mask_builder: typing.Callable[[int, int, int, int, int], "Mask"]
         | typing.Callable[[], "SparseMask"]
         | None = None,
@@ -791,15 +790,11 @@ def blocksparse_attention(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch kv_num_heads kv_len head_dim"],
     value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-    q_segment_ids: Int[Array, "batch seq_len"] | None = None,
-    kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
-    q_positions: Int[Array, "batch seq_len"] | None = None,
-    kv_positions: Int[Array, "batch kv_len"] | None = None,
     softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
-    | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
-    | None = None,
+    /,
+    *,
+    mask_info: MaskInfo | None = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
     logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,
@@ -825,8 +820,11 @@ def blocksparse_attention(
         query: Query tensor [batch, num_heads, seq_len, head_dim]
         key: Key tensor [batch, kv_num_heads, kv_len, head_dim]
         value: Value tensor [batch, kv_num_heads, kv_len, vhead_dim]
-        q_segment_ids: Optional segment IDs for queries [batch, seq_len]
-        kv_segment_ids: Optional segment IDs for keys/values [batch, kv_len]
+        mask_info: Optional MaskInfo containing attention mask, segment IDs, and position indices
+        q_positions: Optional query position indices [batch, seq_len] for positional embeddings.
+            If None and mask_info is provided, will use positions from mask_info.
+        kv_positions: Optional key-value position indices [batch, kv_len] for positional embeddings.
+            If None and mask_info is provided, will use positions from mask_info.
         softmax_aux: Optional auxiliary attention values (e.g., attention sinks)
         logits_soft_cap: Optional soft capping for attention logits
         query_chunk_size: Query chunk size for block tiling (default: 128)
@@ -877,10 +875,38 @@ def blocksparse_attention(
         - Scenarios where custom sparsity patterns are needed
     """
 
+    attention_mask = None
+    q_segment_ids = None
+    kv_segment_ids = None
+    q_positions = None
+    kv_positions = None
+
+    if mask_info is not None:
+        q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids()
+        attention_mask = mask_info.get_or_compute_attention_mask()
+
+        if q_positions is None or kv_positions is None:
+            mask_q_pos, mask_kv_pos = mask_info.get_or_compute_positions()
+            if q_positions is None:
+                q_positions = mask_q_pos
+            if kv_positions is None:
+                kv_positions = mask_kv_pos
+
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
-
+        if mask_info is None:
+            in_specs = (*in_specs, None, None, None, None, None)
+        else:
+            shardings = mask_info.get_shardings(False, mesh=mesh)
+            in_specs = (
+                *in_specs,
+                shardings.q_segment_ids,
+                shardings.kv_segment_ids,
+                shardings.q_positions,
+                shardings.kv_positions,
+                shardings.attention_mask,
+            )
     return _executor(
         BlockSparseAttention(),
         query=query,

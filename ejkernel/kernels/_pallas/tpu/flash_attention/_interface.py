@@ -87,7 +87,7 @@ def flash_attention(
         raise NotImplementedError("Attention sinks (softmax_aux) are not supported on TPU")
 
     if attention_mask is not None and (q_segment_ids is None or kv_segment_ids is None):
-        from ejkernel.xla_utils import mask_to_segment_ids
+        from ejkernel.types.mask import mask_to_segment_ids
 
         inferred_q_seg, inferred_kv_seg = mask_to_segment_ids(attention_mask)
         if q_segment_ids is None:

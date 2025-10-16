@@ -8,6 +8,7 @@ ejkernel API Reference
    kernels/index
    modules/index
    ops/index
+   types/index
    xla_utils/index
    benchmarks
    loggings

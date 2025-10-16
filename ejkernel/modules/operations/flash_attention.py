@@ -72,6 +72,7 @@ from ejkernel.ops import (
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.types.mask import MaskInfo
 
 from ..base import detect_platform
 from .configs import FlashAttentionConfig
@@ -167,11 +168,11 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             query: Float[Array, "batch num_heads seq_len head_dim"],
             key: Float[Array, "batch kv_num_heads kv_len head_dim"],
             value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-            attention_mask: Int[Array, "batch num_heads seq_len kv_len"] | None = None,
             bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
             softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
             cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
             cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+            attention_mask: Int[Array, "batch num_heads seq_len kv_len"] | None = None,
             q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
             kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         ) -> Float[Array, "batch num_heads seq_len head_dim"]:
@@ -203,11 +204,11 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             query,
             key,
             value,
-            attention_mask,
             bias,
             softmax_aux,
             cum_seqlens_q,
             cum_seqlens_k,
+            attention_mask,
             q_segment_ids,
             kv_segment_ids,
         )
@@ -771,17 +772,13 @@ def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
-    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
-    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     /,
     *,
+    mask_info: MaskInfo | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
@@ -805,7 +802,7 @@ def flash_attention(
         query: Query tensor [batch, seq_len, num_heads, head_dim]
         key: Key tensor [batch, seq_len_k, num_heads, head_dim]
         value: Value tensor [batch, seq_len_k, num_heads, head_dim]
-        attention_mask: Optional attention mask (legacy, prefer bias)
+        mask_info: Optional MaskInfo containing attention mask and/or segment IDs
         bias: Optional attention bias tensor
         softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
         dropout_prob: Dropout probability for attention weights
@@ -838,9 +835,28 @@ def flash_attention(
         >>> out = flash_attention(query, key, value, platform="triton")
     """
 
+    attention_mask = None
+    q_segment_ids = None
+    kv_segment_ids = None
+
+    if mask_info is not None:
+        # TODO: segment IDs are not yet supported by Triton and XLA implementations
+        # q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids()
+        attention_mask = mask_info.get_or_compute_attention_mask()
+
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
+        if mask_info is None:
+            in_specs = (*in_specs, None, None, None)
+        else:
+            shardings = mask_info.get_shardings(False, mesh=mesh)
+            in_specs = (
+                *in_specs,
+                shardings.attention_mask,
+                shardings.q_segment_ids,
+                shardings.kv_segment_ids,
+            )
 
     return _flash_executor(
         FlashAttention(),

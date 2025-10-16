@@ -417,7 +417,7 @@ def blocksparse_attention(
         kv_positions = jax.numpy.arange(0, kvlen).reshape(1, -1).repeat(key.shape[0], 0)
 
     if attention_mask is not None and (q_segment_ids is None or kv_segment_ids is None):
-        from ejkernel.xla_utils import mask_to_segment_ids
+        from ejkernel.types.mask import mask_to_segment_ids
 
         inferred_q_seg, inferred_kv_seg = mask_to_segment_ids(attention_mask)
         if q_segment_ids is None:

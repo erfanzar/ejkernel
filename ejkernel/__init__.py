@@ -38,11 +38,14 @@ Example:
     ... )
 """
 
+import os as _os
+
+_os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 __version__ = "0.0.1"
 
-from . import kernels, modules
+from . import kernels, modules, types
 from .kernels import Backend, Platform, kernel_registry
 
 kernel_registry.validate_signatures(None)
 
-__all__ = ("Backend", "Platform", "kernel_registry", "kernels", "modules")
+__all__ = ("Backend", "Platform", "kernel_registry", "kernels", "modules", "types")

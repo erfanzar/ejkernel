@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from .cumsum import chunk_global_cumsum, chunk_local_cumsum
+from .shardings import get_corrected_named_sharding
 from .utils import (
     cdiv,
     identity_dtype_convert,
-    mask_to_segment_ids,
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_cu_seqlens_from_mask,
@@ -26,16 +25,14 @@ from .utils import (
     prepare_position_ids,
     prepare_sequence_ids,
     prepare_token_indices,
-    segment_ids_to_mask,
-    segment_ids_to_qkv_masks,
 )
 
 __all__ = [
     "cdiv",
     "chunk_global_cumsum",
     "chunk_local_cumsum",
+    "get_corrected_named_sharding",
     "identity_dtype_convert",
-    "mask_to_segment_ids",
     "prepare_chunk_indices",
     "prepare_chunk_offsets",
     "prepare_cu_seqlens_from_mask",
@@ -44,6 +41,4 @@ __all__ = [
     "prepare_position_ids",
     "prepare_sequence_ids",
     "prepare_token_indices",
-    "segment_ids_to_mask",
-    "segment_ids_to_qkv_masks",
 ]

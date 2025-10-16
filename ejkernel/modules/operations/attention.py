@@ -41,6 +41,7 @@ from ejkernel.ops import (
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.types.mask import MaskInfo
 
 from ..base import detect_platform
 from .configs import AttentionConfig
@@ -214,12 +215,12 @@ def attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch kv_len num_kv_heads head_dim"],
     value: Float[Array, "batch kv_len num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     dropout_rng: PRNGKeyArray | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
     /,
     *,
+    mask_info: MaskInfo | None = None,
     init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
     softmax_scale: float | None = None,
@@ -238,7 +239,7 @@ def attention(
         query: Query tensor [batch, seq_len, num_heads, head_dim]
         key: Key tensor [batch, seq_len_k, num_heads, head_dim]
         value: Value tensor [batch, seq_len_k, num_heads, head_dim]
-        attention_mask: Optional attention mask (legacy, prefer bias)
+        mask_info: Optional MaskInfo containing attention mask and/or segment IDs
         bias: Optional attention bias tensor
         softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
         dropout_prob: Dropout probability for attention weights
@@ -258,6 +259,11 @@ def attention(
         >>>
         >>> out = attention(query, key, value, platform="xla")
     """
+
+    attention_mask = None
+
+    if mask_info is not None:
+        attention_mask = mask_info.get_or_compute_attention_mask()
 
     return _executor(
         Attention(),

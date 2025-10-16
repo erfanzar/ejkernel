@@ -53,6 +53,7 @@ from ejkernel.ops import (
     Tuner,
 )
 from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.types.mask import MaskInfo
 
 from ..base import detect_platform
 from .configs import ScaledDotProductAttentionConfig
@@ -242,10 +243,10 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
             query,
             key,
             value,
-            attention_mask,
             bias,
             cum_seqlens_q,
             cum_seqlens_k,
+            attention_mask,
         ):
             return impl(
                 query=query,
@@ -265,10 +266,10 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
             query,
             key,
             value,
-            attention_mask,
             bias,
             cum_seqlens_q,
             cum_seqlens_k,
+            attention_mask,
         )
         assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
         shard_map_fn = shard_map(
@@ -330,12 +331,12 @@ def scaled_dot_product_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch kv_len num_kv_heads head_dim"],
     value: Float[Array, "batch kv_len num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     cum_seqlens_q: Int[Array, "batch"] | None = None,
     cum_seqlens_k: Int[Array, "batch"] | None = None,
     /,
     *,
+    mask_info: MaskInfo | None = None,
     init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     softmax_scale: float | None = None,
     causal: bool = False,
@@ -353,7 +354,7 @@ def scaled_dot_product_attention(
         query: Query tensor [batch, seq_len, num_heads, head_dim]
         key: Key tensor [batch, seq_len_k, num_heads, head_dim]
         value: Value tensor [batch, seq_len_k, num_heads, head_dim]
-        attention_mask: Optional attention mask (legacy, prefer bias)
+        mask_info: Optional MaskInfo containing attention mask and/or segment IDs
         bias: Optional attention bias tensor
         softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
         dropout_prob: Dropout probability for attention weights
@@ -381,10 +382,20 @@ def scaled_dot_product_attention(
         >>> out = scaled_dot_product_attention(query, key, value, cum_seqlens_q=cu_q, cum_seqlens_k=cu_k)
     """
 
+    attention_mask = None
+
+    if mask_info is not None:
+        attention_mask = mask_info.get_or_compute_attention_mask()
+
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
 
+        if mask_info is None:
+            in_specs = (*in_specs, None)
+        else:
+            shardings = mask_info.get_shardings(False, mesh=mesh)
+            in_specs = (*in_specs, shardings.attention_mask)
     return _executor(
         ScaledDotProductAttention(),
         query=query,
