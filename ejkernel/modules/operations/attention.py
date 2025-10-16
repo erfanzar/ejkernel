@@ -106,7 +106,7 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         self,
         query: Float[Array, "batch seq_len num_q_heads head_dim"],
         key: Float[Array, "batch kv_len num_kv_heads head_dim"],
-        value: Float[Array, "batch kv_len num_kv_heads head_dim"],
+        value: Float[Array, "batch seq_len num_q_heads vhead_dim"],
         attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
         init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
@@ -214,7 +214,7 @@ _executor: Executor[AttentionConfig, tuple[Array, Array]] = Executor(
 def attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch kv_len num_kv_heads head_dim"],
-    value: Float[Array, "batch kv_len num_kv_heads head_dim"],
+    value: Float[Array, "batch seq_len num_q_heads vhead_dim"],
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     dropout_rng: PRNGKeyArray | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
@@ -230,7 +230,7 @@ def attention(
     dropout_prob: float = 0.0,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
-) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+) -> Float[Array, "batch seq_len num_q_heads vhead_dim"]:
     """Execute flash attention with automatic optimization.
 
     Convenience function that uses a default executor and flash attention module.

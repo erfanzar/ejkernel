@@ -29,7 +29,7 @@ from ..._registry import Backend, Platform, kernel_registry
 def attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch kv_len num_kv_heads head_dim"],
-    value: Float[Array, "batch kv_len num_kv_heads head_dim"],
+    value: Float[Array, "batch kv_len num_kv_heads vhead_dim"],
     attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
@@ -43,7 +43,7 @@ def attention(
     dropout_prob: float = 0.0,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
-) -> tuple[Float[Array, "batch seq_len num_q_heads head_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
+) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
     """
     Computes multi-head attention using standard JAX operations.
 

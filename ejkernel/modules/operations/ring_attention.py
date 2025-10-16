@@ -410,54 +410,14 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             Ring attention performance is sensitive to chunk sizes relative
             to sequence length per device and communication bandwidth.
         """
-        block_configs = [
-            (64, 64, 4, 1),
-            (128, 128, 4, 2),
-            (256, 128, 8, 2),
-        ]
-
         candidates = []
-        for block_q, block_k, num_warps, num_stages in block_configs:
+        for block_q, block_k in [(128, 128), (256, 256), (512, 512)]:
             candidates.append(
                 RingAttentionConfig(
                     block_q=block_q,
                     block_k=block_k,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
                     platform="auto",
                     backend="any",
-                )
-            )
-
-        return candidates
-
-    def candidate_cfgs_gpu(self, inv: Invocation[RingAttentionConfig, Array]):
-        """Generate GPU-optimized candidate configurations for autotuning.
-
-        GPU/Triton kernels benefit from smaller blocks for ring attention.
-
-        Args:
-            inv: Invocation object with arguments and metadata
-
-        Returns:
-            Iterable of GPU-optimized candidate configurations
-        """
-        block_configs = [
-            (32, 32, 4, 1),
-            (64, 64, 4, 1),
-            (128, 128, 8, 2),
-        ]
-
-        candidates = []
-        for block_q, block_k, num_warps, num_stages in block_configs:
-            candidates.append(
-                RingAttentionConfig(
-                    block_q=block_q,
-                    block_k=block_k,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                    platform="triton",
-                    backend="gpu",
                 )
             )
 
@@ -495,7 +455,6 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
 
         return candidates
 
-    candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
     candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
 
 
