@@ -321,13 +321,13 @@ def flash_attention(
     reducing memory usage from O(N²) to O(N). Supports sliding window attention,
     logit soft capping, grouped query attention (GQA/MQA), and attention sinks.
     """
-    if kv_segment_ids is not None:
+    if kv_segment_ids is not None and attention_mask is None:
         raise NotImplementedError("`kv_segment_ids` is not implemented in xla!")
-    if q_segment_ids is not None:
+    if q_segment_ids is not None and attention_mask is None:
         raise NotImplementedError("`q_segment_ids` is not implemented in xla!")
-    if cum_seqlens_k is not None:
+    if cum_seqlens_k is not None and attention_mask is None:
         raise NotImplementedError("`cum_seqlens_k` is not implemented in xla!")
-    if cum_seqlens_q is not None:
+    if cum_seqlens_q is not None and attention_mask is None:
         raise NotImplementedError("`cum_seqlens_q` is not implemented in xla!")
 
     dropout_key = None

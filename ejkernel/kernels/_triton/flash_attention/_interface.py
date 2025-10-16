@@ -356,9 +356,9 @@ def flash_attention(
         >>> out = flash_attention(query, key, value, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
     """
     del precision, logits_dtype, normalize_output
-    if q_segment_ids is not None:
+    if q_segment_ids is not None and attention_mask is None:
         raise NotImplementedError("`q_segment_ids` is not implemented in triton impl yet!")
-    if kv_segment_ids is not None:
+    if kv_segment_ids is not None and attention_mask is None:
         raise NotImplementedError("`kv_segment_ids` is not implemented in triton impl yet!")
 
     ifn = identity_dtype_convert(query.dtype)

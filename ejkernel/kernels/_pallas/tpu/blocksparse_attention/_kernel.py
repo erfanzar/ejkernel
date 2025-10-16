@@ -2467,9 +2467,9 @@ def blocksparse_attention(
     Returns:
         Attention output [batch num_heads seq_len vhead_dim]
     """
-    if q_positions is not None:
+    if q_positions is not None and q_segment_ids is None:
         raise NotImplementedError("`q_positions` is not implemented for tpu-pallas (gpu-triton and xla only).")
-    if kv_positions is not None:
+    if kv_positions is not None and kv_segment_ids is None:
         raise NotImplementedError("`kv_positions` is not implemented for tpu-pallas (gpu-triton and xla only).")
     if bias is not None:
         raise NotImplementedError("`bias` is not implemented for tpu-pallas (gpu-triton and xla only).")
