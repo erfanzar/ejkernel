@@ -6,5 +6,6 @@ ejkernel.ops.execution package
 
    ops/execution/batch
    ops/execution/executor
+   ops/execution/offline
    ops/execution/profiler
    ops/execution/tuning

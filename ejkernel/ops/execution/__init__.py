@@ -36,6 +36,7 @@ Functions:
 
 from .batch import pmap_with_config, vmap_with_config
 from .executor import ConfigChooser, Executor
+from .offline import autotune_lowered
 from .tuning import (
     AutotuneData,
     Autotuner,
@@ -58,6 +59,7 @@ __all__ = (
     "FNAutotuner",
     "Measurement",
     "autotune",
+    "autotune_lowered",
     "autotune_recorded",
     "benchmark",
     "pmap_with_config",

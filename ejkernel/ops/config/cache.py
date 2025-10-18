@@ -157,6 +157,17 @@ class overlay_cache:
         stack = list(_cache_overlay.get())
         stack.append(self.mapping)
         self.token = _cache_overlay.set(stack)
+
+        try:
+            import jax
+
+            if not hasattr(self, "_ejk_user_context"):
+                self._ejk_user_context = jax.make_user_context(()) if hasattr(jax, "make_user_context") else None
+            if self._ejk_user_context:
+                self._ejk_user_context = self._ejk_user_context((*self._ejk_user_context.value, id(self)))
+                self._ejk_user_context.__enter__()
+        except Exception:
+            pass
         return self
 
     def __exit__(self, *exc):
@@ -169,3 +180,8 @@ class overlay_cache:
             *exc: Exception information (ignored)
         """
         _cache_overlay.reset(self.token)
+        try:
+            if hasattr(self, "_ejk_user_context") and self._ejk_user_context:
+                self._ejk_user_context.__exit__(*exc)
+        except Exception:
+            pass

@@ -840,8 +840,6 @@ def flash_attention(
     kv_segment_ids = None
 
     if mask_info is not None:
-        # TODO: segment IDs are not yet supported by Triton and XLA implementations
-        # q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids()
         attention_mask = mask_info.get_or_compute_attention_mask()
 
     method = None

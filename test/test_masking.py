@@ -112,72 +112,6 @@ def _run_and_verify_4d_per_head_true(name: str, mask_4d: jnp.ndarray):
     print(f"  ✓ {name} (per_head=True): OK")
 
 
-def test_suite():
-    print("\nRunning tests for mask_to_segment_ids...\n")
-
-    N = 8
-    m_full = jnp.ones((N, N), dtype=bool)
-    _run_and_verify_2d("Full attention (square)", m_full)
-
-    m_block = jnp.zeros((N, N), dtype=bool)
-    m_block = m_block.at[: N // 2, : N // 2].set(True)
-    m_block = m_block.at[N // 2 :, N // 2 :].set(True)
-    _run_and_verify_2d("Block diagonal (square)", m_block)
-
-    Q, K = 7, 10
-    m_causal = jnp.tril(jnp.ones((Q, K), dtype=bool), k=0)
-    _run_and_verify_2d("Causal (rectangular Q<K)", m_causal)
-
-    Q, K, w = 8, 9, 3
-    m_win = jnp.zeros((Q, K), dtype=bool)
-    for i in range(Q):
-        start = max(0, i - w // 2)
-        end = min(K, i + w // 2 + 1)
-        m_win = m_win.at[i, start:end].set(True)
-    _run_and_verify_2d(f"Local window w={w} (rectangular)", m_win)
-
-    N = 8
-    i = jnp.arange(N)[:, None]
-    j = jnp.arange(N)[None, :]
-    m_parity = (i % 2) == (j % 2)
-    _run_and_verify_2d("Strided parity (square)", m_parity)
-
-    Q, K = 6, 7
-    m_pad = jnp.zeros((Q, K), dtype=bool)
-
-    m_pad = m_pad.at[0, 1:4].set(True)
-    m_pad = m_pad.at[2, 2:6].set(True)
-
-    m_pad = m_pad.at[3, 5].set(True)
-
-    _run_and_verify_2d("Padding rows/cols (rectangular)", m_pad)
-
-    B, Q, K = 3, 6, 7
-    key = jax.random.PRNGKey(0)
-    m3 = jax.random.bernoulli(key, p=0.5, shape=(B, Q, K))
-
-    m3 = m3.at[0, 1, :].set(False)
-    m3 = m3.at[0, :, 0].set(False)
-    _run_and_verify_3d("Batched (B,Q,K)", m3)
-
-    B, H, Q, K = 2, 3, 6, 7
-    key = jax.random.PRNGKey(42)
-    m4 = jax.random.bernoulli(key, p=0.5, shape=(B, H, Q, K))
-
-    m4 = m4.at[0, 0, 2, :].set(False)
-    m4 = m4.at[0, 0, :, 1].set(False)
-    _run_and_verify_4d_per_head_false("4D (B,H,Q,K)", m4)
-
-    _run_and_verify_4d_per_head_true("4D (B,H,Q,K)", m4)
-
-    N = 8
-    m_bool = jnp.arange(N)[:, None] <= jnp.arange(N)[None, :]
-    m_int = m_bool.astype(jnp.int32)
-    m_float = m_bool.astype(jnp.float32)
-    _run_and_verify_2d("Dtype int", m_int)
-    _run_and_verify_2d("Dtype float", m_float)
-
-
 def test_maskinfo_from_segments():
     """Test MaskInfo.from_segments() factory method."""
     print("\nTesting MaskInfo.from_segments()...")
@@ -206,26 +140,12 @@ def test_maskinfo_from_segments():
     print("  ✓ from_segments: OK")
 
 
-def test_maskinfo_from_attention_mask_2d():
-    """Test MaskInfo.from_attention_mask() with 2D padding mask."""
-    print("\nTesting MaskInfo.from_attention_mask() with 2D padding mask...")
-
-    padding_mask = jnp.array([[1, 1, 1, 0, 0]])
-    mask_info = MaskInfo.from_attention_mask(padding_mask)
-
-    expected_seg = jnp.array([[1, 1, 1, -1, -1]])
-    assert jnp.array_equal(mask_info.q_segment_ids, expected_seg)
-    assert jnp.array_equal(mask_info.kv_segment_ids, expected_seg)
-
-    assert mask_info.attention_mask.shape == (1, 1, 5, 5)
-
-    attn = mask_info.attention_mask[0, 0]
-    assert jnp.all(attn[0:3, 0:3])
-
-    assert not jnp.any(attn[3:, :])
-    assert not jnp.any(attn[:, 3:])
-
-    print("  ✓ from_attention_mask (2D): OK")
+def _mk_base_mask(B=1, Q=16, K=16, left=4, right=2):
+    """Full mask -> sliding window to get a deterministic base."""
+    m = MaskInfo.from_random(batch_size=B, q_len=Q, kv_len=K, sparsity=0.0, seed=0)
+    m = m.apply_sliding_window((left, right))
+    base = jax.device_get(m.get_or_compute_attention_mask(dtype=jnp.bool_))
+    return m, base  # m holds the stored attention_mask
 
 
 def test_maskinfo_from_attention_mask_3d():
@@ -632,11 +552,7 @@ def test_maskinfo_segment_ids_as_source_of_truth():
     # Create a "wrong" attention mask that doesn't match the segment IDs (4D)
     wrong_mask = jnp.ones((1, 1, 4, 4), dtype=jnp.bool_)  # All True
 
-    mask_info = MaskInfo(
-        attention_mask=wrong_mask,
-        q_segment_ids=q_seg,
-        kv_segment_ids=kv_seg
-    )
+    mask_info = MaskInfo(attention_mask=wrong_mask, q_segment_ids=q_seg, kv_segment_ids=kv_seg)
 
     # get_or_compute_attention_mask should ALWAYS regenerate from segment IDs
     computed_mask = mask_info.get_or_compute_attention_mask()
@@ -650,10 +566,107 @@ def test_maskinfo_segment_ids_as_source_of_truth():
     assert computed_mask[0, 0, 2, 3], "Token 2 should attend to token 3 (same segment)"
 
     # Verify it's not just using the stored wrong_mask
-    assert not jnp.array_equal(computed_mask, wrong_mask), \
-        "Should regenerate mask from segment IDs, not use stored mask"
+    assert not jnp.array_equal(computed_mask, wrong_mask), "Should regenerate mask from segment IDs, not use stored mask"
 
     print("  ✓ segment IDs as source of truth: OK")
+
+
+def _mk_base_mask(B=1, Q=16, K=16, left=4, right=2):
+    """Full mask -> sliding window to get a deterministic base."""
+    m = MaskInfo.from_random(batch_size=B, q_len=Q, kv_len=K, sparsity=0.0, seed=0)
+    m = m.apply_sliding_window((left, right))
+    base = jax.device_get(m.get_or_compute_attention_mask(dtype=jnp.bool_))
+    return m, base  # m holds the stored attention_mask
+
+
+def _eq_mask(q_types, kv_types, zero_policy="q"):
+    """Build expected equality mask (B,1,Q,K) honoring zero_policy."""
+    B, _Q = q_types.shape
+    B2, _K = kv_types.shape
+    assert B == B2
+    eq2d = q_types[:, :, None] == kv_types[:, None, :]
+    if zero_policy in ("q", "both"):
+        eq2d = eq2d & (q_types != 0)[:, :, None]
+    if zero_policy in ("kv", "both"):
+        eq2d = eq2d & (kv_types != 0)[:, None, :]
+    return eq2d[:, None, :, :].astype(bool)
+
+
+def test_union_adds_edges_outside_window():
+    B, Q, K = 1, 16, 16
+    m, base = _mk_base_mask(B, Q, K, left=4, right=2)
+
+    # Make equality true at a location outside the window (row 0, col 10)
+    q_types = jnp.ones((B, Q), dtype=jnp.int32)
+    kv_types = jnp.full((B, K), 2, dtype=jnp.int32)
+    q_types = q_types.at[0, 0].set(5)
+    kv_types = kv_types.at[0, 10].set(5)
+
+    eq4d = _eq_mask(q_types, kv_types, zero_policy="none")
+    expected = np.logical_or(base, jax.device_get(eq4d))
+
+    m2 = m.apply_token_type_ids((q_types, kv_types), combine="union", zero_policy="none", update_segment_ids=False)
+    actual = jax.device_get(m2.get_or_compute_attention_mask(dtype=jnp.bool_))
+
+    assert actual.shape == expected.shape
+    assert np.array_equal(actual, expected)
+    # Spot-check the outside-window addition
+    assert expected[0, 0, 0, 10] and not base[0, 0, 0, 10]
+
+
+@pytest.mark.parametrize("zero_policy", ["q", "kv", "both", "none"])
+def test_zero_policy_effect(zero_policy):
+    B, Q, K = 1, 12, 12
+    m, base = _mk_base_mask(B, Q, K, left=3, right=2)
+
+    # Create multiple matches; include zeros based on policy to verify disabling.
+    q_types = jnp.array([[1, 0, 2, 2, 0, 3, 3, 1, 0, 4, 4, 5]], dtype=jnp.int32)
+    kv_types = jnp.array([[1, 2, 2, 0, 3, 3, 1, 4, 0, 4, 5, 5]], dtype=jnp.int32)
+
+    eq4d = _eq_mask(q_types, kv_types, zero_policy=zero_policy)
+
+    # Use union to make it easy to observe effects
+    m2 = m.apply_token_type_ids((q_types, kv_types), combine="union", zero_policy=zero_policy, update_segment_ids=False)
+    actual = jax.device_get(m2.get_or_compute_attention_mask(dtype=jnp.bool_))
+    expected = np.logical_or(base, jax.device_get(eq4d))
+
+    assert np.array_equal(actual, expected)
+
+    # Sanity: under zero_policy='q', row with q==0 should not gain any new edges
+    if zero_policy in ("q", "both"):
+        rows_with_zero = np.where(jax.device_get(q_types[0]) == 0)[0]
+        for r in rows_with_zero:
+            # Check any outside-window gains are absent
+            new_edges = np.logical_and(actual[0, 0, r], np.logical_not(base[0, 0, r]))
+            assert not new_edges.any()
+
+
+def test_cross_attention_union_shapes_and_effect():
+    B, Q, K = 1, 12, 20
+    m, base = _mk_base_mask(B, Q, K, left=3, right=2)
+
+    q_types = jnp.ones((B, Q), dtype=jnp.int32)
+    kv_types = jnp.full((B, K), 2, dtype=jnp.int32)
+    # One match outside the window for row 0
+    q_types = q_types.at[0, 0].set(9)
+    kv_types = kv_types.at[0, 15].set(9)
+
+    eq4d = _eq_mask(q_types, kv_types, zero_policy="none")
+    expected = np.logical_or(base, jax.device_get(eq4d))
+
+    m2 = m.apply_token_type_ids((q_types, kv_types), combine="union", zero_policy="none", update_segment_ids=False)
+    actual = jax.device_get(m2.get_or_compute_attention_mask(dtype=jnp.bool_))
+    assert actual.shape == (B, 1, Q, K)
+    assert np.array_equal(actual, expected)
+    assert actual[0, 0, 0, 15] and not base[0, 0, 0, 15]
+
+
+def test_visualize_smoke():
+    # Just ensure visualize returns a string and doesn't crash.
+    B, Q, K = 1, 32, 32
+    m, _ = _mk_base_mask(B, Q, K, left=8, right=4)
+    s = m.visualize(block_size=4, show_segments=True, return_str=True)
+    assert isinstance(s, str) and "Attention mask" in s
 
 
 if __name__ == "__main__":

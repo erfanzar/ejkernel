@@ -71,6 +71,7 @@ import jax.numpy as jnp
 import jax.sharding
 import jax.tree_util as jtu
 
+from ..config.cache import _cache_overlay
 from ..core import Invocation, Kernel, _get_platform_method, _has_custom_vjp
 from ..core.types import Cfg, Out
 from ..utils.fingerprint import abstractify, device_fingerprint, get_device_platform, stable_json
@@ -272,7 +273,12 @@ class Executor(Generic[Cfg, Out]):
             out_specs=out_specs,
             check_vma=check_vma,
         )
-        chosen = self.chooser.choose(inv, kernel)
+
+        policy = getattr(self.chooser, "policy", None)
+        if policy is not None and getattr(policy, "cache_miss_fallback", "heuristics") == "heuristics":
+            chosen = self._choose_heuristics_only(inv, kernel)
+        else:
+            chosen = self.chooser.choose(inv, kernel)
 
         platform = get_device_platform()
         context = "shard_map" if method == "shard_map" else None
@@ -410,15 +416,61 @@ class Executor(Generic[Cfg, Out]):
             cfg = kwargs.pop("_cfg")
 
         args2, kwargs2 = kernel.prepare(*args, **kwargs)
+
+        method = kwargs2.pop("method", None)
+        mesh = kwargs2.pop("mesh", None)
+        in_specs = kwargs2.pop("in_specs", None)
+        out_specs = kwargs2.pop("out_specs", None)
+        check_vma = kwargs2.pop("check_vma", False)
+
         inv = Invocation(
             op_id=kernel.op_id,
             args=args2,
             kwargs=kwargs2,
             override_cfg=cfg,
             stamp=False,
-            method=kwargs.get("_method", None),
+            method=method,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
         )
+        policy = getattr(self.chooser, "policy", None)
+        if policy is not None and getattr(policy, "cache_miss_fallback", "heuristics") == "heuristics":
+            return self._choose_heuristics_only(inv, kernel)
         return self.chooser.choose(inv, kernel)
+
+    def _choose_heuristics_only(self, inv: Invocation[Cfg, Out], kernel: Kernel[Cfg, Out]) -> Cfg:
+        """Fast path: overlay -> memory cache -> persistent -> heuristics.
+
+        Never calls the full selector.choose and never autotunes.
+        Writes back the chosen config to memory/persistent caches if needed.
+        """
+        dev = device_fingerprint()
+        op_id_v = f"{kernel.op_id}@v{getattr(kernel, 'version', '0')}"
+        call_key = inv.make_key(kernel.key_builder)
+
+        for overlay in reversed(_cache_overlay.get()):
+            if (cfg := overlay.get((dev, op_id_v, call_key))) is not None:
+                return cfg
+
+        if (cfg := self.chooser.cache.get(dev, op_id_v, call_key)) is not None:
+            return cfg
+
+        if self.chooser.persistent is not None:
+            if (cfg := self.chooser.persistent.get(dev, op_id_v, call_key)) is not None:
+                self.chooser.cache.put(dev, op_id_v, call_key, cfg)
+                return cfg
+
+        platform = get_device_platform()
+        context = "shard_map" if getattr(inv, "method", None) == "shard_map" else None
+        heuristic_cfg_method = _get_platform_method(kernel, "heuristic_cfg", platform, context) or kernel.heuristic_cfg
+        cfg = heuristic_cfg_method(inv)
+
+        self.chooser.cache.put(dev, op_id_v, call_key, cfg)
+        if self.chooser.persistent is not None and self.chooser.persist_autotune:
+            self.chooser.persistent.put(dev, op_id_v, call_key, cfg)
+        return cfg
 
     def compile(self, kernel: Kernel[Cfg, Out], *example_args, cfg: Cfg | None = None, **example_kwargs):
         """Compile kernel with pre-selected configuration.

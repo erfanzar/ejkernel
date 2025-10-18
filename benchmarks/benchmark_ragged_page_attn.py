@@ -29,12 +29,11 @@ def create_attention_algorithms():
             block_tables,
             query_start_loc,
             num_seqs,
-            optimized=True,
         )
 
     return {
-        "eop": xla_page,
-        "ejk": ejk_page,
+        "xla": xla_page,
+        # "ejk": ejk_page,
     }
 
 
