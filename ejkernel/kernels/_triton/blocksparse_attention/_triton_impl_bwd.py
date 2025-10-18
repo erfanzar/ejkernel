@@ -1108,8 +1108,8 @@ def _bwd_blocksparse_attn_call(
         qkv_layouts,
         out,
         lse,
-        softmax_aux,
-        bias,
+        _softmax_aux,
+        _bias,
     ) = res
     qkv_layouts: tuple[SparseMask]
 

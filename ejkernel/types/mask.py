@@ -1076,7 +1076,7 @@ class MaskInfo:
             base_mask = base_mask[:, None, :, :]
         if base_mask.ndim != 4:
             raise ValueError(f"Expected 4D attention mask, got {base_mask.shape}")
-        B, H, Q_total, K_total = base_mask.shape
+        B, _H, Q_total, K_total = base_mask.shape
 
         kv_lengths = jnp.asarray(kv_lengths, jnp.int32).reshape(B)
         if clamp:

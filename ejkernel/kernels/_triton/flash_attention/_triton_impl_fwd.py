@@ -100,6 +100,7 @@ def _attn_fwd_inner(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    LN2: tl.constexpr = 1.44269504089
     index_start_n = tl.multiple_of(index_start_n, BLOCK_N)
     offset_k_ptrs = k_ptrs + index_start_n * stride_kn
     k = padded_load(
@@ -155,10 +156,8 @@ def _attn_fwd_inner(
             BIG_NEG: tl.constexpr = -2147483648
             qk = tl.where(bias, qk, BIG_NEG)
         else:
-            LN2: tl.constexpr = 1.44269504089
             qk += bias * (LN2 / softmax_scale)
 
-    LN2: tl.constexpr = 1.44269504089
     if SOFTCAP:
         qk_natural = qk * (softmax_scale / LN2)
 
