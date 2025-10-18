@@ -446,16 +446,20 @@ class MaskInfo:
         """
 
         def _canon_01_to_neg1_0(ids):
+            ids = jnp.asarray(ids, dtype=jnp.int32)
             is_01 = jnp.all((ids == 0) | (ids == 1))
             return jax.lax.cond(
                 is_01,
-                lambda x: jnp.where(x == 0, jnp.array(-1, x.dtype), jnp.array(0, x.dtype)),
+                lambda x: jnp.where(x == 0, jnp.int32(-1), jnp.int32(0)),
                 lambda x: x,
                 ids,
             )
 
+        q_segment_ids = jnp.asarray(q_segment_ids, dtype=jnp.int32)
+        if kv_segment_ids is not None:
+            kv_segment_ids = jnp.asarray(kv_segment_ids, dtype=jnp.int32)
+
         if apply_padding:
-            assert jnp.issubdtype(q_segment_ids.dtype, jnp.signedinteger)
             q_segment_ids = _canon_01_to_neg1_0(q_segment_ids)
 
         if kv_segment_ids is None:
