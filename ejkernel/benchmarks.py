@@ -154,7 +154,7 @@ class Benchmark:
         Handles tuple/list outputs by taking first element and applying mean if needed.
         """
 
-        if isinstance(output, (tuple, list)):
+        if isinstance(output, tuple | list):
             output = output[0]
 
         if hasattr(output, "shape") and output.shape != ():
@@ -223,7 +223,7 @@ class Benchmark:
                     grads = grad_fn(inputs)
                 if hasattr(grads, "block_until_ready"):
                     grads.block_until_ready()
-                elif isinstance(grads, (tuple, list)):
+                elif isinstance(grads, tuple | list):
                     for g in jax.tree_util.tree_leaves(grads):
                         if hasattr(g, "block_until_ready"):
                             g.block_until_ready()
@@ -239,7 +239,7 @@ class Benchmark:
                     grads = grad_fn(inputs)
                 if hasattr(grads, "block_until_ready"):
                     grads.block_until_ready()
-                elif isinstance(grads, (tuple, list)):
+                elif isinstance(grads, tuple | list):
                     for g in jax.tree_util.tree_leaves(grads):
                         if hasattr(g, "block_until_ready"):
                             g.block_until_ready()

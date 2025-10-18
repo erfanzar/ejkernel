@@ -487,14 +487,16 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             for (block_m, npages, warps, stages) in block_configs
         ]
 
-        return RaggedPageAttentionConfig(
-            num_kv_pages_per_block=None,
-            num_queries_per_block=None,
-            num_warps=None,
-            num_stages=None,
-            platform="xla",
-            backend="any",
-        )
+        return [
+            RaggedPageAttentionConfig(
+                num_kv_pages_per_block=None,
+                num_queries_per_block=None,
+                num_warps=None,
+                num_stages=None,
+                platform="xla",
+                backend="any",
+            )
+        ]
 
     def candidate_cfgs_tpu(self, inv: Invocation[RaggedPageAttentionConfig, Array]):
         """Generate candidate configurations for autotuning on TPU (Pallas backend).

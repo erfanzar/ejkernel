@@ -188,10 +188,10 @@ class Tuner(Generic[Cfg]):
         """
 
         def _is_arrayish(x) -> bool:
-            return isinstance(x, (jax.Array, np.ndarray)) or isinstance(x, jcore.Tracer)
+            return isinstance(x, jax.Array | np.ndarray) or isinstance(x, jcore.Tracer)
 
         def _to_concrete(x):
-            if isinstance(x, (jax.Array, np.ndarray)):
+            if isinstance(x, jax.Array | np.ndarray):
                 return x
             shape = getattr(x, "shape", None)
             dtype = getattr(x, "dtype", None)
@@ -473,7 +473,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
             kw = dict(inv.kwargs)
 
             def _is_arrayish(x) -> bool:
-                return isinstance(x, (jax.Array, np.ndarray)) or isinstance(x, jcore.Tracer)
+                return isinstance(x, jax.Array | np.ndarray) or isinstance(x, jcore.Tracer)
 
             static_fun_kwargs = {k: v for k, v in kw.items() if callable(v)}
             dyn_kwargs = kw

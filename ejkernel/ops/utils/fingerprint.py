@@ -261,7 +261,7 @@ def stable_json(obj: Any) -> str:
         if dataclasses.is_dataclass(o):
             return dataclasses.asdict(o)
 
-        if isinstance(o, (jax.Array, np.ndarray)):
+        if isinstance(o, jax.Array | np.ndarray):
             try:
                 dtype_name = getattr(o, "dtype", None)
                 dtype_name = getattr(dtype_name, "name", str(dtype_name))
@@ -275,7 +275,7 @@ def stable_json(obj: Any) -> str:
             return {"shape": tuple(int(s) for s in o.shape), "dtype": dtype}
         if isinstance(o, np.dtype):
             return o.name
-        if isinstance(o, (np.integer, np.floating, np.bool_)):
+        if isinstance(o, np.integer | np.floating | np.bool_):
             return o.item()
         return repr(o)
 
@@ -335,7 +335,7 @@ def abstractify(pytree: Any) -> Any:
     """
 
     def leaf(x):
-        if isinstance(x, (jax.Array, np.ndarray)):
+        if isinstance(x, jax.Array | np.ndarray):
             return jax.ShapeDtypeStruct(np.shape(x), getattr(x, "dtype", None))
         return x
 
