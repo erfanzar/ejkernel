@@ -468,7 +468,7 @@ class MaskInfo:
             kv_segment_ids = _canon_01_to_neg1_0(kv_segment_ids)
 
         return cls(
-            attention_mask=segment_ids_to_mask((q_segment_ids, kv_segment_ids)),
+            attention_mask=None,
             q_segment_ids=q_segment_ids,
             kv_segment_ids=kv_segment_ids,
             q_positions=q_positions,
@@ -726,28 +726,36 @@ class MaskInfo:
 
         q_segment_ids = (
             get_corrected_named_sharding(
-                self.q_segment_ids.shape, PartitionSpec(batch_axis_name, sequence_axis_name), mesh=mesh
+                self.q_segment_ids.shape,
+                PartitionSpec(batch_axis_name, sequence_axis_name),
+                mesh=mesh,
             ).spec
             if self.q_segment_ids is not None
             else None
         )
         kv_segment_ids = (
             get_corrected_named_sharding(
-                self.kv_segment_ids.shape, PartitionSpec(batch_axis_name, sequence_axis_name), mesh=mesh
+                self.kv_segment_ids.shape,
+                PartitionSpec(batch_axis_name, sequence_axis_name),
+                mesh=mesh,
             ).spec
             if self.kv_segment_ids is not None
             else None
         )
         q_positions = (
             get_corrected_named_sharding(
-                self.q_positions.shape, PartitionSpec(batch_axis_name, sequence_axis_name), mesh=mesh
+                self.q_positions.shape,
+                PartitionSpec(batch_axis_name, sequence_axis_name),
+                mesh=mesh,
             ).spec
             if self.q_positions is not None
             else None
         )
         kv_positions = (
             get_corrected_named_sharding(
-                self.kv_positions.shape, PartitionSpec(batch_axis_name, sequence_axis_name), mesh=mesh
+                self.kv_positions.shape,
+                PartitionSpec(batch_axis_name, sequence_axis_name),
+                mesh=mesh,
             ).spec
             if self.kv_positions is not None
             else None
@@ -760,7 +768,9 @@ class MaskInfo:
             kv_positions=kv_positions,
         )
 
-    def get_or_compute_positions(self) -> tuple[Int[Array, "batch qlen"] | None, Int[Array, "batch kvlen"] | None]:
+    def get_or_compute_positions(
+        self,
+    ) -> tuple[Int[Array, "batch qlen"] | None, Int[Array, "batch kvlen"] | None]:
         """
         Get position arrays, computing them if not already available.
 
@@ -846,7 +856,11 @@ class MaskInfo:
 
     def get_qkv_masks(
         self, dtype: DTypeLike = jnp.bool_
-    ) -> tuple[Array, Array, Bool[Array, "batch nheads_or_1 qlen kvlen"] | Int[Array, "batch nheads_or_1 qlen kvlen"]]:
+    ) -> tuple[
+        Array,
+        Array,
+        Bool[Array, "batch nheads_or_1 qlen kvlen"] | Int[Array, "batch nheads_or_1 qlen kvlen"],
+    ]:
         """
         Get separate query mask, key-value mask, and attention mask.
 
@@ -1535,7 +1549,11 @@ class MaskInfo:
                     q_blk_labels = _downsample_labels(q_blk_labels, rows_step)
                     kv_blk_labels = _downsample_labels(kv_blk_labels, cols_step)
 
-        block_chars = {0: "  ", 1: (".." if charset == "ascii" else "░░"), 2: ("##" if charset == "ascii" else "██")}
+        block_chars = {
+            0: "  ",
+            1: (".." if charset == "ascii" else "░░"),
+            2: ("##" if charset == "ascii" else "██"),
+        }
         lines = ["".join(block_chars[int(v)] for v in cls[r]) for r in range(block_rows)]
 
         left_width = 6 if show_segments else 0

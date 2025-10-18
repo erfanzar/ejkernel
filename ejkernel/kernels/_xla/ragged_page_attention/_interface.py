@@ -19,7 +19,7 @@ from beartype import beartype
 from jaxtyping import Array, DTypeLike, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._xla_impl_fwd import _ragged_paged_attention_chunked
+from ._xla_impl_fwd import _ragged_paged_attention
 
 
 @kernel_registry.register("ragged_page_attention", Platform.XLA, Backend.ANY)
@@ -93,7 +93,7 @@ def ragged_page_attention(
     del mask_value, num_kv_pages_per_block, num_queries_per_block, vmem_limit_bytes
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
-    fn = _ragged_paged_attention_chunked
+    fn = _ragged_paged_attention
     return fn(
         queries=queries,
         kv_pages=kv_pages,
@@ -102,6 +102,8 @@ def ragged_page_attention(
         query_start_loc=query_start_loc,
         num_seqs=num_seqs,
         softmax_scale=softmax_scale,
-        logits_soft_cap=logits_soft_cap,
+        soft_cap=logits_soft_cap,
+        compute_dtype=compute_dtype,
         sliding_window=sliding_window,
+        softmax_aux=softmax_aux,
     )

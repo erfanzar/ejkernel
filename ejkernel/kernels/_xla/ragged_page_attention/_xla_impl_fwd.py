@@ -22,110 +22,193 @@ from ejkernel.callib import ejit
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 
 
-@ejit(static_argnames=("sliding_window", "logits_soft_cap", "block_q"))
-def _ragged_paged_attention_chunked(
-    queries,
-    kv_pages,
-    context_lens,
-    block_tables,
-    query_start_loc,
-    num_seqs,
-    *,
-    softmax_scale=1.0,
-    sliding_window=None,
-    logits_soft_cap=None,
-    mask_value=DEFAULT_MASK_VALUE,
-    k_scale=None,
-    v_scale=None,
-    block_q: int = 2048,
-):
-    S = block_tables.shape[0]
-    P = block_tables.shape[1]
-    G = kv_pages.shape[1]
-    Hc = kv_pages.shape[2]
-    D = kv_pages.shape[3]
-    Hkv = Hc // 2
-    Hq = queries.shape[1]
-    H_rep = Hq // Hkv
-    Lkv_max = P * G
-    Q_total = queries.shape[0]
-    q_bs = min(block_q, Q_total)
-    cap_start = max(0, Q_total - q_bs)
+@ejit(static_argnums=(7, 8, 9))
+def _ragged_paged_attention(
+    queries: jnp.ndarray,
+    kv_pages: jnp.ndarray,  # [P, PS, 2*KVH, D] (K at 0::2, V at 1::2)
+    context_lens: jnp.ndarray,
+    block_tables: jnp.ndarray,  # [S, max_pages_per_sequence]
+    query_start_loc: jnp.ndarray,  # [S+1]
+    num_seqs: jnp.ndarray,  # [1] or scalar
+    softmax_scale: float,
+    soft_cap: float | None,
+    compute_dtype: jnp.dtype = jnp.bfloat16,
+    sliding_window: int | None = None,
+    softmax_aux: jnp.ndarray | None = None,  # [num_q_heads, num_sinks] or [num_sinks]
+) -> jnp.ndarray:
+    total_query_tokens, num_q_heads, head_size = queries.shape
+    page_size = kv_pages.shape[1]
+    num_kv_heads = kv_pages.shape[2] // 2
+    max_pages_per_sequence = block_tables.shape[-1]
+    out_shape = (total_query_tokens, num_q_heads, head_size)
+    q_heads_per_group = num_q_heads // num_kv_heads
 
-    kv_gathered = kv_pages[block_tables].reshape(S, Lkv_max, Hc, D)
-    k = kv_gathered[:, :, 0::2, :]
-    v = kv_gathered[:, :, 1::2, :]
-    if k_scale is not None:
-        k = (k.astype(jnp.float32) * jnp.asarray(k_scale, jnp.float32)).astype(queries.dtype)
-    if v_scale is not None:
-        v = (v.astype(jnp.float32) * jnp.asarray(v_scale, jnp.float32)).astype(queries.dtype)
-    k = jnp.repeat(k, H_rep, axis=2)
-    v = jnp.repeat(v, H_rep, axis=2)
+    # [T, KVH, QHG, D] and pre-scale
+    queries = queries.reshape(total_query_tokens, num_kv_heads, q_heads_per_group, head_size)
+    qblocks = 8 if total_query_tokens >= 8 else max(1, total_query_tokens)
+    kvblocks = 64 if max_pages_per_sequence >= 64 else max(1, max_pages_per_sequence)
+    queries = queries * softmax_scale
 
-    kv_iota = jnp.arange(Lkv_max, dtype=context_lens.dtype)
-    kv_valid = kv_iota[None, :] < context_lens[:, None]
-    kv_valid_f = kv_valid[..., None, None].astype(k.dtype)
-    k = k * kv_valid_f
-    v = v * kv_valid_f
+    padd = (-total_query_tokens) % qblocks
+    if padd > 0:
+        padding_shape = (padd, num_kv_heads, q_heads_per_group, head_size)
+        padded_queries = jnp.concatenate([queries, jnp.zeros(padding_shape, dtype=queries.dtype)], axis=0)
+    else:
+        padded_queries = queries
 
-    q_idx = jnp.arange(Q_total, dtype=query_start_loc.dtype)
-    q_seq_id = jnp.searchsorted(query_start_loc, q_idx, side="right") - 1
-    q_seq_id = jnp.clip(q_seq_id, 0, S - 1)
-    q_starts = query_start_loc[q_seq_id]
-    q_pos = q_idx - q_starts
-    q_lens = query_start_loc[1:] - query_start_loc[:-1]
-    q_len_q = q_lens[q_seq_id]
-    kv_len_q = context_lens[q_seq_id]
-    q_span = (kv_len_q - q_len_q) + q_pos
+    attention_output = jnp.zeros_like(padded_queries)
 
-    kv_ids = jnp.arange(Lkv_max, dtype=context_lens.dtype)
+    # Prepare sinks (softmax_aux) if provided
+    have_sinks = softmax_aux is not None
+    if have_sinks:
+        if softmax_aux.ndim == 2:
+            num_sinks = softmax_aux.shape[-1]
+            if softmax_aux.shape[0] == num_q_heads:
+                # reshape [QH, S] -> [KVH, QHG, S]
+                sinks_h = softmax_aux.reshape(num_kv_heads, q_heads_per_group, num_sinks)
+            elif softmax_aux.shape[0] == num_kv_heads:
+                # [KVH, S] -> broadcast over QHG
+                sinks_h = jnp.broadcast_to(softmax_aux[:, None, :], (num_kv_heads, q_heads_per_group, num_sinks))
+            else:
+                raise ValueError(
+                    f"softmax_aux first dim must be num_q_heads ({num_q_heads}) "
+                    f"or num_kv_heads ({num_kv_heads}), got {softmax_aux.shape}"
+                )
+        elif softmax_aux.ndim == 1:
+            num_sinks = softmax_aux.shape[0]
+            sinks_h = jnp.broadcast_to(softmax_aux[None, None, :], (num_kv_heads, q_heads_per_group, num_sinks))
+        else:
+            raise ValueError(f"Unsupported softmax_aux shape: {softmax_aux.shape}")
 
-    def step(carry, i_block):
-        out = carry
-        start = i_block * block_q
-        start_c = jnp.minimum(start, jnp.asarray(cap_start, dtype=start.dtype))
-        idx_rel = jnp.arange(q_bs, dtype=q_idx.dtype)
-        valid = (idx_rel + start) < Q_total
-        delta = start - start_c
+    def _compute_attention_for_sequence(seq_idx, output_accumulator):
+        num_queries_for_seq = query_start_loc[seq_idx + 1] - query_start_loc[seq_idx]
 
-        q_block = jax.lax.dynamic_slice(
-            queries,
-            (start_c, 0, 0),
-            (q_bs, Hq, D),
+        def _process_sequence_with_queries():
+            num_query_blocks = (num_queries_for_seq + qblocks - 1) // qblocks
+
+            def _process_query_block(query_block_idx, block_output_accumulator):
+                query_block_offset = query_block_idx * qblocks
+                q_global_start = query_start_loc[seq_idx] + query_block_offset
+                query_block = jax.lax.dynamic_slice(
+                    padded_queries,
+                    (q_global_start, 0, 0, 0),
+                    (qblocks, num_kv_heads, q_heads_per_group, head_size),
+                )
+
+                kv_cache_len_for_seq = context_lens[seq_idx]
+                # absolute token indices of queries in this block
+                q_start_tok = kv_cache_len_for_seq - num_queries_for_seq + query_block_offset
+                query_token_indices = jnp.arange(qblocks, dtype=jnp.int32) + q_start_tok
+
+                kv_tokens_per_block = page_size * kvblocks
+                base_k_ids = jnp.arange(kv_tokens_per_block, dtype=jnp.int32)
+                num_kv_blocks = (kv_cache_len_for_seq + kv_tokens_per_block - 1) // kv_tokens_per_block
+
+                def _process_kv_block(kv_block_idx, online_softmax_carry):
+                    output_block, sum_exp_block, max_score_block = online_softmax_carry
+
+                    page_map_start = kv_block_idx * kvblocks
+                    page_indices_for_block = jax.lax.dynamic_slice(
+                        block_tables, (seq_idx, page_map_start), (1, kvblocks)
+                    )
+                    page_indices_for_kv_block = jnp.squeeze(page_indices_for_block, axis=0)
+
+                    key_block_shape = (kvblocks * page_size, num_kv_heads, head_size)
+                    key_block = kv_pages[page_indices_for_kv_block, :, 0::2, :].reshape(key_block_shape)
+                    value_block = kv_pages[page_indices_for_kv_block, :, 1::2, :].reshape(key_block_shape)
+
+                    kv_token_start_index = kv_block_idx * kv_tokens_per_block
+                    kv_token_indices = base_k_ids + kv_token_start_index  # [K]
+
+                    # scores: [B, KVH, QHG, K]
+                    attention_scores_block = jnp.einsum(
+                        "bihd,kid->bihk",
+                        query_block.astype(compute_dtype),
+                        key_block.astype(compute_dtype),
+                        optimize=True,
+                    )
+                    if soft_cap is not None:
+                        attention_scores_block = jnp.tanh(attention_scores_block / soft_cap) * soft_cap
+
+                    # Masks
+                    causal_mask = jnp.expand_dims(query_token_indices, 1) >= jnp.expand_dims(kv_token_indices, 0)
+                    if sliding_window is not None:
+                        # left-only window due to causal decode
+                        left_window = int(sliding_window) if isinstance(sliding_window, int) else int(sliding_window[0])
+                        left_keep = jnp.expand_dims(kv_token_indices, 0) > jnp.expand_dims(
+                            query_token_indices - left_window, 1
+                        )
+                        causal_mask = jnp.logical_and(causal_mask, left_keep)
+                    kv_bound = jnp.expand_dims(kv_token_indices, 0) < kv_cache_len_for_seq
+                    attention_mask = (causal_mask & kv_bound)[:, None, None, :]  # [B,1,1,K]
+
+                    attention_scores_block = jnp.where(attention_mask, attention_scores_block, -jnp.inf)
+
+                    # Online softmax across KV tokens
+                    current_max = jnp.max(attention_scores_block, axis=3)  # [B,KVH,QHG]
+                    new_max = jnp.maximum(max_score_block, current_max)  # [B,KVH,QHG]
+
+                    probs = jnp.exp(attention_scores_block - jnp.expand_dims(new_max, axis=3))
+                    probs = jnp.where(attention_mask, probs, 0.0)
+
+                    rescale = jnp.exp(max_score_block - new_max)
+                    sum_exp_block = (rescale * sum_exp_block) + jnp.sum(probs, axis=3)
+                    value_update = jnp.einsum("bihk,kid->bihd", probs, value_block.astype(compute_dtype), optimize=True)
+                    output_block = jnp.expand_dims(rescale, 3) * output_block + value_update
+
+                    return output_block, sum_exp_block, new_max
+
+                init_output_block = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=compute_dtype)
+                init_sum_exp = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype)
+                init_max = jnp.full((qblocks, num_kv_heads, q_heads_per_group), -jnp.inf, dtype=compute_dtype)
+
+                output_block, sum_exp_block, max_block = jax.lax.fori_loop(
+                    0, num_kv_blocks, _process_kv_block, (init_output_block, init_sum_exp, init_max)
+                )
+
+                if have_sinks:
+                    # Incorporate sinks into the normalization only
+                    # sinks_h: [KVH, QHG, S] -> broadcast to [B, KVH, QHG, S]
+                    S = sinks_h.shape[-1]
+                    sinks_block = jnp.broadcast_to(sinks_h[None, ...], (qblocks, num_kv_heads, q_heads_per_group, S))
+                    # We do NOT apply sliding/casual masks to sinks; they are always present in normalization
+                    s_max = jnp.max(sinks_block, axis=3)  # [B,KVH,QHG]
+                    m_tot = jnp.maximum(max_block, s_max)  # [B,KVH,QHG]
+                    # total denominator: exp(m_kv - m_tot) * l_kv + sum_s exp(s - m_tot)
+                    denom = jnp.exp(max_block - m_tot) * sum_exp_block + jnp.sum(
+                        jnp.exp(sinks_block - jnp.expand_dims(m_tot, 3)), axis=3
+                    )
+                    denom = jnp.maximum(denom, jnp.asarray(1e-6, denom.dtype))
+                    normalized_output_block = (jnp.exp(max_block - m_tot)[..., None] * output_block) / denom[..., None]
+                else:
+                    # No sinks: normalize by KV sum
+                    sum_exp_block = jnp.maximum(sum_exp_block, 1e-6)
+                    normalized_output_block = (output_block / jnp.expand_dims(sum_exp_block, axis=3)).astype(
+                        padded_queries.dtype
+                    )
+
+                # Cast to query dtype for writeback
+                normalized_output_block = normalized_output_block.astype(padded_queries.dtype)
+
+                return jax.lax.dynamic_update_slice(
+                    block_output_accumulator,
+                    normalized_output_block,
+                    (q_global_start, 0, 0, 0),
+                )
+
+            return jax.lax.fori_loop(0, num_query_blocks, _process_query_block, output_accumulator)
+
+        return jax.lax.cond(
+            num_queries_for_seq > 0,
+            _process_sequence_with_queries,
+            lambda: output_accumulator,
         )
-        seq_id_block = jax.lax.dynamic_slice_in_dim(q_seq_id, start_c, q_bs, axis=0)
-        q_span_block = jax.lax.dynamic_slice_in_dim(q_span, start_c, q_bs, axis=0)
-        kv_len_block = jax.lax.dynamic_slice_in_dim(kv_len_q, start_c, q_bs, axis=0)
 
-        k_b = k[seq_id_block]
-        v_b = v[seq_id_block]
+    # number of active sequences as JAX scalar
+    num_S = (num_seqs[0] if num_seqs.shape != () else num_seqs).astype(jnp.int32)
 
-        attn = jnp.einsum("qbd,qkbd->qbk", q_block, k_b, preferred_element_type=jnp.float32)
-        attn = attn * jnp.asarray(softmax_scale, attn.dtype)
-
-        if logits_soft_cap is not None:
-            sc = jnp.asarray(logits_soft_cap, attn.dtype)
-            attn = sc * jnp.tanh(attn / sc)
-
-        mask = kv_ids[None, :] > q_span_block[:, None]
-        if sliding_window is not None:
-            win = jnp.asarray(sliding_window, q_span.dtype)
-            mask_left = kv_ids[None, :] <= (q_span_block[:, None] - win)
-            mask = jnp.logical_or(mask, mask_left)
-        mask = jnp.logical_or(mask, kv_ids[None, :] >= kv_len_block[:, None])
-
-        attn = attn + jnp.where(mask[:, None, :], jnp.asarray(mask_value, attn.dtype), jnp.array(0.0, attn.dtype))
-        attn = jax.nn.softmax(attn, axis=-1).astype(v_b.dtype)
-
-        out_block = jnp.einsum("qbk,qkbd->qbd", attn, v_b, preferred_element_type=jnp.float32).astype(queries.dtype)
-
-        keep = jnp.logical_and(valid, idx_rel >= delta)
-        out_block = jnp.where(keep[:, None, None], out_block, jnp.array(0, out_block.dtype))
-        out = jax.lax.dynamic_update_slice(out, out_block, (start_c, 0, 0))
-
-        return out, None
-
-    n_blocks = (Q_total + block_q - 1) // block_q
-    out_init = jnp.zeros_like(queries)
-    out, _ = jax.lax.scan(step, out_init, jnp.arange(n_blocks))
-    return out
+    return jax.lax.slice(
+        jax.lax.fori_loop(0, num_S, _compute_attention_for_sequence, attention_output),
+        (0, 0, 0, 0),
+        (total_query_tokens, num_kv_heads, q_heads_per_group, head_size),
+    ).reshape(out_shape)
