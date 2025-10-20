@@ -16,10 +16,11 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
+from beartype.typing import Callable
 
 
 class Mask:

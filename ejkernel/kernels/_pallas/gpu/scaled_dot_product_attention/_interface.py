@@ -19,11 +19,10 @@ This module provides GPU-accelerated scaled dot-product attention using cuDNN
 backend via JAX's Pallas/Triton framework for high-performance computation.
 """
 
-import typing as tp
-
 import jax
 import jaxtyping
 from beartype import beartype
+from beartype.typing import Callable
 from jaxtyping import Array, Bool, Float, Int
 
 from ...._registry import Backend, Platform, kernel_registry
@@ -38,7 +37,7 @@ def scaled_dot_product_attention(
     value: Float[Array, "batch kv_len num_kv_heads head_dim"],
     attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-    init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+    init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     softmax_scale: float | None = None,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,

@@ -81,6 +81,7 @@ import typing
 import jax
 import jaxtyping
 from beartype import beartype
+from beartype.typing import Callable
 from jaxtyping import Array, ArrayLike, Bool, Float, Int
 
 from ejkernel.callib import ejit
@@ -343,7 +344,7 @@ def blocksparse_attention(
     softmax_scale: float | None = None,
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
-    mask_builder: typing.Callable[[int, int, int, int, int], "Mask"] | typing.Callable[[], "SparseMask"] | None = None,
+    mask_builder: Callable[[int, int, int, int, int], "Mask"] | Callable[[], "SparseMask"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
     causal: bool = True,

@@ -13,11 +13,10 @@
 # limitations under the License.
 
 
-import typing as tp
-
 import jax
 import jaxtyping
 from beartype import beartype
+from beartype.typing import Callable
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, PRNGKeyArray
 
@@ -32,7 +31,7 @@ def attention(
     value: Float[Array, "batch kv_len num_kv_heads vhead_dim"],
     attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-    init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+    init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
     dropout_rng: PRNGKeyArray | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
