@@ -1318,7 +1318,7 @@ def _bwd_attention_kernel_call(
         dq = attention_unpack_with_static_shape(dq, cum_seqlens_q, batch_size, QSeq_max)
         dk = attention_unpack_with_static_shape(dk, cum_seqlens_k, batch_size, KSeq_max)
         dv = attention_unpack_with_static_shape(dv, cum_seqlens_k, batch_size, KSeq_max)
-        return dq, dk, dv
+        return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
 
     if attention_mask is not None and varlen_from_cu:
         assert bias is None, "mask + bias not supported; use bias alone or pack bias."
@@ -1491,4 +1491,4 @@ def _bwd_attention_kernel_call(
         dk = jnp.pad(dk, ((0, useless_padding), (0, 0), (0, 0)))
         dv = jnp.pad(dv, ((0, useless_padding), (0, 0), (0, 0)))
 
-    return dq, dk, dv
+    return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)

@@ -1363,9 +1363,9 @@ def _bwd_blocksparse_attn_call(
         )
 
     return (
-        dq,
-        dk,
-        dv,
+        dq.astype(query.dtype),
+        dk.astype(key.dtype),
+        dv.astype(value.dtype),
         None,
         None,
         None,

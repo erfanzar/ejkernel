@@ -80,7 +80,6 @@ from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
 from ejkernel.callib import ejit
 from ejkernel.ops import BwdParams, FwdParams
-from ejkernel.xla_utils import identity_dtype_convert
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_bwd import _bwd_attention_kernel_call
@@ -360,10 +359,6 @@ def flash_attention(
         raise NotImplementedError("`q_segment_ids` is not implemented in triton impl yet!")
     if kv_segment_ids is not None and attention_mask is None:
         raise NotImplementedError("`kv_segment_ids` is not implemented in triton impl yet!")
-
-    ifn = identity_dtype_convert(query.dtype)
-    key = ifn(key)
-    value = ifn(value)
 
     return flash_attention_call(
         query=query,
