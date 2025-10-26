@@ -17,12 +17,11 @@ import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Float, Int32
 
-from ...._registry import Backend, Platform, kernel_registry
-from ._pallas_impl_fwd import ragged_paged_attention as _128_ragged_paged_attention
-from ._pallas_impl_fwd_h64 import ragged_paged_attention as _64_ragged_paged_attention
+from ..._registry import Backend, Platform, kernel_registry
+from ._kernel import _ragged_paged_attention, dynamic_validate_inputs
 
 
-@kernel_registry.register("ragged_page_attention_v3", Platform.PALLAS, Backend.TPU)
+@kernel_registry.register("ragged_page_attention_v3", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def ragged_page_attention_v3(
     queries: Float[Array, "total_tokens num_q_heads head_dim"],
@@ -72,31 +71,31 @@ def ragged_page_attention_v3(
     Returns:
       The output of the attention.
     """
-    del optimized, compute_dtype
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
-    if queries.shape[-1] == 64:
-        return _64_ragged_paged_attention(
-            queries,
-            keys,
-            values,
-            kv_cache,
-            kv_lens,
-            block_tables,
-            query_start_loc,
-            distribution,
-            softmax_scale=softmax_scale,
-            sliding_window=sliding_window,
-            logits_soft_cap=logits_soft_cap,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            chunk_prefill_size=chunk_prefill_size,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
-    return _128_ragged_paged_attention(
+
+    dynamic_validate_inputs(
+        queries,
+        keys,
+        values,
+        kv_cache,
+        kv_lens,
+        block_tables,
+        query_start_loc,
+        distribution,
+        softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        chunk_prefill_size=chunk_prefill_size,
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
+    return _ragged_paged_attention(
         queries,
         keys,
         values,

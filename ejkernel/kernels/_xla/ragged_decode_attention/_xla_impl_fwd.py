@@ -82,17 +82,17 @@ def create_attention_mask(
     return ragged_mask
 
 
-def apply_logits_soft_cap(scores: Float[Array, "... seq_len"], soft_cap: float) -> Float[Array, "... seq_len"]:
+def apply_logits_soft_cap(scores: Float[Array, "... seq_len"], logits_soft_cap: float) -> Float[Array, "... seq_len"]:
     """Applies soft capping to attention logits.
 
     Args:
         scores: Attention scores
-        soft_cap: Soft capping value
+        logits_soft_cap: Soft capping value
 
     Returns:
         Soft-capped scores
     """
-    return jnp.tanh(scores / soft_cap) * soft_cap
+    return jnp.tanh(scores / logits_soft_cap) * logits_soft_cap
 
 
 def apply_attention_sinks_block(

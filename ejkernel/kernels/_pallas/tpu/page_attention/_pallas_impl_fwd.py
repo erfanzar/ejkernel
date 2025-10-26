@@ -33,7 +33,7 @@ class MultiPageAsyncCopyDescriptor:
         pages_hbm_ref,
         vmem_buffer,
         sem,
-        page_indices,
+        block_tables,
         page_indices_start_offset,
         num_pages_to_load,
         head_index,
@@ -46,7 +46,7 @@ class MultiPageAsyncCopyDescriptor:
         else:
             self._pages_hbm_ref = pages_hbm_ref
         self._sem = sem
-        self._page_indices = page_indices
+        self._page_indices = block_tables
         self._page_indices_start_offset = page_indices_start_offset
         self._async_copies = [self._make_async_copy(i) for i in range(self._num_pages_to_load)]
 

@@ -258,6 +258,26 @@ class RaggedPageAttentionConfig(BaseOperationConfig):
 
 
 @dataclass
+class RaggedPageAttentionv3Config(BaseOperationConfig):
+    """Configuration for Ragged Page Attention operation.
+
+    Args:
+        num_kv_pages_per_block: Number of KV pages to process per compute block (default: None for auto)
+        num_queries_per_block: Number of queries to process per compute block (default: None for auto)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    chunk_prefill_size: int | None = None
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+
+@dataclass
 class GLAttentionConfig(BaseOperationConfig):
     """Configuration for Gated Linear Attention operation.
 

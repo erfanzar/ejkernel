@@ -52,7 +52,7 @@ def _ragged_page_attention(
     kv_pages: Float[Array, "total_num_pages page_size num_combined_kv_heads head_dim"],
     context_lens: Int[Array, "max_num_seqs"],
     block_tables: Int[Array, "max_num_seqs pages_per_seq"],
-    cu_q_lens: Int[Array, "max_num_seqs_plus_one"],
+    query_start_loc: Int[Array, "max_num_seqs_plus_one"],
     num_seqs: jax.Array,
     *,
     softmax_scale: float = 1.0,
@@ -71,7 +71,7 @@ def _ragged_page_attention(
       context_lens: padded kv lengths. Only the first num_seqs values are valid.
       block_tables: the first index indicates which page to use in the kv cache
         for each sequence. Only the first num_seqs values are valid.
-      cu_q_lens: the cumulative sum of the effective query lengths. Similar to
+      query_start_loc: the cumulative sum of the effective query lengths. Similar to
         context_lens, only the first num_seqs+1 values are valid.
       num_seqs: the dynamic number of sequences.
       softmax_scale: the softmax softmax_scale which will be applied to the Q@K^T.
@@ -92,7 +92,7 @@ def _ragged_page_attention(
         kv_pages,
         context_lens,
         block_tables,
-        cu_q_lens,
+        query_start_loc,
         num_seqs,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
@@ -149,7 +149,7 @@ def _ragged_page_attention(
         kv_pages.dtype,
     )
     scratch_shapes = [double_buf_scratch, pltpu.SemaphoreType.DMA((2,)), lm_scratch, lm_scratch, acc_scratch]
-    scalar_prefetches = (context_lens, block_tables, cu_q_lens, jnp.array((0, 0), jnp.int32), num_seqs)
+    scalar_prefetches = (context_lens, block_tables, query_start_loc, jnp.array((0, 0), jnp.int32), num_seqs)
     kernel = pl.pallas_call(
         functools.partial(
             ragged_page_attention_kernel,
@@ -233,7 +233,7 @@ def ragged_page_attention(
         kv_pages=kv_pages,
         context_lens=context_lens,
         block_tables=block_tables,
-        cu_q_lens=query_start_loc,
+        query_start_loc=query_start_loc,
         num_seqs=num_seqs,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,

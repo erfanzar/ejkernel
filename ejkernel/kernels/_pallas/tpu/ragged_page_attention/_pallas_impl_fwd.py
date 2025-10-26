@@ -64,7 +64,7 @@ def ref_ragged_page_attention(
     kv_pages: jax.Array,
     context_lens: jax.Array,
     block_tables: jax.Array,
-    cu_q_lens: jax.Array,
+    query_start_loc: jax.Array,
     num_seqs: jax.Array,
     *,
     softmax_scale: float = 1.0,
@@ -77,7 +77,7 @@ def ref_ragged_page_attention(
         kv_pages,
         context_lens,
         block_tables,
-        cu_q_lens,
+        query_start_loc,
         num_seqs,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
@@ -94,8 +94,8 @@ def ref_ragged_page_attention(
     num_query_per_kv = num_q_heads // num_kv_heads
     outputs = []
     for i in range(num_seqs[0]):
-        q_start = cu_q_lens[i]
-        q_end = cu_q_lens[i + 1]
+        q_start = query_start_loc[i]
+        q_end = query_start_loc[i + 1]
         q_len = q_end - q_start
         kv_len = context_lens[i]
         indices = block_tables[i]
@@ -126,7 +126,7 @@ def dynamic_validate_inputs(
     kv_pages: jax.Array,
     context_lens: jax.Array,
     block_tables: jax.Array,
-    cu_q_lens: jax.Array,
+    query_start_loc: jax.Array,
     num_seqs: jax.Array,
     *,
     softmax_scale: float | None = None,
@@ -142,7 +142,7 @@ def dynamic_validate_inputs(
         kv_pages,
         context_lens,
         block_tables,
-        cu_q_lens,
+        query_start_loc,
         num_seqs,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
@@ -163,10 +163,12 @@ def dynamic_validate_inputs(
         raise ValueError(
             f"{pages_per_seq=} must be greater or equal to {min_pages_per_seq=} given {max_kv_len=} and {page_size=}."
         )
-    if cu_q_lens[num_seqs[0]] > max_num_batched_tokens:
-        raise ValueError(f"Total q tokens {cu_q_lens[num_seqs[0]]} must be less or equal to {max_num_batched_tokens=}.")
+    if query_start_loc[num_seqs[0]] > max_num_batched_tokens:
+        raise ValueError(
+            f"Total q tokens {query_start_loc[num_seqs[0]]} must be less or equal to {max_num_batched_tokens=}."
+        )
     for i in range(num_seqs[0]):
-        q_len = cu_q_lens[i + 1] - cu_q_lens[i]
+        q_len = query_start_loc[i + 1] - query_start_loc[i]
         kv_len = context_lens[i]
         if q_len > kv_len:
             raise ValueError(f"{q_len=} must be less or equal to {kv_len=} at sequence {i}.")
@@ -177,7 +179,7 @@ def static_validate_inputs(
     kv_pages: jax.Array,
     context_lens: jax.Array,
     block_tables: jax.Array,
-    cu_q_lens: jax.Array,
+    query_start_loc: jax.Array,
     num_seqs: jax.Array,
     *,
     softmax_scale: float | None = None,
@@ -201,15 +203,16 @@ def static_validate_inputs(
         raise ValueError(
             f"Expected {context_lens.shape=} to be ({max_num_seqs},) where `max_num_seqs` is `block_tables.shape[0]`."
         )
-    if cu_q_lens.shape != (max_num_seqs + 1,):
+    if query_start_loc.shape != (max_num_seqs + 1,):
         raise ValueError(
-            f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},)  where `max_num_seqs` is `block_tables.shape[0]`."
+            f"Expected {query_start_loc.shape=} to be ({max_num_seqs + 1},)  where "
+            f"`max_num_seqs` is `block_tables.shape[0]`."
         )
-    if context_lens.dtype != jnp.int32 or block_tables.dtype != jnp.int32 or cu_q_lens.dtype != jnp.int32:
+    if context_lens.dtype != jnp.int32 or block_tables.dtype != jnp.int32 or query_start_loc.dtype != jnp.int32:
         raise ValueError(
-            "The dtype of `context_lens`, `block_tables`, and `cu_q_lens` must be"
+            "The dtype of `context_lens`, `block_tables`, and `query_start_loc` must be"
             f" int32. Got {context_lens.dtype=}, {block_tables.dtype=},"
-            f" {cu_q_lens.dtype=}."
+            f" {query_start_loc.dtype=}."
         )
     if num_q_heads % num_kv_heads != 0:
         raise ValueError(f"{num_q_heads=} must be divisible by {num_kv_heads=}")

@@ -530,18 +530,18 @@ class TestRingAttentionNumericalCorrectness:
         batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        soft_cap = 30.0
+        logits_soft_cap = 30.0
 
         out_ring = pallas.tpu.ring_attention(
             q,
             k,
             v,
-            logits_soft_cap=soft_cap,
+            logits_soft_cap=logits_soft_cap,
             query_chunk_size=128,
             key_chunk_size=128,
         )
 
-        out_vanilla, _ = vanilla_attention(q, k, v, logits_soft_cap=soft_cap)
+        out_vanilla, _ = vanilla_attention(q, k, v, logits_soft_cap=logits_soft_cap)
 
         assert out_ring.shape == out_vanilla.shape
         assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
@@ -557,14 +557,14 @@ class TestRingAttentionNumericalCorrectness:
         num_sinks = 4
         softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
         window_size = 64
-        soft_cap = 30.0
+        logits_soft_cap = 30.0
 
         out_ring = pallas.tpu.ring_attention(
             q,
             k,
             v,
             softmax_aux=softmax_aux,
-            logits_soft_cap=soft_cap,
+            logits_soft_cap=logits_soft_cap,
             sliding_window=window_size,
             query_chunk_size=128,
             key_chunk_size=128,
@@ -576,7 +576,7 @@ class TestRingAttentionNumericalCorrectness:
             k,
             v,
             softmax_aux=softmax_aux,
-            logits_soft_cap=soft_cap,
+            logits_soft_cap=logits_soft_cap,
             sliding_window=window_size,
             causal=False,
         )

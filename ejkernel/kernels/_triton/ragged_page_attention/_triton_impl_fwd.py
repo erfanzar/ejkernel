@@ -392,7 +392,7 @@ def ragged_paged_attention_triton_call_qblock(
     kv_pages: jax.Array,
     context_lens: jax.Array,
     block_tables: jax.Array,
-    cu_q_lens: jax.Array,
+    query_start_loc: jax.Array,
     *,
     softmax_scale: float | None = None,
     logits_soft_cap: float | None = None,
@@ -404,7 +404,7 @@ def ragged_paged_attention_triton_call_qblock(
 ):
     assert queries.ndim == 3 and kv_pages.ndim == 4
     assert queries.dtype in (jnp.float16, jnp.bfloat16) and kv_pages.dtype == queries.dtype
-    assert context_lens.dtype == jnp.int32 and block_tables.dtype == jnp.int32 and cu_q_lens.dtype == jnp.int32
+    assert context_lens.dtype == jnp.int32 and block_tables.dtype == jnp.int32 and query_start_loc.dtype == jnp.int32
 
     total_tokens, num_q_heads, head_dim = map(int, queries.shape)
     _num_pages, page_size, combined_kv_heads, head_dim_kv = map(int, kv_pages.shape)
@@ -414,7 +414,7 @@ def ragged_paged_attention_triton_call_qblock(
     num_repeats = num_q_heads // num_kv_heads
 
     num_seqs, pages_per_seq = map(int, block_tables.shape)
-    assert context_lens.shape[0] == num_seqs and cu_q_lens.shape[0] == num_seqs + 1
+    assert context_lens.shape[0] == num_seqs and query_start_loc.shape[0] == num_seqs + 1
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -452,7 +452,7 @@ def ragged_paged_attention_triton_call_qblock(
         kv_pages,
         block_tables,
         context_lens,
-        cu_q_lens,
+        query_start_loc,
         float(softmax_scale),
         float(logits_soft_cap_val),
         int(num_seqs),
@@ -487,7 +487,7 @@ def ragged_paged_attention_triton_call(
     kv_pages: jax.Array,
     context_lens: jax.Array,
     block_tables: jax.Array,
-    cu_q_lens: jax.Array,
+    query_start_loc: jax.Array,
     *,
     softmax_scale: float | None = None,
     sliding_window: int | tuple[int, int] | None = None,
@@ -501,7 +501,7 @@ def ragged_paged_attention_triton_call(
 ):
     assert queries.ndim == 3 and kv_pages.ndim == 4
     assert queries.dtype in (jnp.float16, jnp.bfloat16) and kv_pages.dtype == queries.dtype
-    assert context_lens.dtype == jnp.int32 and block_tables.dtype == jnp.int32 and cu_q_lens.dtype == jnp.int32
+    assert context_lens.dtype == jnp.int32 and block_tables.dtype == jnp.int32 and query_start_loc.dtype == jnp.int32
 
     total_tokens, num_q_heads, head_dim = map(int, queries.shape)
     _num_pages, page_size, combined_kv_heads, head_dim_kv = map(int, kv_pages.shape)
@@ -511,7 +511,7 @@ def ragged_paged_attention_triton_call(
     num_kv_heads = combined_kv_heads // 2
 
     num_seqs, pages_per_seq = map(int, block_tables.shape)
-    assert context_lens.shape[0] == num_seqs and cu_q_lens.shape[0] == num_seqs + 1
+    assert context_lens.shape[0] == num_seqs and query_start_loc.shape[0] == num_seqs + 1
     assert num_q_heads % num_kv_heads == 0
     num_repeats = num_q_heads // num_kv_heads
 
@@ -578,7 +578,7 @@ def ragged_paged_attention_triton_call(
         kv_pages,
         block_tables,
         context_lens,
-        cu_q_lens,
+        query_start_loc,
         float(softmax_scale),
         float(logits_soft_cap_val),
         int(total_tokens),

@@ -36,13 +36,13 @@ def ref_ragged_paged_attention_hd64(
     values: jax.Array,
     kv_cache: jax.Array,
     kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
     distribution: jax.Array,
     *,
-    sm_scale: float = 1.0,
+    softmax_scale: float = 1.0,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -56,12 +56,12 @@ def ref_ragged_paged_attention_hd64(
         values,
         kv_cache,
         kv_lens,
-        page_indices,
-        cu_q_lens,
+        block_tables,
+        query_start_loc,
         distribution,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         sliding_window=sliding_window,
-        soft_cap=soft_cap,
+        logits_soft_cap=logits_soft_cap,
         mask_value=mask_value,
         q_scale=q_scale,
         k_scale=k_scale,
@@ -85,7 +85,7 @@ def ref_ragged_paged_attention_hd64(
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     padded_actual_num_kv_heads = align_to(actual_num_kv_heads, kv_packing)
     max_num_seqs = kv_lens.shape[0]
-    num_page_indices = page_indices.shape[0]
+    num_page_indices = block_tables.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
 
@@ -94,14 +94,14 @@ def ref_ragged_paged_attention_hd64(
     outputs = []
 
     for i in range(distribution[-1]):
-        q_start = cu_q_lens[i]
-        q_end = cu_q_lens[i + 1]
+        q_start = query_start_loc[i]
+        q_end = query_start_loc[i + 1]
         q_len = q_end - q_start
 
         kv_len = kv_lens[i]
         indices_start = i * pages_per_seq
         indices_end = indices_start + cdiv(kv_len, page_size)
-        indices = page_indices[indices_start:indices_end]
+        indices = block_tables[indices_start:indices_end]
         q = queries[q_start:q_end, :, :]
 
         assert kv_len - q_len >= 0
@@ -123,7 +123,7 @@ def ref_ragged_paged_attention_hd64(
                 q = jnp.clip(q, min=minval, max=maxval)
             q = q.astype(kv.dtype)
         attn = jnp.einsum("qhd,khd->hqk", q, kv, preferred_element_type=jnp.float32)
-        attn *= sm_scale
+        attn *= softmax_scale
         if k_scale is not None:
             attn *= k_scale
         if q_scale is not None:
@@ -134,8 +134,8 @@ def ref_ragged_paged_attention_hd64(
         mask = q_span < kv_span
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
-        if soft_cap is not None:
-            attn = soft_cap * jnp.tanh(attn / soft_cap)
+        if logits_soft_cap is not None:
+            attn = logits_soft_cap * jnp.tanh(attn / logits_soft_cap)
         attn = jnp.where(mask, mask_value, attn)
         attn = jax.nn.softmax(attn, axis=-1).astype(kv.dtype)
         out = jnp.einsum("hqk,khd->qhd", attn, kv).astype(queries.dtype)
@@ -226,9 +226,9 @@ def _ragged_paged_attention_kernel(
     m_ref,
     acc_ref,
     *,
-    sm_scale: float,
+    softmax_scale: float,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     mask_value: float = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -306,7 +306,7 @@ def _ragged_paged_attention_kernel(
             q = q.astype(kv.dtype)
 
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
-        s *= sm_scale
+        s *= softmax_scale
         if k_scale is not None:
             s *= k_scale
         if q_scale is not None:
@@ -319,8 +319,8 @@ def _ragged_paged_attention_kernel(
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
 
-        if soft_cap is not None:
-            s = soft_cap * jnp.tanh(s / soft_cap)
+        if logits_soft_cap is not None:
+            s = logits_soft_cap * jnp.tanh(s / logits_soft_cap)
         s += jnp.where(mask, mask_value, 0.0)
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = load_with_init(head_m_ref, -jnp.inf)
@@ -775,13 +775,13 @@ def dynamic_validate_inputs(
     values: jax.Array,
     kv_cache: jax.Array,
     kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
     distribution: jax.Array,
     *,
-    sm_scale: float = 1.0,
+    softmax_scale: float = 1.0,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -798,12 +798,12 @@ def dynamic_validate_inputs(
         v,
         kv_cache,
         kv_lens,
-        page_indices,
-        cu_q_lens,
+        block_tables,
+        query_start_loc,
         distribution,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         sliding_window=sliding_window,
-        soft_cap=soft_cap,
+        logits_soft_cap=logits_soft_cap,
         mask_value=mask_value,
         q_scale=q_scale,
         k_scale=k_scale,
@@ -817,7 +817,7 @@ def dynamic_validate_inputs(
     total_num_pages = kv_cache.shape[0]
     page_size = kv_cache.shape[1]
     max_num_seqs = kv_lens.shape[0]
-    num_page_indices = page_indices.shape[0]
+    num_page_indices = block_tables.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
 
@@ -828,10 +828,10 @@ def dynamic_validate_inputs(
     if k > max_num_seqs:
         raise ValueError(f"num_seqs={k} must be <= {max_num_seqs=}")
 
-    if cu_q_lens[k] > max_num_tokens:
-        raise ValueError(f"Total q tokens {cu_q_lens[k]} must be <= {max_num_tokens=}.")
+    if query_start_loc[k] > max_num_tokens:
+        raise ValueError(f"Total q tokens {query_start_loc[k]} must be <= {max_num_tokens=}.")
     for i in range(k):
-        q_len = cu_q_lens[i + 1] - cu_q_lens[i]
+        q_len = query_start_loc[i + 1] - query_start_loc[i]
         kv_len = kv_lens[i]
         if not (0 < q_len <= kv_len):
             raise ValueError(f"Require 0 < {q_len=} <= {kv_len=} at sequence {i}.")
@@ -841,7 +841,7 @@ def dynamic_validate_inputs(
                 f"Require {page_cnt=} <= {pages_per_seq=} at sequence {i} where {kv_len=} and {page_size=}."
             )
         for p in range(page_cnt):
-            page_idx = page_indices[i * pages_per_seq + p]
+            page_idx = block_tables[i * pages_per_seq + p]
             if not (0 <= page_idx < total_num_pages):
                 raise ValueError(
                     f"Require 0 <= {page_idx=} < {total_num_pages=} at sequence {i} where {kv_len=} and {page_size=}."
@@ -854,13 +854,13 @@ def static_validate_inputs(
     values: jax.Array,
     kv_cache: jax.Array,
     kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
     distribution: jax.Array,
     *,
-    sm_scale: float = 1.0,
+    softmax_scale: float = 1.0,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -913,21 +913,21 @@ def static_validate_inputs(
     if align_to(actual_num_kv_heads, kv_packing) != num_kv_heads:
         raise ValueError(f"Invalid {num_kv_heads=}, {actual_num_kv_heads=}, {kv_packing=}")
 
-    if not (jnp.int32 == kv_lens.dtype == page_indices.dtype == cu_q_lens.dtype == distribution.dtype):
+    if not (jnp.int32 == kv_lens.dtype == block_tables.dtype == query_start_loc.dtype == distribution.dtype):
         raise ValueError(
-            f"Expected int32 dtype for {kv_lens.dtype=}, {page_indices.dtype=},"
-            f" {cu_q_lens.dtype=}, {distribution.dtype=}"
+            f"Expected int32 dtype for {kv_lens.dtype=}, {block_tables.dtype=},"
+            f" {query_start_loc.dtype=}, {distribution.dtype=}"
         )
 
-    if not (len(kv_lens.shape) == len(page_indices.shape) == len(cu_q_lens.shape) == 1):
-        raise ValueError(f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=}, {cu_q_lens.shape=}")
+    if not (len(kv_lens.shape) == len(block_tables.shape) == len(query_start_loc.shape) == 1):
+        raise ValueError(f"Expected 1D array for {kv_lens.shape=}, {block_tables.shape=}, {query_start_loc.shape=}")
 
     max_num_seqs = kv_lens.shape[0]
-    num_page_indices = page_indices.shape[0]
+    num_page_indices = block_tables.shape[0]
     if num_page_indices % max_num_seqs != 0:
         raise ValueError(f"Expected {num_page_indices=} to be divisible by {max_num_seqs=}.")
-    if cu_q_lens.shape != (max_num_seqs + 1,):
-        raise ValueError(f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},).")
+    if query_start_loc.shape != (max_num_seqs + 1,):
+        raise ValueError(f"Expected {query_start_loc.shape=} to be ({max_num_seqs + 1},).")
     if distribution.shape != (3,):
         raise ValueError(f"Expected {distribution.shape=} to be (3,).")
 
@@ -935,8 +935,8 @@ def static_validate_inputs(
         raise ValueError(f"{page_size=} must be divisible by {kv_packing=}.")
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError(f"{sliding_window=} must be positive.")
-    if soft_cap is not None and soft_cap == 0.0:
-        raise ValueError(f"{soft_cap=} must not be 0.0.")
+    if logits_soft_cap is not None and logits_soft_cap == 0.0:
+        raise ValueError(f"{logits_soft_cap=} must not be 0.0.")
     if chunk_prefill_size is not None and chunk_prefill_size <= 0:
         raise ValueError(f"{chunk_prefill_size=} must be positive.")
     if num_kv_pages_per_block is not None:
@@ -948,7 +948,7 @@ def static_validate_inputs(
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
 
-    del sm_scale
+    del softmax_scale
     del mask_value
     del q_scale
     del k_scale
@@ -957,9 +957,9 @@ def static_validate_inputs(
 
 @ejit(
     static_argnames=(
-        "sm_scale",
+        "softmax_scale",
         "sliding_window",
-        "soft_cap",
+        "logits_soft_cap",
         "mask_value",
         "q_scale",
         "k_scale",
@@ -977,13 +977,13 @@ def ragged_paged_attention(
     values: jax.Array,
     kv_cache: jax.Array,
     kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
     distribution: jax.Array,
     *,
-    sm_scale: float = 1.0,
+    softmax_scale: float = 1.0,
     sliding_window: int | None = None,
-    soft_cap: float | None = None,
+    logits_soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
     k_scale: float | None = None,
@@ -1003,17 +1003,17 @@ def ragged_paged_attention(
       values: concatenated all sequences' values (quantized).
       kv_cache: paged KV cache with TPU-friendly shape.
       kv_lens: padded kv lengths. Only the first num_seqs values are valid.
-      page_indices: flattened page indices look-up table by (seq_id, page_id).
-      cu_q_lens: the cumulative sum of the effective query lengths. Similar to
+      block_tables: flattened page indices look-up table by (seq_id, page_id).
+      query_start_loc: the cumulative sum of the effective query lengths. Similar to
         kv_lens, only the first num_seqs+1 values are valid.
       distribution: (i, j, k) represents that sequences[0:i] are decode-only,
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
         k is also the total number of sequences.
       actual_head_dim: the actual head size of the attention. Here we assume k and
         v have the same actual head size.
-      sm_scale: the softmax scale which will be applied to the Q@K^T.
+      softmax_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
-      soft_cap: the logit soft cap for the attention.
+      logits_soft_cap: the logit soft cap for the attention.
       mask_value: mask value for causal mask.
       k_scale: the scale for the key cache.
       v_scale: the scale for the value cache.
@@ -1033,12 +1033,12 @@ def ragged_paged_attention(
         v,
         kv_cache,
         kv_lens,
-        page_indices,
-        cu_q_lens,
+        block_tables,
+        query_start_loc,
         distribution,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         sliding_window=sliding_window,
-        soft_cap=soft_cap,
+        logits_soft_cap=logits_soft_cap,
         mask_value=mask_value,
         q_scale=q_scale,
         k_scale=k_scale,
@@ -1064,7 +1064,7 @@ def ragged_paged_attention(
     ) = q.shape
     page_size = kv_cache.shape[1]
     max_num_seqs = kv_lens.shape[0]
-    num_page_indices = page_indices.shape[0]
+    num_page_indices = block_tables.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
@@ -1133,8 +1133,8 @@ def ragged_paged_attention(
 
     scalar_prefetches = (
         kv_lens,
-        page_indices,
-        cu_q_lens,
+        block_tables,
+        query_start_loc,
         distribution,
         jnp.zeros((3,), jnp.int32),
         jnp.full((4,), -1, jnp.int32),
@@ -1146,9 +1146,9 @@ def ragged_paged_attention(
         pl.pallas_call(
             functools.partial(
                 _ragged_paged_attention_kernel,
-                sm_scale=sm_scale,
+                softmax_scale=softmax_scale,
                 sliding_window=sliding_window,
-                soft_cap=soft_cap,
+                logits_soft_cap=logits_soft_cap,
                 mask_value=mask_value,
                 q_scale=q_scale,
                 k_scale=k_scale,

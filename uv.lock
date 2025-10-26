@@ -243,7 +243,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.2"
+version = "0.0.7"
 source = { editable = "." }
 dependencies = [
     { name = "beartype" },
@@ -1620,7 +1620,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/89/57/813732d1cf9dc6fe334b0b1e8baaa6469aa5fcae4d66d22cf0ca05ffd6a2/xprof-2.20.6-cp313-none-macosx_12_0_arm64.whl", hash = "sha256:472ddadb29e281f8c5be62531da4d98e052cb6f4a26a0470b97949ad1cfb6ee2", size = 13355049, upload-time = "2025-08-20T02:39:03.932Z" },
     { url = "https://files.pythonhosted.org/packages/fd/c4/75728d1b3150809b2240d0a84af32cf7e229889721be0f950dc3603927fe/xprof-2.20.6-cp313-none-manylinux2014_x86_64.whl", hash = "sha256:020ddfaff6ce3f5f63fb3ce1a2fe0287b9bc22b48ef8ebab81ebfd77bb164510", size = 14673017, upload-time = "2025-08-20T03:20:17.014Z" },
     { url = "https://files.pythonhosted.org/packages/d3/e3/f374ef14a5a80d7e115607a9dd3cbf6eccdc140d3dcee2eca2a48478e9d8/xprof-2.20.6-cp313-none-win_amd64.whl", hash = "sha256:afe872cedb276846e752de3914d3d20c802393ba562cbde7bacbbf82c77e1625", size = 13267059, upload-time = "2025-08-20T02:55:54.121Z" },
-    { url = "https://files.pythonhosted.org/packages/ae/79/2305feeefda12dd89ce6ca479fba09ed001b5a159568f2856321b4d9ccee/xprof-2.20.6-py3-none-any.whl", hash = "sha256:afbe24715d2888e16f899ba6232c0aec476fddc7115fd495a09f1e24ea301a03", size = 6246872, upload-time = "2025-08-20T03:21:35.194Z" },
 ]
 
 [[package]]

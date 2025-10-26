@@ -102,7 +102,7 @@ def ragged_page_attention(
         query_start_loc=query_start_loc,
         num_seqs=num_seqs,
         softmax_scale=softmax_scale,
-        soft_cap=logits_soft_cap,
+        logits_soft_cap=logits_soft_cap,
         compute_dtype=compute_dtype,
         sliding_window=sliding_window,
         softmax_aux=softmax_aux,

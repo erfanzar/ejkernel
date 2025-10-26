@@ -25,16 +25,16 @@ DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 @ejit(static_argnums=(7, 8, 9))
 def _ragged_paged_attention(
     queries: jnp.ndarray,
-    kv_pages: jnp.ndarray,  # [P, PS, 2*KVH, D] (K at 0::2, V at 1::2)
+    kv_pages: jnp.ndarray,
     context_lens: jnp.ndarray,
-    block_tables: jnp.ndarray,  # [S, max_pages_per_sequence]
-    query_start_loc: jnp.ndarray,  # [S+1]
-    num_seqs: jnp.ndarray,  # [1] or scalar
+    block_tables: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    num_seqs: jnp.ndarray,
     softmax_scale: float,
-    soft_cap: float | None,
+    logits_soft_cap: float | None,
     compute_dtype: jnp.dtype = jnp.bfloat16,
     sliding_window: int | None = None,
-    softmax_aux: jnp.ndarray | None = None,  # [num_q_heads, num_sinks] or [num_sinks]
+    softmax_aux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     total_query_tokens, num_q_heads, head_size = queries.shape
     page_size = kv_pages.shape[1]
@@ -43,7 +43,6 @@ def _ragged_paged_attention(
     out_shape = (total_query_tokens, num_q_heads, head_size)
     q_heads_per_group = num_q_heads // num_kv_heads
 
-    # [T, KVH, QHG, D] and pre-scale
     queries = queries.reshape(total_query_tokens, num_kv_heads, q_heads_per_group, head_size)
     qblocks = 8 if total_query_tokens >= 8 else max(1, total_query_tokens)
     kvblocks = 64 if max_pages_per_sequence >= 64 else max(1, max_pages_per_sequence)
@@ -58,16 +57,13 @@ def _ragged_paged_attention(
 
     attention_output = jnp.zeros_like(padded_queries)
 
-    # Prepare sinks (softmax_aux) if provided
     have_sinks = softmax_aux is not None
     if have_sinks:
         if softmax_aux.ndim == 2:
             num_sinks = softmax_aux.shape[-1]
             if softmax_aux.shape[0] == num_q_heads:
-                # reshape [QH, S] -> [KVH, QHG, S]
                 sinks_h = softmax_aux.reshape(num_kv_heads, q_heads_per_group, num_sinks)
             elif softmax_aux.shape[0] == num_kv_heads:
-                # [KVH, S] -> broadcast over QHG
                 sinks_h = jnp.broadcast_to(softmax_aux[:, None, :], (num_kv_heads, q_heads_per_group, num_sinks))
             else:
                 raise ValueError(
@@ -96,7 +92,7 @@ def _ragged_paged_attention(
                 )
 
                 kv_cache_len_for_seq = context_lens[seq_idx]
-                # absolute token indices of queries in this block
+
                 q_start_tok = kv_cache_len_for_seq - num_queries_for_seq + query_block_offset
                 query_token_indices = jnp.arange(qblocks, dtype=jnp.int32) + q_start_tok
 
@@ -118,35 +114,31 @@ def _ragged_paged_attention(
                     value_block = kv_pages[page_indices_for_kv_block, :, 1::2, :].reshape(key_block_shape)
 
                     kv_token_start_index = kv_block_idx * kv_tokens_per_block
-                    kv_token_indices = base_k_ids + kv_token_start_index  # [K]
+                    kv_token_indices = base_k_ids + kv_token_start_index
 
-                    # scores: [B, KVH, QHG, K]
                     attention_scores_block = jnp.einsum(
                         "bihd,kid->bihk",
                         query_block.astype(compute_dtype),
                         key_block.astype(compute_dtype),
                         optimize=True,
                     )
-                    if soft_cap is not None:
-                        attention_scores_block = jnp.tanh(attention_scores_block / soft_cap) * soft_cap
+                    if logits_soft_cap is not None:
+                        attention_scores_block = jnp.tanh(attention_scores_block / logits_soft_cap) * logits_soft_cap
 
-                    # Masks
                     causal_mask = jnp.expand_dims(query_token_indices, 1) >= jnp.expand_dims(kv_token_indices, 0)
                     if sliding_window is not None:
-                        # left-only window due to causal decode
                         left_window = int(sliding_window) if isinstance(sliding_window, int) else int(sliding_window[0])
                         left_keep = jnp.expand_dims(kv_token_indices, 0) > jnp.expand_dims(
                             query_token_indices - left_window, 1
                         )
                         causal_mask = jnp.logical_and(causal_mask, left_keep)
                     kv_bound = jnp.expand_dims(kv_token_indices, 0) < kv_cache_len_for_seq
-                    attention_mask = (causal_mask & kv_bound)[:, None, None, :]  # [B,1,1,K]
+                    attention_mask = (causal_mask & kv_bound)[:, None, None, :]
 
                     attention_scores_block = jnp.where(attention_mask, attention_scores_block, -jnp.inf)
 
-                    # Online softmax across KV tokens
-                    current_max = jnp.max(attention_scores_block, axis=3)  # [B,KVH,QHG]
-                    new_max = jnp.maximum(max_score_block, current_max)  # [B,KVH,QHG]
+                    current_max = jnp.max(attention_scores_block, axis=3)
+                    new_max = jnp.maximum(max_score_block, current_max)
 
                     probs = jnp.exp(attention_scores_block - jnp.expand_dims(new_max, axis=3))
                     probs = jnp.where(attention_mask, probs, 0.0)
@@ -167,27 +159,23 @@ def _ragged_paged_attention(
                 )
 
                 if have_sinks:
-                    # Incorporate sinks into the normalization only
-                    # sinks_h: [KVH, QHG, S] -> broadcast to [B, KVH, QHG, S]
                     S = sinks_h.shape[-1]
                     sinks_block = jnp.broadcast_to(sinks_h[None, ...], (qblocks, num_kv_heads, q_heads_per_group, S))
-                    # We do NOT apply sliding/casual masks to sinks; they are always present in normalization
-                    s_max = jnp.max(sinks_block, axis=3)  # [B,KVH,QHG]
-                    m_tot = jnp.maximum(max_block, s_max)  # [B,KVH,QHG]
-                    # total denominator: exp(m_kv - m_tot) * l_kv + sum_s exp(s - m_tot)
+
+                    s_max = jnp.max(sinks_block, axis=3)
+                    m_tot = jnp.maximum(max_block, s_max)
+
                     denom = jnp.exp(max_block - m_tot) * sum_exp_block + jnp.sum(
                         jnp.exp(sinks_block - jnp.expand_dims(m_tot, 3)), axis=3
                     )
                     denom = jnp.maximum(denom, jnp.asarray(1e-6, denom.dtype))
                     normalized_output_block = (jnp.exp(max_block - m_tot)[..., None] * output_block) / denom[..., None]
                 else:
-                    # No sinks: normalize by KV sum
                     sum_exp_block = jnp.maximum(sum_exp_block, 1e-6)
                     normalized_output_block = (output_block / jnp.expand_dims(sum_exp_block, axis=3)).astype(
                         padded_queries.dtype
                     )
 
-                # Cast to query dtype for writeback
                 normalized_output_block = normalized_output_block.astype(padded_queries.dtype)
 
                 return jax.lax.dynamic_update_slice(
@@ -204,7 +192,6 @@ def _ragged_paged_attention(
             lambda: output_accumulator,
         )
 
-    # number of active sequences as JAX scalar
     num_S = (num_seqs[0] if num_seqs.shape != () else num_seqs).astype(jnp.int32)
 
     return jax.lax.slice(
