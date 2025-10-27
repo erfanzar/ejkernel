@@ -120,7 +120,7 @@ def grouped_matmul(
     """
 
     with set_xla_metadata(ragged_dot_tiling=",".join([str(t) for t in tiling])):
-        out = jax.lax.ragged_dot(
+        out = jax.lax.ragged_dot_general(
             lhs=lhs,
             rhs=rhs,
             group_sizes=group_sizes,
