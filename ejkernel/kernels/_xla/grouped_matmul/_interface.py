@@ -127,5 +127,10 @@ def grouped_matmul(
             precision=precision,
             preferred_element_type=preferred_element_type,
             group_offset=group_offset,
+            ragged_dot_dimension_numbers=jax.lax.RaggedDotDimensionNumbers(
+                dot_dimension_numbers=(((1,), (2,)) if transpose_rhs else ((1,), (1,)), ((), ())),
+                lhs_ragged_dimensions=(0,),
+                rhs_group_dimensions=(0,),
+            ),
         )
     return out
