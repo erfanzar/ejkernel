@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import typing
+
 import jax
 import jax.numpy as jnp
 import jaxtyping
@@ -22,11 +24,13 @@ from beartype import beartype
 from jaxtyping import Array, DTypeLike, Float, Int
 
 from ...._registry import Backend, Platform, kernel_registry
-from ._pallas_impl import LutFn
 from ._pallas_impl import grouped_matmul as back_grouped_matmul
 from ._pallas_impl import transposed_grouped_matmul as back_tgrouped_matmul
 
 _back_grouped_matmul = jax.custom_vjp(back_grouped_matmul, nondiff_argnums=(3, 4, 5, 7, 8))
+
+if typing.TYPE_CHECKING:
+    from ejkernel.kernels._pallas.tpu.grouped_matmul._interface import LutFn
 
 
 def _grouped_matmul_fwd(
