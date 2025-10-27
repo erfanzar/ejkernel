@@ -77,7 +77,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         - Dynamic routing architectures
     """
 
-    def __init__(self, use_v2: bool = True):
+    def __init__(self, use_v2: bool = False):
         """Initialize Grouped Matmul module."""
         super().__init__(op_id="grouped_matmulv2" if use_v2 else "grouped_matmul")
 
@@ -350,7 +350,7 @@ def grouped_matmul(
     transpose_rhs: bool = False,
     interpret: bool = False,
     precision=None,
-    use_v2: bool = True,
+    use_v2: bool = False,
     out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: GroupedMatmulConfig | None = None,
