@@ -28,7 +28,16 @@ Key Components:
 """
 
 from ._ejit import ejit
+from ._pallas_call import buffered_pallas_call
 from ._triton_call import get_triton_type, triton_call
 from ._utils import cdiv, next_power_of_2, strides_from_shape
 
-__all__ = ("cdiv", "ejit", "get_triton_type", "next_power_of_2", "strides_from_shape", "triton_call")
+__all__ = (
+    "buffered_pallas_call",
+    "cdiv",
+    "ejit",
+    "get_triton_type",
+    "next_power_of_2",
+    "strides_from_shape",
+    "triton_call",
+)

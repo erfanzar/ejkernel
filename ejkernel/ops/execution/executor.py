@@ -383,7 +383,8 @@ class Executor(Generic[Cfg, Out]):
             if not hasattr(kernel, "create_shard_map_wrapper"):
                 raise AttributeError(f"Kernel {kernel.op_id} does not implement create_shard_map_wrapper")
 
-            shard_map_fn, call_args = kernel.create_shard_map_wrapper(
+            callback = None
+            eagers = kernel.create_shard_map_wrapper(
                 *args2,
                 mesh=mesh,
                 in_specs=in_specs,
@@ -392,7 +393,15 @@ class Executor(Generic[Cfg, Out]):
                 cfg=chosen,
                 **kwargs2,
             )
-            return shard_map_fn(*call_args)
+
+            if len(eagers) == 2:
+                shard_map_fn, call_args = eagers
+            elif len(eagers) == 3:
+                shard_map_fn, call_args, callback = eagers
+            outs = shard_map_fn(*call_args)
+            if callback is not None:
+                outs = callback(outs, cfg=chosen)
+            return outs
 
         return fn(*args2, **kwargs2)
 

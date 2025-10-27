@@ -447,6 +447,21 @@ def numeric_gen(*shape, dtype: str | jnp.dtype = jnp.float16, method: str = "nor
     return method(key=key, shape=shape, dtype=dtype)
 
 
+def random_dense(
+    *shape,
+    dtype: str | jnp.dtype = jnp.float16,
+    limit: int | None = 1,
+) -> jnp.ndarray:
+    global DEBUG_GLOBAL_RNG
+    if DEBUG_GLOBAL_RNG is None:
+        DEBUG_GLOBAL_RNG = jax.random.PRNGKey(0)
+    DEBUG_GLOBAL_RNG, key = jax.random.split(DEBUG_GLOBAL_RNG, 2)
+    if limit is None:
+        limit = 1 / np.prod(shape)
+    x = jax.random.uniform(key, shape, dtype, minval=-limit, maxval=limit)
+    return x.astype(jnp.bfloat16).astype(dtype)
+
+
 def get_abs_err(x, y):
     """Calculate maximum absolute error between two arrays.
 

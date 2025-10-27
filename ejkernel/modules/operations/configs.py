@@ -197,7 +197,7 @@ class GroupedMatmulConfig(BaseOperationConfig):
 
     block_m: int = 128
     block_n: int = 128
-    block_k: int = 64
+    block_k: int = 128
     num_warps: int = 4
     num_stages: int = 2
 

@@ -521,7 +521,7 @@ def grouped_matmul(
     tiles_n, n_rem = _calculate_irregular_num_tiles(n, tn)
     del n_rem
 
-    group_metadata, num_active_tiles = make_group_metadata(  # pylint: disable=unbalanced-tuple-unpacking
+    group_metadata, num_active_tiles = make_group_metadata(
         group_sizes=group_sizes,
         m=m,
         tm=tm,

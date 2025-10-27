@@ -486,7 +486,8 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
 
                 def mk(c, _static=static_fun_kwargs):
                     def f(*a, **k):
-                        shard_map_fn, call_args = kernel.create_shard_map_wrapper(
+                        callback = None
+                        eagers = kernel.create_shard_map_wrapper(
                             *a,
                             cfg=c,
                             mesh=inv.mesh,
@@ -495,7 +496,15 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                             check_vma=inv.check_vma,
                             **(k | _static),
                         )
-                        return shard_map_fn(*call_args)
+                        if len(eagers) == 2:
+                            shard_map_fn, call_args = eagers
+                        elif len(eagers) == 3:
+                            shard_map_fn, call_args, callback = eagers
+
+                        outs = shard_map_fn(*call_args)
+                        if callback is not None:
+                            outs = callback(outs, cfg=c)
+                        return outs
 
                     f._ejk_method = "shard_map"
                     if self.policy.validate_backward and getattr(kernel, "supports_grad_validation", False):

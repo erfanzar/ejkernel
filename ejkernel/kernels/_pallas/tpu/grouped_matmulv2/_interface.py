@@ -15,27 +15,141 @@
 
 from __future__ import annotations
 
-import typing
-
 import jax
 import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
-from jax.experimental import xla_metadata
 from jaxtyping import Array, DTypeLike, Float, Int
 
-from ..._registry import Backend, Platform, kernel_registry
+from ...._registry import Backend, Platform, kernel_registry
+from ._pallas_impl import LutFn
+from ._pallas_impl import grouped_matmul as back_grouped_matmul
+from ._pallas_impl import transposed_grouped_matmul as back_tgrouped_matmul
 
-if typing.TYPE_CHECKING:
-    from ejkernel.kernels._pallas.tpu.grouped_matmul._interface import LutFn
-
-set_xla_metadata = xla_metadata.set_xla_metadata
+_back_grouped_matmul = jax.custom_vjp(back_grouped_matmul, nondiff_argnums=(3, 4, 5, 7, 8))
 
 
-@kernel_registry.register("grouped_matmul", Platform.XLA, Backend.ANY)
-@kernel_registry.register("grouped_matmulv2", Platform.XLA, Backend.ANY)
+def _grouped_matmul_fwd(
+    lhs: jax.Array,
+    rhs: jax.Array,
+    group_sizes: jax.Array,
+    preferred_element_type: jnp.dtype,
+    tiling: tuple[int, int, int] | None = (128, 128, 128),
+    input_buffer_count: int = 2,
+    group_offset: jax.Array | None = None,
+    transpose_rhs: bool = False,
+    interpret: bool = False,
+) -> tuple[
+    jnp.ndarray,
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, int],
+]:
+    """Forward pass for grouped matrix multiplication with custom VJP.
+
+    Computes the grouped matrix multiplication and saves necessary tensors
+    for the backward pass. This function is called during the forward pass
+    of automatic differentiation.
+
+    Args:
+        lhs: Left-hand side matrix of shape [m, k].
+        rhs: Right-hand side tensor of shape [num_groups, k, n] or
+            [num_groups, n, k] if transpose_rhs is True.
+        group_sizes: Array of group sizes with shape [num_groups], dtype int32.
+            Each element specifies the number of rows from lhs for that group.
+        preferred_element_type: Output dtype, defaults to float32.
+        tiling: Tile dimensions (tm, tk, tn) for kernel execution.
+        group_offset: Starting group index for computation (for sharding).
+        existing_out: Optional existing output array to accumulate into.
+        transpose_rhs: Whether to transpose the last two dimensions of rhs.
+        interpret: Whether to run in interpret mode for debugging.
+
+    Returns:
+        Tuple of:
+            - out: Result of grouped matmul with shape [m, n]
+            - residual: Tuple of tensors needed for backward pass
+                (lhs, rhs, group_sizes, group_offset, num_groups)
+    """
+    out = back_grouped_matmul(
+        lhs,
+        rhs,
+        group_sizes,
+        preferred_element_type,
+        tiling,
+        input_buffer_count,
+        group_offset,
+        transpose_rhs=transpose_rhs,
+        interpret=interpret,
+    )
+    return out, (lhs, rhs, group_sizes, group_offset, rhs.shape[0])
+
+
+def _grouped_matmul_bwd(
+    preferred_element_type: jnp.dtype,
+    tiling: tuple[int, int, int] | None,
+    input_buffer_count: int,
+    transpose_rhs: bool,
+    interpret: bool,
+    residual: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, int],
+    grad: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, None, None, jnp.ndarray]:
+    """Backward pass for grouped matrix multiplication with custom VJP.
+
+    Computes gradients with respect to lhs and rhs using the gradient of the
+    output and saved tensors from the forward pass. This function is called
+    during the backward pass of automatic differentiation.
+
+    Args:
+        preferred_element_type: Output dtype (unused in backward).
+        tiling: Tile dimensions (tm, tk, tn) for kernel execution.
+        transpose_rhs: Whether rhs was transposed in forward pass.
+        interpret: Whether to run in interpret mode for debugging.
+        residual: Saved tensors from forward pass containing
+            (lhs, rhs, group_sizes, group_offset, num_actual_groups).
+        grad: Gradient of the loss with respect to the output, shape [m, n].
+
+    Returns:
+        Tuple of gradients:
+            - grad_lhs: Gradient w.r.t. lhs, shape [m, k]
+            - grad_rhs: Gradient w.r.t. rhs, same shape as original rhs
+            - None: Placeholder for group_sizes gradient (non-differentiable)
+            - None: Placeholder for group_offset gradient (non-differentiable)
+            - grad: Pass-through gradient for existing_out
+    """
+
+    del preferred_element_type
+    lhs, rhs, group_sizes, group_offset, num_actual_groups = residual
+
+    grad_lhs = back_grouped_matmul(
+        grad,
+        rhs,
+        group_sizes,
+        lhs[0].dtype,
+        tiling,
+        input_buffer_count=input_buffer_count,
+        group_offset=group_offset,
+        transpose_rhs=not transpose_rhs,
+        interpret=interpret,
+    )
+    grad_rhs = back_tgrouped_matmul(
+        lhs.swapaxes(0, 1),
+        grad,
+        group_sizes,
+        rhs.dtype,
+        tiling,
+        group_offset=group_offset,
+        num_actual_groups=num_actual_groups,
+        interpret=interpret,
+    )
+
+    grad_rhs = grad_rhs.swapaxes(1, 2) if transpose_rhs else grad_rhs
+    return grad_lhs, grad_rhs, None, None, grad
+
+
+_back_grouped_matmul.defvjp(_grouped_matmul_fwd, _grouped_matmul_bwd)
+
+
+@kernel_registry.register("grouped_matmulv2", Platform.PALLAS, Backend.TPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
-def grouped_matmul(
+def grouped_matmulv2(
     lhs: Float[Array, "m k"],
     rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
     group_sizes: Int[Array, "num_groups_or_shards"],
@@ -118,14 +232,15 @@ def grouped_matmul(
         - Empty groups (size 0) are skipped for efficiency
         - Cost estimation helps XLA make scheduling decisions
     """
-
-    with set_xla_metadata(ragged_dot_tiling=",".join([str(t) for t in tiling])):
-        out = jax.lax.ragged_dot(
-            lhs=lhs,
-            rhs=rhs,
-            group_sizes=group_sizes,
-            precision=precision,
-            preferred_element_type=preferred_element_type,
-            group_offset=group_offset,
-        )
-    return out
+    if existing_out is not None:
+        raise NotImplementedError("existing_out is not supported in ragged dot")
+    return _back_grouped_matmul(
+        lhs=lhs,
+        rhs=rhs,
+        group_sizes=group_sizes,
+        preferred_element_type=preferred_element_type,
+        tiling=tiling if tiling is not None else (128, 128, 128),
+        group_offset=group_offset,
+        transpose_rhs=transpose_rhs,
+        interpret=interpret,
+    )

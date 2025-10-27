@@ -31,8 +31,13 @@ grouped matmul handles variable-sized groups efficiently by:
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import Literal
 
+import jax
+from jax import numpy as jnp
+from jax import shard_map
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -72,9 +77,9 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         - Dynamic routing architectures
     """
 
-    def __init__(self):
+    def __init__(self, use_v2: bool = True):
         """Initialize Grouped Matmul module."""
-        super().__init__(op_id="grouped_matmul")
+        super().__init__(op_id="grouped_matmulv2" if use_v2 else "grouped_matmul")
 
     def get_impl(self, cfg: GroupedMatmulConfig):
         """Get kernel implementation from registry.
@@ -88,22 +93,106 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         Raises:
             ValueError: If no matching implementation is found
         """
-        platform = detect_platform("grouped_matmul", cfg.platform)
-        return kernel_registry.get("grouped_matmul", platform=platform, backend=cfg.backend)
+        platform = detect_platform(self.op_id, cfg.platform)
+        return kernel_registry.get(self.op_id, platform=platform, backend=cfg.backend)
 
-    def run(
+    def create_shard_map_wrapper(
         self,
         lhs: Float[Array, "m k"],
         rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
-        group_sizes: Int[Array, "num_groups"],
+        group_sizes: Int[Array, "num_groups_or_shards"],
         preferred_element_type=None,
-        tiling: tuple[int, int, int] | None = (128, 128, 128),
         group_offset: Int[Array, "..."] | None = None,
         existing_out: Float[Array, "m n"] | None = None,
         transpose_rhs: bool = False,
         interpret: bool = False,
         precision=None,
+        out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        *,
+        cfg: GroupedMatmulConfig | None = None,
+        mesh: Mesh | None = None,
+        in_specs: tuple[PartitionSpec, ...] | None = None,
+        out_specs: PartitionSpec | None = None,
+        check_vma: bool = False,
+    ):
+        """Create a shard_map wrapper specifically for blocksparse attention.
+
+        Args:
+            mesh: JAX device mesh
+            in_specs: Input partition specs (must match length of tensor args)
+            out_specs: Output partition spec
+            query, key, value: Input tensors to be sharded
+            All other args: Blocksparse attention parameters
+
+        Returns:
+            Tuple of (shard_map_fn, call_args)
+        """
+        assert mesh is not None, "mesh must be provided for shard_map execution"
+        assert in_specs is not None, "in_specs must be provided for shard_map execution"
+        assert out_specs is not None, "out_specs must be provided for shard_map execution"
+
+        mSize, padded_size = lhs.shape[0], 0
+        if mSize % cfg.block_m:
+            padded_size = cfg.block_m - mSize % cfg.block_m
+            lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
+
+        def _wrapped_blocksparse_attn(
+            lhs: Float[Array, "m k"],
+            rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
+            group_sizes: Int[Array, "num_groups_or_shards"],
+        ) -> Float[Array, "batch seq_len num_heads head_dim"]:
+            out = self.run(
+                lhs=lhs,
+                rhs=rhs,
+                group_sizes=group_sizes,
+                preferred_element_type=preferred_element_type,
+                group_offset=group_offset,
+                existing_out=existing_out,
+                transpose_rhs=transpose_rhs,
+                interpret=interpret,
+                precision=precision,
+                platform=platform,
+                do_padding=False,
+                cfg=cfg or self.heuristic_cfg(None),
+            )
+            if out_shard_callback is not None:
+                out = out_shard_callback(out)
+            return out
+
+        call_args = (lhs, rhs, group_sizes)
+
+        assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+
+        shard_map_fn = shard_map(
+            _wrapped_blocksparse_attn,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
+        )
+
+        def callback(out, cfg):
+            if padded_size > 0:
+                out = out[:mSize]
+            return out
+
+        return shard_map_fn, call_args, callback
+
+    def run(
+        self,
+        lhs: Float[Array, "m k"],
+        rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
+        group_sizes: Int[Array, "num_groups_or_shards"],
+        preferred_element_type=None,
+        group_offset: Int[Array, "..."] | None = None,
+        existing_out: Float[Array, "m n"] | None = None,
+        transpose_rhs: bool = False,
+        interpret: bool = False,
+        precision=None,
+        out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        do_padding: bool = True,
         *,
         cfg: GroupedMatmulConfig,
     ) -> Float[Array, "m n"]:
@@ -141,19 +230,33 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
+
         impl = self.get_impl(cfg)
-        return impl(
+
+        mSize, kSize, nSize = lhs.shape[0], lhs.shape[1], rhs.shape[2]
+
+        if do_padding:
+            padded_size = 0
+            if mSize % cfg.block_m:
+                padded_size = cfg.block_m - mSize % cfg.block_m
+                lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
+
+        out = impl(
             lhs=lhs,
             rhs=rhs,
             group_sizes=group_sizes,
             preferred_element_type=preferred_element_type,
-            tiling=tiling,
+            tiling=(min(cfg.block_m, mSize), min(cfg.block_k, kSize), min(cfg.block_n, nSize)),
             group_offset=group_offset,
             existing_out=existing_out,
             transpose_rhs=transpose_rhs,
             interpret=interpret,
             precision=precision,
         )
+        if do_padding:
+            if padded_size > 0:
+                out = out[:mSize]
+        return out
 
     def heuristic_cfg(self, inv: Invocation[GroupedMatmulConfig, Array]) -> GroupedMatmulConfig:
         """Provide default configuration with block sizes.
@@ -189,28 +292,30 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
             inv: Invocation object containing arguments and metadata
 
         Returns:
-            List of candidate configurations with block sizes from 64 to 256
+            List of candidate configurations
 
-        Note:
-            - Smaller blocks (64x64) work better for many small groups
-            - Larger blocks (256x256) are efficient for fewer, larger groups
-            - The k dimension blocking affects memory bandwidth utilization
         """
         block_configs = [
-            (64, 64, 64, 4, 1),
-            (128, 128, 128, 4, 2),
-            (256, 256, 128, 8, 3),
+            (128, 128, 128),
+            (256, 256, 128),
+            (512, 512, 128),
+            (512, 512, 256),
+            (512, 512, 512),
+            (1024, 1024, 128),
+            (1024, 1024, 256),
+            (1024, 1024, 512),
+            (1024, 1024, 1024),
         ]
 
         candidates = []
-        for block_m, block_n, block_k, num_warps, num_stages in block_configs:
+        for block_m, block_n, block_k in block_configs:
             candidates.append(
                 GroupedMatmulConfig(
                     block_m=block_m,
                     block_n=block_n,
                     block_k=block_k,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
+                    num_warps=None,
+                    num_stages=None,
                     platform="auto",
                     backend="any",
                 )
@@ -236,18 +341,22 @@ _grouped_matmul_executor: Executor[GroupedMatmulConfig, Array] = Executor(
 def grouped_matmul(
     lhs: Float[Array, "m k"],
     rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
-    group_sizes: Int[Array, "num_groups"],
+    group_sizes: Int[Array, "num_groups_or_shards"],
     group_offset: Int[Array, "..."] | None = None,
     existing_out: Float[Array, "m n"] | None = None,
     /,
     *,
     preferred_element_type=None,
-    tiling: tuple[int, int, int] | None = (128, 128, 128),
     transpose_rhs: bool = False,
     interpret: bool = False,
     precision=None,
+    use_v2: bool = True,
+    out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: GroupedMatmulConfig | None = None,
+    mesh: Mesh | None = None,
+    in_specs: tuple[PartitionSpec | None, ...] | None = None,
+    out_specs: PartitionSpec | None = None,
 ) -> Float[Array, "m n"]:
     """Execute grouped matrix multiplication with automatic optimization.
 
@@ -275,7 +384,7 @@ def grouped_matmul(
         >>>
         >>> out = grouped_matmul(lhs, rhs, group_sizes)
         >>>
-        >>> out = grouped_matmul(lhs, rhs, group_sizes, tiling=(256, 256, 256))
+        >>> out = grouped_matmul(lhs, rhs, group_sizes)
         >>>
         >>> out = grouped_matmul(lhs, rhs_transposed, group_sizes, transpose_rhs=True)
         >>>
@@ -283,18 +392,27 @@ def grouped_matmul(
         >>>
         >>> out = grouped_matmul(..., platform="pallas")
     """
+
+    method = None
+    if mesh is not None and in_specs is not None and out_specs is not None:
+        method = "shard_map"
+
     return _grouped_matmul_executor(
-        GroupedMatmul(),
+        GroupedMatmul(use_v2=use_v2),
         lhs=lhs,
         rhs=rhs,
         group_sizes=group_sizes,
         preferred_element_type=preferred_element_type,
-        tiling=tiling,
         group_offset=group_offset,
         existing_out=existing_out,
         transpose_rhs=transpose_rhs,
         interpret=interpret,
         precision=precision,
+        out_shard_callback=out_shard_callback,
         platform=platform,
+        method=method,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
         _cfg=cfg,
     )
