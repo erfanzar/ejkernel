@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import typing
 
 import jax
@@ -118,8 +119,11 @@ def grouped_matmul(
         - Empty groups (size 0) are skipped for efficiency
         - Cost estimation helps XLA make scheduling decisions
     """
-
-    with set_xla_metadata(ragged_dot_tiling=",".join([str(t) for t in tiling])):
+    if tiling is None:
+        manager = contextlib.nullcontext()
+    else:
+        manager = set_xla_metadata(ragged_dot_tiling=",".join([str(t) for t in tiling]))
+    with manager:
         out = jax.lax.ragged_dot_general(
             lhs=lhs,
             rhs=rhs,

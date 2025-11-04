@@ -106,6 +106,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         existing_out: Float[Array, "m n"] | None = None,
         transpose_rhs: bool = False,
         interpret: bool = False,
+        do_padding: bool = True,
         precision=None,
         out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
@@ -189,10 +190,10 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         existing_out: Float[Array, "m n"] | None = None,
         transpose_rhs: bool = False,
         interpret: bool = False,
+        do_padding: bool = True,
         precision=None,
         out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-        do_padding: bool = True,
         *,
         cfg: GroupedMatmulConfig,
     ) -> Float[Array, "m n"]:
@@ -229,33 +230,38 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
                 num_stages=cfg.num_stages,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
+                bypass_xla_tiling=cfg.bypass_xla_tiling,
             )
 
+        resolved_platform = detect_platform(self.op_id, cfg.platform)
         impl = self.get_impl(cfg)
-
+        tiling = None
         mSize, kSize, nSize = lhs.shape[0], lhs.shape[1], rhs.shape[2]
+        padded_size = 0
 
-        if do_padding:
-            padded_size = 0
-            if mSize % cfg.block_m:
-                padded_size = cfg.block_m - mSize % cfg.block_m
-                lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
+        if cfg.bypass_xla_tiling and resolved_platform == "xla":
+            ...
+        else:
+            if do_padding:
+                if mSize % cfg.block_m:
+                    padded_size = cfg.block_m - mSize % cfg.block_m
+                    lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
+            tiling = (min(cfg.block_m, mSize), min(cfg.block_k, kSize), min(cfg.block_n, nSize))
 
         out = impl(
             lhs=lhs,
             rhs=rhs,
             group_sizes=group_sizes,
             preferred_element_type=preferred_element_type,
-            tiling=(min(cfg.block_m, mSize), min(cfg.block_k, kSize), min(cfg.block_n, nSize)),
+            tiling=tiling,
             group_offset=group_offset,
             existing_out=existing_out,
             transpose_rhs=transpose_rhs,
             interpret=interpret,
             precision=precision,
         )
-        if do_padding:
-            if padded_size > 0:
-                out = out[:mSize]
+        if do_padding and padded_size > 0:
+            out = out[:mSize]
         return out
 
     def heuristic_cfg(self, inv: Invocation[GroupedMatmulConfig, Array]) -> GroupedMatmulConfig:
@@ -349,6 +355,7 @@ def grouped_matmul(
     preferred_element_type=None,
     transpose_rhs: bool = False,
     interpret: bool = False,
+    do_padding: bool = True,
     precision=None,
     use_v2: bool = False,
     out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
@@ -407,6 +414,7 @@ def grouped_matmul(
         existing_out=existing_out,
         transpose_rhs=transpose_rhs,
         interpret=interpret,
+        do_padding=do_padding,
         precision=precision,
         out_shard_callback=out_shard_callback,
         platform=platform,

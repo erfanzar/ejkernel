@@ -200,6 +200,7 @@ class GroupedMatmulConfig(BaseOperationConfig):
     block_k: int = 128
     num_warps: int = 4
     num_stages: int = 2
+    bypass_xla_tiling: bool = False
 
 
 @dataclass
