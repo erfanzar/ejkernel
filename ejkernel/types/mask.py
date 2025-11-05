@@ -660,12 +660,13 @@ class MaskInfo:
             >>> mask_info.q_segment_ids.shape
             (1, 3)
         """
-        m = attention_mask.astype(jnp.bool_)
+        m = jnp.asarray(attention_mask, dtype=jnp.bool_)
         q_segment_ids = kv_segment_ids = None
         if m.ndim == 2:
-            q_segment_ids = jnp.where(m, 0, -1)
-            kv_segment_ids = q_segment_ids
-            pairwise_mask = segment_ids_to_mask((q_segment_ids, kv_segment_ids))
+            q_ids_1d, kv_ids_1d = _mask_to_segments_single(m)
+            q_segment_ids = q_ids_1d[None, :]
+            kv_segment_ids = kv_ids_1d[None, :]
+            pairwise_mask = segment_ids_to_mask((q_segment_ids, kv_segment_ids), dtype=jnp.bool_)
             return cls(
                 _attention_mask=pairwise_mask,
                 _q_segment_ids=q_segment_ids,
@@ -992,11 +993,10 @@ class MaskInfo:
 
     def get_or_compute_attention_mask(self, dtype: DTypeLike = jnp.bool_) -> Array:
         """
-        Get attention mask, always computing from segment IDs when available.
+        Get attention mask, using cached data when available and deriving from segment IDs otherwise.
 
-        Prioritizes segment IDs as the source of truth - if segment IDs are available,
-        the attention mask is always generated from them rather than using a cached version.
-        This ensures consistency and avoids stale mask data.
+        If a materialized attention mask is already stored, it is returned (with dtype conversion if needed).
+        Otherwise, the mask is constructed from the available segment IDs.
 
         Args:
             dtype: Desired output dtype (default: bool)
@@ -1635,7 +1635,7 @@ class MaskInfo:
             kv_seg = kv_seg.astype(jnp.int32)
         else:
             q_seg = self._q_segment_ids
-            kv_seg = self._kv_segment_id
+            kv_seg = self._kv_segment_ids
 
         return MaskInfo(
             _attention_mask=new_mask,
@@ -1703,15 +1703,15 @@ class MaskInfo:
         Returns:
             Human-readable string describing the MaskInfo contents and dimensions
         """
-        parts = ["MaskInfo("]
+        items = []
         if self.attention_mask is not None:
-            parts.append(f"attention_mask.shape={self.attention_mask.shape}")
+            items.append(f"attention_mask.shape={self.attention_mask.shape}")
         if self.q_segment_ids is not None:
-            parts.append(f"q_segment_ids.shape={self.q_segment_ids.shape}")
+            items.append(f"q_segment_ids.shape={self.q_segment_ids.shape}")
         if self.kv_segment_ids is not None:
-            parts.append(f"kv_segment_ids.shape={self.kv_segment_ids.shape}")
-        parts.append(f"self_attn={self.is_self_attention()})")
-        return ", ".join(parts)
+            items.append(f"kv_segment_ids.shape={self.kv_segment_ids.shape}")
+        items.append(f"self_attn={self.is_self_attention()}")
+        return f"MaskInfo({', '.join(items)})"
 
     def tree_flatten(self):
         """
@@ -1833,9 +1833,9 @@ class MaskInfo:
         cls,
         *,
         mask_info: MaskInfo | None = None,
-        input_ids: Float[Array, "batch seglen"] | None = None,
+        input_ids: Int[Array, "batch seqlen"] | None = None,
         inputs_embeds: Float[Array, "batch seqlen dim"] | None = None,
-        attention_mask: Float[Array, "batch seglen"] | Bool[Array, "batch seglen"] | None = None,
+        attention_mask: Int[Array, "batch seqlen"] | Bool[Array, "batch seqlen"] | None = None,
     ) -> MaskInfo:
         """
         Dynamically initialize a MaskInfo from various input sources.
@@ -1887,12 +1887,13 @@ class MaskInfo:
                     "You must provide at least one of: mask_info, input_ids, inputs_embeds, or attention_mask. "
                     "These are needed to determine the batch size and sequence length."
                 )
-            attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+            attention_mask = jnp.ones((batch_size, sequence_length), dtype=jnp.bool_)
         else:
-            if attention_mask.dtype != jnp.bool:
-                attention_mask = jnp.astype(attention_mask == 1, "b1")
+            attention_mask = jnp.asarray(attention_mask)
+            if attention_mask.dtype != jnp.bool_:
+                attention_mask = (attention_mask == 1).astype(jnp.bool_)
         if attention_mask.ndim == 2:
-            mask_info = MaskInfo.from_segments(attention_mask)
+            mask_info = MaskInfo.from_segments(attention_mask, apply_padding=True)
         else:
             mask_info = MaskInfo.from_attention_mask(attention_mask)
         return mask_info

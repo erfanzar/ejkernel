@@ -18,7 +18,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from ejkernel.types.mask import MaskInfo, mask_to_segment_ids
+from ejkernel.types.mask import (
+    MaskInfo,
+    mask_to_segment_ids,
+    segment_ids_to_mask,
+    segment_ids_to_qkv_masks,
+)
 
 
 def _row_equal(m: jnp.ndarray) -> jnp.ndarray:
@@ -110,6 +115,106 @@ def _run_and_verify_4d_per_head_true(name: str, mask_4d: jnp.ndarray):
         for h in range(H):
             _verify_segmentation(mask_4d[b, h], q_ids[b, h], kv_ids[b, h])
     print(f"  ✓ {name} (per_head=True): OK")
+
+
+def test_segment_ids_to_mask_conversions():
+    """Test segment_ids_to_mask for self- and cross-attention inputs."""
+    print("\nTesting segment_ids_to_mask() conversions...")
+
+    segment_ids = jnp.array([[1, 1, 2, -1]], dtype=jnp.int32)
+    seg_arr = np.array(jax.device_get(segment_ids))
+    attn = jax.device_get(segment_ids_to_mask(segment_ids))
+    expected_self = (seg_arr[:, :, None] == seg_arr[:, None, :]) & (
+        (seg_arr >= 0)[:, :, None] & (seg_arr >= 0)[:, None, :]
+    )
+    assert attn.shape == (1, 1, 4, 4)
+    assert np.array_equal(attn[:, 0], expected_self)
+
+    q_mask, kv_mask, attn_separate = segment_ids_to_mask(segment_ids, return_separate_masks=True)
+    assert np.array_equal(jax.device_get(q_mask), seg_arr >= 0)
+    assert np.array_equal(jax.device_get(kv_mask), seg_arr >= 0)
+    assert np.array_equal(jax.device_get(attn_separate)[:, 0], expected_self)
+
+    q_segments = jnp.array([[1, 2, 2, -1]], dtype=jnp.int32)
+    kv_segments = jnp.array([[1, 1, 2, 2, 3]], dtype=jnp.int32)
+    q_arr = np.array(jax.device_get(q_segments))
+    kv_arr = np.array(jax.device_get(kv_segments))
+
+    mask_float = segment_ids_to_mask((q_segments, kv_segments), dtype=jnp.float32)
+    mask_cross = jax.device_get(mask_float[:, 0] > 0.5)
+    expected_cross = (q_arr[:, :, None] == kv_arr[:, None, :]) & (
+        (q_arr >= 0)[:, :, None] & (kv_arr >= 0)[:, None, :]
+    )
+    assert mask_float.dtype == jnp.float32
+    assert mask_float.shape == (1, 1, 4, 5)
+    assert np.array_equal(mask_cross, expected_cross)
+
+    print("  ✓ segment_ids_to_mask: OK")
+
+
+def test_segment_ids_to_qkv_masks_cross_attention():
+    """Test segment_ids_to_qkv_masks returns consistent masks for cross-attention."""
+    print("\nTesting segment_ids_to_qkv_masks() for cross-attention inputs...")
+
+    q_segments = jnp.array([[1, 2, 2, -1]], dtype=jnp.int32)
+    kv_segments = jnp.array([[1, 1, 2, 2, 3]], dtype=jnp.int32)
+    q_arr = np.array(jax.device_get(q_segments))
+    kv_arr = np.array(jax.device_get(kv_segments))
+
+    q_mask, kv_mask, attn = segment_ids_to_qkv_masks(q_segments, kv_segments)
+    expected_q = q_arr >= 0
+    expected_kv = kv_arr >= 0
+    expected_attn = (q_arr[:, :, None] == kv_arr[:, None, :]) & (
+        expected_q[:, :, None] & expected_kv[:, None, :]
+    )
+
+    assert np.array_equal(jax.device_get(q_mask), expected_q)
+    assert np.array_equal(jax.device_get(kv_mask), expected_kv)
+    assert np.array_equal(jax.device_get(attn)[:, 0], expected_attn)
+
+    print("  ✓ segment_ids_to_qkv_masks: OK")
+
+
+def test_maskinfo_apply_kv_lengths_updates_masks_and_segments():
+    """Test apply_kv_lengths masking, slicing, and segment updates."""
+    print("\nTesting MaskInfo.apply_kv_lengths() slicing and masking...")
+
+    q_segments = jnp.array(
+        [[1, 1, 2, 2, 3], [1, 2, 2, 3, 3]],
+        dtype=jnp.int32,
+    )
+    mask_info = MaskInfo.from_segments(q_segments)
+
+    kv_lengths = jnp.array([4, 3], dtype=jnp.int32)
+    end_index = jnp.array([5, 4], dtype=jnp.int32)
+
+    updated = mask_info.apply_kv_lengths(kv_lengths=kv_lengths, q_len=2, end_index=end_index)
+
+    assert updated.attention_mask.shape == (2, 1, 2, 5)
+    attn = jax.device_get(updated.attention_mask.astype(bool))
+    for batch, length in enumerate(kv_lengths):
+        assert not attn[batch, 0, :, length:].any(), "KV positions beyond length must be masked"
+
+    expected_q_segments = np.array([[2, 3], [2, 3]], dtype=np.int32)
+    expected_kv_segments = np.array([[1, 1, 2, 2, -1], [1, 2, 2, -1, -1]], dtype=np.int32)
+
+    assert np.array_equal(jax.device_get(updated.q_segment_ids), expected_q_segments)
+    assert np.array_equal(jax.device_get(updated.kv_segment_ids), expected_kv_segments)
+
+    print("  ✓ apply_kv_lengths masking: OK")
+
+
+def test_maskinfo_apply_kv_lengths_requires_indices():
+    """Test apply_kv_lengths enforces start/end indices when slicing queries."""
+    print("\nTesting MaskInfo.apply_kv_lengths() input validation...")
+
+    q_segments = jnp.array([[1, 1, 1, 1]], dtype=jnp.int32)
+    mask_info = MaskInfo.from_segments(q_segments)
+
+    with pytest.raises(ValueError):
+        mask_info.apply_kv_lengths(kv_lengths=jnp.array([3]), q_len=2)
+
+    print("  ✓ apply_kv_lengths validation: OK")
 
 
 def test_maskinfo_from_segments():
@@ -365,8 +470,13 @@ def test_maskinfo_from_random():
     # Random masks don't compute segment IDs (to avoid O(n^2) memory usage)
     mask_info = MaskInfo.from_random(batch_size=2, q_len=10, seed=42)
     assert mask_info.attention_mask.shape == (2, 1, 10, 10)
-    assert mask_info.q_segment_ids is None, "Random masks should not have segment IDs"
-    assert mask_info.kv_segment_ids is None, "Random masks should not have segment IDs"
+    assert mask_info._q_segment_ids is None
+    assert mask_info._kv_segment_ids is None
+    q_ids, kv_ids = mask_info.get_or_compute_segment_ids()
+    assert q_ids.shape == (2, 10)
+    assert kv_ids.shape == (2, 10)
+    assert mask_info._q_segment_ids is not None
+    assert mask_info._kv_segment_ids is not None
     assert mask_info.is_self_attention()
 
     mask_info_cross = MaskInfo.from_random(batch_size=1, q_len=8, kv_len=12, seed=0)
@@ -405,9 +515,10 @@ def test_maskinfo_get_or_compute_positions():
     assert q_pos.shape == (1, 5)
     assert kv_pos.shape == (1, 5)
 
-    expected_pos = jnp.array([[0, 1, 2, 3, 4]], dtype=jnp.int32)
-    assert jnp.array_equal(q_pos, expected_pos)
-    assert jnp.array_equal(kv_pos, expected_pos)
+    expected_q = jnp.array([[0, 1, 0, 1, -1]], dtype=jnp.int32)
+    expected_kv = jnp.array([[0, 1, 0, 1, jnp.iinfo(jnp.int32).max]], dtype=jnp.int32)
+    assert jnp.array_equal(q_pos, expected_q)
+    assert jnp.array_equal(kv_pos, expected_kv)
 
     q_seg = jnp.array([[1, 2]])
     kv_seg = jnp.array([[1, 1, 2, 2]])
@@ -416,8 +527,8 @@ def test_maskinfo_get_or_compute_positions():
     q_pos_cross, kv_pos_cross = mask_info_cross.get_or_compute_positions()
     assert q_pos_cross.shape == (1, 2)
     assert kv_pos_cross.shape == (1, 4)
-    assert jnp.array_equal(q_pos_cross, jnp.array([[0, 1]], dtype=jnp.int32))
-    assert jnp.array_equal(kv_pos_cross, jnp.array([[0, 1, 2, 3]], dtype=jnp.int32))
+    assert jnp.array_equal(q_pos_cross, jnp.array([[0, 0]], dtype=jnp.int32))
+    assert jnp.array_equal(kv_pos_cross, jnp.array([[0, 1, 0, 1]], dtype=jnp.int32))
 
     print("  ✓ get_or_compute_positions: OK")
 
@@ -526,9 +637,13 @@ def test_maskinfo_positions_with_batches():
     assert q_pos.shape == (2, 4)
     assert kv_pos.shape == (2, 4)
 
-    expected = jnp.array([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=jnp.int32)
-    assert jnp.array_equal(q_pos, expected)
-    assert jnp.array_equal(kv_pos, expected)
+    expected_q = jnp.array([[0, 1, 0, 1], [0, 0, 1, -1]], dtype=jnp.int32)
+    expected_kv = jnp.array(
+        [[0, 1, 0, 1], [0, 0, 1, jnp.iinfo(jnp.int32).max]],
+        dtype=jnp.int32,
+    )
+    assert jnp.array_equal(q_pos, expected_q)
+    assert jnp.array_equal(kv_pos, expected_kv)
 
     custom_pos = jnp.array([[0, 1, 2, 3], [10, 11, 12, 13]], dtype=jnp.int32)
 
@@ -552,21 +667,20 @@ def test_maskinfo_segment_ids_as_source_of_truth():
     # Create a "wrong" attention mask that doesn't match the segment IDs (4D)
     wrong_mask = jnp.ones((1, 1, 4, 4), dtype=jnp.bool_)  # All True
 
-    mask_info = MaskInfo(attention_mask=wrong_mask, q_segment_ids=q_seg, kv_segment_ids=kv_seg)
+    mask_info = MaskInfo.from_segments(q_seg, kv_seg)
+    mask_with_wrong = mask_info.replace(attention_mask=wrong_mask)
+    assert jnp.array_equal(mask_with_wrong.get_or_compute_attention_mask(), wrong_mask)
 
-    # get_or_compute_attention_mask should ALWAYS regenerate from segment IDs
-    computed_mask = mask_info.get_or_compute_attention_mask()
+    mask_with_wrong._attention_mask = None
+    computed_mask = mask_with_wrong.get_or_compute_attention_mask()
+    expected_mask = MaskInfo.from_segments(q_seg, kv_seg).attention_mask
 
     # The computed mask should reflect segment structure, not the "wrong" mask
-    # Tokens [0,1] are in segment 1, tokens [2,3] are in segment 2
-    # So [0,1] should NOT attend to [2,3]
     assert not computed_mask[0, 0, 0, 2], "Token 0 (seg 1) should not attend to token 2 (seg 2)"
     assert not computed_mask[0, 0, 1, 3], "Token 1 (seg 1) should not attend to token 3 (seg 2)"
     assert computed_mask[0, 0, 0, 1], "Token 0 should attend to token 1 (same segment)"
     assert computed_mask[0, 0, 2, 3], "Token 2 should attend to token 3 (same segment)"
-
-    # Verify it's not just using the stored wrong_mask
-    assert not jnp.array_equal(computed_mask, wrong_mask), "Should regenerate mask from segment IDs, not use stored mask"
+    assert jnp.array_equal(computed_mask, expected_mask)
 
     print("  ✓ segment IDs as source of truth: OK")
 
