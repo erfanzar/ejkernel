@@ -633,9 +633,12 @@ class MaskInfo:
         """
         Create MaskInfo from an existing attention mask.
 
-        Analyzes the attention mask structure to extract segment IDs and create
-        a complete MaskInfo representation. Useful when you have a mask and need
-        to derive the segment structure.
+        For 2D masks this treats the input as a padding mask (1/True = valid, 0/False = padding),
+        converts it to segment IDs (0 for valid tokens, -1 for padding), and materializes a
+        broadcasted 4D pairwise mask. For 3D masks the head dimension is added automatically.
+        For 4D masks the array is stored as-is (after casting to bool) and segment IDs remain
+        unset until they are explicitly materialized. This mirrors how higher-dimensional masks
+        are typically passed around inside transformer models.
 
         Args:
             attention_mask: Attention mask array. Supported shapes:
@@ -643,8 +646,6 @@ class MaskInfo:
                 - (batch, qlen, kvlen): 3D batched mask
                 - (batch, heads, qlen, kvlen): 4D multi-head mask
                 Values: True/1 = valid attention, False/0 = masked
-            per_head: If True and mask is 4D, compute separate segment IDs per head.
-                If False, merge mask across heads before computing segments. Default: False
             q_positions: Optional query position indices (batch, qlen)
             kv_positions: Optional key-value position indices (batch, kvlen)
 
@@ -663,9 +664,8 @@ class MaskInfo:
         m = jnp.asarray(attention_mask, dtype=jnp.bool_)
         q_segment_ids = kv_segment_ids = None
         if m.ndim == 2:
-            q_ids_1d, kv_ids_1d = _mask_to_segments_single(m)
-            q_segment_ids = q_ids_1d[None, :]
-            kv_segment_ids = kv_ids_1d[None, :]
+            q_segment_ids = attention_mask.astype("i4") - 1
+            kv_segment_ids = q_segment_ids
             pairwise_mask = segment_ids_to_mask((q_segment_ids, kv_segment_ids), dtype=jnp.bool_)
             return cls(
                 _attention_mask=pairwise_mask,
@@ -945,7 +945,9 @@ class MaskInfo:
         )
         return MaskSharding(attention_mask, q_segment_ids, kv_segment_ids, q_positions, kv_positions)
 
-    def get_or_compute_positions(self) -> tuple[Int[Array, "batch qlen"] | None, Int[Array, "batch kvlen"] | None]:
+    def get_or_compute_positions(
+        self,
+    ) -> tuple[Int[Array, "batch qlen"] | None, Int[Array, "batch kvlen"] | None]:
         """
         Get position arrays, computing them if not already available.
 
@@ -1007,7 +1009,6 @@ class MaskInfo:
         Raises:
             ValueError: If both attention_mask and segment_ids are None
         """
-
         if self._attention_mask is not None:
             return self._attention_mask.astype(dtype)
         if self._q_segment_ids is not None and self._kv_segment_ids is not None:
@@ -1024,7 +1025,9 @@ class MaskInfo:
         Get segment IDs, computing from attention mask if not available.
 
         Args:
-            per_head: If True and attention mask is 4D, compute segment IDs per head
+            per_head: Forwarded to mask_to_segment_ids when segment IDs are derived from a 4D
+                attention mask. The resulting IDs are collapsed to a binary scheme (0 for valid
+                tokens, -1 for padding), so detailed grouping information is not preserved.
 
         Returns:
             Tuple of (q_segment_ids, kv_segment_ids)
@@ -1036,6 +1039,10 @@ class MaskInfo:
             return self._q_segment_ids, self._kv_segment_ids
         if self._attention_mask is not None:
             self._q_segment_ids, self._kv_segment_ids = mask_to_segment_ids(self._attention_mask, per_head=per_head)
+
+            self._q_segment_ids = jnp.where(self._q_segment_ids == -1, -1, 0)
+            self._kv_segment_ids = jnp.where(self._kv_segment_ids == -1, -1, 0)
+
             return self._q_segment_ids, self._kv_segment_ids
         raise ValueError(
             "Cannot compute segment IDs: MaskInfo is empty (both attention_mask and segment_ids are None). "
@@ -1176,142 +1183,59 @@ class MaskInfo:
         kv_lengths: Int[Array, "batch"],
         *,
         q_len: int | None = None,
-        end_index: Int[Array, "batch"] | None = None,
-        start_index: Int[Array, "batch"] | None = None,
-        clamp: bool = True,
-        update_segment_ids: bool = True,
+        sliding_window: int | None = None,
     ) -> "MaskInfo":
         """
-        Apply per-batch KV sequence lengths and optionally slice query dimension.
+        Mask out key/value positions beyond per-example lengths and keep a trailing query window.
 
-        This method is useful for incremental decoding and variable-length sequences where
-        different batch elements have different numbers of valid KV tokens. It masks out
-        KV positions beyond each batch's valid length and can optionally slice the query
-        dimension to a window for efficient incremental attention.
+        The method expects a 4D attention mask (batch, heads, q_len, kv_len). For each batch item:
+            1. KV positions with index >= kv_lengths[b] are masked out.
+            2. The query dimension is sliced to the last `q_len` rows, starting at kv_lengths[b] - q_len.
+            3. If `sliding_window` is provided and smaller than the current KV dimension, only the most
+               recent `sliding_window` columns are kept.
+        Segment IDs and position arrays are reused unchanged; only the materialized attention mask is updated.
 
         Args:
-            kv_lengths: Integer array of shape (batch,) specifying the number of valid KV tokens
-                per batch element. KV positions at indices [0, kv_lengths[b]) are kept valid,
-                while positions >= kv_lengths[b] are masked out.
-            q_len: If specified, slices the query dimension to this length. Requires either
-                end_index or start_index to determine which query rows to keep.
-            end_index: Array of shape (batch,) specifying the end position for query slicing.
-                When provided with q_len, keeps query rows [end_index[b] - q_len, end_index[b])
-                for each batch element. Useful for incremental decoding where you want the
-                last q_len query positions.
-            start_index: Array of shape (batch,) specifying the start position for query slicing.
-                When provided with q_len, keeps query rows [start_index[b], start_index[b] + q_len)
-                for each batch element. Alternative to end_index.
-            clamp: If True, clamps all indices and lengths to valid ranges to prevent out-of-bounds
-                errors. Recommended for safety. Default: True
-            update_segment_ids: If True, updates segment IDs to reflect masking:
-                - Sets kv_segment_ids[b, t] = -1 for t >= kv_lengths[b]
-                - Slices q_segment_ids if q_len is provided
-                - Creates q_segment_ids (filled with 0s) if missing and q slicing occurs
-                Default: True
+            kv_lengths: Integer array of shape (batch,) with the number of valid KV tokens per batch element.
+                The implementation assumes kv_lengths[b] >= q_len and does not clamp indices.
+            q_len: Number of query rows to keep. Must be specified and should be <= kv_lengths[b] for all b.
+            sliding_window: Optional maximum number of KV columns to retain after masking. If None, keeps all
+                remaining KV positions.
 
         Returns:
-            New MaskInfo with:
-            - attention_mask: Shape (batch, 1, q_len or Q_total, K_total) with KV positions
-              beyond kv_lengths masked out and optional query slicing applied
-            - kv_segment_ids: Updated with -1 for positions >= kv_lengths[b]
-            - q_segment_ids: Sliced if q_len provided, or created if missing
+            New MaskInfo whose attention_mask has shape (batch, 1, q_len, effective_kv_len), where
+            effective_kv_len equals kv_len when sliding_window is None and otherwise min(kv_len, sliding_window).
 
         Raises:
-            ValueError: If attention mask is not 4D or if q_len is provided without position indices
-
-        Example:
-            >>>
-            >>> mask_info = MaskInfo.from_segments(jnp.ones((2, 128), dtype=jnp.int32))
-            >>> kv_lengths = jnp.array([100, 80])
-            >>> current_pos = jnp.array([100, 80])
-            >>> new_mask = mask_info.apply_kv_lengths(
-            ...     kv_lengths=kv_lengths,
-            ...     q_len=1,
-            ...     end_index=current_pos
-            ... )
-            >>> new_mask.attention_mask.shape
-            (2, 1, 1, 128)
-
-        Notes:
-            - This is particularly useful for KV caching in autoregressive generation
-            - The query slicing supports both "last N positions" (via end_index) and
-              "positions starting at offset" (via start_index) patterns
-            - Segment IDs are updated to maintain consistency with the masked regions
+            ValueError: If the attention mask cannot be materialized.
         """
 
-        base_mask = (
-            self.attention_mask.astype(jnp.bool_)
-            if self.attention_mask is not None
-            else self.get_or_compute_attention_mask(dtype=jnp.bool_)
-        )
-        if base_mask.ndim == 3:
-            base_mask = base_mask[:, None, :, :]
-        if base_mask.ndim != 4:
-            raise ValueError(
-                f"Expected 4D attention mask with shape (batch, heads, q_len, kv_len), "
-                f"but got {base_mask.ndim}D mask with shape {base_mask.shape}. "
-                f"Ensure the mask is properly formatted before applying KV lengths."
-            )
-        B, _H, Q_total, K_total = base_mask.shape
+        attention_mask = self.get_or_compute_attention_mask(dtype=jnp.bool_)
+
+        B, _H, _Q, K = attention_mask.shape
 
         kv_lengths = jnp.asarray(kv_lengths, jnp.int32).reshape(B)
-        if clamp:
-            kv_lengths = jnp.clip(kv_lengths, 0, K_total)
 
-        sliced_mask = base_mask
-        q_seg = self._q_segment_ids
-        if q_len is not None:
-            if end_index is None and start_index is None:
-                raise ValueError(
-                    "Query slicing requires position information. When q_len is specified, "
-                    "you must provide either 'end_index' or 'start_index' to determine which query rows to slice. "
-                    "For example: end_index=current_position or start_index=offset."
-                )
+        def _update_batched(x, qseq):
+            x = jax.lax.dynamic_slice_in_dim(x, qseq - q_len, q_len, 1)
+            if sliding_window is not None and K > sliding_window:
+                x = jax.lax.dynamic_slice_in_dim(x, qseq - q_len, sliding_window, 2)
+            return x
 
-            if end_index is not None:
-                end_index = jnp.asarray(end_index, jnp.int32).reshape(B)
-                q_start = end_index - jnp.int32(q_len)
-            else:
-                start_index = jnp.asarray(start_index, jnp.int32).reshape(B)
-                q_start = start_index
+        kv_valid = jnp.arange(K, dtype=jnp.int32)[None, :] < kv_lengths[:, None]
+        kv_mask4d = jnp.broadcast_to(kv_valid[:, None, None, :], (B, 1, 1, K))
+        attention_mask = jnp.logical_and(attention_mask, kv_mask4d)
 
-            if clamp:
-                q_start = jnp.clip(q_start, 0, jnp.maximum(0, Q_total - jnp.int32(q_len)))
-
-            def _slice_q_per_batch(m_b, s_b):
-                return jax.lax.dynamic_slice(m_b, (0, s_b, 0), (m_b.shape[0], q_len, m_b.shape[2]))
-
-            sliced_mask = jax.vmap(_slice_q_per_batch, in_axes=(0, 0), out_axes=0)(base_mask, q_start)
-
-            if q_seg is not None:
-                q_seg = jnp.asarray(q_seg, jnp.int32)
-
-                def _slice_ids_row(ids_b, s_b):
-                    return jax.lax.dynamic_slice_in_dim(ids_b, s_b, q_len, axis=0)
-
-                q_seg = jax.vmap(_slice_ids_row, in_axes=(0, 0), out_axes=0)(q_seg, q_start)
-            elif update_segment_ids:
-                q_seg = jnp.zeros((B, q_len), jnp.int32)
-
-        kv_idx = jnp.arange(K_total, dtype=jnp.int32)
-        kv_valid = kv_idx[None, :] < kv_lengths[:, None]
-        kv_mask4d = kv_valid[:, None, None, :]
-        attention_mask = sliced_mask & kv_mask4d
-
-        if update_segment_ids:
-            if self._kv_segment_ids is not None:
-                kv_seg = jnp.asarray(self._kv_segment_ids, jnp.int32)
-                kv_segment_ids = jnp.where(kv_valid, kv_seg, jnp.int32(-1))
-            else:
-                kv_segment_ids = jnp.where(kv_valid, jnp.int32(0), jnp.int32(-1))
-        else:
-            kv_segment_ids = self._kv_segment_ids
+        attention_mask = jax.vmap(
+            _update_batched,
+            in_axes=(0, 0),
+            out_axes=0,
+        )(attention_mask, kv_lengths)
 
         return MaskInfo(
             _attention_mask=attention_mask,
-            _q_segment_ids=q_seg if q_len is not None else self._q_segment_ids,
-            _kv_segment_ids=kv_segment_ids,
+            _q_segment_ids=self._q_segment_ids,
+            _kv_segment_ids=self._kv_segment_ids,
             q_positions=self.q_positions,
             kv_positions=self.kv_positions,
             batch_axis_name=self.batch_axis_name,
@@ -1354,13 +1278,15 @@ class MaskInfo:
                 f"Current state: q_len={self.q_len}, kv_len={self.kv_len}"
             )
 
-        q_seg, kv_seg = self._q_segment_ids, self._kv_segment_ids
+        base_mask = self.get_or_compute_attention_mask(dtype=jnp.bool_)
 
-        base_mask = (
-            self._attention_mask.astype(jnp.bool_)
-            if self._attention_mask is not None
-            else self.get_or_compute_attention_mask(dtype=jnp.bool_)
-        )
+        q_seg, kv_seg = self._q_segment_ids, self._kv_segment_ids
+        if q_seg is None or kv_seg is None:
+            try:
+                q_seg, kv_seg = self.get_or_compute_segment_ids(per_head=False)
+            except Exception:
+                q_seg, kv_seg = None, None
+
         Q, K = base_mask.shape[-2], base_mask.shape[-1]
         q_idx = jnp.arange(Q, dtype=jnp.int32)
         kv_idx = jnp.arange(K, dtype=jnp.int32)
@@ -1704,12 +1630,12 @@ class MaskInfo:
             Human-readable string describing the MaskInfo contents and dimensions
         """
         items = []
-        if self.attention_mask is not None:
-            items.append(f"attention_mask.shape={self.attention_mask.shape}")
-        if self.q_segment_ids is not None:
-            items.append(f"q_segment_ids.shape={self.q_segment_ids.shape}")
-        if self.kv_segment_ids is not None:
-            items.append(f"kv_segment_ids.shape={self.kv_segment_ids.shape}")
+        if self._attention_mask is not None:
+            items.append(f"attention_mask.shape={self._attention_mask.shape}")
+        if self._q_segment_ids is not None:
+            items.append(f"q_segment_ids.shape={self._q_segment_ids.shape}")
+        if self._kv_segment_ids is not None:
+            items.append(f"kv_segment_ids.shape={self._kv_segment_ids.shape}")
         items.append(f"self_attn={self.is_self_attention()}")
         return f"MaskInfo({', '.join(items)})"
 
@@ -2051,8 +1977,8 @@ class MaskInfo:
         q_blk_labels = None
         kv_blk_labels = None
         if show_segments:
-            if self.q_segment_ids is not None:
-                q_ids_all = jax.device_get(self.q_segment_ids)
+            if self._q_segment_ids is not None:
+                q_ids_all = jax.device_get(self._q_segment_ids)
                 if q_ids_all.ndim == 3:
                     q_ids = np.asarray(q_ids_all[batch, head])
                 else:
@@ -2065,8 +1991,8 @@ class MaskInfo:
                 else:
                     q_ids = np.asarray(q_ids_all[batch])
 
-            if self.kv_segment_ids is not None:
-                kv_ids_all = jax.device_get(self.kv_segment_ids)
+            if self._kv_segment_ids is not None:
+                kv_ids_all = jax.device_get(self._kv_segment_ids)
                 if kv_ids_all.ndim == 3:
                     kv_ids = np.asarray(kv_ids_all[batch, head])
                 else:
