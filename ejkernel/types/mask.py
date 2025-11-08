@@ -1369,7 +1369,7 @@ class MaskInfo:
                     seg = jax.lax.dynamic_slice_in_dim(seg, start_k, width, axis=0)
                 return x, seg
 
-            attn, kv_seg = jax.vmap(_slice_k, in_axes=(0, 0, seg_idx), out_axes=(0, seg_idx))(attn, kv_lengths)
+            attn, kv_seg = jax.vmap(_slice_k, in_axes=(0, 0, seg_idx), out_axes=(0, seg_idx))(attn, kv_lengths, kv_seg)
             # (B,H,q_len,width)
 
         return self.replace(attention_mask=attn, q_segment_ids=q_seg, kv_segment_ids=kv_seg)
