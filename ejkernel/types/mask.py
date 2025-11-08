@@ -1343,23 +1343,36 @@ class MaskInfo:
 
         kv_valid = jnp.arange(K, dtype=jnp.int32)[None, :] < kv_lengths[:, None]
         attn = attn & kv_valid[:, None, None, :]
+        q_seg = self._q_segment_ids
+        kv_seg = self._kv_segment_ids
 
-        def _slice_q(x, klen):
+        def _slice_q(x, klen, seg=None):
             start_q = jnp.clip(klen - q_len, 0, jnp.maximum(Q - q_len, 0))
-            return jax.lax.dynamic_slice_in_dim(x, start_q, q_len, axis=1)  # x: (H,Q,K)
+            x = jax.lax.dynamic_slice_in_dim(x, start_q, q_len, axis=1)  # x: (H,Q,K)
+            if seg is not None:
+                seg = jax.lax.dynamic_slice_in_dim(seg, start_q, q_len, axis=0)
+            return x, seg
 
-        attn = jax.vmap(_slice_q, in_axes=(0, 0), out_axes=0)(attn, kv_lengths)  # (B,H,q_len,K)
+        seg_idx = 0 if q_seg is not None else None
+        attn, q_seg = jax.vmap(_slice_q, in_axes=(0, 0, seg_idx), out_axes=(0, seg_idx))(attn, kv_lengths, q_seg)
+        # (B,H,q_len,K)
 
         if sliding_window is not None:
             width = min(sliding_window, K)
 
-            def _slice_k(x, klen):
+            seg_idx = 0 if kv_seg is not None else None
+
+            def _slice_k(x, klen, seg=None):
                 start_k = jnp.clip(klen - width, 0, jnp.maximum(K - width, 0))
-                return jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)  # x: (H,q_len,K)
+                x = jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)  # x: (H,q_len,K)
+                if seg is not None:
+                    seg = jax.lax.dynamic_slice_in_dim(seg, start_k, width, axis=0)
+                return x, seg
 
-            attn = jax.vmap(_slice_k, in_axes=(0, 0), out_axes=0)(attn, kv_lengths)  # (B,H,q_len,width)
+            attn, kv_seg = jax.vmap(_slice_k, in_axes=(0, 0, seg_idx), out_axes=(0, seg_idx))(attn, kv_lengths)
+            # (B,H,q_len,width)
 
-        return self.replace(attention_mask=attn)
+        return self.replace(attention_mask=attn, q_segment_ids=q_seg, kv_segment_ids=kv_seg)
 
     @_debug_trace
     def apply_causal(self, offset: int | Int[Array, "batch"] = 0) -> "MaskInfo":
