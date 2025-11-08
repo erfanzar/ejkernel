@@ -47,6 +47,17 @@ Mask Representations:
        - Non-negative = segment membership
        - -1 = padding tokens
 
+Debug Mode:
+    Enable debug tracing to see which functions are being called:
+
+    >>> import os
+    >>> os.environ['EJKERNEL_MASK_DEBUG'] = '1'  # Enable debug mode
+    >>> # Now all MaskInfo operations will print debug traces
+    >>> mask_info = MaskInfo.from_segments(segment_ids)
+    [MaskInfo Debug] Calling type.from_segments()
+
+    Set EJKERNEL_MASK_DEBUG to '0' or remove it to disable debug output.
+
 See Also:
     - mask_to_segment_ids(): Convert masks to segment IDs
     - segment_ids_to_mask(): Convert segment IDs to masks
@@ -55,7 +66,10 @@ See Also:
 
 from __future__ import annotations
 
+import functools
+import os
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from typing import Literal, NamedTuple
 
 import jax
@@ -67,6 +81,80 @@ from jaxtyping import Array, Bool, DTypeLike, Float, Int
 from ejkernel.xla_utils import get_corrected_named_sharding
 
 mdim_t = "batch nheads_or_1 qlen kvlen"
+
+# Debug mode flag - set via environment variable
+_DEBUG_MODE = os.environ.get("EJKERNEL_MASK_DEBUG", "0") == "1"
+
+
+def set_debug_mode(enabled: bool) -> None:
+    """
+    Enable or disable debug tracing for MaskInfo operations.
+
+    When debug mode is enabled, all MaskInfo method calls will be logged to stdout,
+    helping you understand the execution flow and identify performance bottlenecks.
+
+    Args:
+        enabled: If True, enables debug tracing. If False, disables it.
+
+    Examples:
+        >>> from ejkernel.types.mask import set_debug_mode, MaskInfo
+        >>> import jax.numpy as jnp
+        >>>
+        >>> # Enable debug mode
+        >>> set_debug_mode(True)
+        >>>
+        >>> # Now operations will print debug traces
+        >>> mask_info = MaskInfo.from_segments(jnp.array([[1, 1, 2, 2]]))
+        [MaskInfo Debug] Calling type.from_segments()
+        >>>
+        >>> # Disable debug mode
+        >>> set_debug_mode(False)
+    """
+    global _DEBUG_MODE
+    _DEBUG_MODE = enabled
+    if enabled:
+        print("[MaskInfo Debug] Debug mode enabled")
+    else:
+        print("[MaskInfo Debug] Debug mode disabled")
+
+
+def get_debug_mode() -> bool:
+    """
+    Check if debug mode is currently enabled.
+
+    Returns:
+        True if debug mode is enabled, False otherwise.
+
+    Examples:
+        >>> from ejkernel.types.mask import get_debug_mode, set_debug_mode
+        >>>
+        >>> get_debug_mode()
+        False
+        >>>
+        >>> set_debug_mode(True)
+        [MaskInfo Debug] Debug mode enabled
+        >>>
+        >>> get_debug_mode()
+        True
+    """
+    return _DEBUG_MODE
+
+
+def _debug_trace(func):
+    """Decorator to trace function calls when debug mode is enabled."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if _DEBUG_MODE:
+            # Get class name if this is a method
+            if args and hasattr(args[0].__class__, "__name__"):
+                class_name = args[0].__class__.__name__
+                print(f"[MaskInfo Debug] Calling {class_name}.{func.__name__}()")
+            else:
+                print(f"[MaskInfo Debug] Calling {func.__name__}()")
+        return func(*args, **kwargs)
+
+    return wrapper
 
 
 def _compress_ids_from_anchors(anchors: jnp.ndarray, pad_mask: jnp.ndarray) -> jnp.ndarray:
@@ -162,6 +250,7 @@ def _mask_to_segments_single(m: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     return q_segment_ids, kv_segment_ids
 
 
+@_debug_trace
 def mask_to_segment_ids(mask: jnp.ndarray, per_head: bool = False) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Convert attention mask to segment IDs (JIT-friendly).
@@ -259,6 +348,7 @@ def _positions_from_segments_2d(segment_ids: jnp.ndarray, *, pad_value: int) -> 
     return jax.vmap(_scan_1d, in_axes=0, out_axes=0)(segment_ids)
 
 
+@_debug_trace
 def segment_ids_to_mask(
     segment_ids: Int[Array, "batch seq_len"] | tuple[Int[Array, "batch q_len"], Int[Array, "batch kv_len"]],
     dtype: DTypeLike = jnp.bool_,
@@ -348,15 +438,15 @@ def segment_ids_to_mask(
     """
     if isinstance(segment_ids, tuple):
         q_segment_ids, kv_segment_ids = segment_ids
-        q_valid = q_segment_ids >= 0
-        kv_valid = kv_segment_ids >= 0
+        q_valid = q_segment_ids > -1
+        kv_valid = kv_segment_ids > -1
         q_mask = q_valid.astype(dtype)
         kv_mask = kv_valid.astype(dtype)
         attention_mask = (
             (q_segment_ids[:, :, None] == kv_segment_ids[:, None, :]) & q_valid[:, :, None] & kv_valid[:, None, :]
         )
     else:
-        q_valid = segment_ids >= 0
+        q_valid = segment_ids > -1
         q_mask = q_valid.astype(dtype)
         kv_mask = q_mask
         attention_mask = (segment_ids[:, :, None] == segment_ids[:, None, :]) & q_valid[:, :, None] & q_valid[:, None, :]
@@ -370,6 +460,7 @@ def segment_ids_to_mask(
         return attention_mask
 
 
+@_debug_trace
 def segment_ids_to_qkv_masks(
     q_segment_ids: Int[Array, "batch q_len"],
     kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
@@ -488,22 +579,45 @@ class MaskInfo:
 
     @property
     def attention_mask(self) -> Array | None:
+        if _DEBUG_MODE:
+            print("[MaskInfo Debug] Property access: attention_mask")
         if self._attention_mask is None:
             self._attention_mask = self.get_or_compute_attention_mask()
         return self._attention_mask
 
     @property
     def q_segment_ids(self) -> Array | None:
+        if _DEBUG_MODE:
+            print("[MaskInfo Debug] Property access: q_segment_ids")
         if self._q_segment_ids is None:
             self._q_segment_ids, self._kv_segment_ids = self.get_or_compute_segment_ids()
         return self._q_segment_ids
 
     @property
     def kv_segment_ids(self) -> Array | None:
+        if _DEBUG_MODE:
+            print("[MaskInfo Debug] Property access: kv_segment_ids")
         if self._kv_segment_ids is None:
             self._q_segment_ids, self._kv_segment_ids = self.get_or_compute_segment_ids()
         return self._kv_segment_ids
 
+    @property
+    def q_attention_mask(self):
+        return jnp.where(self.q_segment_ids == -1, 0, 1)
+
+    @property
+    def q_position_ids(self) -> Array:
+        """
+        Compute position IDs from the query attention mask.
+
+        Returns cumulative count of valid (non-masked) positions, starting from 0.
+        """
+        m = self.q_attention_mask.astype(jnp.int32)  # (B, Q)
+        pos = jnp.cumsum(m, axis=-1) - 1
+        pos = jnp.clip(pos, a_min=0)  # Correct keyword: a_min not min
+        return pos.astype(jnp.int32)
+
+    @_debug_trace
     def materialize_attention_mask(self, dtype: DTypeLike = jnp.bool_) -> "MaskInfo":
         if self._attention_mask is not None:
             return (
@@ -521,6 +635,7 @@ class MaskInfo:
             "so the mask can be computed from segment information."
         )
 
+    @_debug_trace
     def materialize_segment_ids(self, per_head: bool = False) -> "MaskInfo":
         if self._q_segment_ids is not None and self._kv_segment_ids is not None:
             return self
@@ -536,17 +651,18 @@ class MaskInfo:
         return self.replace(q_segment_ids=q_ids, kv_segment_ids=kv_ids)
 
     @classmethod
+    @_debug_trace
     def from_segments(
         cls,
         q_segment_ids: Int[Array, "batch qlen"],
         kv_segment_ids: Int[Array, "batch kvlen"] | None = None,
         q_positions: Int[Array, "batch qlen"] | None = None,
         kv_positions: Int[Array, "batch kvlen"] | None = None,
-        apply_padding: bool = False,
         batch_axis_name: tuple[str] | str | None = ("dp", "fsdp"),
         qheads_axis_name: tuple[str] | str | None = "tp",
         kvheads_axis_name: tuple[str] | str | None = "tp",
         sequence_axis_name: tuple[str] | str | None = "sp",
+        is_attn_mask: bool = False,
     ) -> "MaskInfo":
         """
         Create MaskInfo from segment IDs.
@@ -563,9 +679,6 @@ class MaskInfo:
                 q_segment_ids (self-attention case). Values follow same convention as q_segment_ids.
             q_positions: Optional query position indices (batch, qlen) for positional embeddings
             kv_positions: Optional key-value position indices (batch, kvlen) for positional embeddings
-            apply_padding: If True, converts binary segment IDs (0/1) to padding convention (-1/0).
-                This is useful when segment IDs use 0 to indicate padding instead of -1.
-                Default: False
             batch_axis_name: Axis name(s) for batch dimension in distributed sharding.
                 Default: ("dp", "fsdp")
             qheads_axis_name: Axis name(s) for query heads dimension in distributed sharding.
@@ -584,31 +697,29 @@ class MaskInfo:
             >>> mask_info.attention_mask.shape
             (1, 1, 5, 5)
         """
-
-        def _canon_01_to_neg1_0(ids):
-            ids = jnp.asarray(ids, dtype=jnp.int32)
-            is_01 = jnp.all((ids == 0) | (ids == 1))
-            return jax.lax.cond(
-                is_01,
-                lambda x: jnp.where(x == 0, jnp.int32(-1), jnp.int32(0)),
-                lambda x: x,
-                ids,
-            )
-
         q_segment_ids = jnp.asarray(q_segment_ids, dtype=jnp.int32)
+
         if kv_segment_ids is not None:
             kv_segment_ids = jnp.asarray(kv_segment_ids, dtype=jnp.int32)
 
-        if apply_padding:
-            q_segment_ids = _canon_01_to_neg1_0(q_segment_ids)
-
         if kv_segment_ids is None:
             kv_segment_ids = q_segment_ids
-        elif apply_padding:
-            kv_segment_ids = _canon_01_to_neg1_0(kv_segment_ids)
+
+        attention_mask = None
+
+        if is_attn_mask:
+            # Treat input as padding mask: non-zero = valid, 0 = padding
+            # Build pairwise outer product mask
+            pm = (q_segment_ids != 0).astype(jnp.bool_)  # (batch, qlen) - True=valid
+            kv_pm = (kv_segment_ids != 0).astype(jnp.bool_)  # (batch, kvlen) - True=valid
+            # Outer product: (batch, 1, qlen, kvlen) where both Q and KV must be valid
+            attention_mask = (pm[:, None, :, None] & kv_pm[:, None, None, :]).astype(jnp.bool_)
+            # Convert to segment IDs: 0 for valid, -1 for padding
+            q_segment_ids = jnp.where(pm, 0, -1).astype(jnp.int32)
+            kv_segment_ids = jnp.where(kv_pm, 0, -1).astype(jnp.int32)
 
         return cls(
-            _attention_mask=None,
+            _attention_mask=attention_mask,
             _q_segment_ids=q_segment_ids,
             _kv_segment_ids=kv_segment_ids,
             q_positions=q_positions,
@@ -620,6 +731,7 @@ class MaskInfo:
         )
 
     @classmethod
+    @_debug_trace
     def from_attention_mask(
         cls,
         attention_mask: Bool[Array, mdim_t] | Int[Array, mdim_t],
@@ -700,6 +812,7 @@ class MaskInfo:
         )
 
     @classmethod
+    @_debug_trace
     def from_random(
         cls,
         batch_size: int,
@@ -791,8 +904,11 @@ class MaskInfo:
         Returns:
             Attention bias array with dtype float32
         """
+        if _DEBUG_MODE:
+            print("[MaskInfo Debug] Property access: bias")
         return self.create_bias()
 
+    @_debug_trace
     def create_bias(self, dtype: jnp.dtype = jnp.float32) -> Array:
         """
         Create attention bias from the mask.
@@ -839,6 +955,7 @@ class MaskInfo:
             kv_positions=None,
         )
 
+    @_debug_trace
     def get_shardings(
         self,
         sequence_parallel: bool = False,
@@ -945,9 +1062,8 @@ class MaskInfo:
         )
         return MaskSharding(attention_mask, q_segment_ids, kv_segment_ids, q_positions, kv_positions)
 
-    def get_or_compute_positions(
-        self,
-    ) -> tuple[Int[Array, "batch qlen"] | None, Int[Array, "batch kvlen"] | None]:
+    @_debug_trace
+    def get_or_compute_positions(self) -> tuple[Int[Array, "batch qlen"] | None, Int[Array, "batch kvlen"] | None]:
         """
         Get position arrays, computing them if not already available.
 
@@ -993,6 +1109,7 @@ class MaskInfo:
         self.kv_positions = kv_positions
         return self.q_positions, self.kv_positions
 
+    @_debug_trace
     def get_or_compute_attention_mask(self, dtype: DTypeLike = jnp.bool_) -> Array:
         """
         Get attention mask, using cached data when available and deriving from segment IDs otherwise.
@@ -1009,6 +1126,7 @@ class MaskInfo:
         Raises:
             ValueError: If both attention_mask and segment_ids are None
         """
+
         if self._attention_mask is not None:
             return self._attention_mask.astype(dtype)
         if self._q_segment_ids is not None and self._kv_segment_ids is not None:
@@ -1020,6 +1138,7 @@ class MaskInfo:
             "IDs using from_attention_mask() or from_segments()."
         )
 
+    @_debug_trace
     def get_or_compute_segment_ids(self, per_head: bool = False) -> tuple[Int[Array, "..."], Int[Array, "..."]]:
         """
         Get segment IDs, computing from attention mask if not available.
@@ -1050,6 +1169,7 @@ class MaskInfo:
             "from_attention_mask() or from_segments()."
         )
 
+    @_debug_trace
     def get_qkv_masks(
         self, dtype: DTypeLike = jnp.bool_
     ) -> tuple[
@@ -1082,9 +1202,9 @@ class MaskInfo:
         Returns:
             True if query and key-value sequences are identical, False otherwise
         """
-        if self.q_segment_ids is not None and self.kv_segment_ids is not None:
-            return self.q_segment_ids.shape == self.kv_segment_ids.shape and jnp.array_equal(
-                self.q_segment_ids, self.kv_segment_ids
+        if self._q_segment_ids is not None and self.kv_segment_ids is not None:
+            return self._q_segment_ids.shape == self.kv_segment_ids.shape and jnp.array_equal(
+                self._q_segment_ids, self.kv_segment_ids
             )
 
         if self.attention_mask is not None:
@@ -1093,6 +1213,7 @@ class MaskInfo:
 
         return False
 
+    @_debug_trace
     def to_dtype(self, dtype: DTypeLike) -> "MaskInfo":
         """
         Convert attention mask to specified dtype, returning a new MaskInfo.
@@ -1103,20 +1224,14 @@ class MaskInfo:
         Returns:
             New MaskInfo with converted attention mask
         """
-        if self.attention_mask is None:
+        # Get or compute the attention mask
+        mask = self.get_or_compute_attention_mask(dtype=jnp.bool_)
+
+        # Convert to requested dtype if needed
+        if mask.dtype == dtype:
             return self
 
-        return MaskInfo(
-            _attention_mask=self.attention_mask.astype(dtype),
-            _q_segment_ids=self._q_segment_ids,
-            _kv_segment_ids=self._kv_segment_ids,
-            q_positions=self.q_positions,
-            kv_positions=self.kv_positions,
-            batch_axis_name=self.batch_axis_name,
-            qheads_axis_name=self.qheads_axis_name,
-            kvheads_axis_name=self.kvheads_axis_name,
-            sequence_axis_name=self.sequence_axis_name,
-        )
+        return self.replace(attention_mask=mask.astype(dtype))
 
     @property
     def batch_size(self) -> int | None:
@@ -1128,10 +1243,12 @@ class MaskInfo:
         Returns:
             Batch size if available, None otherwise
         """
-        if self.q_segment_ids is not None:
-            return self.q_segment_ids.shape[0]
-        if self.attention_mask is not None:
-            return self.attention_mask.shape[0]
+        if _DEBUG_MODE:
+            print("[MaskInfo Debug] Property access: batch_size")
+        if self._q_segment_ids is not None:
+            return self._q_segment_ids.shape[0]
+        if self._attention_mask is not None:
+            return self._attention_mask.shape[0]
         return None
 
     @property
@@ -1144,10 +1261,12 @@ class MaskInfo:
         Returns:
             Query sequence length if available, None otherwise
         """
-        if self.q_segment_ids is not None:
-            return self.q_segment_ids.shape[-1]
-        if self.attention_mask is not None:
-            return self.attention_mask.shape[-2]
+        if _DEBUG_MODE:
+            print("[MaskInfo Debug] Property access: q_len")
+        if self._q_segment_ids is not None:
+            return self._q_segment_ids.shape[-1]
+        if self._attention_mask is not None:
+            return self._attention_mask.shape[-2]
         return None
 
     @property
@@ -1160,6 +1279,8 @@ class MaskInfo:
         Returns:
             Key-value sequence length if available, None otherwise
         """
+        if _DEBUG_MODE:
+            print("[MaskInfo Debug] Property access: kv_len")
         if self.kv_segment_ids is not None:
             return self.kv_segment_ids.shape[-1]
         if self.attention_mask is not None:
@@ -1176,8 +1297,11 @@ class MaskInfo:
         Returns:
             Tuple of (batch_size, query_length, key_value_length)
         """
+        if _DEBUG_MODE:
+            print("[MaskInfo Debug] Property access: shape")
         return (self.batch_size, self.q_len, self.kv_len)
 
+    @_debug_trace
     def apply_kv_lengths(
         self,
         kv_lengths: Int[Array, "batch"],
@@ -1210,41 +1334,35 @@ class MaskInfo:
             ValueError: If the attention mask cannot be materialized.
         """
 
-        attention_mask = self.get_or_compute_attention_mask(dtype=jnp.bool_)
+        if q_len is None:
+            raise ValueError("q_len must be provided.")
 
-        B, _H, _Q, K = attention_mask.shape
-
+        attn = self.get_or_compute_attention_mask(dtype=jnp.bool_)
+        B, _H, Q, K = attn.shape
         kv_lengths = jnp.asarray(kv_lengths, jnp.int32).reshape(B)
 
-        def _update_batched(x, qseq):
-            x = jax.lax.dynamic_slice_in_dim(x, qseq - q_len, q_len, 1)
-            if sliding_window is not None and K > sliding_window:
-                x = jax.lax.dynamic_slice_in_dim(x, qseq - q_len, sliding_window, 2)
-            return x
-
         kv_valid = jnp.arange(K, dtype=jnp.int32)[None, :] < kv_lengths[:, None]
-        kv_mask4d = jnp.broadcast_to(kv_valid[:, None, None, :], (B, 1, 1, K))
-        attention_mask = jnp.logical_and(attention_mask, kv_mask4d)
+        attn = attn & kv_valid[:, None, None, :]
 
-        attention_mask = jax.vmap(
-            _update_batched,
-            in_axes=(0, 0),
-            out_axes=0,
-        )(attention_mask, kv_lengths)
+        def _slice_q(x, klen):
+            start_q = jnp.clip(klen - q_len, 0, jnp.maximum(Q - q_len, 0))
+            return jax.lax.dynamic_slice_in_dim(x, start_q, q_len, axis=1)  # x: (H,Q,K)
 
-        return MaskInfo(
-            _attention_mask=attention_mask,
-            _q_segment_ids=self._q_segment_ids,
-            _kv_segment_ids=self._kv_segment_ids,
-            q_positions=self.q_positions,
-            kv_positions=self.kv_positions,
-            batch_axis_name=self.batch_axis_name,
-            qheads_axis_name=self.qheads_axis_name,
-            kvheads_axis_name=self.kvheads_axis_name,
-            sequence_axis_name=self.sequence_axis_name,
-        )
+        attn = jax.vmap(_slice_q, in_axes=(0, 0), out_axes=0)(attn, kv_lengths)  # (B,H,q_len,K)
 
-    def apply_causal(self, offset: int = 0) -> "MaskInfo":
+        if sliding_window is not None:
+            width = min(sliding_window, K)
+
+            def _slice_k(x, klen):
+                start_k = jnp.clip(klen - width, 0, jnp.maximum(K - width, 0))
+                return jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)  # x: (H,q_len,K)
+
+            attn = jax.vmap(_slice_k, in_axes=(0, 0), out_axes=0)(attn, kv_lengths)  # (B,H,q_len,width)
+
+        return self.replace(attention_mask=attn)
+
+    @_debug_trace
+    def apply_causal(self, offset: int | Int[Array, "batch"] = 0) -> "MaskInfo":
         """
         Apply causal (autoregressive) masking to the attention pattern.
 
@@ -1253,7 +1371,10 @@ class MaskInfo:
         The segment IDs are preserved to maintain grouping structure.
 
         Args:
-            offset: Position offset for causal masking. Default: 0
+            offset: Position offset for causal masking. Can be:
+                - int: Scalar offset applied to all batch elements
+                - Array of shape (batch,): Per-batch offsets
+                Default: 0
                 - offset=0: Standard causal (q_i attends to kv_j where j <= i)
                 - offset>0: Allows attending to future tokens (j <= i + offset)
                 - offset<0: More restrictive causal (j <= i + offset)
@@ -1269,6 +1390,9 @@ class MaskInfo:
             >>> mask_info = MaskInfo.from_segments(segment_ids)
             >>> causal_mask = mask_info.apply_causal()
             >>>
+            >>> # Per-batch offsets
+            >>> offsets = jnp.array([0, 1, 2])
+            >>> causal_mask = mask_info.apply_causal(offset=offsets)
         """
         if self.q_len is None or self.kv_len is None:
             raise ValueError(
@@ -1279,58 +1403,99 @@ class MaskInfo:
             )
 
         base_mask = self.get_or_compute_attention_mask(dtype=jnp.bool_)
+        B, _H, Q, K = base_mask.shape
 
-        q_seg, kv_seg = self._q_segment_ids, self._kv_segment_ids
-        if q_seg is None or kv_seg is None:
-            try:
-                q_seg, kv_seg = self.get_or_compute_segment_ids(per_head=False)
-            except Exception:
-                q_seg, kv_seg = None, None
+        # Handle scalar offset - convert to array if needed
+        off = jnp.asarray(offset, dtype=jnp.int32)
+        if off.ndim == 0:
+            off = jnp.broadcast_to(off, (B,))
 
-        Q, K = base_mask.shape[-2], base_mask.shape[-1]
-        q_idx = jnp.arange(Q, dtype=jnp.int32)
-        kv_idx = jnp.arange(K, dtype=jnp.int32)
-        causal = (q_idx[:, None] + offset >= kv_idx[None, :])[None, None, :, :]
-        return MaskInfo(
-            _attention_mask=base_mask & causal,
-            _q_segment_ids=q_seg,
-            _kv_segment_ids=kv_seg,
-            q_positions=self.q_positions,
-            kv_positions=self.kv_positions,
-            batch_axis_name=self.batch_axis_name,
-            qheads_axis_name=self.qheads_axis_name,
-            kvheads_axis_name=self.kvheads_axis_name,
-            sequence_axis_name=self.sequence_axis_name,
-        )
+        def _mk_causal(Q, K, o):
+            q = jnp.arange(Q, dtype=jnp.int32)[:, None]
+            k = jnp.arange(K, dtype=jnp.int32)[None, :]
+            return k <= (q + o)
 
+        causal = jax.vmap(_mk_causal, in_axes=(None, None, 0))(Q, K, off)  # (B,Q,K)
+        causal = causal[:, None, :, :]  # (B,1,Q,K)
+
+        return self.replace(attention_mask=base_mask & causal)
+
+    @_debug_trace
     def apply_sliding_window(
         self,
-        window_size: int | tuple[int, int] | tuple[int | None, int | None],
-        offset: int = 0,
+        sliding_window: int | tuple[int, int],
+        *,
+        offset: int | Int[Array, "batch"] = 0,
+        mode: Literal["default", "decode", "prefill"] | None = None,
+        index: int | Int[Array, "batch"] | None = None,
     ) -> "MaskInfo":
         """
-        Apply sliding window (local) attention by preserving segment IDs and applying window constraint.
+        Apply sliding window attention to the attention pattern.
 
-        Restricts attention to a local window around each query position. The segment IDs
-        are preserved to maintain the original grouping structure, while the attention mask
-        encodes both the segment constraint AND the sliding window constraint.
+        Restricts attention so that each query position can only attend to
+        key positions within a specified window around its position. This is
+        useful for local attention patterns where distant tokens are masked out.
 
         Args:
-            window_size: Size of the attention window. Can be:
-                - int: Symmetric window of size (window_size, window_size)
-                - tuple[int, int]: Asymmetric window (left_size, right_size)
-                - tuple[int|None, int|None]: One-sided window (None means unlimited)
-            offset: Offset of q start wrt kv (same as causal mask offset)
+            sliding_window: Window size specification:
+                - int: Symmetric window (same size left and right)
+                - tuple[int, int]: (left_window, right_window) for asymmetric windows
+                  - left_window: How many positions to the left can be attended to
+                  - right_window: How many positions to the right can be attended to
+            offset: Row offset for sliding window calculation. Can be:
+                - int: Scalar offset applied to all batch elements
+                - Array of shape (batch,): Per-batch offsets
+                Default: 0
+            mode: Attention mode for dynamic slicing:
+                - "default" or None: Standard sliding window without slicing
+                - "decode": Decode mode - slices KV to window size around current index
+                - "prefill": Prefill mode - slices to last sliding_window positions
+            index: Current position index (required for "decode" mode). Can be:
+                - int: Scalar index applied to all batch elements
+                - Array of shape (batch,): Per-batch indices
 
         Returns:
-            New MaskInfo with sliding window constraint applied
+            New MaskInfo with sliding window constraint applied while preserving segment IDs
+
+        Raises:
+            ValueError: If mask dimensions are unknown, window size is invalid,
+                       or index is missing in decode mode
 
         Example:
-            >>> segment_ids = jnp.array([[1, 1, 1, 1, 1]])
+            >>> segment_ids = jnp.array([[1, 1, 1, 1, 1, 1]])
             >>> mask_info = MaskInfo.from_segments(segment_ids)
             >>>
-            >>> windowed = mask_info.apply_sliding_window(window_size=(1, 1))
+            >>> # Symmetric window: each position attends to 2 positions left and 2 right
+            >>> windowed_mask = mask_info.apply_sliding_window(2)
+            >>>
+            >>> # Asymmetric window: 3 left, 1 right
+            >>> windowed_mask = mask_info.apply_sliding_window((3, 1))
+            >>>
+            >>> # Decode mode at position 5 with window size 3
+            >>> decode_mask = mask_info.apply_sliding_window(3, mode="decode", index=5)
+            >>>
+            >>> # Decode mode with per-batch indices
+            >>> batch_indices = jnp.array([5, 7, 3])
+            >>> decode_mask = mask_info.apply_sliding_window(3, mode="decode", index=batch_indices)
+            >>>
+            >>> # Prefill mode with window size 4
+            >>> prefill_mask = mask_info.apply_sliding_window(4, mode="prefill")
         """
+        if isinstance(sliding_window, int):
+            if sliding_window < 0:
+                raise ValueError(
+                    f"Invalid sliding_window: expected a non-negative integer, but got {sliding_window}. "
+                    f"Window size must be >= 0."
+                )
+            left_window = right_window = sliding_window
+        else:
+            left_window, right_window = sliding_window
+            if left_window < 0 or right_window < 0:
+                raise ValueError(
+                    f"Invalid sliding_window: expected non-negative values, but got ({left_window}, {right_window}). "
+                    f"Both left and right window sizes must be >= 0."
+                )
+
         if self.q_len is None or self.kv_len is None:
             raise ValueError(
                 "Cannot apply sliding window: mask dimensions are unknown. "
@@ -1339,42 +1504,63 @@ class MaskInfo:
                 f"Current state: q_len={self.q_len}, kv_len={self.kv_len}"
             )
 
-        if isinstance(window_size, int):
-            left, right = window_size, window_size
-        else:
-            left, right = window_size
+        if mode == "decode" and index is None:
+            raise ValueError(
+                "index parameter is required when mode='decode'. "
+                "Please provide the current position index for decode mode."
+            )
 
-        q_seg, kv_seg = self._q_segment_ids, self._kv_segment_ids
-        base_mask = (
-            self._attention_mask.astype(jnp.bool_)
-            if self._attention_mask is not None
-            else self.get_or_compute_attention_mask(dtype=jnp.bool_)
-        )
+        base = self.get_or_compute_attention_mask(dtype=jnp.bool_)  # (B,H,Q,K)
 
-        Q, K = base_mask.shape[-2], base_mask.shape[-1]
-        q_idx = jnp.arange(Q, dtype=jnp.int32)
-        kv_idx = jnp.arange(K, dtype=jnp.int32)
+        B, H, Q, K = base.shape
 
-        local_mask = jnp.ones((Q, K), dtype=jnp.bool_)
-        if left is not None:
-            local_mask = local_mask & (q_idx[:, None] - left + offset <= kv_idx[None, :])
-        if right is not None:
-            local_mask = local_mask & (q_idx[:, None] + right + offset >= kv_idx[None, :])
+        off = jnp.asarray(offset, jnp.int32)
+        if off.ndim == 0:
+            off = jnp.broadcast_to(off, (B,))
 
-        attention_mask = base_mask & local_mask[None, None, :, :]
+        # Helper to build window mask for a single (Q,K)
+        def _window_mask_single(Q, K, off_b):
+            row = off_b + jnp.arange(Q, dtype=jnp.int32)[:, None]  # (Q,1)
+            col = jnp.arange(K, dtype=jnp.int32)[None, :]  # (1,K)
+            left_ok = col >= (row - left_window)
+            right_ok = col <= (row + right_window)
+            return left_ok & right_ok
 
-        return MaskInfo(
-            _attention_mask=attention_mask,
-            _q_segment_ids=q_seg,
-            _kv_segment_ids=kv_seg,
-            q_positions=self.q_positions,
-            kv_positions=self.kv_positions,
-            batch_axis_name=self.batch_axis_name,
-            qheads_axis_name=self.qheads_axis_name,
-            kvheads_axis_name=self.kvheads_axis_name,
-            sequence_axis_name=self.sequence_axis_name,
-        )
+        off_rep = jnp.repeat(off, H)
 
+        win = jax.vmap(_window_mask_single, in_axes=(None, None, 0))(Q, K, off_rep)
+        win = win.reshape(B, H, Q, K)
+
+        masked = base & win
+
+        if mode == "decode":
+            idx = jnp.asarray(index, jnp.int32)
+            if idx.ndim == 0:
+                idx = jnp.broadcast_to(idx, (B,))
+            width = min(left_window + right_window + 1, K)
+
+            def _slice_decode(x, i):
+                start_k = jnp.clip(i - left_window, 0, jnp.maximum(K - width, 0))
+                x = jax.lax.dynamic_slice_in_dim(x, i, 1, axis=1)  # Q->1
+                x = jax.lax.dynamic_slice_in_dim(x, start_k, width, 2)  # K->width
+                return x  # (H,1,width)
+
+            masked = jax.vmap(_slice_decode, in_axes=(0, 0), out_axes=0)(masked, idx)  # (B,H,1,width)
+            return self.replace(attention_mask=masked)
+
+        if mode == "prefill":
+            width = min(left_window + right_window + 1, K)
+
+            def _slice_prefill(x):
+                start_k = jnp.maximum(K - width, 0)
+                return jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)  # keep full Q
+
+            masked = jax.vmap(_slice_prefill, in_axes=0, out_axes=0)(masked)  # (B,H,Q,width)
+            return self.replace(attention_mask=masked)
+
+        return self.replace(attention_mask=masked)
+
+    @_debug_trace
     def apply_chunked(self, chunk_size: int, offset: int = 0) -> "MaskInfo":
         """
         Apply chunked causal attention and ALWAYS update q/kv segment IDs to chunk IDs.
@@ -1404,11 +1590,7 @@ class MaskInfo:
                 f"Current state: q_len={self.q_len}, kv_len={self.kv_len}"
             )
 
-        base_mask = (
-            self.attention_mask.astype(jnp.bool_)
-            if self.attention_mask is not None
-            else self.get_or_compute_attention_mask(dtype=jnp.bool_)
-        )
+        base_mask = self.get_or_compute_attention_mask(dtype=jnp.bool_)
 
         q_idx = jnp.arange(self.q_len, dtype=jnp.int32)
         kv_idx = jnp.arange(self.kv_len, dtype=jnp.int32)
@@ -1429,24 +1611,16 @@ class MaskInfo:
             q_pad = ~q_valid
             kv_pad = ~kv_valid
 
-        q_chunk_ids = (q_idx // chunk_size).astype(jnp.int32)[None, :]
-        kv_chunk_ids = (kv_idx // chunk_size).astype(jnp.int32)[None, :]
+        # Chunk IDs are 1-based (chunk indices + 1), padding stays -1
+        q_chunk_ids = (q_idx // chunk_size + 1).astype(jnp.int32)[None, :]
+        kv_chunk_ids = (kv_idx // chunk_size + 1).astype(jnp.int32)[None, :]
 
         q_segment_ids = jnp.where(q_pad, -1, q_chunk_ids)
         kv_segment_ids = jnp.where(kv_pad, -1, kv_chunk_ids)
 
-        return MaskInfo(
-            _attention_mask=attention_mask,
-            _q_segment_ids=q_segment_ids,
-            _kv_segment_ids=kv_segment_ids,
-            q_positions=self.q_positions,
-            kv_positions=self.kv_positions,
-            batch_axis_name=self.batch_axis_name,
-            qheads_axis_name=self.qheads_axis_name,
-            kvheads_axis_name=self.kvheads_axis_name,
-            sequence_axis_name=self.sequence_axis_name,
-        )
+        return self.replace(attention_mask=attention_mask, q_segment_ids=q_segment_ids, kv_segment_ids=kv_segment_ids)
 
+    @_debug_trace
     def apply_token_type_ids(
         self,
         token_type_ids: Int[Array, "batch q_len"] | tuple[Int[Array, "batch q_len"], Int[Array, "batch kv_len"]],
@@ -1513,11 +1687,7 @@ class MaskInfo:
                 f"Shapes: q_types={q_types.shape}, kv_types={kv_types.shape}"
             )
 
-        base_mask = (
-            self.attention_mask.astype(jnp.bool_)
-            if self.attention_mask is not None
-            else self.get_or_compute_attention_mask(dtype=jnp.bool_)
-        )
+        base_mask = self.get_or_compute_attention_mask(dtype=jnp.bool_)
 
         eq2d = q_types[:, :, None] == kv_types[:, None, :]
         if zero_policy not in ("q", "kv", "both", "none"):
@@ -1563,17 +1733,7 @@ class MaskInfo:
             q_seg = self._q_segment_ids
             kv_seg = self._kv_segment_ids
 
-        return MaskInfo(
-            _attention_mask=new_mask,
-            _q_segment_ids=q_seg,
-            _kv_segment_ids=kv_seg,
-            q_positions=self.q_positions,
-            kv_positions=self.kv_positions,
-            batch_axis_name=self.batch_axis_name,
-            qheads_axis_name=self.qheads_axis_name,
-            kvheads_axis_name=self.kvheads_axis_name,
-            sequence_axis_name=self.sequence_axis_name,
-        )
+        return self.replace(attention_mask=new_mask, q_segment_ids=q_seg, kv_segment_ids=kv_seg)
 
     @staticmethod
     def create_chunked_attention_mask(
@@ -1713,12 +1873,13 @@ class MaskInfo:
             sequence_axis_name=sequence_axis_name,
         )
 
+    @_debug_trace
     def replace(self, *, attention_mask=None, q_segment_ids=None, kv_segment_ids=None, **kw) -> "MaskInfo":
         """
         Create a new MaskInfo with specified fields replaced.
 
         This is a convenience method for creating modified copies of MaskInfo instances,
-        similar to dataclasses.replace(). Only specified fields are updated; others are
+        using dataclasses.replace(). Only specified fields are updated; others are
         preserved from the original instance.
 
         Args:
@@ -1742,19 +1903,22 @@ class MaskInfo:
             >>> new_mask_info.batch_axis_name
             'data'
         """
-        return MaskInfo(
-            _attention_mask=attention_mask if attention_mask is not None else self._attention_mask,
-            _q_segment_ids=q_segment_ids if q_segment_ids is not None else self._q_segment_ids,
-            _kv_segment_ids=kv_segment_ids if kv_segment_ids is not None else self._kv_segment_ids,
-            q_positions=kw.get("q_positions", self.q_positions),
-            kv_positions=kw.get("kv_positions", self.kv_positions),
-            batch_axis_name=kw.get("batch_axis_name", self.batch_axis_name),
-            qheads_axis_name=kw.get("qheads_axis_name", self.qheads_axis_name),
-            kvheads_axis_name=kw.get("kvheads_axis_name", self.kvheads_axis_name),
-            sequence_axis_name=kw.get("sequence_axis_name", self.sequence_axis_name),
-        )
+        # Build kwargs with private field names for dataclass_replace
+        replace_kwargs = {}
+        if attention_mask is not None:
+            replace_kwargs["_attention_mask"] = attention_mask
+        if q_segment_ids is not None:
+            replace_kwargs["_q_segment_ids"] = q_segment_ids
+        if kv_segment_ids is not None:
+            replace_kwargs["_kv_segment_ids"] = kv_segment_ids
+
+        # Add other fields from **kw
+        replace_kwargs.update(kw)
+
+        return dataclass_replace(self, **replace_kwargs)
 
     @classmethod
+    @_debug_trace
     def dynamic_init(
         cls,
         *,
@@ -1819,11 +1983,12 @@ class MaskInfo:
             if attention_mask.dtype != jnp.bool_:
                 attention_mask = (attention_mask == 1).astype(jnp.bool_)
         if attention_mask.ndim == 2:
-            mask_info = MaskInfo.from_segments(attention_mask, apply_padding=True)
+            mask_info = MaskInfo.from_segments(attention_mask, is_attn_mask=True)
         else:
             mask_info = MaskInfo.from_attention_mask(attention_mask)
         return mask_info
 
+    @_debug_trace
     def visualize(
         self,
         block_size: int | tuple[int, int] = 32,
@@ -1880,11 +2045,8 @@ class MaskInfo:
             >>> mask_info.visualize(block_size=16, batch=0)
         """
 
-        m = (
-            self.attention_mask.astype(jnp.bool_)
-            if self.attention_mask is not None
-            else self.get_or_compute_attention_mask(dtype=jnp.bool_)
-        )
+        m = self.get_or_compute_attention_mask(dtype=jnp.bool_)
+
         if m.ndim == 3:
             m = m[:, None, :, :]
         if m.ndim != 4:

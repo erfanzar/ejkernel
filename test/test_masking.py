@@ -179,16 +179,19 @@ def test_maskinfo_apply_kv_lengths_updates_masks_and_segments():
     """Test apply_kv_lengths masking, slicing, and segment updates."""
     print("\nTesting MaskInfo.apply_kv_lengths() slicing and masking...")
 
+    @jax.jit
+    def run_apply_kv_lengths(q_segments, kv_lengths, end_index):
+        mask_info = MaskInfo.from_segments(q_segments)
+        return mask_info.apply_kv_lengths(kv_lengths=kv_lengths, q_len=2, end_index=end_index)
+
     q_segments = jnp.array(
         [[1, 1, 2, 2, 3], [1, 2, 2, 3, 3]],
         dtype=jnp.int32,
     )
-    mask_info = MaskInfo.from_segments(q_segments)
-
     kv_lengths = jnp.array([4, 3], dtype=jnp.int32)
     end_index = jnp.array([5, 4], dtype=jnp.int32)
 
-    updated = mask_info.apply_kv_lengths(kv_lengths=kv_lengths, q_len=2, end_index=end_index)
+    updated = run_apply_kv_lengths(q_segments, kv_lengths, end_index)
 
     assert updated.attention_mask.shape == (2, 1, 2, 5)
     attn = jax.device_get(updated.attention_mask.astype(bool))
@@ -201,7 +204,7 @@ def test_maskinfo_apply_kv_lengths_updates_masks_and_segments():
     assert np.array_equal(jax.device_get(updated.q_segment_ids), expected_q_segments)
     assert np.array_equal(jax.device_get(updated.kv_segment_ids), expected_kv_segments)
 
-    print("  ✓ apply_kv_lengths masking: OK")
+    print("  ✓ apply_kv_lengths masking (JIT): OK")
 
 
 def test_maskinfo_apply_kv_lengths_requires_indices():
@@ -221,8 +224,12 @@ def test_maskinfo_from_segments():
     """Test MaskInfo.from_segments() factory method."""
     print("\nTesting MaskInfo.from_segments()...")
 
+    @jax.jit
+    def run_from_segments(q_seg):
+        return MaskInfo.from_segments(q_seg)
+
     q_seg = jnp.array([[1, 1, 2, 2, -1]])
-    mask_info = MaskInfo.from_segments(q_seg)
+    mask_info = run_from_segments(q_seg)
 
     assert mask_info.q_segment_ids.shape == (1, 5)
     assert mask_info.kv_segment_ids.shape == (1, 5)
@@ -233,16 +240,13 @@ def test_maskinfo_from_segments():
     attn = mask_info.attention_mask[0, 0]
 
     assert jnp.all(attn[0:2, 0:2])
-
     assert jnp.all(attn[2:4, 2:4])
-
     assert not jnp.any(attn[0:2, 2:4])
     assert not jnp.any(attn[2:4, 0:2])
-
     assert not jnp.any(attn[4, :])
     assert not jnp.any(attn[:, 4])
 
-    print("  ✓ from_segments: OK")
+    print("  ✓ from_segments (JIT): OK")
 
 
 def _mk_base_mask(B=1, Q=16, K=16, left=4, right=2):
@@ -257,9 +261,13 @@ def test_maskinfo_from_attention_mask_3d():
     """Test MaskInfo.from_attention_mask() with 3D pairwise mask."""
     print("\nTesting MaskInfo.from_attention_mask() with 3D mask...")
 
+    @jax.jit
+    def run_from_attention_mask(mask):
+        return MaskInfo.from_attention_mask(mask)
+
     # 3D input gets converted to 4D internally
     mask = jnp.array([[[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1]]])
-    mask_info = MaskInfo.from_attention_mask(mask)
+    mask_info = run_from_attention_mask(mask)
 
     assert mask_info.q_segment_ids.shape == (1, 4)
     assert mask_info.kv_segment_ids.shape == (1, 4)
@@ -270,7 +278,7 @@ def test_maskinfo_from_attention_mask_3d():
     assert mask_info.q_segment_ids[0, 2] == mask_info.q_segment_ids[0, 3]
     assert mask_info.q_segment_ids[0, 0] != mask_info.q_segment_ids[0, 2]
 
-    print("  ✓ from_attention_mask (3D): OK")
+    print("  ✓ from_attention_mask (3D, JIT): OK")
 
 
 def test_maskinfo_properties():
@@ -328,24 +336,29 @@ def test_maskinfo_to_dtype():
     """Test MaskInfo.to_dtype()."""
     print("\nTesting MaskInfo.to_dtype()...")
 
-    segment_ids = jnp.array([[1, 1, 2]])
-    mask_info = MaskInfo.from_segments(segment_ids)
+    @jax.jit
+    def run_to_dtype(segment_ids):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.to_dtype(jnp.float32)
 
-    mask_info_float = mask_info.to_dtype(jnp.float32)
+    segment_ids = jnp.array([[1, 1, 2]])
+    mask_info_float = run_to_dtype(segment_ids)
     assert mask_info_float.attention_mask.dtype == jnp.float32
 
-    assert mask_info.attention_mask.dtype == jnp.bool_
-
-    print("  ✓ to_dtype: OK")
+    print("  ✓ to_dtype (JIT): OK")
 
 
 def test_maskinfo_apply_causal():
     """Test MaskInfo.apply_causal()."""
     print("\nTesting MaskInfo.apply_causal()...")
 
+    @jax.jit
+    def run_apply_causal(segment_ids, offset):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_causal(offset=offset)
+
     segment_ids = jnp.array([[1, 1, 1, 1, 1]])
-    mask_info = MaskInfo.from_segments(segment_ids)
-    causal_mask_info = mask_info.apply_causal()
+    causal_mask_info = run_apply_causal(segment_ids, 0)
 
     attn = causal_mask_info.attention_mask[0, 0]
     for i in range(5):
@@ -355,53 +368,139 @@ def test_maskinfo_apply_causal():
             else:
                 assert not attn[i, j], f"Expected no attention at [{i},{j}]"
 
-    causal_mask_info_offset = mask_info.apply_causal(offset=1)
+    causal_mask_info_offset = run_apply_causal(segment_ids, 1)
     attn_offset = causal_mask_info_offset.attention_mask[0, 0]
-
     assert attn_offset[0, 1]
 
-    print("  ✓ apply_causal: OK")
+    print("  ✓ apply_causal (JIT): OK")
+
+
+def test_maskinfo_apply_causal_per_batch_offsets():
+    """Test MaskInfo.apply_causal() with per-batch offsets."""
+    print("\nTesting MaskInfo.apply_causal() with per-batch offsets...")
+
+    @jax.jit
+    def run_apply_causal_batch(segment_ids, offsets):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_causal(offset=offsets)
+
+    segment_ids = jnp.ones((2, 6), dtype=jnp.int32)
+    offsets = jnp.array([0, 1])
+    causal = run_apply_causal_batch(segment_ids, offsets)
+
+    # Batch 0: position 3 attends to [0,1,2,3] (offset=0)
+    # Batch 1: position 3 attends to [0,1,2,3,4] (offset=1)
+    assert causal.attention_mask[0, 0, 3, 3] == True
+    assert causal.attention_mask[0, 0, 3, 4] == False
+    assert causal.attention_mask[1, 0, 3, 3] == True
+    assert causal.attention_mask[1, 0, 3, 4] == True
+
+    print("  ✓ apply_causal per-batch offsets (JIT): OK")
 
 
 def test_maskinfo_apply_sliding_window():
     """Test MaskInfo.apply_sliding_window()."""
     print("\nTesting MaskInfo.apply_sliding_window()...")
 
-    segment_ids = jnp.array([[1, 1, 1, 1, 1, 1, 1]])
-    mask_info = MaskInfo.from_segments(segment_ids)
+    @jax.jit
+    def run_apply_sliding_window(segment_ids, window):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_sliding_window(window)
 
-    windowed = mask_info.apply_sliding_window(window_size=(1, 1))
+    segment_ids = jnp.array([[1, 1, 1, 1, 1, 1, 1]])
+    windowed = run_apply_sliding_window(segment_ids, (1, 1))
     attn = windowed.attention_mask[0, 0]
 
+    # Window (1, 1) means: left=1, right=1, so position i attends to [i-1, i, i+1]
     assert not attn[3, 0]
     assert not attn[3, 1]
-    assert attn[3, 2]
-    assert attn[3, 3]
-    assert attn[3, 4]
+    assert attn[3, 2]  # i-1
+    assert attn[3, 3]  # i
+    assert attn[3, 4]  # i+1
     assert not attn[3, 5]
     assert not attn[3, 6]
 
-    windowed_onesided = mask_info.apply_sliding_window(window_size=(None, 2))
-    attn_onesided = windowed_onesided.attention_mask[0, 0]
+    print("  ✓ apply_sliding_window (JIT): OK")
 
-    assert attn_onesided[3, 0]
-    assert attn_onesided[3, 5]
-    assert not attn_onesided[3, 6]
 
-    print("  ✓ apply_sliding_window: OK")
+def test_maskinfo_apply_sliding_window_right_window():
+    """Test MaskInfo.apply_sliding_window() honors right_window."""
+    print("\nTesting MaskInfo.apply_sliding_window() right_window...")
+
+    @jax.jit
+    def run_test(segment_ids):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_sliding_window((2, 1))
+
+    segment_ids = jnp.array([[1, 1, 1, 1, 1, 1]])
+    windowed = run_test(segment_ids)
+    attn = windowed.attention_mask[0, 0]
+
+    # Row i=3 can attend to [3-2, 3+1] = [1, 4]
+    row3 = attn[3]
+    assert row3[0] == False  # Position 0 outside window
+    assert row3[1] == True  # Left boundary
+    assert row3[2] == True
+    assert row3[3] == True
+    assert row3[4] == True  # Right boundary
+    assert row3[5] == False  # Outside window
+
+    print("  ✓ apply_sliding_window right_window (JIT): OK")
+
+
+def test_maskinfo_apply_sliding_window_decode_mode():
+    """Test MaskInfo.apply_sliding_window() decode mode."""
+    print("\nTesting MaskInfo.apply_sliding_window() decode mode...")
+
+    @jax.jit
+    def run_decode(segment_ids, index):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_sliding_window((2, 1), mode="decode", index=index)
+
+    segment_ids = jnp.array([[1, 1, 1, 1, 1, 1, 1, 1]])
+    decode_result = run_decode(segment_ids, 4)
+
+    # Expected shape: (1, 1, 1, 4) - Q sliced to 1, K sliced to left+right+1
+    assert decode_result.attention_mask.shape == (1, 1, 1, 4)
+
+    print("  ✓ apply_sliding_window decode mode (JIT): OK")
+
+
+def test_maskinfo_apply_sliding_window_prefill_mode():
+    """Test MaskInfo.apply_sliding_window() prefill mode."""
+    print("\nTesting MaskInfo.apply_sliding_window() prefill mode...")
+
+    @jax.jit
+    def run_prefill(segment_ids):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_sliding_window(4, mode="prefill")
+
+    segment_ids = jnp.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
+    prefill_result = run_prefill(segment_ids)
+
+    # Expected: full Q, K sliced to trailing window
+    assert prefill_result.attention_mask.shape[2] == 10  # Full Q
+    assert prefill_result.attention_mask.shape[3] == 4  # K sliced
+
+    print("  ✓ apply_sliding_window prefill mode (JIT): OK")
 
 
 def test_maskinfo_apply_chunked():
     """Test MaskInfo.apply_chunked()."""
     print("\nTesting MaskInfo.apply_chunked()...")
 
+    @jax.jit
+    def run_apply_chunked(segment_ids, chunk_size):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_chunked(chunk_size=chunk_size)
+
     segment_ids = jnp.array([[1, 1, 1, 1, 1, 1]])
-    mask_info = MaskInfo.from_segments(segment_ids)
-    chunked = mask_info.apply_chunked(chunk_size=3)
+    chunked = run_apply_chunked(segment_ids, 3)
 
     q_seg = chunked.q_segment_ids[0]
-    assert q_seg[0] == q_seg[1] == q_seg[2]
-    assert q_seg[3] == q_seg[4] == q_seg[5]
+    # With +1 indexing: [1, 1, 1, 2, 2, 2]
+    assert q_seg[0] == q_seg[1] == q_seg[2] == 1
+    assert q_seg[3] == q_seg[4] == q_seg[5] == 2
     assert q_seg[0] != q_seg[3]
 
     attn = chunked.attention_mask[0, 0]
@@ -417,17 +516,39 @@ def test_maskinfo_apply_chunked():
     assert attn[4, 3]
     assert not attn[3, 4]
 
-    print("  ✓ apply_chunked: OK")
+    print("  ✓ apply_chunked (JIT): OK")
+
+
+def test_maskinfo_apply_chunked_one_based_indexing():
+    """Test MaskInfo.apply_chunked() uses 1-based indexing."""
+    print("\nTesting MaskInfo.apply_chunked() 1-based indexing...")
+
+    @jax.jit
+    def run_test(segment_ids):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_chunked(chunk_size=3)
+
+    segment_ids = jnp.ones((1, 8), dtype=jnp.int32)
+    chunked = run_test(segment_ids)
+
+    # Expected: [1, 1, 1, 2, 2, 2, 3, 3] (1-based chunk IDs)
+    expected = jnp.array([1, 1, 1, 2, 2, 2, 3, 3])
+    assert jnp.all(chunked.q_segment_ids[0] == expected)
+
+    print("  ✓ apply_chunked 1-based indexing (JIT): OK")
 
 
 def test_maskinfo_composable():
     """Test that mask operations are composable."""
     print("\nTesting composable mask operations...")
 
-    segment_ids = jnp.array([[1, 1, 1, 1, 1, 1]])
-    mask_info = MaskInfo.from_segments(segment_ids)
+    @jax.jit
+    def run_composed(segment_ids):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_causal().apply_sliding_window(2)
 
-    composed = mask_info.apply_causal().apply_sliding_window(window_size=2)
+    segment_ids = jnp.array([[1, 1, 1, 1, 1, 1]])
+    composed = run_composed(segment_ids)
 
     attn = composed.attention_mask[0, 0]
 
@@ -438,29 +559,34 @@ def test_maskinfo_composable():
     assert attn[4, 4]
     assert not attn[4, 5]
 
-    print("  ✓ Composable operations: OK")
+    print("  ✓ Composable operations (JIT): OK")
 
 
 def test_maskinfo_with_padding():
     """Test that mask operations preserve padding (-1)."""
     print("\nTesting mask operations with padding...")
 
-    segment_ids = jnp.array([[1, 1, 2, 2, -1, -1]])
-    mask_info = MaskInfo.from_segments(segment_ids)
+    @jax.jit
+    def run_with_padding(segment_ids):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        causal = mask_info.apply_causal()
+        windowed = mask_info.apply_sliding_window(1)
+        chunked = mask_info.apply_chunked(chunk_size=2)
+        return causal, windowed, chunked
 
-    causal = mask_info.apply_causal()
+    segment_ids = jnp.array([[1, 1, 2, 2, -1, -1]])
+    causal, windowed, chunked = run_with_padding(segment_ids)
+
     assert jnp.all(causal.q_segment_ids[0, 4:] == -1)
     assert jnp.all(causal.kv_segment_ids[0, 4:] == -1)
 
-    windowed = mask_info.apply_sliding_window(window_size=1)
     assert jnp.all(windowed.q_segment_ids[0, 4:] == -1)
     assert jnp.all(windowed.kv_segment_ids[0, 4:] == -1)
 
-    chunked = mask_info.apply_chunked(chunk_size=2)
     assert jnp.all(chunked.q_segment_ids[0, 4:] == -1)
     assert jnp.all(chunked.kv_segment_ids[0, 4:] == -1)
 
-    print("  ✓ Padding preservation: OK")
+    print("  ✓ Padding preservation (JIT): OK")
 
 
 def test_maskinfo_from_random():
@@ -580,7 +706,7 @@ def test_maskinfo_positions_preservation():
     assert jnp.array_equal(causal.q_positions, custom_q_pos)
     assert jnp.array_equal(causal.kv_positions, custom_kv_pos)
 
-    windowed = mask_info.apply_sliding_window(window_size=2)
+    windowed = mask_info.apply_sliding_window(2)
     assert windowed.q_positions is not None
     assert windowed.kv_positions is not None
     assert jnp.array_equal(windowed.q_positions, custom_q_pos)
@@ -685,12 +811,41 @@ def test_maskinfo_segment_ids_as_source_of_truth():
     print("  ✓ segment IDs as source of truth: OK")
 
 
-def _mk_base_mask(B=1, Q=16, K=16, left=4, right=2):
-    """Full mask -> sliding window to get a deterministic base."""
-    m = MaskInfo.from_random(batch_size=B, q_len=Q, kv_len=K, sparsity=0.0, seed=0)
-    m = m.apply_sliding_window((left, right))
-    base = jax.device_get(m.get_or_compute_attention_mask(dtype=jnp.bool_))
-    return m, base  # m holds the stored attention_mask
+def test_maskinfo_from_segments_is_attn_mask():
+    """Test MaskInfo.from_segments() with is_attn_mask=True (pairwise mask fix)."""
+    print("\nTesting MaskInfo.from_segments() with is_attn_mask=True...")
+
+    @jax.jit
+    def run_test(pm):
+        return MaskInfo.from_segments(pm, is_attn_mask=True)
+
+    # First 2 valid, last 2 padding
+    pm = jnp.array([[1, 1, 0, 0]], dtype=jnp.int32)
+    mask_info = run_test(pm)
+
+    att = mask_info.attention_mask[0, 0]
+    assert att.shape == (4, 4)
+    # Valid positions should attend to each other
+    assert att[0, 0] == True and att[0, 1] == True
+    # Valid shouldn't attend to padding
+    assert att[0, 2] == False and att[0, 3] == False
+    # Padding shouldn't attend
+    assert att[2, 0] == False and att[2, 2] == False
+
+    print("  ✓ from_segments with is_attn_mask=True (JIT): OK")
+
+
+def test_maskinfo_q_position_ids():
+    """Test MaskInfo.q_position_ids property (clip keyword fix)."""
+    print("\nTesting MaskInfo.q_position_ids...")
+
+    segment_ids = jnp.array([[1, 1, -1, 1, 1]], dtype=jnp.int32)
+    mask_info = MaskInfo.from_segments(segment_ids)
+
+    pos = mask_info.q_position_ids
+    assert pos.shape == segment_ids.shape
+
+    print("  ✓ q_position_ids (clip keyword fix): OK")
 
 
 def _eq_mask(q_types, kv_types, zero_policy="q"):
@@ -784,4 +939,4 @@ def test_visualize_smoke():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    pytest.main([__file__, "-v"])

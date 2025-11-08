@@ -13,6 +13,6 @@
 # limitations under the License.
 
 
-from .mask import MaskInfo
+from .mask import MaskInfo, get_debug_mode, set_debug_mode
 
-__all__ = ("MaskInfo",)
+__all__ = ("MaskInfo", "get_debug_mode", "set_debug_mode")
