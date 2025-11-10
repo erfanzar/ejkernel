@@ -15,6 +15,6 @@
 
 """modified from google org impl"""
 
-from ._interface import ragged_page_attention
+from ._interface import ragged_page_attention_v3
 
-__all__ = ("ragged_page_attention",)
+__all__ = ("ragged_page_attention_v3",)

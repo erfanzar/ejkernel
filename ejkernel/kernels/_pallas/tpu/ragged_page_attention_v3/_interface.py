@@ -72,7 +72,6 @@ def ragged_page_attention_v3(
     Returns:
       The output of the attention.
     """
-    del optimized, compute_dtype
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
     if queries.shape[-1] == 64:

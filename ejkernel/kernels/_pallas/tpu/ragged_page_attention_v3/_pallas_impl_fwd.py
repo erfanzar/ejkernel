@@ -17,16 +17,17 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from eformer.callib import ejit
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from ejkernel.callib import ejit
 
 from ._utils import align_to, cdiv, get_dtype_bitwidth, get_dtype_packing, get_tuned_block_sizes
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 def ref_ragged_paged_attention(
@@ -1126,8 +1127,7 @@ def ragged_paged_attention(
             pages_per_seq,
         )
     bkv_sz = bkv_p * page_size
-    if vmem_limit_bytes is None:
-        vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
+
     grid = (distribution[2],)
 
     in_specs = [
@@ -1184,7 +1184,7 @@ def ragged_paged_attention(
         jnp.full((6,), -1, jnp.int32),
     )
 
-    scope_name = f"RPA-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
+    scope_name = f"RPA-blocksizeQ-{bq_sz}-blocksizeKV-{bkv_p}-pageSize-{page_size}"
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
@@ -1207,10 +1207,7 @@ def ragged_paged_attention(
                 grid=grid,
                 scratch_shapes=scratch_shapes,
             ),
-            compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
-            ),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",), vmem_limit_bytes=vmem_limit_bytes),
             out_shape=[
                 jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
                 jax.ShapeDtypeStruct(shape=kv_cache.shape, dtype=kv_cache.dtype),

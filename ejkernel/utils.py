@@ -690,3 +690,125 @@ def barrier_sync(timeout: float = 200):
 
     _sync_counter += 1
     client.wait_at_barrier(f"easy_barrier_sync_{_sync_counter}", timeout_in_ms=int(timeout * 1000.0))
+
+
+def _align_to(x: int, multiple: int) -> int:
+    return ((int(x) + int(multiple) - 1) // int(multiple)) * int(multiple)
+
+
+def _dtype_packing(dtype: jnp.dtype) -> int:
+    """# lanes per 32-bit slot (matches typical get_dtype_packing)."""
+    bw = jnp.dtype(dtype).itemsize * 8
+    if bw not in (16, 32):
+        raise ValueError(f"Only 16/32-bit floats supported for packing, got {dtype} ({bw} bits).")
+    return 32 // bw  # fp32->1, (b)fp16->2
+
+
+def make_dummy_rpa_inputs(
+    *,
+    rng_seed: int = 0,
+    num_seqs: int = 4,
+    pages_per_seq: int = 3,
+    page_size: int = 16,
+    num_q_heads: int = 8,
+    num_kv_heads: int = 2,
+    head_dim: int = 80,  # intentionally not multiple of 128 to exercise padding
+    kv_dtype=jnp.float32,  # must be 16/32-bit float
+    q_dtype=None,  # defaults to kv_dtype if None
+    kv_len_max: int | None = None,  # cap on kv_len per sequence; defaults to pages_per_seq*page_size
+    decode_prefill_mixed: tuple[int, int, int]
+    | None = None,  # (decode_end, prefill_end, mixed_end/total). Defaults to (0,0,num_seqs).
+):
+    """
+    Returns a dict with:
+      queries:         (sum_q, num_q_heads, head_dim)       [q_dtype]
+      keys, values:    (sum_q, num_kv_heads, head_dim)      [kv_dtype]
+      kv_cache:        (total_pages, page_size, x2_per_pack, pack, align(head_dim,128)) [kv_dtype]
+      kv_lens:         (num_seqs,)                           [int32]
+      block_tables:    (num_seqs * pages_per_seq,)           [int32]
+      query_start_loc: (num_seqs + 1,)                       [int32]
+      distribution:    (3,)                                  [int32]
+    All constraints required by the kernel/validators are satisfied.
+    """
+    if q_dtype is None:
+        q_dtype = kv_dtype
+
+    pack = _dtype_packing(kv_dtype)
+    if page_size % pack != 0:
+        raise ValueError(f"page_size ({page_size}) must be divisible by packing ({pack}).")
+
+    head_dim_aligned = _align_to(head_dim, 128)
+    kv_len_cap = pages_per_seq * page_size
+    if kv_len_max is None:
+        kv_len_max = kv_len_cap
+    kv_len_max = min(kv_len_max, kv_len_cap)
+
+    # Build per-sequence kv_len and q_len with 0 < q_len <= kv_len.
+    key = jax.random.PRNGKey(rng_seed)
+    key_kv, key_q, key_data = jax.random.split(key, 3)
+
+    # Sample kv_lens in [1, kv_len_max] and q_lens in [1, kv_len]
+    kv_lens = jax.random.randint(key_kv, (num_seqs,), minval=1, maxval=kv_len_max + 1, dtype=jnp.int32)
+    # q_lens chosen uniformly in [1, kv_len]
+    # We generate a random factor in (0,1], then ceil -> [1, kv_len]
+    rnd = jax.random.uniform(key_q, (num_seqs,), minval=0.0, maxval=1.0)
+    q_lens = jnp.maximum(1, jnp.ceil(rnd * kv_lens).astype(jnp.int32))
+
+    # Cumulative query starts
+    query_start_loc = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(q_lens, dtype=jnp.int32)])
+    sum_q = int(query_start_loc[-1])
+
+    # Distribution triple
+    if decode_prefill_mixed is None:
+        distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
+    else:
+        i, j, k = decode_prefill_mixed
+        if not (0 <= i <= j <= k == num_seqs):
+            raise ValueError("distribution must satisfy 0 <= i <= j <= k == num_seqs.")
+        distribution = jnp.array([i, j, k], dtype=jnp.int32)
+
+    # Block tables: assign each sequence a disjoint, contiguous page range
+    total_pages = num_seqs * pages_per_seq
+    seq_bases = jnp.arange(num_seqs, dtype=jnp.int32) * jnp.int32(pages_per_seq)
+    per_seq = (seq_bases[:, None] + jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :]).reshape(-1)
+    block_tables = per_seq  # shape (num_seqs * pages_per_seq,)
+
+    # Allocate kv_cache with random data
+    kv_cache_shape = (
+        total_pages,
+        page_size,
+        _align_to(num_kv_heads * 2, pack) // pack,  # x2_per_pack
+        pack,
+        head_dim_aligned,
+    )
+    kcache = jax.random.normal(key_data, kv_cache_shape, dtype=kv_dtype)
+    key_qry, key_key, key_val = jax.random.split(jax.random.PRNGKey(rng_seed ^ 0xC0FFEE), 3)
+    queries = jax.random.normal(key_qry, (sum_q, num_q_heads, head_dim), dtype=q_dtype)
+    keys = jax.random.normal(key_key, (sum_q, num_kv_heads, head_dim), dtype=kv_dtype)
+    values = jax.random.normal(key_val, (sum_q, num_kv_heads, head_dim), dtype=kv_dtype)
+
+    return dict(
+        queries=queries,
+        keys=keys,
+        values=values,
+        kv_cache=kcache,
+        kv_lens=kv_lens.astype(jnp.int32),
+        block_tables=block_tables.astype(jnp.int32),
+        query_start_loc=query_start_loc.astype(jnp.int32),
+        distribution=distribution.astype(jnp.int32),
+        # Helpful metadata for debugging/inspection:
+        _meta=dict(
+            num_seqs=num_seqs,
+            pages_per_seq=pages_per_seq,
+            page_size=page_size,
+            total_pages=total_pages,
+            q_lens=q_lens,
+            kv_lens=kv_lens,
+            head_dim=head_dim,
+            head_dim_aligned=head_dim_aligned,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            packing=pack,
+            dtypes=dict(q=q_dtype, kv=kv_dtype),
+        ),
+    )

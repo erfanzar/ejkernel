@@ -20,6 +20,7 @@ from .grouped_matmulv2 import grouped_matmulv2
 from .page_attention import page_attention
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention import ragged_page_attention
+from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .ring_attention import ring_attention
 
 __all__ = (
@@ -30,5 +31,6 @@ __all__ = (
     "page_attention",
     "ragged_decode_attention",
     "ragged_page_attention",
+    "ragged_page_attention_v3",
     "ring_attention",
 )

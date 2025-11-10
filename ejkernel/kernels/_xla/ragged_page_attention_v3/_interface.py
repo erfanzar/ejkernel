@@ -18,7 +18,7 @@ from beartype import beartype
 from jaxtyping import Array, Float, Int32
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._kernel import _ragged_paged_attention, dynamic_validate_inputs
+from ._kernel import ragged_paged_attention as _ragged_paged_attention
 
 
 @kernel_registry.register("ragged_page_attention_v3", Platform.XLA, Backend.ANY)
@@ -73,27 +73,6 @@ def ragged_page_attention_v3(
     """
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
-
-    dynamic_validate_inputs(
-        queries,
-        keys,
-        values,
-        kv_cache,
-        kv_lens,
-        block_tables,
-        query_start_loc,
-        distribution,
-        softmax_scale=softmax_scale,
-        sliding_window=sliding_window,
-        logits_soft_cap=logits_soft_cap,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        chunk_prefill_size=chunk_prefill_size,
-        num_kv_pages_per_block=num_kv_pages_per_block,
-        num_queries_per_block=num_queries_per_block,
-        vmem_limit_bytes=vmem_limit_bytes,
-    )
 
     return _ragged_paged_attention(
         queries,

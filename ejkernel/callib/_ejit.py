@@ -77,11 +77,14 @@ R = tp.TypeVar("R")
 
 RECOMPILE_FORCE = check_bool_flag("EASYDEL_RECOMPILE_FORCE", False)
 ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
+ALLOW_FULL_CACHE = check_bool_flag("ALLOW_FULL_CACHE", True)
 
 CACHE_DIR = get_cache_dir()
 COMPILE_FUNC_DIR = os.getenv("COMPILE_FUNC_DIR", CACHE_DIR / "ejit_compiled_functions")
+
 if not isinstance(COMPILE_FUNC_DIR, str):
     COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+
 COMPILED_FILE_NAME = "compiled.executable"
 SIGNATURE_FILE_NAME = "compiled.signature"
 COMPILED_CACHE: dict[str, Compiled] = {}
@@ -197,6 +200,11 @@ def ejit(
 
         cc.set_cache_dir(str(COMPILE_FUNC_DIR))
         jax.config.update("jax_compilation_cache_dir", str(COMPILE_FUNC_DIR))
+        if ALLOW_FULL_CACHE:
+            jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+            jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+            jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+
         jitted_function = jax.jit(
             func,
             static_argnums=static_argnums,

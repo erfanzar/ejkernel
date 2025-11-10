@@ -54,6 +54,7 @@ This is the most memory-efficient attention variant for serving workloads.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Literal
 
 from jax import shard_map
@@ -74,6 +75,114 @@ from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
 from .configs import RaggedPageAttentionv3Config
+
+
+@dataclass(frozen=True)
+class _RPAWorkload:
+    q_dtype: object
+    kv_dtype: object
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    page_size: int
+    max_num_tokens: int
+    pages_per_seq: int
+
+
+_ARGUMENT_ORDER = (
+    "queries",
+    "keys",
+    "values",
+    "kv_cache",
+    "kv_lens",
+    "block_tables",
+    "query_start_loc",
+    "distribution",
+)
+_ARGUMENT_INDEX = {name: idx for idx, name in enumerate(_ARGUMENT_ORDER)}
+
+
+def _resolve_inv_arg(inv: Invocation, name: str):
+    if name in inv.kwargs:
+        return inv.kwargs[name]
+    idx = _ARGUMENT_INDEX.get(name)
+    if idx is None or idx >= len(inv.args):
+        raise KeyError(name)
+    return inv.args[idx]
+
+
+def _round_up_to_step(value: int, step: int) -> int:
+    if step <= 0:
+        return int(value)
+    return ((int(value) + step - 1) // step) * step
+
+
+def _suggest_block_sizes(workload: _RPAWorkload, aggressive: bool) -> tuple[int, int]:
+    pages_per_seq = max(1, workload.pages_per_seq)
+    page_size = max(1, workload.page_size)
+    page_budget = max(1, 2048 // page_size)
+
+    if page_size <= 64:
+        kv_pref = 8 if aggressive else 4
+    elif page_size <= 128:
+        kv_pref = 6 if aggressive else 3
+    elif page_size <= 256:
+        kv_pref = 4 if aggressive else 2
+    else:
+        kv_pref = 2 if aggressive else 1
+    kv_pages = max(1, min(pages_per_seq, min(page_budget, kv_pref)))
+
+    token_cap = max(1, min(workload.max_num_tokens, 512))
+    if workload.head_dim <= 64:
+        q_pref = 96 if aggressive else 64
+    elif workload.head_dim <= 128:
+        q_pref = 64 if aggressive else 48
+    else:
+        q_pref = 48 if aggressive else 32
+    q_pref = max(8, min(token_cap, q_pref))
+    q_pref = max(8, (q_pref // 8) * 8)
+    if q_pref > token_cap:
+        q_pref = max(8, token_cap)
+
+    return kv_pages, q_pref
+
+
+def _expand_axis_candidates(
+    base: int | None,
+    limit: int,
+    *,
+    seeds: tuple[int, ...],
+    min_value: int = 1,
+    step: int | None = None,
+) -> list[int]:
+    limit = int(limit) if limit > 0 else 1
+    effective_min = min(max(1, min_value), limit)
+
+    def _quantize(val: float | int) -> int:
+        if step is None or step <= 1:
+            quantized = round(val)
+        else:
+            quantized = _round_up_to_step(round(val), step)
+        return max(effective_min, min(limit, max(1, quantized)))
+
+    candidates: list[int] = []
+
+    def _push(val: float | int | None):
+        if val is None:
+            return
+        quantized = _quantize(val)
+        if quantized not in candidates:
+            candidates.append(quantized)
+
+    _push(base)
+    if base is not None and base > effective_min:
+        _push(base / 2)
+    if base is not None and base < limit:
+        _push(base * 2)
+    for seed in seeds:
+        _push(seed)
+    _push(limit)
+    return candidates
 
 
 class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Array]]):
@@ -108,7 +217,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         Sets up the kernel with the operation identifier for registry lookup
         and configuration management.
         """
-        super().__init__(op_id="ragged_page_attention")
+        super().__init__(op_id="ragged_page_attention_v3")
 
     def create_shard_map_wrapper(
         self,
@@ -225,6 +334,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                 k_scale=k_scale,
                 v_scale=v_scale,
                 vmem_limit_bytes=vmem_limit_bytes,
+                platform=platform,
                 cfg=cfg,
             )
 
@@ -261,8 +371,8 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         Raises:
             ValueError: If no matching implementation is found for the configuration
         """
-        platform = detect_platform("ragged_page_attention", cfg.platform)
-        return kernel_registry.get("ragged_page_attention", platform=platform, backend=cfg.backend)
+        platform = detect_platform("ragged_page_attention_v3", cfg.platform)
+        return kernel_registry.get("ragged_page_attention_v3", platform=platform, backend=cfg.backend)
 
     def run(
         self,
@@ -402,6 +512,150 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             num_queries_per_block=cfg.num_queries_per_block,
         )
 
+    def _extract_workload(self, inv: Invocation[RaggedPageAttentionv3Config, Array]) -> _RPAWorkload | None:
+        try:
+            queries = _resolve_inv_arg(inv, "queries")
+            keys = _resolve_inv_arg(inv, "keys")
+            kv_cache = _resolve_inv_arg(inv, "kv_cache")
+            kv_lens = _resolve_inv_arg(inv, "kv_lens")
+            block_tables = _resolve_inv_arg(inv, "block_tables")
+        except KeyError:
+            return None
+
+        try:
+            max_num_tokens = int(queries.shape[0])
+            num_q_heads = int(queries.shape[1])
+            head_dim = int(queries.shape[2])
+            num_kv_heads = int(keys.shape[1])
+            page_size = int(kv_cache.shape[1])
+            kv_lens_dim = int(kv_lens.shape[0])
+            block_table_dim = int(block_tables.shape[0])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None
+
+        if kv_lens_dim <= 0 or block_table_dim <= 0:
+            return None
+        pages_per_seq = block_table_dim // kv_lens_dim
+        if pages_per_seq <= 0 or max_num_tokens <= 0:
+            return None
+
+        return _RPAWorkload(
+            q_dtype=getattr(queries, "dtype", None),
+            kv_dtype=getattr(kv_cache, "dtype", None),
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            max_num_tokens=max_num_tokens,
+            pages_per_seq=pages_per_seq,
+        )
+
+    def _candidate_pairs(
+        self,
+        inv: Invocation[RaggedPageAttentionv3Config, Array],
+        *,
+        prefer_tuned: bool,
+        max_candidates: int,
+    ) -> list[tuple[int, int]]:
+        workload = self._extract_workload(inv)
+        if workload is None:
+            return []
+
+        base_pair = _suggest_block_sizes(workload, aggressive=prefer_tuned)
+        return self._generate_candidate_pairs(workload, base_pair, max_candidates=max_candidates)
+
+    def _generate_candidate_pairs(
+        self,
+        workload: _RPAWorkload,
+        base_pair: tuple[int, int],
+        *,
+        max_candidates: int,
+    ) -> list[tuple[int, int]]:
+        base_kv, base_q = base_pair
+        kv_limit = max(1, workload.pages_per_seq)
+        kv_candidates = _expand_axis_candidates(
+            base_kv,
+            kv_limit,
+            seeds=(1, 2, 4, 8, min(16, kv_limit)),
+            min_value=1,
+            step=None,
+        )
+        query_limit = max(1, min(workload.max_num_tokens, 512))
+        q_candidates = _expand_axis_candidates(
+            base_q,
+            query_limit,
+            seeds=(8, 16, 32),
+            min_value=1,
+            step=8,
+        )
+
+        pairs: list[tuple[int, int]] = []
+        for kv in kv_candidates:
+            for qb in q_candidates:
+                if kv <= 0 or qb <= 0:
+                    continue
+                pair = (kv, qb)
+                if pair in pairs:
+                    continue
+                pairs.append(pair)
+                if len(pairs) >= max_candidates:
+                    return pairs
+        return pairs
+
+    def _materialize_configs(
+        self,
+        pairs: list[tuple[int, int]],
+        *,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"],
+        backend: Backend | Literal["any"],
+        num_warps: int | None,
+        num_stages: int | None,
+    ) -> list[RaggedPageAttentionv3Config]:
+        if not pairs:
+            return [
+                RaggedPageAttentionv3Config(
+                    num_kv_pages_per_block=None,
+                    num_queries_per_block=None,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    platform=platform,
+                    backend=backend,
+                )
+            ]
+
+        configs: list[RaggedPageAttentionv3Config] = []
+        for kv_pages, q_tokens in pairs:
+            configs.append(
+                RaggedPageAttentionv3Config(
+                    num_kv_pages_per_block=kv_pages,
+                    num_queries_per_block=q_tokens,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    platform=platform,
+                    backend=backend,
+                )
+            )
+        return configs
+
+    def _build_candidate_configs(
+        self,
+        inv: Invocation[RaggedPageAttentionv3Config, Array],
+        *,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"],
+        backend: Backend | Literal["any"],
+        num_warps: int | None,
+        num_stages: int | None,
+        prefer_tuned: bool,
+        max_candidates: int,
+    ) -> list[RaggedPageAttentionv3Config]:
+        return self._materialize_configs(
+            self._candidate_pairs(inv, prefer_tuned=prefer_tuned, max_candidates=max_candidates),
+            platform=platform,
+            backend=backend,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
     def heuristic_cfg(self, inv: Invocation[RaggedPageAttentionv3Config, Array]) -> RaggedPageAttentionv3Config:
         """Provide default configuration optimized for ragged page attention.
 
@@ -412,9 +666,12 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             Default configuration with conservative block sizes suitable for
             typical ragged attention workloads with variable sequence lengths
         """
+        pairs = self._candidate_pairs(inv, prefer_tuned=True, max_candidates=1)
+        kv_block = pairs[0][0] if pairs else None
+        q_block = pairs[0][1] if pairs else None
         return RaggedPageAttentionv3Config(
-            num_kv_pages_per_block=None,
-            num_queries_per_block=None,
+            num_kv_pages_per_block=kv_block,
+            num_queries_per_block=q_block,
             num_warps=4,
             num_stages=1,
             platform="auto",
@@ -439,16 +696,15 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             common serving scenarios.
         """
 
-        return [
-            RaggedPageAttentionv3Config(
-                num_kv_pages_per_block=None,
-                num_queries_per_block=None,
-                num_warps=None,
-                num_stages=None,
-                platform="auto",
-                backend="any",
-            )
-        ]
+        return self._build_candidate_configs(
+            inv,
+            platform="auto",
+            backend="any",
+            num_warps=None,
+            num_stages=None,
+            prefer_tuned=True,
+            max_candidates=6,
+        )
 
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedPageAttentionv3Config, Array]):
         """Generate candidate configurations for autotuning on GPU (Triton backend).
@@ -480,16 +736,15 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             based on the specific GPU architecture and workload characteristics.
         """
 
-        return [
-            RaggedPageAttentionv3Config(
-                num_kv_pages_per_block=None,
-                num_queries_per_block=None,
-                num_warps=None,
-                num_stages=None,
-                platform="xla",
-                backend="any",
-            )
-        ]
+        return self._build_candidate_configs(
+            inv,
+            platform="xla",
+            backend="any",
+            num_warps=None,
+            num_stages=None,
+            prefer_tuned=True,
+            max_candidates=6,
+        )
 
     def candidate_cfgs_tpu(self, inv: Invocation[RaggedPageAttentionv3Config, Array]):
         """Generate candidate configurations for autotuning on TPU (Pallas backend).
@@ -501,16 +756,15 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         - Constrain S_block = page_size * num_kv_pages_per_block <= 256 to keep tiles reasonable.
         """
 
-        return [
-            RaggedPageAttentionv3Config(
-                num_kv_pages_per_block=None,
-                num_queries_per_block=None,
-                num_warps=None,
-                num_stages=None,
-                platform="pallas",
-                backend="tpu",
-            )
-        ]
+        return self._build_candidate_configs(
+            inv,
+            platform="pallas",
+            backend="tpu",
+            num_warps=None,
+            num_stages=None,
+            prefer_tuned=True,
+            max_candidates=8,
+        )
 
     candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
@@ -525,12 +779,12 @@ _ragged_page_attention_executor: Executor[RaggedPageAttentionv3Config, Array] = 
             validate_backward=False,
         ),
         tuner=Tuner(warmup=5, iters=100),
-        persistent=PersistentCache("ragged-page-attentionv3"),
+        persistent=PersistentCache("ragged-page-attention-v3"),
     )
 )
 
 
-def ragged_page_attentionv3(
+def ragged_page_attention_v3(
     queries: Float[Array, "total_tokens num_q_heads head_dim"],
     keys: Float[Array, "total_tokens num_kv_heads head_dim"],
     values: Float[Array, "total_tokens num_kv_heads head_dim"],
@@ -675,7 +929,7 @@ def ragged_page_attentionv3(
     Example:
         >>> import jax
         >>> import jax.numpy as jnp
-        >>> from ejkernel.modules.operations import ragged_page_attentionv3
+        >>> from ejkernel.modules.operations import ragged_page_attention_v3
         >>>
         >>>
         >>> queries = jnp.ones((25, 32, 128), dtype=jnp.bfloat16)
@@ -688,7 +942,7 @@ def ragged_page_attentionv3(
         >>> distribution = jnp.array([2, 100, 16], dtype=jnp.int32)
         >>>
         >>>
-        >>> output, updated_cache = ragged_page_attentionv3(
+        >>> output, updated_cache = ragged_page_attention_v3(
         ...     queries, keys, values, kv_cache, kv_lens,
         ...     block_tables, query_start_loc, distribution,
         ...     softmax_scale=1.0 / jnp.sqrt(128.0),
@@ -702,7 +956,7 @@ def ragged_page_attentionv3(
         >>> devices = jax.devices()
         >>> mesh = Mesh(devices, axis_names=('data',))
         >>> P = PartitionSpec
-        >>> output, updated_cache = ragged_page_attentionv3(
+        >>> output, updated_cache = ragged_page_attention_v3(
         ...     queries, keys, values, kv_cache, kv_lens,
         ...     block_tables, query_start_loc, distribution,
         ...     mesh=mesh,
