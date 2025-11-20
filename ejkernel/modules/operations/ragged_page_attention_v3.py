@@ -98,6 +98,7 @@ _ARGUMENT_ORDER = (
     "block_tables",
     "query_start_loc",
     "distribution",
+    "attention_sink",
 )
 _ARGUMENT_INDEX = {name: idx for idx, name in enumerate(_ARGUMENT_ORDER)}
 
@@ -229,6 +230,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
         query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
         distribution: Int32[Array, "3"],
+        attention_sink: Float[Array, "num_q_heads"] | None = None,
         softmax_scale: float = 1.0,
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
@@ -317,6 +319,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
             query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
             distribution: Int32[Array, "3"],
+            attention_sink: Float[Array, "num_q_heads"] | None,
         ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
             return self.run(
                 queries=queries,
@@ -327,6 +330,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                 block_tables=block_tables,
                 query_start_loc=query_start_loc,
                 distribution=distribution,
+                attention_sink=attention_sink,
                 softmax_scale=softmax_scale,
                 sliding_window=sliding_window,
                 logits_soft_cap=logits_soft_cap,
@@ -347,6 +351,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             block_tables,
             query_start_loc,
             distribution,
+            attention_sink,
         )
         assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
         shard_map_fn = shard_map(
@@ -384,6 +389,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
         query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
         distribution: Int32[Array, "3"],
+        attention_sink: Float[Array, "num_q_heads"] | None = None,
         softmax_scale: float = 1.0,
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
@@ -500,6 +506,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             block_tables=block_tables,
             query_start_loc=query_start_loc,
             distribution=distribution,
+            attention_sink=attention_sink,
             softmax_scale=softmax_scale,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
@@ -750,20 +757,45 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         """Generate candidate configurations for autotuning on TPU (Pallas backend).
 
         Heuristics:
-        - For small head_dim, larger BLOCK_M is fine (64-128).
-        - For large head_dim (>=160), prefer smaller BLOCK_M (32-64).
-        - More KV pages per block helps small page_size (<=32).
-        - Constrain S_block = page_size * num_kv_pages_per_block <= 256 to keep tiles reasonable.
+        - Enforce power-of-2 block sizes.
+        - Restrict Q and KV block sizes to max 64.
+        - Min KV block size 16, Min Q block size 4.
+        - chunk_prefill_size always None.
         """
+        workload = self._extract_workload(inv)
+        if workload is None:
+            return []
 
-        return self._build_candidate_configs(
-            inv,
+        # Generate power-of-2 candidates
+        # KV: 16, 32, 64 (bounded by pages_per_seq)
+        # Q: 4, 8, 16, 32, 64 (bounded by max_num_tokens)
+
+        kv_candidates = [16, 32, 64]
+        q_candidates = [4, 8, 16, 32, 64]
+
+        kv_limit = max(1, workload.pages_per_seq)
+        # 512 is arbitrary cap from before, but we are capped at 64 anyway.
+        q_limit = max(1, min(workload.max_num_tokens, 512))
+
+        pairs = []
+        for kv in kv_candidates:
+            if kv > kv_limit:
+                continue
+            for q in q_candidates:
+                if q > q_limit:
+                    continue
+                pairs.append((kv, q))
+
+        # If no pairs found (e.g. very small limits), add minimal
+        if not pairs:
+            pairs.append((16, 4))
+
+        return self._materialize_configs(
+            pairs,
             platform="pallas",
             backend="tpu",
             num_warps=None,
             num_stages=None,
-            prefer_tuned=True,
-            max_candidates=8,
         )
 
     candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
@@ -793,6 +825,7 @@ def ragged_page_attention_v3(
     block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
     query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
     distribution: Int32[Array, "3"],
+    attention_sink: Float[Array, "num_q_heads"] | None = None,
     /,
     *,
     softmax_scale: float = 1.0,
@@ -982,6 +1015,7 @@ def ragged_page_attention_v3(
         block_tables=block_tables,
         query_start_loc=query_start_loc,
         distribution=distribution,
+        attention_sink=attention_sink,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,

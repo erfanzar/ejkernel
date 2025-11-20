@@ -149,6 +149,7 @@ def ragged_paged_attention(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     distribution: jax.Array,
+    attention_sink: jax.Array | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -190,129 +191,237 @@ def ragged_paged_attention(
 
     _P, page_sz, _Hx2_per_pack, _pack, Dalign = kv_cache.shape
     pages_per_seq = block_tables.shape[0] // kv_lens.shape[0]
-    kv_cap = pages_per_seq * page_sz
-    positions = jnp.arange(kv_cap, dtype=jnp.int32)
-    page_positions = jnp.arange(pages_per_seq, dtype=jnp.int32)
-    B = min(kv_cap, int(T))
-    B_i32 = jnp.int32(B)
-    row_indices = jnp.arange(B, dtype=jnp.int32)
-    scatter_dnums = lax.ScatterDimensionNumbers(
-        update_window_dims=(1, 2),
-        inserted_window_dims=(0,),
-        scatter_dims_to_operand_dims=(0,),
-    )
-    T_i32 = jnp.int32(T)
-    max_row_idx = jnp.maximum(T_i32 - 1, 0)
+
+    # Constants for tiling
+    BQ = 128
+    BKV = 128
+    BKV = max(BKV, page_sz)
+    BKV = (BKV // page_sz) * page_sz
 
     fused_kv = merge_kv(keys, values)
 
-    out_acc = jnp.zeros_like(queries)
-
-    num_seqs = jnp.asarray(distribution[-1], dtype=jnp.int32)
     max_num_seqs = kv_lens.shape[0]
+    num_seqs = jnp.asarray(distribution[-1], dtype=jnp.int32)
 
-    def seq_body(seq_idx, carry):
-        out_accum, cache_accum = carry
+    # 1. Update KV Cache using scatter
+    # Map each token t in 0..T to its cache location
 
+    def get_scatter_indices(t_idx):
+        # Find sequence index
+        # query_start_loc is [0, len1, len1+len2, ...]
+        # searchsorted 'right' gives index in [1, num_seqs+1]
+        s_idx = jnp.searchsorted(query_start_loc, t_idx, side="right") - 1
+
+        # Position in sequence (relative to new tokens)
+        pos_in_new = t_idx - query_start_loc[s_idx]
+
+        # Position in full KV sequence
+        # kv_len includes new tokens
+        # q_len is length of new tokens
+        q_start = query_start_loc[s_idx]
+        q_end = query_start_loc[s_idx + 1]
+        q_len = q_end - q_start
+        kv_len = kv_lens[s_idx]
+
+        # The new tokens are at the END of the KV sequence: [kv_len - q_len : kv_len]
+        pos_in_kv = (kv_len - q_len) + pos_in_new
+
+        # Page index and offset
+        page_idx_in_seq = pos_in_kv // page_sz
+        page_offset = pos_in_kv % page_sz
+
+        # Physical page index
+        # block_tables is [num_seqs * pages_per_seq] (flattened view logic)
+        # But input block_tables is [max_num_seqs * pages_per_seq]
+        flat_block_idx = s_idx * pages_per_seq + page_idx_in_seq
+        physical_page = block_tables[flat_block_idx]
+
+        return physical_page, page_offset
+
+    # vmap over all tokens
+    t_indices = jnp.arange(T, dtype=jnp.int32)
+    physical_pages, page_offsets = jax.vmap(get_scatter_indices)(t_indices)
+
+    # Flatten cache for scatter: [Total_Pages * Page_Sz, ...]
+    # kv_cache shape: [Num_Pages, Page_Size, Hx2, Pack, D]
+    # We want to index by (page * page_sz + offset)
+    kv_cache_flat = kv_cache.reshape(-1, *kv_cache.shape[2:])
+
+    scatter_indices = (physical_pages * page_sz + page_offsets)[:, None]  # [T, 1]
+
+    # Scatter update
+    # updates is fused_kv [T, Hx2, Pack, D]
+    # operand is kv_cache_flat [Num_Pages*Page_Size, Hx2, Pack, D]
+
+    dnums = lax.ScatterDimensionNumbers(
+        update_window_dims=(1, 2, 3),
+        inserted_window_dims=(0,),
+        scatter_dims_to_operand_dims=(0,),
+    )
+
+    kv_cache_flat = lax.scatter(
+        kv_cache_flat,
+        scatter_indices,
+        fused_kv,
+        dnums,
+        mode=lax.GatherScatterMode.CLIP,  # Safe for out of bounds if any
+    )
+
+    # Reshape back
+    kv_cache = kv_cache_flat.reshape(kv_cache.shape)
+
+    # 2. Compute Attention
+
+    # Pad out_acc to T+1 to handle OOB writes (scatter garbage to index T)
+    out_acc = jnp.zeros((T + 1, Hq, D), dtype=queries.dtype)
+
+    def attn_seq_body(seq_idx, out_acc):
         q_start = query_start_loc[seq_idx]
         q_end = query_start_loc[seq_idx + 1]
         q_len = q_end - q_start
         kv_len = kv_lens[seq_idx]
 
-        start_idx = seq_idx * pages_per_seq
-        indices_all = lax.dynamic_slice_in_dim(block_tables, start_idx, pages_per_seq, axis=0)
-        gathered = cache_accum[indices_all]
-        flat = gathered.reshape(kv_cap, *gathered.shape[2:])
+        num_q_blocks = cdiv(q_len, BQ)
 
-        tail_mask = jnp.logical_and(positions >= (kv_len - q_len), positions < kv_len)
-        src_idx = q_start + (positions - (kv_len - q_len))
-        fused_rows = jnp.take(fused_kv, src_idx, axis=0, mode="fill", fill_value=0)
-        flat_updated = jnp.where(tail_mask[:, None, None, None], fused_rows, flat)
+        def q_block_body(q_block_idx, out_acc):
+            curr_q_start = q_block_idx * BQ
 
-        page_cnt = cdiv(kv_len, page_sz)
-        page_mask = page_positions < page_cnt
-        page_mask_b = page_mask[:, None, None, None, None]
-        gathered_upd = flat_updated.reshape(gathered.shape)
-        blend = jnp.where(page_mask_b, gathered_upd, gathered)
-        cache_accum = cache_accum.at[indices_all].set(blend)
+            # Load Q with masking
+            indices = q_start + curr_q_start + jnp.arange(BQ)
+            safe_indices = jnp.minimum(indices, T - 1)
+            mask_load = indices < (q_start + q_len)
 
-        K_full, V_full = _kv_flat_unpack(flat_updated, Hkv, Dalign)
-        K_full = K_full[:, :, :D]
-        V_full = V_full[:, :, :D]
-        if Hrep != 1:
-            K_full = jnp.repeat(K_full, Hrep, axis=1)
-            V_full = jnp.repeat(V_full, Hrep, axis=1)
+            q_chunk = queries[safe_indices]
+            q_chunk = jnp.where(mask_load[:, None, None], q_chunk, 0)
 
-        idx_q = q_start + positions
-        Q_full = jnp.take(queries, idx_q, axis=0, mode="fill", fill_value=0)
+            if q_scale is not None:
+                info = jnp.finfo(q_chunk.dtype) if jnp.issubdtype(q_chunk.dtype, jnp.floating) else None
+                q_chunk = q_chunk / q_scale
+                if info is not None:
+                    q_chunk = jnp.clip(q_chunk, info.min, info.max)
+                q_chunk = q_chunk.astype(keys.dtype)
 
-        if q_scale is not None:
-            info = jnp.finfo(K_full.dtype) if jnp.issubdtype(K_full.dtype, jnp.floating) else None
-            Q_full = Q_full / q_scale
-            if info is not None:
-                Q_full = jnp.clip(Q_full, info.min, info.max)
-            Q_full = Q_full.astype(K_full.dtype)
+            # Init accumulators [BQ, H]
+            if attention_sink is not None:
+                m = jnp.broadcast_to(attention_sink[None, :], (BQ, Hq)).astype(jnp.float32)
+                l = jnp.ones((BQ, Hq), dtype=jnp.float32)
+            else:
+                m = jnp.full((BQ, Hq), -jnp.inf, dtype=jnp.float32)
+                l = jnp.zeros((BQ, Hq), dtype=jnp.float32)
 
-        Q_hqd = Q_full.astype(jnp.float32).transpose(1, 0, 2)
-        K_hkd = K_full.astype(jnp.float32).transpose(1, 0, 2)
-        S = jnp.matmul(Q_hqd, jnp.swapaxes(K_hkd, -1, -2))
-        S = S * softmax_scale
-        if k_scale is not None:
-            S = S * k_scale
-        if q_scale is not None:
-            S = S * q_scale
+            acc = jnp.zeros((BQ, Hq, D), dtype=jnp.float32)
 
-        q_pos = positions
-        k_pos = positions
-        q_valid = q_pos < q_len
-        k_valid = k_pos < kv_len
-        q_span = (kv_len - q_len) + q_pos
-        causal = q_span[:, None] < k_pos[None, :]
-        bad = (~q_valid[:, None]) | (~k_valid[None, :]) | causal
-        if sliding_window is not None:
-            bad = jnp.logical_or(bad, (q_span[:, None] - sliding_window) >= k_pos[None, :])
+            num_kv_blocks = cdiv(kv_len, BKV)
 
-        if logits_soft_cap is not None:
-            S = logits_soft_cap * jnp.tanh(S / logits_soft_cap)
-        S = jnp.where(bad[None, :, :], S + mask_value, S)
+            def kv_block_body(kv_block_idx, carry):
+                m, l, acc = carry
+                curr_kv_start = kv_block_idx * BKV
 
-        P = jax.nn.softmax(S, axis=-1).astype(V_full.dtype)
-        V_hkd = V_full.astype(jnp.float32).transpose(1, 0, 2)
-        O_hqd = jnp.matmul(P.astype(jnp.float32), V_hkd)
-        O = O_hqd.transpose(1, 0, 2)
-        if v_scale is not None:
-            O = O * v_scale
+                # Load KV
+                start_page = curr_kv_start // page_sz
+                num_pages = BKV // page_sz
 
-        row_valid = (positions < q_len).astype(O.dtype)[:, None, None]
-        O = O * row_valid
+                block_table_start = seq_idx * pages_per_seq
 
-        O_block = lax.dynamic_slice_in_dim(O.astype(out_accum.dtype), 0, B, axis=0)
+                page_indices = lax.dynamic_slice_in_dim(block_tables, block_table_start + start_page, num_pages, axis=0)
+                pages = kv_cache[page_indices]
+                flat_kv = pages.reshape(num_pages * page_sz, *pages.shape[2:])
 
-        fits = (q_start + B_i32) <= T_i32
+                K_chunk, V_chunk = _kv_flat_unpack(flat_kv, Hkv, Dalign)
+                K_chunk = K_chunk[:, :, :D]
+                V_chunk = V_chunk[:, :, :D]
 
-        def _block(a):
-            return lax.dynamic_update_slice(a, O_block, (q_start, 0, 0))
+                if Hrep != 1:
+                    K_chunk = jnp.repeat(K_chunk, Hrep, axis=1)
+                    V_chunk = jnp.repeat(V_chunk, Hrep, axis=1)
 
-        def _tail(a):
-            dest = q_start + row_indices
-            dest_valid = dest < T_i32
-            updates = jnp.where(dest_valid[:, None, None], O_block, jnp.zeros_like(O_block))
-            dest = jnp.clip(dest, 0, max_row_idx)
-            return lax.scatter_add(
-                a,
-                dest[:, None],
-                updates,
-                scatter_dnums,
-                indices_are_sorted=True,
-                unique_indices=False,
-                mode=lax.GatherScatterMode.CLIP,
+                Q_t = q_chunk.transpose(1, 0, 2)  # [H, BQ, D]
+                K_t = K_chunk.transpose(1, 0, 2)  # [H, BKV, D]
+                V_t = V_chunk.transpose(1, 0, 2)  # [H, BKV, D]
+
+                S = jnp.matmul(Q_t, jnp.swapaxes(K_t, -1, -2))  # [H, BQ, BKV]
+
+                S = S * softmax_scale
+                if k_scale is not None:
+                    S = S * k_scale
+                if q_scale is not None:
+                    S = S * q_scale
+
+                q_idx_rel = jnp.arange(BQ)[:, None]
+                k_idx_rel = jnp.arange(BKV)[None, :]
+
+                q_pos = (kv_len - q_len) + (curr_q_start + q_idx_rel)
+                k_pos = curr_kv_start + k_idx_rel
+
+                k_valid = k_pos < kv_len
+                mask = q_pos >= k_pos
+                mask = jnp.logical_and(mask, k_valid)
+
+                if sliding_window is not None:
+                    mask = jnp.logical_and(mask, (q_pos - sliding_window) < k_pos)
+
+                mask_b = mask[None, :, :]
+                S = jnp.where(mask_b, S, mask_value)
+
+                if logits_soft_cap is not None:
+                    S = logits_soft_cap * jnp.tanh(S / logits_soft_cap)
+
+                m_curr = jnp.max(S, axis=-1)
+                m_new = jnp.maximum(m.transpose(1, 0), m_curr)
+
+                P = jnp.exp(S - m_new[:, :, None])
+                l_curr = jnp.sum(P, axis=-1)
+
+                m_prev = m.transpose(1, 0)
+                alpha = jnp.exp(m_prev - m_new)
+
+                l_new = l.transpose(1, 0) * alpha + l_curr
+
+                pv = jnp.matmul(P.astype(V_t.dtype), V_t)
+                acc_t = acc.transpose(1, 0, 2)
+                acc_new = acc_t * alpha[:, :, None] + pv.astype(jnp.float32)
+
+                return (m_new.transpose(1, 0), l_new.transpose(1, 0), acc_new.transpose(1, 0, 2))
+
+            m, l, acc = lax.fori_loop(0, num_kv_blocks, kv_block_body, (m, l, acc))
+
+            output = acc / l[:, :, None]
+            output = output.astype(queries.dtype)
+            if v_scale is not None:
+                output = output * v_scale
+
+            # Scatter to out_acc
+            indices = q_start + curr_q_start + jnp.arange(BQ)
+            mask_write = indices < (q_start + q_len)
+
+            # Use T as garbage index (out_acc has size T+1)
+            safe_indices = jnp.where(mask_write, indices, T)
+
+            dnums_sc = lax.ScatterDimensionNumbers(
+                update_window_dims=(1, 2),
+                inserted_window_dims=(0,),
+                scatter_dims_to_operand_dims=(0,),
             )
 
-        out_accum = lax.cond(fits, _block, _tail, out_accum)
-        return (out_accum, cache_accum)
+            out_acc = lax.scatter(
+                out_acc,
+                safe_indices[:, None],
+                output,
+                dnums_sc,
+                # Default mode (UPDATE) is fine since indices are unique and T is valid
+            )
 
-    def masked_seq(i, carry):
-        return lax.cond(i < num_seqs, lambda c: seq_body(i, c), lambda c: c, carry)
+            return out_acc
 
-    out_final, kv_cache_final = lax.fori_loop(0, max_num_seqs, masked_seq, (out_acc, kv_cache))
-    return out_final, kv_cache_final
+        out_acc = lax.fori_loop(0, num_q_blocks, q_block_body, out_acc)
+        return out_acc
+
+    def masked_seq(i, out_acc):
+        return lax.cond(i < num_seqs, lambda: attn_seq_body(i, out_acc), lambda: out_acc)
+
+    out_final = lax.fori_loop(0, max_num_seqs, masked_seq, out_acc)
+
+    # Slice back to T
+    out_final = out_final[:T]
+
+    return out_final, kv_cache
