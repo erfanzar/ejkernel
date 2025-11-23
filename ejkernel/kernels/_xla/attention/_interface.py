@@ -167,21 +167,17 @@ def attention(
             raise ValueError(f"Unsupported attention_mask shape: {attention_mask.shape}")
 
         aw = jnp.where(attention_mask, aw, jnp.finfo(aw.dtype).min)
+
     if softmax_aux is not None:
-        if softmax_aux.ndim == 2:
-            num_sinks = softmax_aux.shape[-1]
-            sinks = softmax_aux.reshape(1, kh, 1, 1, num_sinks)
-            sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, num_sinks))
-        elif softmax_aux.ndim == 1:
-            num_sinks = softmax_aux.shape[0]
-            sinks = softmax_aux.reshape(1, 1, 1, 1, num_sinks)
-            sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, num_sinks))
+        if softmax_aux.ndim == 1:
+            sinks = softmax_aux.reshape(1, kh, num_reps, 1, 1)
         else:
-            raise ValueError(f"Unsupported softmax_aux shape: {softmax_aux.shape}")
+            num_sinks = softmax_aux.shape[-1]
+            sinks = softmax_aux.reshape(1, kh, num_reps, 1, num_sinks)
+        sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, sinks.shape[-1]))
         combined_logits = jnp.concatenate([aw, sinks], axis=-1)
         combined_logits = combined_logits - jnp.max(combined_logits, axis=-1, keepdims=True)
         probs = jax.nn.softmax(combined_logits.astype(softmax_dtype), axis=-1).astype(dtype)
-
         aw = probs[..., :ks]
     else:
         aw = jax.nn.softmax(aw.astype(softmax_dtype), axis=-1).astype(dtype)
