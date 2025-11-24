@@ -46,7 +46,6 @@ def _ragged_paged_attention(
     queries = queries.reshape(total_query_tokens, num_kv_heads, q_heads_per_group, head_size)
     qblocks = 8 if total_query_tokens >= 8 else max(1, total_query_tokens)
     kvblocks = 64 if max_pages_per_sequence >= 64 else max(1, max_pages_per_sequence)
-    queries = queries * softmax_scale
 
     padd = (-total_query_tokens) % qblocks
     if padd > 0:
@@ -121,7 +120,7 @@ def _ragged_paged_attention(
                         query_block.astype(compute_dtype),
                         key_block.astype(compute_dtype),
                         optimize=True,
-                    )
+                    ) * softmax_scale
                     if logits_soft_cap is not None:
                         attention_scores_block = jnp.tanh(attention_scores_block / logits_soft_cap) * logits_soft_cap
 

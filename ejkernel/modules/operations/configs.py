@@ -240,7 +240,7 @@ class RaggedDecodeAttentionConfig(BaseOperationConfig):
 
 
 @dataclass
-class RaggedPageAttentionConfig(BaseOperationConfig):
+class RaggedPageAttentionv2Config(BaseOperationConfig):
     """Configuration for Ragged Page Attention operation.
 
     Args:

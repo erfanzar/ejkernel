@@ -16,7 +16,7 @@ ejkernel.modules.operations package
    modules/operations/page_attention
    modules/operations/pooling
    modules/operations/ragged_decode_attention
-   modules/operations/ragged_page_attention
+   modules/operations/ragged_page_attention_v2
    modules/operations/ragged_page_attention_v3
    modules/operations/recurrent
    modules/operations/ring_attention

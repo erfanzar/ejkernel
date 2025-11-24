@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from ejkernel.kernels import xla
-from ejkernel.modules import ragged_page_attention
+from ejkernel.modules import ragged_page_attention_v2
 
 
 def make_dummy_ragged_paged_attention_inputs(
@@ -117,7 +117,7 @@ def make_dummy_ragged_paged_attention_inputs(
 
 batch = make_dummy_ragged_paged_attention_inputs(page_size=64, max_num_seqs=32, pages_per_seq=64)
 
-ref = ragged_page_attention(
+ref = ragged_page_attention_v2(
     batch["queries"],
     batch["kv_pages"],
     batch["context_lens"],
@@ -127,7 +127,7 @@ ref = ragged_page_attention(
     sliding_window=None,
     logits_soft_cap=None,
 )
-out = xla.ragged_page_attention(
+out = xla.ragged_page_attention_v2(
     queries=batch["queries"],
     kv_pages=batch["kv_pages"],
     context_lens=batch["context_lens"],

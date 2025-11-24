@@ -22,9 +22,9 @@ from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_fwd import _ragged_paged_attention
 
 
-@kernel_registry.register("ragged_page_attention", Platform.XLA, Backend.ANY)
+@kernel_registry.register("ragged_page_attention_v2", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
-def ragged_page_attention(
+def ragged_page_attention_v2(
     queries: Float[Array, "total_tokens num_q_heads head_dim"],
     kv_pages: Float[Array, "num_pages page_size num_combined_kv_heads head_dim"],
     context_lens: Int[Array, "num_seqs"],

@@ -70,6 +70,8 @@ import numpy as np
 from jax import core as jcore
 from jax import tree_util as jtu
 
+from ejkernel.loggings import get_logger
+
 from ..core import Invocation, Kernel, _get_platform_method
 from ..utils.fingerprint import device_fingerprint, get_device_platform
 from .cache import ConfigCache, _cache_overlay
@@ -77,6 +79,8 @@ from .persistent import PersistentCache
 
 Cfg = TypeVar("Cfg")
 Out = TypeVar("Out")
+
+autotune_logger = get_logger("ejKernel-Selection")
 
 
 @dataclass
@@ -326,17 +330,19 @@ class Tuner(Generic[Cfg]):
             try:
                 t = self.measure(make_fn(cfg), *args, **kwargs)
                 if os.getenv("EJKERNEL_LOG_AUTOTUNE", "0") == "1":
-                    pprint.pprint({"config": cfg, "time": t})
+                    autotune_logger.info(pprint.pformat({"config": cfg, "time": t}))
             except Exception as e:
                 last_err = e
                 continue
             if t < best_t:
                 best_cfg, best_t = cfg, t
         if best_cfg is None:
-            traceback.print_exception(last_err)
-            raise RuntimeError(f"All candidates failed during autotune: {last_err}")
+            if last_err:
+                traceback.print_exception(last_err)
+            autotune_logger.warning("All candidates failed during autotune; falling back to heuristics.")
+            return None
         if os.getenv("EJKERNEL_LOG_AUTOTUNE", "0") == "1":
-            pprint.pprint({"best_config": best_cfg, "best_time": best_t})
+            autotune_logger.info(pprint.pformat({"best_config": best_cfg, "best_time": best_t}))
         return best_cfg
 
 
@@ -523,20 +529,21 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                     return f
 
             best = self.tuner.autotune(mk, inv.args, dyn_kwargs, candidates)
-            self._autotuned_keys.add((dev, op_id, call_key))
-            self.cache.put(dev, op_id, call_key, best)
-            if self.persistent is not None and self.persist_autotune:
-                self.persistent.put(dev, op_id, call_key, best)
-            self._emit(
-                "autotune_finish",
-                device=dev,
-                op_id=op_id,
-                call_key=call_key,
-                cfg=best,
-                platform=platform,
-                method=inv.method,
-            )
-            return best
+            if best is not None:
+                self._autotuned_keys.add((dev, op_id, call_key))
+                self.cache.put(dev, op_id, call_key, best)
+                if self.persistent is not None and self.persist_autotune:
+                    self.persistent.put(dev, op_id, call_key, best)
+                self._emit(
+                    "autotune_finish",
+                    device=dev,
+                    op_id=op_id,
+                    call_key=call_key,
+                    cfg=best,
+                    platform=platform,
+                    method=inv.method,
+                )
+                return best
 
         if self.policy.allow_heuristics:
             platform = get_device_platform()

@@ -43,7 +43,7 @@ from ejkernel.modules import (
     native_sparse_attention,
     page_attention,
     ragged_decode_attention,
-    ragged_page_attention,
+    ragged_page_attention_v2,
     recurrent_attention,
     ring_attention,
     scaled_dot_product_attention,
@@ -316,7 +316,7 @@ class TestPageAttention:
 
 
 class TestRaggedPageAttention:
-    """Test suite for RaggedPageAttention operation."""
+    """Test suite for RaggedPageAttentionv2 operation."""
 
     def test_ragged_page_attention_basic(self):
         """Test basic ragged page attention."""
@@ -334,7 +334,7 @@ class TestRaggedPageAttention:
         block_tables = jnp.array([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]], dtype=jnp.int32)
         _context_lens = jnp.array([48, 96, 64], dtype=jnp.int32)
 
-        output = ragged_page_attention(q, k_cache, v_cache, block_tables, cu_seqlens_q, num_seqs=3)
+        output = ragged_page_attention_v2(q, k_cache, v_cache, block_tables, cu_seqlens_q, num_seqs=3)
         assert output.shape == (total_q_len, H, D)
 
 

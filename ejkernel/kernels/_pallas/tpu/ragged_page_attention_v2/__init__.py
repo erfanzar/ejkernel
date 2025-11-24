@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
-from ._interface import ragged_page_attention
+"""modified from google org impl"""
 
-__all__ = ["ragged_page_attention"]
+from ._interface import ragged_page_attention_v2
+
+__all__ = ("ragged_page_attention_v2",)

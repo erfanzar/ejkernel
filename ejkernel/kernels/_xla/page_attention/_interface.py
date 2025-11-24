@@ -75,7 +75,7 @@ def page_attention(
         - Supports Grouped Query Attention (GQA) where num_heads >= num_kv_heads
         - Each sequence can use a different number of blocks based on context_lens
         - Blocks are indexed via block_tables to avoid fragmentation
-        - This is a simpler version compared to ragged_page_attention which handles
+        - This is a simpler version compared to ragged_page_attention_v2 which handles
           multiple query tokens per sequence
 
     Examples:

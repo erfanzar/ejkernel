@@ -44,7 +44,7 @@ Use cases:
 
 Example:
     >>> import jax.numpy as jnp
-    >>> from ejkernel.kernels._triton.ragged_page_attention import ragged_page_attention
+    >>> from ejkernel.kernels._triton.ragged_page_attention_v2 import ragged_page_attention_v2
     >>>
     >>>
     >>> total_tokens = 16
@@ -61,7 +61,7 @@ Example:
     >>> query_start_loc = jnp.array([0, 5, 13, 16])
     >>> block_tables = jnp.zeros((num_seqs, 10), dtype=jnp.int32)
     >>>
-    >>> output = ragged_page_attention(
+    >>> output = ragged_page_attention_v2(
     ...     queries, kv_pages, context_lens, block_tables,
     ...     query_start_loc, num_seqs
     ... )
@@ -83,9 +83,9 @@ from ._triton_impl_fwd import ragged_paged_attention_triton_call, ragged_paged_a
 DEFAULT_MASK_VALUE = -2.381976426469702e38
 
 
-@kernel_registry.register("ragged_page_attention", Platform.TRITON, Backend.GPU)
+@kernel_registry.register("ragged_page_attention_v2", Platform.TRITON, Backend.GPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
-def ragged_page_attention(
+def ragged_page_attention_v2(
     queries: Float[Array, "total_tokens num_q_heads head_dim"],
     kv_pages: Float[Array, "num_pages page_size num_combined_kv_heads head_dim"],
     context_lens: Int[Array, "num_seqs"],
@@ -162,7 +162,7 @@ def ragged_page_attention(
 
     Example:
         >>> import jax.numpy as jnp
-        >>> from ejkernel.kernels._triton.ragged_page_attention import ragged_page_attention
+        >>> from ejkernel.kernels._triton.ragged_page_attention_v2 import ragged_page_attention_v2
         >>>
         >>>
         >>> num_seqs = 3
@@ -186,7 +186,7 @@ def ragged_page_attention(
         ...     [5, -1, -1, -1],
         ... ])
         >>>
-        >>> output = ragged_page_attention(
+        >>> output = ragged_page_attention_v2(
         ...     queries, kv_pages, context_lens, block_tables,
         ...     query_start_loc, num_seqs
         ... )

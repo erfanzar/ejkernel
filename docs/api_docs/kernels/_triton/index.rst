@@ -13,5 +13,5 @@ ejkernel.kernels._triton package
    kernels/_triton/native_sparse_attention/index
    kernels/_triton/page_attention/index
    kernels/_triton/ragged_decode_attention/index
-   kernels/_triton/ragged_page_attention/index
+   kernels/_triton/ragged_page_attention_v2/index
    kernels/_triton/recurrent/index

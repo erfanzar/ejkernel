@@ -13,13 +13,12 @@
 # limitations under the License.
 
 
-"""Unified tests for ragged_page_attention (Triton implementation)."""
+"""Unified tests for ragged_page_attention_v2 (Triton implementation)."""
 
 import jax
 import jax.numpy as jnp
 import pytest
-
-from ejkernel.kernels._triton.ragged_page_attention._interface import ragged_page_attention
+from ejkernel.kernels._triton.ragged_page_attention_v2._interface import ragged_page_attention_v2
 
 pytestmark = pytest.mark.skipif(
     jax.devices()[0].platform != "gpu",
@@ -76,7 +75,7 @@ class TestBasicFunctionality:
     def test_basic_forward_pass(self):
         """Test that basic forward pass works without any features."""
         data = create_test_data(num_seqs=3, max_seq_len=64)
-        output = ragged_page_attention(
+        output = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -93,7 +92,7 @@ class TestBasicFunctionality:
         for dtype in [jnp.float32, jnp.bfloat16]:
             queries_typed = data["queries"].astype(dtype)
             kv_pages_typed = data["kv_pages"].astype(dtype)
-            output = ragged_page_attention(
+            output = ragged_page_attention_v2(
                 queries=queries_typed,
                 kv_pages=kv_pages_typed,
                 context_lens=data["context_lens"],
@@ -112,7 +111,7 @@ class TestBasicFunctionality:
                 num_q_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
             )
-            output = ragged_page_attention(
+            output = ragged_page_attention_v2(
                 queries=data["queries"],
                 kv_pages=data["kv_pages"],
                 context_lens=data["context_lens"],
@@ -142,7 +141,7 @@ class TestBasicFunctionality:
         query_start_loc = jnp.concatenate([jnp.array([0]), jnp.cumsum(seq_lens)])
         num_seqs_val = num_seqs
 
-        output = ragged_page_attention(
+        output = ragged_page_attention_v2(
             queries=queries,
             kv_pages=kv_pages,
             context_lens=context_lens,
@@ -165,7 +164,7 @@ class TestSoftCap:
         """Test that soft cap actually changes the output."""
         data = create_test_data(num_seqs=2, max_seq_len=128, seed=42)
 
-        output_no_cap = ragged_page_attention(
+        output_no_cap = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -174,7 +173,7 @@ class TestSoftCap:
             num_seqs=data["num_seqs"],
         )
 
-        output_with_cap = ragged_page_attention(
+        output_with_cap = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -192,7 +191,7 @@ class TestSoftCap:
         """Test different soft cap values produce different results."""
         data = create_test_data(num_seqs=2, max_seq_len=64, seed=123)
 
-        output_cap_10 = ragged_page_attention(
+        output_cap_10 = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -202,7 +201,7 @@ class TestSoftCap:
             logits_soft_cap=10.0,
         )
 
-        output_cap_50 = ragged_page_attention(
+        output_cap_50 = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -221,7 +220,7 @@ class TestSoftCap:
 
         large_queries = data["queries"] * 10.0
 
-        output = ragged_page_attention(
+        output = ragged_page_attention_v2(
             queries=large_queries,
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -241,7 +240,7 @@ class TestSlidingWindow:
         """Test that sliding window changes the output."""
         data = create_test_data(num_seqs=2, max_seq_len=256, seed=42)
 
-        output_full = ragged_page_attention(
+        output_full = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -250,7 +249,7 @@ class TestSlidingWindow:
             num_seqs=data["num_seqs"],
         )
 
-        output_windowed = ragged_page_attention(
+        output_windowed = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -270,7 +269,7 @@ class TestSlidingWindow:
 
         outputs = {}
         for window_size in [32, 64, 128]:
-            outputs[window_size] = ragged_page_attention(
+            outputs[window_size] = ragged_page_attention_v2(
                 queries=data["queries"],
                 kv_pages=data["kv_pages"],
                 context_lens=data["context_lens"],
@@ -294,7 +293,7 @@ class TestMaskValue:
         """Test that custom mask value works."""
         data = create_test_data(num_seqs=2, max_seq_len=128, seed=42)
 
-        output_default = ragged_page_attention(
+        output_default = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -303,7 +302,7 @@ class TestMaskValue:
             num_seqs=data["num_seqs"],
         )
 
-        output_custom = ragged_page_attention(
+        output_custom = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -324,7 +323,7 @@ class TestCombinedFeatures:
         """Test soft cap and sliding window together."""
         data = create_test_data(num_seqs=2, max_seq_len=256, seed=42)
 
-        output = ragged_page_attention(
+        output = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -342,7 +341,7 @@ class TestCombinedFeatures:
         """Test all features together."""
         data = create_test_data(num_seqs=3, max_seq_len=256, seed=123)
 
-        output = ragged_page_attention(
+        output = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -362,7 +361,7 @@ class TestCombinedFeatures:
         """Test that different feature combinations produce different results."""
         data = create_test_data(num_seqs=2, max_seq_len=128, seed=456)
 
-        output_baseline = ragged_page_attention(
+        output_baseline = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -371,7 +370,7 @@ class TestCombinedFeatures:
             num_seqs=data["num_seqs"],
         )
 
-        output_cap = ragged_page_attention(
+        output_cap = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -381,7 +380,7 @@ class TestCombinedFeatures:
             logits_soft_cap=30.0,
         )
 
-        output_window = ragged_page_attention(
+        output_window = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -391,7 +390,7 @@ class TestCombinedFeatures:
             sliding_window=64,
         )
 
-        output_both = ragged_page_attention(
+        output_both = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -420,7 +419,7 @@ class TestEdgeCases:
         """Test with a single sequence."""
         data = create_test_data(num_seqs=1, max_seq_len=128, seed=42)
 
-        output = ragged_page_attention(
+        output = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -438,7 +437,7 @@ class TestEdgeCases:
         """Test with very large soft cap value (should behave like no cap)."""
         data = create_test_data(num_seqs=2, max_seq_len=64, seed=456)
 
-        output_no_cap = ragged_page_attention(
+        output_no_cap = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -447,7 +446,7 @@ class TestEdgeCases:
             num_seqs=data["num_seqs"],
         )
 
-        output_large_cap = ragged_page_attention(
+        output_large_cap = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -464,7 +463,7 @@ class TestEdgeCases:
         """Test sliding window larger than sequence length."""
         data = create_test_data(num_seqs=2, max_seq_len=64, seed=789)
 
-        output_no_window = ragged_page_attention(
+        output_no_window = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],
@@ -473,7 +472,7 @@ class TestEdgeCases:
             num_seqs=data["num_seqs"],
         )
 
-        output_large_window = ragged_page_attention(
+        output_large_window = ragged_page_attention_v2(
             queries=data["queries"],
             kv_pages=data["kv_pages"],
             context_lens=data["context_lens"],

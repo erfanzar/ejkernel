@@ -9,6 +9,6 @@ ejkernel.kernels._pallas.tpu package
    kernels/_pallas/tpu/grouped_matmul/index
    kernels/_pallas/tpu/page_attention/index
    kernels/_pallas/tpu/ragged_decode_attention/index
-   kernels/_pallas/tpu/ragged_page_attention/index
+   kernels/_pallas/tpu/ragged_page_attention_v2/index
    kernels/_pallas/tpu/ragged_page_attention_v3/index
    kernels/_pallas/tpu/ring_attention/index

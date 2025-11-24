@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![JAX](https://img.shields.io/badge/JAX-0.7.2+-orange.svg)](https://github.com/google/jax)
+[![JAX](https://img.shields.io/badge/JAX-0.8.0+-orange.svg)](https://github.com/google/jax)
 [![Documentation](https://img.shields.io/badge/docs-readthedocs-green.svg)](https://ejkernel.readthedocs.io/en/latest/)
 
 ejKernel is a production-grade kernel library for JAX that provides highly optimized implementations of deep learning operations with automatic multi-backend support. The library features a sophisticated configuration management system with autotuning, comprehensive type safety, and seamless execution across GPUs, TPUs, and CPUs.
@@ -17,7 +17,6 @@ ejKernel is a production-grade kernel library for JAX that provides highly optim
 - [Architecture Overview](#architecture-overview)
 - [Supported Operations](#supported-operations)
 - [Advanced Usage](#advanced-usage)
-- [Performance](#performance)
 - [Development](#development)
 - [Testing](#testing)
 - [Contributing](#contributing)
@@ -35,7 +34,7 @@ ejKernel is a production-grade kernel library for JAX that provides highly optim
 
 ### State-of-the-Art Operations
 
-- **15+ Attention Mechanisms**: Flash Attention v2, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, and more
+- **15+ Attention Mechanisms**: Flash Attention v2, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, Ragged Page Attention, and more
 - **Memory Efficiency**: Custom VJP implementations with O(N) memory complexity for attention
 - **Distributed Support**: Full shard_map integration for model and data parallelism
 - **Mixed Precision**: Comprehensive dtype support with automatic gradient conversion
@@ -73,7 +72,7 @@ pip install -e ".[dev]"
 ### Dependencies
 
 - Python 3.11-3.13
-- JAX >= 0.7.2
+- JAX >= 0.8.0
 - Triton == 3.4.0 (for GPU)
 - jaxtyping >= 0.3.2
 - beartype >= 0.22.2
@@ -98,7 +97,7 @@ output = flash_attention(
     query, key, value,
     causal=True,
     sliding_window=128,        # Local attention window
-    logits_soft_cap=30.0,     # Gemma-2 style soft capping
+    logits_soft_cap=30.0,      # Gemma-2 style soft capping
     attention_mask=mask,       # Custom attention pattern
 )
 ```
@@ -192,22 +191,91 @@ ejKernel employs a sophisticated layered architecture that separates concerns wh
 
 ```md
 ejkernel/
-├── kernels/
-│   ├── _triton/         # GPU kernels via Triton
-│   ├── _pallas/         # TPU/GPU kernels via Pallas
-│   │   ├── tpu/        # TPU-specific implementations
-│   │   └── gpu/        # GPU Pallas implementations
-│   ├── _xla/           # Universal XLA implementations
-│   └── _cuda/          # Native CUDA kernels
-├── modules/
-│   └── operations/     # High-level API modules
-├── ops/
-│   ├── config/         # Configuration management
-│   ├── core/           # Base kernel classes
-│   ├── execution/      # Execution orchestration
-│   └── utils/          # Fingerprinting, utilities
-├── xla_utils/          # XLA-specific utilities
-└── callib/             # Calibration utilities
+├── kernels/                          # Low-level kernel implementations
+│   ├── _triton/                      # Triton kernels (GPU)
+│   │   ├── flash_attention/
+│   │   ├── page_attention/
+│   │   ├── ragged_page_attention_v2/
+│   │   ├── gated_linear_attention/
+│   │   ├── lightning_attn/
+│   │   ├── mean_pooling/
+│   │   ├── native_sparse_attention/
+│   │   ├── recurrent/
+│   │   └── blocksparse_attention/
+│   ├── _pallas/
+│   │   ├── tpu/                      # TPU-specific implementations
+│   │   │   ├── flash_attention/
+│   │   │   ├── ring_attention/
+│   │   │   ├── page_attention/
+│   │   │   ├── ragged_page_attention_v2/
+│   │   │   ├── ragged_page_attention_v3/
+│   │   │   ├── blocksparse_attention/
+│   │   │   ├── grouped_matmul/
+│   │   │   └── ragged_decode_attention/
+│   │   └── gpu/                      # GPU Pallas implementations
+│   ├── _xla/                         # XLA implementations (universal)
+│   │   ├── attention/
+│   │   ├── flash_attention/
+│   │   ├── gated_linear_attention/
+│   │   ├── grouped_matmul/
+│   │   ├── lightning_attn/
+│   │   ├── mean_pooling/
+│   │   ├── native_sparse_attention/
+│   │   ├── page_attention/
+│   │   ├── ragged_decode_attention/
+│   │   ├── ragged_page_attention_v2/
+│   │   ├── ragged_page_attention_v3/
+│   │   ├── recurrent/
+│   │   ├── ring_attention/
+│   │   └── scaled_dot_product_attention/
+│   ├── _cuda/                        # CUDA implementations (dev)
+│   └── _registry.py                  # Kernel registry system
+│
+├── modules/                          # High-level API
+│   └── operations/
+│       ├── flash_attention.py
+│       ├── ring_attention.py
+│       ├── page_attention.py
+│       ├── ragged_page_attention_v2.py
+│       ├── ragged_page_attention_v3.py
+│       ├── blocksparse_attention.py
+│       ├── gated_linear_attention.py
+│       ├── lightning_attention.py
+│       ├── native_sparse_attention.py
+│       ├── recurrent.py
+│       ├── grouped_matmul.py
+│       ├── pooling.py
+│       ├── attention.py
+│       ├── multi_head_latent_attention.py
+│       ├── ragged_decode_attention.py
+│       ├── scaled_dot_product_attention.py
+│       └── configs.py
+│
+├── ops/                              # Configuration & execution framework
+│   ├── config/                       # Configuration management
+│   │   ├── cache.py                  # In-memory config cache
+│   │   ├── persistent.py             # Disk-based persistence
+│   │   └── selection.py              # Config selection chain
+│   ├── core/                         # Base kernel class
+│   ├── execution/                    # Execution orchestration
+│   │   └── tuning.py                 # Autotuning framework
+│   ├── registry.py                   # Operation invocation tracking
+│   └── utils/                        # Utilities (fingerprinting, etc)
+│
+├── xla_utils/                        # XLA-specific utilities
+│   ├── cumsum.py                     # Cumulative sum operations
+│   ├── shardings.py                  # Sharding utilities
+│   └── utils.py                      # Sequence length utilities
+│
+├── types/                            # Type definitions
+│   └── mask.py                       # MaskInfo for attention masking
+│
+├── callib/                           # Calling library
+│   ├── _ejit.py                      # Enhanced JIT
+│   ├── _triton_call.py               # Triton kernel calling
+│   └── _pallas_call.py               # Pallas kernel calling
+│
+└── utils.py                          # General utilities
 ```
 
 ### Core Components
@@ -281,31 +349,86 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 | **GLA** | Gated Linear Attention | O(N) | Linear complexity, gated updates |
 | **Lightning Attention** | Layer-dependent decay | O(N) | Exponential moving average |
 | **MLA** | Multi-head Latent Attention | O(N) | Compressed KV representation |
-| **Ragged Attention** | Variable-length sequences | O(N) | Efficient padding, batched inference |
+| **Ragged Page Attention v2** | Variable-length paged attention | O(N) | Ragged sequences with page caching |
+| **Ragged Page Attention v3** | Enhanced ragged page attention | O(N) | Attention sinks support, improved handling |
+| **Ragged Decode Attention** | Variable-length decoding | O(N) | Efficient batched inference |
+| **Scaled Dot-Product Attention** | Standard attention | O(N²) | Basic reference implementation |
 
 ### Other Operations
 
-- **Recurrent Kernels**: Optimized RNN/LSTM/GRU operations
-- **Mean Pooling**: Variable-length sequence aggregation
-- **Grouped MatMul**: Efficient batched matrix operations
-- **Native Sparse**: Block-sparse matrix computations
+| Operation | Description | Use Case |
+|-----------|-------------|----------|
+| **Grouped MatMul** | Efficient batched matrix operations | Expert models, MoE |
+| **Grouped MatMul v2** | Enhanced with shard_map support | Distributed expert models |
+| **Mean Pooling** | Variable-length sequence aggregation | Sentence embeddings |
+| **Recurrent** | Optimized RNN/LSTM/GRU operations | Sequential modeling |
+| **Native Sparse** | Block-sparse matrix computations | Sparse attention patterns |
 
 ### Platform Support Matrix
 
-| Operation | Triton (GPU) | Pallas (TPU) | XLA (Universal) | CUDA |
-|-----------|-------------|--------------|-----------------|------|
-| Flash Attention v2 | ✓ | ✓ | ✓ | Dev |
-| Ring Attention | ✓ | ✓ | ✓ | Dev |
-| Page Attention | ✓ | ✓ | ✓ | Dev |
-| Block Sparse | ✓ | - | ✓ | Dev |
-| GLA | ✓ | Dev | ✓ | - |
-| Lightning | ✓ | - | ✓ | Dev |
-| MLA | ✓ | Dev | - | - |
-| Ragged Attention | ✓ | ✓ | ✓ | Dev |
+| Operation | Triton (GPU) | Pallas (TPU) | XLA (Universal) |
+|-----------|:------------:|:------------:|:---------------:|
+| Flash Attention v2 | ✅ | ✅ | ✅ |
+| Ring Attention | ✅ | ✅ | ✅ |
+| Page Attention | ✅ | ✅ | ✅ |
+| Block Sparse Attention | ✅ | ✅ | ✅ |
+| Ragged Page Attention v2 | ✅ | ✅ | ✅ |
+| Ragged Page Attention v3 | - | ✅ | ✅ |
+| Ragged Decode Attention | ✅ | ✅ | ✅ |
+| GLA | ✅ | - | ✅ |
+| Lightning Attention | ✅ | - | ✅ |
+| MLA | ✅ | 🚧 | - |
+| Recurrent | ✅ | - | ✅ |
+| Mean Pooling | ✅ | - | ✅ |
+| Grouped MatMul | - | ✅ | ✅ |
+| Grouped MatMul v2 | - | ✅ | - |
+| Native Sparse Attention | ✅ | - | ✅ |
 
-✓ = Production ready | Dev = Under development | - = Not planned
+✅ = Production ready | 🚧 = Under development | - = Not available
 
 ## Advanced Usage
+
+### Page Attention for KV-Cache Inference
+
+```python
+from ejkernel.modules import page_attention, PageAttentionConfig
+
+# Configure paged attention for inference
+config = PageAttentionConfig(
+    platform="auto",
+    backend="gpu"
+)
+
+output = page_attention(
+    query=q,
+    key_cache=k_cache,
+    value_cache=v_cache,
+    block_table=block_table,
+    cache_seqlens=cache_seqlens,
+    cfg=config
+)
+```
+
+### Ragged Page Attention for Variable-Length Batches
+
+```python
+from ejkernel.modules import ragged_page_attention_v3, RaggedPageAttentionv3Config
+
+# For variable-length sequences with attention sinks
+config = RaggedPageAttentionv3Config(
+    platform="pallas",
+    backend="tpu"
+)
+
+output = ragged_page_attention_v3(
+    query=q,
+    key_pages=k_pages,
+    value_pages=v_pages,
+    lengths=seq_lengths,
+    page_indices=page_indices,
+    cfg=config
+)
+```
 
 ### Performance Optimization
 
@@ -325,6 +448,7 @@ os.environ["EJKERNEL_OPS_RECORD"] = "1"    # Record invocations
 ```python
 from ejkernel.ops.core import Kernel
 from ejkernel.modules.operations.configs import BaseOperationConfig
+from dataclasses import dataclass
 
 @dataclass
 class MyConfig(BaseOperationConfig):
@@ -348,10 +472,11 @@ class MyKernel(Kernel[MyConfig, Array]):
         return [MyConfig(param1=p) for p in [64, 128, 256]]
 ```
 
-### Integration with Models
+### Integration with Flax Models
 
 ```python
 import flax.linen as nn
+from ejkernel.modules import flash_attention
 
 class TransformerBlock(nn.Module):
     num_heads: int = 8
@@ -378,8 +503,6 @@ class TransformerBlock(nn.Module):
         # Project output
         return nn.Dense(x.shape[-1])(attn_output.reshape(x.shape))
 ```
-
-## Performance
 
 ## Development
 
@@ -415,14 +538,14 @@ The project uses:
 1. **Implement the kernel** in appropriate backend directory:
 
 ```python
-# ejkernel/kernels/_triton/my_kernel.py
+# ejkernel/kernels/_triton/my_kernel/_interface.py
 @kernel_registry.register("my_kernel", Platform.TRITON, Backend.GPU)
 def my_kernel_triton(x, config):
     # Implementation
     pass
 ```
 
-2 **Create module wrapper**:
+1. **Create module wrapper**:
 
 ```python
 # ejkernel/modules/operations/my_kernel.py
@@ -431,7 +554,7 @@ class MyKernel(Kernel[MyKernelConfig, Array]):
     pass
 ```
 
-3 **Add tests**:
+1. **Add tests**:
 
 ```python
 # test/kernels/_triton/test_my_kernel.py
@@ -440,7 +563,7 @@ class TestMyKernel(unittest.TestCase):
     pass
 ```
 
-4 **Update documentation**
+1. **Update documentation**
 
 ## Testing
 
@@ -448,19 +571,19 @@ class TestMyKernel(unittest.TestCase):
 
 ```bash
 # Run all tests
-python test/run_tests.py
+pytest test/
 
 # Platform-specific tests
-python test/run_tests.py --xla      # XLA implementations
-python test/run_tests.py --triton   # Triton implementations
-python test/run_tests.py --pallas   # Pallas implementations
-
-# Cross-platform validation
-python test/run_tests.py --comparison
+pytest test/kernels/_xla/          # XLA implementations
+pytest test/kernels/_triton/       # Triton implementations
+pytest test/kernels/_pallas/       # Pallas implementations
 
 # Specific test patterns
-python test/run_tests.py -k "flash_attention"
-python test/run_tests.py --verbose --failfast
+pytest -k "flash_attention"
+pytest --verbose --failfast
+
+# Module operations tests
+pytest test/test_module_operations.py
 ```
 
 ### Test Categories
@@ -469,15 +592,18 @@ python test/run_tests.py --verbose --failfast
 - **Integration Tests**: End-to-end workflows
 - **Comparison Tests**: Cross-backend consistency
 - **Performance Tests**: Regression detection
-- **Property Tests**: Invariant verification
 
-### Continuous Integration
+## Benchmarking
 
-The project uses GitHub Actions for CI with tests across:
+Run benchmarks to compare performance across backends:
 
-- Multiple Python versions (3.11, 3.12, 3.13)
-- Multiple platforms (CPU, GPU, TPU)
-- Multiple JAX versions
+```bash
+# General attention benchmarks
+python benchmarks/benchmark_attention.py
+
+# Ragged page attention benchmarks
+python benchmarks/benchmark_ragged_page_attn.py
+```
 
 ## Contributing
 
@@ -494,10 +620,10 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ### Contribution Process
 
 1. Fork the repository
-2. Create a feature branch
-3. Implement your changes with tests
-4. Ensure all tests pass
-5. Submit a pull request
+1. Create a feature branch
+1. Implement your changes with tests
+1. Ensure all tests pass
+1. Submit a pull request
 
 ## Documentation
 
@@ -542,28 +668,6 @@ ejKernel builds upon excellent work from:
 - **Discussions**: [Community forum](https://github.com/erfanzar/ejkernel/discussions)
 - **Email**: <Erfanzare810@gmail.com>
 
-## Roadmap
-
-### Near Term (Q1 2025)
-
-- Flash Attention 3 implementation
-- Complete CUDA backend
-- Quantized attention (INT8/INT4)
-- Fused operations (LayerNorm+Attention)
-
-### Medium Term (Q2-Q3 2025)
-
-- Speculative decoding support
-- Continuous batching
-- Mamba SSM kernels
-
-### Long Term (Q4 2025+)
-
-- Multi-GPU kernel fusion
-- Automatic kernel selection ML model
-- Custom DSL for kernel development
-- Hardware-agnostic IR
-
 ---
 
-ejKernel - Production-grade kernels for JAX deep learning
+**ejKernel** - Production-grade kernels for JAX deep learning

@@ -137,8 +137,6 @@ class Autotuner(Generic[Cfg]):
         Returns:
             AutotuneData containing all performance measurements
 
-        Raises:
-            RuntimeError: If compilation or execution fails for all candidates
         """
         measures = []
         for cfg in candidates:
@@ -159,8 +157,7 @@ class Autotuner(Generic[Cfg]):
                 measures.append(Measurement(cfg, float("inf")))
 
         if not measures or all(m.seconds == float("inf") for m in measures):
-            raise RuntimeError("All candidate configurations failed to execute")
-
+            autotune_logger.warning("All candidate configurations failed to execute; returning empty measurements.")
         return AutotuneData(measures)
 
 

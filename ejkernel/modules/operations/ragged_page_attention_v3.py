@@ -57,10 +57,15 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
+import jax
 from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int32
 
+from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._utils import (
+    get_tuned_block_sizes,
+    get_tuned_block_sizes_h64,
+)
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
@@ -184,6 +189,47 @@ def _expand_axis_candidates(
         _push(seed)
     _push(limit)
     return candidates
+
+
+def _is_tpu() -> bool:
+    try:
+        return jax.devices()[0].platform == "tpu"
+    except Exception:
+        return False
+
+
+def _lookup_tuned_pair(workload: _RPAWorkload) -> tuple[int, int] | None:
+    """Try to fetch tuned block sizes from the kernel's TPU utils."""
+    if not _is_tpu():
+        return None
+    try:
+        if workload.head_dim == 64:
+            bkv, bq = get_tuned_block_sizes_h64(
+                workload.q_dtype,
+                workload.kv_dtype,
+                workload.num_q_heads,
+                workload.num_kv_heads,
+                workload.head_dim,
+                workload.page_size,
+                workload.max_num_tokens,
+                workload.pages_per_seq,
+            )
+        else:
+            bkv, bq = get_tuned_block_sizes(
+                workload.q_dtype,
+                workload.kv_dtype,
+                workload.num_q_heads,
+                workload.num_kv_heads,
+                workload.head_dim,
+                workload.page_size,
+                workload.max_num_tokens,
+                workload.pages_per_seq,
+            )
+        if bkv <= 0 or bq <= 0:
+            return None
+        return int(bkv), int(bq)
+    except (KeyError, ValueError, RuntimeError):
+        return None
 
 
 class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Array]]):
@@ -568,8 +614,13 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         if workload is None:
             return []
 
-        base_pair = _suggest_block_sizes(workload, aggressive=prefer_tuned)
-        return self._generate_candidate_pairs(workload, base_pair, max_candidates=max_candidates)
+        tuned_pair = _lookup_tuned_pair(workload) if prefer_tuned else None
+        base_pair = tuned_pair or _suggest_block_sizes(workload, aggressive=prefer_tuned)
+        pairs = self._generate_candidate_pairs(workload, base_pair, max_candidates=max_candidates)
+        if tuned_pair and tuned_pair not in pairs:
+            pairs.insert(0, tuned_pair)
+            pairs = pairs[:max_candidates]
+        return pairs
 
     def _generate_candidate_pairs(
         self,
@@ -580,20 +631,22 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
     ) -> list[tuple[int, int]]:
         base_kv, base_q = base_pair
         kv_limit = max(1, workload.pages_per_seq)
+        kv_seed_tuple = (16, 32, 64) if _is_tpu() else (16, 32, 64, 128, 256)
         kv_candidates = _expand_axis_candidates(
             base_kv,
             kv_limit,
-            seeds=(1, 2, 4, 8, min(16, kv_limit)),
+            seeds=kv_seed_tuple,
             min_value=1,
             step=None,
         )
         query_limit = max(1, min(workload.max_num_tokens, 512))
+        q_seeds = (4, 8, 16, 32, 64) if _is_tpu() else (32, 64, 128, 256)
         q_candidates = _expand_axis_candidates(
             base_q,
             query_limit,
-            seeds=(8, 16, 32),
+            seeds=q_seeds,
             min_value=1,
-            step=8,
+            step=4 if _is_tpu() else 16,
         )
 
         pairs: list[tuple[int, int]] = []
@@ -607,6 +660,12 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                 pairs.append(pair)
                 if len(pairs) >= max_candidates:
                     return pairs
+        if _is_tpu():
+            allowed_kv = {16, 32, 64}
+            allowed_q = {4, 8, 16, 32, 64}
+            filtered = [(kv, qb) for kv, qb in pairs if kv in allowed_kv and qb in allowed_q]
+            if filtered:
+                pairs = filtered[:max_candidates]
         return pairs
 
     def _materialize_configs(

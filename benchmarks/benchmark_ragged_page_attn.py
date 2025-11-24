@@ -12,7 +12,7 @@ def create_attention_algorithms():
     """Create dictionary of attention algorithm implementations."""
 
     def xla_page(queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs):
-        return operations.ragged_page_attention(
+        return operations.ragged_page_attention_v2(
             queries,
             kv_pages,
             context_lens,
@@ -22,7 +22,7 @@ def create_attention_algorithms():
         )
 
     def ejk_page(queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs):
-        return operations.ragged_page_attention(
+        return operations.ragged_page_attention_v2(
             queries,
             kv_pages,
             context_lens,

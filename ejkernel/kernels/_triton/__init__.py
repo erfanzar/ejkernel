@@ -41,7 +41,7 @@ from .mean_pooling import mean_pooling
 from .native_sparse_attention import apply_native_sparse_attention, native_sparse_attention
 from .page_attention import page_attention
 from .ragged_decode_attention import ragged_decode_attention
-from .ragged_page_attention import ragged_page_attention
+from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .recurrent import recurrent
 
 __all__ = (
@@ -53,7 +53,7 @@ __all__ = (
     "native_sparse_attention",
     "page_attention",
     "ragged_decode_attention",
-    "ragged_page_attention",
+    "ragged_page_attention_v2",
     "recurrent",
     "recurrent_gla",
 )

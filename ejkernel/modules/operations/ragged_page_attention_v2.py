@@ -74,10 +74,47 @@ from ejkernel.ops import (
 from ejkernel.ops.config.persistent import PersistentCache
 
 from ..base import detect_platform
-from .configs import RaggedPageAttentionConfig
+from .configs import RaggedPageAttentionv2Config
 
 
-class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
+def _xla_block_candidates_v2(inv: Invocation[RaggedPageAttentionv2Config, Array]) -> list[RaggedPageAttentionv2Config]:
+    """Generate power-of-2 XLA configs with larger blocks."""
+    try:
+        queries = inv.kwargs["queries"]
+        block_tables = inv.kwargs["block_tables"]
+    except KeyError:
+        return []
+
+    total_tokens = int(getattr(queries, "shape", (0,))[0] or 0)
+    pages_per_seq = int(getattr(block_tables, "shape", (0, 0))[1] or 0)
+    if total_tokens <= 0 or pages_per_seq <= 0:
+        return []
+
+    kv_candidates = [k for k in (16, 32, 64) if k <= pages_per_seq]
+    if not kv_candidates:
+        kv_candidates = [min(16, pages_per_seq)]
+
+    q_candidates = [q for q in (64, 128, 256) if q <= total_tokens]
+    if not q_candidates:
+        q_candidates = [min(64, total_tokens)]
+
+    configs: list[RaggedPageAttentionv2Config] = []
+    for kv in kv_candidates:
+        for q in q_candidates:
+            configs.append(
+                RaggedPageAttentionv2Config(
+                    num_kv_pages_per_block=kv,
+                    num_queries_per_block=q,
+                    num_warps=None,
+                    num_stages=None,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+    return configs
+
+
+class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
     """Ragged Page Attention with custom optimization logic.
 
     Combines ragged (variable-length) sequence processing with paged KV cache
@@ -109,7 +146,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         Sets up the kernel with the operation identifier for registry lookup
         and configuration management.
         """
-        super().__init__(op_id="ragged_page_attention")
+        super().__init__(op_id="ragged_page_attention_v2")
 
     def create_shard_map_wrapper(
         self,
@@ -128,7 +165,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         mask_value: float | None = None,
         vmem_limit_bytes: int | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-        cfg: RaggedPageAttentionConfig | None = None,
+        cfg: RaggedPageAttentionv2Config | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
         out_specs: PartitionSpec | None = None,
@@ -207,7 +244,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
 
         return shard_map_fn, call_args
 
-    def get_impl(self, cfg: RaggedPageAttentionConfig):
+    def get_impl(self, cfg: RaggedPageAttentionv2Config):
         """Get kernel implementation from registry.
 
         Args:
@@ -219,8 +256,8 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         Raises:
             ValueError: If no matching implementation is found for the configuration
         """
-        platform = detect_platform("ragged_page_attention", cfg.platform)
-        return kernel_registry.get("ragged_page_attention", platform=platform, backend=cfg.backend)
+        platform = detect_platform("ragged_page_attention_v2", cfg.platform)
+        return kernel_registry.get("ragged_page_attention_v2", platform=platform, backend=cfg.backend)
 
     def run(
         self,
@@ -240,7 +277,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         mask_value: float | None = None,
         vmem_limit_bytes: int | None = None,
         *,
-        cfg: RaggedPageAttentionConfig,
+        cfg: RaggedPageAttentionv2Config,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
         """Execute ragged page attention over variable-length sequences.
 
@@ -280,14 +317,14 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         Example:
             >>>
             >>> query_start_loc = jnp.array([0, 10, 25])
-            >>> out = ragged_page_attention(
+            >>> out = ragged_page_attention_v2(
             ...     queries, kv_pages, context_lens,
             ...     block_tables, query_start_loc, num_seqs=2
             ... )
         """
 
         if platform is not None:
-            cfg = RaggedPageAttentionConfig(
+            cfg = RaggedPageAttentionv2Config(
                 num_kv_pages_per_block=cfg.num_kv_pages_per_block,
                 num_queries_per_block=cfg.num_queries_per_block,
                 num_warps=cfg.num_warps,
@@ -317,7 +354,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             num_stages=cfg.num_stages,
         )
 
-    def heuristic_cfg(self, inv: Invocation[RaggedPageAttentionConfig, Array]) -> RaggedPageAttentionConfig:
+    def heuristic_cfg(self, inv: Invocation[RaggedPageAttentionv2Config, Array]) -> RaggedPageAttentionv2Config:
         """Provide default configuration optimized for ragged page attention.
 
         Args:
@@ -327,7 +364,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             Default configuration with conservative block sizes suitable for
             typical ragged attention workloads with variable sequence lengths
         """
-        return RaggedPageAttentionConfig(
+        return RaggedPageAttentionv2Config(
             num_kv_pages_per_block=None,
             num_queries_per_block=None,
             num_warps=4,
@@ -336,7 +373,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             backend="any",
         )
 
-    def candidate_cfgs(self, inv: Invocation[RaggedPageAttentionConfig, Array]):
+    def candidate_cfgs(self, inv: Invocation[RaggedPageAttentionv2Config, Array]):
         """Generate candidate configurations for autotuning.
 
         Creates configurations optimized for ragged attention scenarios with
@@ -363,7 +400,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         candidates = []
         for num_kv_pages, num_queries, num_warps, num_stages in block_configs:
             candidates.append(
-                RaggedPageAttentionConfig(
+                RaggedPageAttentionv2Config(
                     num_kv_pages_per_block=num_kv_pages,
                     num_queries_per_block=num_queries,
                     num_warps=num_warps,
@@ -375,7 +412,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
 
         return candidates
 
-    def candidate_cfgs_gpu(self, inv: Invocation[RaggedPageAttentionConfig, Array]):
+    def candidate_cfgs_gpu(self, inv: Invocation[RaggedPageAttentionv2Config, Array]):
         """Generate candidate configurations for autotuning on GPU (Triton).
 
         Heuristics:
@@ -476,7 +513,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         block_configs = block_configs[:max_candidates]
 
         candidates = [  # noqa
-            RaggedPageAttentionConfig(
+            RaggedPageAttentionv2Config(
                 num_kv_pages_per_block=npages,
                 num_queries_per_block=block_m,
                 num_warps=warps,
@@ -487,8 +524,8 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             for (block_m, npages, warps, stages) in block_configs
         ]
 
-        return [
-            RaggedPageAttentionConfig(
+        return _xla_block_candidates_v2(inv) or [
+            RaggedPageAttentionv2Config(
                 num_kv_pages_per_block=None,
                 num_queries_per_block=None,
                 num_warps=None,
@@ -498,7 +535,7 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
             )
         ]
 
-    def candidate_cfgs_tpu(self, inv: Invocation[RaggedPageAttentionConfig, Array]):
+    def candidate_cfgs_tpu(self, inv: Invocation[RaggedPageAttentionv2Config, Array]):
         """Generate candidate configurations for autotuning on TPU (Pallas backend).
 
         Heuristics:
@@ -508,22 +545,47 @@ class RaggedPageAttention(Kernel[RaggedPageAttentionConfig, Array]):
         - Constrain S_block = page_size * num_kv_pages_per_block <= 256 to keep tiles reasonable.
         """
 
-        return [
-            RaggedPageAttentionConfig(
-                num_kv_pages_per_block=None,
-                num_queries_per_block=None,
-                num_warps=None,
-                num_stages=None,
-                platform="pallas",
-                backend="tpu",
-            )
-        ]
+        try:
+            queries = inv.kwargs["queries"]
+            kv_pages = inv.kwargs["kv_pages"]
+            block_tables = inv.kwargs["block_tables"]
+        except KeyError:
+            return []
+
+        total_tokens = int(getattr(queries, "shape", (0,))[0] or 0)
+        pages_per_seq = int(getattr(block_tables, "shape", (0, 0))[1] or 0)
+        if total_tokens <= 0 or pages_per_seq <= 0:
+            return []
+
+        kv_candidates = [k for k in (16, 32, 64) if k <= pages_per_seq]
+        if not kv_candidates:
+            kv_candidates = [min(16, pages_per_seq)]
+
+        q_candidates = [q for q in (4, 8, 16, 32, 64) if q <= total_tokens]
+        if not q_candidates:
+            q_candidates = [min(4, total_tokens)]
+
+        configs = []
+        for kv in kv_candidates:
+            for q in q_candidates:
+                configs.append(
+                    RaggedPageAttentionv2Config(
+                        num_kv_pages_per_block=kv,
+                        num_queries_per_block=q,
+                        num_warps=None,
+                        num_stages=None,
+                        platform="pallas",
+                        backend="tpu",
+                    )
+                )
+
+        return configs
 
     candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
 
 
-_ragged_page_attention_executor: Executor[RaggedPageAttentionConfig, Array] = Executor(
+_ragged_page_attention_executor: Executor[RaggedPageAttentionv2Config, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(
@@ -537,7 +599,7 @@ _ragged_page_attention_executor: Executor[RaggedPageAttentionConfig, Array] = Ex
 )
 
 
-def ragged_page_attention(
+def ragged_page_attention_v2(
     queries: Float[Array, "total_tokens num_q_heads head_dim"],
     kv_pages: Float[Array, "num_pages page_size num_combined_kv_heads head_dim"],
     context_lens: Int[Array, "num_seqs"],
@@ -555,7 +617,7 @@ def ragged_page_attention(
     mask_value: float | None = None,
     vmem_limit_bytes: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    cfg: RaggedPageAttentionConfig | None = None,
+    cfg: RaggedPageAttentionv2Config | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: PartitionSpec | None = None,
@@ -591,25 +653,25 @@ def ragged_page_attention(
 
     Example:
         >>>
-        >>> out = ragged_page_attention(
+        >>> out = ragged_page_attention_v2(
         ...     queries, kv_pages, context_lens, block_tables,
         ...     query_start_loc, num_seqs
         ... )
         >>>
         >>>
-        >>> out = ragged_page_attention(
+        >>> out = ragged_page_attention_v2(
         ...     queries, kv_pages, context_lens, block_tables,
         ...     query_start_loc, num_seqs, sliding_window=256
         ... )
         >>>
         >>>
-        >>> out = ragged_page_attention(
+        >>> out = ragged_page_attention_v2(
         ...     queries, kv_pages, context_lens, block_tables,
         ...     query_start_loc, num_seqs, optimized=True, logits_soft_cap=50.0
         ... )
         >>>
         >>>
-        >>> out = ragged_page_attention(..., platform="triton")
+        >>> out = ragged_page_attention_v2(..., platform="triton")
     """
 
     method = None
@@ -617,7 +679,7 @@ def ragged_page_attention(
         method = "shard_map"
 
     return _ragged_page_attention_executor(
-        RaggedPageAttention(),
+        RaggedPageAttentionv2(),
         queries=queries,
         kv_pages=kv_pages,
         context_lens=context_lens,

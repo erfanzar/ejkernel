@@ -23,7 +23,7 @@ ejkernel/modules/
 │   ├── gated_linear_attention.py      # GLA implementation
 │   ├── lightning_attention.py         # Lightning attention
 │   ├── ragged_decode_attention.py     # Variable-length decode
-│   ├── ragged_page_attention.py       # Variable-length paged
+│   ├── ragged_page_attention_v2.py       # Variable-length paged
 │   └── scaled_dot_product_attention.py # Basic SDPA
 ```
 

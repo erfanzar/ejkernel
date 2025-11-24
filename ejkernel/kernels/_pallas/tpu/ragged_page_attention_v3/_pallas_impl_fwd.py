@@ -88,6 +88,19 @@ def ref_ragged_paged_attention(
     num_page_indices = block_tables.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
+    bkv_sz = None
+    if sliding_window is not None:
+        bkv_p, _ = get_tuned_block_sizes(
+            queries.dtype,
+            kv_cache.dtype,
+            actual_num_q_heads,
+            actual_num_kv_heads,
+            actual_head_dim,
+            page_size,
+            queries.shape[0],
+            pages_per_seq,
+        )
+        bkv_sz = bkv_p * page_size
     outputs = []
 
     for i in range(distribution[-1]):
@@ -96,23 +109,32 @@ def ref_ragged_paged_attention(
         q_len = q_end - q_start
 
         kv_len = kv_lens[i]
+        kv_start = 0
+        if sliding_window is not None:
+            kv_start = jnp.maximum(kv_len - sliding_window, 0)
+            kv_start = (kv_start // bkv_sz) * bkv_sz
+        kv_len_eff = kv_len - kv_start
+        if kv_len_eff < q_len:
+            raise ValueError(f"Sliding window {sliding_window} too small for q_len {q_len} (kv_len {kv_len}).")
         indices_start = i * pages_per_seq
-        indices_end = indices_start + cdiv(kv_len, page_size)
-        indices = block_tables[indices_start:indices_end]
+        start_page = kv_start // page_size
+        end_page = start_page + cdiv(kv_len_eff, page_size)
+        indices = block_tables[indices_start + start_page : indices_start + end_page]
         q = queries[q_start:q_end, :, :actual_head_dim]
 
         assert kv_len - q_len >= 0
         gathered_kv = kv_cache[indices]
         gathered_shape = gathered_kv.shape
         gathered_kv = gathered_kv.reshape(-1, *gathered_shape[-3:])
-        gathered_kv = gathered_kv.at[kv_len - q_len : kv_len].set(merged_kv[q_start:q_end])
+        gathered_kv = gathered_kv.at[kv_len_eff - q_len : kv_len_eff].set(merged_kv[q_start:q_end])
         kv_cache = kv_cache.at[indices].set(gathered_kv.reshape(gathered_shape))
 
         kv = gathered_kv.reshape(-1, num_kv_heads_x2, head_dim)[:, : actual_num_kv_heads * 2, :].reshape(
             -1, actual_num_kv_heads, head_dim * 2
         )
-        k = kv[:kv_len, :, :head_dim][:, :, :actual_head_dim]
-        v = kv[:kv_len, :, head_dim:][:, :, :actual_head_dim]
+        kv = kv[:kv_len_eff]
+        k = kv[:, :, :head_dim][:, :, :actual_head_dim]
+        v = kv[:, :, head_dim:][:, :, :actual_head_dim]
         k = jnp.repeat(k, actual_num_q_heads_per_kv_head, axis=1)
         v = jnp.repeat(v, actual_num_q_heads_per_kv_head, axis=1)
 
@@ -133,10 +155,8 @@ def ref_ragged_paged_attention(
             attn *= q_scale
 
         q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
-        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
+        kv_span = kv_start + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
         mask = q_span < kv_span
-        if sliding_window is not None:
-            mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if logits_soft_cap is not None:
             attn = logits_soft_cap * jnp.tanh(attn / logits_soft_cap)
         attn += jnp.where(mask, mask_value, 0.0)
@@ -1177,6 +1197,7 @@ def ragged_paged_attention(
             pages_per_seq,
         )
     bkv_sz = bkv_p * page_size
+    assert bkv_sz > 0, "bkv_sz must be positive"
 
     grid = (distribution[2],)
 

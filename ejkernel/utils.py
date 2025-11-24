@@ -24,6 +24,7 @@ with focus on GPU architectures (CDNA, RDNA) and distributed training scenarios.
 """
 
 import functools
+import re
 import typing as tp
 from typing import Literal, overload
 
@@ -812,3 +813,25 @@ def make_dummy_rpa_inputs(
             dtypes=dict(q=q_dtype, kv=kv_dtype),
         ),
     )
+
+
+def get_tpu_generation() -> int:
+    """
+    Returns the TPU generation as an integer (e.g., 3, 4, 5).
+    Returns 0 if no TPU is detected or if the generation cannot be determined.
+    """
+    try:
+        devices = jax.devices("tpu")
+
+        if not devices:
+            return 0
+        device_kind = devices[0].device_kind
+        match = re.search(r"v(\d+)", device_kind)
+
+        if match:
+            return int(match.group(1))
+
+        return 0
+
+    except (RuntimeError, IndexError):
+        return 0

@@ -127,7 +127,7 @@ python test/run_tests.py --failfast
 - ✅ `mean_pooling` - Custom VJP
 - ✅ `apply_native_sparse_attention` - Custom VJP
 - ✅ `page_attention` - Inference only (no gradients tested)
-- ✅ `ragged_page_attention` - Inference only
+- ✅ `ragged_page_attention_v2` - Inference only
 
 ### Triton Implementations
 

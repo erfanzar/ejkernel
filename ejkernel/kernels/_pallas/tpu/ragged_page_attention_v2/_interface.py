@@ -62,6 +62,7 @@ def _ragged_page_attention(
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
+    softmax_aux: jax.Array | None = None,
 ):
     """Ragged paged attention that supports mixed prefill and decode.
 
@@ -98,10 +99,14 @@ def _ragged_page_attention(
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
         mask_value=mask_value,
-        num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
     )
+    if softmax_aux is None:
+        # Should be handled by caller, but for safety
+        softmax_aux = jnp.full((num_kv_heads, 1), -jnp.inf, dtype=jnp.float32)
+
+    num_sinks = softmax_aux.shape[-1]
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     num_q_tokens, num_q_heads, head_dim = q.shape
@@ -140,7 +145,13 @@ def _ragged_page_attention(
         return (q_blk_idx, heads_blk_idx, 0)
 
     q_block_spec = pl.BlockSpec((num_q_per_blk, num_q_heads_per_blk, head_dim), q_index_map)
-    in_specs = [q_block_spec, pl.BlockSpec(memory_space=pltpu.ANY)]
+
+    def softmax_aux_index_map(heads_blk_idx, q_blk_idx, *_):
+        return (heads_blk_idx, 0)
+
+    softmax_aux_block_spec = pl.BlockSpec((num_kv_heads_per_blk, num_sinks), softmax_aux_index_map)
+
+    in_specs = [q_block_spec, pl.BlockSpec(memory_space=pltpu.ANY), softmax_aux_block_spec]
     out_specs = q_block_spec
     lm_scratch = pltpu.VMEM((num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128), jnp.float32)
     acc_scratch = pltpu.VMEM((num_q_per_blk, num_q_heads_per_blk, head_dim), jnp.float32)
@@ -173,12 +184,12 @@ def _ragged_page_attention(
         name="ragged_page_attention_kernel",
     )
 
-    return kernel(*scalar_prefetches, q, kv_pages)
+    return kernel(*scalar_prefetches, q, kv_pages, softmax_aux)
 
 
-@kernel_registry.register("ragged_page_attention", Platform.PALLAS, Backend.TPU)
+@kernel_registry.register("ragged_page_attention_v2", Platform.PALLAS, Backend.TPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
-def ragged_page_attention(
+def ragged_page_attention_v2(
     queries: Float[Array, "total_tokens num_q_heads head_dim"],
     kv_pages: Float[Array, "num_pages page_size num_combined_kv_heads head_dim"],
     context_lens: Int[Array, "num_seqs"],
@@ -224,10 +235,15 @@ def ragged_page_attention(
       The output of the attention.
     """
     del optimized, compute_dtype
-    if softmax_aux is not None:
-        raise NotImplementedError("`softmax_aux` is not implemented in tpu-pallas kernel yet!")
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
+
+    if softmax_aux is None:
+        # Create dummy softmax_aux
+        _, _, num_combined_kv_heads, _ = kv_pages.shape
+        num_kv_heads = num_combined_kv_heads // 2
+        softmax_aux = jnp.full((num_kv_heads, 1), -jnp.inf, dtype=jnp.float32)
+
     return _ragged_page_attention(
         queries,
         kv_pages=kv_pages,
@@ -242,4 +258,5 @@ def ragged_page_attention(
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
+        softmax_aux=softmax_aux,
     )

@@ -41,11 +41,11 @@ Example:
 import os as _os
 
 _os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
-__version__ = "0.0.18"
+__version__ = "0.0.19"
 
-from . import kernels, modules, types
+from . import kernels, modules, types, utils, xla_utils
 from .kernels import Backend, Platform, kernel_registry
 
 kernel_registry.validate_signatures(None)
 
-__all__ = ("Backend", "Platform", "kernel_registry", "kernels", "modules", "types")
+__all__ = ("Backend", "Platform", "kernel_registry", "kernels", "modules", "types", "utils", "xla_utils")

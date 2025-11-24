@@ -23,7 +23,7 @@ Available Modules:
         - FlashAttention: Memory-efficient exact attention
         - BlockSparseAttention: Memory-efficient Sparse attention
         - PageAttention: Paged KV cache attention for serving
-        - RaggedPageAttention: Variable-length page attention
+        - RaggedPageAttentionv2: Variable-length page attention
         - NativeSparseAttention: Block-wise sparse attention
         - Recurrent: Linear-time recurrent attention
         - GLAttention: Gated linear attention
@@ -65,9 +65,10 @@ from .operations import (
     PageAttentionConfig,
     RaggedDecodeAttention,
     RaggedDecodeAttentionConfig,
-    RaggedPageAttention,
-    RaggedPageAttentionConfig,
+    RaggedPageAttentionv2,
+    RaggedPageAttentionv2Config,
     RaggedPageAttentionv3,
+    RaggedPageAttentionv3Config,
     RecurrentAttention,
     RecurrentAttentionConfig,
     RingAttention,
@@ -85,7 +86,7 @@ from .operations import (
     native_sparse_attention,
     page_attention,
     ragged_decode_attention,
-    ragged_page_attention,
+    ragged_page_attention_v2,
     ragged_page_attention_v3,
     recurrent_attention,
     ring_attention,
@@ -114,9 +115,10 @@ __all__ = (
     "PageAttentionConfig",
     "RaggedDecodeAttention",
     "RaggedDecodeAttentionConfig",
-    "RaggedPageAttention",
-    "RaggedPageAttentionConfig",
+    "RaggedPageAttentionv2",
+    "RaggedPageAttentionv2Config",
     "RaggedPageAttentionv3",
+    "RaggedPageAttentionv3Config",
     "RecurrentAttention",
     "RecurrentAttentionConfig",
     "RingAttention",
@@ -134,7 +136,7 @@ __all__ = (
     "native_sparse_attention",
     "page_attention",
     "ragged_decode_attention",
-    "ragged_page_attention",
+    "ragged_page_attention_v2",
     "ragged_page_attention_v3",
     "recurrent_attention",
     "ring_attention",
