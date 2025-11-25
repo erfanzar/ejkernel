@@ -56,24 +56,12 @@ def _ragged_paged_attention(
 
     attention_output = jnp.zeros_like(padded_queries)
 
+    # V3 attention_sink semantics: softmax_aux has shape [num_q_heads]
     have_sinks = softmax_aux is not None
     if have_sinks:
-        if softmax_aux.ndim == 2:
-            num_sinks = softmax_aux.shape[-1]
-            if softmax_aux.shape[0] == num_q_heads:
-                sinks_h = softmax_aux.reshape(num_kv_heads, q_heads_per_group, num_sinks)
-            elif softmax_aux.shape[0] == num_kv_heads:
-                sinks_h = jnp.broadcast_to(softmax_aux[:, None, :], (num_kv_heads, q_heads_per_group, num_sinks))
-            else:
-                raise ValueError(
-                    f"softmax_aux first dim must be num_q_heads ({num_q_heads}) "
-                    f"or num_kv_heads ({num_kv_heads}), got {softmax_aux.shape}"
-                )
-        elif softmax_aux.ndim == 1:
-            num_sinks = softmax_aux.shape[0]
-            sinks_h = jnp.broadcast_to(softmax_aux[None, None, :], (num_kv_heads, q_heads_per_group, num_sinks))
-        else:
-            raise ValueError(f"Unsupported softmax_aux shape: {softmax_aux.shape}")
+        if softmax_aux.ndim != 1 or softmax_aux.shape[0] != num_q_heads:
+            raise ValueError(f"softmax_aux must have shape [num_q_heads] = [{num_q_heads}], got {softmax_aux.shape}")
+        sinks_h = softmax_aux.reshape(num_kv_heads, q_heads_per_group)
 
     def _compute_attention_for_sequence(seq_idx, output_accumulator):
         num_queries_for_seq = query_start_loc[seq_idx + 1] - query_start_loc[seq_idx]
@@ -115,12 +103,15 @@ def _ragged_paged_attention(
                     kv_token_start_index = kv_block_idx * kv_tokens_per_block
                     kv_token_indices = base_k_ids + kv_token_start_index
 
-                    attention_scores_block = jnp.einsum(
-                        "bihd,kid->bihk",
-                        query_block.astype(compute_dtype),
-                        key_block.astype(compute_dtype),
-                        optimize=True,
-                    ) * softmax_scale
+                    attention_scores_block = (
+                        jnp.einsum(
+                            "bihd,kid->bihk",
+                            query_block.astype(compute_dtype),
+                            key_block.astype(compute_dtype),
+                            optimize=True,
+                        )
+                        * softmax_scale
+                    )
                     if logits_soft_cap is not None:
                         attention_scores_block = jnp.tanh(attention_scores_block / logits_soft_cap) * logits_soft_cap
 
@@ -150,30 +141,30 @@ def _ragged_paged_attention(
                     return output_block, sum_exp_block, new_max
 
                 init_output_block = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=compute_dtype)
-                init_sum_exp = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype)
-                init_max = jnp.full((qblocks, num_kv_heads, q_heads_per_group), -jnp.inf, dtype=compute_dtype)
+                # V3 attention_sink semantics: initialize with sink values
+                if have_sinks:
+                    # sinks_h has shape [num_kv_heads, q_heads_per_group]
+                    init_sum_exp = jnp.ones((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype)
+                    init_max = jnp.broadcast_to(
+                        sinks_h[None, :, :].astype(compute_dtype),
+                        (qblocks, num_kv_heads, q_heads_per_group),
+                    )
+                else:
+                    init_sum_exp = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype)
+                    init_max = jnp.full((qblocks, num_kv_heads, q_heads_per_group), -jnp.inf, dtype=compute_dtype)
 
-                output_block, sum_exp_block, max_block = jax.lax.fori_loop(
-                    0, num_kv_blocks, _process_kv_block, (init_output_block, init_sum_exp, init_max)
+                output_block, sum_exp_block, _max_block = jax.lax.fori_loop(
+                    0,
+                    num_kv_blocks,
+                    _process_kv_block,
+                    (init_output_block, init_sum_exp, init_max),
                 )
 
-                if have_sinks:
-                    S = sinks_h.shape[-1]
-                    sinks_block = jnp.broadcast_to(sinks_h[None, ...], (qblocks, num_kv_heads, q_heads_per_group, S))
-
-                    s_max = jnp.max(sinks_block, axis=3)
-                    m_tot = jnp.maximum(max_block, s_max)
-
-                    denom = jnp.exp(max_block - m_tot) * sum_exp_block + jnp.sum(
-                        jnp.exp(sinks_block - jnp.expand_dims(m_tot, 3)), axis=3
-                    )
-                    denom = jnp.maximum(denom, jnp.asarray(1e-6, denom.dtype))
-                    normalized_output_block = (jnp.exp(max_block - m_tot)[..., None] * output_block) / denom[..., None]
-                else:
-                    sum_exp_block = jnp.maximum(sum_exp_block, 1e-6)
-                    normalized_output_block = (output_block / jnp.expand_dims(sum_exp_block, axis=3)).astype(
-                        padded_queries.dtype
-                    )
+                # Standard normalization (sink is already incorporated via initial m and l)
+                sum_exp_block = jnp.maximum(sum_exp_block, 1e-6)
+                normalized_output_block = (output_block / jnp.expand_dims(sum_exp_block, axis=3)).astype(
+                    padded_queries.dtype
+                )
 
                 normalized_output_block = normalized_output_block.astype(padded_queries.dtype)
 

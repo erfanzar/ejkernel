@@ -157,6 +157,8 @@ def ref_ragged_paged_attention_hd64(
         q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
         kv_span = kv_start + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
         mask = q_span < kv_span
+        if sliding_window is not None:
+            mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if logits_soft_cap is not None:
             attn = logits_soft_cap * jnp.tanh(attn / logits_soft_cap)
         attn = jnp.where(mask, mask_value, attn)
@@ -360,6 +362,8 @@ def _ragged_paged_attention_kernel(
         q_span = kv_len - q_len + bq_idx * bq_sz + lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 1)
         mask = q_span < k_span
+        if sliding_window is not None:
+            mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
 
         if logits_soft_cap is not None:
             s = logits_soft_cap * jnp.tanh(s / logits_soft_cap)

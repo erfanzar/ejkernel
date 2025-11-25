@@ -37,7 +37,7 @@ def ragged_page_attention_v2(
     compute_dtype: DTypeLike = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_q_heads"] | None = None,
     mask_value: float | None = None,
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
@@ -77,8 +77,8 @@ def ragged_page_attention_v2(
         compute_dtype: The dtype to use for computation (default: bfloat16).
         optimized: Whether to use the optimized implementation (default: False).
         sliding_window: Optional sliding window size for local attention.
-        softmax_aux: Optional attention sink logits of shape [num_kv_heads, num_sinks] or [num_sinks].
-            These are auxiliary logits that participate in softmax normalization but don't
+        softmax_aux: Optional attention sink logits of shape [num_q_heads].
+            Single value per query head that participates in softmax normalization but doesn't
             contribute to output, allowing the model to absorb probability mass.
 
     Returns:

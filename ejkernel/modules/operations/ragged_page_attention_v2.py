@@ -161,7 +161,7 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
         compute_dtype: DTypeLike = jnp.bfloat16,
         optimized: bool = False,
         sliding_window: int | None = None,
-        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        softmax_aux: Float[Array, "num_q_heads"] | Float[Array, "num_sinks"] | None = None,
         mask_value: float | None = None,
         vmem_limit_bytes: int | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
@@ -203,7 +203,7 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
             block_tables: Int[Array, "num_seqs pages_per_seq"],
             query_start_loc: Int[Array, "num_seqs_plus_one"],
             num_seqs: Array | int,
-            softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+            softmax_aux: Float[Array, "num_q_heads"] | Float[Array, "num_sinks"] | None = None,
         ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
             return self.run(
                 queries=queries,
@@ -273,7 +273,7 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
         compute_dtype: DTypeLike = jnp.bfloat16,
         optimized: bool = False,
         sliding_window: int | None = None,
-        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        softmax_aux: Float[Array, "num_q_heads"] | Float[Array, "num_sinks"] | None = None,
         mask_value: float | None = None,
         vmem_limit_bytes: int | None = None,
         *,
@@ -547,7 +547,6 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
 
         try:
             queries = inv.kwargs["queries"]
-            kv_pages = inv.kwargs["kv_pages"]
             block_tables = inv.kwargs["block_tables"]
         except KeyError:
             return []
@@ -606,7 +605,7 @@ def ragged_page_attention_v2(
     block_tables: Int[Array, "num_seqs pages_per_seq"],
     query_start_loc: Int[Array, "num_seqs_plus_one"],
     num_seqs: Array | int,
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_q_heads"] | Float[Array, "num_sinks"] | None = None,
     /,
     *,
     softmax_scale: float | None = None,

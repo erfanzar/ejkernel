@@ -72,7 +72,7 @@ def _build_test_inputs(seed=0, *, with_softmax_aux=False):
 
     softmax_aux = None
     if with_softmax_aux:
-        softmax_aux = jax.random.normal(key, (num_kv_heads, 2), dtype=jnp.float32)
+        softmax_aux = jax.random.normal(key, (num_q_heads,), dtype=jnp.float32)
 
     softmax_scale = float(head_dim) ** -0.5
     num_seqs_arr = jnp.array([num_seqs], dtype=jnp.int32)

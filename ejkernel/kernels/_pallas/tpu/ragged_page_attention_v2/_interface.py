@@ -104,9 +104,7 @@ def _ragged_page_attention(
     )
     if softmax_aux is None:
         # Should be handled by caller, but for safety
-        softmax_aux = jnp.full((num_kv_heads, 1), -jnp.inf, dtype=jnp.float32)
-
-    num_sinks = softmax_aux.shape[-1]
+        softmax_aux = jnp.full((num_q_heads,), -jnp.inf, dtype=jnp.float32)
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     num_q_tokens, num_q_heads, head_dim = q.shape
@@ -146,14 +144,13 @@ def _ragged_page_attention(
 
     q_block_spec = pl.BlockSpec((num_q_per_blk, num_q_heads_per_blk, head_dim), q_index_map)
 
-    def softmax_aux_index_map(heads_blk_idx, q_blk_idx, *_):
-        return (heads_blk_idx, 0)
-
-    softmax_aux_block_spec = pl.BlockSpec((num_kv_heads_per_blk, num_sinks), softmax_aux_index_map)
+    softmax_aux_reshaped = softmax_aux.reshape(num_kv_heads, num_q_heads_per_kv_head, 1)
+    softmax_aux_reshaped = jnp.repeat(softmax_aux_reshaped, head_dim, axis=-1)
+    softmax_aux_block_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
 
     in_specs = [q_block_spec, pl.BlockSpec(memory_space=pltpu.ANY), softmax_aux_block_spec]
     out_specs = q_block_spec
-    lm_scratch = pltpu.VMEM((num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, 128), jnp.float32)
+    lm_scratch = pltpu.VMEM((num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, head_dim), jnp.float32)
     acc_scratch = pltpu.VMEM((num_q_per_blk, num_q_heads_per_blk, head_dim), jnp.float32)
     double_buf_scratch = pltpu.VMEM(
         (2, num_kv_pages_per_blk, page_size, num_combined_kv_heads_per_blk, head_dim),
@@ -184,7 +181,7 @@ def _ragged_page_attention(
         name="ragged_page_attention_kernel",
     )
 
-    return kernel(*scalar_prefetches, q, kv_pages, softmax_aux)
+    return kernel(*scalar_prefetches, q, kv_pages, softmax_aux_reshaped)
 
 
 @kernel_registry.register("ragged_page_attention_v2", Platform.PALLAS, Backend.TPU)
@@ -202,7 +199,7 @@ def ragged_page_attention_v2(
     compute_dtype: DTypeLike = jnp.bfloat16,
     optimized: bool = False,
     sliding_window: int | None = None,
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_q_heads"] | None = None,
     mask_value: float | None = None,
     num_kv_pages_per_block: int | None = None,
     num_queries_per_block: int | None = None,
@@ -239,10 +236,8 @@ def ragged_page_attention_v2(
         softmax_scale = queries.shape[-1] ** -0.5
 
     if softmax_aux is None:
-        # Create dummy softmax_aux
-        _, _, num_combined_kv_heads, _ = kv_pages.shape
-        num_kv_heads = num_combined_kv_heads // 2
-        softmax_aux = jnp.full((num_kv_heads, 1), -jnp.inf, dtype=jnp.float32)
+        num_q_heads = queries.shape[1]
+        softmax_aux = jnp.full((num_q_heads,), -jnp.inf, dtype=jnp.float32)
 
     return _ragged_page_attention(
         queries,

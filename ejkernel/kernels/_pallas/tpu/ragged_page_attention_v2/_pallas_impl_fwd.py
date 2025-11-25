@@ -117,15 +117,13 @@ def ref_ragged_page_attention(
         attn += jnp.where(mask, mask_value, 0.0)
 
         if softmax_aux is not None:
-            # softmax_aux: [num_kv_heads, num_sinks]
-            sinks = jnp.repeat(softmax_aux, num_query_per_kv, axis=0)  # [num_q_heads, num_sinks]
-            sinks = jnp.broadcast_to(sinks[:, None, :], (num_q_heads, q_len, softmax_aux.shape[-1]))
-            attn = jnp.concatenate([attn, sinks], axis=-1)
-
-        attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
-
-        if softmax_aux is not None:
-            attn = attn[..., :kv_len]
+            reshaped_sink = softmax_aux.reshape(num_q_heads, 1, 1)
+            reshaped_sink = jnp.repeat(reshaped_sink, q_len, axis=1)
+            attn = jnp.concatenate([reshaped_sink, attn], axis=2)
+            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+            attn = attn[..., 1:]  # Drop left sink column
+        else:
+            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
 
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
@@ -396,7 +394,7 @@ def ragged_page_attention_kernel(
             assert q.shape == (num_q_per_blk * num_q_heads_per_kv_head, head_dim)
             assert k.shape == v.shape == (num_kv_per_blk, head_dim)
             assert k.dtype == v.dtype
-            assert head_m_ref.shape == head_l_ref.shape == (num_q_per_blk * num_q_heads_per_kv_head, 128)
+            assert head_m_ref.shape == head_l_ref.shape == (num_q_per_blk * num_q_heads_per_kv_head, head_dim)
             assert head_acc_ref.shape == (num_q_per_blk, num_q_heads_per_kv_head, head_dim)
             kv_len_start = kv_blk_idx * num_kv_per_blk
 
@@ -412,19 +410,9 @@ def ragged_page_attention_kernel(
             k = jnp.where(kv_mask, k, 0)
             v = jnp.where(kv_mask, v, 0)
 
-            # Compute aux stats
-            aux_val = softmax_aux_ref[...]
-            m_aux = jnp.max(aux_val, axis=-1)
-            all_neginf_aux = jnp.isneginf(m_aux)
-            m_aux_safe = jnp.where(all_neginf_aux, 0.0, m_aux)
-            l_aux = jnp.sum(jnp.exp(aux_val - m_aux_safe[..., None]), axis=-1)
-            l_aux = jnp.where(all_neginf_aux, 0.0, l_aux)
-            m_aux = jnp.where(all_neginf_aux, -jnp.inf, m_aux)
-
-            # Broadcast to [num_q_per_blk * num_q_heads_per_kv_head, 128]
-            # m_aux: scalar (per kv head). ref shape: [N, 128]
-            m_aux = m_aux
-            l_aux = l_aux
+            sinks = softmax_aux_ref[...]  # [num_q_heads_per_kv_head, head_dim]
+            m_aux = jnp.concatenate([sinks] * num_q_per_blk, axis=0)
+            l_aux = jnp.ones_like(m_aux)
 
             qk = jnp.einsum("nd,md->nm", q, k, preferred_element_type=jnp.float32) * softmax_scale
             store_start = jnp.maximum(q_start - q_len_start, 0)
@@ -542,6 +530,7 @@ def ragged_page_attention_kernel(
                     k = k_list[step_idx]
                     v = v_list[step_idx]
                     kv_head_idx = kv_head_chunk_idx + step_idx
+                    global_kv_head_idx = heads_blk_idx * num_kv_heads_per_blk + kv_head_idx
                     q_head_idx = kv_head_idx * num_q_heads_per_kv_head
                     q = fold_on_2nd_minor(q_ref[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :])
                     flash_attention(
@@ -551,7 +540,7 @@ def ragged_page_attention_kernel(
                         l_ref.at[kv_head_idx],
                         m_ref.at[kv_head_idx],
                         acc_ref.at[:, q_head_idx : q_head_idx + num_q_heads_per_kv_head, :],
-                        softmax_aux_ref.at[kv_head_idx],
+                        softmax_aux_ref[global_kv_head_idx],
                         kv_blk_idx=kv_blk_idx,
                     )
             return kv_blk_idx + 1, next_buf_idx
