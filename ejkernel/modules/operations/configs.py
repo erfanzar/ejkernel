@@ -20,10 +20,29 @@ providing type-safe, operation-specific parameters for kernel execution
 and autotuning.
 """
 
+import hashlib
 from dataclasses import dataclass
 from typing import Literal
 
 from ejkernel.ops import BwdParams, FwdParams
+
+
+def get_safe_hash_int(text, algorithm="md5"):
+    """Generate a hash of text using specified algorithm with safety checks."""
+    try:
+        text_str = str(text)
+        hash_object = getattr(hashlib, algorithm)(text_str.encode())
+        return int.from_bytes(hash_object.digest(), byteorder="big")
+    except AttributeError as e:
+        raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
+    except Exception as e:
+        raise Exception(f"Error generating hash: {e!s}") from e
+
+
+def hash_fn(self) -> int:
+    """Generate a hash for an object based on its dictionary values."""
+    shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
+    return get_safe_hash_int(shu)
 
 
 @dataclass
@@ -32,6 +51,8 @@ class BaseOperationConfig:
 
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] = "auto"
     backend: str = "any"
+
+    __hash__ = hash_fn
 
 
 @dataclass
@@ -56,6 +77,8 @@ class FlashAttentionConfig(BaseOperationConfig):
         if isinstance(self.bwd_params, dict):
             self.bwd_params = BwdParams(**self.bwd_params)
 
+    __hash__ = hash_fn
+
 
 @dataclass
 class BlockSparseAttentionConfig(BaseOperationConfig):
@@ -74,6 +97,8 @@ class BlockSparseAttentionConfig(BaseOperationConfig):
             self.fwd_params = FwdParams(**self.fwd_params)
         if isinstance(self.bwd_params, dict):
             self.bwd_params = BwdParams(**self.bwd_params)
+
+    __hash__ = hash_fn
 
 
 @dataclass
@@ -98,6 +123,8 @@ class NativeSparseAttentionConfig(BaseOperationConfig):
     num_warps: int = 4
     num_stages: int = 1
 
+    __hash__ = hash_fn
+
 
 @dataclass
 class RecurrentAttentionConfig(BaseOperationConfig):
@@ -118,6 +145,8 @@ class RecurrentAttentionConfig(BaseOperationConfig):
     block_d: int = 64
     num_warps: int = 4
     num_stages: int = 1
+
+    __hash__ = hash_fn
 
 
 @dataclass
@@ -142,6 +171,8 @@ class RingAttentionConfig(BaseOperationConfig):
     num_warps: int = 4
     num_stages: int = 2
 
+    __hash__ = hash_fn
+
 
 @dataclass
 class PageAttentionConfig(BaseOperationConfig):
@@ -161,6 +192,8 @@ class PageAttentionConfig(BaseOperationConfig):
     num_warps: int = 4
     num_stages: int = 1
 
+    __hash__ = hash_fn
+
 
 @dataclass
 class AttentionConfig(BaseOperationConfig):
@@ -179,6 +212,8 @@ class AttentionConfig(BaseOperationConfig):
     block_k: int = 128
     num_warps: int = 4
     num_stages: int = 2
+
+    __hash__ = hash_fn
 
 
 @dataclass
@@ -202,6 +237,8 @@ class GroupedMatmulConfig(BaseOperationConfig):
     num_stages: int = 2
     bypass_xla_tiling: bool = False
 
+    __hash__ = hash_fn
+
 
 @dataclass
 class MeanPoolingConfig(BaseOperationConfig):
@@ -218,6 +255,8 @@ class MeanPoolingConfig(BaseOperationConfig):
     block_size: int = 64
     num_warps: int = 4
     num_stages: int = 1
+
+    __hash__ = hash_fn
 
 
 @dataclass
@@ -238,6 +277,8 @@ class RaggedDecodeAttentionConfig(BaseOperationConfig):
         if isinstance(self.fwd_params, dict):
             self.fwd_params = FwdParams(**self.fwd_params)
 
+    __hash__ = hash_fn
+
 
 @dataclass
 class RaggedPageAttentionv2Config(BaseOperationConfig):
@@ -256,6 +297,8 @@ class RaggedPageAttentionv2Config(BaseOperationConfig):
     num_queries_per_block: int | None = None
     num_warps: int = 4
     num_stages: int = 1
+
+    __hash__ = hash_fn
 
 
 @dataclass
@@ -276,6 +319,8 @@ class RaggedPageAttentionv3Config(BaseOperationConfig):
     num_queries_per_block: int | None = None
     num_warps: int = 4
     num_stages: int = 1
+
+    __hash__ = hash_fn
 
 
 @dataclass
@@ -298,6 +343,8 @@ class GLAttentionConfig(BaseOperationConfig):
     num_warps: int = 4
     num_stages: int = 1
 
+    __hash__ = hash_fn
+
 
 @dataclass
 class LightningAttentionConfig(BaseOperationConfig):
@@ -319,6 +366,8 @@ class LightningAttentionConfig(BaseOperationConfig):
     num_warps: int = 4
     num_stages: int = 1
 
+    __hash__ = hash_fn
+
 
 @dataclass
 class FlashMLAConfig(BaseOperationConfig):
@@ -338,6 +387,8 @@ class FlashMLAConfig(BaseOperationConfig):
     num_warps: int = 4
     num_stages: int = 2
 
+    __hash__ = hash_fn
+
 
 @dataclass
 class ScaledDotProductAttentionConfig(BaseOperationConfig):
@@ -352,3 +403,5 @@ class ScaledDotProductAttentionConfig(BaseOperationConfig):
     """
 
     pass
+
+    __hash__ = hash_fn
