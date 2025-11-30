@@ -838,36 +838,36 @@ def get_tpu_generation() -> int:
         return 0
 
 
-def make_mesh(mesh_axis: tuple[int, int, int]):
-    return jax.make_mesh(mesh_axis, ("data", "tensor", "sequence"))
+def make_mesh(mesh_axis: tuple[int, int, int, int]):
+    return jax.make_mesh(mesh_axis, ("dp", "fsdp", "tp", "sp"))
 
 
 def get_qkv_shardings(layout: Literal["bhsd", "bshd", "thd"]):
     """Returns sharding specifications for queries, keys, and values based on the layout."""
     if layout == "bhsd":
-        qps = Ps("data", "tensor", None, None)
-        kps = Ps("data", "tensor", None, None)
-        vps = Ps("data", "tensor", None, None)
+        qps = Ps(("dp", "fsdp"), "tp", None, None)
+        kps = Ps(("dp", "fsdp"), "tp", None, None)
+        vps = Ps(("dp", "fsdp"), "tp", None, None)
 
-        sqps = Ps("data", "tensor", "sequence", None)
-        skps = Ps("data", "tensor", "sequence", None)
-        svps = Ps("data", "tensor", "sequence", None)
+        sqps = Ps(("dp", "fsdp"), "tp", "sp", None)
+        skps = Ps(("dp", "fsdp"), "tp", "sp", None)
+        svps = Ps(("dp", "fsdp"), "tp", "sp", None)
     elif layout == "bshd":
-        qps = Ps("data", None, "tensor", None)
-        kps = Ps("data", None, "tensor", None)
-        vps = Ps("data", None, "tensor", None)
+        qps = Ps(("dp", "fsdp"), None, "tp", None)
+        kps = Ps(("dp", "fsdp"), None, "tp", None)
+        vps = Ps(("dp", "fsdp"), None, "tp", None)
 
-        sqps = Ps("data", "sequence", "tensor", None)
-        skps = Ps("data", "sequence", "tensor", None)
-        svps = Ps("data", "sequence", "tensor", None)
+        sqps = Ps(("dp", "fsdp"), "sp", "tp", None)
+        skps = Ps(("dp", "fsdp"), "sp", "tp", None)
+        svps = Ps(("dp", "fsdp"), "sp", "tp", None)
     elif layout == "thd":
-        qps = Ps(None, "tensor", "data", None)
-        kps = Ps(None, "tensor", "data", None)
-        vps = Ps(None, "tensor", "data", None)
+        qps = Ps(None, "tp", ("dp", "fsdp"), None)
+        kps = Ps(None, "tp", ("dp", "fsdp"), None)
+        vps = Ps(None, "tp", ("dp", "fsdp"), None)
 
-        sqps = Ps("sequence", "tensor", "data", None)
-        skps = Ps("sequence", "tensor", "data", None)
-        svps = Ps("sequence", "tensor", "data", None)
+        sqps = Ps("sp", "tp", ("dp", "fsdp"), None)
+        skps = Ps("sp", "tp", ("dp", "fsdp"), None)
+        svps = Ps("sp", "tp", ("dp", "fsdp"), None)
     else:
         raise ValueError(f"Unsupported layout: {layout}")
 
@@ -875,8 +875,8 @@ def get_qkv_shardings(layout: Literal["bhsd", "bshd", "thd"]):
 
 
 def get_segments_shardings():
-    qps = Ps("data", None)
-    kvps = Ps("data", None)
-    sqps = Ps("data", None)
-    skvps = Ps("data", "sequence")
+    qps = Ps(("dp", "fsdp"), None)
+    kvps = Ps(("dp", "fsdp"), None)
+    sqps = Ps(("dp", "fsdp"), None)
+    skvps = Ps(("dp", "fsdp"), "sp")
     return qps, kvps, sqps, skvps

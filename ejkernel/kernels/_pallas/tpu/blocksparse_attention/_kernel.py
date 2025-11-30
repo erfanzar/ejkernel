@@ -2494,6 +2494,11 @@ def blocksparse_attention(
         if kv_segment_ids is None:
             kv_segment_ids = inferred_kv_seg
 
+    if q_segment_ids is not None and kv_segment_ids is None:
+        raise ValueError("If `q_segment_ids` is provided, `kv_segment_ids` must also be provided.")
+    if kv_segment_ids is not None and q_segment_ids is None:
+        raise ValueError("If `kv_segment_ids` is provided, `q_segment_ids` must also be provided.")
+
     if mask_builder is None:
 
         def mask_builder(q_len: int, kv_len: int, num_heads: int, head_idx: int, num_reps: int) -> Mask:
@@ -2538,7 +2543,19 @@ def blocksparse_attention(
         [mask_builder(query_length, kv_length, query.shape[-3], ox, query.shape[-2]) for ox in range(query.shape[-3])]
     )
 
-    def attn_static_fn(q, k, v, segment_ids, softmax_aux):
+    def attn_static_fn(
+        q,
+        k,
+        v,
+        q_segment_ids,
+        kv_segment_ids,
+        softmax_aux,
+    ):
+        segment_ids = None
+
+        if kv_segment_ids is not None and q_segment_ids is not None:
+            segment_ids = SegmentIds(q_segment_ids, kv_segment_ids)
+
         return make_splash_mha(
             mask=mask,
             block_sizes=block_sizes,
@@ -2553,16 +2570,23 @@ def blocksparse_attention(
             sinks=softmax_aux,
         )
 
-    attn_fn = jax.vmap(attn_static_fn, in_axes=(0, 0, 0, None, None))
-    segment_ids = None
-
-    if kv_segment_ids is not None:
-        segment_ids = SegmentIds(q_segment_ids, kv_segment_ids)
+    attn_fn = jax.vmap(
+        attn_static_fn,
+        in_axes=(
+            0,
+            0,
+            0,
+            0 if q_segment_ids is not None else None,
+            0 if kv_segment_ids is not None else None,
+            None,
+        ),
+    )
 
     return attn_fn(
         query * softmax_scale,
         key,
         value,
-        segment_ids,
+        q_segment_ids,
+        kv_segment_ids,
         softmax_aux,
     )

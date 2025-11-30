@@ -1021,7 +1021,7 @@ class MaskInfo:
                     f"{self._attention_mask.ndim}D array with shape {self._attention_mask.shape}. "
                     f"Use from_attention_mask() to construct MaskInfo from lower-dimensional masks."
                 )
-            att_spec = PartitionSpec(batch_axis_name, qheads_axis_name, att_seq_spec, att_seq_spec)
+            att_spec = PartitionSpec(batch_axis_name, qheads_axis_name, att_seq_spec, None)
             attention_mask = get_corrected_named_sharding(self._attention_mask.shape, att_spec, mesh=mesh).spec
 
         q_segment_ids = (
@@ -1915,7 +1915,7 @@ class MaskInfo:
 
         Example:
             >>> mask_info = MaskInfo.from_segments(jnp.array([[1, 1, 2, 2]]))
-            >>> new_mask_info = mask_info.replace(batch_axis_name="data")
+            >>> new_mask_info = mask_info.replace(batch_axis_name="dp")
             >>> new_mask_info.batch_axis_name
             'data'
         """

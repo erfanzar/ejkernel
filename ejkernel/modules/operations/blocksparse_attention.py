@@ -33,7 +33,7 @@ import typing
 from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
@@ -112,11 +112,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
         softmax_aux: Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
-        attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
-        | Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
-        | Int[Array, "batch num_heads seq_len kv_len"]
-        | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
-        | None = None,
         q_segment_ids: Int[Array, "batch seq_len"] | None = None,
         kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
         q_positions: Int[Array, "batch seq_len"] | None = None,
@@ -165,11 +160,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             kv_segment_ids: Int[Array, "batch kv_len"] | None,
             q_positions: Int[Array, "batch seq_len"] | None,
             kv_positions: Int[Array, "batch kv_len"] | None,
-            attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
-            | Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
-            | Int[Array, "batch num_heads seq_len kv_len"]
-            | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
-            | None,
         ) -> Float[Array, "batch seq_len num_heads head_dim"]:
             return self.run(
                 query=query,
@@ -181,7 +171,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
                 kv_positions=kv_positions,
                 softmax_aux=softmax_aux,
                 bias=bias,
-                attention_mask=attention_mask,
                 sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
                 logits_soft_cap=logits_soft_cap,
                 qkv_layouts=qkv_layouts,
@@ -205,7 +194,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             kv_segment_ids,
             q_positions,
             kv_positions,
-            attention_mask,
         )
 
         assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
@@ -245,11 +233,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
         softmax_aux: Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
-        attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
-        | Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
-        | Int[Array, "batch num_heads seq_len kv_len"]
-        | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
-        | None = None,
         q_segment_ids: Int[Array, "batch seq_len"] | None = None,
         kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
         q_positions: Int[Array, "batch seq_len"] | None = None,
@@ -316,7 +299,6 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             softmax_aux=softmax_aux,
             logits_soft_cap=logits_soft_cap,
             bias=bias,
-            attention_mask=attention_mask,
             sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
             qkv_layouts=qkv_layouts,
             fwd_params=cfg.fwd_params,
@@ -875,7 +857,6 @@ def blocksparse_attention(
         - Scenarios where custom sparsity patterns are needed
     """
 
-    attention_mask = None
     q_segment_ids = None
     kv_segment_ids = None
     q_positions = None
@@ -883,7 +864,6 @@ def blocksparse_attention(
 
     if mask_info is not None:
         q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids()
-        attention_mask = mask_info.get_or_compute_attention_mask()
 
         if q_positions is None or kv_positions is None:
             mask_q_pos, mask_kv_pos = mask_info.get_or_compute_positions()
@@ -896,7 +876,7 @@ def blocksparse_attention(
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
         if mask_info is None:
-            in_specs = (*in_specs, None, None, None, None, None)
+            in_specs = (*in_specs, None, None, None, None)
         else:
             shardings = mask_info.get_shardings(False, mesh=mesh)
             in_specs = (
@@ -905,7 +885,6 @@ def blocksparse_attention(
                 shardings.kv_segment_ids,
                 shardings.q_positions,
                 shardings.kv_positions,
-                shardings.attention_mask,
             )
     return _executor(
         BlockSparseAttention(),
@@ -919,7 +898,6 @@ def blocksparse_attention(
         softmax_aux=softmax_aux,
         logits_soft_cap=logits_soft_cap,
         bias=bias,
-        attention_mask=attention_mask,
         sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
         qkv_layouts=qkv_layouts,
         softmax_scale=softmax_scale,
