@@ -43,6 +43,7 @@ from .page_attention import page_attention
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .recurrent import recurrent
+from .ring_attention import ring_attention
 
 __all__ = (
     "apply_native_sparse_attention",
@@ -56,4 +57,5 @@ __all__ = (
     "ragged_page_attention_v2",
     "recurrent",
     "recurrent_gla",
+    "ring_attention",
 )

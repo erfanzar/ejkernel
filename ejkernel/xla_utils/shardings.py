@@ -13,6 +13,10 @@
 # limitations under the License.
 
 
+from functools import partial
+
+import jax
+from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 
@@ -100,3 +104,45 @@ def get_corrected_named_sharding(
         final_spec_to_apply = corrected_spec
 
     return NamedSharding(mesh, final_spec_to_apply)
+
+
+@partial(jax.jit, static_argnames=("cp_size", "seq_dim", "to_contiguous"))
+def reorder_sequence(tensor, cp_size: int, seq_dim: int = 1, to_contiguous: bool = False):
+    if tensor is None:
+        return tensor
+
+    seq_len = tensor.shape[seq_dim]
+    group_size = seq_len // (2 * cp_size)
+
+    if cp_size % 2 != 0:
+        raise ValueError(f"{cp_size=} must be a multiple of 2.")
+
+    if seq_len % (cp_size * 2) != 0:
+        raise ValueError(f"{tensor.shape=} is not a multiple of {cp_size*2=}")
+
+    ori_tensor_shape = tensor.shape
+    reshaped = tensor.reshape(
+        *ori_tensor_shape[:seq_dim],
+        2 * cp_size,
+        group_size,
+        *ori_tensor_shape[seq_dim + 1 :],
+    )
+
+    if not to_contiguous:
+        first_half = jnp.arange(cp_size)
+        second_half = jnp.arange(2 * cp_size - 1, cp_size - 1, -1)
+        src_indices = jnp.stack([first_half, second_half], axis=1).reshape(-1)
+
+    else:
+        half = cp_size // 2
+        first_pair = [4 * r for r in range(half)]
+        second_pair = [4 * r + 2 for r in range(half)]
+        third_pair = [2 * cp_size - 1 - 4 * r for r in range(half)]
+        fourth_pair = [i - 2 for i in third_pair]
+        first_block = first_pair + third_pair
+        second_block = second_pair + fourth_pair
+        src_indices = jnp.stack([jnp.array(first_block), jnp.array(second_block)], axis=1).reshape(-1)
+
+    reordered = jnp.take(reshaped, src_indices, axis=seq_dim)
+
+    return reordered.reshape(ori_tensor_shape)

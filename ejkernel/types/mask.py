@@ -1202,9 +1202,10 @@ class MaskInfo:
         Returns:
             True if query and key-value sequences are identical, False otherwise
         """
-        if self._q_segment_ids is not None and self.kv_segment_ids is not None:
-            return self._q_segment_ids.shape == self.kv_segment_ids.shape and jnp.array_equal(
-                self._q_segment_ids, self.kv_segment_ids
+        if self._q_segment_ids is not None and self._kv_segment_ids is not None:
+            return self._q_segment_ids.shape == self._kv_segment_ids.shape and jnp.array_equal(
+                self._q_segment_ids,
+                self._kv_segment_ids,
             )
 
         if self.attention_mask is not None:
@@ -1618,15 +1619,17 @@ class MaskInfo:
             q_seg_cur, kv_seg_cur = self.get_or_compute_segment_ids()
             q_pad = q_seg_cur < 0
             kv_pad = kv_seg_cur < 0
-        except Exception:
+        except ValueError:
             q_valid = jnp.any(base_mask, axis=(1, 3))
             kv_valid = jnp.any(base_mask, axis=(1, 2))
             q_pad = ~q_valid
             kv_pad = ~kv_valid
 
-        # Chunk IDs are 1-based (chunk indices + 1), padding stays -1
-        q_chunk_ids = (q_idx // chunk_size + 1).astype(jnp.int32)[None, :]
-        kv_chunk_ids = (kv_idx // chunk_size + 1).astype(jnp.int32)[None, :]
+        batch_size = base_mask.shape[0]
+        q_chunk_ids_base = (q_idx // chunk_size + 1).astype(jnp.int32)
+        kv_chunk_ids_base = (kv_idx // chunk_size + 1).astype(jnp.int32)
+        q_chunk_ids = jnp.broadcast_to(q_chunk_ids_base[None, :], (batch_size, self.q_len))
+        kv_chunk_ids = jnp.broadcast_to(kv_chunk_ids_base[None, :], (batch_size, self.kv_len))
 
         q_segment_ids = jnp.where(q_pad, -1, q_chunk_ids)
         kv_segment_ids = jnp.where(kv_pad, -1, kv_chunk_ids)

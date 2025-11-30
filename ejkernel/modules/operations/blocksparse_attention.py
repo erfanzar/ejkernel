@@ -110,7 +110,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         query: Float[Array, "batch num_heads seq_len head_dim"],
         key: Float[Array, "batch kv_num_heads kv_len head_dim"],
         value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        softmax_aux: Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
         attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
         | Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
@@ -159,7 +159,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             query: Float[Array, "batch num_heads seq_len head_dim"],
             key: Float[Array, "batch kv_num_heads kv_len head_dim"],
             value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-            softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None,
+            softmax_aux: Float[Array, "num_sinks"] | None,
             bias: Float[Array, "batch num_heads seq_len head_dim"] | None,
             q_segment_ids: Int[Array, "batch seq_len"] | None,
             kv_segment_ids: Int[Array, "batch kv_len"] | None,
@@ -243,7 +243,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         query: Float[Array, "batch num_heads seq_len head_dim"],
         key: Float[Array, "batch kv_num_heads kv_len head_dim"],
         value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-        softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        softmax_aux: Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
         attention_mask: Bool[Array, "batch num_heads seq_len kv_len"]
         | Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
@@ -790,7 +790,7 @@ def blocksparse_attention(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch kv_num_heads kv_len head_dim"],
     value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
     /,
     *,

@@ -154,22 +154,20 @@ class RingAttentionConfig(BaseOperationConfig):
     """Configuration for Ring Attention operation.
 
     Args:
-        block_q: Query block size (default: 128)
-        block_k: Key block size (default: 128)
-        query_chunk_size: Chunk size for query processing (default: 512)
-        key_chunk_size: Chunk size for key processing (default: 512)
-        num_warps: Number of warps for Triton kernels (default: 4)
-        num_stages: Number of pipeline stages (default: 2)
+        fwd_params: Forward pass block size parameters
+        bwd_params: Backward pass block size parameters
         platform: Target platform (triton/pallas/cuda/xla/auto)
         backend: Backend specification (default: "any")
     """
 
-    block_q: int = 128
-    block_k: int = 128
-    query_chunk_size: int = 512
-    key_chunk_size: int = 512
-    num_warps: int = 4
-    num_stages: int = 2
+    fwd_params: FwdParams | None = None
+    bwd_params: BwdParams | None = None
+
+    def __post_init__(self):
+        if isinstance(self.fwd_params, dict):
+            self.fwd_params = FwdParams(**self.fwd_params)
+        if isinstance(self.bwd_params, dict):
+            self.bwd_params = BwdParams(**self.bwd_params)
 
     __hash__ = hash_fn
 

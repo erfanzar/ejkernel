@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 
+import typing
+from collections.abc import Callable
 from functools import partial
 
 import chex
@@ -24,10 +27,14 @@ from jax import numpy as jnp
 from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
 
 from ejkernel.callib import ejit
+from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_bwd import _ring_attention_bwd
 from ._xla_impl_fwd import _ring_attention_fwd
+
+if typing.TYPE_CHECKING:
+    from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
 @partial(jax.custom_vjp, nondiff_argnums=[7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23])
@@ -144,45 +151,28 @@ def ring_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    cache_idx=None,
-    attention_mask=None,
-    axis_name: str | None = None,
-    float32_logits: bool = True,
-    softmax_scale: float | None = None,
-    query_chunk_size: int = 512,
-    key_chunk_size: int = 512,
-    causal_block_size: int | None = None,
-    deterministic: bool = True,
-    dropout_rng: PRNGKeyArray | None = None,
-    pdrop: float = 0.0,
-    dtype: DTypeLike = jnp.float32,
-    policy=jax.checkpoint_policies.nothing_saveable,
-    precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
-    prevent_cse: bool = True,
+    softmax_aux: Float[Array, "num_heads"] | Float[Array, "num_sinks"] | None = None,
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
-    logits_soft_cap: float | None = None,
-    attention_sink_size: int = 0,
+    chunk_size: int | None = None,
     causal: bool = False,
+    logits_soft_cap: float | None = None,
+    softmax_scale: float | None = None,
+    axis_name: str | None = None,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
+    fused_backward: bool = False,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    query_chunk_size = min(query_chunk_size, query.shape[1])
-    key_chunk_size = min(key_chunk_size, key.shape[1])
-
-    if attention_mask is not None:
-        if attention_mask.dtype != jnp.bool_:
-            attention_mask = attention_mask.astype(jnp.bool_)
-        if attention_mask.ndim == 2:
-            attention_mask = attention_mask[None, None, ...]
-        elif attention_mask.ndim == 3:
-            attention_mask = attention_mask[:, None, ...]
-
-        neg_inf = jnp.array(-jnp.inf, dtype=dtype)
-        zero = jnp.array(0.0, dtype=dtype)
-        mask_bias = jnp.where(attention_mask, zero, neg_inf)
-        bias = mask_bias if bias is None else (bias + mask_bias)
+    if fwd_params is None:
+        fwd_params = FwdParams(
+            q_blocksize=min(512, query.shape[1]),
+            kv_blocksize=min(512, key.shape[1]),
+        )
+    query_chunk_size = min(fwd_params.q_blocksize, query.shape[1])
+    key_chunk_size = min(fwd_params.kv_blocksize, key.shape[1])
 
     return _ring_attention(
         query,
@@ -193,20 +183,20 @@ def ring_attention(
         kv_segment_ids,
         softmax_aux,
         axis_name,
-        float32_logits,
+        True,
         softmax_scale,
         query_chunk_size,
         key_chunk_size,
-        causal_block_size,
-        deterministic,
-        dropout_rng,
-        pdrop,
-        dtype,
-        policy,
-        precision,
-        prevent_cse,
+        None,
+        True,
+        None,
+        0.0,
+        jnp.bfloat16,
+        jax.checkpoint_policies.nothing_saveable,
+        jax.lax.Precision.DEFAULT,
+        True,
         sliding_window,
         logits_soft_cap,
-        attention_sink_size,
+        0,
         causal,
     )

@@ -199,7 +199,7 @@ def inner_decode_tpu(
     fwd_params: FwdParams | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
 ) -> chex.Array:
     """JIT-compiled core implementation of ragged MQA Flash Attention for TPU.
 

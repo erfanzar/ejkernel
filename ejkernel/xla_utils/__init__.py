@@ -14,7 +14,7 @@
 
 
 from .cumsum import chunk_global_cumsum, chunk_local_cumsum
-from .shardings import get_corrected_named_sharding
+from .shardings import get_corrected_named_sharding, reorder_sequence
 from .utils import (
     cdiv,
     identity_dtype_convert,
@@ -42,4 +42,5 @@ __all__ = [
     "prepare_position_ids",
     "prepare_sequence_ids",
     "prepare_token_indices",
+    "reorder_sequence",
 ]

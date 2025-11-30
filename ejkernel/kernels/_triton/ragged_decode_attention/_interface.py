@@ -35,7 +35,7 @@ def ragged_decode_attention(
     fwd_params: FwdParams | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
 ) -> Float[Array, "batch num_q_heads head_dim"]:
     """
     Ragged decode attention (GPU/Triton), functionally matching the TPU/Pallas version.

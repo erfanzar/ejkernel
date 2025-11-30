@@ -938,5 +938,123 @@ def test_visualize_smoke():
     assert isinstance(s, str) and "Attention mask" in s
 
 
+def test_is_self_attention_no_lazy_compute():
+    """Test is_self_attention uses consistent private field access (bug fix regression)."""
+    print("\nTesting is_self_attention consistent field access...")
+
+    # Create MaskInfo with only attention_mask, no segment IDs
+    mask = jnp.ones((1, 1, 4, 4), dtype=jnp.bool_)
+    mask_info = MaskInfo(
+        _attention_mask=mask,
+        _q_segment_ids=None,
+        _kv_segment_ids=None,
+    )
+
+    # is_self_attention should check private fields and not trigger lazy compute
+    # Since both _q_segment_ids and _kv_segment_ids are None, it should fall through
+    # to the attention_mask check without triggering get_or_compute_segment_ids
+    result = mask_info.is_self_attention()
+
+    # With square mask, it's considered self-attention
+    assert result == True
+
+    # Verify segment IDs were NOT computed (no side effect)
+    assert mask_info._q_segment_ids is None
+    assert mask_info._kv_segment_ids is None
+
+    print("  ✓ is_self_attention no lazy compute: OK")
+
+
+def test_apply_chunked_multi_batch_padding():
+    """Test apply_chunked handles multiple batches with different padding correctly (bug fix regression)."""
+    print("\nTesting apply_chunked multi-batch padding...")
+
+    @jax.jit
+    def run_chunked(segment_ids):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_chunked(chunk_size=3)
+
+    # Two batches with different padding patterns
+    segment_ids = jnp.array([
+        [1, 1, 1, 1, 1, 1],  # No padding
+        [1, 1, 1, 1, -1, -1],  # Last 2 are padding
+    ], dtype=jnp.int32)
+
+    chunked = run_chunked(segment_ids)
+
+    # Verify shapes
+    assert chunked.q_segment_ids.shape == (2, 6)
+    assert chunked.kv_segment_ids.shape == (2, 6)
+
+    # Batch 0: no padding, chunks should be [1,1,1,2,2,2]
+    assert jnp.all(chunked.q_segment_ids[0, :3] == 1)
+    assert jnp.all(chunked.q_segment_ids[0, 3:] == 2)
+
+    # Batch 1: positions 4,5 are padding, should be -1
+    assert jnp.all(chunked.q_segment_ids[1, :3] == 1)
+    assert chunked.q_segment_ids[1, 3] == 2
+    assert chunked.q_segment_ids[1, 4] == -1
+    assert chunked.q_segment_ids[1, 5] == -1
+
+    print("  ✓ apply_chunked multi-batch padding (JIT): OK")
+
+
+def test_apply_chunked_batch_independence():
+    """Test apply_chunked maintains batch independence for chunk IDs (bug fix regression)."""
+    print("\nTesting apply_chunked batch independence...")
+
+    @jax.jit
+    def run_chunked(segment_ids):
+        mask_info = MaskInfo.from_segments(segment_ids)
+        return mask_info.apply_chunked(chunk_size=2)
+
+    # Three batches with varying padding
+    segment_ids = jnp.array([
+        [1, 1, 1, 1, 1, 1, 1, 1],  # No padding
+        [1, 1, 1, 1, 1, -1, -1, -1],  # Last 3 padding
+        [1, 1, -1, -1, -1, -1, -1, -1],  # Last 6 padding
+    ], dtype=jnp.int32)
+
+    chunked = run_chunked(segment_ids)
+
+    # Batch 0: [1,1,2,2,3,3,4,4]
+    expected_b0 = jnp.array([1, 1, 2, 2, 3, 3, 4, 4])
+    assert jnp.array_equal(chunked.q_segment_ids[0], expected_b0)
+
+    # Batch 1: [1,1,2,2,3,-1,-1,-1]
+    expected_b1 = jnp.array([1, 1, 2, 2, 3, -1, -1, -1])
+    assert jnp.array_equal(chunked.q_segment_ids[1], expected_b1)
+
+    # Batch 2: [1,1,-1,-1,-1,-1,-1,-1]
+    expected_b2 = jnp.array([1, 1, -1, -1, -1, -1, -1, -1])
+    assert jnp.array_equal(chunked.q_segment_ids[2], expected_b2)
+
+    print("  ✓ apply_chunked batch independence (JIT): OK")
+
+
+def test_is_self_attention_with_segment_ids():
+    """Test is_self_attention correctly identifies self vs cross attention."""
+    print("\nTesting is_self_attention correctness...")
+
+    # Self-attention: same q and kv segments
+    q_seg = jnp.array([[1, 1, 2, 2]])
+    mask_info_self = MaskInfo.from_segments(q_seg)
+    assert mask_info_self.is_self_attention() == True
+
+    # Cross-attention: different q and kv segments
+    q_seg = jnp.array([[1, 2]])
+    kv_seg = jnp.array([[1, 1, 2, 2]])
+    mask_info_cross = MaskInfo.from_segments(q_seg, kv_seg)
+    assert mask_info_cross.is_self_attention() == False
+
+    # Same shape but different values - not self-attention
+    q_seg = jnp.array([[1, 1, 2, 2]])
+    kv_seg = jnp.array([[2, 2, 1, 1]])
+    mask_info_diff = MaskInfo.from_segments(q_seg, kv_seg)
+    assert mask_info_diff.is_self_attention() == False
+
+    print("  ✓ is_self_attention correctness: OK")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

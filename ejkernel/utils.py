@@ -34,6 +34,7 @@ import numpy as np
 import triton
 from jax import Array
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec as Ps
 
 F = tp.TypeVar("F", bound=tp.Callable[..., tp.Any])
 
@@ -835,3 +836,47 @@ def get_tpu_generation() -> int:
 
     except (RuntimeError, IndexError):
         return 0
+
+
+def make_mesh(mesh_axis: tuple[int, int, int]):
+    return jax.make_mesh(mesh_axis, ("data", "tensor", "sequence"))
+
+
+def get_qkv_shardings(layout: Literal["bhsd", "bshd", "thd"]):
+    """Returns sharding specifications for queries, keys, and values based on the layout."""
+    if layout == "bhsd":
+        qps = Ps("data", "tensor", None, None)
+        kps = Ps("data", "tensor", None, None)
+        vps = Ps("data", "tensor", None, None)
+
+        sqps = Ps("data", "tensor", "sequence", None)
+        skps = Ps("data", "tensor", "sequence", None)
+        svps = Ps("data", "tensor", "sequence", None)
+    elif layout == "bshd":
+        qps = Ps("data", None, "tensor", None)
+        kps = Ps("data", None, "tensor", None)
+        vps = Ps("data", None, "tensor", None)
+
+        sqps = Ps("data", "sequence", "tensor", None)
+        skps = Ps("data", "sequence", "tensor", None)
+        svps = Ps("data", "sequence", "tensor", None)
+    elif layout == "thd":
+        qps = Ps(None, "tensor", "data", None)
+        kps = Ps(None, "tensor", "data", None)
+        vps = Ps(None, "tensor", "data", None)
+
+        sqps = Ps("sequence", "tensor", "data", None)
+        skps = Ps("sequence", "tensor", "data", None)
+        svps = Ps("sequence", "tensor", "data", None)
+    else:
+        raise ValueError(f"Unsupported layout: {layout}")
+
+    return qps, kps, vps, sqps, skps, svps
+
+
+def get_segments_shardings():
+    qps = Ps("data", None)
+    kvps = Ps("data", None)
+    sqps = Ps("data", None)
+    skvps = Ps("data", "sequence")
+    return qps, kvps, sqps, skvps

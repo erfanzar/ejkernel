@@ -88,10 +88,7 @@ class SegmentIds(NamedTuple):
     kv: jax.Array
 
 
-SplashCustomReturnType = Union[  # noqa
-    jax.Array,
-    tuple[jax.Array, tuple[jax.Array,]],
-]
+SplashCustomReturnType = Union[jax.Array, tuple[jax.Array, tuple[jax.Array,]]]  # noqa
 
 SplashResidualsType = tuple[
     jax.Array,
@@ -2416,7 +2413,7 @@ def blocksparse_attention(
     kv_segment_ids: Int[Array, "batch kv_len"] | None = None,
     q_positions: Int[Array, "batch seq_len"] | None = None,
     kv_positions: Int[Array, "batch kv_len"] | None = None,
-    softmax_aux: Float[Array, "num_kv_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len head_dim"] | None = None,
     attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
     | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
@@ -2537,20 +2534,17 @@ def blocksparse_attention(
         softmax_scale = query.shape[-1] ** -0.5
 
     assert query_length != 1
-
-    output_shape = (*query.shape[:-1], value.shape[-1])
-    num_reps = query.shape[1] // key.shape[1]
-    query = query.reshape((*query.shape[:-3], key.shape[-3], num_reps, query.shape[-2], query.shape[-1]))
-
     mask = MultiHeadMask(
         [mask_builder(query_length, kv_length, query.shape[-3], ox, query.shape[-2]) for ox in range(query.shape[-3])]
     )
 
     def attn_static_fn(q, k, v, segment_ids, softmax_aux):
-        return make_splash_mqa_single_device(
+        return make_splash_mha(
             mask=mask,
             block_sizes=block_sizes,
             logits_soft_cap=logits_soft_cap,
+            head_shards=1,
+            q_seq_shards=1,
         )(
             q=q,
             k=k,
@@ -2559,8 +2553,9 @@ def blocksparse_attention(
             sinks=softmax_aux,
         )
 
-    attn_fn = jax.vmap(jax.vmap(attn_static_fn, in_axes=(0, 0, 0, None, None)), in_axes=(0, 0, 0, 0, None))
+    attn_fn = jax.vmap(attn_static_fn, in_axes=(0, 0, 0, None, None))
     segment_ids = None
+
     if kv_segment_ids is not None:
         segment_ids = SegmentIds(q_segment_ids, kv_segment_ids)
 
@@ -2570,4 +2565,4 @@ def blocksparse_attention(
         value,
         segment_ids,
         softmax_aux,
-    ).reshape(output_shape)
+    )

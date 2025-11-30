@@ -62,20 +62,21 @@ References:
 from __future__ import annotations
 
 import os
+import typing
 from typing import Literal
 
-import jax
-from jax import lax, shard_map
-from jax import numpy as jnp
+from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
-from jaxtyping import Array, DTypeLike, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
+    BwdParams,
     ConfigCache,
     ConfigSelectorChain,
     Executor,
+    FwdParams,
     Invocation,
     Kernel,
     Tuner,
@@ -85,6 +86,11 @@ from ejkernel.types.mask import MaskInfo
 
 from ..base import detect_platform
 from .configs import RingAttentionConfig
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
 class RingAttention(Kernel[RingAttentionConfig, Array]):
@@ -127,27 +133,18 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-        cache_idx=None,
-        axis_name: str | None = None,
-        float32_logits: bool = True,
-        softmax_scale: float | None = None,
-        query_chunk_size: int = 512,
-        key_chunk_size: int = 512,
-        causal_block_size: int | None = None,
-        deterministic: bool = True,
-        dropout_rng: PRNGKeyArray | None = None,
-        pdrop: float = 0.0,
-        dtype: DTypeLike = jnp.float32,
-        policy=jax.checkpoint_policies.nothing_saveable,
-        precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
-        prevent_cse: bool = True,
+        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+        mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
         sliding_window: int | tuple[int, int] | None = None,
+        chunk_size: int | None = None,
+        causal: bool = False,
         logits_soft_cap: float | None = None,
-        attention_sink_size: int = 0,
+        softmax_scale: float | None = None,
+        axis_name: str | None = None,
+        fused_backward: bool = False,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         cfg: RingAttentionConfig | None = None,
         mesh: Mesh | None = None,
@@ -164,16 +161,24 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             query: Query tensor to be sharded
             key: Key tensor to be sharded
             value: Value tensor to be sharded
-            bias: Optional bias tensor
             q_segment_ids: Optional query segment IDs
             kv_segment_ids: Optional KV segment IDs
-            softmax_aux: Optional auxiliary softmax values
-            cache_idx: Optional cache index
+            softmax_aux: Optional attention sink logits
+            bias: Optional bias tensor
+            mask_builder: Optional custom mask builder function
+            sliding_window: Window size for local attention
+            chunk_size: Chunk size for chunked causal attention
+            causal: Whether to use causal masking
+            logits_soft_cap: Soft cap value for attention logits
+            softmax_scale: Scaling factor for attention scores
             axis_name: Axis name for ring communication
-            All other args: Ring attention parameters to be fixed
+            fused_backward: Whether to use fused backward kernel
+            platform: Target platform
+            cfg: Kernel configuration object
             mesh: JAX device mesh
-            in_specs: Input partition specs (for q, k, v, and optional bias/segment_ids/etc)
+            in_specs: Input partition specs
             out_specs: Output partition spec
+            check_vma: Check for virtual memory access
 
         Returns:
             Tuple of (shard_map_fn, call_args)
@@ -186,9 +191,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             query: Float[Array, "batch seq_len_q num_heads head_dim"],
             key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
             value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-            bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
             softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-            dropout_rng: PRNGKeyArray | None = None,
+            bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
             q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
             kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
@@ -196,27 +200,18 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
                 query=query,
                 key=key,
                 value=value,
-                bias=bias,
                 q_segment_ids=q_segment_ids,
                 kv_segment_ids=kv_segment_ids,
                 softmax_aux=softmax_aux,
-                cache_idx=cache_idx,
-                axis_name=axis_name,
-                float32_logits=float32_logits,
-                softmax_scale=softmax_scale,
-                query_chunk_size=query_chunk_size,
-                key_chunk_size=key_chunk_size,
-                causal_block_size=causal_block_size,
-                deterministic=deterministic,
-                dropout_rng=dropout_rng,
-                pdrop=pdrop,
-                dtype=dtype,
-                policy=policy,
-                precision=precision,
-                prevent_cse=prevent_cse,
+                bias=bias,
+                mask_builder=mask_builder,
                 sliding_window=sliding_window,
+                chunk_size=chunk_size,
+                causal=causal,
                 logits_soft_cap=logits_soft_cap,
-                attention_sink_size=attention_sink_size,
+                softmax_scale=softmax_scale,
+                axis_name=axis_name,
+                fused_backward=fused_backward,
                 platform=platform,
                 cfg=cfg,
             )
@@ -225,9 +220,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             query,
             key,
             value,
-            bias,
             softmax_aux,
-            dropout_rng,
+            bias,
             q_segment_ids,
             kv_segment_ids,
         )
@@ -262,27 +256,18 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
         key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-        cache_idx=None,
-        axis_name: str | None = None,
-        float32_logits: bool = True,
-        softmax_scale: float | None = None,
-        query_chunk_size: int = 512,
-        key_chunk_size: int = 512,
-        causal_block_size: int | None = None,
-        deterministic: bool = True,
-        dropout_rng: PRNGKeyArray | None = None,
-        pdrop: float = 0.0,
-        dtype: DTypeLike = jnp.float32,
-        policy=jax.checkpoint_policies.nothing_saveable,
-        precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
-        prevent_cse: bool = True,
+        bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+        mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
         sliding_window: int | tuple[int, int] | None = None,
+        chunk_size: int | None = None,
+        causal: bool = False,
         logits_soft_cap: float | None = None,
-        attention_sink_size: int = 0,
+        softmax_scale: float | None = None,
+        axis_name: str | None = None,
+        fused_backward: bool = False,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: RingAttentionConfig,
@@ -296,27 +281,18 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             query: Query tensor [batch, seq_len_q, num_heads, head_dim]
             key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim] (distributed)
             value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim] (distributed)
-            bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k]
             q_segment_ids: Optional query segment IDs [batch, seq_len_q]
             kv_segment_ids: Optional KV segment IDs [batch, seq_len_k]
             softmax_aux: Optional attention sink logits for long-context stability
-            cache_idx: Optional cache index for incremental decoding
-            axis_name: Name of the axis for collective operations (required for multi-device)
-            float32_logits: Use float32 for logit computation (default: True)
-            softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
-            query_chunk_size: Size of query chunks for tiling (default: 512)
-            key_chunk_size: Size of key chunks for tiling (default: 512)
-            causal_block_size: Block size for causal masking (None = no causal)
-            deterministic: Use deterministic dropout (default: True)
-            dropout_rng: PRNG key for dropout
-            pdrop: Dropout probability (default: 0.0)
-            dtype: Computation dtype (default: float32)
-            policy: Gradient checkpointing policy
-            precision: Matrix multiplication precision setting
-            prevent_cse: Prevent common subexpression elimination (default: True)
+            bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k]
+            mask_builder: Custom mask builder function(q_len, kv_len, num_heads, head_idx, num_reps) -> Mask
             sliding_window: Window size for local attention (int or (left, right) tuple)
+            chunk_size: Chunk size for chunked causal attention (Llama4 style)
+            causal: Whether to use causal masking
             logits_soft_cap: Soft cap value to bound attention logits
-            attention_sink_size: Number of sink tokens for attention stability
+            softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
+            axis_name: Name of the axis for collective operations (required for multi-device)
+            fused_backward: Whether to use fused backward kernel
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
             cfg: Kernel configuration object
 
@@ -339,11 +315,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
 
         if platform is not None:
             cfg = RingAttentionConfig(
-                block_q=cfg.block_q,
-                block_k=cfg.block_k,
-                block_d=cfg.block_d if hasattr(cfg, "block_d") else None,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
+                fwd_params=cfg.fwd_params,
+                bwd_params=cfg.bwd_params,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
@@ -352,27 +325,20 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             query=query,
             key=key,
             value=value,
-            bias=bias,
             q_segment_ids=q_segment_ids,
             kv_segment_ids=kv_segment_ids,
             softmax_aux=softmax_aux,
-            cache_idx=cache_idx,
-            axis_name=axis_name,
-            float32_logits=float32_logits,
-            softmax_scale=softmax_scale,
-            query_chunk_size=query_chunk_size,
-            key_chunk_size=key_chunk_size,
-            causal_block_size=causal_block_size,
-            deterministic=deterministic,
-            dropout_rng=dropout_rng,
-            pdrop=pdrop,
-            dtype=dtype,
-            policy=policy,
-            precision=precision,
-            prevent_cse=prevent_cse,
+            bias=bias,
+            mask_builder=mask_builder,
             sliding_window=sliding_window,
+            chunk_size=chunk_size,
+            causal=causal,
             logits_soft_cap=logits_soft_cap,
-            attention_sink_size=attention_sink_size,
+            softmax_scale=softmax_scale,
+            axis_name=axis_name,
+            fwd_params=cfg.fwd_params,
+            bwd_params=cfg.bwd_params,
+            fused_backward=fused_backward,
         )
 
     def heuristic_cfg(self, inv: Invocation[RingAttentionConfig, Array]) -> RingAttentionConfig:
@@ -382,14 +348,12 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             inv: Invocation object containing arguments and metadata
 
         Returns:
-            Default KernelConfig with block sizes balanced for communication
+            Default RingAttentionConfig with block sizes balanced for communication
             and computation overlap in distributed settings
         """
         return RingAttentionConfig(
-            block_q=128,
-            block_k=128,
-            num_warps=4,
-            num_stages=2,
+            fwd_params=FwdParams(q_blocksize=512, kv_blocksize=512, num_stages=2, num_warps=4),
+            bwd_params=BwdParams(q_blocksize=512, kv_blocksize=512, num_stages=2, num_warps=4),
             platform="auto",
             backend="any",
         )
@@ -414,8 +378,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         for block_q, block_k in [(128, 128), (256, 256), (512, 512)]:
             candidates.append(
                 RingAttentionConfig(
-                    block_q=block_q,
-                    block_k=block_k,
+                    fwd_params=FwdParams(q_blocksize=block_q, kv_blocksize=block_k, num_stages=2, num_warps=4),
+                    bwd_params=BwdParams(q_blocksize=block_q, kv_blocksize=block_k, num_stages=2, num_warps=4),
                     platform="auto",
                     backend="any",
                 )
@@ -442,12 +406,12 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
 
         candidates = []
         for block_q, block_k, num_warps, num_stages in block_configs:
+            fwd = FwdParams(q_blocksize=block_q, kv_blocksize=block_k, num_stages=num_stages, num_warps=num_warps)
+            bwd = BwdParams(q_blocksize=block_q, kv_blocksize=block_k, num_stages=num_stages, num_warps=num_warps)
             candidates.append(
                 RingAttentionConfig(
-                    block_q=block_q,
-                    block_k=block_k,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
+                    fwd_params=fwd,
+                    bwd_params=bwd,
                     platform="pallas",
                     backend="tpu",
                 )
@@ -467,7 +431,7 @@ _ring_executor: Executor[RingAttentionConfig, Array] = Executor(
             validate_backward=True,
         ),
         tuner=Tuner(warmup=5, iters=100),
-        persistent=PersistentCache("ring-attention"),
+        persistent=PersistentCache("ring-attention", cfg_type=RingAttentionConfig),
     )
 )
 
@@ -476,28 +440,19 @@ def ring_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
-    dropout_rng: PRNGKeyArray | None = None,
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     /,
     *,
     mask_info: MaskInfo | None = None,
-    cache_idx=None,
-    axis_name: str | None = None,
-    float32_logits: bool = True,
-    softmax_scale: float | None = None,
-    query_chunk_size: int = 512,
-    key_chunk_size: int = 512,
-    causal_block_size: int | None = None,
-    deterministic: bool = True,
-    pdrop: float = 0.0,
-    dtype: DTypeLike = jnp.float32,
-    policy=jax.checkpoint_policies.nothing_saveable,
-    precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
-    prevent_cse: bool = True,
+    mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
+    chunk_size: int | None = None,
+    causal: bool = False,
     logits_soft_cap: float | None = None,
-    attention_sink_size: int = 0,
+    softmax_scale: float | None = None,
+    axis_name: str | None = None,
+    fused_backward: bool = False,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: RingAttentionConfig | None = None,
     mesh: Mesh | None = None,
@@ -514,26 +469,17 @@ def ring_attention(
         query: Query tensor [batch, seq_len_q, num_heads, head_dim]
         key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim]
         value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim]
-        mask_info: Optional MaskInfo containing attention mask and/or segment IDs
+        softmax_aux: Optional attention sink logits for long-context stability
         bias: Optional attention bias tensor
-        softmax_aux: Auxiliary softmax values
-        cache_idx: Cache index for inference
-        axis_name: Name of the axis for collective operations
-        float32_logits: Use float32 for logit computation
-        softmax_scale: Scaling factor for attention scores
-        query_chunk_size: Chunk size for queries (default: 512)
-        key_chunk_size: Chunk size for keys (default: 512)
-        causal_block_size: Block size for causal masking
-        deterministic: Use deterministic dropout
-        dropout_rng: RNG for dropout
-        pdrop: Dropout probability
-        dtype: Data type for computation
-        policy: Sharding policy
-        precision: Computation precision
-        prevent_cse: Prevent common subexpression elimination
-        sliding_window: Window size for local attention
+        mask_info: Optional MaskInfo containing attention mask and/or segment IDs
+        mask_builder: Custom mask builder function(q_len, kv_len, num_heads, head_idx, num_reps) -> Mask
+        sliding_window: Window size for local attention (int or (left, right) tuple)
+        chunk_size: Chunk size for chunked causal attention (Llama4 style)
+        causal: Whether to use causal masking
         logits_soft_cap: Soft capping value for logits
-        attention_sink_size: Size of attention sink
+        softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
+        axis_name: Name of the axis for collective operations
+        fused_backward: Whether to use fused backward kernel
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
         cfg: Optional configuration override
         mesh: JAX device mesh for shard_map execution (optional)
@@ -545,24 +491,16 @@ def ring_attention(
 
     Example:
         >>>
-        >>> out = ring_attention(query, key, value)
+        >>> out = ring_attention(query, key, value, causal=True, axis_name="sp")
         >>>
         >>>
         >>> out = ring_attention(
         ...     query, key, value,
-        ...     causal_block_size=128,
-        ...     query_chunk_size=256,
-        ...     key_chunk_size=256
-        ... )
-        >>>
-        >>>
-        >>> out = ring_attention(
-        ...     query, key, value,
+        ...     causal=True,
         ...     sliding_window=1024,
-        ...     pdrop=0.1,
-        ...     dropout_rng=rng
+        ...     axis_name="sp",
         ... )
-            >>>
+        >>>
         >>>
         >>> out = ring_attention(..., platform="triton")
     """
@@ -581,33 +519,25 @@ def ring_attention(
         else:
             shardings = mask_info.get_shardings(True, mesh=mesh)
             in_specs = (*in_specs, shardings.q_segment_ids, shardings.kv_segment_ids)
-            assert mask_info.sequence_axis_name == axis_name, "missmatch between two sequence axis names!."
+            assert mask_info.sequence_axis_name == axis_name, "mismatch between two sequence axis names!"
+
     return _ring_executor(
         RingAttention(),
         query=query,
         key=key,
         value=value,
+        softmax_aux=softmax_aux,
         bias=bias,
         q_segment_ids=q_segment_ids,
         kv_segment_ids=kv_segment_ids,
-        softmax_aux=softmax_aux,
-        cache_idx=cache_idx,
-        axis_name=axis_name,
-        float32_logits=float32_logits,
-        softmax_scale=softmax_scale,
-        query_chunk_size=query_chunk_size,
-        key_chunk_size=key_chunk_size,
-        causal_block_size=causal_block_size,
-        deterministic=deterministic,
-        dropout_rng=dropout_rng,
-        pdrop=pdrop,
-        dtype=dtype,
-        policy=policy,
-        precision=precision,
-        prevent_cse=prevent_cse,
+        mask_builder=mask_builder,
         sliding_window=sliding_window,
+        chunk_size=chunk_size,
+        causal=causal,
         logits_soft_cap=logits_soft_cap,
-        attention_sink_size=attention_sink_size,
+        softmax_scale=softmax_scale,
+        axis_name=axis_name,
+        fused_backward=fused_backward,
         platform=platform,
         method=method,
         mesh=mesh,

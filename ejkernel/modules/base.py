@@ -105,6 +105,9 @@ def detect_platform(
     if has_pallas and jax_backend in ("gpu") and maybe_pallas:
         return Platform.PALLAS
 
+    if has_pallas and jax_backend in ("tpu"):
+        return Platform.PALLAS
+
     if has_triton and jax_backend in ("gpu", "cuda"):
         return Platform.TRITON
 
