@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Reference: JAX Pallas PagedAttention TPU kernel
+# https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/paged_attention/paged_attention_kernel.py
 
 """PagedAttention TPU kernel."""
 
@@ -23,6 +25,85 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
+
+
+def ref_paged_attention(
+    query: jax.Array,
+    key_cache: jax.Array,
+    value_cache: jax.Array,
+    context_lens: jax.Array,
+    block_tables: jax.Array,
+    *,
+    mask_value: float = DEFAULT_MASK_VALUE,
+    attn_logits_soft_cap: float | None = None,
+    sliding_window: int | None = None,
+) -> jax.Array:
+    """Reference implementation of paged attention for testing.
+
+    Args:
+        query: A [batch_size, num_q_heads, head_dim] jax.Array.
+        key_cache: A [num_kv_heads, total_num_pages, page_size, head_dim] jax.Array.
+        value_cache: A [num_kv_heads, total_num_pages, page_size, head_dim] jax.Array.
+        context_lens: A i32[batch_size] jax.Array the length of each example.
+        block_tables: A i32[batch_size, pages_per_sequence] jax.Array.
+        mask_value: The value used for padding in attention.
+        attn_logits_soft_cap: The value used for soft capping the attention logits.
+        sliding_window: If set, only attend to the last `sliding_window` tokens.
+
+    Returns:
+        The output of attention([batch_size, num_q_heads, head_dim]).
+    """
+    batch_size, num_q_heads, head_dim = query.shape
+    num_kv_heads, _total_num_pages, page_size, _ = key_cache.shape
+    block_tables.shape[1]
+    num_groups = num_q_heads // num_kv_heads
+
+    outputs = []
+    for b in range(batch_size):
+        length = int(context_lens[b])
+        num_pages = (length + page_size - 1) // page_size
+
+        # Gather K/V from paged cache
+        page_indices = block_tables[b, :num_pages]
+        k_pages = key_cache[:, page_indices]  # [num_kv_heads, num_pages, page_size, head_dim]
+        v_pages = value_cache[:, page_indices]  # [num_kv_heads, num_pages, page_size, head_dim]
+
+        # Reshape to [num_kv_heads, seq_len, head_dim]
+        k = k_pages.reshape(num_kv_heads, -1, head_dim)[:, :length, :]
+        v = v_pages.reshape(num_kv_heads, -1, head_dim)[:, :length, :]
+
+        # Repeat K/V for grouped query attention
+        k = jnp.repeat(k, num_groups, axis=0)  # [num_q_heads, seq_len, head_dim]
+        v = jnp.repeat(v, num_groups, axis=0)  # [num_q_heads, seq_len, head_dim]
+
+        # Compute attention: q @ k.T
+        q = query[b]  # [num_q_heads, head_dim]
+        qk = jnp.einsum("hd,htd->ht", q, k)  # [num_q_heads, seq_len]
+
+        # Apply soft cap if specified
+        if attn_logits_soft_cap is not None:
+            qk = attn_logits_soft_cap * jnp.tanh(qk / attn_logits_soft_cap)
+
+        # Apply sliding window mask if specified
+        # For decode (single query token), q_pos = length - 1 (last position)
+        # We want to attend only to positions where: kv_pos >= q_pos - sliding_window + 1
+        # Which means: kv_pos >= length - sliding_window
+        if sliding_window is not None:
+            kv_positions = jnp.arange(length)  # [seq_len]
+            # Mask out positions outside the sliding window
+            # q_pos (current query position) = length - 1
+            # Valid kv positions: kv_pos >= q_pos - sliding_window + 1 = length - sliding_window
+            sliding_mask = kv_positions < (length - sliding_window)
+            qk = qk + jnp.where(sliding_mask, mask_value, 0.0)
+
+        # Softmax
+        attn = jax.nn.softmax(qk, axis=-1)
+
+        # Compute output: attn @ v
+        out = jnp.einsum("ht,htd->hd", attn, v)  # [num_q_heads, head_dim]
+        outputs.append(out)
+
+    return jnp.stack(outputs, axis=0)
 
 
 class MultiPageAsyncCopyDescriptor:
@@ -90,6 +171,7 @@ def paged_flash_attention_kernel(
     mask_value: float,
     attn_logits_soft_cap: float | None,
     megacore_mode: str | None,
+    sliding_window: int | None = None,
     program_ids=(),
 ):
     """Pallas kernel for paged attention."""
@@ -204,7 +286,17 @@ def paged_flash_attention_kernel(
             capped_qk = jnp.tanh(qk / attn_logits_soft_cap)
             qk = capped_qk * attn_logits_soft_cap
 
-        mask = i * bk + jax.lax.broadcasted_iota(jnp.int32, qk.shape, 1) < length
+        # Mask for positions beyond sequence length
+        kv_positions = i * bk + jax.lax.broadcasted_iota(jnp.int32, qk.shape, 1)
+        mask = kv_positions < length
+
+        # Apply sliding window mask if specified
+        # For decode (single query token), q_pos = length - 1 (last position)
+        # Valid kv positions: kv_pos >= length - sliding_window
+        if sliding_window is not None:
+            sliding_mask = kv_positions >= (length - sliding_window)
+            mask = jnp.logical_and(mask, sliding_mask)
+
         qk = qk + jnp.where(mask, 0.0, mask_value)
         m_curr = qk.max(axis=-1)
 
@@ -246,6 +338,7 @@ def paged_flash_attention_kernel_inline_seq_dim(
     mask_value: float,
     attn_logits_soft_cap: float | None,
     megacore_mode: str | None,
+    sliding_window: int | None = None,
 ):
     core_index, b, h = pl.program_id(0), pl.program_id(1), pl.program_id(2)
 
@@ -275,6 +368,7 @@ def paged_flash_attention_kernel_inline_seq_dim(
             mask_value=mask_value,
             attn_logits_soft_cap=attn_logits_soft_cap,
             megacore_mode=megacore_mode,
+            sliding_window=sliding_window,
             program_ids=(core_index, b, h, i),
         )
         return ()

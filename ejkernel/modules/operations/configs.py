@@ -424,3 +424,20 @@ class ScaledDotProductAttentionConfig(BaseOperationConfig):
     pass
 
     __hash__ = hash_fn
+
+
+@dataclass
+class PrefillPageAttentionConfig(BaseOperationConfig):
+    """Configuration for Prefill Page Attention operation.
+
+    Args:
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 1)
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn

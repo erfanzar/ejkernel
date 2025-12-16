@@ -76,6 +76,7 @@ from .configs import (
     LightningAttentionConfig,
     NativeSparseAttentionConfig,
     PageAttentionConfig,
+    PrefillPageAttentionConfig,
     RaggedDecodeAttentionConfig,
     RaggedPageAttentionv2Config,
     RaggedPageAttentionv3Config,
@@ -92,6 +93,7 @@ from .multi_head_latent_attention import FlashMLA, mla_attention
 from .native_sparse_attention import NativeSparseAttention, native_sparse_attention
 from .page_attention import PageAttention, page_attention
 from .pooling import MeanPooling, mean_pooling
+from .prefill_page_attention import PrefillPageAttention, prefill_page_attention
 from .ragged_decode_attention import RaggedDecodeAttention, ragged_decode_attention
 from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attention_v2
 from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attention_v3
@@ -120,6 +122,9 @@ __all__ = (
     "NativeSparseAttentionConfig",
     "PageAttention",
     "PageAttentionConfig",
+    "PrefillPageAttention",
+    "PrefillPageAttention",
+    "PrefillPageAttentionConfig",
     "RaggedDecodeAttention",
     "RaggedDecodeAttentionConfig",
     "RaggedPageAttentionv2",
@@ -144,6 +149,8 @@ __all__ = (
     "mla_attention",
     "native_sparse_attention",
     "page_attention",
+    "prefill_page_attention",
+    "prefill_page_attention",
     "ragged_decode_attention",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",

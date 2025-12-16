@@ -76,6 +76,7 @@ Reference:
 import jax
 import jax.numpy as jnp
 import jaxtyping
+import numpy as np
 from beartype import beartype
 from jaxtyping import Array, Float, Int
 
@@ -84,24 +85,27 @@ from ejkernel.callib import cdiv, strides_from_shape, triton_call
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_fwd import _paged_attn_kernel, _paged_attn_v2_reduce_kernel
 
+DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
+
 
 @kernel_registry.register("page_attention", Platform.TRITON, Backend.GPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def page_attention(
     query: Float[Array, "num_seqs num_heads head_dim"],
-    key_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],
-    value_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],
+    key_cache: Float[Array, "num_kv_heads total_num_pages page_size head_dim"],
+    value_cache: Float[Array, "num_kv_heads total_num_pages page_size head_dim"],
     context_lens: Int[Array, "num_seqs"],
     block_tables: Int[Array, "num_seqs max_blocks"],
     attn_scale: float | None = None,
     max_context_len: int | None = None,
     num_splits: int = 0,
     *,
-    mask_value: float = -2.381976426469702e38,
+    mask_value: float = DEFAULT_MASK_VALUE,
     attn_logits_soft_cap: float | None = None,
     pages_per_compute_block: int | None = None,
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
+    sliding_window: int | None = None,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
     """Compute paged attention with key-value caches stored in memory pages.
 

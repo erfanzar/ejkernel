@@ -15,6 +15,7 @@ ejkernel.modules.operations package
    native_sparse_attention
    page_attention
    pooling
+   prefill_page_attention
    ragged_decode_attention
    ragged_page_attention_v2
    ragged_page_attention_v3

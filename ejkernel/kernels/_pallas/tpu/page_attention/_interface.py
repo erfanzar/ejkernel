@@ -43,13 +43,14 @@ from ._pallas_impl_fwd import (
         "mask_value",
         "megacore_mode",
         "inline_seq_dim",
+        "sliding_window",
     ],
 )
 @jaxtyping.jaxtyped(typechecker=beartype)
 def page_attention(
     query: Float[Array, "num_seqs num_heads head_dim"],
-    key_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],
-    value_cache: Float[Array, "num_blocks num_kv_heads block_size head_dim"],
+    key_cache: Float[Array, "num_kv_heads total_num_pages page_size head_dim"],
+    value_cache: Float[Array, "num_kv_heads total_num_pages page_size head_dim"],
     context_lens: Int[Array, "num_seqs"],
     block_tables: Int[Array, "num_seqs max_blocks"],
     attn_scale: float | None = None,
@@ -61,6 +62,7 @@ def page_attention(
     pages_per_compute_block: int | None = None,
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
+    sliding_window: int | None = None,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
     """Paged grouped query attention.
 
@@ -91,6 +93,8 @@ def page_attention(
           by 2.
       inline_seq_dim: whether to fuse kernel instances along the sequence dim into
         one kernel.
+      sliding_window: if set, only attend to the last `sliding_window` tokens.
+        This is useful for models with sliding window attention like Mistral.
 
     Returns:
       The output of attention([batch_size, num_q_heads, head_dim]).
@@ -223,6 +227,7 @@ def page_attention(
             mask_value=mask_value,
             attn_logits_soft_cap=attn_logits_soft_cap,
             megacore_mode=megacore_mode,
+            sliding_window=sliding_window,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
