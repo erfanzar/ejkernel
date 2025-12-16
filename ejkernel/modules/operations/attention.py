@@ -261,6 +261,7 @@ def attention(
     """
 
     attention_mask = None
+    q_mask = None
 
     if mask_info is not None:
         mask_info.assert_not_multi_sequence(
@@ -268,9 +269,9 @@ def attention(
             "All valid tokens must have segment ID 0. For packed sequences, use flash_attention "
             "or other attention variants that support segment IDs."
         )
-        attention_mask = mask_info.get_or_compute_attention_mask()
+        q_mask, _, attention_mask = mask_info.get_qkv_masks(dtype=jnp.bool_)
 
-    return _executor(
+    out, weights = _executor(
         Attention(),
         query=query,
         key=key,
@@ -289,3 +290,8 @@ def attention(
         softmax_aux=softmax_aux,
         causal=causal,
     )
+
+    if q_mask is not None:
+        out = out * q_mask[:, :, None, None].astype(out.dtype)
+
+    return out, weights

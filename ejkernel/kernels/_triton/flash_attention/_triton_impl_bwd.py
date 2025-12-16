@@ -197,6 +197,10 @@ def _attn_bwd_dkdv(
     actual_seqlen_k,
     fully_masked_lines,
     headdim,
+    q_segment_ids_ptr,
+    kv_segment_ids_ptr,
+    stride_qsm,
+    stride_ksn,
     window_left,
     window_right,
     logits_soft_cap,
@@ -213,6 +217,7 @@ def _attn_bwd_dkdv(
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
+    USE_SEGMENTS: tl.constexpr,
 ):
     BIG_NEG: tl.constexpr = -2147483648
     LN2: tl.constexpr = 1.44269504089
@@ -277,6 +282,28 @@ def _attn_bwd_dkdv(
         in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
         qk = tl.where(in_window, qk, float("-inf"))
 
+    # Keep `attn_mask` shape stable across control-flow (see fwd kernel).
+    attn_mask = (offs_m_curr[:, None] < actual_seqlen_q) & (offs_n[None, :] >= 0)
+    if PAD_COLS:
+        attn_mask = attn_mask & (offs_n[None, :] < actual_seqlen_k)
+    if MASKED:
+        if PAD_COLS:
+            if IS_CAUSAL:
+                attn_mask = attn_mask & (tl.minimum(actual_seqlen_q - 1, offs_m_curr)[:, None] >= offs_n_causal[None, :])
+            else:
+                attn_mask = attn_mask & ((actual_seqlen_q - 1) >= offs_n_causal[None, :])
+        elif IS_CAUSAL:
+            attn_mask = attn_mask & (offs_m_curr[:, None] >= offs_n_causal[None, :])
+    if SLIDING:
+        attn_mask = attn_mask & in_window
+    if USE_SEGMENTS:
+        q_ids = tl.load(q_segment_ids_ptr + offs_m_curr * stride_qsm, mask=offs_m_curr < actual_seqlen_q, other=-1)
+        kv_ids = tl.load(kv_segment_ids_ptr + offs_n * stride_ksn, mask=offs_n < actual_seqlen_k, other=-1)
+        seg_mask = (q_ids[:, None] == kv_ids[None, :]) & (q_ids[:, None] >= 0)
+        attn_mask = attn_mask & seg_mask
+    if BIAS_ON and BOOL_BIAS:
+        attn_mask = attn_mask & bias
+
     if SOFTCAP:
         s = qk * softmax_scale
         x = s / logits_soft_cap
@@ -296,6 +323,8 @@ def _attn_bwd_dkdv(
 
     if MASKED and (fully_masked_lines > 0):
         p = tl.where(offs_m_curr[:, None] < fully_masked_lines, 0, p)
+
+    p = tl.where(attn_mask, p, 0.0)
 
     do = padded_load(
         do_ptrs,
@@ -322,6 +351,8 @@ def _attn_bwd_block_dkdv(
     Q,
     K,
     V,
+    QSeg,
+    KSeg,
     B,
     Dropout,
     Do,
@@ -340,6 +371,8 @@ def _attn_bwd_block_dkdv(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
+    stride_qsm,
+    stride_ksn,
     window_left,
     window_right,
     logits_soft_cap,
@@ -357,6 +390,7 @@ def _attn_bwd_block_dkdv(
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
+    USE_SEGMENTS: tl.constexpr,
 ):
     """Process a block of K/V positions for gradient computation.
 
@@ -423,6 +457,10 @@ def _attn_bwd_block_dkdv(
                 actual_seqlen_k,
                 fully_masked_lines,
                 headdim,
+                QSeg,
+                KSeg,
+                stride_qsm,
+                stride_ksn,
                 window_left,
                 window_right,
                 logits_soft_cap,
@@ -439,6 +477,7 @@ def _attn_bwd_block_dkdv(
                 SLIDING=SLIDING,
                 SOFTCAP=SOFTCAP,
                 USE_SINKS=USE_SINKS,
+                USE_SEGMENTS=USE_SEGMENTS,
             )
             index_next_start_m += BLOCK_M
 
@@ -467,6 +506,10 @@ def _attn_bwd_block_dkdv(
                 actual_seqlen_k,
                 fully_masked_lines,
                 headdim,
+                QSeg,
+                KSeg,
+                stride_qsm,
+                stride_ksn,
                 window_left,
                 window_right,
                 logits_soft_cap,
@@ -483,6 +526,7 @@ def _attn_bwd_block_dkdv(
                 SLIDING=SLIDING,
                 SOFTCAP=SOFTCAP,
                 USE_SINKS=USE_SINKS,
+                USE_SEGMENTS=USE_SEGMENTS,
             )
 
     if HEADS_PADDED:
@@ -524,6 +568,10 @@ def _attn_bwd_dq(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
+    q_segment_ids_ptr,
+    kv_segment_ids_ptr,
+    stride_qsm,
+    stride_ksn,
     window_left,
     window_right,
     logits_soft_cap,
@@ -539,6 +587,7 @@ def _attn_bwd_dq(
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
+    USE_SEGMENTS: tl.constexpr,
 ):
     BIG_NEG: tl.constexpr = -2147483648
     LN2: tl.constexpr = 1.44269504089
@@ -587,6 +636,28 @@ def _attn_bwd_dq(
         in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
         qk = tl.where(in_window, qk, float("-inf"))
 
+    # Keep `attn_mask` shape stable across control-flow (see fwd kernel).
+    attn_mask = (offs_m[:, None] < actual_seqlen_q) & (offs_n_curr[None, :] >= 0)
+    if PAD_COLS:
+        attn_mask = attn_mask & (offs_n_curr[None, :] < actual_seqlen_k)
+    if MASKED:
+        if PAD_COLS:
+            if IS_CAUSAL:
+                attn_mask = attn_mask & (tl.minimum(actual_seqlen_q - 1, offs_m)[:, None] >= offs_n_causal[None, :])
+            else:
+                attn_mask = attn_mask & ((actual_seqlen_q - 1) >= offs_n_causal[None, :])
+        elif IS_CAUSAL:
+            attn_mask = attn_mask & (offs_m[:, None] >= offs_n_causal[None, :])
+    if SLIDING:
+        attn_mask = attn_mask & in_window
+    if USE_SEGMENTS:
+        q_ids = tl.load(q_segment_ids_ptr + offs_m * stride_qsm, mask=offs_m < actual_seqlen_q, other=-1)
+        kv_ids = tl.load(kv_segment_ids_ptr + offs_n_curr * stride_ksn, mask=offs_n_curr < actual_seqlen_k, other=-1)
+        seg_mask = (q_ids[:, None] == kv_ids[None, :]) & (q_ids[:, None] >= 0)
+        attn_mask = attn_mask & seg_mask
+    if BIAS_ON and BOOL_BIAS:
+        attn_mask = attn_mask & bias
+
     if SOFTCAP:
         s = qk * softmax_scale
         x = s / logits_soft_cap
@@ -603,6 +674,7 @@ def _attn_bwd_dq(
     tl.debug_barrier()
 
     p = tl.exp2(qk_after - me_i[:, None])
+    p = tl.where(attn_mask, p, 0.0)
     dp = tl.dot(do, tl.trans(v.to(tl.float32)))
     ds = (p * (dp - de_i[:, None]) * jac).to(q.dtype)
     dq += tl.dot(ds, k)
@@ -615,6 +687,8 @@ def _attn_bwd_block_dq(
     Q,
     K,
     V,
+    QSeg,
+    KSeg,
     B,
     Dropout,
     Do,
@@ -633,6 +707,8 @@ def _attn_bwd_block_dq(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
+    stride_qsm,
+    stride_ksn,
     window_left,
     window_right,
     logits_soft_cap,
@@ -652,6 +728,7 @@ def _attn_bwd_block_dq(
     SLIDING: tl.constexpr,
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
+    USE_SEGMENTS: tl.constexpr,
 ):
     if IS_CAUSAL:
         index_end_n = min(
@@ -733,6 +810,10 @@ def _attn_bwd_block_dq(
                 actual_seqlen_q,
                 actual_seqlen_k,
                 headdim,
+                QSeg,
+                KSeg,
+                stride_qsm,
+                stride_ksn,
                 window_left,
                 window_right,
                 logits_soft_cap,
@@ -748,6 +829,7 @@ def _attn_bwd_block_dq(
                 SLIDING=SLIDING,
                 SOFTCAP=SOFTCAP,
                 USE_SINKS=USE_SINKS,
+                USE_SEGMENTS=USE_SEGMENTS,
             )
             index_next_start_n += BLOCK_N
 
@@ -776,6 +858,10 @@ def _attn_bwd_block_dq(
                 actual_seqlen_q,
                 actual_seqlen_k,
                 headdim,
+                QSeg,
+                KSeg,
+                stride_qsm,
+                stride_ksn,
                 window_left,
                 window_right,
                 logits_soft_cap,
@@ -791,6 +877,7 @@ def _attn_bwd_block_dq(
                 SLIDING=SLIDING,
                 SOFTCAP=SOFTCAP,
                 USE_SINKS=USE_SINKS,
+                USE_SEGMENTS=USE_SEGMENTS,
             )
 
     if fully_masked_lines > 0:
@@ -879,6 +966,8 @@ def _attn_bwd(
     Q,
     K,
     V,
+    QSeg,
+    KSeg,
     B,
     Do,
     M,
@@ -895,6 +984,10 @@ def _attn_bwd(
     stride_vz,
     stride_vn,
     stride_vh,
+    stride_qsz,
+    stride_qsm,
+    stride_ksz,
+    stride_ksn,
     stride_bz,
     stride_bm,
     stride_bh,
@@ -933,6 +1026,7 @@ def _attn_bwd(
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
+    USE_SEGMENTS: tl.constexpr,
     USE_DROPOUT: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     EVEN_M1: tl.constexpr,
@@ -978,6 +1072,8 @@ def _attn_bwd(
     Q += off_z * stride_qz + off_head_q * stride_qh + cu_seq_start_q * stride_qm
     K += off_z * stride_kz + off_head_kv * stride_kh + cu_seq_start_k * stride_kn
     V += off_z * stride_vz + off_head_kv * stride_vh + cu_seq_start_k * stride_vn
+    QSeg += off_z * stride_qsz + cu_seq_start_q * stride_qsm
+    KSeg += off_z * stride_ksz + cu_seq_start_k * stride_ksn
 
     Do += off_z * stride_doz + off_head_q * stride_doh + cu_seq_start_q * stride_dom
     Dq += off_z * stride_dqz + off_head_q * stride_dqh + cu_seq_start_q * stride_dqm
@@ -1006,6 +1102,8 @@ def _attn_bwd(
             Q,
             K,
             V,
+            QSeg,
+            KSeg,
             B,
             Dropout,
             Do,
@@ -1024,6 +1122,8 @@ def _attn_bwd(
             actual_seqlen_q,
             actual_seqlen_k,
             headdim,
+            stride_qsm,
+            stride_ksn,
             window_left,
             window_right,
             logits_soft_cap,
@@ -1041,6 +1141,7 @@ def _attn_bwd(
             SLIDING=SLIDING,
             SOFTCAP=SOFTCAP,
             USE_SINKS=USE_SINKS,
+            USE_SEGMENTS=USE_SEGMENTS,
         )
     else:
         i_start_m = pid - NUM_BLOCKS_KV
@@ -1050,6 +1151,8 @@ def _attn_bwd(
             Q,
             K,
             V,
+            QSeg,
+            KSeg,
             B,
             Dropout,
             Do,
@@ -1068,6 +1171,8 @@ def _attn_bwd(
             actual_seqlen_q,
             actual_seqlen_k,
             headdim,
+            stride_qsm,
+            stride_ksn,
             window_left,
             window_right,
             logits_soft_cap,
@@ -1087,6 +1192,7 @@ def _attn_bwd(
             SLIDING=SLIDING,
             SOFTCAP=SOFTCAP,
             USE_SINKS=USE_SINKS,
+            USE_SEGMENTS=USE_SEGMENTS,
         )
 
 
@@ -1110,6 +1216,8 @@ def _bwd_attention_kernel_call(
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len_q num_heads head_dim"],
     Float[Array, "batch seq_len_k num_heads head_dim"],
@@ -1183,8 +1291,31 @@ def _bwd_attention_kernel_call(
         if softcap_flag:
             softmax_aux_tensor = logits_soft_cap_val * jnp.tanh(softmax_aux_tensor / logits_soft_cap_val)
 
+    use_segments = (q_segment_ids is not None) or (kv_segment_ids is not None)
+    if use_segments:
+        if q_segment_ids is None:
+            q_segment_ids = kv_segment_ids
+        if kv_segment_ids is None:
+            kv_segment_ids = q_segment_ids
+        q_segment_ids = jnp.asarray(q_segment_ids, dtype=jnp.int32)
+        kv_segment_ids = jnp.asarray(kv_segment_ids, dtype=jnp.int32)
+        if q_segment_ids.ndim != 2 or kv_segment_ids.ndim != 2:
+            raise ValueError("q_segment_ids/kv_segment_ids must be 2D int32 arrays.")
+        if q_segment_ids.shape[0] != q.shape[0] or q_segment_ids.shape[1] != q.shape[1]:
+            raise ValueError("q_segment_ids must have shape [batch, seq_len_q].")
+        if kv_segment_ids.shape[0] != k.shape[0] or kv_segment_ids.shape[1] != k.shape[1]:
+            raise ValueError("kv_segment_ids must have shape [batch, seq_len_k].")
+        qsz, qsm = get_strides(q_segment_ids.shape)
+        ksz, ksn = get_strides(kv_segment_ids.shape)
+    else:
+        q_segment_ids = jnp.zeros((1,), dtype=jnp.int32)
+        kv_segment_ids = jnp.zeros((1,), dtype=jnp.int32)
+        qsz = qsm = ksz = ksn = 0
+
     varlen_from_cu = (cum_seqlens_q is not None) and (cum_seqlens_k is not None)
     if varlen_from_cu:
+        if use_segments:
+            raise NotImplementedError("segment_ids are not supported with cum_seqlens in triton flash-attention.")
         assert cum_seqlens_q.dtype == jnp.int32 and cum_seqlens_k.dtype == jnp.int32
         batch_size, QSeq_max, nheads_q, head_dim = q.shape
         _, KSeq_max, nheads_kv, _ = k.shape
@@ -1242,6 +1373,8 @@ def _bwd_attention_kernel_call(
             q_p,
             k_p,
             v_p,
+            q_segment_ids,
+            kv_segment_ids,
             jnp.zeros((1,), q.dtype),
             dO_p,
             M,
@@ -1258,6 +1391,10 @@ def _bwd_attention_kernel_call(
             vz,
             vn,
             vh,
+            qsz,
+            qsm,
+            ksz,
+            ksn,
             bz,
             bm,
             bh,
@@ -1295,6 +1432,7 @@ def _bwd_attention_kernel_call(
             USE_DROPOUT=(dropout_prob > 0),
             BLOCK_HEADDIM=BLOCK_HEADDIM,
             BOOL_BIAS=False,
+            USE_SEGMENTS=False,
             SLIDING=sliding_flag,
             SOFTCAP=softcap_flag,
             USE_SINKS=use_sinks,
@@ -1408,6 +1546,8 @@ def _bwd_attention_kernel_call(
         q,
         k,
         v,
+        q_segment_ids,
+        kv_segment_ids,
         bias if bias is not None else jnp.zeros((1,), jnp.float16),
         dO,
         M,
@@ -1424,6 +1564,10 @@ def _bwd_attention_kernel_call(
         vz,
         vn,
         vh,
+        qsz,
+        qsm,
+        ksz,
+        ksn,
         bz,
         bm,
         bh,
@@ -1461,6 +1605,7 @@ def _bwd_attention_kernel_call(
         USE_DROPOUT=(dropout_prob > 0),
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         BOOL_BIAS=BOOL_BIAS,
+        USE_SEGMENTS=use_segments,
         SLIDING=sliding_flag,
         SOFTCAP=softcap_flag,
         USE_SINKS=use_sinks,

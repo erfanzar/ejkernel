@@ -1239,6 +1239,7 @@ class MaskInfo:
             kv_segment_ids = jnp.asarray(kv_segment_ids, dtype=jnp.int32)
 
         if kv_segment_ids is None:
+            # Self-attention case: KV segment IDs match query segment IDs, including padding (-1).
             kv_segment_ids = q_segment_ids
 
         attention_mask = None

@@ -5,6 +5,7 @@ ejkernel.kernels._xla package
    :maxdepth: 2
 
    attention/index
+   blocksparse_attention/index
    flash_attention/index
    gla/index
    grouped_matmul/index

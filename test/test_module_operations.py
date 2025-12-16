@@ -49,6 +49,8 @@ from ejkernel.modules import (
     scaled_dot_product_attention,
     unified_attention,
 )
+from ejkernel.ops import get_device_platform
+from ejkernel.types import MaskInfo
 
 
 def rand_tensors(B, Nq, Nk, Hq, Hkv, D, dtype=jnp.float16, key=0):
@@ -146,6 +148,55 @@ class TestFlashAttention:
         assert grads[0].shape == q.shape
         assert grads[1].shape == k.shape
         assert grads[2].shape == v.shape
+
+    def test_flash_attention_packed_segments_xla_matches_dense(self):
+        """Test packed/multi-sequence segment IDs on XLA."""
+        B, T, Hq, Hkv, D = 2, 64, 8, 4, 32
+        q, k, v = rand_tensors(B, T, T, Hq, Hkv, D, dtype=jnp.bfloat16, key=0)
+
+        seg = jnp.array(
+            [
+                [0] * 24 + [1] * 16 + [2] * 8 + [-1] * 16,
+                [0] * 16 + [1] * 16 + [-1] * 32,
+            ],
+            dtype=jnp.int32,
+        )
+        mask_info = MaskInfo.from_segments(q_segment_ids=seg)
+
+        out = flash_attention(q, k, v, mask_info=mask_info, platform="xla")
+
+        reps = Hq // Hkv
+        k_rep = jnp.repeat(k, reps, axis=2)
+        v_rep = jnp.repeat(v, reps, axis=2)
+        scale = D**-0.5
+
+        scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k_rep.astype(jnp.float32)) * scale
+        q_ids = seg[:, None, :, None]
+        kv_ids = seg[:, None, None, :]
+        mask = (q_ids == kv_ids) & (q_ids >= 0)
+        scores = jnp.where(mask, scores, jnp.finfo(scores.dtype).min)
+        weights = jax.nn.softmax(scores, axis=-1).astype(jnp.float32)
+        ref = jnp.einsum("bhqk,bkhd->bqhd", weights, v_rep.astype(jnp.float32)).astype(q.dtype)
+        ref = jnp.where((seg >= 0)[:, :, None, None], ref, 0)
+
+        assert jnp.allclose(out, ref, atol=0.2, rtol=0.0)
+
+    @pytest.mark.skipif(get_device_platform() != "gpu", reason="requires GPU")
+    def test_flash_attention_packed_segments_triton_matches_xla(self):
+        """Test packed/multi-sequence segment IDs on Triton vs XLA."""
+        B, T, Hq, Hkv, D = 2, 128, 8, 4, 64
+        q, k, v = rand_tensors(B, T, T, Hq, Hkv, D, dtype=jnp.bfloat16, key=1)
+        seg = jnp.array(
+            [
+                [0] * 48 + [1] * 32 + [2] * 16 + [-1] * 32,
+                [0] * 64 + [1] * 32 + [-1] * 32,
+            ],
+            dtype=jnp.int32,
+        )
+        mask_info = MaskInfo.from_segments(q_segment_ids=seg)
+        out_triton = flash_attention(q, k, v, mask_info=mask_info, platform="triton")
+        out_xla = flash_attention(q, k, v, mask_info=mask_info, platform="xla")
+        assert jnp.allclose(out_triton, out_xla, atol=0.25, rtol=0.0)
 
 
 class TestAttention:

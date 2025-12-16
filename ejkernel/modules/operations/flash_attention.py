@@ -114,6 +114,10 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         >>> output = executor(attn, query, key, value, sliding_window=(256, 256))
     """
 
+    # Bump for persistent-cache invalidation: packed (segment-id) support and
+    # Triton kernel parameter changes.
+    version = "1"
+
     def __init__(self):
         """Initialize Flash Attention module."""
         super().__init__(op_id="flash_attention")
@@ -302,7 +306,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
         impl = self.get_impl(cfg)
-        return impl(
+        out = impl(
             query=query,
             key=key,
             value=value,
@@ -325,6 +329,10 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             fwd_params=cfg.fwd_params,
             bwd_params=cfg.bwd_params,
         )
+        if q_segment_ids is not None:
+            q_valid = q_segment_ids >= 0
+            out = jnp.where(q_valid[:, :, None, None], out, 0)
+        return out
 
     def heuristic_cfg_gpu(self, inv: Invocation[FlashAttentionConfig, Array]) -> FlashAttentionConfig:
         """Provide default configuration based on invocation context.
@@ -338,13 +346,15 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             Default configuration with block sizes
         """
 
+        q = inv.kwargs["query"]
+        head_dim = int(q.shape[-1])
+        use_segments = (inv.kwargs.get("q_segment_ids") is not None) or (inv.kwargs.get("kv_segment_ids") is not None)
+
+        # Conservative defaults to avoid SMEM launch failures on GPUs with ~99KiB limit.
+        kv_block = 64 if (use_segments or head_dim >= 128) else 128
+
         return FlashAttentionConfig(
-            fwd_params=FwdParams(
-                q_blocksize=64,
-                kv_blocksize=128,
-                num_warps=4,
-                num_stages=2,
-            ),
+            fwd_params=FwdParams(q_blocksize=64, kv_blocksize=kv_block, num_warps=4, num_stages=2),
             bwd_params=BwdParams(
                 q_blocksize=32,
                 kv_blocksize=32,
@@ -465,8 +475,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         q = inv.kwargs["query"]
         k = inv.kwargs["key"]
         head_dim = int(q.shape[-1])
-        q_len = int(q.shape[-2])
-        k_len = int(k.shape[-2])
+        q_len = int(q.shape[1])
+        k_len = int(k.shape[1])
         dtype = q.dtype
 
         sliding_window = inv.kwargs.get("sliding_window", None)
@@ -591,8 +601,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
 
         q = inv.kwargs["query"]
         k = inv.kwargs["key"]
-        q_len = int(q.shape[-2])
-        k_len = int(k.shape[-2])
+        q_len = int(q.shape[1])
+        k_len = int(k.shape[1])
 
         sliding_window = inv.kwargs.get("sliding_window", None)
         causal = bool(inv.kwargs.get("causal", True))
@@ -675,8 +685,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
 
         q = inv.kwargs["query"]
         k = inv.kwargs["key"]
-        q_len = int(q.shape[-2])
-        k_len = int(k.shape[-2])
+        q_len = int(q.shape[1])
+        k_len = int(k.shape[1])
 
         sliding_window = inv.kwargs.get("sliding_window", None)
         causal = bool(inv.kwargs.get("causal", True))
@@ -838,7 +848,11 @@ def flash_attention(
     kv_segment_ids = None
 
     if mask_info is not None:
-        attention_mask = mask_info.get_or_compute_attention_mask()
+        attention_mask = mask_info._attention_mask
+        if mask_info._q_segment_ids is not None or mask_info._kv_segment_ids is not None:
+            q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids(per_head=False)
+        elif attention_mask is None:
+            attention_mask = mask_info.get_or_compute_attention_mask()
 
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
@@ -849,9 +863,9 @@ def flash_attention(
             shardings = mask_info.get_shardings(False, mesh=mesh)
             in_specs = (
                 *in_specs,
-                shardings.attention_mask,
-                shardings.q_segment_ids,
-                shardings.kv_segment_ids,
+                shardings.attention_mask if attention_mask is not None else None,
+                shardings.q_segment_ids if q_segment_ids is not None else None,
+                shardings.kv_segment_ids if kv_segment_ids is not None else None,
             )
 
     return _flash_executor(

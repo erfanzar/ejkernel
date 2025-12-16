@@ -87,6 +87,11 @@ def _attn_fwd_inner(
     actual_seqlen_q,
     actual_seqlen_k,
     headdim,
+    q_segment_ids_ptr,
+    kv_segment_ids_ptr,
+    stride_qsm,
+    stride_ksn,
+    USE_SEGMENTS: tl.constexpr,
     USE_DROPOUT: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BIAS_ON: tl.constexpr,
@@ -158,6 +163,28 @@ def _attn_fwd_inner(
         else:
             qk += bias * (LN2 / softmax_scale)
 
+    # Keep `attn_mask` shape stable across control-flow. Triton requires values
+    # carried through an `if` to have identical types/shapes in both branches.
+    # Start with a (BLOCK_M, BLOCK_N) mask (the `offs_n >= 0` term is always True).
+    attn_mask = (offs_m[:, None] < actual_seqlen_q) & (offs_n[None, :] >= 0)
+    if PADDED_COLS:
+        attn_mask = attn_mask & ((index_start_n + offs_n)[None, :] < actual_seqlen_k)
+    if MASKED and IS_CAUSAL:
+        attn_mask = attn_mask & causal_mask
+    if SLIDING:
+        attn_mask = attn_mask & in_window
+    if USE_SEGMENTS:
+        q_ids = tl.load(q_segment_ids_ptr + offs_m * stride_qsm, mask=offs_m < actual_seqlen_q, other=-1)
+        kv_ids = tl.load(
+            kv_segment_ids_ptr + (index_start_n + offs_n) * stride_ksn,
+            mask=(index_start_n + offs_n) < actual_seqlen_k,
+            other=-1,
+        )
+        seg_mask = (q_ids[:, None] == kv_ids[None, :]) & (q_ids[:, None] >= 0)
+        attn_mask = attn_mask & seg_mask
+    if BIAS_ON and BOOL_BIAS:
+        attn_mask = attn_mask & bias
+
     if SOFTCAP:
         qk_natural = qk * (softmax_scale / LN2)
 
@@ -167,6 +194,8 @@ def _attn_fwd_inner(
         qk = (logits_soft_cap * tanh_x) * LN2
     else:
         qk = qk * softmax_scale
+
+    qk = tl.where(attn_mask, qk, float("-inf"))
 
     if USE_SINKS:
         sink_offs = tl.arange(0, 16)
@@ -186,16 +215,18 @@ def _attn_fwd_inner(
         qk_max = tl.max(qk, 1)
         aux_max = tl.max(tl.where(sink_mask, aux_log2, float("-inf")))
         m_ij = tl.maximum(tl.maximum(qk_max, aux_max), me_i)
+        m_ij_safe = tl.where(m_ij == float("-inf"), 0.0, m_ij)
 
-        P_ij = tl.exp2(qk - m_ij[:, None])
+        P_ij = tl.exp2(qk - m_ij_safe[:, None])
 
         aux_log2_row = tl.where(sink_mask[None, :], aux_log2[None, :], float("-inf"))
-        l_aux_row = tl.sum(tl.exp2(aux_log2_row - m_ij[:, None]), axis=1)
+        l_aux_row = tl.sum(tl.exp2(aux_log2_row - m_ij_safe[:, None]), axis=1)
 
         l_ij = tl.sum(P_ij, 1) + l_aux_row
     else:
         m_ij = tl.maximum(tl.max(qk, 1), me_i)
-        P_ij = tl.exp2(qk - m_ij[:, None])
+        m_ij_safe = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+        P_ij = tl.exp2(qk - m_ij_safe[:, None])
         l_ij = tl.sum(P_ij, 1)
 
     if USE_DROPOUT:
@@ -203,7 +234,7 @@ def _attn_fwd_inner(
         dropout_mask = tl.rand(dropout_seed, dropout_offs) > dropout_prob
         P_ij = tl.where(dropout_mask, P_ij, 0.0)
 
-    acc_o_scale = tl.exp2(m_i - m_ij)
+    acc_o_scale = tl.where(m_ij == float("-inf"), 0.0, tl.exp2(m_i - m_ij_safe))
     acc_o = acc_o * acc_o_scale[:, None]
 
     offset_v_ptrs = v_ptrs + index_start_n * stride_vn
@@ -219,8 +250,8 @@ def _attn_fwd_inner(
 
     acc_o += tl.dot(P_ij.to(tl.bfloat16), v.to(tl.bfloat16))
     m_i = m_ij
-    l_i_new = tl.exp2(me_i - m_ij) + l_ij
-    me_i = m_ij + tl.log2(l_i_new)
+    l_i_new = tl.exp2(me_i - m_ij_safe) + l_ij
+    me_i = m_ij_safe + tl.log2(l_i_new)
     return m_i, me_i, acc_o.to(tl.bfloat16)
 
 
@@ -235,6 +266,8 @@ def _attn_fwd(
     q,
     k,
     v,
+    QSeg,
+    KSeg,
     B,
     softmax_scale,
     dropout_prob,
@@ -251,6 +284,10 @@ def _attn_fwd(
     stride_vz,
     stride_vn,
     stride_vh,
+    stride_qsz,
+    stride_qsm,
+    stride_ksz,
+    stride_ksn,
     stride_oz,
     stride_om,
     stride_oh,
@@ -280,6 +317,7 @@ def _attn_fwd(
     SOFTCAP: tl.constexpr,
     USE_SINKS: tl.constexpr,
     BOOL_BIAS: tl.constexpr,
+    USE_SEGMENTS: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     PADDED_HEADS: tl.constexpr,
     EVEN_M: tl.constexpr,
@@ -379,6 +417,9 @@ def _attn_fwd(
         + (offs_n[:, None] * stride_vn + offs_d[None, :])
     )
 
+    q_seg_ptrs = QSeg + off_z * stride_qsz + cu_seq_start_q * stride_qsm
+    kv_seg_ptrs = KSeg + off_z * stride_ksz + cu_seq_start_k * stride_ksn
+
     if BIAS_ON:
         bias_ptrs = (
             B
@@ -455,6 +496,10 @@ def _attn_fwd(
                 actual_seqlen_q,
                 actual_seqlen_k,
                 headdim,
+                q_seg_ptrs,
+                kv_seg_ptrs,
+                stride_qsm,
+                stride_ksn,
                 USE_DROPOUT=USE_DROPOUT,
                 IS_CAUSAL=IS_CAUSAL,
                 BIAS_ON=BIAS_ON,
@@ -463,6 +508,7 @@ def _attn_fwd(
                 SLIDING=SLIDING,
                 SOFTCAP=SOFTCAP,
                 USE_SINKS=USE_SINKS,
+                USE_SEGMENTS=USE_SEGMENTS,
                 PADDED_COLS=False,
                 PADDED_HEADS=PADDED_HEADS,
                 BLOCK_M=BLOCK_M,
@@ -499,6 +545,10 @@ def _attn_fwd(
                 actual_seqlen_q,
                 actual_seqlen_k,
                 headdim,
+                q_seg_ptrs,
+                kv_seg_ptrs,
+                stride_qsm,
+                stride_ksn,
                 USE_DROPOUT=USE_DROPOUT,
                 IS_CAUSAL=IS_CAUSAL,
                 BIAS_ON=BIAS_ON,
@@ -507,11 +557,17 @@ def _attn_fwd(
                 SLIDING=SLIDING,
                 SOFTCAP=SOFTCAP,
                 USE_SINKS=USE_SINKS,
+                USE_SEGMENTS=USE_SEGMENTS,
                 PADDED_COLS=pad_cols,
                 PADDED_HEADS=PADDED_HEADS,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
             )
+
+    invalid = me_i == float("-inf")
+    me_i = tl.where(invalid, 0.0, me_i)
+    m_i = tl.where(invalid, 0.0, m_i)
+    acc_o = tl.where(invalid[:, None], 0.0, acc_o)
 
     if USE_DROPOUT:
         o_scale = tl.exp2((m_i - me_i) - tl.log2(1 - dropout_prob))
@@ -555,6 +611,8 @@ def _fwd_attention_kernel_call(
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], Float[Array, "batch num_heads max_seqlen_q_rounded"]]:
     if sliding_window is None:
         window_left = 0
@@ -597,6 +655,27 @@ def _fwd_attention_kernel_call(
 
         pass
 
+    use_segments = (q_segment_ids is not None) or (kv_segment_ids is not None)
+    if use_segments:
+        if q_segment_ids is None:
+            q_segment_ids = kv_segment_ids
+        if kv_segment_ids is None:
+            kv_segment_ids = q_segment_ids
+        q_segment_ids = jnp.asarray(q_segment_ids, dtype=jnp.int32)
+        kv_segment_ids = jnp.asarray(kv_segment_ids, dtype=jnp.int32)
+        if q_segment_ids.ndim != 2 or kv_segment_ids.ndim != 2:
+            raise ValueError("q_segment_ids/kv_segment_ids must be 2D int32 arrays.")
+        if q_segment_ids.shape[0] != q.shape[0] or q_segment_ids.shape[1] != q.shape[1]:
+            raise ValueError("q_segment_ids must have shape [batch, seq_len_q].")
+        if kv_segment_ids.shape[0] != k.shape[0] or kv_segment_ids.shape[1] != k.shape[1]:
+            raise ValueError("kv_segment_ids must have shape [batch, seq_len_k].")
+        qsz, qsm = get_strides(q_segment_ids.shape)
+        ksz, ksn = get_strides(kv_segment_ids.shape)
+    else:
+        q_segment_ids = jnp.zeros((1,), dtype=jnp.int32)
+        kv_segment_ids = jnp.zeros((1,), dtype=jnp.int32)
+        qsz = qsm = ksz = ksn = 0
+
     if fwd_params is None:
         fwd_params = FwdParams()
 
@@ -609,6 +688,8 @@ def _fwd_attention_kernel_call(
 
     varlen_from_cu = (cum_seqlens_q is not None) and (cum_seqlens_k is not None)
     if varlen_from_cu:
+        if use_segments:
+            raise NotImplementedError("segment_ids are not supported with cum_seqlens in triton flash-attention.")
         assert cum_seqlens_q.dtype == jnp.int32 and cum_seqlens_k.dtype == jnp.int32
         batch = q.shape[0]
         QSeq_max = int(q.shape[1])
@@ -652,6 +733,7 @@ def _fwd_attention_kernel_call(
             SOFTCAP=softcap_flag,
             USE_SINKS=use_sinks,
             BOOL_BIAS=BOOL_BIAS,
+            USE_SEGMENTS=False,
             BLOCK_HEADDIM=BLOCK_HEADDIM,
             PADDED_HEADS=PADDED_HEADS,
             BLOCK_N=block_n,
@@ -669,6 +751,8 @@ def _fwd_attention_kernel_call(
             q_packed,
             k_packed,
             v_packed,
+            q_segment_ids,
+            kv_segment_ids,
             jnp.zeros((1,), q.dtype),
             softmax_scale,
             dropout_prob,
@@ -685,6 +769,10 @@ def _fwd_attention_kernel_call(
             vz,
             vn,
             vh,
+            qsz,
+            qsm,
+            ksz,
+            ksn,
             oz,
             om,
             oh,
@@ -773,6 +861,7 @@ def _fwd_attention_kernel_call(
         SOFTCAP=softcap_flag,
         USE_SINKS=use_sinks,
         BOOL_BIAS=BOOL_BIAS,
+        USE_SEGMENTS=use_segments,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         PADDED_HEADS=PADDED_HEADS,
         BLOCK_N=block_n,
@@ -790,6 +879,8 @@ def _fwd_attention_kernel_call(
         q,
         k,
         v,
+        q_segment_ids,
+        kv_segment_ids,
         bias if bias is not None else jnp.zeros((1,), q.dtype),
         softmax_scale,
         dropout_prob,
@@ -806,6 +897,10 @@ def _fwd_attention_kernel_call(
         vz,
         vn,
         vh,
+        qsz,
+        qsm,
+        ksz,
+        ksn,
         oz,
         om,
         oh,

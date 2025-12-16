@@ -93,6 +93,8 @@ def _make_core_func(
         value: chex.Array,
         bias: chex.Array | None,
         attention_mask: chex.Array | None,
+        q_segment_ids: chex.Array | None,
+        kv_segment_ids: chex.Array | None,
         softmax_aux: chex.Array | None,
         sliding_window: tuple[int, int] | None,
         softmax_scale: float,
@@ -108,6 +110,8 @@ def _make_core_func(
             logits_soft_cap=logits_soft_cap,
             bias=bias,
             mask=attention_mask,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
             window=sliding_window,
             chunk_size_q=chunk_size_q_val,
             chunk_size_k=chunk_size_k_val,
@@ -126,6 +130,8 @@ def _make_core_func(
         value: chex.Array,
         bias: chex.Array | None,
         attention_mask: chex.Array | None,
+        q_segment_ids: chex.Array | None,
+        kv_segment_ids: chex.Array | None,
         softmax_aux: chex.Array | None,
         sliding_window: tuple[int, int] | None,
         softmax_scale: float,
@@ -141,6 +147,8 @@ def _make_core_func(
             logits_soft_cap=logits_soft_cap,
             bias=bias,
             mask=attention_mask,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
             window=sliding_window,
             chunk_size_q=chunk_size_q_val,
             chunk_size_k=chunk_size_k_val,
@@ -156,6 +164,8 @@ def _make_core_func(
         ctx = (
             bias,
             attention_mask,
+            q_segment_ids,
+            kv_segment_ids,
             softmax_aux,
             sliding_window,
             softmax_scale,
@@ -177,6 +187,8 @@ def _make_core_func(
         (
             bias,
             attention_mask,
+            q_segment_ids,
+            kv_segment_ids,
             softmax_aux,
             sliding_window,
             softmax_scale,
@@ -195,6 +207,8 @@ def _make_core_func(
         dq, dk, dv = _flash_attention_bwd(
             bias=bias,
             mask=attention_mask,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
             softmax_aux=softmax_aux,
             window=sliding_window,
             softmax_scale=softmax_scale,
@@ -222,6 +236,8 @@ def _make_core_func(
             None,
             None,
             None,
+            None,
+            None,
         )
 
     _flash_attention_core_specialized.defvjp(_fwd, _bwd)
@@ -237,6 +253,8 @@ def _flash_attention_core(
     value: chex.Array,
     bias: chex.Array | None,
     attention_mask: chex.Array | None,
+    q_segment_ids: chex.Array | None,
+    kv_segment_ids: chex.Array | None,
     softmax_aux: chex.Array | None,
     sliding_window: tuple[int, int] | None,
     softmax_scale: float,
@@ -263,6 +281,8 @@ def _flash_attention_core(
         value,
         bias,
         attention_mask,
+        q_segment_ids,
+        kv_segment_ids,
         softmax_aux,
         sliding_window,
         softmax_scale,
@@ -321,10 +341,6 @@ def flash_attention(
     reducing memory usage from O(N²) to O(N). Supports sliding window attention,
     logit soft capping, grouped query attention (GQA/MQA), and attention sinks.
     """
-    if kv_segment_ids is not None and attention_mask is None:
-        raise NotImplementedError("`kv_segment_ids` is not implemented in xla!")
-    if q_segment_ids is not None and attention_mask is None:
-        raise NotImplementedError("`q_segment_ids` is not implemented in xla!")
     if cum_seqlens_k is not None and attention_mask is None:
         raise NotImplementedError("`cum_seqlens_k` is not implemented in xla!")
     if cum_seqlens_q is not None and attention_mask is None:
@@ -369,6 +385,8 @@ def flash_attention(
         value,
         bias,
         attention_mask,
+        q_segment_ids,
+        kv_segment_ids,
         softmax_aux,
         window_tuple,
         scale_val,

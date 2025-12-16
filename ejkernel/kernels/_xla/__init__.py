@@ -14,6 +14,7 @@
 
 
 from .attention import attention
+from .blocksparse_attention import blocksparse_attention
 from .flash_attention import flash_attention
 from .gla import recurrent_gla
 from .grouped_matmul import grouped_matmul
@@ -32,6 +33,7 @@ from .unified_attention import unified_attention
 __all__ = [
     "apply_native_sparse_attention",
     "attention",
+    "blocksparse_attention",
     "flash_attention",
     "grouped_matmul",
     "lightning_attn",

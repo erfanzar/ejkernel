@@ -24,10 +24,12 @@ def _maybe_broadcast_kv_to_q_heads(k: chex.Array, v: chex.Array, hq: int) -> tup
     """Broadcast KV heads to match Q heads for GQA/MQA support."""
     if k.shape[-2] == hq:
         return k, v
-    if k.shape[-2] != 1:
-        raise ValueError(f"K/V heads must be either 1 or match Q heads. Got Hk={k.shape[-2]}, Hq={hq}.")
-    k = jnp.broadcast_to(k, (*k.shape[:-2], hq, k.shape[-1]))
-    v = jnp.broadcast_to(v, (*v.shape[:-2], hq, v.shape[-1]))
+    hk = k.shape[-2]
+    if (hq % hk) != 0:
+        raise ValueError(f"K/V heads must divide Q heads. Got Hk={hk}, Hq={hq}.")
+    reps = hq // hk
+    k = jnp.repeat(k, reps, axis=-2)
+    v = jnp.repeat(v, reps, axis=-2)
     return k, v
 
 
@@ -228,6 +230,8 @@ def _flash_attention_fwd(
     logits_soft_cap: float | None,
     bias: chex.Array | None,
     mask: chex.Array | None,
+    q_segment_ids: chex.Array | None = None,
+    kv_segment_ids: chex.Array | None = None,
     window: tuple[int, int] | None,
     chunk_size_q: int,
     chunk_size_k: int,
@@ -251,6 +255,9 @@ def _flash_attention_fwd(
     if v.shape[-2] != Hk:
         raise ValueError("k and v must share head count.")
     d_out = v.shape[-1]
+
+    if q_segment_ids is not None and kv_segment_ids is None:
+        kv_segment_ids = q_segment_ids
 
     S_Q = min(chunk_size_q, Tq)
     S_K = min(chunk_size_k, Tk)
@@ -283,6 +290,12 @@ def _flash_attention_fwd(
 
             bias_qk = _slice_broadcast_qk(bias, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
             mask_qk = _slice_broadcast_qk(mask, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
+
+            if q_segment_ids is not None and kv_segment_ids is not None:
+                q_ids = lax.dynamic_slice_in_dim(q_segment_ids, q_chunk_start, q_chunk_len, axis=1)
+                kv_ids = lax.dynamic_slice_in_dim(kv_segment_ids, kv_chunk_start, kv_chunk_len, axis=1)
+                seg_mask = (q_ids[:, None, :, None] == kv_ids[:, None, None, :]) & (q_ids[:, None, :, None] >= 0)
+                mask_qk = seg_mask if mask_qk is None else jnp.logical_and(mask_qk, seg_mask)
 
             win_mask = _window_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len, window)
             causal_mask = (
@@ -329,6 +342,12 @@ def _flash_attention_fwd(
 
             bias_qk = _slice_broadcast_qk(bias, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
             mask_qk = _slice_broadcast_qk(mask, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
+
+            if q_segment_ids is not None and kv_segment_ids is not None:
+                q_ids = lax.dynamic_slice_in_dim(q_segment_ids, q_chunk_start, q_chunk_len, axis=1)
+                kv_ids = lax.dynamic_slice_in_dim(kv_segment_ids, kv_chunk_start, kv_chunk_len, axis=1)
+                seg_mask = (q_ids[:, None, :, None] == kv_ids[:, None, None, :]) & (q_ids[:, None, :, None] >= 0)
+                mask_qk = seg_mask if mask_qk is None else jnp.logical_and(mask_qk, seg_mask)
 
             win_mask = _window_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len, window)
             causal_mask = (
@@ -398,6 +417,12 @@ def _flash_attention_fwd(
                 bias_qk = _slice_broadcast_qk(bias, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
                 mask_qk = _slice_broadcast_qk(mask, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
 
+                if q_segment_ids is not None and kv_segment_ids is not None:
+                    q_ids = lax.dynamic_slice_in_dim(q_segment_ids, q_chunk_start, q_chunk_len, axis=1)
+                    kv_ids = lax.dynamic_slice_in_dim(kv_segment_ids, kv_chunk_start, kv_chunk_len, axis=1)
+                    seg_mask = (q_ids[:, None, :, None] == kv_ids[:, None, None, :]) & (q_ids[:, None, :, None] >= 0)
+                    mask_qk = seg_mask if mask_qk is None else jnp.logical_and(mask_qk, seg_mask)
+
                 win_mask = _window_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len, window)
                 causal_mask = (
                     _causal_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len) if causal else None
@@ -437,6 +462,12 @@ def _flash_attention_fwd(
 
                 bias_qk = _slice_broadcast_qk(bias, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
                 mask_qk = _slice_broadcast_qk(mask, q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len)
+
+                if q_segment_ids is not None and kv_segment_ids is not None:
+                    q_ids = lax.dynamic_slice_in_dim(q_segment_ids, q_chunk_start, q_chunk_len, axis=1)
+                    kv_ids = lax.dynamic_slice_in_dim(kv_segment_ids, kv_chunk_start, kv_chunk_len, axis=1)
+                    seg_mask = (q_ids[:, None, :, None] == kv_ids[:, None, None, :]) & (q_ids[:, None, :, None] >= 0)
+                    mask_qk = seg_mask if mask_qk is None else jnp.logical_and(mask_qk, seg_mask)
 
                 win_mask = _window_mask_for_chunk(q_chunk_start, q_chunk_len, kv_chunk_start, kv_chunk_len, window)
                 causal_mask = (

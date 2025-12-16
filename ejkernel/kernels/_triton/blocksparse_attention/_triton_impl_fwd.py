@@ -160,21 +160,24 @@ def _blocksparse_attn_fwd_inner(
             qk_max = tl.max(attn_weights, 1)
             aux_max = tl.max(tl.where(sink_mask, aux_logits, float("-inf")))
             m_new = tl.maximum(tl.maximum(qk_max, aux_max), m)
+            m_new_safe = tl.where(m_new == BIG_NEG, 0.0, m_new)
 
-            attn_weights -= m_new[:, None]
+            attn_weights -= m_new_safe[:, None]
             p = tl.math.exp2(attn_weights)
 
             aux_logits_row = tl.where(sink_mask[None, :], aux_logits[None, :], float("-inf"))
-            l_aux_row = tl.sum(tl.exp2(aux_logits_row - m_new[:, None]), axis=1)
+            l_aux_row = tl.sum(tl.exp2(aux_logits_row - m_new_safe[:, None]), axis=1)
 
             l_new = tl.sum(p, axis=1) + l_aux_row
         else:
             m_new = tl.maximum(m, tl.max(attn_weights, axis=1))
-            attn_weights -= m_new[:, None]
+            m_new_safe = tl.where(m_new == BIG_NEG, 0.0, m_new)
+            attn_weights -= m_new_safe[:, None]
             p = tl.math.exp2(attn_weights)
             l_new = tl.sum(p, axis=1)
 
-        alpha = tl.math.exp2(m - m_new)
+        m_safe = tl.where(m_new == BIG_NEG, 0.0, m)
+        alpha = tl.math.exp2(m_safe - m_new_safe)
         l = l * alpha + l_new
         acc *= alpha[:, None]
         value = tl.load(value_block_ptr)
@@ -482,8 +485,12 @@ def blocksparse_attn_fwd(
         SOFTCAP=SOFTCAP,
     )
 
-    m += tl.math.log2(l)
-    acc /= l[:, None]
+    invalid = l == 0.0
+    l_safe = tl.where(invalid, 1.0, l)
+    m = m + tl.math.log2(l_safe)
+    acc = acc / l_safe[:, None]
+    m = tl.where(invalid, 0.0, m)
+    acc = tl.where(invalid[:, None], 0.0, acc)
 
     tl.store(M + logsumexp_offset, m)
     tl.store(out_block_ptr, acc.to(Po.type.element_ty))

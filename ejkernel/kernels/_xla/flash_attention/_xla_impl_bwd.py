@@ -20,6 +20,8 @@ import jax
 def _flash_attention_bwd(
     bias: chex.Array | None,
     mask: chex.Array | None,
+    q_segment_ids: chex.Array | None,
+    kv_segment_ids: chex.Array | None,
     softmax_aux: chex.Array | None,
     window: tuple[int, int] | None,
     softmax_scale: float,
@@ -68,6 +70,8 @@ def _flash_attention_bwd(
             logits_soft_cap=logits_soft_cap,
             bias=bias,
             mask=mask,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
             window=window,
             chunk_size_q=chunk_size_q,
             chunk_size_k=chunk_size_k,

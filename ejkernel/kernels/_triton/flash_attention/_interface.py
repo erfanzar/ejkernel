@@ -105,6 +105,8 @@ def _jax_fwd_attention_call(
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], tuple[Float[Array, "..."], ...]]:
     """Forward pass for flash attention with custom gradient support.
 
@@ -148,9 +150,24 @@ def _jax_fwd_attention_call(
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
         softmax_aux=softmax_aux,
+        q_segment_ids=q_segment_ids,
+        kv_segment_ids=kv_segment_ids,
     )
 
-    return out, (query, key, value, bias, attention_mask, out, lse, dropout_seed, cum_seqlens_q, cum_seqlens_k)
+    return out, (
+        query,
+        key,
+        value,
+        bias,
+        attention_mask,
+        out,
+        lse,
+        dropout_seed,
+        cum_seqlens_q,
+        cum_seqlens_k,
+        q_segment_ids,
+        kv_segment_ids,
+    )
 
 
 def _jax_bwd_attention_call(
@@ -167,6 +184,8 @@ def _jax_bwd_attention_call(
     Float[Array, "batch seq_len_q num_heads head_dim"] | None,
     Float[Array, "batch seq_len_k num_heads head_dim"] | None,
     Float[Array, "batch seq_len_k num_heads head_dim"] | None,
+    None,
+    None,
     None,
     None,
     None,
@@ -192,7 +211,20 @@ def _jax_bwd_attention_call(
         tuple: Gradients (dq, dk, dv, d_attention_mask, d_bias, d_scale, d_prob, d_seed)
                where only dq, dk, dv are non-None for differentiable parameters
     """
-    query, key, value, bias, attention_mask, out, lse, dropout_seed, cum_seqlens_q, cum_seqlens_k = residual
+    (
+        query,
+        key,
+        value,
+        bias,
+        attention_mask,
+        out,
+        lse,
+        dropout_seed,
+        cum_seqlens_q,
+        cum_seqlens_k,
+        q_segment_ids,
+        kv_segment_ids,
+    ) = residual
     dq, dk, dv = _bwd_attention_kernel_call(
         dO=dO,
         q=query,
@@ -200,6 +232,8 @@ def _jax_bwd_attention_call(
         v=value,
         bias=bias,
         attention_mask=attention_mask,
+        q_segment_ids=q_segment_ids,
+        kv_segment_ids=kv_segment_ids,
         o=out,
         M=lse,
         dropout_prob=dropout_prob,
@@ -213,7 +247,7 @@ def _jax_bwd_attention_call(
         cum_seqlens_q=cum_seqlens_q,
         logits_soft_cap=logits_soft_cap,
     )
-    return dq, dk, dv, None, None, None, None, None, None
+    return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 9, 10, 13, 14))
@@ -237,6 +271,8 @@ def flash_attention_call(
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Flash attention with custom gradient computation.
 
@@ -284,6 +320,8 @@ def flash_attention_call(
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
         softmax_aux=softmax_aux,
+        q_segment_ids=q_segment_ids,
+        kv_segment_ids=kv_segment_ids,
     )[0]
 
 
@@ -339,7 +377,7 @@ def flash_attention(
         sliding_window: Size of local attention window for sparse patterns
         logits_soft_cap: Optional soft cap value for logits (e.g., 20.0 for Gemma)
         softmax_aux: Optional attention sink logits of shape [H, num_sinks] or [num_sinks]
-        segment_ids: Not supported in Triton implementation (raises NotImplementedError)
+        q_segment_ids/kv_segment_ids: Optional packed-sequence segment IDs (mask cross-segment attention)
 
     Returns:
         chex.Array: Attention output with shape [batch, seq_len, num_heads, head_dim]
@@ -355,10 +393,6 @@ def flash_attention(
         >>> out = flash_attention(query, key, value, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
     """
     del precision, logits_dtype, normalize_output
-    if q_segment_ids is not None and attention_mask is None:
-        raise NotImplementedError("`q_segment_ids` is not implemented in triton impl yet!")
-    if kv_segment_ids is not None and attention_mask is None:
-        raise NotImplementedError("`kv_segment_ids` is not implemented in triton impl yet!")
 
     return flash_attention_call(
         query=query,
@@ -377,4 +411,6 @@ def flash_attention(
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
         softmax_aux=softmax_aux,
+        q_segment_ids=q_segment_ids,
+        kv_segment_ids=kv_segment_ids,
     )

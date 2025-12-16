@@ -861,9 +861,15 @@ def blocksparse_attention(
     kv_segment_ids = None
     q_positions = None
     kv_positions = None
+    q_mask = None
 
     if mask_info is not None:
         q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids()
+        q_ids_for_mask = q_segment_ids
+        if q_ids_for_mask is not None and q_ids_for_mask.ndim == 3:
+            q_ids_for_mask = q_ids_for_mask[:, 0, :]
+        if q_ids_for_mask is not None:
+            q_mask = q_ids_for_mask >= 0
 
         if q_positions is None or kv_positions is None:
             mask_q_pos, mask_kv_pos = mask_info.get_or_compute_positions()
@@ -886,7 +892,7 @@ def blocksparse_attention(
                 shardings.q_positions,
                 shardings.kv_positions,
             )
-    return _executor(
+    out = _executor(
         BlockSparseAttention(),
         query=query,
         key=key,
@@ -913,3 +919,8 @@ def blocksparse_attention(
         out_specs=out_specs,
         _cfg=cfg,
     )
+
+    if q_mask is not None:
+        out = out * q_mask[:, None, :, None].astype(out.dtype)
+
+    return out
