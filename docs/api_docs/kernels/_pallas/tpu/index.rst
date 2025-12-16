@@ -4,11 +4,12 @@ ejkernel.kernels._pallas.tpu package
 .. toctree::
    :maxdepth: 2
 
-   kernels/_pallas/tpu/blocksparse_attention/index
-   kernels/_pallas/tpu/flash_attention/index
-   kernels/_pallas/tpu/grouped_matmul/index
-   kernels/_pallas/tpu/page_attention/index
-   kernels/_pallas/tpu/ragged_decode_attention/index
-   kernels/_pallas/tpu/ragged_page_attention_v2/index
-   kernels/_pallas/tpu/ragged_page_attention_v3/index
-   kernels/_pallas/tpu/ring_attention/index
+   blocksparse_attention/index
+   flash_attention/index
+   grouped_matmul/index
+   grouped_matmulv2/index
+   page_attention/index
+   ragged_decode_attention/index
+   ragged_page_attention_v2/index
+   ragged_page_attention_v3/index
+   ring_attention/index

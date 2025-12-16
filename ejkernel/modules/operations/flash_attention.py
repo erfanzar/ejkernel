@@ -443,8 +443,6 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
                 FlashAttentionConfig(
                     fwd_params=FwdParams(q_blocksize=chunk_q, kv_blocksize=chunk_k, num_warps=4, num_stages=2),
                     bwd_params=BwdParams(q_blocksize=chunk_q // 2, kv_blocksize=chunk_k // 2, num_warps=4, num_stages=2),
-                    num_warps=4,
-                    num_stages=2,
                     platform="auto",
                     backend="any",
                 )

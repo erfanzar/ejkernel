@@ -75,6 +75,8 @@ from .operations import (
     RingAttentionConfig,
     ScaledDotProductAttention,
     ScaledDotProductAttentionConfig,
+    UnifiedAttention,
+    UnifiedAttentionConfig,
     attention,
     blocksparse_attention,
     flash_attention,
@@ -91,6 +93,7 @@ from .operations import (
     recurrent_attention,
     ring_attention,
     scaled_dot_product_attention,
+    unified_attention,
 )
 
 __all__ = (
@@ -125,6 +128,8 @@ __all__ = (
     "RingAttentionConfig",
     "ScaledDotProductAttention",
     "ScaledDotProductAttentionConfig",
+    "UnifiedAttention",
+    "UnifiedAttentionConfig",
     "attention",
     "blocksparse_attention",
     "flash_attention",
@@ -141,4 +146,5 @@ __all__ = (
     "recurrent_attention",
     "ring_attention",
     "scaled_dot_product_attention",
+    "unified_attention",
 )

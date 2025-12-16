@@ -25,6 +25,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+if not any(d.platform in ("gpu", "cuda") for d in jax.devices()):
+    pytest.skip("Triton native sparse attention tests require a GPU backend.", allow_module_level=True)
+
 from ejkernel.kernels._triton.native_sparse_attention import apply_native_sparse_attention as apply_nsa_triton
 from ejkernel.kernels._triton.native_sparse_attention import native_sparse_attention as nsa_triton
 from ejkernel.kernels._xla.native_sparse_attention import apply_native_sparse_attention as apply_nsa_xla

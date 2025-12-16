@@ -30,11 +30,8 @@ from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._pallas_impl_fwd_h64 
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3._pallas_impl_fwd_h64 import (
     ref_ragged_paged_attention_hd64,
 )
-
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu",
-    reason="Pallas TPU tests require TPU backend",
-)
+from ejkernel.kernels._xla.ragged_page_attention_v3 import ragged_page_attention_v3 as xla_ragged_page_attention_v3
+from ejkernel.utils import make_dummy_rpa_inputs
 
 
 def _has_tpu():
@@ -44,7 +41,7 @@ def _has_tpu():
         return False
 
 
-pytestmark = pytest.mark.skipif(not _has_tpu(), reason="TPU/Pallas required")
+pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
 
 
 def _build_inputs(head_dim: int, seed: int = 0, *, with_attention_sink: bool = False):
@@ -185,3 +182,49 @@ class TestRaggedPageAttentionV3TPU:
 
     def test_hd64_with_sliding_window_and_attention_sink(self):
         _run_and_compare(head_dim=64, seed=7, sliding_window=24, with_attention_sink=True)
+
+    def test_pallas_matches_xla_on_dummy_inputs(self):
+        cfg = dict(
+            rng_seed=0,
+            num_seqs=8,
+            pages_per_seq=8,
+            page_size=16,
+            num_q_heads=8,
+            num_kv_heads=4,
+            head_dim=80,  # intentionally not a multiple of 128 (cache is padded)
+            kv_dtype=jnp.bfloat16,
+            q_dtype=None,
+            kv_len_max=64,
+            decode_prefill_mixed=None,
+        )
+        batch_pallas = make_dummy_rpa_inputs(**cfg)
+        batch_xla = make_dummy_rpa_inputs(**cfg)  # same values, distinct buffers (donation-safe)
+        softmax_scale = float(cfg["head_dim"]) ** -0.5
+
+        out_p, cache_p = ragged_page_attention_v3(
+            batch_pallas["queries"],
+            batch_pallas["keys"],
+            batch_pallas["values"],
+            batch_pallas["kv_cache"],
+            batch_pallas["kv_lens"],
+            batch_pallas["block_tables"],
+            batch_pallas["query_start_loc"],
+            batch_pallas["distribution"],
+            softmax_scale=softmax_scale,
+        )
+        out_x, cache_x = xla_ragged_page_attention_v3(
+            batch_xla["queries"],
+            batch_xla["keys"],
+            batch_xla["values"],
+            batch_xla["kv_cache"],
+            batch_xla["kv_lens"],
+            batch_xla["block_tables"],
+            batch_xla["query_start_loc"],
+            batch_xla["distribution"],
+            softmax_scale=softmax_scale,
+        )
+
+        assert out_p.shape == out_x.shape
+        assert cache_p.shape == cache_x.shape
+        assert jnp.allclose(out_p, out_x, rtol=0, atol=0.25)
+        assert jnp.allclose(cache_p, cache_x, rtol=0, atol=0.25)

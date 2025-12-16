@@ -20,7 +20,10 @@ import pytest
 
 from ejkernel.types.mask import (
     MaskInfo,
+    attention_mask_to_qkv_cu_seqlens,
+    cu_seqlens_to_mask,
     mask_to_segment_ids,
+    qkv_masks_to_cu_seqlens,
     segment_ids_to_mask,
     segment_ids_to_qkv_masks,
 )
@@ -274,11 +277,33 @@ def test_maskinfo_from_attention_mask_3d():
     # After conversion, the mask is 4D (batch, 1, q, kv)
     assert mask_info.attention_mask.shape == (1, 1, 4, 4)
 
-    assert mask_info.q_segment_ids[0, 0] == mask_info.q_segment_ids[0, 1]
-    assert mask_info.q_segment_ids[0, 2] == mask_info.q_segment_ids[0, 3]
-    assert mask_info.q_segment_ids[0, 0] != mask_info.q_segment_ids[0, 2]
+    # All positions are valid (attend to at least one position), so all get segment ID 0
+    # The simpler padding-style extraction doesn't recover full segment structure
+    assert jnp.all(mask_info.q_segment_ids == 0)
+    assert jnp.all(mask_info.kv_segment_ids == 0)
 
     print("  ✓ from_attention_mask (3D, JIT): OK")
+
+
+def test_maskinfo_from_attention_mask_masked_semantics():
+    """Test MaskInfo.from_attention_mask() supports PyTorch-style masked attention masks."""
+    print("\nTesting MaskInfo.from_attention_mask() with mask_is_valid=False...")
+
+    # PyTorch-style: 1/True means "masked-out", 0/False means "allowed".
+    masked = jnp.zeros((1, 1, 8, 8), dtype=jnp.int32)
+    masked = masked.at[:, :, 2:6, 3:5].set(1)
+
+    mask_info = MaskInfo.from_attention_mask(masked, mask_is_valid=False)
+    expected = ~(masked.astype(jnp.bool_))
+    assert jnp.array_equal(mask_info.attention_mask, expected)
+
+    # Check cu_seqlens with explicit max_segments
+    cu_q, cu_kv = mask_info.get_or_compute_qkv_cu_seqlens(max_segments=2)
+    # All positions are valid (segment 0), so cumulative is [0, 8, 8]
+    assert jnp.array_equal(cu_q, jnp.array([0, 8, 8], dtype=jnp.int32)), f"cu_q: {cu_q}"
+    assert jnp.array_equal(cu_kv, jnp.array([0, 8, 8], dtype=jnp.int32)), f"cu_kv: {cu_kv}"
+
+    print("  ✓ from_attention_mask mask_is_valid=False: OK")
 
 
 def test_maskinfo_properties():
@@ -1054,6 +1079,75 @@ def test_is_self_attention_with_segment_ids():
     assert mask_info_diff.is_self_attention() == False
 
     print("  ✓ is_self_attention correctness: OK")
+
+
+def test_cu_seqlens_roundtrip_from_padding_mask():
+    """Test Q/KV cu_seqlens conversions from a padding mask and back."""
+    print("\nTesting cu_seqlens <-> padding mask roundtrip...")
+
+    q_mask = jnp.array([[1, 1, 0, 0], [1, 0, 0, 0]], dtype=jnp.int32)
+    cu_q, cu_kv = qkv_masks_to_cu_seqlens(q_mask)
+
+    # New format: [start_0, end_0, start_1, end_1]
+    # batch 0: valid at 0-1 (start=0, end=2)
+    # batch 1: valid at 0 (start=0, end=1)
+    assert jnp.array_equal(cu_q, jnp.array([0, 2, 0, 1], dtype=jnp.int32))
+    assert jnp.array_equal(cu_kv, jnp.array([0, 2, 0, 1], dtype=jnp.int32))
+
+    q_mask_rt = cu_seqlens_to_mask(cu_q, max_len=4, dtype=jnp.int32)
+    assert jnp.array_equal(q_mask_rt, q_mask)
+
+    print("  ✓ cu_seqlens <-> padding mask: OK")
+
+
+def test_maskinfo_cu_seqlens_roundtrip_cross_attention():
+    """Test MaskInfo cu_seqlens derivation and reconstruction for cross-attention."""
+    print("\nTesting MaskInfo cu_seqlens roundtrip (cross-attention)...")
+
+    q_mask = jnp.array([[1, 1, 1, 0]], dtype=jnp.int32)  # q_len=4, q_valid=3
+    kv_mask = jnp.array([[1, 1, 0, 0, 0]], dtype=jnp.int32)  # kv_len=5, kv_valid=2
+
+    mask_info = MaskInfo.from_segments(q_mask, kv_mask, is_attn_mask=True)
+    cu_q, cu_kv = mask_info.get_or_compute_qkv_cu_seqlens(max_segments=2)
+
+    # With max_segments=2, output is [0, 3, 3] for q and [0, 2, 2] for kv
+    assert jnp.array_equal(cu_q, jnp.array([0, 3, 3], dtype=jnp.int32)), f"cu_q: {cu_q}"
+    assert jnp.array_equal(cu_kv, jnp.array([0, 2, 2], dtype=jnp.int32)), f"cu_kv: {cu_kv}"
+
+    # Test reconstruction using the old-style cu_seqlens format for from_cu_seqlens
+    # from_cu_seqlens expects start/end pairs, not cumulative offsets
+    cu_q_old_format = jnp.array([0, 3])  # start=0, end=3
+    cu_kv_old_format = jnp.array([0, 2])  # start=0, end=2
+    reconstructed = MaskInfo.from_cu_seqlens(cu_q_old_format, max_q_len=4, cu_seqlens_kv=cu_kv_old_format, max_kv_len=5)
+    assert jnp.array_equal(reconstructed.attention_mask, mask_info.attention_mask)
+
+    print("  ✓ MaskInfo cu_seqlens roundtrip: OK")
+
+
+def test_maskinfo_cu_seqlens_fields_and_pytree_roundtrip():
+    """Test MaskInfo stores cu_seqlens_q/cu_seqlens_kv and preserves them through pytree ops."""
+    print("\nTesting MaskInfo cu_seqlens fields + pytree roundtrip...")
+
+    # New format: [start_0, end_0, start_1, end_1, ...] for batch_size=2
+    # Batch 0: Q sequence from 0 to 3 (length 3), Batch 1: Q sequence from 0 to 2 (length 2)
+    cu_q = jnp.array([0, 3, 0, 2], dtype=jnp.int32)
+    # Batch 0: KV sequence from 0 to 2 (length 2), Batch 1: KV sequence from 0 to 4 (length 4)
+    cu_kv = jnp.array([0, 2, 0, 4], dtype=jnp.int32)
+
+    mask_info = MaskInfo.from_cu_seqlens(cu_q, max_q_len=4, cu_seqlens_kv=cu_kv, max_kv_len=6)
+    assert jnp.array_equal(mask_info.cu_seqlens_q, cu_q)
+    assert jnp.array_equal(mask_info.cu_seqlens_kv, cu_kv)
+    assert jnp.array_equal(mask_info.q_lens, jnp.array([3, 2], dtype=jnp.int32))
+    assert jnp.array_equal(mask_info.kv_lens, jnp.array([2, 4], dtype=jnp.int32))
+
+    leaves, treedef = jax.tree_util.tree_flatten(mask_info)
+    reconstructed = jax.tree_util.tree_unflatten(treedef, leaves)
+    assert jnp.array_equal(reconstructed.cu_seqlens_q, cu_q)
+    assert jnp.array_equal(reconstructed.cu_seqlens_kv, cu_kv)
+    assert jnp.array_equal(reconstructed.q_lens, jnp.array([3, 2], dtype=jnp.int32))
+    assert jnp.array_equal(reconstructed.kv_lens, jnp.array([2, 4], dtype=jnp.int32))
+
+    print("  ✓ MaskInfo cu_seqlens fields + pytree: OK")
 
 
 if __name__ == "__main__":

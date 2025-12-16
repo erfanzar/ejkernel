@@ -47,6 +47,7 @@ from ejkernel.modules import (
     recurrent_attention,
     ring_attention,
     scaled_dot_product_attention,
+    unified_attention,
 )
 
 
@@ -358,6 +359,46 @@ class TestRaggedDecodeAttention:
 
         output = ragged_decode_attention(q, k, v, cu_seqlens, kv_lengths)
         assert output.shape == (total_tokens, H, D)
+
+
+class TestUnifiedAttention:
+    """Test suite for UnifiedAttention operation."""
+
+    def test_unified_attention_basic(self):
+        """Test unified attention forward shape."""
+        num_seqs = 3
+        num_q_heads = 8
+        num_kv_heads = 2
+        head_dim = 32
+        block_size = 8
+
+        kv_lens = [32, 17, 9]
+        q_lens = [8, 1, 4]
+        max_kv = max(kv_lens)
+        max_blocks_per_seq = (max_kv + block_size - 1) // block_size
+        num_blocks_total = num_seqs * max_blocks_per_seq
+
+        block_tables = jnp.arange(num_blocks_total, dtype=jnp.int32).reshape(num_seqs, max_blocks_per_seq)
+        kv_lens_arr = jnp.array(kv_lens, dtype=jnp.int32)
+
+        cu = [0]
+        for q in q_lens:
+            cu.append(cu[-1] + int(q))
+        query_start_loc = jnp.array(cu, dtype=jnp.int32)
+        total_tokens = int(query_start_loc[-1])
+
+        q = jax.random.normal(jax.random.PRNGKey(0), (total_tokens, num_q_heads, head_dim), dtype=jnp.float32).astype(
+            jnp.bfloat16
+        )
+        k_cache = jax.random.normal(
+            jax.random.PRNGKey(1), (num_blocks_total, block_size, num_kv_heads, head_dim), dtype=jnp.float32
+        ).astype(jnp.bfloat16)
+        v_cache = jax.random.normal(
+            jax.random.PRNGKey(2), (num_blocks_total, block_size, num_kv_heads, head_dim), dtype=jnp.float32
+        ).astype(jnp.bfloat16)
+
+        out = unified_attention(q, k_cache, v_cache, kv_lens_arr, block_tables, query_start_loc)
+        assert out.shape == (total_tokens, num_q_heads, head_dim)
 
 
 class TestRingAttention:

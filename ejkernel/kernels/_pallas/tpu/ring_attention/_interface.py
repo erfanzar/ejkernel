@@ -242,7 +242,6 @@ def ring_attention(
         kv_seg = kv_segment_ids if kv_segment_ids is not None else q_segment_ids
         segment_ids = SegmentIds(q=q_seg[0], kv=kv_seg[0])
 
-
     def single_batch_attention(q, k, v, seg_ids, sinks_batch):
         """Process single batch element."""
         # Rearrange from [seq_len, num_heads, head_dim] to [num_heads, seq_len, head_dim]

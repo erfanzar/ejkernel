@@ -27,6 +27,7 @@ from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .recurrent import recurrent
 from .ring_attention import ring_attention
 from .scaled_dot_product_attention import scaled_dot_product_attention
+from .unified_attention import unified_attention
 
 __all__ = [
     "apply_native_sparse_attention",
@@ -43,4 +44,5 @@ __all__ = [
     "recurrent_gla",
     "ring_attention",
     "scaled_dot_product_attention",
+    "unified_attention",
 ]

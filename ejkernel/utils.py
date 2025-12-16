@@ -715,11 +715,13 @@ def make_dummy_rpa_inputs(
     num_q_heads: int = 8,
     num_kv_heads: int = 2,
     head_dim: int = 80,  # intentionally not multiple of 128 to exercise padding
-    kv_dtype=jnp.float32,  # must be 16/32-bit float
-    q_dtype=None,  # defaults to kv_dtype if None
+    kv_dtype: jnp.dtype = jnp.float32,  # must be 16/32-bit float
+    q_dtype: jnp.dtype | None = None,  # defaults to kv_dtype if None
     kv_len_max: int | None = None,  # cap on kv_len per sequence; defaults to pages_per_seq*page_size
-    decode_prefill_mixed: tuple[int, int, int]
-    | None = None,  # (decode_end, prefill_end, mixed_end/total). Defaults to (0,0,num_seqs).
+    total_q: int | None = None,  # total number of query tokens (sum_q). If set, uses deterministic q/kv lengths.
+    total_num_pages: int | None = None,  # physical kv_cache pages (>= num_seqs*pages_per_seq); defaults to used pages.
+    decode_prefill_mixed: tuple[int, int, int] | None = None,
+    # (decode_end, prefill_end, mixed_end/total). Defaults to (0,0,num_seqs).
 ):
     """
     Returns a dict with:
@@ -731,6 +733,11 @@ def make_dummy_rpa_inputs(
       query_start_loc: (num_seqs + 1,)                       [int32]
       distribution:    (3,)                                  [int32]
     All constraints required by the kernel/validators are satisfied.
+
+    Example (matches the large benchmark shapes discussed in ragged_page_attention_v3):
+      - `total_q=1024`, `num_q_heads=8`, `head_dim=128`
+      - `num_kv_heads=4`, `kv_dtype=jnp.bfloat16` (packing=2)
+      - `page_size=64`, `pages_per_seq=16`, `total_num_pages=2**17`
     """
     if q_dtype is None:
         q_dtype = kv_dtype
@@ -749,12 +756,27 @@ def make_dummy_rpa_inputs(
     key = jax.random.PRNGKey(rng_seed)
     key_kv, key_q, key_data = jax.random.split(key, 3)
 
-    # Sample kv_lens in [1, kv_len_max] and q_lens in [1, kv_len]
-    kv_lens = jax.random.randint(key_kv, (num_seqs,), minval=1, maxval=kv_len_max + 1, dtype=jnp.int32)
-    # q_lens chosen uniformly in [1, kv_len]
-    # We generate a random factor in (0,1], then ceil -> [1, kv_len]
-    rnd = jax.random.uniform(key_q, (num_seqs,), minval=0.0, maxval=1.0)
-    q_lens = jnp.maximum(1, jnp.ceil(rnd * kv_lens).astype(jnp.int32))
+    if total_q is None:
+        # Sample kv_lens in [1, kv_len_max] and q_lens in [1, kv_len]
+        kv_lens = jax.random.randint(key_kv, (num_seqs,), minval=1, maxval=kv_len_max + 1, dtype=jnp.int32)
+        # q_lens chosen uniformly in [1, kv_len]
+        # We generate a random factor in (0,1], then ceil -> [1, kv_len]
+        rnd = jax.random.uniform(key_q, (num_seqs,), minval=0.0, maxval=1.0)
+        q_lens = jnp.maximum(1, jnp.ceil(rnd * kv_lens).astype(jnp.int32))
+    else:
+        if total_q < num_seqs:
+            raise ValueError(f"total_q ({total_q}) must be >= num_seqs ({num_seqs}) so each sequence has >= 1 token.")
+        if total_q > num_seqs * kv_len_max:
+            raise ValueError(
+                f"total_q ({total_q}) must be <= num_seqs*kv_len_max ({num_seqs}*{kv_len_max}) "
+                "to satisfy q_len <= kv_len <= kv_len_max per sequence."
+            )
+        base = total_q // num_seqs
+        rem = total_q % num_seqs
+        q_lens = jnp.full((num_seqs,), base, dtype=jnp.int32)
+        if rem:
+            q_lens = q_lens.at[:rem].add(jnp.int32(1))
+        kv_lens = q_lens
 
     # Cumulative query starts
     query_start_loc = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(q_lens, dtype=jnp.int32)])
@@ -770,7 +792,10 @@ def make_dummy_rpa_inputs(
         distribution = jnp.array([i, j, k], dtype=jnp.int32)
 
     # Block tables: assign each sequence a disjoint, contiguous page range
-    total_pages = num_seqs * pages_per_seq
+    total_pages_used = num_seqs * pages_per_seq
+    total_pages = total_pages_used if total_num_pages is None else int(total_num_pages)
+    if total_pages < total_pages_used:
+        raise ValueError(f"total_num_pages ({total_pages}) must be >= num_seqs*pages_per_seq ({total_pages_used}).")
     seq_bases = jnp.arange(num_seqs, dtype=jnp.int32) * jnp.int32(pages_per_seq)
     per_seq = (seq_bases[:, None] + jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :]).reshape(-1)
     block_tables = per_seq  # shape (num_seqs * pages_per_seq,)
@@ -804,6 +829,7 @@ def make_dummy_rpa_inputs(
             pages_per_seq=pages_per_seq,
             page_size=page_size,
             total_pages=total_pages,
+            total_pages_used=total_pages_used,
             q_lens=q_lens,
             kv_lens=kv_lens,
             head_dim=head_dim,

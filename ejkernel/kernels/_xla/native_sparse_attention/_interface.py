@@ -264,13 +264,52 @@ def apply_native_sparse_attention(
     else:
         softmax_scale = float(softmax_scale)
 
-    if isinstance(block_counts, int):
-        batch = query.shape[0]
-        seq_len = query.shape[1]
-        num_kv_heads = key.shape[2]
-        block_counts = jnp.full((batch, seq_len, num_kv_heads), block_counts, dtype=jnp.int32)
+    batch = query.shape[0]
+    seq_len = query.shape[1]
+    num_kv_heads = key.shape[2]
+    num_blocks = (seq_len + block_size - 1) // block_size
 
-    return _sparse_attention_with_vjp(query, key, value, block_indices, block_counts, block_size, softmax_scale)
+    # Support both:
+    #  1) per-token indices: (B, T, H_kv, S)
+    #  2) per-query-block indices: (B, H_kv, num_blocks, S)
+    block_indices_arr = jnp.asarray(block_indices, dtype=jnp.int32)
+    if block_indices_arr.ndim != 4:
+        raise ValueError(f"block_indices must be a 4D int32 array, got shape {block_indices_arr.shape}.")
+
+    if block_indices_arr.shape[1] == seq_len and block_indices_arr.shape[2] == num_kv_heads:
+        block_indices_tok = block_indices_arr
+    elif block_indices_arr.shape[1] == num_kv_heads and block_indices_arr.shape[2] == num_blocks:
+        qb = (jnp.arange(seq_len, dtype=jnp.int32) // block_size).astype(jnp.int32)  # (T,)
+        block_indices_blk = jnp.transpose(block_indices_arr, (0, 2, 1, 3))  # (B, num_blocks, H_kv, S)
+        block_indices_tok = block_indices_blk[:, qb, :, :]  # (B, T, H_kv, S)
+    else:
+        raise ValueError(
+            "block_indices must have shape (batch, seq_len, num_kv_heads, num_selected_blocks) "
+            "or (batch, num_kv_heads, num_blocks, num_selected_blocks). "
+            f"Got shape {block_indices_arr.shape} for seq_len={seq_len}, num_kv_heads={num_kv_heads}, "
+            f"num_blocks={num_blocks}, block_size={block_size}."
+        )
+
+    if isinstance(block_counts, int):
+        block_counts_tok = jnp.full((batch, seq_len, num_kv_heads), int(block_counts), dtype=jnp.int32)
+    else:
+        block_counts_arr = jnp.asarray(block_counts, dtype=jnp.int32)
+        if block_counts_arr.ndim != 3:
+            raise ValueError(f"block_counts must be an int or a 3D int32 array, got shape {block_counts_arr.shape}.")
+        if block_counts_arr.shape == (batch, seq_len, num_kv_heads):
+            block_counts_tok = block_counts_arr
+        elif block_counts_arr.shape == (batch, num_kv_heads, num_blocks):
+            qb = (jnp.arange(seq_len, dtype=jnp.int32) // block_size).astype(jnp.int32)  # (T,)
+            block_counts_blk = jnp.transpose(block_counts_arr, (0, 2, 1))  # (B, num_blocks, H_kv)
+            block_counts_tok = block_counts_blk[:, qb, :]  # (B, T, H_kv)
+        else:
+            raise ValueError(
+                "block_counts must have shape (batch, seq_len, num_kv_heads) or (batch, num_kv_heads, num_blocks). "
+                f"Got shape {block_counts_arr.shape} for seq_len={seq_len}, num_kv_heads={num_kv_heads}, "
+                f"num_blocks={num_blocks}, block_size={block_size}."
+            )
+
+    return _sparse_attention_with_vjp(query, key, value, block_indices_tok, block_counts_tok, block_size, softmax_scale)
 
 
 @kernel_registry.register("native_sparse_attention", Platform.XLA, Backend.ANY)

@@ -352,6 +352,14 @@ def flash_attention(
     else:
         scale_val = float(softmax_scale)
 
+    if fwd_params is None:
+        fwd_params = FwdParams(q_blocksize=min(128, query.shape[1]), kv_blocksize=min(128, key.shape[1]))
+
+    q_block = min(128, query.shape[1]) if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize)
+    kv_block = min(128, key.shape[1]) if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize)
+    q_block = max(1, q_block)
+    kv_block = max(1, kv_block)
+
     precision_code = _precision_to_code(precision)
     logits_dtype_code = _dtype_to_code(logits_dtype)
 
@@ -365,8 +373,8 @@ def flash_attention(
         window_tuple,
         scale_val,
         logits_soft_cap,
-        int(fwd_params.q_blocksize),
-        int(fwd_params.kv_blocksize),
+        q_block,
+        kv_block,
         bool(normalize_output),
         precision_code,
         logits_dtype_code,

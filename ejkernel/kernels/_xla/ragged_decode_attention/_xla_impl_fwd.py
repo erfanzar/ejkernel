@@ -47,39 +47,31 @@ def create_attention_mask(
         Boolean mask of shape [batch, q_len, 1, kv_len]
     """
 
-    kv_positions = jnp.arange(kv_len)[None, None, :]
+    kv_positions = jnp.arange(kv_len, dtype=jnp.int32)[None, None, :]  # (1,1,K)
+    start = jnp.asarray(sequence_start, jnp.int32)[:, None, None]  # (B,1,1)
+    end = jnp.asarray(sequence_end, jnp.int32)[:, None, None]  # (B,1,1)
 
-    start_expanded = sequence_start[:, None, None]
-    end_expanded = sequence_end[:, None, None]
+    kv_valid = (kv_positions >= start) & (kv_positions < end)  # (B,1,K)
+    kv_valid = jnp.broadcast_to(kv_valid, (batch_size, q_len, kv_len))  # (B,Q,K)
 
-    ragged_mask = (kv_positions >= start_expanded) & (kv_positions < end_expanded)
+    mask = kv_valid
 
     if sliding_window is not None:
         window_left, window_right = sliding_window
-
         if q_len == 1:
-            q_positions = end_expanded - 1
-
-            window_mask = (kv_positions >= q_positions - window_left) & (kv_positions <= q_positions + window_right)
-
-            ragged_mask = ragged_mask & window_mask
+            q_pos = (end - 1).astype(jnp.int32)  # (B,1,1)
         else:
-            q_positions = jnp.arange(q_len)[None, :, None] + start_expanded
-            window_mask = (kv_positions >= q_positions - window_left) & (kv_positions <= q_positions + window_right)
-            ragged_mask = ragged_mask[:, None, :] & window_mask
+            q_pos = (jnp.arange(q_len, dtype=jnp.int32)[None, :, None] + start).astype(jnp.int32)  # (B,Q,1)
+
+        window_mask = (kv_positions >= (q_pos - window_left)) & (kv_positions <= (q_pos + window_right))  # (B,Q,K)
+        mask = mask & window_mask
 
     if num_sinks > 0:
-        sink_positions = jnp.arange(kv_len)[None, None, :]
+        sink_mask = (kv_positions >= start) & (kv_positions < (start + jnp.int32(num_sinks)))  # (B,1,K)
+        sink_mask = jnp.broadcast_to(sink_mask, mask.shape)
+        mask = mask | sink_mask
 
-        sink_mask = (sink_positions >= start_expanded) & (sink_positions < start_expanded + num_sinks)
-        ragged_mask = ragged_mask | sink_mask
-
-    if ragged_mask.ndim == 3:
-        ragged_mask = ragged_mask[:, None, None, :]
-    elif ragged_mask.ndim == 4:
-        ragged_mask = ragged_mask[:, :, None, :]
-
-    return ragged_mask
+    return mask[:, :, None, :]
 
 
 def apply_logits_soft_cap(scores: Float[Array, "... seq_len"], logits_soft_cap: float) -> Float[Array, "... seq_len"]:
@@ -177,7 +169,10 @@ def flash_attention_block(
 
     mask_expanded = jnp.broadcast_to(mask_block, scores.shape)
 
-    scores = jnp.where(mask_expanded, scores, -jnp.inf)
+    # Use a large finite negative instead of -inf so completely-masked blocks
+    # don't produce NaNs via (-inf - -inf) in the blockwise softmax update.
+    min_score = jnp.finfo(scores.dtype).min
+    scores = jnp.where(mask_expanded, scores, min_score)
 
     m_curr = jnp.max(scores, axis=-1, keepdims=True)
     m_new = jnp.maximum(m_prev, m_curr)
@@ -328,10 +323,15 @@ def ragged_decode_mqa_xla(
         Output tensor [B, H_q, D]
     """
     batch_size, num_heads_q, head_dim = query.shape
-    _, _seq_len, num_heads_kv, _ = key.shape
+    _, kv_len, num_heads_kv, _ = key.shape
 
     if softmax_scale is None:
         softmax_scale = 1.0 / jnp.sqrt(head_dim)
+
+    if fwd_params is None:
+        fwd_params = FwdParams()
+    block_size = 256 if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize)
+    block_size = max(1, min(block_size, kv_len))
 
     group_size = num_heads_q // num_heads_kv
     query = query.reshape(batch_size, num_heads_kv, group_size, head_dim)
@@ -340,7 +340,21 @@ def ragged_decode_mqa_xla(
     key = jnp.transpose(key, (2, 0, 1, 3))
     value = jnp.transpose(value, (2, 0, 1, 3))
 
-    def process_kv_head(q_group, k_head, v_head):
+    aux = softmax_aux
+    if aux is not None and aux.ndim == 2:
+        if aux.shape[0] == num_heads_kv:
+            # Per-KV-head sinks: feed a per-head 1D bias so it broadcasts over the grouped query heads.
+            aux = aux  # (num_kv_heads, num_sinks)
+        elif aux.shape[0] == num_heads_q:
+            # Per-query-head sinks: reshape into KV-head groups so each group receives (group_size, num_sinks).
+            aux = aux.reshape(num_heads_kv, group_size, aux.shape[1])  # (num_kv_heads, group_size, num_sinks)
+        else:
+            raise ValueError(
+                "softmax_aux must have shape (num_sinks,), (num_kv_heads, num_sinks) or (num_q_heads, num_sinks); "
+                f"got shape {aux.shape} for num_q_heads={num_heads_q}, num_kv_heads={num_heads_kv}."
+            )
+
+    def process_kv_head(q_group, k_head, v_head, aux_i):
         k_head = k_head[:, :, None, :]
         v_head = v_head[:, :, None, :]
         q_group = q_group[:, None, :, :]
@@ -352,15 +366,18 @@ def ragged_decode_mqa_xla(
             sequence_start,
             sequence_end,
             softmax_scale=softmax_scale,
-            block_size=fwd_params.kv_blocksize,
+            block_size=block_size,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
-            softmax_aux=softmax_aux,
+            softmax_aux=aux_i,
         )
 
         return output[:, 0, :, :]
 
-    outputs = jax.vmap(process_kv_head)(query, key, value)
+    if aux is None or aux.ndim == 1:
+        outputs = jax.vmap(process_kv_head, in_axes=(0, 0, 0, None))(query, key, value, aux)
+    else:
+        outputs = jax.vmap(process_kv_head, in_axes=(0, 0, 0, 0))(query, key, value, aux)
 
     outputs = jnp.transpose(outputs, (1, 0, 2, 3))
     return outputs.reshape(batch_size, num_heads_q, head_dim)

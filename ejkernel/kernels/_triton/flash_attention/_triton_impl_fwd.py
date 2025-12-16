@@ -597,6 +597,16 @@ def _fwd_attention_kernel_call(
 
         pass
 
+    if fwd_params is None:
+        fwd_params = FwdParams()
+
+    default_block_m = min(128, int(q.shape[1]))
+    default_block_n = min(128, int(k.shape[1]))
+    block_m = default_block_m if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize)
+    block_n = default_block_n if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize)
+    num_warps = 4 if fwd_params.num_warps is None else int(fwd_params.num_warps)
+    num_stages = 2 if fwd_params.num_stages is None else int(fwd_params.num_stages)
+
     varlen_from_cu = (cum_seqlens_q is not None) and (cum_seqlens_k is not None)
     if varlen_from_cu:
         assert cum_seqlens_q.dtype == jnp.int32 and cum_seqlens_k.dtype == jnp.int32
@@ -644,10 +654,10 @@ def _fwd_attention_kernel_call(
             BOOL_BIAS=BOOL_BIAS,
             BLOCK_HEADDIM=BLOCK_HEADDIM,
             PADDED_HEADS=PADDED_HEADS,
-            BLOCK_N=fwd_params.kv_blocksize,
-            BLOCK_M=fwd_params.q_blocksize,
-            num_warps=fwd_params.num_warps,
-            num_stages=fwd_params.num_stages,
+            BLOCK_N=block_n,
+            BLOCK_M=block_m,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
 
         out_shape = [
@@ -765,10 +775,10 @@ def _fwd_attention_kernel_call(
         BOOL_BIAS=BOOL_BIAS,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
         PADDED_HEADS=PADDED_HEADS,
-        BLOCK_N=fwd_params.kv_blocksize,
-        BLOCK_M=fwd_params.q_blocksize,
-        num_warps=fwd_params.num_warps,
-        num_stages=fwd_params.num_stages,
+        BLOCK_N=block_n,
+        BLOCK_M=block_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     out_shape = [

@@ -166,13 +166,28 @@ def ring_attention(
     bwd_params: BwdParams | None = None,
     fused_backward: bool = False,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+    del mask_builder, bwd_params, fused_backward
+
     if fwd_params is None:
-        fwd_params = FwdParams(
-            q_blocksize=min(512, query.shape[1]),
-            kv_blocksize=min(512, key.shape[1]),
-        )
-    query_chunk_size = min(fwd_params.q_blocksize, query.shape[1])
-    key_chunk_size = min(fwd_params.kv_blocksize, key.shape[1])
+        fwd_params = FwdParams()
+
+    # Back-compat: `chunk_size` sets both query/key chunk sizes unless explicitly overridden.
+    if chunk_size is not None:
+        if query_chunk_size is None:
+            query_chunk_size = chunk_size
+        if key_chunk_size is None:
+            key_chunk_size = chunk_size
+
+    default_q = min(512, query.shape[1])
+    default_k = min(512, key.shape[1])
+    qcs = default_q if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize)
+    kcs = default_k if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize)
+
+    qcs = qcs if query_chunk_size is None else int(query_chunk_size)
+    kcs = kcs if key_chunk_size is None else int(key_chunk_size)
+
+    qcs = max(1, min(qcs, query.shape[1]))
+    kcs = max(1, min(kcs, key.shape[1]))
 
     return _ring_attention(
         query,
@@ -185,13 +200,13 @@ def ring_attention(
         axis_name,
         True,
         softmax_scale,
-        query_chunk_size,
-        key_chunk_size,
+        qcs,
+        kcs,
         None,
         True,
         None,
-        0.0,
-        jnp.bfloat16,
+        0,
+        jnp.float32,
         jax.checkpoint_policies.nothing_saveable,
         jax.lax.Precision.DEFAULT,
         True,

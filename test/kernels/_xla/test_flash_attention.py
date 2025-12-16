@@ -21,6 +21,7 @@ import pytest
 
 from ejkernel.kernels._xla.attention._interface import attention
 from ejkernel.kernels._xla.flash_attention import flash_attention
+from ejkernel.ops import FwdParams
 
 
 def naive_attention(q, k, v, softmax_scale=None, mask=None):
@@ -58,7 +59,7 @@ class TestBasicFunctionality:
         k = jax.random.normal(keys[1], (B, T, H, D), dtype=jnp.float32)
         v = jax.random.normal(keys[2], (B, T, H, D), dtype=jnp.float32)
 
-        output_flash = flash_attention(q, k, v, chunk_size_q=64, chunk_size_k=64)
+        output_flash = flash_attention(q, k, v, fwd_params=FwdParams(q_blocksize=64, kv_blocksize=64))
 
         output_naive = naive_attention(q, k, v)
 
@@ -77,7 +78,9 @@ class TestBasicFunctionality:
 
         causal_mask = jnp.tril(jnp.ones((1, 1, T, T), dtype=bool))
 
-        output_flash = flash_attention(q, k, v, sliding_window=(T - 1, 0), chunk_size_q=32, chunk_size_k=32)
+        output_flash = flash_attention(
+            q, k, v, sliding_window=(T - 1, 0), fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32)
+        )
 
         output_naive = naive_attention(q, k, v, mask=causal_mask)
 
@@ -94,7 +97,7 @@ class TestBasicFunctionality:
         k = jax.random.normal(keys[1], (B, T, 1, D), dtype=jnp.float32)
         v = jax.random.normal(keys[2], (B, T, 1, D), dtype=jnp.float32)
 
-        output_flash = flash_attention(q, k, v, chunk_size_q=32, chunk_size_k=32)
+        output_flash = flash_attention(q, k, v, fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32))
         output_naive = naive_attention(q, k, v)
 
         max_diff = jnp.max(jnp.abs(output_flash - output_naive))
@@ -112,7 +115,7 @@ class TestBasicFunctionality:
             k = jax.random.normal(keys[1], (B, T, H, D), dtype=dtype)
             v = jax.random.normal(keys[2], (B, T, H, D), dtype=dtype)
 
-            output = flash_attention(q, k, v, chunk_size_q=32, chunk_size_k=32)
+            output = flash_attention(q, k, v, fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32))
             assert output.dtype == dtype
             assert jnp.all(jnp.isfinite(output))
 
@@ -130,9 +133,11 @@ class TestSlidingWindow:
         k = jax.random.normal(keys[1], (B, T, H, D), dtype=jnp.float32)
         v = jax.random.normal(keys[2], (B, T, H, D), dtype=jnp.float32)
 
-        output_full = flash_attention(q, k, v, chunk_size_q=64, chunk_size_k=64)
+        output_full = flash_attention(q, k, v, fwd_params=FwdParams(q_blocksize=64, kv_blocksize=64))
 
-        output_windowed = flash_attention(q, k, v, sliding_window=(64, 64), chunk_size_q=64, chunk_size_k=64)
+        output_windowed = flash_attention(
+            q, k, v, sliding_window=(64, 64), fwd_params=FwdParams(q_blocksize=64, kv_blocksize=64)
+        )
 
         assert output_windowed.shape == q.shape
         diff = jnp.mean(jnp.abs(output_full - output_windowed))
@@ -148,9 +153,13 @@ class TestSlidingWindow:
         k = jax.random.normal(keys[1], (B, T, H, D), dtype=jnp.float32)
         v = jax.random.normal(keys[2], (B, T, H, D), dtype=jnp.float32)
 
-        output_sym = flash_attention(q, k, v, sliding_window=(32, 32), chunk_size_q=32, chunk_size_k=32)
+        output_sym = flash_attention(
+            q, k, v, sliding_window=(32, 32), fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32)
+        )
 
-        output_asym = flash_attention(q, k, v, sliding_window=(64, 16), chunk_size_q=32, chunk_size_k=32)
+        output_asym = flash_attention(
+            q, k, v, sliding_window=(64, 16), fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32)
+        )
 
         diff = jnp.mean(jnp.abs(output_sym - output_asym))
         assert diff > 1e-6, "Asymmetric window should differ from symmetric"
@@ -361,8 +370,7 @@ class TestCombinedFeatures:
             sliding_window=(64, 64),
             logits_soft_cap=30.0,
             softmax_aux=sinks,
-            chunk_size_q=32,
-            chunk_size_k=32,
+            fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32),
         )
 
         assert out.shape == q.shape
@@ -383,7 +391,7 @@ class TestGradients:
         v = jax.random.normal(keys[2], (B, T, H, D))
 
         def loss_fn(q, k, v):
-            output = flash_attention(q, k, v, chunk_size_q=32, chunk_size_k=32)
+            output = flash_attention(q, k, v, fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32))
             return jnp.sum(output**2)
 
         grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
@@ -411,8 +419,7 @@ class TestGradients:
                 sliding_window=(32, 32),
                 logits_soft_cap=30.0,
                 softmax_aux=sinks,
-                chunk_size_q=32,
-                chunk_size_k=32,
+                fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32),
             )
             return jnp.sum(output**2)
 
@@ -433,7 +440,7 @@ class TestVanillaComparison:
         k = jax.random.normal(keys[1], (B, T, H, D))
         v = jax.random.normal(keys[2], (B, T, H, D))
 
-        flash_out = flash_attention(q, k, v, chunk_size_q=32, chunk_size_k=32)
+        flash_out = flash_attention(q, k, v, fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32))
         vanilla_out, _ = attention(q, k, v)
 
         max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
@@ -454,7 +461,7 @@ class TestVanillaComparison:
         causal_mask = causal_mask[None, None, :, :]
         causal_mask = jnp.broadcast_to(causal_mask, (B, 1, T, T))
 
-        flash_out = flash_attention(q, k, v, causal=True, chunk_size_q=32, chunk_size_k=32)
+        flash_out = flash_attention(q, k, v, causal=True, fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32))
         vanilla_out, _ = attention(q, k, v, attention_mask=causal_mask)
 
         max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
@@ -472,7 +479,7 @@ class TestVanillaComparison:
         v = jax.random.normal(keys[2], (B, T, H, D))
         bias = jax.random.normal(keys[3], (B, H, T, T)) * 0.1
 
-        flash_out = flash_attention(q, k, v, bias=bias, chunk_size_q=32, chunk_size_k=32)
+        flash_out = flash_attention(q, k, v, bias=bias, fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32))
         vanilla_out, _ = attention(q, k, v, bias=bias)
 
         max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
@@ -490,7 +497,9 @@ class TestVanillaComparison:
         v = jax.random.normal(keys[2], (B, T, H, D))
 
         window = 16
-        flash_out = flash_attention(q, k, v, sliding_window=(window, window), chunk_size_q=32, chunk_size_k=32)
+        flash_out = flash_attention(
+            q, k, v, sliding_window=(window, window), fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32)
+        )
         vanilla_out, _ = attention(q, k, v, sliding_window=window)
 
         max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))
@@ -508,7 +517,9 @@ class TestVanillaComparison:
         v = jax.random.normal(keys[2], (B, T, H, D))
 
         softmax_scale = 0.5
-        flash_out = flash_attention(q, k, v, softmax_scale=softmax_scale, chunk_size_q=32, chunk_size_k=32)
+        flash_out = flash_attention(
+            q, k, v, softmax_scale=softmax_scale, fwd_params=FwdParams(q_blocksize=32, kv_blocksize=32)
+        )
         vanilla_out, _ = attention(q, k, v, softmax_scale=softmax_scale)
 
         max_diff = float(jnp.max(jnp.abs(flash_out - vanilla_out)))

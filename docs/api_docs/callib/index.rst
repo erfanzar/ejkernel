@@ -4,6 +4,7 @@ ejkernel.callib package
 .. toctree::
    :maxdepth: 2
 
-   callib/_ejit
-   callib/_triton_call
-   callib/_utils
+   _ejit
+   _pallas_call
+   _triton_call
+   _utils

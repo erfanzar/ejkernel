@@ -43,28 +43,29 @@ def align_to(x, a):
 
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
-    assert k.shape == v.shape and k.dtype == v.dtype
-    T, Hkv, Dact = k.shape
-    pack = get_dtype_packing(k.dtype)
-    Hx2_act = Hkv * 2
-    Hx2 = align_to(Hx2_act, pack)
-    Dalign = align_to(Dact, 128)
-    kv = jnp.pad(
-        jnp.concatenate([k, v], axis=-1).reshape(T, Hx2_act, Dact),
-        ((0, 0), (0, Hx2 - Hx2_act), (0, Dalign - Dact)),
-        constant_values=0,
-    ).reshape(T, Hx2 // pack, pack, Dalign)
-    return kv
-
-
-def _kv_flat_unpack(flat_kv: jax.Array, actual_num_kv_heads: int, Dalign: int):
-    Tcap, Hx2_per_pack, pack, _ = flat_kv.shape
-    Hx2 = Hx2_per_pack * pack
-    kv = flat_kv.reshape(Tcap, Hx2, Dalign)[:, : actual_num_kv_heads * 2, :]
-    kv = kv.reshape(Tcap, actual_num_kv_heads, 2 * Dalign)
-    K = kv[:, :, :Dalign]
-    V = kv[:, :, Dalign:]
-    return K, V
+    with jax.named_scope("rpa_v3_xla.merge_kv"):
+        assert k.shape == v.shape
+        assert k.dtype == v.dtype
+        max_num_tokens, actual_num_kv_heads, actual_head_dim = k.shape
+        kv_packing = get_dtype_packing(k.dtype)
+        actual_num_kv_heads_x2 = actual_num_kv_heads * 2
+        num_kv_heads_x2 = align_to(actual_num_kv_heads_x2, kv_packing)
+        head_dim = align_to(actual_head_dim, 128)
+        kv = jnp.pad(
+            jnp.concat([k, v], axis=-1).reshape(max_num_tokens, actual_num_kv_heads_x2, actual_head_dim),
+            (
+                (0, 0),
+                (0, num_kv_heads_x2 - actual_num_kv_heads_x2),
+                (0, head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        ).reshape(
+            max_num_tokens,
+            num_kv_heads_x2 // kv_packing,
+            kv_packing,
+            head_dim,
+        )
+        return kv
 
 
 def static_validate_inputs(
@@ -89,6 +90,7 @@ def static_validate_inputs(
     num_queries_per_block=None,
     vmem_limit_bytes=None,
 ):
+    del chunk_prefill_size, vmem_limit_bytes
     if not (q.ndim == k.ndim == v.ndim == 3):
         raise ValueError("q,k,v must be 3D")
     if k.shape != v.shape or q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2]:
@@ -122,6 +124,10 @@ def static_validate_inputs(
         raise ValueError("sliding_window > 0")
     if logits_soft_cap is not None and logits_soft_cap == 0.0:
         raise ValueError("soft_cap != 0")
+    if num_kv_pages_per_block is not None and int(num_kv_pages_per_block) <= 0:
+        raise ValueError("num_kv_pages_per_block must be > 0")
+    if num_queries_per_block is not None and int(num_queries_per_block) <= 0:
+        raise ValueError("num_queries_per_block must be > 0")
 
 
 @ejit(
@@ -139,6 +145,7 @@ def static_validate_inputs(
         "vmem_limit_bytes",
     ),
     donate_argnums=(3,),
+    inline=True,
 )
 def ragged_paged_attention(
     queries: jax.Array,
@@ -163,265 +170,313 @@ def ragged_paged_attention(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    del chunk_prefill_size, num_kv_pages_per_block, num_queries_per_block, vmem_limit_bytes
+    del chunk_prefill_size, vmem_limit_bytes
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
 
-    static_validate_inputs(
-        queries,
-        keys,
-        values,
-        kv_cache,
-        kv_lens,
-        block_tables,
-        query_start_loc,
-        distribution,
-        softmax_scale=softmax_scale,
-        sliding_window=sliding_window,
-        logits_soft_cap=logits_soft_cap,
-        mask_value=mask_value,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
+    with jax.named_scope("rpa_v3_xla.validate"):
+        static_validate_inputs(
+            queries,
+            keys,
+            values,
+            kv_cache,
+            kv_lens,
+            block_tables,
+            query_start_loc,
+            distribution,
+            softmax_scale=softmax_scale,
+            sliding_window=sliding_window,
+            logits_soft_cap=logits_soft_cap,
+            mask_value=mask_value,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+        )
 
-    T, Hq, D = queries.shape
-    Hkv = keys.shape[1]
-    Hrep = Hq // Hkv
+    with jax.named_scope("rpa_v3_xla.setup"):
+        actual_head_dim = queries.shape[2]
+        total_q = queries.shape[0]
+        actual_num_q_heads = queries.shape[1]
+        actual_num_kv_heads = keys.shape[1]
+        actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
-    _P, page_sz, _Hx2_per_pack, _pack, Dalign = kv_cache.shape
-    pages_per_seq = block_tables.shape[0] // kv_lens.shape[0]
+        (
+            _total_num_pages,
+            page_size,
+            num_kv_heads_x2_per_kv_packing,
+            kv_packing,
+            head_dim_padded,
+        ) = kv_cache.shape
+        num_kv_heads_x2 = num_kv_heads_x2_per_kv_packing * kv_packing
+        max_num_seqs = kv_lens.shape[0]
+        pages_per_seq = block_tables.shape[0] // max_num_seqs
+        tokens_per_seq = pages_per_seq * page_size
 
-    # Constants for tiling
-    BQ = 128
-    BKV = 128
-    BKV = max(BKV, page_sz)
-    BKV = (BKV // page_sz) * page_sz
-
-    fused_kv = merge_kv(keys, values)
-
-    max_num_seqs = kv_lens.shape[0]
-    num_seqs = jnp.asarray(distribution[-1], dtype=jnp.int32)
-
-    # 1. Update KV Cache using scatter
-    # Map each token t in 0..T to its cache location
-
-    def get_scatter_indices(t_idx):
-        # Find sequence index
-        # query_start_loc is [0, len1, len1+len2, ...]
-        # searchsorted 'right' gives index in [1, num_seqs+1]
-        s_idx = jnp.searchsorted(query_start_loc, t_idx, side="right") - 1
-
-        # Position in sequence (relative to new tokens)
-        pos_in_new = t_idx - query_start_loc[s_idx]
-
-        # Position in full KV sequence
-        # kv_len includes new tokens
-        # q_len is length of new tokens
-        q_start = query_start_loc[s_idx]
-        q_end = query_start_loc[s_idx + 1]
-        q_len = q_end - q_start
-        kv_len = kv_lens[s_idx]
-
-        # The new tokens are at the END of the KV sequence: [kv_len - q_len : kv_len]
-        pos_in_kv = (kv_len - q_len) + pos_in_new
-
-        # Page index and offset
-        page_idx_in_seq = pos_in_kv // page_sz
-        page_offset = pos_in_kv % page_sz
-
-        # Physical page index
-        # block_tables is [num_seqs * pages_per_seq] (flattened view logic)
-        # But input block_tables is [max_num_seqs * pages_per_seq]
-        flat_block_idx = s_idx * pages_per_seq + page_idx_in_seq
-        physical_page = block_tables[flat_block_idx]
-
-        return physical_page, page_offset
-
-    # vmap over all tokens
-    t_indices = jnp.arange(T, dtype=jnp.int32)
-    physical_pages, page_offsets = jax.vmap(get_scatter_indices)(t_indices)
-
-    # Flatten cache for scatter: [Total_Pages * Page_Sz, ...]
-    # kv_cache shape: [Num_Pages, Page_Size, Hx2, Pack, D]
-    # We want to index by (page * page_sz + offset)
-    kv_cache_flat = kv_cache.reshape(-1, *kv_cache.shape[2:])
-
-    scatter_indices = (physical_pages * page_sz + page_offsets)[:, None]  # [T, 1]
-
-    # Scatter update
-    # updates is fused_kv [T, Hx2, Pack, D]
-    # operand is kv_cache_flat [Num_Pages*Page_Size, Hx2, Pack, D]
-
-    dnums = lax.ScatterDimensionNumbers(
-        update_window_dims=(1, 2, 3),
-        inserted_window_dims=(0,),
-        scatter_dims_to_operand_dims=(0,),
-    )
-
-    kv_cache_flat = lax.scatter(
-        kv_cache_flat,
-        scatter_indices,
-        fused_kv,
-        dnums,
-        mode=lax.GatherScatterMode.CLIP,  # Safe for out of bounds if any
-    )
-
-    # Reshape back
-    kv_cache = kv_cache_flat.reshape(kv_cache.shape)
-
-    # 2. Compute Attention
-
-    # Pad out_acc to T+1 to handle OOB writes (scatter garbage to index T)
-    out_acc = jnp.zeros((T + 1, Hq, D), dtype=queries.dtype)
-
-    def attn_seq_body(seq_idx, out_acc):
-        q_start = query_start_loc[seq_idx]
-        q_end = query_start_loc[seq_idx + 1]
-        q_len = q_end - q_start
-        kv_len = kv_lens[seq_idx]
-
-        num_q_blocks = cdiv(q_len, BQ)
-
-        def q_block_body(q_block_idx, out_acc):
-            curr_q_start = q_block_idx * BQ
-
-            # Load Q with masking
-            indices = q_start + curr_q_start + jnp.arange(BQ)
-            safe_indices = jnp.minimum(indices, T - 1)
-            mask_load = indices < (q_start + q_len)
-
-            q_chunk = queries[safe_indices]
-            q_chunk = jnp.where(mask_load[:, None, None], q_chunk, 0)
-
-            if q_scale is not None:
-                info = jnp.finfo(q_chunk.dtype) if jnp.issubdtype(q_chunk.dtype, jnp.floating) else None
-                q_chunk = q_chunk / q_scale
-                if info is not None:
-                    q_chunk = jnp.clip(q_chunk, info.min, info.max)
-                q_chunk = q_chunk.astype(keys.dtype)
-
-            # Init accumulators [BQ, H]
-            if attention_sink is not None:
-                m = jnp.broadcast_to(attention_sink[None, :], (BQ, Hq)).astype(jnp.float32)
-                l = jnp.ones((BQ, Hq), dtype=jnp.float32)
+        # Block sizes for a generic, jittable implementation.
+        qblocks = 8 if num_queries_per_block is None else int(num_queries_per_block)
+        if num_kv_pages_per_block is None:
+            # Larger kvblocks reduces Python/XLA loop overhead in `kv_loop`.
+            if pages_per_seq >= 256:
+                kvblocks = 256
+            elif pages_per_seq >= 128:
+                kvblocks = 128
+            elif pages_per_seq >= 64:
+                kvblocks = 64
             else:
-                m = jnp.full((BQ, Hq), -jnp.inf, dtype=jnp.float32)
-                l = jnp.zeros((BQ, Hq), dtype=jnp.float32)
+                kvblocks = max(1, pages_per_seq)
+        else:
+            kvblocks = max(1, min(pages_per_seq, int(num_kv_pages_per_block)))
+        kv_tokens_per_block = kvblocks * page_size
 
-            acc = jnp.zeros((BQ, Hq, D), dtype=jnp.float32)
+        # Pad Q/K/V so any qblocks-sized dynamic_slice is in-bounds.
+        # This may read across sequence boundaries for the final partial block, but
+        # masked writes ensure correctness.
+        pad_q = qblocks - 1
+        if pad_q:
+            queries = jnp.concatenate(
+                [queries, jnp.zeros((pad_q, actual_num_q_heads, actual_head_dim), queries.dtype)],
+                axis=0,
+            )
+            keys = jnp.concatenate(
+                [keys, jnp.zeros((pad_q, actual_num_kv_heads, actual_head_dim), keys.dtype)],
+                axis=0,
+            )
+            values = jnp.concatenate(
+                [values, jnp.zeros((pad_q, actual_num_kv_heads, actual_head_dim), values.dtype)],
+                axis=0,
+            )
 
-            num_kv_blocks = cdiv(kv_len, BKV)
+        padded_total_q = queries.shape[0]
+        q_grouped = queries.reshape(
+            padded_total_q,
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            actual_head_dim,
+        )
+        merged_kv = merge_kv(keys, values)
+        o_grouped = jnp.zeros_like(q_grouped)
 
-            def kv_block_body(kv_block_idx, carry):
-                m, l, acc = carry
-                curr_kv_start = kv_block_idx * BKV
+        arange_q = jnp.arange(qblocks, dtype=jnp.int32)
+        arange_kv = jnp.arange(kv_tokens_per_block, dtype=jnp.int32)
 
-                # Load KV
-                start_page = curr_kv_start // page_sz
-                num_pages = BKV // page_sz
+        # Sliding-window KV start alignment; keep it simple and portable.
+        bkv_sz = page_size if sliding_window is not None else None
 
-                block_table_start = seq_idx * pages_per_seq
+        sinks_h = None
+        if attention_sink is not None:
+            sinks_h = attention_sink.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head).astype(jnp.float32)
 
-                page_indices = lax.dynamic_slice_in_dim(block_tables, block_table_start + start_page, num_pages, axis=0)
-                pages = kv_cache[page_indices]
-                flat_kv = pages.reshape(num_pages * page_sz, *pages.shape[2:])
+    def _seq_body(seq_idx, carry):
+        o_acc, kv_cache_acc = carry
 
-                K_chunk, V_chunk = _kv_flat_unpack(flat_kv, Hkv, Dalign)
-                K_chunk = K_chunk[:, :, :D]
-                V_chunk = V_chunk[:, :, :D]
+        with jax.named_scope("rpa_v3_xla.seq_setup"):
+            q_start = query_start_loc[seq_idx]
+            q_end = query_start_loc[seq_idx + 1]
+            q_len = q_end - q_start
+            kv_len = kv_lens[seq_idx]
 
-                if Hrep != 1:
-                    K_chunk = jnp.repeat(K_chunk, Hrep, axis=1)
-                    V_chunk = jnp.repeat(V_chunk, Hrep, axis=1)
+            kv_start = jnp.int32(0)
+            if sliding_window is not None:
+                kv_start = jnp.maximum(kv_len - jnp.int32(sliding_window), 0)
+                kv_start = (kv_start // jnp.int32(bkv_sz)) * jnp.int32(bkv_sz)
 
-                Q_t = q_chunk.transpose(1, 0, 2)  # [H, BQ, D]
-                K_t = K_chunk.transpose(1, 0, 2)  # [H, BKV, D]
-                V_t = V_chunk.transpose(1, 0, 2)  # [H, BKV, D]
+            write_start = kv_len - q_len
+            num_q_blocks = (q_len + qblocks - 1) // qblocks
 
-                S = jnp.matmul(Q_t, jnp.swapaxes(K_t, -1, -2))  # [H, BQ, BKV]
+        with jax.named_scope("rpa_v3_xla.gather_pages"):
+            indices_start = seq_idx * pages_per_seq
+            page_indices = lax.dynamic_slice(block_tables, (indices_start,), (pages_per_seq,))
 
-                S = S * softmax_scale
-                if k_scale is not None:
-                    S = S * k_scale
+            kv_pages = kv_cache_acc[page_indices]
+            kv_pages_flat = kv_pages.reshape(
+                tokens_per_seq,
+                num_kv_heads_x2_per_kv_packing,
+                kv_packing,
+                head_dim_padded,
+            )
+
+        def _update_kv_block(qb, kv_flat_pad):
+            with jax.named_scope("rpa_v3_xla.kv_update_block"):
+                q_off = qb * qblocks
+                dst = write_start + q_off
+                src = q_start + q_off
+                updates = lax.dynamic_slice(
+                    merged_kv,
+                    (src, 0, 0, 0),
+                    (qblocks, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim_padded),
+                )
+                existing = lax.dynamic_slice(
+                    kv_flat_pad,
+                    (dst, 0, 0, 0),
+                    (qblocks, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim_padded),
+                )
+                q_tok = q_off + arange_q
+                q_valid = q_tok < q_len
+                updates = jnp.where(q_valid[:, None, None, None], updates, existing)
+                return lax.dynamic_update_slice(kv_flat_pad, updates, (dst, 0, 0, 0))
+
+        with jax.named_scope("rpa_v3_xla.kv_update"):
+            kv_pages_flat_padded = jnp.concatenate(
+                [
+                    kv_pages_flat,
+                    jnp.zeros(
+                        (
+                            qblocks - 1,
+                            num_kv_heads_x2_per_kv_packing,
+                            kv_packing,
+                            head_dim_padded,
+                        ),
+                        dtype=kv_pages_flat.dtype,
+                    ),
+                ],
+                axis=0,
+            )
+            kv_pages_flat_padded = lax.fori_loop(0, num_q_blocks, _update_kv_block, kv_pages_flat_padded)
+            kv_pages_flat = kv_pages_flat_padded[:tokens_per_seq]
+            kv_pages = kv_pages_flat.reshape(kv_pages.shape)
+            kv_cache_acc = kv_cache_acc.at[page_indices].set(kv_pages)
+
+        with jax.named_scope("rpa_v3_xla.attn_setup"):
+            # Pad pages axis to make kvblocks-sized slices safe.
+            kv_pages_padded = jnp.concatenate(
+                [
+                    kv_pages,
+                    jnp.zeros((kvblocks - 1, *kv_pages.shape[1:]), dtype=kv_pages.dtype),
+                ],
+                axis=0,
+            )
+
+            num_kv_blocks = (kv_len + kv_tokens_per_block - 1) // kv_tokens_per_block
+            kv_block_start = kv_start // jnp.int32(kv_tokens_per_block)
+
+        def _process_query_block(qb, o_inner):
+            with jax.named_scope("rpa_v3_xla.q_block"):
+                q_off = qb * qblocks
+                q_global_start = q_start + q_off
+                q_block = lax.dynamic_slice(
+                    q_grouped,
+                    (q_global_start, 0, 0, 0),
+                    (qblocks, actual_num_kv_heads, actual_num_q_heads_per_kv_head, actual_head_dim),
+                )
+
                 if q_scale is not None:
-                    S = S * q_scale
+                    q_block = q_block / q_scale
+                    if jnp.issubdtype(kv_pages.dtype, jnp.floating):
+                        finfo = jnp.finfo(kv_pages.dtype)
+                        q_block = jnp.clip(q_block, finfo.min, finfo.max)
+                    q_block = q_block.astype(kv_pages.dtype)
 
-                q_idx_rel = jnp.arange(BQ)[:, None]
-                k_idx_rel = jnp.arange(BKV)[None, :]
+                q_tok = q_off + arange_q
+                q_valid = q_tok < q_len
+                q_pos = write_start + q_tok
 
-                q_pos = (kv_len - q_len) + (curr_q_start + q_idx_rel)
-                k_pos = curr_kv_start + k_idx_rel
+                init_acc = jnp.zeros(
+                    (qblocks, actual_num_kv_heads, actual_num_q_heads_per_kv_head, actual_head_dim),
+                    dtype=jnp.float32,
+                )
+                if sinks_h is not None:
+                    init_m = jnp.broadcast_to(
+                        sinks_h[None, :, :],
+                        (qblocks, actual_num_kv_heads, actual_num_q_heads_per_kv_head),
+                    )
+                    init_l = jnp.ones_like(init_m)
+                else:
+                    init_m = jnp.full(
+                        (qblocks, actual_num_kv_heads, actual_num_q_heads_per_kv_head),
+                        -jnp.inf,
+                        dtype=jnp.float32,
+                    )
+                    init_l = jnp.zeros_like(init_m)
 
-                k_valid = k_pos < kv_len
-                mask = q_pos >= k_pos
-                mask = jnp.logical_and(mask, k_valid)
+            def _process_kv_block(kb, state):
+                with jax.named_scope("rpa_v3_xla.kv_block"):
+                    acc, l, m = state
+                    page_map_start = kb * kvblocks
+                    kv_page_block = lax.dynamic_slice(
+                        kv_pages_padded,
+                        (page_map_start, 0, 0, 0, 0),
+                        (kvblocks, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim_padded),
+                    )
+                    kv_tok = kv_page_block.reshape(
+                        kv_tokens_per_block,
+                        num_kv_heads_x2_per_kv_packing,
+                        kv_packing,
+                        head_dim_padded,
+                    )
+                    kv_tok = kv_tok.reshape(kv_tokens_per_block, num_kv_heads_x2, head_dim_padded)
+                    kv_tok = kv_tok[:, : actual_num_kv_heads * 2, :]
+                    kv_tok = kv_tok.reshape(kv_tokens_per_block, actual_num_kv_heads, 2, head_dim_padded)
+                    k_block = kv_tok[:, :, 0, :actual_head_dim]
+                    v_block = kv_tok[:, :, 1, :actual_head_dim]
 
-                if sliding_window is not None:
-                    mask = jnp.logical_and(mask, (q_pos - sliding_window) < k_pos)
+                    with jax.named_scope("logits"):
+                        logits = jnp.einsum(
+                            "bihd,kid->bihk",
+                            q_block,
+                            k_block,
+                            preferred_element_type=jnp.float32,
+                        )
+                        logits = logits * softmax_scale
+                        if k_scale is not None:
+                            logits = logits * k_scale
+                        if q_scale is not None:
+                            logits = logits * q_scale
+                        if logits_soft_cap is not None:
+                            logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
-                mask_b = mask[None, :, :]
-                S = jnp.where(mask_b, S, mask_value)
+                    with jax.named_scope("mask"):
+                        kv_pos = kb * jnp.int32(kv_tokens_per_block) + arange_kv
+                        kv_valid = jnp.logical_and(kv_pos >= kv_start, kv_pos < kv_len)
+                        mask = jnp.logical_or(kv_pos[None, :] > q_pos[:, None], jnp.logical_not(kv_valid[None, :]))
+                        if sliding_window is not None:
+                            mask = jnp.logical_or(
+                                mask,
+                                kv_pos[None, :] <= (q_pos[:, None] - jnp.int32(sliding_window)),
+                            )
+                        mask = jnp.logical_or(mask, jnp.logical_not(q_valid)[:, None])
+                        mask = mask[:, None, None, :]
 
-                if logits_soft_cap is not None:
-                    S = logits_soft_cap * jnp.tanh(S / logits_soft_cap)
+                    logits = logits + jnp.where(mask, mask_value, 0.0)
 
-                m_curr = jnp.max(S, axis=-1)
-                m_new = jnp.maximum(m.transpose(1, 0), m_curr)
+                    with jax.named_scope("online_softmax"):
+                        cur_max = jnp.max(logits, axis=-1)
+                        new_m = jnp.maximum(m, cur_max)
+                        exp_logits = jnp.exp(logits - new_m[..., None])
+                        exp_logits = jnp.where(mask, 0.0, exp_logits)
+                        rescale = jnp.exp(m - new_m)
+                        l = rescale * l + jnp.sum(exp_logits, axis=-1)
+                        acc = rescale[..., None] * acc + jnp.einsum(
+                            "bihk,kid->bihd",
+                            exp_logits,
+                            v_block,
+                            preferred_element_type=jnp.float32,
+                        )
+                    return acc, l, new_m
 
-                P = jnp.exp(S - m_new[:, :, None])
-                l_curr = jnp.sum(P, axis=-1)
-
-                m_prev = m.transpose(1, 0)
-                alpha = jnp.exp(m_prev - m_new)
-
-                l_new = l.transpose(1, 0) * alpha + l_curr
-
-                pv = jnp.matmul(P.astype(V_t.dtype), V_t)
-                acc_t = acc.transpose(1, 0, 2)
-                acc_new = acc_t * alpha[:, :, None] + pv.astype(jnp.float32)
-
-                return (m_new.transpose(1, 0), l_new.transpose(1, 0), acc_new.transpose(1, 0, 2))
-
-            m, l, acc = lax.fori_loop(0, num_kv_blocks, kv_block_body, (m, l, acc))
-
-            output = acc / l[:, :, None]
-            output = output.astype(queries.dtype)
+            with jax.named_scope("rpa_v3_xla.kv_loop"):
+                acc, l, _m = lax.fori_loop(kv_block_start, num_kv_blocks, _process_kv_block, (init_acc, init_l, init_m))
+            l = jnp.maximum(l, 1e-6)
+            out_block = (acc / l[..., None]).astype(queries.dtype)
             if v_scale is not None:
-                output = output * v_scale
+                out_block = out_block * v_scale
 
-            # Scatter to out_acc
-            indices = q_start + curr_q_start + jnp.arange(BQ)
-            mask_write = indices < (q_start + q_len)
-
-            # Use T as garbage index (out_acc has size T+1)
-            safe_indices = jnp.where(mask_write, indices, T)
-
-            dnums_sc = lax.ScatterDimensionNumbers(
-                update_window_dims=(1, 2),
-                inserted_window_dims=(0,),
-                scatter_dims_to_operand_dims=(0,),
+            existing = lax.dynamic_slice(
+                o_inner,
+                (q_global_start, 0, 0, 0),
+                (qblocks, actual_num_kv_heads, actual_num_q_heads_per_kv_head, actual_head_dim),
             )
+            out_block = jnp.where(q_valid[:, None, None, None], out_block, existing)
+            return lax.dynamic_update_slice(o_inner, out_block, (q_global_start, 0, 0, 0))
 
-            out_acc = lax.scatter(
-                out_acc,
-                safe_indices[:, None],
-                output,
-                dnums_sc,
-                # Default mode (UPDATE) is fine since indices are unique and T is valid
-            )
+        with jax.named_scope("rpa_v3_xla.q_loop"):
+            o_acc = lax.fori_loop(0, num_q_blocks, _process_query_block, o_acc)
+        return o_acc, kv_cache_acc
 
-            return out_acc
-
-        out_acc = lax.fori_loop(0, num_q_blocks, q_block_body, out_acc)
-        return out_acc
-
-    def masked_seq(i, out_acc):
-        return lax.cond(i < num_seqs, lambda: attn_seq_body(i, out_acc), lambda: out_acc)
-
-    out_final = lax.fori_loop(0, max_num_seqs, masked_seq, out_acc)
-
-    # Slice back to T
-    out_final = out_final[:T]
-
-    return out_final, kv_cache
+    num_seqs = distribution[2]
+    with jax.named_scope("rpa_v3_xla.seq_loop"):
+        o_grouped, kv_cache = lax.fori_loop(0, num_seqs, _seq_body, (o_grouped, kv_cache))
+    with jax.named_scope("rpa_v3_xla.finalize"):
+        out = o_grouped.reshape(padded_total_q, actual_num_q_heads, actual_head_dim)[:total_q]
+    return out, kv_cache

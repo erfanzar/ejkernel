@@ -60,10 +60,8 @@ class FlashAttentionConfig(BaseOperationConfig):
     """Configuration for Flash Attention operation.
 
     Args:
-        chunk_size_q: Query chunk size for tiling (default: 128)
-        chunk_size_k: Key chunk size for tiling (default: 128)
-        num_warps: Number of warps for Triton kernels (default: 4)
-        num_stages: Number of pipeline stages for Triton (default: 2)
+        fwd_params: Forward kernel parameters (uses `q_blocksize`/`kv_blocksize` for tiling).
+        bwd_params: Backward kernel parameters (optional).
         platform: Target platform (triton/pallas/cuda/xla/auto)
         backend: Backend specification (default: "any")
     """
@@ -189,6 +187,29 @@ class PageAttentionConfig(BaseOperationConfig):
     pages_per_compute_block: int | None = None
     num_warps: int = 4
     num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class UnifiedAttentionConfig(BaseOperationConfig):
+    """Configuration for vLLM-style unified (paged) attention operation.
+
+    Args:
+        seq_threshold_3d: Threshold (in #seqs) for selecting the segmented 3D
+            decode kernel on GPU (Triton only).
+        num_par_softmax_segments: Number of parallel softmax segments used by
+            the segmented 3D decode kernel (Triton only).
+        num_warps: Optional Triton kernel override.
+        num_stages: Optional Triton kernel override.
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    seq_threshold_3d: int | None = None
+    num_par_softmax_segments: int | None = None
+    num_warps: int | None = None
+    num_stages: int | None = None
 
     __hash__ = hash_fn
 

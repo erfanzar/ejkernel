@@ -28,6 +28,7 @@ Available Attention Variants:
     - NativeSparseAttention: Sparse attention with block patterns
     - PageAttention: Paged KV cache for serving workloads
     - RaggedPageAttentionv2: Page attention for variable-length sequences
+    - RaggedPageAttentionv3: Advanced page attention for variable-length sequences v3
     - RecurrentAttention: Stateful recurrent attention
     - RingAttention: Distributed attention with ring topology
     - ScaledDotProductAttention: Standard scaled dot-product attention
@@ -81,6 +82,7 @@ from .configs import (
     RecurrentAttentionConfig,
     RingAttentionConfig,
     ScaledDotProductAttentionConfig,
+    UnifiedAttentionConfig,
 )
 from .flash_attention import FlashAttention, flash_attention
 from .gated_linear_attention import GLAttention, gla_attention
@@ -96,6 +98,7 @@ from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attenti
 from .recurrent import RecurrentAttention, recurrent_attention
 from .ring_attention import RingAttention, ring_attention
 from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_product_attention
+from .unified_attention import UnifiedAttention, unified_attention
 
 __all__ = (
     "Attention",
@@ -129,6 +132,8 @@ __all__ = (
     "RingAttentionConfig",
     "ScaledDotProductAttention",
     "ScaledDotProductAttentionConfig",
+    "UnifiedAttention",
+    "UnifiedAttentionConfig",
     "attention",
     "blocksparse_attention",
     "flash_attention",
@@ -145,4 +150,5 @@ __all__ = (
     "recurrent_attention",
     "ring_attention",
     "scaled_dot_product_attention",
+    "unified_attention",
 )

@@ -66,11 +66,21 @@ Project Statistics
    project_overview
    kernel_registry_system
    ops_system_architecture
+   maskinfo_guide
    kernel_implementations
    module_operations
    utilities_and_helpers
    test_suite_and_examples
    comprehensive_architecture_report
+
+.. toctree::
+   :maxdepth: 2
+   :caption: User Guides:
+
+   api/index
+   api/modules
+   api/types
+   api/ops
 
 .. toctree::
    :maxdepth: 2

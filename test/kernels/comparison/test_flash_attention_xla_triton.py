@@ -22,6 +22,9 @@ import pytest
 from ejkernel.kernels._triton.flash_attention import flash_attention as flash_attention_triton
 from ejkernel.kernels._xla.flash_attention import flash_attention as flash_attention_xla
 
+if not any(d.platform in ("gpu", "cuda") for d in jax.devices()):
+    pytest.skip("Triton flash attention tests require a GPU backend.", allow_module_level=True)
+
 
 class TestBasicComparison:
     """Compare basic functionality between XLA and Triton."""

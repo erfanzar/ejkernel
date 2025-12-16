@@ -13,9 +13,16 @@
 # limitations under the License.
 
 
-import os
+"""
+Manual reproduction script for ragged page attention v2.
 
-os.environ["EJKERNEL_LOG_AUTOTUNE"] = "1"
+This file is intentionally **not** a pytest test module. It contains utilities and a
+large reproduction run for debugging/perf work. The heavy computation is gated behind
+`if __name__ == "__main__":` so importing the file during `pytest` collection does not
+execute it.
+"""
+
+import os
 
 import jax
 import jax.numpy as jnp
@@ -115,28 +122,35 @@ def make_dummy_ragged_paged_attention_inputs(
     )
 
 
-batch = make_dummy_ragged_paged_attention_inputs(page_size=64, max_num_seqs=32, pages_per_seq=64)
+def main():
+    os.environ.setdefault("EJKERNEL_LOG_AUTOTUNE", "1")
 
-ref = ragged_page_attention_v2(
-    batch["queries"],
-    batch["kv_pages"],
-    batch["context_lens"],
-    batch["block_tables"],
-    batch["query_start_loc"],
-    batch["num_seqs"],
-    sliding_window=None,
-    logits_soft_cap=None,
-)
-out = xla.ragged_page_attention_v2(
-    queries=batch["queries"],
-    kv_pages=batch["kv_pages"],
-    context_lens=batch["context_lens"],
-    block_tables=batch["block_tables"],
-    query_start_loc=batch["query_start_loc"],
-    num_seqs=batch["num_seqs"],
-)
+    batch = make_dummy_ragged_paged_attention_inputs(page_size=64, max_num_seqs=32, pages_per_seq=64)
 
-print(out.shape)
-print(ref.shape)
-print(jnp.allclose(out, ref, atol=0.125))
-print(out[-1, -1, -5:], ref[-1, -1, -5:])
+    ref = ragged_page_attention_v2(
+        batch["queries"],
+        batch["kv_pages"],
+        batch["context_lens"],
+        batch["block_tables"],
+        batch["query_start_loc"],
+        batch["num_seqs"],
+        sliding_window=None,
+        logits_soft_cap=None,
+    )
+    out = xla.ragged_page_attention_v2(
+        queries=batch["queries"],
+        kv_pages=batch["kv_pages"],
+        context_lens=batch["context_lens"],
+        block_tables=batch["block_tables"],
+        query_start_loc=batch["query_start_loc"],
+        num_seqs=batch["num_seqs"],
+    )
+
+    print(out.shape)
+    print(ref.shape)
+    print(jnp.allclose(out, ref, atol=0.125))
+    print(out[-1, -1, -5:], ref[-1, -1, -5:])
+
+
+if __name__ == "__main__":
+    main()

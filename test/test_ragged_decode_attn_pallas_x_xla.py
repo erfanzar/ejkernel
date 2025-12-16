@@ -13,25 +13,41 @@
 # limitations under the License.
 
 
+"""
+Manual reproduction script for ragged decode attention.
+
+This file is intentionally not a pytest test module. It previously executed work at
+import time, which breaks `pytest` collection. Keep the snippet for debugging, but
+gate execution behind `if __name__ == "__main__":`.
+"""
+
 import os
 
-os.environ["EJKERNEL_LOG_AUTOTUNE"] = "1"
 import jax
 from jax import numpy as jnp
 
 from ejkernel.modules import ragged_decode_attention
 
-total_tokens = 128
-H, D = 8, 128
-max_kv_len = 512
-num_seqs = 4
+def main():
+    os.environ.setdefault("EJKERNEL_LOG_AUTOTUNE", "1")
 
-q = jax.random.normal(jax.random.PRNGKey(0), (num_seqs, H, D), dtype=jnp.bfloat16)
+    total_tokens = 128
+    H, D = 8, 128
+    max_kv_len = 512
+    num_seqs = 4
 
-k = jax.random.normal(jax.random.PRNGKey(1), (num_seqs, max_kv_len, H, D), dtype=jnp.bfloat16)
-v = jax.random.normal(jax.random.PRNGKey(2), (num_seqs, max_kv_len, H, D), dtype=jnp.bfloat16)
+    q = jax.random.normal(jax.random.PRNGKey(0), (num_seqs, H, D), dtype=jnp.bfloat16)
 
-cu_seqlens = jnp.array([0, 8, 18, 32], dtype=jnp.int32)
-kv_lengths = cu_seqlens + 1
+    k = jax.random.normal(jax.random.PRNGKey(1), (num_seqs, max_kv_len, H, D), dtype=jnp.bfloat16)
+    v = jax.random.normal(jax.random.PRNGKey(2), (num_seqs, max_kv_len, H, D), dtype=jnp.bfloat16)
 
-output = ragged_decode_attention(q, k, v, cu_seqlens, kv_lengths)
+    cu_seqlens = jnp.array([0, 8, 18, 32], dtype=jnp.int32)
+    kv_lengths = cu_seqlens + 1
+
+    _ = total_tokens  # keep var for easy editing
+    output = ragged_decode_attention(q, k, v, cu_seqlens, kv_lengths)
+    print(output.shape)
+
+
+if __name__ == "__main__":
+    main()

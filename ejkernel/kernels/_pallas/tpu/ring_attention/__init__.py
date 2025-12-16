@@ -38,8 +38,8 @@ from ._ring_splash import (
 )
 
 __all__ = [
-    "BlockSizes",
     "RING_AXIS",
+    "BlockSizes",
     "RingSplashAttentionKernel",
     "SegmentIds",
     "make_ring_attention",

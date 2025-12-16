@@ -27,6 +27,9 @@ from jax.sharding import PartitionSpec
 from ejkernel.kernels import pallas, xla
 from ejkernel.utils import numeric_gen
 
+if not any(d.platform == "tpu" for d in jax.devices()):
+    pytest.skip("Pallas TPU ring attention comparison requires a TPU backend.", allow_module_level=True)
+
 
 class TestRingAttentionComparison:
     """Test ring attention implementations across XLA and Pallas backends."""

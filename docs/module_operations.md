@@ -9,23 +9,66 @@ The module operations layer provides high-level interfaces to kernel implementat
 ```md
 ejkernel/modules/
 ├── operations/
-│   ├── __init__.py                    # Public API exports
-│   ├── configs.py                     # Configuration dataclasses
-│   ├── attention.py                   # Standard attention
-│   ├── flash_attention.py             # Flash attention v2
-│   ├── blocksparse_attention.py       # Block-sparse patterns
-│   ├── ring_attention.py              # Distributed attention
-│   ├── page_attention.py              # Paged KV-cache
-│   ├── native_sparse_attention.py     # Native sparse ops
-│   ├── recurrent.py                   # RNN operations
-│   ├── mean_pooling.py                # Sequence pooling
-│   ├── grouped_matmul.py              # Batched GEMM
-│   ├── gated_linear_attention.py      # GLA implementation
-│   ├── lightning_attention.py         # Lightning attention
-│   ├── ragged_decode_attention.py     # Variable-length decode
-│   ├── ragged_page_attention_v2.py       # Variable-length paged
-│   └── scaled_dot_product_attention.py # Basic SDPA
+│   ├── __init__.py                        # Public API exports
+│   ├── configs.py                         # Configuration dataclasses
+│   ├── attention.py                       # Standard attention
+│   ├── flash_attention.py                 # Flash attention v2
+│   ├── blocksparse_attention.py           # Block-sparse patterns
+│   ├── ring_attention.py                  # Distributed attention
+│   ├── page_attention.py                  # Paged KV-cache
+│   ├── native_sparse_attention.py         # Native sparse ops
+│   ├── recurrent.py                       # RNN operations
+│   ├── pooling.py                         # Sequence pooling
+│   ├── grouped_matmul.py                  # Batched GEMM
+│   ├── gated_linear_attention.py          # GLA implementation
+│   ├── lightning_attention.py             # Lightning attention
+│   ├── multi_head_latent_attention.py     # Multi-head latent attention
+│   ├── ragged_decode_attention.py         # Variable-length decode
+│   ├── ragged_page_attention_v2.py        # Variable-length paged v2
+│   ├── ragged_page_attention_v3.py        # Variable-length paged v3
+│   ├── scaled_dot_product_attention.py    # Basic SDPA
+│   └── unified_attention.py               # Unified attention interface
 ```
+
+## Available Operations
+
+### Attention Variants
+
+- **Attention**: Standard multi-head attention with XLA optimization
+
+- **FlashAttention**: Memory-efficient O(N) complexity attention
+
+- **FlashMLA**: Multi-head latent attention with low-rank compression
+
+- **GLAttention**: Gated linear attention mechanism
+
+- **LightningAttention**: Layer-aware attention optimization
+
+- **NativeSparseAttention**: Sparse attention with block patterns
+
+- **PageAttention**: Paged KV cache for serving workloads
+
+- **RaggedDecodeAttention**: Variable-length decode attention
+
+- **RaggedPageAttentionv2**: Page attention for variable-length sequences v2
+
+- **RaggedPageAttentionv3**: Advanced page attention for variable-length sequences v3
+
+- **RecurrentAttention**: Stateful recurrent attention
+
+- **RingAttention**: Distributed attention with ring topology
+
+- **ScaledDotProductAttention**: Standard scaled dot-product attention
+
+- **UnifiedAttention**: Unified attention interface
+
+### Additional Operations
+
+- **BlockSparseAttention**: Block-sparse attention patterns
+
+- **GroupedMatmul**: Efficient grouped matrix multiplication
+
+- **MeanPooling**: Sequence mean pooling operation
 
 ## Base Configuration Classes
 

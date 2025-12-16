@@ -263,6 +263,11 @@ def attention(
     attention_mask = None
 
     if mask_info is not None:
+        mask_info.assert_not_multi_sequence(
+            "attention does not support multi-sequence (packed) format. "
+            "All valid tokens must have segment ID 0. For packed sequences, use flash_attention "
+            "or other attention variants that support segment IDs."
+        )
         attention_mask = mask_info.get_or_compute_attention_mask()
 
     return _executor(

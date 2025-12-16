@@ -69,9 +69,14 @@ def _write_package_index(pkg_docname: str, children: list[str], packages: set[st
         f.write(".. toctree::\n")
         f.write("   :maxdepth: 2\n\n")
 
-        # Show packages first, then modules
         for child in sorted(children, key=lambda c: (0 if c in packages else 1, c)):
-            entry = f"{child}/index" if child in packages else child
+            if pkg_docname:
+                prefix = f"{pkg_docname}/"
+                child_rel = child[len(prefix) :] if child.startswith(prefix) else child
+            else:
+                child_rel = child
+
+            entry = f"{child_rel}/index" if child in packages else child_rel
             f.write(f"   {entry}\n")
 
 
@@ -86,7 +91,6 @@ def generate_api_docs(clean: bool = True) -> bool:
         shutil.rmtree(DOCS_API_DIR)
     DOCS_API_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Discover modules (full import paths, e.g., ejkernel.kernels.foo.bar)
     modules = sorted(discover_modules(PROJECT_NAME))
     if not modules:
         print("No modules found to document")

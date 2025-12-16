@@ -19,6 +19,7 @@ import pytest
 
 from ejkernel.kernels._pallas.tpu.flash_attention import flash_attention
 from ejkernel.kernels._xla.flash_attention import flash_attention as flash_attention_xla
+from ejkernel.ops import FwdParams
 
 pytestmark = pytest.mark.skipif(
     jax.devices()[0].platform != "tpu",
@@ -133,8 +134,7 @@ class TestFlashAttentionTPU:
                 query=query,
                 key=key_tensor,
                 value=value,
-                chunk_size_q=int(chunk_q),
-                chunk_size_k=int(chunk_k),
+                fwd_params=FwdParams(q_blocksize=int(chunk_q), kv_blocksize=int(chunk_k)),
             )
 
             assert output.shape == (batch_size, seq_len, num_heads, head_dim)
@@ -450,8 +450,7 @@ class TestFlashAttentionTPU:
             query=query,
             key=key_tensor,
             value=value,
-            chunk_size_q=512,
-            chunk_size_k=512,
+            fwd_params=FwdParams(q_blocksize=512, kv_blocksize=512),
         )
 
         assert output.shape == (batch_size, seq_len, num_heads, head_dim)

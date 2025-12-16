@@ -773,11 +773,13 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         )
 
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedPageAttentionv3Config, Array]):
-        """Generate candidate configurations for autotuning on GPU (Triton backend).
+        """Generate candidate configurations for autotuning on GPU.
 
-        Produces a set of kernel configurations optimized for GPU execution using
-        the Triton compiler. The configurations explore different block sizes and
-        parallelism settings to find the optimal performance for the given workload.
+        Produces a set of kernel configurations optimized for GPU execution.
+        By default ragged_page_attention_v3 prefers the Triton implementation on
+        GPU. If the user forces `platform="xla"` (via the public API), we instead
+        generate larger KV/Q blocks to reduce XLA loop overhead (e.g. pairs like
+        (1024 pages, 256 queries) when the workload/page_size permits).
 
         Args:
             inv: Invocation object containing the input arguments and metadata.
@@ -790,26 +792,151 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             that may perform well on GPU hardware.
 
         Note:
-            Currently returns a single default configuration that delegates to XLA
-            backend with automatic parameter selection. In future versions, this may
-            return multiple configurations exploring different:
-            - num_queries_per_block: Controls query batch size (e.g., 16, 32, 64, 128)
-            - num_kv_pages_per_block: Controls KV page batch size (e.g., 1, 2, 4, 8)
-            - num_warps: Parallelism level for Triton (e.g., 4, 8, 16)
-            - num_stages: Pipeline depth for async memory operations (e.g., 1, 2, 3)
-
-            These parameters significantly affect performance and should be tuned
-            based on the specific GPU architecture and workload characteristics.
+            Candidates are intentionally biased toward power-of-2 block sizes to
+            keep compilation caching effective and reduce autotune time.
         """
+        platform_override = inv.kwargs.get("platform", None)
+        if platform_override in (None, "auto"):
+            try:
+                platform_override = getattr(
+                    detect_platform("ragged_page_attention_v3", platform="auto"),
+                    "value",
+                    "xla",
+                )
+            except Exception:
+                platform_override = "xla"
+        workload = self._extract_workload(inv)
 
-        return self._build_candidate_configs(
-            inv,
-            platform="xla",
-            backend="any",
+        if workload is None:
+            return self._build_candidate_configs(
+                inv,
+                platform="xla" if platform_override == "xla" else "triton",
+                backend="any" if platform_override == "xla" else "gpu",
+                num_warps=None,
+                num_stages=None,
+                prefer_tuned=True,
+                max_candidates=6,
+            )
+
+        if platform_override == "xla":
+            kv_limit = max(1, workload.pages_per_seq)
+            page_size = max(1, workload.page_size)
+            q_limit = max(1, min(workload.max_num_tokens, 1024))
+
+            # Keep KV tiles bounded by *tokens* so this scales across page sizes.
+            # These budgets are chosen to enable cases like page_size=8 -> kv_pages=1024.
+            token_budgets = (4096, 8192, 16384)
+            kv_candidates: list[int] = []
+
+            def _prev_pow2(x: int) -> int:
+                x = int(x)
+                if x <= 1:
+                    return 1
+                return 1 << (x.bit_length() - 1)
+
+            def _push_kv_pages(kv_pages: int):
+                kv_pages = int(kv_pages)
+                if kv_pages <= 0:
+                    return
+                kv_pages = min(kv_limit, kv_pages)
+                if kv_pages not in kv_candidates:
+                    kv_candidates.append(kv_pages)
+
+            # Budget-derived candidates, rounded down to power-of-2 for cache friendliness.
+            for budget in token_budgets:
+                pages = max(1, budget // page_size)
+                _push_kv_pages(_prev_pow2(pages))
+
+            # Explicit power-of-2 sweep (bounded by the largest token budget).
+            max_pages_by_budget = max(1, token_budgets[-1] // page_size)
+            for pages in (2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1):
+                if pages > kv_limit:
+                    continue
+                if pages > max_pages_by_budget:
+                    continue
+                _push_kv_pages(pages)
+
+            q_candidates = [q for q in (256, 128, 64, 32, 16, 8) if q <= q_limit]
+            if not q_candidates:
+                q_candidates = [min(8, q_limit)]
+
+            pairs: list[tuple[int, int]] = []
+
+            def _push_pair(kv_pages: int, q_tokens: int):
+                kv_pages = int(kv_pages)
+                q_tokens = int(q_tokens)
+                if kv_pages <= 0 or q_tokens <= 0:
+                    return
+                if kv_pages > kv_limit or q_tokens > q_limit:
+                    return
+                pair = (kv_pages, q_tokens)
+                if pair not in pairs:
+                    pairs.append(pair)
+
+            # Prefer the empirically-good large blocks first when feasible.
+            kv_8192 = _prev_pow2(max(1, 8192 // page_size))
+            _push_pair(min(kv_limit, kv_8192), 256 if q_limit >= 256 else q_candidates[0])
+            _push_pair(min(kv_limit, kv_8192), 128 if q_limit >= 128 else q_candidates[0])
+
+            for kv_pages in kv_candidates:
+                for q_tokens in q_candidates:
+                    _push_pair(kv_pages, q_tokens)
+
+            # Always include heuristic-based candidates as a fallback.
+            for kv_pages, q_tokens in self._candidate_pairs(inv, prefer_tuned=True, max_candidates=6):
+                _push_pair(kv_pages, q_tokens)
+
+            pairs = pairs[:12]
+            return self._materialize_configs(
+                pairs,
+                platform="xla",
+                backend="any",
+                num_warps=None,
+                num_stages=None,
+            )
+
+        kv_limit = max(1, workload.pages_per_seq)
+        q_limit = max(1, min(workload.max_num_tokens, 512))
+
+        # KV is expressed in *pages* (each page is `page_size` tokens). Extremely large
+        # KV blocks can create oversized (BQ x BK) tiles; keep candidates conservative
+        # and let `kv_limit` bound the search.
+        kv_candidates = [32, 16, 8, 4, 2, 1]
+        q_candidates = [256, 128, 64, 32, 16, 8]
+
+        pairs: list[tuple[int, int]] = []
+
+        def _push_pair(kv_pages: int, q_tokens: int):
+            if kv_pages <= 0 or q_tokens <= 0:
+                return
+            if kv_pages > kv_limit or q_tokens > q_limit:
+                return
+            pair = (int(kv_pages), int(q_tokens))
+            if pair not in pairs:
+                pairs.append(pair)
+
+        # Seed a few larger options first when the workload allows it.
+        _push_pair(min(32, kv_limit), 256)
+        _push_pair(min(32, kv_limit), 128)
+        _push_pair(min(16, kv_limit), 256)
+        _push_pair(min(16, kv_limit), 128)
+
+        for kv_pages in kv_candidates:
+            for q_tokens in q_candidates:
+                _push_pair(kv_pages, q_tokens)
+
+        # Always include heuristic-based candidates as a fallback.
+        for kv_pages, q_tokens in self._candidate_pairs(inv, prefer_tuned=True, max_candidates=6):
+            _push_pair(kv_pages, q_tokens)
+
+        # Keep autotuning time bounded.
+        pairs = pairs[:10]
+        return self._materialize_configs(
+            pairs,
+            platform="triton",
+            backend="gpu",
             num_warps=None,
             num_stages=None,
-            prefer_tuned=True,
-            max_candidates=6,
         )
 
     def candidate_cfgs_tpu(self, inv: Invocation[RaggedPageAttentionv3Config, Array]):
