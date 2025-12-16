@@ -903,6 +903,10 @@ class MaskInfo:
         cu_seqlens_kv: Cumulative sequence lengths for keys/values (batch+1,)
         q_positions: Query position indices (batch, qlen) for positional embeddings
         kv_positions: Key-value position indices (batch, kvlen) for positional embeddings
+        causal_mask_baked_in: Flag indicating if causal masking has been applied
+        sliding_window_baked_in: Flag indicating if sliding window masking has been applied
+        chunked_mask_baked_in: Flag indicating if chunked masking has been applied
+        token_type_ids_baked_in: Flag indicating if token type ID masking has been applied
     """
 
     _attention_mask: Bool[Array, "batch nheads_or_1 q k"] | Int[Array, "batch nheads_or_1 q k"] | None = None
@@ -913,6 +917,12 @@ class MaskInfo:
 
     q_positions: Int[Array, "batch qlen"] | None = None
     kv_positions: Int[Array, "batch kvlen"] | None = None
+
+    # Baked-in mask operation flags (static metadata)
+    causal_mask_baked_in: bool = field(default=False)
+    sliding_window_baked_in: bool = field(default=False)
+    chunked_mask_baked_in: bool = field(default=False)
+    token_type_ids_baked_in: bool = field(default=False)
 
     batch_axis_name: tuple[str] | str | None = field(default=("dp", "fsdp"))
     qheads_axis_name: tuple[str] | str | None = field(default="tp")
@@ -1076,6 +1086,30 @@ class MaskInfo:
 
         # If no segment IDs available, return False as JAX array
         return jnp.array(False, dtype=jnp.bool_)
+
+    @property
+    def baked_in_masks(self) -> dict[str, bool]:
+        """Get a dictionary of all baked-in mask operation flags.
+
+        Returns:
+            Dictionary mapping operation names to their baked-in status:
+            - 'causal': Whether causal masking has been applied
+            - 'sliding_window': Whether sliding window masking has been applied
+            - 'chunked': Whether chunked masking has been applied
+            - 'token_type_ids': Whether token type ID masking has been applied
+
+        Example:
+            >>> mask_info = MaskInfo.from_segments(jnp.array([[1, 1, 1]]))
+            >>> mask_info = mask_info.apply_causal()
+            >>> mask_info.baked_in_masks
+            {'causal': True, 'sliding_window': False, 'chunked': False, 'token_type_ids': False}
+        """
+        return {
+            "causal": self.causal_mask_baked_in,
+            "sliding_window": self.sliding_window_baked_in,
+            "chunked": self.chunked_mask_baked_in,
+            "token_type_ids": self.token_type_ids_baked_in,
+        }
 
     @_debug_trace
     def assert_not_multi_sequence(self, message: str | None = None) -> "MaskInfo":
@@ -2211,7 +2245,7 @@ class MaskInfo:
         causal = jax.vmap(_mk_causal, in_axes=(None, None, 0))(Q, K, off)  # (B,Q,K)
         causal = causal[:, None, :, :]  # (B,1,Q,K)
 
-        return self.replace(attention_mask=base_mask & causal)
+        return self.replace(attention_mask=base_mask & causal, causal_mask_baked_in=True)
 
     @_debug_trace
     def apply_sliding_window(
@@ -2401,6 +2435,7 @@ class MaskInfo:
                 kv_segment_ids=kv_seg,
                 q_positions=q_pos,
                 kv_positions=kv_pos,
+                sliding_window_baked_in=True,
             )
 
         if mode == "prefill":
@@ -2426,9 +2461,14 @@ class MaskInfo:
             if kv_pos is not None:
                 kv_pos = kv_pos[:, start_k : start_k + width]
 
-            return self.replace(attention_mask=masked, kv_segment_ids=kv_seg, kv_positions=kv_pos)
+            return self.replace(
+                attention_mask=masked,
+                kv_segment_ids=kv_seg,
+                kv_positions=kv_pos,
+                sliding_window_baked_in=True,
+            )
 
-        return self.replace(attention_mask=masked)
+        return self.replace(attention_mask=masked, sliding_window_baked_in=True)
 
     @_debug_trace
     def apply_chunked(self, chunk_size: int, offset: int = 0) -> "MaskInfo":
@@ -2494,7 +2534,12 @@ class MaskInfo:
         q_segment_ids = jnp.where(q_pad, -1, q_chunk_ids)
         kv_segment_ids = jnp.where(kv_pad, -1, kv_chunk_ids)
 
-        return self.replace(attention_mask=attention_mask, q_segment_ids=q_segment_ids, kv_segment_ids=kv_segment_ids)
+        return self.replace(
+            attention_mask=attention_mask,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
+            chunked_mask_baked_in=True,
+        )
 
     @_debug_trace
     def apply_token_type_ids(
@@ -2609,7 +2654,12 @@ class MaskInfo:
             q_seg = self._q_segment_ids
             kv_seg = self._kv_segment_ids
 
-        return self.replace(attention_mask=new_mask, q_segment_ids=q_seg, kv_segment_ids=kv_seg)
+        return self.replace(
+            attention_mask=new_mask,
+            q_segment_ids=q_seg,
+            kv_segment_ids=kv_seg,
+            token_type_ids_baked_in=True,
+        )
 
     @staticmethod
     def create_chunked_attention_mask(
@@ -2677,6 +2727,11 @@ class MaskInfo:
         if self._cu_seqlens_kv is not None:
             items.append(f"cu_seqlens_kv.shape={self._cu_seqlens_kv.shape}")
         items.append(f"self_attn={self.is_self_attention()}")
+
+        baked = [k for k, v in self.baked_in_masks.items() if v]
+        if baked:
+            items.append(f"baked_in={baked}")
+
         return f"MaskInfo({', '.join(items)})"
 
     def tree_flatten(self):
@@ -2716,6 +2771,10 @@ class MaskInfo:
             self.qheads_axis_name,
             self.kvheads_axis_name,
             self.sequence_axis_name,
+            self.causal_mask_baked_in,
+            self.sliding_window_baked_in,
+            self.chunked_mask_baked_in,
+            self.token_type_ids_baked_in,
         )
         return children, aux_data
 
@@ -2743,7 +2802,16 @@ class MaskInfo:
             - The method signature must match the output format of tree_flatten()
         """
         attention_mask, q_segment_ids, kv_segment_ids, cu_seqlens_q, cu_seqlens_kv, q_positions, kv_positions = children
-        batch_axis_name, qheads_axis_name, kvheads_axis_name, sequence_axis_name = aux_data
+        (
+            batch_axis_name,
+            qheads_axis_name,
+            kvheads_axis_name,
+            sequence_axis_name,
+            causal_mask_baked_in,
+            sliding_window_baked_in,
+            chunked_mask_baked_in,
+            token_type_ids_baked_in,
+        ) = aux_data
         return cls(
             _attention_mask=attention_mask,
             _q_segment_ids=q_segment_ids,
@@ -2752,6 +2820,10 @@ class MaskInfo:
             _cu_seqlens_kv=cu_seqlens_kv,
             q_positions=q_positions,
             kv_positions=kv_positions,
+            causal_mask_baked_in=causal_mask_baked_in,
+            sliding_window_baked_in=sliding_window_baked_in,
+            chunked_mask_baked_in=chunked_mask_baked_in,
+            token_type_ids_baked_in=token_type_ids_baked_in,
             batch_axis_name=batch_axis_name,
             qheads_axis_name=qheads_axis_name,
             kvheads_axis_name=kvheads_axis_name,

@@ -271,6 +271,12 @@ def attention(
         )
         q_mask, _, attention_mask = mask_info.get_qkv_masks(dtype=jnp.bool_)
 
+        # If masks are already baked into attention_mask, don't reapply them
+        if mask_info.causal_mask_baked_in:
+            causal = False
+        if mask_info.sliding_window_baked_in:
+            sliding_window = None
+
     out, weights = _executor(
         Attention(),
         query=query,
