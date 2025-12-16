@@ -1111,61 +1111,6 @@ class MaskInfo:
             "token_type_ids": self.token_type_ids_baked_in,
         }
 
-    @_debug_trace
-    def assert_not_multi_sequence(self, message: str | None = None) -> "MaskInfo":
-        """Assert that the mask represents a single sequence, not packed sequences.
-
-        This method checks if the mask contains multiple sequences (packed format) and
-        raises an error if it does. It's useful for operations that only support single
-        sequences.
-
-        Args:
-            message: Optional custom error message. If None, uses a default message.
-
-        Returns:
-            Self (MaskInfo) for method chaining if assertion passes.
-
-        Raises:
-            ValueError: If the mask represents multiple sequences (is_multi_sequence is True).
-
-        Note:
-            This method uses runtime assertion checking and may not be compatible with all
-            JIT compilation scenarios. For maximum JIT compatibility, check is_multi_sequence
-            before passing to functions that don't support packed sequences.
-
-        Examples:
-            >>> # Single sequence - assertion passes
-            >>> q_seg = jnp.array([[0, 0, 0, -1, -1]])
-            >>> mask_info = MaskInfo.from_segments(q_seg)
-            >>> mask_info.assert_not_multi_sequence()  # Returns self, no error
-            MaskInfo(...)
-
-            >>> # Multiple sequences - assertion fails
-            >>> q_seg = jnp.array([[0, 0, 1, 1, -1]])
-            >>> mask_info = MaskInfo.from_segments(q_seg)
-            >>> mask_info.assert_not_multi_sequence()
-            ValueError: Expected single sequence but found multi-sequence (packed) format...
-        """
-        if message is None:
-            message = (
-                "Expected single sequence but found multi-sequence (packed) format. "
-                "This operation only supports masks with a single sequence (all valid tokens "
-                "have segment ID 0). Found multiple segment IDs (0, 1, 2, ...), which indicates "
-                "packed sequences."
-            )
-
-        is_multi = self.is_multi_sequence
-
-        def check_assertion():
-            import builtins
-
-            if builtins.bool(is_multi):
-                raise ValueError(message)
-
-        check_assertion()
-
-        return self
-
     @property
     def q_attention_mask(self):
         return jnp.where(self.q_segment_ids == -1, 0, 1)
@@ -2032,7 +1977,6 @@ class MaskInfo:
         kv_lengths: Int[Array, "batch"],
         *,
         q_len: int | None = None,
-        end_index: int | Int[Array, "batch"] | None = None,
         sliding_window: int | None = None,
     ) -> "MaskInfo":
         """
@@ -2040,18 +1984,15 @@ class MaskInfo:
 
         The method expects a 4D attention mask (batch, heads, q_len, kv_len). For each batch item:
             1. KV positions with index >= kv_lengths[b] are masked out.
-            2. The query dimension is sliced to the last `q_len` rows ending at `end_index[b]`
-               (i.e. starting at end_index[b] - q_len).
+            2. The query dimension is sliced to the last `q_len` rows, starting at kv_lengths[b] - q_len.
             3. If `sliding_window` is provided and smaller than the current KV dimension, only the most
                recent `sliding_window` columns are kept.
-        Segment IDs and (optional) position arrays are updated to stay shape-consistent with the new mask.
+        Segment IDs and position arrays are reused unchanged; only the materialized attention mask is updated.
 
         Args:
             kv_lengths: Integer array of shape (batch,) with the number of valid KV tokens per batch element.
-            q_len: Number of query rows to keep. If provided, `end_index` must also be provided.
-            end_index: Integer array (or scalar) giving the exclusive end index of the query window per batch.
-                The query rows are sliced from `[end_index[b] - q_len, end_index[b])`, with indices clamped to
-                the valid range for the underlying (Q) dimension.
+                The implementation assumes kv_lengths[b] >= q_len and does not clamp indices.
+            q_len: Number of query rows to keep. Must be specified and should be <= kv_lengths[b] for all b.
             sliding_window: Optional maximum number of KV columns to retain after masking. If None, keeps all
                 remaining KV positions.
 
@@ -2063,8 +2004,8 @@ class MaskInfo:
             ValueError: If the attention mask cannot be materialized.
         """
 
-        if q_len is not None and end_index is None:
-            raise ValueError("end_index must be provided when q_len is specified.")
+        if q_len is None:
+            raise ValueError("q_len must be provided.")
 
         attn = self.get_or_compute_attention_mask(dtype=jnp.bool_)
         B, _H, Q, K = attn.shape
@@ -2074,119 +2015,32 @@ class MaskInfo:
         attn = attn & kv_valid[:, None, None, :]
         q_seg = self._q_segment_ids
         kv_seg = self._kv_segment_ids
-        q_pos = self.q_positions
-        kv_pos = self.kv_positions
 
-        if kv_seg is not None:
-            if kv_seg.ndim == 2:
-                kv_seg = jnp.where(kv_valid, kv_seg, -1).astype(jnp.int32)
-            elif kv_seg.ndim == 3:
-                kv_seg = jnp.where(kv_valid[:, None, :], kv_seg, -1).astype(jnp.int32)
-            else:
-                raise ValueError(f"kv_segment_ids must be 2D or 3D, got shape {kv_seg.shape}.")
+        def _slice_q(x, klen, seg=None):
+            start_q = jnp.clip(klen - q_len, 0, jnp.maximum(Q - q_len, 0))
+            x = jax.lax.dynamic_slice_in_dim(x, start_q, q_len, axis=1)  # x: (H,Q,K)
+            if seg is not None:
+                seg = jax.lax.dynamic_slice_in_dim(seg, start_q, q_len, axis=0)
+            return x, seg
 
-        if kv_pos is not None:
-            kv_pad = jnp.iinfo(jnp.int32).max
-            kv_pos = jnp.where(kv_valid, kv_pos, kv_pad).astype(jnp.int32)
-
-        if q_len is not None:
-            if q_len <= 0:
-                raise ValueError(f"q_len must be a positive integer when provided, got {q_len}.")
-            if q_len > Q:
-                raise ValueError(f"q_len={q_len} cannot exceed the current query length Q={Q}.")
-
-            end = jnp.asarray(end_index, jnp.int32)
-            if end.ndim == 0:
-                end = jnp.broadcast_to(end, (B,))
-            else:
-                end = end.reshape(B)
-
-            start_q = jnp.clip(end - jnp.int32(q_len), 0, jnp.maximum(Q - q_len, 0))
-
-            def _slice_attn_q(x, s):
-                return jax.lax.dynamic_slice_in_dim(x, s, q_len, axis=1)
-
-            attn = jax.vmap(_slice_attn_q, in_axes=(0, 0), out_axes=0)(attn, start_q)
-
-            if q_seg is not None:
-                if q_seg.ndim == 2:
-                    q_seg = jax.vmap(
-                        lambda seg, s: jax.lax.dynamic_slice_in_dim(seg, s, q_len, axis=0),
-                        in_axes=(0, 0),
-                        out_axes=0,
-                    )(q_seg, start_q)
-                elif q_seg.ndim == 3:
-                    q_seg = jax.vmap(
-                        lambda seg, s: jax.lax.dynamic_slice_in_dim(seg, s, q_len, axis=1),
-                        in_axes=(0, 0),
-                        out_axes=0,
-                    )(q_seg, start_q)
-                else:
-                    raise ValueError(f"q_segment_ids must be 2D or 3D, got shape {q_seg.shape}.")
-
-            if q_pos is not None:
-                q_pos = jax.vmap(
-                    lambda pos, s: jax.lax.dynamic_slice_in_dim(pos, s, q_len, axis=0),
-                    in_axes=(0, 0),
-                    out_axes=0,
-                )(q_pos, start_q)
+        seg_idx = 0 if q_seg is not None else None
+        attn, q_seg = jax.vmap(_slice_q, in_axes=(0, 0, seg_idx), out_axes=(0, seg_idx))(attn, kv_lengths, q_seg)
 
         if sliding_window is not None:
-            if sliding_window < 0:
-                raise ValueError(f"sliding_window must be non-negative, got {sliding_window}.")
             width = min(sliding_window, K)
 
-            def _slice_k(x, klen):
+            seg_idx = 0 if kv_seg is not None else None
+
+            def _slice_k(x, klen, seg=None):
                 start_k = jnp.clip(klen - width, 0, jnp.maximum(K - width, 0))
-                return jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)
+                x = jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)  # x: (H,q_len,K)
+                if seg is not None:
+                    seg = jax.lax.dynamic_slice_in_dim(seg, start_k, width, axis=0)
+                return x, seg
 
-            attn = jax.vmap(_slice_k, in_axes=(0, 0), out_axes=0)(attn, kv_lengths)
+            attn, kv_seg = jax.vmap(_slice_k, in_axes=(0, 0, seg_idx), out_axes=(0, seg_idx))(attn, kv_lengths, kv_seg)
 
-            if kv_seg is not None:
-                if kv_seg.ndim == 2:
-                    kv_seg = jax.vmap(
-                        lambda seg, klen: jax.lax.dynamic_slice_in_dim(
-                            seg,
-                            jnp.clip(klen - width, 0, jnp.maximum(K - width, 0)),
-                            width,
-                            axis=0,
-                        ),
-                        in_axes=(0, 0),
-                        out_axes=0,
-                    )(kv_seg, kv_lengths)
-                elif kv_seg.ndim == 3:
-                    kv_seg = jax.vmap(
-                        lambda seg, klen: jax.lax.dynamic_slice_in_dim(
-                            seg,
-                            jnp.clip(klen - width, 0, jnp.maximum(K - width, 0)),
-                            width,
-                            axis=1,
-                        ),
-                        in_axes=(0, 0),
-                        out_axes=0,
-                    )(kv_seg, kv_lengths)
-                else:
-                    raise ValueError(f"kv_segment_ids must be 2D or 3D, got shape {kv_seg.shape}.")
-
-            if kv_pos is not None:
-                kv_pos = jax.vmap(
-                    lambda pos, klen: jax.lax.dynamic_slice_in_dim(
-                        pos,
-                        jnp.clip(klen - width, 0, jnp.maximum(K - width, 0)),
-                        width,
-                        axis=0,
-                    ),
-                    in_axes=(0, 0),
-                    out_axes=0,
-                )(kv_pos, kv_lengths)
-
-        return self.replace(
-            attention_mask=attn,
-            q_segment_ids=q_seg,
-            kv_segment_ids=kv_seg,
-            q_positions=q_pos,
-            kv_positions=kv_pos,
-        )
+        return self.replace(attention_mask=attn, q_segment_ids=q_seg, kv_segment_ids=kv_seg)
 
     @_debug_trace
     def apply_causal(self, offset: int | Int[Array, "batch"] = 0) -> "MaskInfo":

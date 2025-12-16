@@ -177,7 +177,6 @@ from ejkernel.modules.operations import attention
 # This will pass
 q_seg = jnp.array([[0, 0, 0, 0, -1, -1]])
 mask_info = MaskInfo.from_segments(q_seg)
-mask_info.assert_not_multi_sequence()  # ✓ No error
 output = attention(query, key, value, mask_info=mask_info)
 
 # This will fail with a clear error message
@@ -472,7 +471,6 @@ cu_seqlens = mask_info.cu_seqlens_q  # Efficient
 mask_info = MaskInfo.from_segments(q_segment_ids)
 
 # Assert expectations
-mask_info.assert_not_multi_sequence()  # For single-sequence operations
 assert mask_info.is_self_attention()   # For self-attention layers
 ```
 

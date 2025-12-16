@@ -264,11 +264,6 @@ def attention(
     q_mask = None
 
     if mask_info is not None:
-        mask_info.assert_not_multi_sequence(
-            "attention does not support multi-sequence (packed) format. "
-            "All valid tokens must have segment ID 0. For packed sequences, use flash_attention "
-            "or other attention variants that support segment IDs."
-        )
         q_mask, _, attention_mask = mask_info.get_qkv_masks(dtype=jnp.bool_)
 
         # If masks are already baked into attention_mask, don't reapply them
