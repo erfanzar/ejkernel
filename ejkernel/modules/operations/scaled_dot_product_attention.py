@@ -387,12 +387,6 @@ def scaled_dot_product_attention(
     if mask_info is not None:
         attention_mask = mask_info.get_or_compute_attention_mask()
 
-        # If masks are already baked into attention_mask, don't reapply them
-        if mask_info.causal_mask_baked_in:
-            causal = False
-        if mask_info.sliding_window_baked_in:
-            sliding_window = None
-
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"

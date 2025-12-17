@@ -261,18 +261,11 @@ def attention(
     """
 
     attention_mask = None
-    q_mask = None
 
     if mask_info is not None:
-        q_mask, _, attention_mask = mask_info.get_qkv_masks(dtype=jnp.bool_)
+        attention_mask = mask_info.get_or_compute_attention_mask()
 
-        # If masks are already baked into attention_mask, don't reapply them
-        if mask_info.causal_mask_baked_in:
-            causal = False
-        if mask_info.sliding_window_baked_in:
-            sliding_window = None
-
-    out, weights = _executor(
+    return _executor(
         Attention(),
         query=query,
         key=key,
@@ -291,8 +284,3 @@ def attention(
         softmax_aux=softmax_aux,
         causal=causal,
     )
-
-    if q_mask is not None:
-        out = out * q_mask[:, :, None, None].astype(out.dtype)
-
-    return out, weights

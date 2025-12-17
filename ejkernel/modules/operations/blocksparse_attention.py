@@ -786,6 +786,7 @@ def blocksparse_attention(
     chunk_size: int | None = None,
     causal: bool = True,
     fused_backward: bool = False,
+    purify: bool = False,
     platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: BlockSparseAttentionConfig | None = None,
     mesh: Mesh | None = None,
@@ -920,7 +921,7 @@ def blocksparse_attention(
         _cfg=cfg,
     )
 
-    if q_mask is not None:
+    if q_mask is not None and purify:
         out = out * q_mask[:, None, :, None].astype(out.dtype)
 
     return out
