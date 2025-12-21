@@ -29,15 +29,9 @@ Reference:
 """
 
 from ._interface import kda, kda_decay, kernel_delta_attention
-from ._xla_impl_fwd import (
-    _chunk_kda_fwd as kernel_delta_attention_xla_chunk_fwd,
-)
-from ._xla_impl_fwd import (
-    _recurrent_kda_fwd as kernel_delta_attention_xla_recurrent_fwd,
-)
-from ._xla_impl_fwd import (
-    _single_step_kda_fwd as kernel_delta_attention_xla_single_step_fwd,
-)
+from ._xla_impl_fwd import _chunk_kda_fwd as kernel_delta_attention_xla_chunk_fwd
+from ._xla_impl_fwd import _recurrent_kda_fwd as kernel_delta_attention_xla_recurrent_fwd
+from ._xla_impl_fwd import _single_step_kda_fwd as kernel_delta_attention_xla_single_step_fwd
 
 __all__ = (
     "kda",

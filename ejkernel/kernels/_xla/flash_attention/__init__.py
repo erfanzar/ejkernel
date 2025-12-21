@@ -28,7 +28,7 @@ Key Features:
 
 Algorithm:
     The implementation processes attention in tiles/chunks, computing
-    softmax incrementally to avoid materializing the full N×N attention matrix.
+    softmax incrementally to avoid materializing the full NxN attention matrix.
 
 Reference:
     FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness

@@ -24,15 +24,9 @@ Key characteristics:
 - O(N) complexity through sequential processing
 """
 
-from ._interface import (
-    _ssm1_bwd_rule as ssm1_xla_bwd,
-)
-from ._interface import (
-    _ssm1_fwd_rule as ssm1_xla_fwd,
-)
-from ._interface import (
-    state_space_v1,
-)
+from ._interface import _ssm1_bwd_rule as ssm1_xla_bwd
+from ._interface import _ssm1_fwd_rule as ssm1_xla_fwd
+from ._interface import state_space_v1
 
 __all__ = [
     "ssm1_xla_bwd",
