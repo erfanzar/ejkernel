@@ -1,6 +1,6 @@
 # ejKernel: High-Performance JAX Kernels for Deep Learning
 
-> *"The best optimization is the one you don't have to think about."*
+> _"The best optimization is the one you don't have to think about."_
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -34,7 +34,7 @@ ejKernel is a production-grade kernel library for JAX that provides highly optim
 
 ### State-of-the-Art Operations
 
-- **15+ Attention Mechanisms**: Flash Attention v2, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, Ragged Page Attention, and more
+- **20+ Deep Learning Operations**: Flash Attention v2, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, State Space Models (Mamba), and more
 - **Memory Efficiency**: Custom VJP implementations with O(N) memory complexity for attention
 - **Distributed Support**: Full shard_map integration for model and data parallelism
 - **Mixed Precision**: Comprehensive dtype support with automatic gradient conversion
@@ -173,109 +173,18 @@ ejKernel employs a sophisticated layered architecture that separates concerns wh
 
 ```md
 ┌─────────────────────────────────────────────────────┐
-│              Public API (modules/)                   │
-│         Simple functions with sensible defaults      │
+│ Public API (modules/)                               │
+│ Simple functions with sensible defaults             │
 ├─────────────────────────────────────────────────────┤
-│            Operations Layer (ops/)                   │
-│    Configuration management, autotuning, caching     │
+│ Operations Layer (ops/)                             │
+│ Configuration management, autotuning, caching       │
 ├─────────────────────────────────────────────────────┤
-│          Kernel Registry (kernels/)                  │
-│      Platform routing, signature validation          │
+│ Kernel Registry (kernels/)                          │
+│ Platform routing, signature validation              │
 ├─────────────────────────────────────────────────────┤
-│      Backend Implementations (kernels/_*)            │
-│         Triton, Pallas, XLA, CUDA kernels           │
+│ Backend Implementations (kernels/\_\*)              │
+│ Triton, Pallas, XLA, CUDA kernels                   │
 └─────────────────────────────────────────────────────┘
-```
-
-### Project Structure
-
-```md
-ejkernel/
-├── kernels/                          # Low-level kernel implementations
-│   ├── _triton/                      # Triton kernels (GPU)
-│   │   ├── flash_attention/
-│   │   ├── page_attention/
-│   │   ├── ragged_page_attention_v2/
-│   │   ├── gated_linear_attention/
-│   │   ├── lightning_attn/
-│   │   ├── mean_pooling/
-│   │   ├── native_sparse_attention/
-│   │   ├── recurrent/
-│   │   └── blocksparse_attention/
-│   ├── _pallas/
-│   │   ├── tpu/                      # TPU-specific implementations
-│   │   │   ├── flash_attention/
-│   │   │   ├── ring_attention/
-│   │   │   ├── page_attention/
-│   │   │   ├── ragged_page_attention_v2/
-│   │   │   ├── ragged_page_attention_v3/
-│   │   │   ├── blocksparse_attention/
-│   │   │   ├── grouped_matmul/
-│   │   │   └── ragged_decode_attention/
-│   │   └── gpu/                      # GPU Pallas implementations
-│   ├── _xla/                         # XLA implementations (universal)
-│   │   ├── attention/
-│   │   ├── flash_attention/
-│   │   ├── gated_linear_attention/
-│   │   ├── grouped_matmul/
-│   │   ├── lightning_attn/
-│   │   ├── mean_pooling/
-│   │   ├── native_sparse_attention/
-│   │   ├── page_attention/
-│   │   ├── ragged_decode_attention/
-│   │   ├── ragged_page_attention_v2/
-│   │   ├── ragged_page_attention_v3/
-│   │   ├── recurrent/
-│   │   ├── ring_attention/
-│   │   └── scaled_dot_product_attention/
-│   ├── _cuda/                        # CUDA implementations (dev)
-│   └── _registry.py                  # Kernel registry system
-│
-├── modules/                          # High-level API
-│   └── operations/
-│       ├── flash_attention.py
-│       ├── ring_attention.py
-│       ├── page_attention.py
-│       ├── ragged_page_attention_v2.py
-│       ├── ragged_page_attention_v3.py
-│       ├── blocksparse_attention.py
-│       ├── gated_linear_attention.py
-│       ├── lightning_attention.py
-│       ├── native_sparse_attention.py
-│       ├── recurrent.py
-│       ├── grouped_matmul.py
-│       ├── pooling.py
-│       ├── attention.py
-│       ├── multi_head_latent_attention.py
-│       ├── ragged_decode_attention.py
-│       ├── scaled_dot_product_attention.py
-│       └── configs.py
-│
-├── ops/                              # Configuration & execution framework
-│   ├── config/                       # Configuration management
-│   │   ├── cache.py                  # In-memory config cache
-│   │   ├── persistent.py             # Disk-based persistence
-│   │   └── selection.py              # Config selection chain
-│   ├── core/                         # Base kernel class
-│   ├── execution/                    # Execution orchestration
-│   │   └── tuning.py                 # Autotuning framework
-│   ├── registry.py                   # Operation invocation tracking
-│   └── utils/                        # Utilities (fingerprinting, etc)
-│
-├── xla_utils/                        # XLA-specific utilities
-│   ├── cumsum.py                     # Cumulative sum operations
-│   ├── shardings.py                  # Sharding utilities
-│   └── utils.py                      # Sequence length utilities
-│
-├── types/                            # Type definitions
-│   └── mask.py                       # MaskInfo for attention masking
-│
-├── callib/                           # Calling library
-│   ├── _ejit.py                      # Enhanced JIT
-│   ├── _triton_call.py               # Triton kernel calling
-│   └── _pallas_call.py               # Pallas kernel calling
-│
-└── utils.py                          # General utilities
 ```
 
 ### Core Components
@@ -340,49 +249,64 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 
 ### Attention Mechanisms
 
-| Algorithm | Description | Memory | Key Features |
-|-----------|-------------|--------|--------------|
-| **Flash Attention v2** | Memory-efficient exact attention | O(N) | Causal masking, dropout, sliding windows, soft capping |
-| **Ring Attention** | Distributed sequence parallelism | O(N/P) | Ultra-long sequences, communication overlap |
-| **Page Attention** | KV-cache optimized inference | O(N) | Block-wise memory, continuous batching |
-| **Block Sparse Attention** | Configurable sparse patterns | O(N√N) | Local+global, custom patterns |
-| **GLA** | Gated Linear Attention | O(N) | Linear complexity, gated updates |
-| **Lightning Attention** | Layer-dependent decay | O(N) | Exponential moving average |
-| **MLA** | Multi-head Latent Attention | O(N) | Compressed KV representation |
-| **Ragged Page Attention v2** | Variable-length paged attention | O(N) | Ragged sequences with page caching |
-| **Ragged Page Attention v3** | Enhanced ragged page attention | O(N) | Attention sinks support, improved handling |
-| **Ragged Decode Attention** | Variable-length decoding | O(N) | Efficient batched inference |
-| **Scaled Dot-Product Attention** | Standard attention | O(N²) | Basic reference implementation |
+| Algorithm                        | Description                      | Memory | Key Features                                           |
+| -------------------------------- | -------------------------------- | ------ | ------------------------------------------------------ |
+| **Flash Attention v2**           | Memory-efficient exact attention | O(N)   | Causal masking, dropout, sliding windows, soft capping |
+| **Ring Attention**               | Distributed sequence parallelism | O(N/P) | Ultra-long sequences, communication overlap            |
+| **Page Attention**               | KV-cache optimized inference     | O(N)   | Block-wise memory, continuous batching                 |
+| **Block Sparse Attention**       | Configurable sparse patterns     | O(N√N) | Local+global, custom patterns                          |
+| **GLA**                          | Gated Linear Attention           | O(N)   | Linear complexity, gated updates                       |
+| **Lightning Attention**          | Layer-dependent decay            | O(N)   | Exponential moving average                             |
+| **MLA**                          | Multi-head Latent Attention      | O(N)   | Compressed KV representation                           |
+| **Ragged Page Attention v2**     | Variable-length paged attention  | O(N)   | Ragged sequences with page caching                     |
+| **Ragged Page Attention v3**     | Enhanced ragged page attention   | O(N)   | Attention sinks support, improved handling             |
+| **Ragged Decode Attention**      | Variable-length decoding         | O(N)   | Efficient batched inference                            |
+| **Kernel Delta Attention**       | Delta-rule linear attention      | O(N)   | Linear complexity, delta updates, decay control        |
+| **Unified Attention**            | vLLM-style paged attention       | O(N)   | Segmented 3D decode kernel                             |
+| **Prefill Page Attention**       | Page attention prefill phase     | O(N)   | Separate prefill handling                              |
+| **Scaled Dot-Product Attention** | Standard attention               | O(N²)  | Basic reference implementation                         |
 
 ### Other Operations
 
-| Operation | Description | Use Case |
-|-----------|-------------|----------|
-| **Grouped MatMul** | Efficient batched matrix operations | Expert models, MoE |
-| **Grouped MatMul v2** | Enhanced with shard_map support | Distributed expert models |
-| **Mean Pooling** | Variable-length sequence aggregation | Sentence embeddings |
-| **Recurrent** | Optimized RNN/LSTM/GRU operations | Sequential modeling |
-| **Native Sparse** | Block-sparse matrix computations | Sparse attention patterns |
+| Operation             | Description                          | Use Case                  |
+| --------------------- | ------------------------------------ | ------------------------- |
+| **Grouped MatMul**    | Efficient batched matrix operations  | Expert models, MoE        |
+| **Grouped MatMul v2** | Enhanced with shard_map support      | Distributed expert models |
+| **Mean Pooling**      | Variable-length sequence aggregation | Sentence embeddings       |
+| **Recurrent**         | Optimized RNN/LSTM/GRU operations    | Sequential modeling       |
+| **Native Sparse**     | Block-sparse matrix computations     | Sparse attention patterns |
+
+### State Space Models
+
+| Operation          | Description      | Key Features                                                               |
+| ------------------ | ---------------- | -------------------------------------------------------------------------- |
+| **State Space v1** | Mamba1-style SSM | 2D A matrix, separate dt_proj, custom VJP for memory efficiency            |
+| **State Space v2** | Mamba2-style SSM | Per-head scalar A, n_groups for parameter grouping, optional gated RMSNorm |
 
 ### Platform Support Matrix
 
-| Operation | Triton (GPU) | Pallas (TPU) | XLA (Universal) |
-|-----------|:------------:|:------------:|:---------------:|
-| Flash Attention v2 | ✅ | ✅ | ✅ |
-| Ring Attention | ✅ | ✅ | ✅ |
-| Page Attention | ✅ | ✅ | ✅ |
-| Block Sparse Attention | ✅ | ✅ | ✅ |
-| Ragged Page Attention v2 | ✅ | ✅ | ✅ |
-| Ragged Page Attention v3 | - | ✅ | ✅ |
-| Ragged Decode Attention | ✅ | ✅ | ✅ |
-| GLA | ✅ | - | ✅ |
-| Lightning Attention | ✅ | - | ✅ |
-| MLA | ✅ | 🚧 | - |
-| Recurrent | ✅ | - | ✅ |
-| Mean Pooling | ✅ | - | ✅ |
-| Grouped MatMul | - | ✅ | ✅ |
-| Grouped MatMul v2 | - | ✅ | - |
-| Native Sparse Attention | ✅ | - | ✅ |
+| Operation                | Triton (GPU) | Pallas (TPU) | XLA (Universal) |
+| ------------------------ | ------------ | ------------ | --------------- |
+| Flash Attention v2       | ✅           | ✅           | ✅              |
+| Ring Attention           | ✅           | ✅           | ✅              |
+| Page Attention           | ✅           | ✅           | ✅              |
+| Block Sparse Attention   | ✅           | ✅           | ✅              |
+| Ragged Page Attention v2 | ✅           | ✅           | ✅              |
+| Ragged Page Attention v3 | ✅           | ✅           | ✅              |
+| Ragged Decode Attention  | ✅           | ✅           | ✅              |
+| GLA                      | ✅           | -            | ✅              |
+| Lightning Attention      | ✅           | -            | ✅              |
+| MLA                      | ✅           | 🚧           | -               |
+| Recurrent                | ✅           | -            | ✅              |
+| Mean Pooling             | ✅           | -            | ✅              |
+| Grouped MatMul           | -            | ✅           | ✅              |
+| Grouped MatMul v2        | -            | ✅           | -               |
+| Native Sparse Attention  | ✅           | -            | ✅              |
+| Kernel Delta Attention   | -            | -            | ✅              |
+| Unified Attention        | ✅           | -            | ✅              |
+| Prefill Page Attention   | -            | ✅           | ✅              |
+| State Space v1           | -            | -            | ✅              |
+| State Space v2           | -            | -            | ✅              |
 
 ✅ = Production ready | 🚧 = Under development | - = Not available
 
