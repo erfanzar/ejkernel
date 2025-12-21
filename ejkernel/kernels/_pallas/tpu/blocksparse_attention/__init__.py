@@ -13,7 +13,17 @@
 # limitations under the License.
 
 
-"""modified from google org impl"""
+"""Pallas TPU backend for Block-Sparse (Splash) Attention.
+
+This submodule provides TPU-optimized block-sparse attention using Pallas
+with Mosaic backend. Based on Google's Splash Attention implementation.
+
+Key Features:
+    - Multiple mask types: Causal, LocalMask, ChunkedCausal, Full
+    - Multi-head and multi-query attention support
+    - Single-device and multi-device execution
+    - Custom mask builder support
+"""
 
 from ._info import MaskInfo
 from ._kernel import (

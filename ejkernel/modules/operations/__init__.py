@@ -73,6 +73,7 @@ from .configs import (
     FlashMLAConfig,
     GLAttentionConfig,
     GroupedMatmulConfig,
+    KernelDeltaAttentionConfig,
     LightningAttentionConfig,
     NativeSparseAttentionConfig,
     PageAttentionConfig,
@@ -83,11 +84,14 @@ from .configs import (
     RecurrentAttentionConfig,
     RingAttentionConfig,
     ScaledDotProductAttentionConfig,
+    StateSpaceV1Config,
+    StateSpaceV2Config,
     UnifiedAttentionConfig,
 )
 from .flash_attention import FlashAttention, flash_attention
 from .gated_linear_attention import GLAttention, gla_attention
 from .grouped_matmul import GroupedMatmul, grouped_matmul
+from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
 from .multi_head_latent_attention import FlashMLA, mla_attention
 from .native_sparse_attention import NativeSparseAttention, native_sparse_attention
@@ -100,6 +104,8 @@ from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attenti
 from .recurrent import RecurrentAttention, recurrent_attention
 from .ring_attention import RingAttention, ring_attention
 from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_product_attention
+from .state_space_v1 import StateSpaceV1, state_space_v1
+from .state_space_v2 import StateSpaceV2, state_space_v2
 from .unified_attention import UnifiedAttention, unified_attention
 
 __all__ = (
@@ -115,6 +121,8 @@ __all__ = (
     "GLAttentionConfig",
     "GroupedMatmul",
     "GroupedMatmulConfig",
+    "KernelDeltaAttention",
+    "KernelDeltaAttentionConfig",
     "LightningAttention",
     "LightningAttentionConfig",
     "MeanPooling",
@@ -137,6 +145,10 @@ __all__ = (
     "RingAttentionConfig",
     "ScaledDotProductAttention",
     "ScaledDotProductAttentionConfig",
+    "StateSpaceV1",
+    "StateSpaceV1Config",
+    "StateSpaceV2",
+    "StateSpaceV2Config",
     "UnifiedAttention",
     "UnifiedAttentionConfig",
     "attention",
@@ -144,6 +156,8 @@ __all__ = (
     "flash_attention",
     "gla_attention",
     "grouped_matmul",
+    "kda_attention",
+    "kernel_delta_attention",
     "lightning_attention",
     "mean_pooling",
     "mla_attention",
@@ -157,5 +171,7 @@ __all__ = (
     "recurrent_attention",
     "ring_attention",
     "scaled_dot_product_attention",
+    "state_space_v1",
+    "state_space_v2",
     "unified_attention",
 )

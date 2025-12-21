@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Pallas TPU backend for Prefill Paged Attention.
+
+This submodule provides TPU-optimized paged attention for the prefill
+phase using Pallas with Mosaic backend.
+
+Key Features:
+    - Paged KV cache management during prefill
+    - Support for variable-length prompt processing
+    - Efficient page table lookups
+    - Sliding window attention support
+"""
+
 from ._interface import prefill_page_attention
 
 __all__ = ("prefill_page_attention",)

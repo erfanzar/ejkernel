@@ -145,7 +145,6 @@ def ejit(
     keep_unused: bool = False,
     backend: str | None = None,
     inline: bool = False,
-    abstracted_axes: tp.Any | None = None,
     compiler_options: dict[str, tp.Any] | None = None,
 ):
     """Enhanced JIT compilation with persistent caching.
@@ -187,7 +186,6 @@ def ejit(
             donate_argnums=donate_argnums,
             in_shardings=in_shardings,
             out_shardings=out_shardings,
-            abstracted_axes=abstracted_axes,
             backend=backend,
             compiler_options=compiler_options,
             donate_argnames=donate_argnames,
@@ -212,7 +210,6 @@ def ejit(
             donate_argnums=donate_argnums,
             in_shardings=in_shardings,
             out_shardings=out_shardings,
-            abstracted_axes=abstracted_axes,
             backend=backend,
             compiler_options=compiler_options,
             donate_argnames=donate_argnames,
@@ -227,7 +224,6 @@ def ejit(
         donate_argnums=donate_argnums,
         in_shardings=in_shardings,
         out_shardings=out_shardings,
-        abstracted_axes=abstracted_axes,
         backend=backend,
         compiler_options=compiler_options,
         donate_argnames=donate_argnames,
@@ -264,10 +260,20 @@ def ejit(
     )
 
     def get_compiled_and_cache(args_sig: str, args, kwargs) -> Compiled | None:
-        """
-        This inner function handles the "slow path": looking up in the L2 cache,
-        on disk, or compiling. It's decorated with LRU cache so it only runs
-        once per unique set of argument shapes.
+        """Retrieve or compile a function with the given argument signature.
+
+        Handles the cache lookup and compilation "slow path":
+        1. Check in-memory cache (L2)
+        2. Check disk cache
+        3. Compile and cache if not found
+
+        Args:
+            args_sig: String signature of the arguments
+            args: Positional arguments for compilation
+            kwargs: Keyword arguments for compilation
+
+        Returns:
+            Compiled function if successful, None otherwise
         """
         compilation_key = hashlib.md5((static_key_part + args_sig).encode("utf-8")).hexdigest()
 
@@ -325,7 +331,18 @@ def ejit(
 
 
 def load_cached_functions(verbose: bool = True) -> None:
-    """Pre-loads all valid cached functions from disk into the persistent L2 cache."""
+    """Pre-load all cached compiled functions from disk into memory.
+
+    Scans the cache directory and loads all valid compiled functions into
+    the in-memory cache for faster subsequent lookups.
+
+    Args:
+        verbose: If True, print status messages and warnings about loading.
+
+    Note:
+        This is useful at startup to warm up the cache before running
+        performance-critical code paths.
+    """
     if not COMPILE_FUNC_DIR.exists():
         return
 
@@ -404,7 +421,19 @@ def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None =
 
 
 def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
-    """Load a compiled function from disk."""
+    """Load a previously saved compiled function from disk.
+
+    Args:
+        path: Directory path where the compiled function was saved.
+        prefix: Optional prefix that was used when saving.
+
+    Returns:
+        The deserialized compiled JAX function.
+
+    Raises:
+        FileNotFoundError: If the compiled function file doesn't exist.
+        pickle.UnpicklingError: If the file is corrupted.
+    """
     prefix = prefix or ""
     filename = path / (prefix + "-" + COMPILED_FILE_NAME)
     (serialized, in_tree, out_tree) = pickle.load(open(filename, "rb"))
@@ -433,7 +462,18 @@ def get_safe_hash_int(text, algorithm="md5"):
         raise Exception(f"Error generating hash: {e!s}") from e
 
 
-def get_hash_of_lowering(lowered_func: Lowered):
+def get_hash_of_lowering(lowered_func: Lowered) -> str:
+    """Generate a SHA-256 hash of a lowered JAX function.
+
+    Creates a deterministic hash based on the text representation of the
+    lowered function, useful for cache key generation.
+
+    Args:
+        lowered_func: JAX lowered function object.
+
+    Returns:
+        Hexadecimal string of the SHA-256 hash.
+    """
     text_representation = lowered_func.as_text()
     hash_object = hashlib.sha256(text_representation.encode("utf-8"))
     hash_digest = hash_object.hexdigest()
@@ -446,7 +486,26 @@ def smart_compile(
     verbose: bool = True,
     cache_key: tuple[str, tuple] | None = None,
 ) -> tuple[Compiled, tuple[str, tuple] | None]:
-    """Compile a lowered JAX function with caching."""
+    """Compile a lowered JAX function with intelligent caching.
+
+    Attempts to load a previously compiled version from disk cache,
+    falling back to fresh compilation if not found. Automatically
+    caches newly compiled functions for future use.
+
+    Args:
+        lowered_func: JAX lowered function to compile.
+        tag: Optional tag to include in the cache filename for organization.
+        verbose: If True, print warnings about cache operations.
+        cache_key: Optional custom cache key for the function signature.
+
+    Returns:
+        Tuple of (compiled_function, cache_key) where cache_key may be
+        updated if loaded from disk.
+
+    Note:
+        Uses SHA-256 hash of the lowered function text for cache keys,
+        combined with optional tag for namespacing.
+    """
     func_hash = get_hash_of_lowering(lowered_func)
     foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
     func_dir = COMPILE_FUNC_DIR / foldername

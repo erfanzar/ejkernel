@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""XLA backend for Grouped Matrix Multiplication.
+
+This submodule provides XLA-optimized implementation of grouped matrix
+multiplication operations for processing multiple matrix multiplications
+with different sizes in a single batched operation.
+
+Key Features:
+    - Efficient batched processing of variable-size matrix multiplications
+    - Support for group indices specifying which matrices to multiply
+    - Optimized memory access patterns for grouped operations
+"""
+
 from ._interface import grouped_matmul
 
 __all__ = ("grouped_matmul",)

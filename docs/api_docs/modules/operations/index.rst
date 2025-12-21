@@ -10,6 +10,7 @@ ejkernel.modules.operations package
    flash_attention
    gated_linear_attention
    grouped_matmul
+   kernel_delta_attention
    lightning_attention
    multi_head_latent_attention
    native_sparse_attention
@@ -22,4 +23,6 @@ ejkernel.modules.operations package
    recurrent
    ring_attention
    scaled_dot_product_attention
+   state_space_v1
+   state_space_v2
    unified_attention

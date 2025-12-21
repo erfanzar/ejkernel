@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""XLA backend for Ragged Page Attention V2.
+
+This submodule provides XLA-optimized implementation of ragged page attention
+for variable-length sequences with paged key-value cache management.
+
+Key Features:
+    - Variable-length sequence support via cu_seqlens
+    - Paged KV cache with flexible page sizes
+    - Optimized for mixed prefill and decode phases
+    - Efficient handling of ragged batch shapes
+"""
+
 from ._interface import ragged_page_attention_v2
 
 __all__ = ["ragged_page_attention_v2"]

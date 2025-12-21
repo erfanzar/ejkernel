@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Native Sparse Attention interface with block selection and compression.
+
+This module provides the public API for Native Sparse Attention (NSA) that
+combines compressed global attention with fine-grained sparse block selection.
+Includes VJP for training support and top-k block selection algorithms.
+"""
 
 import warnings
 from functools import partial

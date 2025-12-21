@@ -13,6 +13,17 @@
 # limitations under the License.
 
 
+"""Pallas kernel implementations for TPU and GPU.
+
+This module provides Pallas-based kernel implementations organized by
+target hardware (TPU and GPU). Pallas kernels compile to hardware-specific
+optimized code through JAX's lower-level APIs.
+
+Submodules:
+    tpu: TPU-optimized kernels using Pallas with Mosaic
+    gpu: GPU-optimized kernels using Pallas with Triton backend
+"""
+
 from . import gpu, tpu
 
 __all__ = ("gpu", "tpu")

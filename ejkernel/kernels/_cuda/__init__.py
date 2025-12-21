@@ -13,3 +13,13 @@
 # limitations under the License.
 
 
+"""CUDA kernel implementations for NVIDIA GPUs.
+
+This module is reserved for native CUDA kernel implementations that
+require direct CUDA code (not Triton). Currently a placeholder for
+future custom CUDA kernels.
+
+Note:
+    Most GPU kernels are implemented via Triton in the _triton module
+    or via Pallas in the _pallas/gpu module.
+"""

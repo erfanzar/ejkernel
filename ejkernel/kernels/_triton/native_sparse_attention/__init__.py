@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Triton backend for Native Sparse Attention (NSA).
+
+This submodule provides GPU-optimized sparse attention using Triton kernels
+with dynamic block selection based on compressed attention scores.
+
+Key Features:
+    - Compressed global attention with mean-pooled blocks
+    - Dynamic top-k block selection per query
+    - Custom forward and backward Triton kernels
+    - Support for both prefill and decode phases
+"""
+
 from ._interface import _bwd_call as native_sparse_attention_gpu_bwd
 from ._interface import _fwd_call as native_sparse_attention_gpu_fwd
 from ._interface import apply_native_sparse_attention, native_sparse_attention

@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""XLA backend for Ragged Page Attention V3.
+
+This submodule provides the latest XLA-optimized implementation of ragged
+page attention with improved performance and additional features.
+
+Key Features:
+    - Enhanced variable-length sequence support
+    - Improved paging algorithm for better memory efficiency
+    - Sliding window attention support
+    - Optimized tiling for different hardware configurations
+"""
+
 from ._interface import ragged_page_attention_v3
 
 __all__ = ("ragged_page_attention_v3",)

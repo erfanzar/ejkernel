@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Gated Linear Attention interface using recurrent formulation.
+
+This module provides the public API for GLA implemented via the recurrent
+attention mechanism. Wraps the core recurrent implementation with GLA-specific
+gating support for linear-time sequence processing.
+"""
 
 import jaxtyping
 from beartype import beartype

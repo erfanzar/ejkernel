@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""XLA backend for Ragged Decode Attention.
+
+This submodule provides XLA-optimized implementation of attention
+specifically optimized for the decode phase with ragged batches.
+
+Key Features:
+    - Optimized for single-token decoding
+    - Variable-length KV cache support
+    - Efficient handling of ragged batch shapes
+    - Low-latency implementation for serving
+"""
+
 from ._interface import ragged_decode_attention
 
 __all__ = ["ragged_decode_attention"]

@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""XLA backend for Prefill Paged Attention.
+
+This submodule provides XLA-optimized implementation of paged attention
+specifically designed for the prefill phase of sequence processing.
+
+Key Features:
+    - Paged KV cache management during prefill
+    - Support for variable-length prompt processing
+    - Efficient page table lookups for scattered KV access
+    - Sliding window attention support
+"""
+
 from ._impl import prefill_page_attention
 
 __all__ = ("prefill_page_attention",)

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Grouped matrix multiplication interface using XLA ragged_dot.
+
+This module provides the public API for grouped matrix multiplication
+where different row slices of a matrix are multiplied with different
+weight matrices. Uses JAX's ragged_dot_general for efficient computation.
+"""
 
 from __future__ import annotations
 

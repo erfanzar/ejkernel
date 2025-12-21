@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Triton backend for Mean Pooling.
+
+This submodule provides GPU-optimized mean pooling using Triton kernels
+for efficient sequence embedding aggregation.
+
+Key Features:
+    - Sequence mean pooling with mask support
+    - Efficient handling of variable-length sequences
+    - Custom forward and backward Triton kernels
+    - Support for packed sequence processing
+"""
+
 from ._interface import (
     _bwd_call as mean_pooling_gpu_bwd,
 )

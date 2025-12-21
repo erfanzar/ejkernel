@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Unified attention interface for paged KV cache with mixed workloads.
+
+This module provides the public API for unified attention that handles
+ragged batches with paged key-value caches. Supports sliding window,
+ALiBi slopes, and attention sink features.
+"""
+
 from __future__ import annotations
 
 import jaxtyping

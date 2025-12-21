@@ -13,6 +13,38 @@
 # limitations under the License.
 
 
+"""Sharding utilities for distributed JAX computation.
+
+This module provides utilities for managing array shardings across distributed
+devices, with automatic correction of partition specifications based on
+array shapes and mesh configurations.
+
+Key Functions:
+    get_corrected_named_sharding: Create valid shardings based on shape/mesh constraints
+    reorder_sequence: Reorder sequence dimensions for ring attention patterns
+
+Sharding Correction:
+    The get_corrected_named_sharding function automatically adjusts PartitionSpecs
+    to ensure validity based on:
+    - Axis names present in the current mesh
+    - Divisibility of array dimensions by mesh axis sizes
+    - Proper handling of multi-axis sharding
+
+Ring Attention Reordering:
+    The reorder_sequence function rearranges sequence dimensions to enable
+    efficient ring attention communication patterns, alternating between
+    forward and backward sequence chunks.
+
+Example:
+    >>> from ejkernel.xla_utils import get_corrected_named_sharding
+    >>> from jax.sharding import PartitionSpec, Mesh
+    >>>
+    >>> mesh = Mesh(devices, ('dp', 'mp'))
+    >>> shape = (8, 1024, 512)
+    >>> spec = PartitionSpec('dp', None, 'mp')
+    >>> sharding = get_corrected_named_sharding(shape, spec, mesh)
+"""
+
 from functools import partial
 
 import jax
@@ -108,6 +140,29 @@ def get_corrected_named_sharding(
 
 @partial(jax.jit, static_argnames=("cp_size", "seq_dim", "to_contiguous"))
 def reorder_sequence(tensor, cp_size: int, seq_dim: int = 1, to_contiguous: bool = False):
+    """Reorder sequence dimension for ring attention communication patterns.
+
+    Rearranges the sequence dimension to enable efficient ring attention
+    communication, alternating between forward and backward sequence chunks
+    to minimize communication overhead during context parallel processing.
+
+    Args:
+        tensor: Input tensor with a sequence dimension to reorder.
+        cp_size: Context parallelism size (must be even).
+        seq_dim: Dimension index of the sequence axis (default: 1).
+        to_contiguous: If True, reorder for contiguous memory layout;
+            if False, reorder for ring attention pattern.
+
+    Returns:
+        Tensor with reordered sequence dimension for ring communication.
+
+    Raises:
+        ValueError: If cp_size is not even or seq_len not divisible by 2*cp_size.
+
+    Note:
+        The reordering interleaves forward and backward chunks to enable
+        efficient bidirectional communication in ring attention patterns.
+    """
     if tensor is None:
         return tensor
 

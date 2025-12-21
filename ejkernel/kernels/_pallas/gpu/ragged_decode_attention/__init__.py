@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Pallas GPU backend for Ragged Decode Attention.
+
+This submodule provides GPU-optimized attention for decoding with
+variable-length KV caches using Pallas with Triton backend.
+
+Key Features:
+    - Optimized for single-token decoding on GPU
+    - Variable-length KV cache support
+    - Efficient handling of ragged batch shapes
+    - Low-latency implementation for serving
+"""
+
 from ._interface import ragged_decode_attention
 
 __all__ = ("ragged_decode_attention",)

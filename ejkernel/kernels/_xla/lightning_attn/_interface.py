@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Lightning Attention interface with layer-dependent decay.
+
+This module provides the public API for Lightning Attention using recurrent
+formulation with layer-depth-dependent decay rates for different temporal
+receptive fields across transformer layers.
+"""
 
 import jaxtyping
 from beartype import beartype

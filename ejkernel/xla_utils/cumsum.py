@@ -13,6 +13,38 @@
 # limitations under the License.
 
 
+"""Chunked cumulative sum operations for attention mechanisms.
+
+This module provides efficient chunked cumulative sum operations used in
+various attention mechanisms, particularly linear attention variants that
+require running sums over sequence dimensions.
+
+Key Operations:
+    - chunk_local_cumsum: Cumsum within fixed-size chunks (resets at boundaries)
+    - chunk_global_cumsum: Cumsum across entire sequences (respects boundaries)
+
+Both operations support:
+    - Scalar (3D) and vector (4D) inputs
+    - Forward and reverse directions
+    - Softmax scaling
+    - Variable-length sequences via cu_seqlens
+    - Head-first or time-first tensor layouts
+
+Typical Use Cases:
+    - Gated Linear Attention (GLA): Computing cumulative gate products
+    - Linear Attention: Accumulating key-value outer products
+    - RetNet: Computing retention decay factors
+
+Example:
+    >>> from ejkernel.xla_utils import chunk_local_cumsum, chunk_global_cumsum
+    >>>
+    >>> # Local cumsum within 128-token chunks
+    >>> local_cumsum = chunk_local_cumsum(g, chunk_size=128)
+    >>>
+    >>> # Global cumsum respecting sequence boundaries
+    >>> global_cumsum = chunk_global_cumsum(s, cu_seqlens=cu_seqlens)
+"""
+
 from functools import partial
 
 import jax
@@ -30,6 +62,22 @@ def chunk_local_cumsum_scalar(
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
+    """Compute local cumulative sum within chunks for 3D scalar inputs.
+
+    Performs cumulative sum within fixed-size chunks, resetting at each
+    chunk boundary. Supports forward and reverse directions.
+
+    Args:
+        g: Input tensor of shape [B, H, T] if head_first else [B, T, H].
+        chunk_size: Size of each chunk (must be power of 2).
+        reverse: If True, compute reverse cumsum within each chunk.
+        softmax_scale: Optional scaling factor applied to result.
+        head_first: If True, expects [B, H, T] layout; otherwise [B, T, H].
+        output_dtype: Optional output dtype (defaults to input dtype).
+
+    Returns:
+        Tensor with same shape containing chunked cumulative sums.
+    """
     if head_first:
         B, H, T = g.shape
     else:
@@ -70,6 +118,22 @@ def chunk_local_cumsum_vector(
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
+    """Compute local cumulative sum within chunks for 4D vector inputs.
+
+    Performs cumulative sum within fixed-size chunks for tensors with
+    an additional state dimension.
+
+    Args:
+        g: Input tensor of shape [B, H, T, S] if head_first else [B, T, H, S].
+        chunk_size: Size of each chunk (must be power of 2).
+        reverse: If True, compute reverse cumsum within each chunk.
+        softmax_scale: Optional scaling factor applied to result.
+        head_first: If True, expects [B, H, T, S] layout.
+        output_dtype: Optional output dtype (defaults to input dtype).
+
+    Returns:
+        Tensor with same shape containing chunked cumulative sums.
+    """
     if head_first:
         B, H, T, _S = g.shape
     else:
@@ -110,6 +174,22 @@ def chunk_global_cumsum_scalar(
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
+    """Compute global cumulative sum across sequences for 3D scalar inputs.
+
+    Performs cumulative sum across the entire sequence, with optional
+    support for variable-length sequences via cu_seqlens.
+
+    Args:
+        s: Input tensor of shape [B, H, T] if head_first else [B, T, H].
+        reverse: If True, compute reverse cumsum.
+        cu_seqlens: Optional cumulative sequence lengths for packed sequences.
+        softmax_scale: Optional scaling factor applied to result.
+        head_first: If True, expects [B, H, T] layout.
+        output_dtype: Optional output dtype (defaults to input dtype).
+
+    Returns:
+        Tensor with same shape containing global cumulative sums.
+    """
     output_dtype = output_dtype or s.dtype
     time_axis = 2 if head_first else 1
 
@@ -245,6 +325,28 @@ def chunk_local_cumsum(
     output_dtype: DTypeLike | None = None,
     **kwargs,
 ) -> jnp.ndarray:
+    """Compute local cumulative sum within fixed-size chunks.
+
+    Main entry point for chunked local cumulative sum, automatically
+    dispatching to scalar or vector implementations based on input rank.
+
+    Args:
+        g: Input tensor of shape [B, T, H] or [B, T, H, S].
+        chunk_size: Size of each chunk (must be power of 2).
+        reverse: If True, compute reverse cumsum within each chunk.
+        softmax_scale: Optional scaling factor applied to result.
+        cu_seqlens: Optional cumulative sequence lengths for packed sequences.
+        head_first: If True, expects head dimension before time dimension.
+        output_dtype: Optional output dtype (defaults to input dtype).
+        **kwargs: Additional keyword arguments (ignored).
+
+    Returns:
+        Tensor with same shape containing chunked cumulative sums.
+
+    Note:
+        When cu_seqlens is provided, only batch size 1 is supported.
+        The function handles variable-length sequences by padding and masking.
+    """
     is_vector = g.ndim == 4
     base_fn = chunk_local_cumsum_vector if is_vector else chunk_local_cumsum_scalar
     if cu_seqlens is None:
@@ -290,6 +392,27 @@ def chunk_global_cumsum(
     head_first: bool = False,
     output_dtype: DTypeLike | None = None,
 ) -> jnp.ndarray:
+    """Compute global cumulative sum across sequences.
+
+    Main entry point for global cumulative sum, automatically dispatching
+    to scalar or vector implementations based on input rank.
+
+    Args:
+        s: Input tensor of shape [B, T, H] or [B, T, H, S].
+        reverse: If True, compute reverse cumsum.
+        cu_seqlens: Optional cumulative sequence lengths for packed sequences.
+            When provided, cumsum resets at sequence boundaries.
+        softmax_scale: Optional scaling factor applied to result.
+        head_first: If True, expects head dimension before time dimension.
+        output_dtype: Optional output dtype (defaults to input dtype).
+
+    Returns:
+        Tensor with same shape containing global cumulative sums.
+
+    Note:
+        With cu_seqlens, the cumulative sum respects sequence boundaries
+        and does not accumulate across different sequences in the batch.
+    """
     is_vector = s.ndim == 4
     if is_vector:
         return chunk_global_cumsum_vector(s, reverse, cu_seqlens, softmax_scale, head_first, output_dtype)

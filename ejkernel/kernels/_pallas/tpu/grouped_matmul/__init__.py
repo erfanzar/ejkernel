@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Pallas TPU backend for Grouped Matrix Multiplication.
+
+This submodule provides TPU-optimized grouped matrix multiplication
+using Pallas with Mosaic backend.
+
+Key Features:
+    - Efficient batched processing of variable-size matmuls
+    - Optimized tiling for TPU Matrix Units
+    - Support for group indices and offsets
+    - Incremental accumulation support
+"""
+
 from ._interface import grouped_matmul
 
 __all__ = ("grouped_matmul",)

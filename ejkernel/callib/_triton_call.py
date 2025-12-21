@@ -13,6 +13,62 @@
 # limitations under the License.
 
 
+"""Triton kernel integration with JAX for GPU computation.
+
+This module provides the interface for calling Triton kernels from JAX code,
+enabling high-performance GPU computation with Triton's programming model
+while maintaining JAX's functional semantics.
+
+Key Features:
+    - Seamless Triton kernel invocation from JAX
+    - CUDA and ROCm (AMD) GPU support
+    - Automatic kernel compilation and caching
+    - Support for Triton autotuner and heuristics
+    - Input-output aliasing for memory efficiency
+    - Configurable launch parameters (warps, stages, CTAs)
+
+Key Components:
+    triton_call: Main entry point for executing Triton kernels from JAX
+    get_triton_type: Convert JAX/NumPy types to Triton type strings
+    CompilationResult: Container for compiled kernel binary and metadata
+
+Supported Platforms:
+    - CUDA: NVIDIA GPUs via PTX compilation
+    - ROCm: AMD GPUs via HSACO compilation
+
+Type Conversions:
+    The module handles automatic type conversion between JAX and Triton:
+    - JAX arrays -> Triton pointers (*bf16, *fp32, *i32, etc.)
+    - Python scalars -> Triton scalars (i32, fp32, etc.)
+    - NumPy arrays -> Triton pointers
+
+Example:
+    >>> import triton
+    >>> import triton.language as tl
+    >>> from ejkernel.callib import triton_call
+    >>>
+    >>> @triton.jit
+    ... def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+    ...     pid = tl.program_id(0)
+    ...     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    ...     mask = offsets < n
+    ...     x = tl.load(x_ptr + offsets, mask=mask)
+    ...     y = tl.load(y_ptr + offsets, mask=mask)
+    ...     tl.store(out_ptr + offsets, x + y, mask=mask)
+    >>>
+    >>> result = triton_call(
+    ...     x, y,
+    ...     kernel=add_kernel,
+    ...     out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+    ...     grid=lambda meta: (triton.cdiv(n, meta['BLOCK_SIZE']),),
+    ...     BLOCK_SIZE=1024,
+    ... )
+
+Note:
+    Automatic differentiation (JVP/VJP) and vmap are not natively supported.
+    Use jax.custom_vjp or jax.custom_vmap for custom gradient/batching rules.
+"""
+
 from __future__ import annotations
 
 import copy

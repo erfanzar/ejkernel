@@ -13,6 +13,26 @@
 # limitations under the License.
 
 
+"""Flash Attention interface for XLA backend.
+
+This module provides the public API for Flash Attention using XLA,
+including the main `flash_attention` function with custom VJP support.
+
+The implementation supports:
+    - Configurable chunk sizes for query and key processing
+    - Causal and non-causal attention modes
+    - Sliding window attention
+    - Attention masks and bias tensors
+    - Segment IDs for packed sequence processing
+    - Dropout with reproducible randomness
+    - Multiple precision modes (DEFAULT, HIGH, HIGHEST)
+
+Internal Functions:
+    _make_core_func: Creates specialized attention cores for given static params
+    _precision_to_code: Convert JAX precision to integer code
+    _dtype_to_code: Convert dtype to integer code for JIT compilation
+"""
+
 import math
 
 import chex

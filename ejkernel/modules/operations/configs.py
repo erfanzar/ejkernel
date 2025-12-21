@@ -389,6 +389,23 @@ class LightningAttentionConfig(BaseOperationConfig):
 
 
 @dataclass
+class KernelDeltaAttentionConfig(BaseOperationConfig):
+    """Configuration for Kernel Delta Attention (KDA) operation.
+
+    Note: This operation currently uses an XLA implementation without tunable
+    block sizes. The config exists primarily for platform/backend selection.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class FlashMLAConfig(BaseOperationConfig):
     """Configuration for Flash Multi-head Latent Attention operation.
 
@@ -439,5 +456,39 @@ class PrefillPageAttentionConfig(BaseOperationConfig):
 
     num_warps: int = 4
     num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class StateSpaceV1Config(BaseOperationConfig):
+    """Configuration for SSM1 (Mamba1-style) Selective State Space operation.
+
+    Note: This operation uses XLA implementation primarily without tunable
+    block sizes. The config exists primarily for platform/backend selection.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class StateSpaceV2Config(BaseOperationConfig):
+    """Configuration for SSM2 (Mamba2-style) Selective State Space operation.
+
+    Args:
+        n_groups: Number of groups for B, C parameters (default: 1)
+        use_gated_rmsnorm: Whether to use gated RMSNorm for output (default: False)
+        rmsnorm_eps: Epsilon for RMSNorm stability (default: 1e-5)
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    n_groups: int = 1
+    use_gated_rmsnorm: bool = False
+    rmsnorm_eps: float = 1e-5
 
     __hash__ = hash_fn

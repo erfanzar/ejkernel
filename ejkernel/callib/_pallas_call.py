@@ -13,7 +13,31 @@
 # limitations under the License.
 
 
-"""Grouped matrix multiplication kernels for TPU written in Pallas."""
+"""Buffered Pallas call utilities for TPU kernel execution.
+
+This module provides utilities for creating optimized Pallas kernel calls on TPU
+with advanced features like double/triple buffering, scalar prefetching, and
+pipeline emission for hiding memory latency.
+
+Key Features:
+    - Scalar memory prefetching from SMEM for fast grid parameter access
+    - Configurable input buffering (double/triple) to hide memory latency
+    - Automatic pipeline scheduling with emit_pipeline
+    - Proper memory space mapping (SMEM, HBM) for TPU memory hierarchy
+
+Functions:
+    buffered_pallas_call: Create a buffered Pallas call with custom prefetch config
+
+Example:
+    >>> grid_spec = pltpu.PrefetchScalarGridSpec(
+    ...     num_scalar_prefetch=2,
+    ...     in_specs=[lhs_spec, rhs_spec],
+    ...     out_specs=out_spec,
+    ...     grid=(tiles_n, tiles_m, tiles_k),
+    ... )
+    >>> call_fn = buffered_pallas_call(kernel, out_shape, grid_spec, compiler_params)
+    >>> result = call_fn(group_metadata, grid_metadata, lhs, rhs)
+"""
 
 import dataclasses
 import functools

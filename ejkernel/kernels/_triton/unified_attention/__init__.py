@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+"""Triton backend for Unified Attention.
+
+This submodule provides GPU-optimized unified attention for mixed workloads
+with paged KV caches using Triton kernels.
+
+Key Features:
+    - Unified handling of prefill and decode
+    - Paged KV cache with block tables
+    - Sliding window and attention sink support
+    - ALiBi position encoding support
+"""
+
 from ._interface import unified_attention
 
 __all__ = ("unified_attention",)

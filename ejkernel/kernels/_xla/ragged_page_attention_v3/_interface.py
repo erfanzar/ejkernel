@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged paged attention v3 interface for mixed prefill and decode.
+
+This module provides the public API for the third-generation ragged paged
+attention that supports mixed prefill and decode operations in a single
+batch. Includes KV cache update functionality.
+"""
 
 import jaxtyping
 from beartype import beartype

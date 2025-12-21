@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""XLA backend for Recurrent Attention mechanisms.
+
+This submodule provides XLA-optimized implementation of recurrent attention
+with linear-time complexity through sequential state updates.
+
+Key Features:
+    - O(N) complexity through state recurrence
+    - Chunked processing for parallel training
+    - State caching for incremental inference
+    - Custom VJP for gradient computation
+"""
+
 from ._interface import (
     _recurrent_bwd as recurrent_xla_bwd,
 )

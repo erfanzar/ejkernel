@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Triton backend for Ragged Paged Attention v2.
+
+This submodule provides GPU-optimized paged attention v2 for variable-length
+batches using Triton kernels with FlashAttention-style online softmax.
+
+Key Features:
+    - Multiple query tokens per sequence support
+    - Block-based KV cache with page tables
+    - FlashAttention-style memory efficiency
+    - Optimized for mixed workloads
+"""
+
 from ._interface import ragged_page_attention_v2
 
 __all__ = ("ragged_page_attention_v2",)

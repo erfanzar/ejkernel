@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Recurrent attention interface for linear-time sequence processing.
+
+This module provides the public API for recurrent linear attention with
+O(N) complexity. Supports various gating mechanisms (GLA, Lightning)
+and provides custom VJP for efficient gradient computation.
+"""
 
 from functools import partial
 

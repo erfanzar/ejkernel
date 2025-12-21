@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Triton backend for Paged Attention.
+
+This submodule provides GPU-optimized paged attention using Triton kernels
+for efficient KV cache memory management during inference.
+
+Key Features:
+    - Block-based KV cache with page tables
+    - Variable-length sequence support
+    - Optimized decode-phase attention
+    - Sliding window support
+"""
+
 from ._interface import page_attention
 
 __all__ = ("page_attention",)

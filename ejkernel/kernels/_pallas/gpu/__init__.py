@@ -13,6 +13,17 @@
 # limitations under the License.
 
 
+"""Pallas GPU kernel implementations.
+
+This module provides GPU-optimized kernels using Pallas with Triton backend.
+Kernels leverage GPU's parallel architecture for efficient attention and
+matrix operations.
+
+Available Kernels:
+    - ragged_decode_attention: Decode-phase attention for serving
+    - scaled_dot_product_attention: Standard SDPA implementation
+"""
+
 from .ragged_decode_attention import ragged_decode_attention
 from .scaled_dot_product_attention import scaled_dot_product_attention
 

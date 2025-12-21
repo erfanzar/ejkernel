@@ -80,19 +80,19 @@ def cdiv(a: int | jax.Array, b: int | jax.Array) -> int | jax.Array:
 def strides_from_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     """Calculate the strides for a contiguous array with the given shape.
 
+    Computes the number of elements to skip in memory to advance by one
+    position along each dimension, assuming row-major (C-style) layout.
+
     Args:
         shape: A tuple of integers representing the dimensions of an array.
 
     Returns:
         A tuple of integers representing the strides of a contiguous array.
-    """
-    """Calculate the strides for a contiguous array with the given shape.
+        The stride for dimension i is the product of all dimensions after i.
 
-    Args:
-            shape: A tuple of integers representing the dimensions of an array.
-
-    Returns:
-            A tuple of integers representing the strides of a contiguous array.
+    Example:
+        >>> strides_from_shape((2, 3, 4))
+        (12, 4, 1)
     """
     size = np.prod(shape)
     strides = []

@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Block-sparse attention interface for XLA fallback computation.
+
+This module provides the public API for block-sparse attention that
+handles packed multi-sequence inputs with segment IDs and positions.
+Acts as a correctness fallback when specialized kernels are unavailable.
+"""
+
 from __future__ import annotations
 
 import typing as tp

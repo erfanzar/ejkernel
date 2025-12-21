@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Triton backend for Ragged Paged Attention v3.
+
+This submodule provides GPU-optimized paged attention v3 for mixed prefill
+and decode operations using Triton kernels.
+
+Key Features:
+    - Mixed prefill and decode in single batch
+    - Integrated KV cache update functionality
+    - Block-based memory management
+    - Sliding window attention support
+"""
+
 from ._interface import ragged_page_attention_v3
 
 __all__ = ("ragged_page_attention_v3",)

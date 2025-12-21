@@ -13,6 +13,22 @@
 # limitations under the License.
 
 
+"""XLA backend for Lightning Attention.
+
+This submodule provides XLA-optimized implementation of Lightning Attention,
+a linear-complexity attention with exponential decay for fast training.
+
+Key Features:
+    - O(N) complexity with linear attention formulation
+    - Configurable decay rates for temporal weighting
+    - Chunked processing for efficient training
+    - State persistence for incremental inference
+
+Reference:
+    Lightning Attention-2: A Free Lunch for Handling Unlimited Sequence Lengths in Large Language Models
+    https://arxiv.org/abs/2401.04658
+"""
+
 from ._interface import lightning_attn
 
 __all__ = ["lightning_attn"]

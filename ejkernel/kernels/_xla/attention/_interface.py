@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Standard attention interface using pure JAX/XLA operations.
+
+This module provides the public API for standard multi-head attention
+implemented using native JAX operations, suitable for fallback computation
+when specialized kernels are unavailable.
+"""
 
 import jax
 import jaxtyping

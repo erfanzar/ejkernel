@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+"""XLA backend for Block Sparse Attention.
+
+This submodule provides XLA-optimized implementation of block-sparse
+attention with configurable sparsity patterns.
+
+Key Features:
+    - Block-wise sparse attention patterns
+    - Configurable block sizes
+    - Support for custom sparsity masks
+    - Memory-efficient computation for long sequences
+"""
+
 from ._interface import blocksparse_attention
 
 __all__ = ("blocksparse_attention",)

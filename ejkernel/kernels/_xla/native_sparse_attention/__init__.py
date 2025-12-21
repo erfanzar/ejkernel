@@ -13,6 +13,22 @@
 # limitations under the License.
 
 
+"""XLA backend for Native Sparse Attention.
+
+This submodule provides XLA-optimized implementation of native sparse
+attention using configurable sparsity patterns like DeepSeek NSA.
+
+Key Features:
+    - Configurable block-sparse attention patterns
+    - Sliding window with compressed global tokens
+    - Support for both prefill and decode phases
+    - Custom VJP for efficient gradient computation
+
+Reference:
+    DeepSeek-V3 Technical Report
+    https://arxiv.org/abs/2412.19437
+"""
+
 from ._interface import (
     _sparse_attention_bwd_vjp as native_sparse_attention_xla_bwd,
 )

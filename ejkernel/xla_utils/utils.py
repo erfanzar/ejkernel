@@ -13,6 +13,36 @@
 # limitations under the License.
 
 
+"""Utility functions for packed sequence processing in XLA.
+
+This module provides efficient utilities for working with packed (variable-length)
+sequences in JAX/XLA computations, commonly used in attention mechanisms.
+
+Packed sequences are represented using cumulative sequence lengths (cu_seqlens),
+which define the boundaries of each sequence in a flattened 1D tensor.
+
+Key Concepts:
+    - cu_seqlens: [0, len1, len1+len2, ...] - cumulative start positions
+    - position_ids: Position within each sequence (0-indexed)
+    - sequence_ids: Which sequence each token belongs to (0-indexed)
+    - chunk_indices: For tiled processing with fixed chunk sizes
+
+Functions:
+    cdiv: Ceiling division for computing block counts
+    prepare_lens: Extract individual lengths from cumulative lengths
+    prepare_position_ids: Generate per-token position indices
+    prepare_sequence_ids: Generate per-token sequence membership
+    prepare_token_indices: Combined (seq_id, pos_id) pairs
+    prepare_chunk_indices: Chunk-level indices for tiled attention
+    prepare_chunk_offsets: Cumulative chunk counts per sequence
+    identity_dtype_convert: Create identity function with dtype conversion on backward
+
+Example:
+    >>> cu_seqlens = jnp.array([0, 3, 5, 9])  # 3 sequences
+    >>> lens = prepare_lens(cu_seqlens)  # [3, 2, 4]
+    >>> pos_ids = prepare_position_ids(cu_seqlens)  # [0, 1, 2, 0, 1, 0, 1, 2, 3]
+"""
+
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -169,6 +199,26 @@ def prepare_chunk_offsets(
 
 
 def identity_dtype_convert(dtype: jnp.dtype):
+    """Create an identity function that converts gradients to a specific dtype.
+
+    Returns a function that passes inputs unchanged in the forward pass,
+    but converts gradients to the specified dtype during backpropagation.
+    This is useful for mixed-precision training where gradients need to
+    be accumulated in a specific precision.
+
+    Args:
+        dtype: The target dtype for gradient conversion.
+
+    Returns:
+        A JAX function that acts as identity in forward pass but
+        converts gradients to the specified dtype in backward pass.
+
+    Example:
+        >>> convert_to_fp32 = identity_dtype_convert(jnp.float32)
+        >>> result = convert_to_fp32(bf16_tensor)  # Forward: unchanged
+        >>> # Backward: gradients will be converted to float32
+    """
+
     @jax.custom_vjp
     def identity_fn(x):
         return x

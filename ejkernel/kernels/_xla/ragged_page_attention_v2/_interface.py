@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged paged attention v2 interface for variable-length batches.
+
+This module provides the public API for paged attention with ragged (variable-length)
+sequences. Supports multiple query tokens per sequence and FlashAttention-style
+online softmax for memory-efficient computation.
+"""
 
 import jax.numpy as jnp
 import jaxtyping

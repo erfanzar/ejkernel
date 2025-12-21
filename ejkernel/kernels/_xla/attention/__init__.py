@@ -13,6 +13,19 @@
 # limitations under the License.
 
 
+"""XLA backend for standard multi-head attention.
+
+This submodule provides XLA-optimized implementation of standard
+multi-head attention with support for various masking patterns
+and attention biases.
+
+Features:
+    - Standard scaled dot-product attention
+    - Support for attention masks and biases
+    - Configurable softmax scaling
+    - Multiple output formats (BSHD, BHSD)
+"""
+
 from ._interface import attention
 
 __all__ = ("attention",)

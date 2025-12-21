@@ -13,6 +13,22 @@
 # limitations under the License.
 
 
+"""Pallas TPU kernel implementations.
+
+This module provides TPU-optimized kernels using Pallas with Mosaic backend.
+Kernels are designed to leverage TPU's Matrix Multiply Units (MXUs) and
+High Bandwidth Memory (HBM) for efficient execution.
+
+Available Kernels:
+    - flash_attention: Memory-efficient exact attention
+    - blocksparse_attention: Block-sparse attention patterns
+    - ring_attention: Distributed attention across devices
+    - page_attention: Paged KV cache attention
+    - ragged_page_attention_v2/v3: Variable-length paged attention
+    - ragged_decode_attention: Decode-phase attention
+    - grouped_matmul/v2: Grouped matrix multiplication
+"""
+
 from .blocksparse_attention import blocksparse_attention as blocksparse_attention
 from .flash_attention import flash_attention
 from .grouped_matmul import grouped_matmul

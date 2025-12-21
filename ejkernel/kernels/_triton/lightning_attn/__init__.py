@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Triton backend for Lightning Attention.
+
+This submodule provides GPU-optimized Lightning Attention using Triton
+kernels with layer-adaptive exponential decay.
+
+Key Features:
+    - O(N) complexity with linear attention formulation
+    - Layer-dependent decay rates for varied temporal receptive fields
+    - Chunked processing for efficient training
+    - State persistence for incremental inference
+"""
+
 from ._interface import lightning_attn
 
 __all__ = ("lightning_attn",)

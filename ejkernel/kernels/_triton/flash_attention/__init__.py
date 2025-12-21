@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Triton backend for Flash Attention.
+
+This submodule provides GPU-optimized Flash Attention using Triton kernels.
+Achieves O(N) memory complexity through tiled computation with online softmax.
+
+Key Features:
+    - Memory-efficient exact attention computation
+    - Custom forward and backward Triton kernels
+    - Support for causal masking, sliding window, and bias
+    - GQA/MQA head configurations
+"""
+
 from ._interface import _jax_bwd_attention_call as flash_attention_gpu_bwd
 from ._interface import _jax_fwd_attention_call as flash_attention_gpu_fwd
 from ._interface import flash_attention

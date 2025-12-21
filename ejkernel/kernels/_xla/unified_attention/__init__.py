@@ -12,6 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+"""XLA backend for Unified Attention.
+
+This submodule provides XLA-optimized implementation of unified attention
+that combines multiple attention variants into a single configurable interface.
+
+Key Features:
+    - Unified interface supporting multiple attention patterns
+    - Automatic backend selection based on input characteristics
+    - Support for causal, bidirectional, and custom masks
+    - Efficient handling of various head configurations (MHA, GQA, MQA)
+"""
+
 from ._interface import unified_attention
 
 __all__ = ("unified_attention",)

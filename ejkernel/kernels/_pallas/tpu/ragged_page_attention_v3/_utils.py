@@ -15,7 +15,6 @@
 
 import jax
 import jax.numpy as jnp
-from jax._src import dtypes
 
 
 def cdiv(a, b):
@@ -28,7 +27,10 @@ def align_to(x, a):
 
 
 def get_dtype_bitwidth(dtype):
-    return dtypes.bit_width(dtype)
+    try:
+        return jnp.finfo(dtype).bits
+    except Exception:
+        return jnp.iinfo(dtype).bits
 
 
 def get_dtype_packing(dtype):

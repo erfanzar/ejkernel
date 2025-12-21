@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Triton backend for Gated Linear Attention (GLA).
+
+This submodule provides GPU-optimized GLA using Triton kernels with
+recurrent formulation for O(N) complexity.
+
+Key Features:
+    - Linear complexity through recurrent state updates
+    - Gated key-value updates for selective memory
+    - Chunked computation for training efficiency
+    - State caching for autoregressive generation
+"""
+
 from ._interface import recurrent_gla
 
 __all__ = ("recurrent_gla",)

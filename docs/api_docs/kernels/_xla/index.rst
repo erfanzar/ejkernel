@@ -9,6 +9,7 @@ ejkernel.kernels._xla package
    flash_attention/index
    gla/index
    grouped_matmul/index
+   kernel_delta_attention/index
    lightning_attn/index
    mean_pooling/index
    native_sparse_attention/index
@@ -20,4 +21,6 @@ ejkernel.kernels._xla package
    recurrent/index
    ring_attention/index
    scaled_dot_product_attention/index
+   state_space_v1/index
+   state_space_v2/index
    unified_attention/index

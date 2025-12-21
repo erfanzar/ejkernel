@@ -454,6 +454,24 @@ def random_dense(
     dtype: str | jnp.dtype = jnp.float16,
     limit: int | None = 1,
 ) -> jnp.ndarray:
+    """Generate a random dense array with uniform distribution.
+
+    Creates a random array with values uniformly distributed in [-limit, limit],
+    optionally casting through bfloat16 for numerical stability.
+
+    Args:
+        *shape: Dimensions of the array to generate.
+        dtype: Output data type. Defaults to float16.
+        limit: Maximum absolute value. If None, defaults to 1/prod(shape).
+
+    Returns:
+        Random JAX array with specified shape and dtype.
+
+    Example:
+        >>> arr = random_dense(2, 3, 4, dtype=jnp.float32)
+        >>> arr.shape
+        (2, 3, 4)
+    """
     global DEBUG_GLOBAL_RNG
     if DEBUG_GLOBAL_RNG is None:
         DEBUG_GLOBAL_RNG = jax.random.PRNGKey(0)
@@ -695,11 +713,33 @@ def barrier_sync(timeout: float = 200):
 
 
 def _align_to(x: int, multiple: int) -> int:
+    """Round up a value to the nearest multiple.
+
+    Args:
+        x: Value to align.
+        multiple: Alignment boundary.
+
+    Returns:
+        Smallest value >= x that is divisible by multiple.
+    """
     return ((int(x) + int(multiple) - 1) // int(multiple)) * int(multiple)
 
 
 def _dtype_packing(dtype: jnp.dtype) -> int:
-    """# lanes per 32-bit slot (matches typical get_dtype_packing)."""
+    """Calculate lanes per 32-bit slot for dtype packing.
+
+    Determines how many elements of the given dtype fit into a 32-bit slot,
+    used for memory-efficient paged attention layouts.
+
+    Args:
+        dtype: JAX/NumPy dtype to calculate packing for.
+
+    Returns:
+        Number of lanes per 32-bit slot (2 for fp16/bf16, 1 for fp32).
+
+    Raises:
+        ValueError: If dtype is not 16-bit or 32-bit float.
+    """
     bw = jnp.dtype(dtype).itemsize * 8
     if bw not in (16, 32):
         raise ValueError(f"Only 16/32-bit floats supported for packing, got {dtype} ({bw} bits).")
@@ -865,11 +905,43 @@ def get_tpu_generation() -> int:
 
 
 def make_mesh(mesh_axis: tuple[int, int, int, int]):
+    """Create a JAX mesh with standard sharding axes.
+
+    Creates a device mesh with axes named for data parallelism (dp),
+    fully-sharded data parallelism (fsdp), tensor parallelism (tp),
+    and sequence parallelism (sp).
+
+    Args:
+        mesh_axis: Tuple of (dp, fsdp, tp, sp) axis sizes.
+
+    Returns:
+        JAX Mesh with named axes ("dp", "fsdp", "tp", "sp").
+
+    Example:
+        >>> mesh = make_mesh((2, 1, 4, 1))  # 2 data parallel, 4 tensor parallel
+    """
     return jax.make_mesh(mesh_axis, ("dp", "fsdp", "tp", "sp"))
 
 
 def get_qkv_shardings(layout: Literal["bhsd", "bshd", "thd"]):
-    """Returns sharding specifications for queries, keys, and values based on the layout."""
+    """Get sharding specifications for attention tensors based on layout.
+
+    Returns PartitionSpecs for queries, keys, and values that are compatible
+    with the given tensor layout and a standard (dp, fsdp, tp, sp) mesh.
+
+    Args:
+        layout: Tensor layout format:
+            - "bhsd": [batch, heads, seq, dim]
+            - "bshd": [batch, seq, heads, dim]
+            - "thd": [tokens, heads, dim] for packed sequences
+
+    Returns:
+        Tuple of 6 PartitionSpecs: (q_spec, k_spec, v_spec, sq_spec, sk_spec, sv_spec)
+        where the 's' prefix indicates sequence-parallel variants.
+
+    Raises:
+        ValueError: If layout is not one of the supported formats.
+    """
     if layout == "bhsd":
         qps = Ps(("dp", "fsdp"), "tp", None, None)
         kps = Ps(("dp", "fsdp"), "tp", None, None)
@@ -901,6 +973,15 @@ def get_qkv_shardings(layout: Literal["bhsd", "bshd", "thd"]):
 
 
 def get_segments_shardings():
+    """Get sharding specifications for segment ID tensors.
+
+    Returns PartitionSpecs for query and key/value segment IDs,
+    compatible with a standard (dp, fsdp, tp, sp) mesh.
+
+    Returns:
+        Tuple of 4 PartitionSpecs: (q_spec, kv_spec, sq_spec, skv_spec)
+        where the 's' prefix indicates sequence-parallel variants.
+    """
     qps = Ps(("dp", "fsdp"), None)
     kvps = Ps(("dp", "fsdp"), None)
     sqps = Ps(("dp", "fsdp"), None)

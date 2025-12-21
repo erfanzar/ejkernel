@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Mean pooling interface for sequence embedding aggregation.
+
+This module provides the public API for mean pooling operations over
+sequence dimensions. Supports both fixed-length and variable-length
+(packed) sequences with custom VJP for efficient gradient computation.
+"""
 
 from functools import partial
 

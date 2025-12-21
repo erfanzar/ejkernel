@@ -13,6 +13,28 @@
 # limitations under the License.
 
 
+"""XLA backend for Flash Attention with tiled computation.
+
+This submodule provides an XLA-optimized implementation of Flash Attention
+that achieves memory-efficient attention through tiled computation.
+
+Key Features:
+    - Memory-efficient O(N) space complexity (vs O(N^2) for standard attention)
+    - Tiled forward and backward passes
+    - Support for causal masking and sliding window
+    - Optional dropout and attention bias
+    - Segment ID support for packed sequences
+    - Custom gradient implementation for numerical stability
+
+Algorithm:
+    The implementation processes attention in tiles/chunks, computing
+    softmax incrementally to avoid materializing the full N×N attention matrix.
+
+Reference:
+    FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness
+    https://arxiv.org/abs/2205.14135
+"""
+
 from ._interface import (
     _make_core_func,
     flash_attention,

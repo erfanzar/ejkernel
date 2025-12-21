@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged decode attention interface for variable-length decoding.
+
+This module provides the public API for attention during decoding with
+variable-length sequences. Supports MQA/GQA configurations with sliding
+window and attention sink capabilities.
+"""
 
 import jaxtyping
 from beartype import beartype

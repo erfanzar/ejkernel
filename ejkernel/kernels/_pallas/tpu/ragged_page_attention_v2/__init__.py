@@ -13,7 +13,17 @@
 # limitations under the License.
 
 
-"""modified from google org impl"""
+"""Pallas TPU backend for Ragged Paged Attention v2.
+
+This submodule provides TPU-optimized paged attention v2 for variable-length
+batches. Based on Google's ragged attention implementation with online softmax.
+
+Key Features:
+    - Multiple query tokens per sequence support
+    - Block-based KV cache with page tables
+    - FlashAttention-style memory efficiency
+    - Optimized for TPU Matrix Units
+"""
 
 from ._interface import ragged_page_attention_v2
 

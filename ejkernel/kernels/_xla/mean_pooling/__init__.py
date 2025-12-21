@@ -13,6 +13,17 @@
 # limitations under the License.
 
 
+"""XLA backend for Mean Pooling operation.
+
+This submodule provides XLA-optimized implementation of mean pooling
+over sequence dimensions with proper handling of padding.
+
+Key Features:
+    - Sequence mean pooling with mask support
+    - Efficient handling of variable-length sequences
+    - Support for packed sequence processing
+"""
+
 from ._interface import mean_pooling
 
 __all__ = ["mean_pooling"]

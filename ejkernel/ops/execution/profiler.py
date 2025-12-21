@@ -13,6 +13,37 @@
 # limitations under the License.
 
 
+"""JAX profiler for performance analysis and autotuning.
+
+This module provides a comprehensive profiler for JAX operations that captures
+execution traces, parses profile data, and provides detailed timing analysis.
+It is designed to work with JAX's built-in profiling infrastructure and
+supports advanced features for autotuning hyperparameter optimization.
+
+Key Features:
+    - Profile capture using JAX's native profiling system
+    - Nested event time accounting with interval merging
+    - Regex-based event filtering for focused analysis
+    - Device-specific profiling across GPU/TPU/CPU platforms
+    - Statistical aggregation with outlier removal
+
+Classes:
+    Profiler: Main profiler class for capturing and analyzing JAX traces
+    ProfilingError: Exception raised when profiling operations fail
+
+The profiler handles:
+    - GPU and TPU timing formats (nanoseconds vs picoseconds)
+    - Function identification by ID patterns for autotuning
+    - Child event detection for accurate nested timing
+    - Graceful fallback when TensorFlow hooks are unavailable
+
+Example:
+    >>> profiler = Profiler(prefix_filter='jit_', min_duration_ns=1000)
+    >>> timings = profiler.profile_time_by_function_id(
+    ...     closure, platform='gpu', total_calls_number=5
+    ... )
+"""
+
 from __future__ import annotations
 
 import importlib

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Paged attention interface for efficient KV cache management.
+
+This module provides the public API for paged attention where the KV cache
+is organized into fixed-size blocks. Enables efficient memory management
+for variable-length sequences in decode/generation.
+"""
 
 import jax.numpy as jnp
 import jaxtyping

@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ring attention interface for distributed sequence processing.
+
+This module provides the public API for ring attention using blockwise
+transformers with KV cache rotation across devices. Supports chunked
+computation with custom VJP for gradient computation.
+"""
+
 from __future__ import annotations
 
 import typing

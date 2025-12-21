@@ -13,9 +13,16 @@
 # limitations under the License.
 
 
-"""modified from google/vllm org impl
+"""Pallas TPU backend for Ragged Paged Attention v3.
 
-1. rn head-dim==128 support attention sinks unlike vllm org impl
+This submodule provides TPU-optimized paged attention v3 for mixed prefill
+and decode operations. Based on Google/vLLM implementation with extensions.
+
+Key Features:
+    - Mixed prefill and decode in single batch
+    - Attention sink support for head_dim==128
+    - Integrated KV cache update
+    - Sliding window attention support
 """
 
 from ._interface import ragged_page_attention_v3

@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Pallas TPU backend for Paged Attention.
+
+This submodule provides TPU-optimized paged attention using Pallas for
+efficient KV cache memory management during inference.
+
+Key Features:
+    - Block-based KV cache with page tables
+    - Optimized for TPU's memory hierarchy
+    - Variable-length sequence support
+    - Sliding window attention
+"""
+
 from ._interface import page_attention
 
 __all__ = ("page_attention",)

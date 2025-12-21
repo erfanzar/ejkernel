@@ -13,6 +13,41 @@
 # limitations under the License.
 
 
+"""Autotuning and benchmarking utilities for JAX kernel optimization.
+
+This module provides comprehensive tools for automatic hyperparameter optimization
+of JAX functions through systematic benchmarking and configuration testing.
+
+Key Features:
+    - Profiler-based timing with Python-level fallback for accuracy
+    - Parallel compilation and testing of hyperparameter configurations
+    - Statistical timing analysis with outlier removal
+    - Thread-safe caching with configurable size limits
+    - Support for distributed computation with sharding specifications
+
+Classes:
+    Measurement: Container for a single performance measurement
+    AutotuneData: Container for all optimization measurements and results
+    Autotuner: Core autotuning engine for hyperparameter optimization
+    Entry: Cache entry for storing optimal configurations
+    AutotuningResult: Device-specific optimization results container
+    TimingResult: Statistical timing result with mean and standard deviation
+    FNAutotuner: Advanced class-based autotuner with profiler integration
+
+Functions:
+    autotune: Decorator for automatic hyperparameter optimization
+    autotune_recorded: Autotune all recorded invocations
+    benchmark: Simple function benchmarking utility
+
+Example:
+    >>> @autotune(hyperparams={'block_size': [64, 128, 256]})
+    ... def matrix_op(x, y, block_size=128):
+    ...     return compute(x, y, block_size)
+    >>>
+    >>> result = matrix_op(x, y)
+    >>> print(matrix_op.optimal_hyperparams)
+"""
+
 from __future__ import annotations
 
 import contextlib

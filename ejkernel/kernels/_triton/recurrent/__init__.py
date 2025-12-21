@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+"""Triton backend for Recurrent Attention.
+
+This submodule provides GPU-optimized recurrent linear attention using
+Triton kernels for O(N) complexity sequential processing.
+
+Key Features:
+    - Linear complexity through state recurrence
+    - Custom forward and backward Triton kernels
+    - State caching for incremental inference
+    - Support for various gating mechanisms
+"""
+
 from ._interface import (
     _bwd_call as recurrent_gpu_bwd,
 )
