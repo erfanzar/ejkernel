@@ -35,12 +35,6 @@ Reference:
     https://arxiv.org/abs/2205.14135
 """
 
-from ._interface import (
-    _make_core_func,
-    flash_attention,
-)
+from ._interface import _make_core_func, flash_attention
 
-__all__ = [
-    "_make_core_func",
-    "flash_attention",
-]
+__all__ = ["_make_core_func", "flash_attention"]
