@@ -25,6 +25,7 @@ from jax.sharding import PartitionSpec
 
 from ejkernel.kernels import pallas
 from ejkernel.kernels._xla.attention import attention as vanilla_attention
+from ejkernel.ops import FwdParams
 from ejkernel.utils import numeric_gen
 
 
@@ -36,6 +37,8 @@ def _has_tpu() -> bool:
 
 
 pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
+
+FWD_128 = FwdParams(q_blocksize=128, kv_blocksize=128)
 
 
 class TestRingAttentionPallasFwd:
@@ -50,8 +53,7 @@ class TestRingAttentionPallasFwd:
             q,
             k,
             v,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -72,8 +74,7 @@ class TestRingAttentionPallasFwd:
             k,
             v,
             softmax_aux=softmax_aux,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -86,17 +87,14 @@ class TestRingAttentionPallasFwd:
 
         num_sinks = 4
         softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
-        out = pallas.tpu.ring_attention(
-            q,
-            k,
-            v,
-            softmax_aux=softmax_aux,
-            query_chunk_size=128,
-            key_chunk_size=128,
-        )
-
-        assert out.shape == (batch, seq_len, num_heads, head_dim)
-        assert not jnp.any(jnp.isnan(out))
+        with pytest.raises(ValueError, match="softmax_aux must be 1D"):
+            pallas.tpu.ring_attention(
+                q,
+                k,
+                v,
+                softmax_aux=softmax_aux,
+                fwd_params=FWD_128,
+            )
 
     def test_logits_soft_cap(self):
         """Test with logit soft cap."""
@@ -108,8 +106,7 @@ class TestRingAttentionPallasFwd:
             k,
             v,
             logits_soft_cap=30.0,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -125,8 +122,7 @@ class TestRingAttentionPallasFwd:
             k,
             v,
             sliding_window=64,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -142,8 +138,7 @@ class TestRingAttentionPallasFwd:
             k,
             v,
             sliding_window=(32, 96),
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -159,8 +154,7 @@ class TestRingAttentionPallasFwd:
             k,
             v,
             sliding_window=0,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -176,8 +170,7 @@ class TestRingAttentionPallasFwd:
             k,
             v,
             sliding_window=512,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -197,8 +190,7 @@ class TestRingAttentionPallasFwd:
             v,
             sliding_window=64,
             softmax_aux=softmax_aux,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -214,27 +206,8 @@ class TestRingAttentionPallasFwd:
             k,
             v,
             sliding_window=64,
-            causal_block_size=1,
-            query_chunk_size=128,
-            key_chunk_size=128,
-        )
-
-        assert out.shape == (batch, seq_len, num_heads, head_dim)
-        assert not jnp.any(jnp.isnan(out))
-
-    def test_attention_sinks(self):
-        """Test with attention sinks."""
-        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
-        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
-
-        out = pallas.tpu.ring_attention(
-            q,
-            k,
-            v,
-            sliding_window=64,
-            attention_sink_size=8,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            causal=True,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -249,9 +222,8 @@ class TestRingAttentionPallasFwd:
             q,
             k,
             v,
-            causal_block_size=64,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            causal=True,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -272,10 +244,8 @@ class TestRingAttentionPallasFwd:
             softmax_aux=softmax_aux,
             logits_soft_cap=30.0,
             sliding_window=(32, 96),
-            attention_sink_size=8,
-            causal_block_size=64,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            causal=True,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -299,8 +269,7 @@ class TestRingAttentionPallasBwd:
                 k,
                 v,
                 softmax_aux=softmax_aux,
-                query_chunk_size=128,
-                key_chunk_size=128,
+                fwd_params=FWD_128,
             )
             return jnp.mean(out**2)
 
@@ -322,8 +291,7 @@ class TestRingAttentionPallasBwd:
                 k,
                 v,
                 logits_soft_cap=30.0,
-                query_chunk_size=128,
-                key_chunk_size=128,
+                fwd_params=FWD_128,
             )
             return jnp.mean(out**2)
 
@@ -345,8 +313,7 @@ class TestRingAttentionPallasBwd:
                 k,
                 v,
                 sliding_window=64,
-                query_chunk_size=128,
-                key_chunk_size=128,
+                fwd_params=FWD_128,
             )
             return jnp.mean(out**2)
 
@@ -368,8 +335,7 @@ class TestRingAttentionPallasBwd:
                 k,
                 v,
                 sliding_window=(32, 96),
-                query_chunk_size=128,
-                key_chunk_size=128,
+                fwd_params=FWD_128,
             )
             return jnp.mean(out**2)
 
@@ -396,9 +362,7 @@ class TestRingAttentionPallasBwd:
                 softmax_aux=softmax_aux,
                 logits_soft_cap=30.0,
                 sliding_window=64,
-                attention_sink_size=4,
-                query_chunk_size=128,
-                key_chunk_size=128,
+                fwd_params=FWD_128,
             )
             return jnp.mean(out**2)
 
@@ -423,8 +387,7 @@ class TestRingAttentionNumericalCorrectness:
             q,
             k,
             v,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_vanilla, _ = vanilla_attention(q, k, v)
@@ -444,9 +407,7 @@ class TestRingAttentionNumericalCorrectness:
             k,
             v,
             causal=True,
-            query_chunk_size=128,
-            causal_block_size=1,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_vanilla, _ = vanilla_attention(q, k, v, causal=True, dtype=jnp.float32)
@@ -468,8 +429,7 @@ class TestRingAttentionNumericalCorrectness:
             k,
             v,
             sliding_window=window_size,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_vanilla, _ = vanilla_attention(q, k, v, sliding_window=window_size)
@@ -493,8 +453,7 @@ class TestRingAttentionNumericalCorrectness:
             k,
             v,
             softmax_aux=softmax_aux,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_vanilla, _ = vanilla_attention(q, k, v, softmax_aux=softmax_aux)
@@ -503,36 +462,6 @@ class TestRingAttentionNumericalCorrectness:
         assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
             f"Ring attention with softmax_aux differs from vanilla. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
         )
-
-    def test_numerical_correctness_vs_vanilla_softmax_aux_2d(self):
-        """2D softmax_aux is equivalent to 1D when uniform across heads."""
-        batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
-        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
-
-        num_sinks = 4
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
-        out_ring_2d = pallas.tpu.ring_attention(
-            q,
-            k,
-            v,
-            softmax_aux=softmax_aux,
-            query_chunk_size=128,
-            key_chunk_size=128,
-        )
-
-        softmax_aux_1d = softmax_aux[0]
-        out_ring_1d = pallas.tpu.ring_attention(
-            q,
-            k,
-            v,
-            softmax_aux=softmax_aux_1d,
-            query_chunk_size=128,
-            key_chunk_size=128,
-        )
-        out_vanilla, _ = vanilla_attention(q, k, v, softmax_aux=softmax_aux_1d)
-
-        assert jnp.allclose(out_ring_2d, out_ring_1d, rtol=0, atol=0)
-        assert jnp.allclose(out_ring_1d, out_vanilla, rtol=1e-2, atol=1e-2)
 
     def test_numerical_correctness_vs_vanilla_logits_soft_cap(self):
         """Test numerical correctness with logit soft cap."""
@@ -546,8 +475,7 @@ class TestRingAttentionNumericalCorrectness:
             k,
             v,
             logits_soft_cap=logits_soft_cap,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_vanilla, _ = vanilla_attention(q, k, v, logits_soft_cap=logits_soft_cap)
@@ -575,9 +503,8 @@ class TestRingAttentionNumericalCorrectness:
             softmax_aux=softmax_aux,
             logits_soft_cap=logits_soft_cap,
             sliding_window=window_size,
-            query_chunk_size=128,
-            key_chunk_size=128,
             causal=False,
+            fwd_params=FWD_128,
         )
 
         out_vanilla, _ = vanilla_attention(
@@ -617,7 +544,7 @@ class TestRingAttentionPallasDistributed:
         softmax_aux = numeric_gen(num_sinks, dtype="f4") * -1.0
 
         out = shard_map(
-            partial(pallas.tpu.ring_attention, axis_name="sp", query_chunk_size=128, key_chunk_size=128),
+            partial(pallas.tpu.ring_attention, axis_name="sp", fwd_params=FWD_128),
             in_specs=(
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
@@ -647,8 +574,7 @@ class TestRingAttentionPallasEdgeCases:
             q,
             k,
             v,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -663,8 +589,7 @@ class TestRingAttentionPallasEdgeCases:
             q,
             k,
             v,
-            query_chunk_size=128,
-            key_chunk_size=256,
+            fwd_params=FwdParams(q_blocksize=128, kv_blocksize=256),
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
@@ -679,8 +604,7 @@ class TestRingAttentionPallasEdgeCases:
             q,
             k,
             v,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)

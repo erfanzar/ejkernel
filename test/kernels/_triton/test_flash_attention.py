@@ -104,7 +104,7 @@ class TestSoftmaxAux:
         assert not jnp.allclose(out_with_sinks, out_no_sinks, rtol=1e-2)
 
     def test_attention_sinks_broadcast(self):
-        """Test that 2D sinks are rejected (softmax_aux must be 1D)."""
+        """Test that 1D sinks broadcast matches explicit 2D sinks."""
         batch, seq_len, num_heads, head_dim = 1, 16, 4, 32
         num_sinks = 2
         key = jax.random.PRNGKey(0)
@@ -117,9 +117,10 @@ class TestSoftmaxAux:
         out_1d = flash_attention(q, k, v, softmax_aux=sinks_1d)
 
         sinks_2d = jnp.broadcast_to(sinks_1d[None, :], (num_heads, num_sinks))
-        with pytest.raises(Exception):
-            flash_attention(q, k, v, softmax_aux=sinks_2d)
+        out_2d = flash_attention(q, k, v, softmax_aux=sinks_2d)
         assert jnp.all(jnp.isfinite(out_1d))
+        assert jnp.all(jnp.isfinite(out_2d))
+        assert jnp.allclose(out_1d, out_2d, rtol=1e-2, atol=1e-3)
 
     def test_attention_sinks_gradient(self):
         """Test gradients with attention sinks."""

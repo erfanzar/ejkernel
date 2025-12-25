@@ -633,30 +633,22 @@ def generate_block_indices(
         (2, 256, 8, 2)
     """
     seq_len = num_query_blocks * block_size
-    block_indices = jnp.full((batch, seq_len, heads, selected_blocks), -1, dtype=jnp.int32)
-
-    key = jax.random.PRNGKey(seed)
+    rng = np.random.default_rng(seed)
+    block_indices = np.full((batch, seq_len, heads, selected_blocks), -1, dtype=np.int32)
 
     for b in range(batch):
         for qb in range(num_query_blocks):
+            num_available_blocks = qb + 1
+            token_start = qb * block_size
+            token_end = (qb + 1) * block_size
             for h in range(heads):
-                key, subkey = jax.random.split(key)
-
-                num_available_blocks = qb + 1
-
-                perm = jax.random.permutation(subkey, num_available_blocks)[:selected_blocks]
-
+                perm = rng.permutation(num_available_blocks)[:selected_blocks]
                 if num_available_blocks < selected_blocks:
-                    perm = jnp.pad(perm, (0, selected_blocks - num_available_blocks), constant_values=-1)
+                    perm = np.pad(perm, (0, selected_blocks - num_available_blocks), constant_values=-1)
+                perm_sorted = np.sort(perm)
+                block_indices[b, token_start:token_end, h, :] = perm_sorted
 
-                perm_sorted = jnp.sort(perm)
-
-                token_start = qb * block_size
-                token_end = (qb + 1) * block_size
-                for t in range(token_start, token_end):
-                    block_indices = block_indices.at[b, t, h, :].set(perm_sorted)
-
-    return block_indices
+    return jnp.asarray(block_indices)
 
 
 _sync_counter = 0

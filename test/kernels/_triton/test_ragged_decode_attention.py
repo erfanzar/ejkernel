@@ -32,7 +32,6 @@ def ragged_decode_ref(
     sequence_start,
     sequence_end,
     softmax_scale=1.0,
-    block_size=256,
     sliding_window=None,
     logits_soft_cap=None,
     softmax_aux=None,
@@ -116,7 +115,14 @@ class TestRaggedDecodeAttentionTriton:
         starts = jnp.array([0, 100], dtype=jnp.int32)
         ends = jnp.array([400, 480], dtype=jnp.int32)
 
-        out = ragged_decode_triton(q, k, v, sequence_start=starts, sequence_end=ends, softmax_scale=1.0, block_size=128)
+        out = ragged_decode_triton(
+            q,
+            k,
+            v,
+            sequence_start=starts,
+            sequence_end=ends,
+            softmax_scale=1.0,
+        )
         assert out.shape == (B, HQ, D)
         assert jnp.isfinite(out).all()
 
@@ -150,7 +156,6 @@ class TestRaggedDecodeAttentionTriton:
             sequence_start=starts,
             sequence_end=ends,
             softmax_scale=1.0,
-            block_size=128,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
             softmax_aux=None,
@@ -163,7 +168,6 @@ class TestRaggedDecodeAttentionTriton:
             sequence_start=starts,
             sequence_end=ends,
             softmax_scale=1.0,
-            block_size=128,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
             softmax_aux=None,
@@ -189,7 +193,7 @@ class TestRaggedDecodeAttentionTriton:
         aux_per_kv = jax.random.normal(ka, (HKV, NS), dtype=jnp.float32)
         aux_shared = jnp.linspace(-0.5, 0.5, NS, dtype=jnp.float32)
 
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017
             ragged_decode_triton(
                 q,
                 k,
@@ -197,12 +201,11 @@ class TestRaggedDecodeAttentionTriton:
                 starts,
                 ends,
                 softmax_scale=0.75,
-                block_size=64,
                 sliding_window=(128, 16),
                 logits_soft_cap=25.0,
                 softmax_aux=aux_per_kv,
             )
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017
             ragged_decode_ref(
                 q,
                 k,
@@ -210,7 +213,6 @@ class TestRaggedDecodeAttentionTriton:
                 starts,
                 ends,
                 softmax_scale=0.75,
-                block_size=64,
                 sliding_window=(128, 16),
                 logits_soft_cap=25.0,
                 softmax_aux=aux_per_kv,
@@ -223,7 +225,6 @@ class TestRaggedDecodeAttentionTriton:
             starts,
             ends,
             softmax_scale=1.25,
-            block_size=128,
             sliding_window=None,
             logits_soft_cap=None,
             softmax_aux=aux_shared,
@@ -235,7 +236,6 @@ class TestRaggedDecodeAttentionTriton:
             starts,
             ends,
             softmax_scale=1.25,
-            block_size=128,
             sliding_window=None,
             logits_soft_cap=None,
             softmax_aux=aux_shared,
@@ -255,8 +255,22 @@ class TestRaggedDecodeAttentionTriton:
         starts = jnp.array([5], dtype=jnp.int32)
         ends = jnp.array([407], dtype=jnp.int32)
 
-        out_tri = ragged_decode_triton(q, k, v, starts, ends, softmax_scale=1.0, block_size=128)
-        out_ref = ragged_decode_ref(q, k, v, starts, ends, softmax_scale=1.0, block_size=128)
+        out_tri = ragged_decode_triton(
+            q,
+            k,
+            v,
+            starts,
+            ends,
+            softmax_scale=1.0,
+        )
+        out_ref = ragged_decode_ref(
+            q,
+            k,
+            v,
+            starts,
+            ends,
+            softmax_scale=1.0,
+        )
         assert jnp.allclose(out_tri, out_ref, rtol=2e-4, atol=2e-5)
 
 

@@ -183,22 +183,21 @@ def _compress_ids_from_anchors(anchors: jnp.ndarray, pad_mask: jnp.ndarray) -> j
         >>> _compress_ids_from_anchors(anchors, pad_mask)
         Array([0, 0, 1, 1, -1], dtype=int32)
     """
+    # NOTE: Avoid sort/argsort here. Some JAX/XLA GPU builds have an intermittent
+    # kernel reuse cache crash in sorting primitives. We can derive contiguous IDs
+    # without sorting because `anchors` are defined as the *minimum index* of each
+    # group, so anchor indices are already ordered by first occurrence.
     n = anchors.shape[0]
-    sentinel = n + 1
-    vals = jnp.where(pad_mask, sentinel, anchors)
-    idx_sorted = jnp.argsort(vals)
-    vals_sorted = vals[idx_sorted]
-    valid_sorted = vals_sorted != sentinel
+    anchors = jnp.asarray(anchors, jnp.int32)
+    pad_mask = jnp.asarray(pad_mask, jnp.bool_)
 
-    head = valid_sorted[:1]
-    rest_new = (vals_sorted[1:] != vals_sorted[:-1]) & valid_sorted[1:]
-    is_new_sorted = jnp.concatenate([head, rest_new], axis=0).astype(jnp.int32)
+    idx = jnp.arange(n, dtype=jnp.int32)
+    is_anchor = (~pad_mask) & (anchors == idx)
+    gid_for_anchor_idx = jnp.cumsum(is_anchor.astype(jnp.int32)) - 1
 
-    gid_sorted = jnp.cumsum(is_new_sorted) - 1
-    gid_sorted = jnp.where(valid_sorted, gid_sorted, -1)
-
-    gid = jnp.zeros_like(gid_sorted)
-    gid = gid.at[idx_sorted].set(gid_sorted)
+    anchors_safe = jnp.clip(anchors, 0, max(n - 1, 0))
+    gid = gid_for_anchor_idx[anchors_safe]
+    gid = jnp.where(pad_mask, -1, gid)
     return gid
 
 

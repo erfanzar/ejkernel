@@ -104,7 +104,7 @@ def _jax_fwd_attention_call(
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], tuple[Float[Array, "..."], ...]]:
@@ -270,7 +270,7 @@ def flash_attention_call(
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:

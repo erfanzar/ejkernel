@@ -83,6 +83,7 @@ def ragged_decode_mqa_fwd_kernel(
 
     for i in tl.static_range(0, NBLOCKS):
         t_idx = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        in_bounds = t_idx < S
 
         valid = (t_idx >= s_b) & (t_idx < e_b)
 
@@ -100,7 +101,7 @@ def ragged_decode_mqa_fwd_kernel(
 
             k_block = tl.load(
                 k_ptr + k_base + d_col[None, :] + (tl.arange(0, BLOCK_SIZE)[:, None] * D),
-                mask=d_m[None, :],
+                mask=in_bounds[:, None] & d_m[None, :],
                 other=0.0,
             ).to(tl.float32)
 
@@ -150,7 +151,7 @@ def ragged_decode_mqa_fwd_kernel(
             d_m = d_col < D
             v_block = tl.load(
                 v_ptr + k_base + d_col[None, :] + (tl.arange(0, BLOCK_SIZE)[:, None] * D),
-                mask=d_m[None, :],
+                mask=in_bounds[:, None] & d_m[None, :],
                 other=0.0,
             ).to(tl.float32)
             o_blk += tl.sum(v_block * s_seq[:, None], axis=0)
@@ -258,6 +259,11 @@ def inner_decode_triton(
 
     if softmax_scale is None:
         softmax_scale = query_tensor.shape[-1] ** -0.5
+
+    if fwd_params is None:
+        fwd_params = FwdParams(kv_blocksize=256)
+    elif fwd_params.kv_blocksize is None:
+        fwd_params.kv_blocksize = 256
 
     _S, HKV = key_tensor.shape[1], key_tensor.shape[2]
     assert HQ % HKV == 0, "GQA requires HQ divisible by HKV"

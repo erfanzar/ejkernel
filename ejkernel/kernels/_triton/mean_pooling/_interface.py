@@ -83,7 +83,7 @@ def _bwd_call(
     chunk_size: int,
     residual: tuple[int, int, Int[Array, "num_seqs_plus_one"] | None],
     do: Float[Array, "batch hidden_dim"],
-) -> Float[Array, "batch seq_len hidden_dim"]:
+) -> tuple[Float[Array, "batch seq_len hidden_dim"], None]:
     """
     Backward pass for mean pooling with custom VJP.
 
@@ -97,7 +97,8 @@ def _bwd_call(
     """
     A, B, cu_seqlens = residual
     dEo = bwd_triton_impl(do=do, batch_size=A, seq_len=B, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
-    return dEo
+    # `cu_seqlens` is an integer index tensor (non-differentiable).
+    return dEo, None
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(1,))

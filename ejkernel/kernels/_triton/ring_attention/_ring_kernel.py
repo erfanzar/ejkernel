@@ -133,7 +133,7 @@ def _ring_flash_attention_fwd(
         axis_size = 1
 
     # Initialize accumulators
-    o = jnp.zeros_like(query)
+    o = jnp.zeros(query.shape, dtype=jnp.float32)
     lse = jnp.full((batch, num_heads, q_seq_len), -jnp.inf, dtype=jnp.float32)
 
     def scan_ring(carry, idx):
@@ -179,7 +179,7 @@ def _ring_flash_attention_fwd(
         beta_expanded = jnp.transpose(beta, (0, 2, 1))[..., None]
         sum_weights_expanded = jnp.transpose(sum_weights_safe, (0, 2, 1))[..., None]
 
-        o_next = (alpha_expanded * o_acc + beta_expanded * o_chunk) / sum_weights_expanded
+        o_next = (alpha_expanded * o_acc + beta_expanded * o_chunk.astype(jnp.float32)) / sum_weights_expanded
 
         # Update log-sum-exp
         lse_next = lse_max + jnp.log(jnp.where(sum_weights == 0, 1.0, sum_weights))
@@ -195,6 +195,7 @@ def _ring_flash_attention_fwd(
         return (o_next, lse_next, k_next, v_next), None
 
     (o, lse, _, _), _ = lax.scan(scan_ring, (o, lse, key, value), jnp.arange(axis_size))
+    o_out = o.astype(query.dtype)
 
     residuals = RingFlashResiduals(
         q=query,
@@ -202,12 +203,12 @@ def _ring_flash_attention_fwd(
         v=value,
         bias=bias,
         attention_mask=attention_mask,
-        o=o,
+        o=o_out,
         lse=lse,
         dropout_seed=dropout_seed,
     )
 
-    return o, residuals
+    return o_out, residuals
 
 
 def _ring_flash_attention_bwd(

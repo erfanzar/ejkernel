@@ -588,15 +588,26 @@ def get_or_create_triton_kernel(
         compilation_result = compile_ttir_inplace(module, backend, options, compute_capability, platform)
 
         kernel_name = compilation_result.name
-        kernel = triton_kernel_call_lib.TritonKernel(
-            kernel_name,
-            num_warps,
-            compilation_result.shared_mem_bytes,
-            compilation_result.binary,
-            ttir,
-            compute_capability,
-            *compilation_result.cluster_dims,
-        )
+        try:
+            kernel = triton_kernel_call_lib.TritonKernel(
+                kernel_name,
+                num_warps,
+                num_ctas,
+                compilation_result.shared_mem_bytes,
+                compilation_result.binary,
+                ttir,
+                compute_capability,
+            )
+        except TypeError:
+            kernel = triton_kernel_call_lib.TritonKernel(
+                kernel_name,
+                num_warps,
+                compilation_result.shared_mem_bytes,
+                compilation_result.binary,
+                ttir,
+                compute_capability,
+                *compilation_result.cluster_dims,
+            )
 
         _COMPILED_KERNEL_CACHE[cache_key] = kernel
 
@@ -665,45 +676,52 @@ def triton_kernel_call_lowering(
     arg_dtypes.extend(safe_map(get_triton_type, ctx.avals_out))
     named_args = dict(unsafe_zip(fn.arg_names, args))
 
-    if isinstance(fn, autotuner.Autotuner):
-        prev_early_config_prune_fn = fn.early_config_prune
+    default_config = triton.Config(
+        {},
+        num_warps=num_warps,
+        num_stages=num_stages,
+        num_ctas=num_ctas,
+    )
 
-        def prune_configs(configs, named_args, **kwargs):
-            pruned_configs = []
+    def unwrap_triton_kernel(kernel, configs):
+        """Return (jit_fn, configs) for any supported Triton wrapper stack."""
+
+        if isinstance(kernel, autotuner.Autotuner):
+            prev_early_config_prune_fn = kernel.early_config_prune
+
+            def prune_configs(configs, named_args, **kwargs):
+                pruned_configs = []
+                for config in configs:
+                    if config.pre_hook is not None:
+                        raise NotImplementedError("`pre_hook` is not supported")
+
+                    if all(config.kwargs.get(k, v) == v for k, v in metaparams.items()):
+                        pruned_configs.append(config)
+                if prev_early_config_prune_fn is not None:
+                    pruned_configs = prev_early_config_prune_fn(pruned_configs, named_args)
+                return pruned_configs
+
+            kernel.early_config_prune = prune_configs
+            kernel.nargs = named_args
+            tuned_configs = kernel.prune_configs(metaparams)
+            return unwrap_triton_kernel(kernel.fn, tuned_configs)
+
+        if isinstance(kernel, autotuner.Heuristics):
+            inner_fn, configs = unwrap_triton_kernel(kernel.fn, configs)
+            updated_configs = []
             for config in configs:
-                if config.pre_hook is not None:
-                    raise NotImplementedError("`pre_hook` is not supported")
+                kwargs = config.kwargs.copy()
+                for name, heuristic in kernel.values.items():
+                    kwargs[name] = heuristic({**named_args, **metaparams, **kwargs})
+                updated_config = copy.copy(config)
+                updated_config.kwargs = kwargs
+                updated_configs.append(updated_config)
+            return inner_fn, updated_configs
 
-                if all(config.kwargs.get(k, v) == v for k, v in metaparams.items()):
-                    pruned_configs.append(config)
-            if prev_early_config_prune_fn is not None:
-                pruned_configs = prev_early_config_prune_fn(pruned_configs, named_args)
-            return pruned_configs
+        return kernel, configs
 
-        fn.early_config_prune = prune_configs
-        fn.nargs = named_args
-        configs = fn.prune_configs(metaparams)
-        fn = fn.fn
-    else:
-        config = triton.Config(
-            {},
-            num_warps=num_warps,
-            num_stages=num_stages,
-            num_ctas=num_ctas,
-        )
-        configs = [config]
-
-    if isinstance(fn, autotuner.Heuristics):
-        updated_configs = []
-        for config in configs:
-            kwargs = config.kwargs.copy()
-            for name, heuristic in fn.values.items():
-                kwargs[name] = heuristic({**named_args, **metaparams, **kwargs})
-            updated_config = copy.copy(config)
-            updated_config.kwargs = kwargs
-            updated_configs.append(updated_config)
-        configs = updated_configs
-        fn = fn.fn
+    # Support both decorator orders: @heuristics @autotune @jit and @autotune @heuristics @jit.
+    fn, configs = unwrap_triton_kernel(fn, [default_config])
 
     if not isinstance(fn, triton.JITFunction):
         raise ValueError("`kernel` must be a Triton `JITFunction`, `Heuristics` or `Autotuner`.")

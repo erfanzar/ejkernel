@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from ejkernel.ops import FwdParams
 from ejkernel.kernels._xla.attention._interface import attention
 from ejkernel.kernels._xla.ring_attention._interface import ring_attention
 
@@ -40,13 +41,7 @@ class TestBasicFunctionality:
         k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
         v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
 
-        output = ring_attention(
-            q,
-            k,
-            v,
-            query_chunk_size=64,
-            key_chunk_size=64,
-        )
+        output = ring_attention(q, k, v)
 
         assert output.shape == q.shape
         assert jnp.all(jnp.isfinite(output))
@@ -65,26 +60,17 @@ class TestBasicFunctionality:
         k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
         v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
 
-        output = ring_attention(
-            q,
-            k,
-            v,
-            query_chunk_size=64,
-            key_chunk_size=64,
-        )
+        output = ring_attention(q, k, v)
 
         output_causal = ring_attention(
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             causal=True,
-            causal_block_size=64,
         )
 
         assert output_causal.shape == q.shape
-        diff = float(jnp.mean(jnp.abs(output - output_causal)))
+        diff = float(jnp.mean(jnp.abs(output - output_causal).astype(jnp.bfloat16)))
         assert diff > 1e-6, "Causal masking should affect output"
 
     def test_different_block_sizes(self):
@@ -107,13 +93,12 @@ class TestBasicFunctionality:
                 q,
                 k,
                 v,
-                query_chunk_size=blocksize,
-                key_chunk_size=blocksize,
+                fwd_params=FwdParams(q_blocksize=blocksize, kv_blocksize=blocksize),
             )
             outputs.append(output)
 
         for i in range(len(outputs) - 1):
-            diff = float(jnp.mean(jnp.abs(outputs[i] - outputs[i + 1])))
+            diff = float(jnp.mean(jnp.abs(outputs[i] - outputs[i + 1]).astype(jnp.bfloat16)))
             assert diff < 1e-3, f"Block size configuration affects output too much: {diff}"
 
 
@@ -138,23 +123,19 @@ class TestSlidingWindow:
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
         )
 
         output_windowed = ring_attention(
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             sliding_window=64,
         )
 
         assert output_windowed.shape == q.shape
         assert jnp.all(jnp.isfinite(output_windowed))
 
-        diff = float(jnp.mean(jnp.abs(output_full - output_windowed)))
+        diff = float(jnp.mean(jnp.abs(output_full - output_windowed).astype(jnp.bfloat16)))
         assert diff > 1e-6, "Sliding window should affect output"
 
     def test_asymmetric_sliding_window(self):
@@ -175,8 +156,6 @@ class TestSlidingWindow:
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             sliding_window=64,
         )
 
@@ -184,15 +163,13 @@ class TestSlidingWindow:
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             sliding_window=(32, 96),
         )
 
         assert output_asym.shape == q.shape
         assert jnp.all(jnp.isfinite(output_asym))
 
-        diff = float(jnp.mean(jnp.abs(output_sym - output_asym)))
+        diff = float(jnp.mean(jnp.abs(output_sym - output_asym).astype(jnp.bfloat16)))
         assert diff > 1e-6, "Asymmetric should differ from symmetric"
 
     def test_different_window_sizes(self):
@@ -215,13 +192,11 @@ class TestSlidingWindow:
                 q,
                 k,
                 v,
-                query_chunk_size=64,
-                key_chunk_size=64,
                 sliding_window=window_size,
             )
 
-        diff_32_64 = float(jnp.mean(jnp.abs(outputs[32] - outputs[64])))
-        diff_64_128 = float(jnp.mean(jnp.abs(outputs[64] - outputs[128])))
+        diff_32_64 = float(jnp.mean(jnp.abs(outputs[32] - outputs[64]).astype(jnp.bfloat16)))
+        diff_64_128 = float(jnp.mean(jnp.abs(outputs[64] - outputs[128]).astype(jnp.bfloat16)))
 
         assert diff_32_64 > 1e-6
         assert diff_64_128 > 1e-6
@@ -248,23 +223,19 @@ class TestLogitSoftCap:
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
         )
 
         output_with_cap = ring_attention(
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             logits_soft_cap=30.0,
         )
 
         assert output_with_cap.shape == q.shape
         assert jnp.all(jnp.isfinite(output_with_cap))
 
-        diff = float(jnp.mean(jnp.abs(output_no_cap - output_with_cap)))
+        diff = float(jnp.mean(jnp.abs(output_no_cap - output_with_cap).astype(jnp.bfloat16)))
         assert diff > 1e-6, "Soft cap should affect output"
 
     def test_soft_cap_numerical_stability(self):
@@ -285,8 +256,6 @@ class TestLogitSoftCap:
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             logits_soft_cap=30.0,
         )
 
@@ -294,10 +263,10 @@ class TestLogitSoftCap:
 
 
 class TestAttentionSink:
-    """Test attention sink feature."""
+    """Test softmax_aux (attention sinks) feature."""
 
     def test_attention_sink_affects_output(self):
-        """Test that attention sink changes the output."""
+        """Test that softmax_aux changes the output."""
         key = jax.random.PRNGKey(42)
         keys = jax.random.split(key, 3)
 
@@ -314,29 +283,26 @@ class TestAttentionSink:
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             sliding_window=64,
         )
 
+        softmax_aux = jnp.full((4,), -2.0, dtype=jnp.float32)
         output_with_sink = ring_attention(
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             sliding_window=64,
-            attention_sink_size=4,
+            softmax_aux=softmax_aux,
         )
 
         assert output_with_sink.shape == q.shape
         assert jnp.all(jnp.isfinite(output_with_sink))
 
-        diff = float(jnp.mean(jnp.abs(output_no_sink - output_with_sink)))
+        diff = float(jnp.mean(jnp.abs(output_no_sink - output_with_sink).astype(jnp.bfloat16)))
         assert diff > 1e-6, "Attention sink should affect output"
 
     def test_different_sink_sizes(self):
-        """Test different attention sink sizes."""
+        """Test different num_sinks values."""
         key = jax.random.PRNGKey(123)
         keys = jax.random.split(key, 3)
 
@@ -355,14 +321,12 @@ class TestAttentionSink:
                 q,
                 k,
                 v,
-                query_chunk_size=64,
-                key_chunk_size=64,
                 sliding_window=64,
-                attention_sink_size=sink_size,
+                softmax_aux=jnp.full((sink_size,), -2.0, dtype=jnp.float32),
             )
 
-        diff_2_4 = float(jnp.mean(jnp.abs(outputs[2] - outputs[4])))
-        diff_4_8 = float(jnp.mean(jnp.abs(outputs[4] - outputs[8])))
+        diff_2_4 = float(jnp.mean(jnp.abs(outputs[2] - outputs[4]).astype(jnp.bfloat16)))
+        diff_4_8 = float(jnp.mean(jnp.abs(outputs[4] - outputs[8]).astype(jnp.bfloat16)))
 
         assert diff_2_4 > 1e-6
         assert diff_4_8 > 1e-6
@@ -389,8 +353,6 @@ class TestCombinedFeatures:
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             sliding_window=64,
             logits_soft_cap=30.0,
         )
@@ -399,7 +361,7 @@ class TestCombinedFeatures:
         assert jnp.all(jnp.isfinite(output))
 
     def test_asymmetric_window_and_sink(self):
-        """Test asymmetric window with attention sink."""
+        """Test asymmetric window with softmax_aux."""
         key = jax.random.PRNGKey(222)
         keys = jax.random.split(key, 3)
 
@@ -412,14 +374,13 @@ class TestCombinedFeatures:
         k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
         v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
 
+        softmax_aux = jnp.full((8,), -2.0, dtype=jnp.float32)
         output = ring_attention(
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
             sliding_window=(32, 96),
-            attention_sink_size=8,
+            softmax_aux=softmax_aux,
         )
 
         assert output.shape == q.shape
@@ -439,15 +400,14 @@ class TestCombinedFeatures:
         k = jax.random.normal(keys[1], (batch_size, seq_len, num_heads, head_dim))
         v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
 
+        softmax_aux = jnp.full((4,), -2.0, dtype=jnp.float32)
         output = ring_attention(
             q,
             k,
             v,
-            query_chunk_size=64,
-            key_chunk_size=64,
-            causal_block_size=64,
+            causal=True,
             sliding_window=(32, 96),
-            attention_sink_size=4,
+            softmax_aux=softmax_aux,
             logits_soft_cap=30.0,
         )
 
@@ -500,21 +460,18 @@ class TestMaskingComparison:
             q,
             k,
             v,
-            query_chunk_size=32,
-            key_chunk_size=32,
             causal=True,
-            causal_block_size=1,
         )
 
         max_diff = float(jnp.max(jnp.abs(vanilla_output - ring_output)))
-        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output)))
+        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output).astype(jnp.bfloat16)))
 
         print("\nCausal mask comparison:")
         print(f"  Max diff: {max_diff:.6e}")
         print(f"  Mean diff: {mean_diff:.6e}")
 
         assert jnp.allclose(vanilla_output, ring_output, atol=2e-2), (
-            f"Ring attention with causal_block_size differs from vanilla with causal mask! Max diff: {max_diff}"
+            f"Ring attention differs from vanilla with causal mask! Max diff: {max_diff}"
         )
 
     def test_padding_mask_vs_vanilla(self):
@@ -547,12 +504,10 @@ class TestMaskingComparison:
             v,
             q_segment_ids=q_seg_ids,
             kv_segment_ids=kv_seg_ids,
-            query_chunk_size=32,
-            key_chunk_size=32,
         )
 
         max_diff = float(jnp.max(jnp.abs(vanilla_output - ring_output)))
-        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output)))
+        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output).astype(jnp.bfloat16)))
 
         print("\nPadding mask comparison:")
         print(f"  Max diff: {max_diff:.6e}")
@@ -596,10 +551,7 @@ class TestMaskingComparison:
             v,
             q_segment_ids=q_seg_ids,
             kv_segment_ids=kv_seg_ids,
-            query_chunk_size=32,
-            key_chunk_size=32,
             causal=True,
-            causal_block_size=1,
         )
 
         valid_mask = q_seg_ids > 0
@@ -610,7 +562,7 @@ class TestMaskingComparison:
         ring_valid = jnp.where(jnp.isnan(ring_valid), 0.0, ring_valid)
 
         max_diff = float(jnp.max(jnp.abs(vanilla_valid - ring_valid)))
-        mean_diff = float(jnp.mean(jnp.abs(vanilla_valid - ring_valid)))
+        mean_diff = float(jnp.mean(jnp.abs(vanilla_valid - ring_valid).astype(jnp.bfloat16)))
 
         print("\nCombined causal + padding mask comparison:")
         print(f"  Max diff: {max_diff:.6e}")
@@ -642,13 +594,11 @@ class TestMaskingComparison:
             q,
             k,
             v,
-            query_chunk_size=32,
-            key_chunk_size=32,
             sliding_window=window_size,
         )
 
         max_diff = float(jnp.max(jnp.abs(vanilla_output - ring_output)))
-        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output)))
+        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output).astype(jnp.bfloat16)))
 
         print("\nSliding window comparison:")
         print(f"  Max diff: {max_diff:.6e}")
@@ -680,13 +630,11 @@ class TestMaskingComparison:
             q,
             k,
             v,
-            query_chunk_size=32,
-            key_chunk_size=32,
             sliding_window=window_size,
         )
 
         max_diff = float(jnp.max(jnp.abs(vanilla_output - ring_output)))
-        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output)))
+        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output).astype(jnp.bfloat16)))
 
         print("\nAsymmetric sliding window comparison:")
         print(f"  Max diff: {max_diff:.6e}")
@@ -718,12 +666,10 @@ class TestMaskingComparison:
             k,
             v,
             bias=bias,
-            query_chunk_size=32,
-            key_chunk_size=32,
         )
 
         max_diff = float(jnp.max(jnp.abs(vanilla_output - ring_output)))
-        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output)))
+        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output).astype(jnp.bfloat16)))
 
         print("\nBias comparison:")
         print(f"  Max diff: {max_diff:.6e}")
@@ -756,12 +702,10 @@ class TestMaskingComparison:
             k,
             v,
             softmax_scale=custom_scale,
-            query_chunk_size=32,
-            key_chunk_size=32,
         )
 
         max_diff = float(jnp.max(jnp.abs(vanilla_output - ring_output)))
-        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output)))
+        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output).astype(jnp.bfloat16)))
 
         print("\nSoftmax softmax_scale comparison:")
         print(f"  Max diff: {max_diff:.6e}")
@@ -796,12 +740,10 @@ class TestMaskingComparison:
             v,
             bias=bias,
             sliding_window=window_size,
-            query_chunk_size=32,
-            key_chunk_size=32,
         )
 
         max_diff = float(jnp.max(jnp.abs(vanilla_output - ring_output)))
-        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output)))
+        mean_diff = float(jnp.mean(jnp.abs(vanilla_output - ring_output).astype(jnp.bfloat16)))
 
         print("\nBias + sliding window comparison:")
         print(f"  Max diff: {max_diff:.6e}")
@@ -856,8 +798,6 @@ class TestMaskingComparison:
             bias=bias,
             sliding_window=window_size,
             softmax_scale=custom_scale,
-            query_chunk_size=32,
-            key_chunk_size=32,
         )
 
         valid_mask = q_seg_ids > 0
@@ -869,7 +809,7 @@ class TestMaskingComparison:
         ring_valid = jnp.where(jnp.isnan(ring_valid), 0.0, ring_valid)
 
         max_diff = float(jnp.max(jnp.abs(vanilla_valid - ring_valid)))
-        mean_diff = float(jnp.mean(jnp.abs(vanilla_valid - ring_valid)))
+        mean_diff = float(jnp.mean(jnp.abs(vanilla_valid - ring_valid).astype(jnp.bfloat16)))
 
         print("\nAll features combined comparison:")
         print(f"  Max diff: {max_diff:.6e}")
@@ -902,8 +842,6 @@ class TestGradients:
                 q,
                 k,
                 v,
-                query_chunk_size=32,
-                key_chunk_size=32,
             )
             return jnp.mean(output**2)
 
@@ -927,15 +865,14 @@ class TestGradients:
         v = jax.random.normal(keys[2], (batch_size, seq_len, num_heads, head_dim))
 
         def loss_fn(q, k, v):
+            softmax_aux = jnp.full((2,), -2.0, dtype=jnp.float32)
             output = ring_attention(
                 q,
                 k,
                 v,
-                query_chunk_size=32,
-                key_chunk_size=32,
                 sliding_window=32,
                 logits_soft_cap=30.0,
-                attention_sink_size=2,
+                softmax_aux=softmax_aux,
             )
             return jnp.mean(output**2)
 

@@ -249,8 +249,9 @@ def apply_native_sparse_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"],
-    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"]
+    | Int[Array, "batch num_kv_heads num_blocks num_selected_blocks"],
+    block_counts: Int[Array, "batch seq_len num_kv_heads"] | Int[Array, "batch num_kv_heads num_blocks"] | int = 16,
     block_size: int = 64,
     softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,

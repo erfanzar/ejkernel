@@ -77,7 +77,9 @@ R = tp.TypeVar("R")
 
 RECOMPILE_FORCE = check_bool_flag("EASYDEL_RECOMPILE_FORCE", False)
 ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
-ALLOW_FULL_CACHE = check_bool_flag("ALLOW_FULL_CACHE", True)
+# Persisting "all" XLA caches can trigger instability on some JAX/XLA GPU builds
+# (e.g., CUDA kernel launch failures / kernel reuse cache errors). Keep it opt-in.
+ALLOW_FULL_CACHE = check_bool_flag("ALLOW_FULL_CACHE", False)
 
 CACHE_DIR = get_cache_dir()
 COMPILE_FUNC_DIR = os.getenv("COMPILE_FUNC_DIR", CACHE_DIR / "ejit_compiled_functions")

@@ -19,16 +19,6 @@ from pathlib import Path
 from typing import Any
 
 _TRITON_ONLY_TEST_BASENAMES = {
-    # Standalone Triton kernel tests.
-    "test_flash_attention_advanced.py",
-    "test_gla.py",
-    "test_lightning_attn.py",
-    "test_native_spare_attention.py",
-    "test_page_attention.py",
-    "test_ragged_decode_attention.py",
-    "test_ragged_page_attention.py",
-    "test_recurrent.py",
-    "test_unified_attention.py",
     # Cross-backend comparisons that require Triton.
     "test_flash_attention_xla_triton.py",
     "test_native_sparse_attention_xla_triton.py",
@@ -50,4 +40,3 @@ def pytest_ignore_collect(collection_path: Path, config: Any) -> bool:
     # Also ignore the entire Triton test directory when Triton isn't installed.
     parts = set(collection_path.parts)
     return "test" in parts and "kernels" in parts and "_triton" in parts
-

@@ -415,9 +415,12 @@ def define_sparse_mask_fn(
         lower_block = jnp.minimum(lower_block, upper_block)
 
         lower_full_block = jnp.clip(lower_full_block, 0, num_query_blocks)
+        no_full_block = upper_full_block == 0
+        lower_full_block = jnp.where(no_full_block, lower_block, lower_full_block)
         lower_full_block = jnp.maximum(lower_full_block, lower_block)
 
         upper_full_block = jnp.clip(upper_full_block, 0, num_query_blocks)
+        upper_full_block = jnp.where(no_full_block, lower_block, upper_full_block)
         upper_full_block = jnp.maximum(upper_full_block, lower_full_block)
         upper_full_block = jnp.minimum(upper_full_block, upper_block)
 
@@ -442,8 +445,11 @@ def define_sparse_mask_fn(
     upper_block = jnp.clip(upper_block, 0, num_kv_blocks)
     lower_block = jnp.minimum(lower_block, upper_block)
     lower_full_block = jnp.clip(lower_full_block, 0, num_kv_blocks)
+    no_full_block = upper_full_block == 0
+    lower_full_block = jnp.where(no_full_block, lower_block, lower_full_block)
     lower_full_block = jnp.maximum(lower_full_block, lower_block)
     upper_full_block = jnp.clip(upper_full_block, 0, num_kv_blocks)
+    upper_full_block = jnp.where(no_full_block, lower_block, upper_full_block)
     upper_full_block = jnp.maximum(upper_full_block, lower_full_block)
     upper_full_block = jnp.minimum(upper_full_block, upper_block)
     return lower_block, upper_block, lower_full_block, upper_full_block

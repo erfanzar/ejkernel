@@ -129,6 +129,25 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
             over the sparsity pattern.
         """
 
+        # Triton NSA enforces a GQA group size multiple-of-16 constraint. For common
+        # non-GQA shapes (e.g., HQ == H_kv), fall back to the XLA implementation
+        # when the platform is not explicitly forced.
+        if platform is None or platform == "auto":
+            num_q_heads = int(query.shape[2])
+            num_kv_heads = int(key.shape[2])
+            group_size = num_q_heads // num_kv_heads if (num_kv_heads > 0 and num_q_heads % num_kv_heads == 0) else 0
+            if group_size % 16 != 0:
+                cfg = NativeSparseAttentionConfig(
+                    block_q=cfg.block_q,
+                    block_k=cfg.block_k,
+                    block_d=cfg.block_d,
+                    block_size=cfg.block_size,
+                    num_warps=cfg.num_warps,
+                    num_stages=cfg.num_stages,
+                    platform="xla",
+                    backend=Backend.ANY,
+                )
+
         if platform is not None:
             cfg = NativeSparseAttentionConfig(
                 block_q=cfg.block_q,

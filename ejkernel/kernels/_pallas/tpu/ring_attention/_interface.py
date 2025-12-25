@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import typing
 
-import chex
 import jax
 import jax.numpy as jnp
 import jaxtyping
@@ -30,14 +29,12 @@ import numpy as np
 from beartype import beartype
 from einops import rearrange
 from jax import Array
-from jax.experimental.pallas.ops.tpu.splash_attention import (
-    splash_attention_mask as mask_lib,
-)
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as mask_lib
 from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_mask_info as mask_info_lib,
 )
 from jax.scipy.special import logsumexp
-from jaxtyping import Float, Int, PRNGKeyArray
+from jaxtyping import Float, Int
 
 from ejkernel.ops import BwdParams, FwdParams
 
@@ -187,28 +184,19 @@ def ring_attention(
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
-    query_chunk_size: int | None = None,
-    key_chunk_size: int | None = None,
-    causal_block_size: int | None = None,
-    attention_sink_size: int = 0,
     causal: bool = False,
     logits_soft_cap: float | None = None,
     softmax_scale: float | None = None,
     axis_name: str | None = None,
-    float32_logits: bool = True,
-    deterministic: bool = True,
-    dropout_rng: PRNGKeyArray | None = None,
-    pdrop: float = 0.0,
-    prevent_cse: bool = True,
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     fused_backward: bool = False,
-) -> chex.Array:
+) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Computes ring attention using Splash Attention kernels on TPU.
 
     This implementation uses JAX's splash attention with ring communication
@@ -244,7 +232,7 @@ def ring_attention(
             "Attention bias is not supported in splash ring attention. "
             "Please remove the bias parameter or use a different kernel."
         )
-    del float32_logits, deterministic, dropout_rng, pdrop, prevent_cse, causal_block_size
+    del mask_builder, fused_backward
 
     # Get dimensions
     _, q_len, num_heads, head_dim = query.shape
@@ -262,11 +250,6 @@ def ring_attention(
     if fwd_params is None:
         fwd_params = FwdParams(q_blocksize=min(512, q_len), kv_blocksize=min(512, kv_len))
 
-    if query_chunk_size is not None:
-        fwd_params.q_blocksize = int(query_chunk_size)
-    if key_chunk_size is not None:
-        fwd_params.kv_blocksize = int(key_chunk_size)
-
     block_sizes = _make_block_sizes(fwd_params, bwd_params)
 
     # Build mask from parameters
@@ -275,7 +258,7 @@ def ring_attention(
         kv_seq_len=kv_len,
         causal=causal,
         sliding_window=sliding_window,
-        attention_sink_size=attention_sink_size,
+        attention_sink_size=0,
         chunk_size=chunk_size,
     )
 
@@ -287,16 +270,8 @@ def ring_attention(
         aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
         if aux.ndim == 1:
             sinks = jnp.broadcast_to(logsumexp(aux), (num_heads,))
-        elif aux.ndim == 2:
-            aux_lse = logsumexp(aux, axis=-1)
-            if aux_lse.shape[0] == num_heads:
-                sinks = aux_lse
-            elif aux_lse.shape[0] == 1:
-                sinks = jnp.broadcast_to(aux_lse[0], (num_heads,))
-            else:
-                raise ValueError(f"softmax_aux has incompatible first dimension {aux.shape[0]} for {num_heads=}.")
         else:
-            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}.")
+            raise ValueError(f"softmax_aux must be 1D, got shape {aux.shape}.")
 
     # Create segment IDs if provided
     segment_ids = None

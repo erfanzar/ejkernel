@@ -125,6 +125,8 @@ def grouped_matmul(
         - Empty groups (size 0) are skipped for efficiency
         - Cost estimation helps XLA make scheduling decisions
     """
+    if precision is None:
+        precision = jax.lax.Precision.HIGHEST
     if tiling is None:
         manager = contextlib.nullcontext()
     else:

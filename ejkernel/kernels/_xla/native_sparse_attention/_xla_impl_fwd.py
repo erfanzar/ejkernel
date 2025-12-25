@@ -54,15 +54,20 @@ def _sparse_attention_fwd(
             inds = bi_b[t, kvh]
             cnt = bc_b[t, kvh]
 
-            k_sel = k_blocks_b[inds, :, kvh, :]
-            v_sel = v_blocks_b[inds, :, kvh, :]
+            # Support sentinel values (e.g., -1) in `inds` by masking them out.
+            nb = k_blocks_b.shape[0]
+            inds_valid = (inds >= 0) & (inds < nb)
+            inds_safe = jnp.where(inds_valid, inds, 0)
+
+            k_sel = k_blocks_b[inds_safe, :, kvh, :]
+            v_sel = v_blocks_b[inds_safe, :, kvh, :]
 
             bs = jnp.arange(block_size)
             local_limit = t - inds * block_size
             pos_mask = bs[None, :] <= local_limit[:, None]
             s = jnp.arange(inds.shape[0])
             blk_mask = s < cnt
-            valid_mask = pos_mask & blk_mask[:, None]
+            valid_mask = pos_mask & blk_mask[:, None] & inds_valid[:, None]
 
             scores = jnp.einsum("d,sbd->sb", q_vec, k_sel) * softmax_scale
             scores = jnp.where(valid_mask, scores, jnp.full_like(scores, -1e9))

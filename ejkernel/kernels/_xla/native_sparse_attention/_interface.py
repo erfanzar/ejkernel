@@ -170,13 +170,27 @@ def _nsa_topk_xla(
     future_mask = jnp.arange(C, dtype=jnp.int32)[None, None, None, :] > qb[None, :, None, None]
     p_sum = jnp.where(future_mask, -jnp.inf, p_sum)
 
-    tie = (C - 1.0 - jnp.arange(C, dtype=p_sum.dtype)[None, None, None, :]) * jnp.array(1e-8, dtype=p_sum.dtype)
+    # Triton bitonic sorting swaps on ties, which effectively prioritizes larger
+    # block indices when scores are exactly equal.
+    tie = jnp.arange(C, dtype=p_sum.dtype)[None, None, None, :] * jnp.array(1e-8, dtype=p_sum.dtype)
     p_sum_adj = p_sum + tie
     S = block_counts if isinstance(block_counts, int) else int(block_counts)
+    S = min(int(S), int(C))
     p_flat = p_sum_adj.reshape(B * T * H, C)
-    _, idx_flat = jax.lax.top_k(p_flat, S)
+    # Work around an intermittent XLA:GPU kernel reuse cache crash triggered by
+    # sorting/top-k ops on some JAX/XLA builds. For the small C used here, moving
+    # the selection to CPU is a practical workaround.
+    if isinstance(p_flat, jax.Array) and p_flat.device.platform in ("gpu", "cuda"):
+        cpu = jax.devices("cpu")[0]
+        p_cpu = jax.device_put(p_flat, cpu)
+        _, idx_cpu = jax.lax.top_k(p_cpu, S)
+        idx_flat = jax.device_put(idx_cpu, p_flat.device)
+    else:
+        _, idx_flat = jax.lax.top_k(p_flat, S)
     idx = idx_flat.reshape(B, T, H, S).astype(jnp.int32)
-    idx = jnp.minimum(idx, qb[None, :, None, None])
+    # Match Triton semantics: blocks beyond the current query block are invalid.
+    # Represent invalid blocks with -1 (the sparse attention implementation masks them out).
+    idx = jnp.where(idx <= qb[None, :, None, None], idx, jnp.full_like(idx, -1))
     return idx
 
 
@@ -329,10 +343,8 @@ def native_sparse_attention(
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     g_cmp: Float[Array, "batch seq_len num_q_heads"] | None = None,
     g_slc: Float[Array, "batch seq_len num_q_heads"] | None = None,
-    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"]
-    | Int[Array, "batch num_kv_heads num_blocks num_selected_blocks"]
-    | None = None,
-    block_counts: Int[Array, "batch seq_len num_kv_heads"] | Int[Array, "batch num_kv_heads num_blocks"] | int = 16,
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"] | None = None,
+    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
     block_size: int = 64,
     softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,

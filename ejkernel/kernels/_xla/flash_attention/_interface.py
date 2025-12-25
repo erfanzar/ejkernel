@@ -395,6 +395,10 @@ def flash_attention(
     kv_block = min(128, key.shape[1]) if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize)
     q_block = max(1, q_block)
     kv_block = max(1, kv_block)
+    if logits_soft_cap is not None:
+        min_block = 32 if softmax_aux is not None else 16
+        q_block = max(min_block, q_block)
+        kv_block = max(min_block, kv_block)
 
     precision_code = _precision_to_code(precision)
     logits_dtype_code = _dtype_to_code(logits_dtype)

@@ -101,6 +101,7 @@ def _blocksparse_attn_fwd_inner(
         Updated (acc, l, m) tuple
     """
     BIG_NEG: tl.constexpr = float("-inf")
+    LOG2_CONST: tl.constexpr = 1.4426950408889634  # log2(e)
     key_transpose_block_ptr = tl.advance(key_transpose_block_ptr, (0, lower))
     value_block_ptr = tl.advance(value_block_ptr, (lower, 0))
     kv_arange = tl.arange(0, BLOCK_N)
@@ -137,7 +138,6 @@ def _blocksparse_attn_fwd_inner(
                 mask = window_mask
 
         if SOFTCAP:
-            LOG2_CONST: tl.constexpr = 1.4426950408889634
             softmax_scale_e = softmax_scale / LOG2_CONST
             x = (attn_weights * softmax_scale_e) / logits_soft_cap
             exp_2x = tl.exp(2.0 * x)
@@ -156,16 +156,17 @@ def _blocksparse_attn_fwd_inner(
             sink_offs = tl.arange(0, 16)
             sink_mask = sink_offs < NUM_SINKS
             aux_logits = tl.load(softmax_aux_ptrs + sink_offs, mask=sink_mask, other=float("-inf"))
+            aux_log2 = aux_logits * LOG2_CONST
 
             qk_max = tl.max(attn_weights, 1)
-            aux_max = tl.max(tl.where(sink_mask, aux_logits, float("-inf")))
+            aux_max = tl.max(tl.where(sink_mask, aux_log2, float("-inf")))
             m_new = tl.maximum(tl.maximum(qk_max, aux_max), m)
             m_new_safe = tl.where(m_new == BIG_NEG, 0.0, m_new)
 
             attn_weights -= m_new_safe[:, None]
             p = tl.math.exp2(attn_weights)
 
-            aux_logits_row = tl.where(sink_mask[None, :], aux_logits[None, :], float("-inf"))
+            aux_logits_row = tl.where(sink_mask[None, :], aux_log2[None, :], float("-inf"))
             l_aux_row = tl.sum(tl.exp2(aux_logits_row - m_new_safe[:, None]), axis=1)
 
             l_new = tl.sum(p, axis=1) + l_aux_row

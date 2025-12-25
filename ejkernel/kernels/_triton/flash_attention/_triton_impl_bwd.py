@@ -48,6 +48,12 @@ def config_prune_kernel(
     Returns:
         list[Config]: Valid configurations for the given problem size
     """
+    # Triton kernels require dot M/N/K >= 16 on recent versions. For very small
+    # sequences we still need to allow block sizes >= 16, relying on padding
+    # masks for correctness.
+    effective_q = max(int(named_args["QSeq"]), 16)
+    effective_k = max(int(named_args["KSeq"]), 16)
+
     kept_configs = []
     for config in configs:
         largest_m = (
@@ -55,14 +61,14 @@ def config_prune_kernel(
                 config.kwargs["BLOCK_M1"],
                 config.kwargs["BLOCK_M2"],
             )
-            > named_args["QSeq"]
+            > effective_q
         )
         largest_n = (
             max(
                 config.kwargs["BLOCK_N1"],
                 config.kwargs["BLOCK_N2"],
             )
-            > named_args["KSeq"]
+            > effective_k
         )
         if largest_m or largest_n:
             pass
@@ -339,8 +345,8 @@ def _attn_bwd_dkdv(
     dv += tl.dot(tl.trans(p), do)
     dp = tl.dot(do, tl.trans(v.to(tl.float32)))
     Di = tl.load(D + offs_m_curr)
-    ds = (p * (dp - Di[:, None]) * jac).to(q.dtype)
-    dk += tl.dot(tl.trans(ds), q)
+    ds = (p * (dp - Di[:, None]) * jac).to(tl.float32)
+    dk += tl.dot(tl.trans(ds), q.to(tl.float32))
 
     return dk, dv
 
@@ -676,8 +682,8 @@ def _attn_bwd_dq(
     p = tl.exp2(qk_after - me_i[:, None])
     p = tl.where(attn_mask, p, 0.0)
     dp = tl.dot(do, tl.trans(v.to(tl.float32)))
-    ds = (p * (dp - de_i[:, None]) * jac).to(q.dtype)
-    dq += tl.dot(ds, k)
+    ds = (p * (dp - de_i[:, None]) * jac).to(tl.float32)
+    dq += tl.dot(ds, k.to(tl.float32))
     return dq
 
 
@@ -1443,8 +1449,8 @@ def _bwd_attention_kernel_call(
             ),
             out_shape=[
                 jax.ShapeDtypeStruct(shape=q_p.shape, dtype="f4", sharding=get_sharding(q)),
-                jax.ShapeDtypeStruct(shape=(*k_p.shape[:2], q_p.shape[2], k_p.shape[3]), dtype=k.dtype),
-                jax.ShapeDtypeStruct(shape=(*v_p.shape[:2], q_p.shape[2], v_p.shape[3]), dtype=v.dtype),
+                jax.ShapeDtypeStruct(shape=(*k_p.shape[:2], q_p.shape[2], k_p.shape[3]), dtype="f4"),
+                jax.ShapeDtypeStruct(shape=(*v_p.shape[:2], q_p.shape[2], v_p.shape[3]), dtype="f4"),
             ],
             name="ejkernel::triton::flash_attn_bwd",
         )
@@ -1456,7 +1462,7 @@ def _bwd_attention_kernel_call(
         dq = attention_unpack_with_static_shape(dq, cum_seqlens_q, batch_size, QSeq_max)
         dk = attention_unpack_with_static_shape(dk, cum_seqlens_k, batch_size, KSeq_max)
         dv = attention_unpack_with_static_shape(dv, cum_seqlens_k, batch_size, KSeq_max)
-        return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
+        return dq, dk, dv
 
     if attention_mask is not None and varlen_from_cu:
         assert bias is None, "mask + bias not supported; use bias alone or pack bias."
@@ -1636,4 +1642,4 @@ def _bwd_attention_kernel_call(
         dk = jnp.pad(dk, ((0, useless_padding), (0, 0), (0, 0)))
         dv = jnp.pad(dv, ((0, useless_padding), (0, 0), (0, 0)))
 
-    return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
+    return dq, dk, dv

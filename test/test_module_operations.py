@@ -435,7 +435,7 @@ class TestRingAttention:
         B, N, H, D = 2, 1024, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
 
-        output = ring_attention(q, k, v, axis_name="batch", causal_block_size=512)
+        output = ring_attention(q, k, v, axis_name="batch", chunk_size=512, causal=True)
         assert output.shape == (B, N, H, D)
 
 

@@ -163,12 +163,11 @@ def _ragged_paged_attn_fwd(
                 qk = tl.dot(q, tl.trans(k_tile)) * softmax_scale
 
                 if SOFTCAP:
-                    LOG2_CONST: tl.constexpr = 1.4426950408889634
-                    softmax_scale_e = softmax_scale / LOG2_CONST
-                    x = (qk * softmax_scale_e) / logits_soft_cap
-                    exp_2x = tl.exp(2.0 * x)
-                    tanh_x = (exp_2x - 1.0) / (exp_2x + 1.0)
-                    qk = (logits_soft_cap * tanh_x) * LOG2_CONST
+                    x = qk / logits_soft_cap
+                    ax = tl.where(x >= 0, x, -x)
+                    z = tl.exp(-2.0 * ax)
+                    tanh_x = tl.where(x >= 0, (1 - z) / (1 + z), -(1 - z) / (1 + z))
+                    qk = logits_soft_cap * tanh_x
 
                 neg_large = -1.0e30
                 qk_masked = tl.where(s_mask, qk, neg_large)
@@ -500,7 +499,7 @@ def ragged_paged_attention_triton_call(
     compute_lse: bool = False,
 ):
     assert queries.ndim == 3 and kv_pages.ndim == 4
-    assert queries.dtype in (jnp.float16, jnp.bfloat16) and kv_pages.dtype == queries.dtype
+    assert queries.dtype in (jnp.float16, jnp.bfloat16, jnp.float32) and kv_pages.dtype == queries.dtype
     assert context_lens.dtype == jnp.int32 and block_tables.dtype == jnp.int32 and query_start_loc.dtype == jnp.int32
 
     total_tokens, num_q_heads, head_dim = map(int, queries.shape)

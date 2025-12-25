@@ -209,14 +209,16 @@ def ragged_page_attention_v2(
             num_stages=num_stages,
         ).astype(queries.dtype)
     else:
+        block_m = 128 if num_queries_per_block is None else int(num_queries_per_block)
+        block_npages = 2 if num_kv_pages_per_block is None else int(num_kv_pages_per_block)
         return ragged_paged_attention_triton_call(
             queries=queries,
             kv_pages=kv_pages,
             context_lens=context_lens,
             block_tables=block_tables,
             query_start_loc=query_start_loc,
-            block_m=num_queries_per_block,
-            block_npages=num_kv_pages_per_block,
+            block_m=block_m,
+            block_npages=block_npages,
             causal=True,
             logits_soft_cap=logits_soft_cap,
             sliding_window=sliding_window,

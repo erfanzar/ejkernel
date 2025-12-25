@@ -679,10 +679,10 @@ def _fwd_attention_kernel_call(
     if fwd_params is None:
         fwd_params = FwdParams()
 
-    default_block_m = min(128, int(q.shape[1]))
-    default_block_n = min(128, int(k.shape[1]))
-    block_m = default_block_m if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize)
-    block_n = default_block_n if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize)
+    default_block_m = max(16, min(128, int(q.shape[1])))
+    default_block_n = max(16, min(128, int(k.shape[1])))
+    block_m = default_block_m if fwd_params.q_blocksize is None else max(16, int(fwd_params.q_blocksize))
+    block_n = default_block_n if fwd_params.kv_blocksize is None else max(16, int(fwd_params.kv_blocksize))
     num_warps = 4 if fwd_params.num_warps is None else int(fwd_params.num_warps)
     num_stages = 2 if fwd_params.num_stages is None else int(fwd_params.num_stages)
 

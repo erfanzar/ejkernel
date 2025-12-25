@@ -112,6 +112,19 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
             computation, ensuring accurate pooling for variable-length sequences.
         """
 
+        # The Triton "mean_pooling" kernel is used internally for block-compression
+        # (e.g., in Native Sparse Attention) and operates on 4D inputs. The public
+        # pooling operation expects global mean pooling for 3D inputs, so default to
+        # the XLA implementation unless the user explicitly selects a platform.
+        if platform is None or platform == "auto":
+            cfg = MeanPoolingConfig(
+                block_size=cfg.block_size,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+                platform="xla",
+                backend=Backend.ANY,
+            )
+
         if platform is not None:
             cfg = MeanPoolingConfig(
                 block_size=cfg.block_size,

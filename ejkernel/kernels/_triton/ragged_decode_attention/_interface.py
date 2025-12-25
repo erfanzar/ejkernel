@@ -47,7 +47,6 @@ def ragged_decode_attention(
         sequence_start: [B] int32 (inclusive)
         sequence_end:   [B] int32 (exclusive)
         softmax_scale: logits scale
-        block_size: tile size along sequence axis
         sliding_window: optional (left, right) window; None => full attention
         logits_soft_cap: optional tanh-cap for logits
         softmax_aux: optional sinks:
@@ -60,6 +59,11 @@ def ragged_decode_attention(
 
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
+
+    if fwd_params is None:
+        fwd_params = FwdParams(kv_blocksize=256)
+    elif fwd_params.kv_blocksize is None:
+        fwd_params.kv_blocksize = 256
 
     return inner_decode_triton(
         query_tensor=query,

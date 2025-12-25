@@ -25,10 +25,14 @@ from jax import shard_map
 from jax.sharding import PartitionSpec
 
 from ejkernel.kernels import pallas, xla
+from ejkernel.ops import FwdParams
 from ejkernel.utils import numeric_gen
 
 if not any(d.platform == "tpu" for d in jax.devices()):
     pytest.skip("Pallas TPU ring attention comparison requires a TPU backend.", allow_module_level=True)
+
+
+FWD_128 = FwdParams(q_blocksize=128, kv_blocksize=128)
 
 
 class TestRingAttentionComparison:
@@ -59,16 +63,14 @@ class TestRingAttentionComparison:
             q,
             k,
             v,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_pallas = pallas.tpu.ring_attention(
             q,
             k,
             v,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         np.testing.assert_allclose(
@@ -92,8 +94,7 @@ class TestRingAttentionComparison:
             k,
             v,
             softmax_aux=softmax_aux_1d,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_pallas = pallas.tpu.ring_attention(
@@ -101,8 +102,7 @@ class TestRingAttentionComparison:
             k,
             v,
             softmax_aux=softmax_aux_1d,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         np.testing.assert_allclose(
@@ -111,40 +111,6 @@ class TestRingAttentionComparison:
             rtol=self.rtol,
             atol=self.atol,
             err_msg="Ring attention with 1D softmax_aux outputs don't match",
-        )
-
-    def test_with_softmax_aux_2d(self):
-        """Test ring attention with 2D softmax_aux."""
-        batch, seq_len, num_heads, head_dim = 2, 512, 8, 64
-        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
-
-        num_sinks = 4
-        softmax_aux_2d = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
-
-        out_xla = xla.ring_attention(
-            q,
-            k,
-            v,
-            softmax_aux=softmax_aux_2d,
-            query_chunk_size=128,
-            key_chunk_size=128,
-        )
-
-        out_pallas = pallas.tpu.ring_attention(
-            q,
-            k,
-            v,
-            softmax_aux=softmax_aux_2d,
-            query_chunk_size=128,
-            key_chunk_size=128,
-        )
-
-        np.testing.assert_allclose(
-            out_xla,
-            out_pallas,
-            rtol=self.rtol,
-            atol=self.atol,
-            err_msg="Ring attention with 2D softmax_aux outputs don't match",
         )
 
     def test_with_logits_soft_cap(self):
@@ -159,8 +125,7 @@ class TestRingAttentionComparison:
             k,
             v,
             logits_soft_cap=logits_soft_cap,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_pallas = pallas.tpu.ring_attention(
@@ -168,8 +133,7 @@ class TestRingAttentionComparison:
             k,
             v,
             logits_soft_cap=logits_soft_cap,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         np.testing.assert_allclose(
@@ -192,8 +156,7 @@ class TestRingAttentionComparison:
             k,
             v,
             sliding_window=sliding_window,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_pallas = pallas.tpu.ring_attention(
@@ -201,8 +164,7 @@ class TestRingAttentionComparison:
             k,
             v,
             sliding_window=sliding_window,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         np.testing.assert_allclose(
@@ -225,8 +187,7 @@ class TestRingAttentionComparison:
             k,
             v,
             sliding_window=sliding_window,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_pallas = pallas.tpu.ring_attention(
@@ -234,8 +195,7 @@ class TestRingAttentionComparison:
             k,
             v,
             sliding_window=sliding_window,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         np.testing.assert_allclose(
@@ -258,8 +218,7 @@ class TestRingAttentionComparison:
             k,
             v,
             sliding_window=sliding_window,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_pallas = pallas.tpu.ring_attention(
@@ -267,8 +226,7 @@ class TestRingAttentionComparison:
             k,
             v,
             sliding_window=sliding_window,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         np.testing.assert_allclose(
@@ -286,7 +244,7 @@ class TestRingAttentionComparison:
 
         sliding_window = 128
         num_sinks = 4
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
 
         out_xla = xla.ring_attention(
             q,
@@ -294,8 +252,7 @@ class TestRingAttentionComparison:
             v,
             sliding_window=sliding_window,
             softmax_aux=softmax_aux,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         out_pallas = pallas.tpu.ring_attention(
@@ -304,8 +261,7 @@ class TestRingAttentionComparison:
             v,
             sliding_window=sliding_window,
             softmax_aux=softmax_aux,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            fwd_params=FWD_128,
         )
 
         np.testing.assert_allclose(
@@ -316,54 +272,16 @@ class TestRingAttentionComparison:
             err_msg="Ring attention with sliding_window and softmax_aux outputs don't match",
         )
 
-    def test_with_attention_sinks(self):
-        """Test ring attention with attention sinks."""
-        batch, seq_len, num_heads, head_dim = 2, 512, 8, 64
-        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
-
-        sliding_window = 128
-        attention_sink_size = 8
-
-        out_xla = xla.ring_attention(
-            q,
-            k,
-            v,
-            sliding_window=sliding_window,
-            attention_sink_size=attention_sink_size,
-            query_chunk_size=128,
-            key_chunk_size=128,
-        )
-
-        out_pallas = pallas.tpu.ring_attention(
-            q,
-            k,
-            v,
-            sliding_window=sliding_window,
-            attention_sink_size=attention_sink_size,
-            query_chunk_size=128,
-            key_chunk_size=128,
-        )
-
-        np.testing.assert_allclose(
-            out_xla,
-            out_pallas,
-            rtol=self.rtol,
-            atol=self.atol,
-            err_msg="Ring attention with attention_sinks outputs don't match",
-        )
-
     def test_combined_features(self):
         """Test ring attention with all features combined."""
         batch, seq_len, num_heads, head_dim = 2, 512, 8, 64
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 4
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
 
         logits_soft_cap = 30.0
         sliding_window = (64, 128)
-        attention_sink_size = 8
-        causal_block_size = 64
 
         out_xla = xla.ring_attention(
             q,
@@ -372,10 +290,8 @@ class TestRingAttentionComparison:
             softmax_aux=softmax_aux,
             logits_soft_cap=logits_soft_cap,
             sliding_window=sliding_window,
-            attention_sink_size=attention_sink_size,
-            causal_block_size=causal_block_size,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            causal=True,
+            fwd_params=FWD_128,
         )
 
         out_pallas = pallas.tpu.ring_attention(
@@ -385,10 +301,8 @@ class TestRingAttentionComparison:
             softmax_aux=softmax_aux,
             logits_soft_cap=logits_soft_cap,
             sliding_window=sliding_window,
-            attention_sink_size=attention_sink_size,
-            causal_block_size=causal_block_size,
-            query_chunk_size=128,
-            key_chunk_size=128,
+            causal=True,
+            fwd_params=FWD_128,
         )
 
         np.testing.assert_allclose(
@@ -408,10 +322,11 @@ class TestRingAttentionComparison:
         batch, seq_len, num_heads, head_dim = 4, 1024, 32, 128
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        softmax_aux = numeric_gen(num_heads, dtype="f4") * -1.0
+        num_sinks = 4
+        softmax_aux = numeric_gen(num_sinks, dtype="f4") * -1.0
 
         out_pallas = shard_map(
-            partial(pallas.tpu.ring_attention, axis_name="sp"),
+            partial(pallas.tpu.ring_attention, axis_name="sp", fwd_params=FWD_128),
             in_specs=(
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
@@ -419,15 +334,15 @@ class TestRingAttentionComparison:
                 None,
                 None,
                 None,
-                PartitionSpec("tp"),
+                None,
             ),
             out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             mesh=self.mesh,
             check_vma=False,
-        )(q, k, v, None, None, None, softmax_aux)
+        )(q, k, v, None, None, softmax_aux, None)
 
         out_xla = shard_map(
-            partial(xla.ring_attention, axis_name="sp"),
+            partial(xla.ring_attention, axis_name="sp", fwd_params=FWD_128),
             in_specs=(
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
                 PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
@@ -435,12 +350,12 @@ class TestRingAttentionComparison:
                 None,
                 None,
                 None,
-                PartitionSpec("tp"),
+                None,
             ),
             out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             mesh=self.mesh,
             check_vma=False,
-        )(q, k, v, None, None, None, softmax_aux)
+        )(q, k, v, None, None, softmax_aux, None)
 
         assert out_pallas.shape == out_xla.shape
 
@@ -469,11 +384,11 @@ class TestRingAttentionGradientComparison:
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         def xla_loss_fn(q, k, v):
-            out = xla.ring_attention(q, k, v, query_chunk_size=128, key_chunk_size=128)
+            out = xla.ring_attention(q, k, v, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         def pallas_loss_fn(q, k, v):
-            out = pallas.tpu.ring_attention(q, k, v, query_chunk_size=128, key_chunk_size=128)
+            out = pallas.tpu.ring_attention(q, k, v, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         xla_grad_fn = jax.grad(xla_loss_fn, argnums=(0, 1, 2))
@@ -513,11 +428,11 @@ class TestRingAttentionGradientComparison:
         softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
 
         def xla_loss_fn(q, k, v):
-            out = xla.ring_attention(q, k, v, softmax_aux=softmax_aux, query_chunk_size=128, key_chunk_size=128)
+            out = xla.ring_attention(q, k, v, softmax_aux=softmax_aux, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         def pallas_loss_fn(q, k, v):
-            out = pallas.tpu.ring_attention(q, k, v, softmax_aux=softmax_aux, query_chunk_size=128, key_chunk_size=128)
+            out = pallas.tpu.ring_attention(q, k, v, softmax_aux=softmax_aux, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         xla_grad_fn = jax.grad(xla_loss_fn, argnums=(0, 1, 2))
@@ -548,50 +463,6 @@ class TestRingAttentionGradientComparison:
             err_msg="Value gradients with 1D softmax_aux don't match",
         )
 
-    def test_gradient_with_softmax_aux_2d(self):
-        """Test gradient computation with 2D softmax_aux."""
-        batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
-        q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
-
-        num_sinks = 4
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
-
-        def xla_loss_fn(q, k, v):
-            out = xla.ring_attention(q, k, v, softmax_aux=softmax_aux, query_chunk_size=128, key_chunk_size=128)
-            return jnp.mean(out**2)
-
-        def pallas_loss_fn(q, k, v):
-            out = pallas.tpu.ring_attention(q, k, v, softmax_aux=softmax_aux, query_chunk_size=128, key_chunk_size=128)
-            return jnp.mean(out**2)
-
-        xla_grad_fn = jax.grad(xla_loss_fn, argnums=(0, 1, 2))
-        dq_xla, dk_xla, dv_xla = xla_grad_fn(q, k, v)
-
-        pallas_grad_fn = jax.grad(pallas_loss_fn, argnums=(0, 1, 2))
-        dq_pallas, dk_pallas, dv_pallas = pallas_grad_fn(q, k, v)
-
-        np.testing.assert_allclose(
-            dq_xla,
-            dq_pallas,
-            rtol=self.grad_rtol,
-            atol=self.grad_atol,
-            err_msg="Query gradients with 2D softmax_aux don't match",
-        )
-        np.testing.assert_allclose(
-            dk_xla,
-            dk_pallas,
-            rtol=self.grad_rtol,
-            atol=self.grad_atol,
-            err_msg="Key gradients with 2D softmax_aux don't match",
-        )
-        np.testing.assert_allclose(
-            dv_xla,
-            dv_pallas,
-            rtol=self.grad_rtol,
-            atol=self.grad_atol,
-            err_msg="Value gradients with 2D softmax_aux don't match",
-        )
-
     def test_gradient_with_logits_soft_cap(self):
         """Test gradient computation with logit soft cap."""
         batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
@@ -600,13 +471,11 @@ class TestRingAttentionGradientComparison:
         logits_soft_cap = 30.0
 
         def xla_loss_fn(q, k, v):
-            out = xla.ring_attention(q, k, v, logits_soft_cap=logits_soft_cap, query_chunk_size=128, key_chunk_size=128)
+            out = xla.ring_attention(q, k, v, logits_soft_cap=logits_soft_cap, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         def pallas_loss_fn(q, k, v):
-            out = pallas.tpu.ring_attention(
-                q, k, v, logits_soft_cap=logits_soft_cap, query_chunk_size=128, key_chunk_size=128
-            )
+            out = pallas.tpu.ring_attention(q, k, v, logits_soft_cap=logits_soft_cap, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         xla_grad_fn = jax.grad(xla_loss_fn, argnums=(0, 1, 2))
@@ -643,7 +512,7 @@ class TestRingAttentionGradientComparison:
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 4
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
         logits_soft_cap = 30.0
 
         def xla_loss_fn(q, k, v):
@@ -653,8 +522,7 @@ class TestRingAttentionGradientComparison:
                 v,
                 softmax_aux=softmax_aux,
                 logits_soft_cap=logits_soft_cap,
-                query_chunk_size=128,
-                key_chunk_size=128,
+                fwd_params=FWD_128,
             )
             return jnp.mean(out**2)
 
@@ -665,8 +533,7 @@ class TestRingAttentionGradientComparison:
                 v,
                 softmax_aux=softmax_aux,
                 logits_soft_cap=logits_soft_cap,
-                query_chunk_size=128,
-                key_chunk_size=128,
+                fwd_params=FWD_128,
             )
             return jnp.mean(out**2)
 
@@ -706,13 +573,11 @@ class TestRingAttentionGradientComparison:
         sliding_window = 64
 
         def xla_loss_fn(q, k, v):
-            out = xla.ring_attention(q, k, v, sliding_window=sliding_window, query_chunk_size=128, key_chunk_size=128)
+            out = xla.ring_attention(q, k, v, sliding_window=sliding_window, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         def pallas_loss_fn(q, k, v):
-            out = pallas.tpu.ring_attention(
-                q, k, v, sliding_window=sliding_window, query_chunk_size=128, key_chunk_size=128
-            )
+            out = pallas.tpu.ring_attention(q, k, v, sliding_window=sliding_window, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         xla_grad_fn = jax.grad(xla_loss_fn, argnums=(0, 1, 2))
@@ -751,13 +616,11 @@ class TestRingAttentionGradientComparison:
         sliding_window = (32, 96)
 
         def xla_loss_fn(q, k, v):
-            out = xla.ring_attention(q, k, v, sliding_window=sliding_window, query_chunk_size=128, key_chunk_size=128)
+            out = xla.ring_attention(q, k, v, sliding_window=sliding_window, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         def pallas_loss_fn(q, k, v):
-            out = pallas.tpu.ring_attention(
-                q, k, v, sliding_window=sliding_window, query_chunk_size=128, key_chunk_size=128
-            )
+            out = pallas.tpu.ring_attention(q, k, v, sliding_window=sliding_window, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         xla_grad_fn = jax.grad(xla_loss_fn, argnums=(0, 1, 2))
@@ -794,7 +657,7 @@ class TestRingAttentionGradientComparison:
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 4
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
 
         def xla_attention_loss_fn(q, k, v):
             out, _ = xla.attention(
@@ -803,7 +666,7 @@ class TestRingAttentionGradientComparison:
             return jnp.mean(out**2)
 
         def xla_ring_loss_fn(q, k, v):
-            out = xla.ring_attention(q, k, v, softmax_aux=softmax_aux, query_chunk_size=128, key_chunk_size=128)
+            out = xla.ring_attention(q, k, v, softmax_aux=softmax_aux, fwd_params=FWD_128)
             return jnp.mean(out**2)
 
         xla_attention_grad_fn = jax.grad(xla_attention_loss_fn, argnums=(0, 1, 2))
