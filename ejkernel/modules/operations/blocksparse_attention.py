@@ -421,12 +421,18 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         for q_block, kv_block in block_configs:
             candidates.append(
                 BlockSparseAttentionConfig(
-                    q_blocksize=q_block,
-                    kv_blocksize=kv_block,
-                    bwd_q_blocksize=q_block * 2,
-                    bwd_kv_blocksize=kv_block * 2,
-                    num_warps=4,
-                    num_stages=2,
+                    fwd_params=FwdParams(
+                        q_blocksize=q_block,
+                        kv_blocksize=kv_block,
+                        num_warps=4,
+                        num_stages=2,
+                    ),
+                    bwd_params=BwdParams(
+                        q_blocksize=q_block * 2,
+                        kv_blocksize=kv_block * 2,
+                        num_warps=4,
+                        num_stages=2,
+                    ),
                     platform="auto",
                     backend="any",
                 )

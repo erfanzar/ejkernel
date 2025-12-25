@@ -26,6 +26,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jaxtyping
+import numpy as np
 from beartype import beartype
 from einops import rearrange
 from jax import Array
@@ -35,7 +36,8 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_mask_info as mask_info_lib,
 )
-from jaxtyping import Float, Int
+from jax.scipy.special import logsumexp
+from jaxtyping import Float, Int, PRNGKeyArray
 
 from ejkernel.ops import BwdParams, FwdParams
 
@@ -54,11 +56,45 @@ if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
+class _AttentionSinkMask(mask_lib._ComputableMask):
+    """Allows attending to the first `attention_sink_size` KV positions."""
+
+    attention_sink_size: int
+
+    def __init__(self, *, shape: tuple[int, int], attention_sink_size: int, shard_count: int = 1):
+        self.attention_sink_size = int(attention_sink_size)
+
+        def sink_mask_function(q_ids: np.ndarray, kv_ids: np.ndarray) -> np.ndarray:
+            return np.broadcast_to(kv_ids < self.attention_sink_size, (q_ids.shape[0], kv_ids.shape[1]))
+
+        super().__init__(shape=shape, mask_function=sink_mask_function, shard_count=shard_count)
+
+    def __eq__(self, other: object):
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return (
+            self.shape == other.shape
+            and self.attention_sink_size == other.attention_sink_size
+            and np.array_equal(self.q_sequence, other.q_sequence)
+        )
+
+    def __hash__(self):
+        return hash(
+            (
+                type(self),
+                self.shape,
+                self.attention_sink_size,
+                self.q_sequence.tobytes() if self.q_sequence is not None else None,
+            )
+        )
+
+
 def _build_mask(
     q_seq_len: int,
     kv_seq_len: int,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
+    attention_sink_size: int = 0,
     chunk_size: int | None = None,
 ) -> mask_lib.Mask:
     """Build a mask from attention parameters.
@@ -91,6 +127,9 @@ def _build_mask(
         else:
             window = sliding_window
         local_mask = mask_lib.LocalMask(shape=shape, window_size=window, offset=0)
+        if attention_sink_size > 0:
+            sink_size = min(int(attention_sink_size), kv_seq_len)
+            local_mask = local_mask | _AttentionSinkMask(shape=shape, attention_sink_size=sink_size)
         # Combine with AND operation
         mask = mask & local_mask
 
@@ -148,15 +187,24 @@ def ring_attention(
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-    softmax_aux: Float[Array, "num_heads"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
+    query_chunk_size: int | None = None,
+    key_chunk_size: int | None = None,
+    causal_block_size: int | None = None,
+    attention_sink_size: int = 0,
     causal: bool = False,
     logits_soft_cap: float | None = None,
     softmax_scale: float | None = None,
     axis_name: str | None = None,
+    float32_logits: bool = True,
+    deterministic: bool = True,
+    dropout_rng: PRNGKeyArray | None = None,
+    pdrop: float = 0.0,
+    prevent_cse: bool = True,
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     fused_backward: bool = False,
@@ -196,6 +244,7 @@ def ring_attention(
             "Attention bias is not supported in splash ring attention. "
             "Please remove the bias parameter or use a different kernel."
         )
+    del float32_logits, deterministic, dropout_rng, pdrop, prevent_cse, causal_block_size
 
     # Get dimensions
     _, q_len, num_heads, head_dim = query.shape
@@ -212,6 +261,12 @@ def ring_attention(
     # Create block sizes configuration
     if fwd_params is None:
         fwd_params = FwdParams(q_blocksize=min(512, q_len), kv_blocksize=min(512, kv_len))
+
+    if query_chunk_size is not None:
+        fwd_params.q_blocksize = int(query_chunk_size)
+    if key_chunk_size is not None:
+        fwd_params.kv_blocksize = int(key_chunk_size)
+
     block_sizes = _make_block_sizes(fwd_params, bwd_params)
 
     # Build mask from parameters
@@ -220,6 +275,7 @@ def ring_attention(
         kv_seq_len=kv_len,
         causal=causal,
         sliding_window=sliding_window,
+        attention_sink_size=attention_sink_size,
         chunk_size=chunk_size,
     )
 
@@ -228,12 +284,19 @@ def ring_attention(
 
     sinks = None
     if softmax_aux is not None:
-        if softmax_aux.ndim == 1 and softmax_aux.shape[0] == num_heads:
-            sinks = softmax_aux
-        elif softmax_aux.ndim == 2:
-            sinks = jnp.mean(softmax_aux, axis=-1)
+        aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
+        if aux.ndim == 1:
+            sinks = jnp.broadcast_to(logsumexp(aux), (num_heads,))
+        elif aux.ndim == 2:
+            aux_lse = logsumexp(aux, axis=-1)
+            if aux_lse.shape[0] == num_heads:
+                sinks = aux_lse
+            elif aux_lse.shape[0] == 1:
+                sinks = jnp.broadcast_to(aux_lse[0], (num_heads,))
+            else:
+                raise ValueError(f"softmax_aux has incompatible first dimension {aux.shape[0]} for {num_heads=}.")
         else:
-            sinks = jnp.broadcast_to(softmax_aux.flatten()[:num_heads], (num_heads,))
+            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}.")
 
     # Create segment IDs if provided
     segment_ids = None

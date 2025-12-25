@@ -68,9 +68,9 @@ def ragged_decode_attention(
             Applies tanh-based soft capping: logits_soft_cap * tanh(logits / logits_soft_cap).
             This prevents attention scores from becoming too large.
         softmax_aux: Optional auxiliary logits for attention sinks.
-            Shape [num_heads, num_sinks] or [num_sinks]. Concatenated to attention logits
-            before softmax to create attention sink behavior (e.g., always attending to
-            initial tokens regardless of their position).
+            Shape [num_sinks]. Concatenated to attention logits before softmax to create
+            attention sink behavior (e.g., always attending to initial tokens regardless
+            of their position).
 
     Returns:
         Output tensor of shape [batch, num_heads, head_dim] after attention.
@@ -95,7 +95,7 @@ def ragged_decode_attention(
         ... )
         >>>
         >>>
-        >>> sinks = jnp.ones((num_heads, 4)) * 5.0
+        >>> sinks = jnp.ones((4,)) * 5.0
         >>> output = ragged_decode_xla(
         ...     query, key, value,
         ...     sequence_start, sequence_end,

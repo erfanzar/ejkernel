@@ -69,6 +69,7 @@ from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
 from .native_sparse_attention import apply_native_sparse_attention
 from .page_attention import page_attention
+from .prefill_page_attention import prefill_page_attention
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
@@ -91,6 +92,7 @@ __all__ = [
     "lightning_attn",
     "mean_pooling",
     "page_attention",
+    "prefill_page_attention",
     "ragged_decode_attention",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",

@@ -314,6 +314,30 @@ def _ring_attention_fwd(
     batch, kv_len, num_heads, dim_per_head = key.shape
     numerator = jnp.zeros((batch, q_len, num_heads, dim_per_head)).astype(jnp.float32)
     denominator = jnp.zeros((batch, num_heads, q_len)).astype(jnp.float32)
+    prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(jnp.float32)
+
+    # `softmax_aux` participates in softmax normalization but does not contribute
+    # to the output. For numerical stability and parity with Splash attention, we
+    # incorporate its total exp-mass once into the initial (denominator, max).
+    if softmax_aux is not None:
+        aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
+        if aux.ndim == 1:
+            sink_lse = jax.nn.logsumexp(aux)
+            sink_lse = jnp.broadcast_to(sink_lse, (num_heads,))
+        elif aux.ndim == 2:
+            sink_lse = jax.nn.logsumexp(aux, axis=-1)
+            if sink_lse.shape[0] == 1:
+                sink_lse = jnp.broadcast_to(sink_lse[0], (num_heads,))
+            elif sink_lse.shape[0] != num_heads:
+                raise ValueError(f"softmax_aux first dim must be 1 or num_heads ({num_heads}); got {aux.shape[0]}")
+        else:
+            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}")
+
+        sink_lse = jnp.broadcast_to(sink_lse[None, :, None], (batch, num_heads, q_len))
+        has_sink = jnp.isfinite(sink_lse)
+        prev_max_score = jnp.where(has_sink, sink_lse, prev_max_score)
+        denominator = jnp.where(has_sink, jnp.ones_like(denominator), denominator)
+
     axis_size = lax.psum(1, axis_name) if axis_name is not None else 1
     q_block_size, kv_blocksize = (q_len, kv_len)
 
@@ -334,11 +358,11 @@ def _ring_attention_fwd(
             bias=bias,
             q_segment_ids=q_segment_ids,
             kv_segment_ids=kv_segment_ids,
-            softmax_aux=softmax_aux,
+            softmax_aux=None,
             softmax_scale=softmax_scale,
             query_chunk_size=query_chunk_size,
             key_chunk_size=key_chunk_size,
-            causal_block_size=causal_block_size,
+            causal_block_size=causal_block_size if causal else None,
             deterministic=deterministic,
             dropout_rng=dropout_rng,
             pdrop=pdrop,
@@ -359,7 +383,6 @@ def _ring_attention_fwd(
         )
         return (max_score, numerator, denominator, key, value), None
 
-    prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(jnp.float32)
     (max_score, numerator, denominator, _, _), _ = lax.scan(
         scan_kv_block,
         init=(prev_max_score, numerator, denominator, key, value),

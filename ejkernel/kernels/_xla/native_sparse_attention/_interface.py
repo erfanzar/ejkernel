@@ -186,8 +186,9 @@ def apply_native_sparse_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"],
-    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"]
+    | Int[Array, "batch num_kv_heads num_blocks num_selected_blocks"],
+    block_counts: Int[Array, "batch seq_len num_kv_heads"] | Int[Array, "batch num_kv_heads num_blocks"] | int = 16,
     block_size: int = 64,
     softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -204,12 +205,14 @@ def apply_native_sparse_attention(
         query: Query tensor of shape `(batch, seq_len, num_heads, head_dim)`.
         key: Key tensor of shape `(batch, seq_len, num_heads, head_dim)`.
         value: Value tensor of shape `(batch, seq_len, num_heads, head_dim)`.
-        block_indices: A tensor of shape `(batch, num_heads, num_query_blocks, num_key_blocks)`
-            specifying which key blocks each query block should attend to. Each entry
-            contains the index of a key block.
-        block_counts: Number of key blocks each query block attends to. Can be:
-            - int: uniform sparsity for all query blocks
-            - tensor [batch, num_heads, num_query_blocks]: per-block sparsity
+        block_indices: Block sparsity pattern. Supported layouts:
+            - per-token indices: `(batch, seq_len, num_kv_heads, num_selected_blocks)`
+            - per-query-block indices: `(batch, num_kv_heads, num_blocks, num_selected_blocks)`
+              where `num_blocks = ceil(seq_len / block_size)`.
+        block_counts: Number of blocks attended per query. Can be:
+            - int: uniform sparsity for all tokens
+            - per-token counts: `(batch, seq_len, num_kv_heads)`
+            - per-query-block counts: `(batch, num_kv_heads, num_blocks)`
         block_size: Size of each block (both query and key blocks).
         softmax_scale: Attention scaling factor. If None, defaults to 1/sqrt(head_dim).
 
@@ -326,8 +329,10 @@ def native_sparse_attention(
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     g_cmp: Float[Array, "batch seq_len num_q_heads"] | None = None,
     g_slc: Float[Array, "batch seq_len num_q_heads"] | None = None,
-    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"] | None = None,
-    block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
+    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"]
+    | Int[Array, "batch num_kv_heads num_blocks num_selected_blocks"]
+    | None = None,
+    block_counts: Int[Array, "batch seq_len num_kv_heads"] | Int[Array, "batch num_kv_heads num_blocks"] | int = 16,
     block_size: int = 64,
     softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -352,14 +357,18 @@ def native_sparse_attention(
         g_cmp: Optional gate tensor for compressed attention, shape `(batch_size, sequence, hidden_dim)`.
             If provided, the compressed attention component is computed.
         g_slc: Optional gate tensor for selected attention, shape `(batch_size, sequence, hidden_dim)`.
-        block_indices: Optional tensor of pre-computed block indices for selected
-            attention, shape `(batch_size, num_heads, num_query_blocks, block_counts)`.
+        block_indices: Optional tensor of pre-computed block indices for selected attention.
+            Supported layouts:
+            - per-token indices: `(batch, seq_len, num_kv_heads, num_selected_blocks)`
+            - per-query-block indices: `(batch, num_kv_heads, num_blocks, num_selected_blocks)`
+              where `num_blocks = ceil(seq_len / block_size)`.
             If `g_cmp` is provided, this argument is ignored, and block indices are
             computed dynamically via top-k selection over the compressed keys.
             If `g_cmp` is NOT provided, this argument is required.
         block_counts: Number of blocks to select for each query. Can be:
             - int: uniform sparsity for all query blocks
-            - tensor [batch, num_heads, num_query_blocks]: per-block sparsity
+            - per-token counts: `(batch, seq_len, num_kv_heads)`
+            - per-query-block counts: `(batch, num_kv_heads, num_blocks)`
             Defaults to 16.
         block_size: The size of each attention block. Defaults to 64.
         softmax_scale: Scale factor for attention scores. Defaults to `1 / sqrt(head_dim)`.

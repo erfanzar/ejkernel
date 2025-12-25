@@ -327,7 +327,7 @@ def _ring_attention_bwd(
             softmax_scale=softmax_scale,
             query_chunk_size=query_chunk_size,
             key_chunk_size=key_chunk_size,
-            causal_block_size=causal_block_size,
+            causal_block_size=causal_block_size if causal else None,
             deterministic=deterministic,
             dropout_rng=dropout_rng,
             pdrop=pdrop,

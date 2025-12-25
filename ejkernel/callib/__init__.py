@@ -27,10 +27,32 @@ Key Components:
     - Mathematical helper functions for kernel development
 """
 
+from __future__ import annotations
+
+from typing import Any, Never
+
 from ._ejit import ejit
 from ._pallas_call import buffered_pallas_call
-from ._triton_call import get_triton_type, triton_call
 from ._utils import cdiv, next_power_of_2, strides_from_shape
+
+
+def _raise_triton_unavailable(err: Exception) -> Never:
+    raise ValueError(
+        "`triton_call` is only available when GPU Triton support is installed "
+        "(install `ejkernel[gpu]` and use a CUDA/ROCm-enabled `jaxlib`)."
+    ) from err
+
+
+try:
+    from ._triton_call import get_triton_type, triton_call
+except (ImportError, ModuleNotFoundError) as _triton_import_error:  # pragma: no cover
+
+    def get_triton_type(obj: Any) -> str:  # type: ignore[override]
+        _raise_triton_unavailable(_triton_import_error)
+
+    def triton_call(*args: Any, **kwargs: Any):  # type: ignore[override]
+        _raise_triton_unavailable(_triton_import_error)
+
 
 __all__ = (
     "buffered_pallas_call",

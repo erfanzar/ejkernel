@@ -50,9 +50,15 @@ Example:
 
 from . import _cuda as cuda
 from . import _pallas as pallas
-from . import _triton as triton
 from . import _xla as xla
 from ._registry import Backend, Platform, kernel_registry
+
+try:
+    from . import _triton as triton
+except ModuleNotFoundError as err:  # pragma: no cover
+    if err.name != "triton":
+        raise
+    triton = None  # type: ignore[assignment]
 
 __all__ = (
     "Backend",

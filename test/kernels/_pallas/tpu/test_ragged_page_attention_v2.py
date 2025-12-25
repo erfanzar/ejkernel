@@ -19,11 +19,7 @@ import pytest
 
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v2._interface import ragged_page_attention_v2
 from ejkernel.kernels._pallas.tpu.ragged_page_attention_v2._pallas_impl_fwd import ref_ragged_page_attention
-
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu",
-    reason="Pallas TPU tests require TPU backend",
-)
+from ejkernel.kernels._xla.ragged_page_attention_v2 import ragged_page_attention_v2 as ragged_page_attention_v2_xla
 
 
 def _has_tpu():
@@ -33,7 +29,7 @@ def _has_tpu():
         return False
 
 
-pytestmark = pytest.mark.skipif(not _has_tpu(), reason="TPU/Pallas required")
+pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
 
 
 def _build_test_inputs(seed=0, *, with_softmax_aux=False):
@@ -122,7 +118,8 @@ class TestRaggedPageAttentionTPU:
             softmax_aux=softmax_aux,
         )
 
-        assert jnp.allclose(out[: num_seqs_arr[0]], ref_out[: num_seqs_arr[0]], rtol=0, atol=0.125)
+        assert out.shape == ref_out.shape
+        assert jnp.allclose(out, ref_out, rtol=0, atol=0.125)
 
     def test_matches_reference_with_softmax_aux(self):
         (
@@ -157,7 +154,8 @@ class TestRaggedPageAttentionTPU:
             softmax_aux=softmax_aux,
         )
 
-        assert jnp.allclose(out[: num_seqs_arr[0]], ref_out[: num_seqs_arr[0]], rtol=0, atol=0.125)
+        assert out.shape == ref_out.shape
+        assert jnp.allclose(out, ref_out, rtol=0, atol=0.125)
 
     def test_matches_reference_with_sliding_window(self):
         (
@@ -194,7 +192,8 @@ class TestRaggedPageAttentionTPU:
             sliding_window=sliding_window,
         )
 
-        assert jnp.allclose(out[: num_seqs_arr[0]], ref_out[: num_seqs_arr[0]], rtol=0, atol=0.125)
+        assert out.shape == ref_out.shape
+        assert jnp.allclose(out, ref_out, rtol=0, atol=0.125)
 
     def test_matches_reference_with_sliding_window_and_softmax_aux(self):
         (
@@ -236,4 +235,45 @@ class TestRaggedPageAttentionTPU:
             softmax_aux=softmax_aux,
         )
 
-        assert jnp.allclose(out[: num_seqs_arr[0]], ref_out[: num_seqs_arr[0]], rtol=0, atol=0.125)
+        assert out.shape == ref_out.shape
+        assert jnp.allclose(out, ref_out, rtol=0, atol=0.125)
+
+    def test_matches_xla(self):
+        (
+            queries,
+            kv_pages,
+            context_lens,
+            block_tables,
+            query_start_loc,
+            num_seqs_arr,
+            softmax_scale,
+            softmax_aux,
+        ) = _build_test_inputs(seed=4, with_softmax_aux=True)
+
+        out_tpu = ragged_page_attention_v2(
+            queries,
+            kv_pages,
+            context_lens,
+            block_tables,
+            query_start_loc,
+            num_seqs_arr,
+            softmax_scale=softmax_scale,
+            softmax_aux=softmax_aux,
+            sliding_window=32,
+            logits_soft_cap=50.0,
+        )
+        out_xla = ragged_page_attention_v2_xla(
+            queries,
+            kv_pages,
+            context_lens,
+            block_tables,
+            query_start_loc,
+            num_seqs_arr,
+            softmax_scale=softmax_scale,
+            softmax_aux=softmax_aux,
+            sliding_window=32,
+            logits_soft_cap=50.0,
+        )
+
+        assert out_tpu.shape == out_xla.shape
+        assert jnp.allclose(out_tpu, out_xla, rtol=0, atol=0.15)

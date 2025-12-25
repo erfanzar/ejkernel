@@ -18,6 +18,7 @@
 Usage:
     python test/run_tests.py
     python test/run_tests.py --xla
+    python test/run_tests.py --pallas
     python test/run_tests.py --triton
     python test/run_tests.py --comparison
     python test/run_tests.py --verbose
@@ -33,6 +34,7 @@ def main():
     """Run test suite with specified options."""
     parser = argparse.ArgumentParser(description="Run ejkernels test suite")
     parser.add_argument("--xla", action="store_true", help="Run only XLA kernel tests")
+    parser.add_argument("--pallas", action="store_true", help="Run only Pallas kernel tests")
     parser.add_argument("--triton", action="store_true", help="Run only Triton kernel tests")
     parser.add_argument("--comparison", action="store_true", help="Run only comparison tests")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
@@ -46,6 +48,8 @@ def main():
 
     if args.xla:
         pytest_args.append("test/kernels/_xla")
+    elif args.pallas:
+        pytest_args.append("test/kernels/_pallas")
     elif args.triton:
         pytest_args.append("test/kernels/_triton")
     elif args.comparison:

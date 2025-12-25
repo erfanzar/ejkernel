@@ -20,11 +20,6 @@ import pytest
 from ejkernel.kernels._pallas.tpu.page_attention import page_attention
 from ejkernel.kernels._xla.page_attention import page_attention as page_attention_xla
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu",
-    reason="Pallas TPU tests require TPU backend",
-)
-
 
 def _has_tpu():
     try:
@@ -33,7 +28,7 @@ def _has_tpu():
         return False
 
 
-pytestmark = pytest.mark.skipif(not _has_tpu(), reason="TPU/Pallas required")
+pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
 
 
 class TestPageAttentionTPU:

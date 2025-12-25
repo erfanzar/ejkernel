@@ -83,7 +83,7 @@ def _ring_attention(
                 If both q_segment_ids and kv_segment_ids are None, no segment masking is applied.
             kv_segment_ids: tp.Optional key/value segment ids array of shape (batch, kv_len).
                 If only one of q_segment_ids or kv_segment_ids is provided, it will be used for both.
-            softmax_aux: Optional attention sink logits of shape [num_heads, num_sinks] or [num_sinks].
+            softmax_aux: Optional attention sink logits of shape [num_sinks].
                 These are auxiliary logits that participate in softmax normalization but don't
                 contribute to output, allowing the model to absorb probability mass.
             axis_name: Name of the axis to ppermute over.
@@ -160,15 +160,24 @@ def ring_attention(
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-    softmax_aux: Float[Array, "num_heads"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "num_heads num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     chunk_size: int | None = None,
+    query_chunk_size: int | None = None,
+    key_chunk_size: int | None = None,
+    causal_block_size: int | None = None,
+    attention_sink_size: int = 0,
     causal: bool = False,
     logits_soft_cap: float | None = None,
     softmax_scale: float | None = None,
     axis_name: str | None = None,
+    float32_logits: bool = True,
+    deterministic: bool = True,
+    dropout_rng: PRNGKeyArray | None = None,
+    pdrop: float = 0.0,
+    prevent_cse: bool = True,
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     fused_backward: bool = False,
@@ -178,20 +187,20 @@ def ring_attention(
     if fwd_params is None:
         fwd_params = FwdParams()
 
+    default_q = min(512, query.shape[1])
+    default_k = min(512, key.shape[1])
+    qcs_default = default_q if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize)
+    kcs_default = default_k if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize)
+
     # Back-compat: `chunk_size` sets both query/key chunk sizes unless explicitly overridden.
     if chunk_size is not None:
         if query_chunk_size is None:
-            query_chunk_size = chunk_size
+            query_chunk_size = int(chunk_size)
         if key_chunk_size is None:
-            key_chunk_size = chunk_size
+            key_chunk_size = int(chunk_size)
 
-    default_q = min(512, query.shape[1])
-    default_k = min(512, key.shape[1])
-    qcs = default_q if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize)
-    kcs = default_k if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize)
-
-    qcs = qcs if query_chunk_size is None else int(query_chunk_size)
-    kcs = kcs if key_chunk_size is None else int(key_chunk_size)
+    qcs = qcs_default if query_chunk_size is None else int(query_chunk_size)
+    kcs = kcs_default if key_chunk_size is None else int(key_chunk_size)
 
     qcs = max(1, min(qcs, query.shape[1]))
     kcs = max(1, min(kcs, key.shape[1]))
@@ -205,20 +214,20 @@ def ring_attention(
         kv_segment_ids,
         softmax_aux,
         axis_name,
-        True,
+        float32_logits,
         softmax_scale,
         qcs,
         kcs,
-        None,
-        True,
-        None,
-        0,
+        causal_block_size,
+        deterministic,
+        dropout_rng,
+        pdrop,
         jnp.float32,
         jax.checkpoint_policies.nothing_saveable,
         jax.lax.Precision.DEFAULT,
-        True,
+        prevent_cse,
         sliding_window,
         logits_soft_cap,
-        0,
+        attention_sink_size,
         causal,
     )

@@ -65,7 +65,7 @@ def flash_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,
@@ -129,6 +129,21 @@ def flash_attention(
                 f"KV segment ids shape mismatch: expected ({batch_size=}, {kv_seq_len=},), got {kv_segment_ids.shape}"
             )
         segment_ids = SegmentIds(q=q_segment_ids, kv=kv_segment_ids)
+
+    if fwd_params is None:
+        fwd_params = FwdParams(
+            q_blocksize=min(512, q_seq_len),
+            kv_blocksize=min(512, kv_seq_len),
+            num_stages=2,
+            num_warps=4,
+        )
+    if bwd_params is None:
+        bwd_params = BwdParams(
+            q_blocksize=min(1024, q_seq_len),
+            kv_blocksize=min(1024, kv_seq_len),
+            num_stages=2,
+            num_warps=4,
+        )
     block_sizes = BlockSizes(
         block_q=fwd_params.q_blocksize,
         block_k_major=fwd_params.kv_blocksize,

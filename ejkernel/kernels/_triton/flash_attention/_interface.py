@@ -104,7 +104,7 @@ def _jax_fwd_attention_call(
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], tuple[Float[Array, "..."], ...]]:
@@ -127,7 +127,7 @@ def _jax_fwd_attention_call(
         cum_seqlens_k: Cumulative sequence lengths for keys in variable-length mode
         sliding_window: Window size for local attention (int or tuple of left/right)
         logits_soft_cap: Optional soft cap value for logits
-        softmax_aux: Optional attention sink logits of shape [H, num_sinks] or [num_sinks]
+        softmax_aux: Optional attention sink logits of shape [num_sinks]
 
     Returns:
         tuple: (attention_output, residuals) where residuals contain intermediate
@@ -270,7 +270,7 @@ def flash_attention_call(
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     sliding_window: int | tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
@@ -348,7 +348,7 @@ def flash_attention(
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
     normalize_output: bool = True,
     precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,
@@ -376,7 +376,7 @@ def flash_attention(
         cum_seqlens_k: Cumulative sequence lengths for keys in variable-length mode
         sliding_window: Size of local attention window for sparse patterns
         logits_soft_cap: Optional soft cap value for logits (e.g., 20.0 for Gemma)
-        softmax_aux: Optional attention sink logits of shape [H, num_sinks] or [num_sinks]
+        softmax_aux: Optional attention sink logits of shape [num_sinks]
         q_segment_ids/kv_segment_ids: Optional packed-sequence segment IDs (mask cross-segment attention)
 
     Returns:

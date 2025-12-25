@@ -96,19 +96,47 @@ class PersistentCache(Generic[Cfg]):
             If loader/dumper are not provided, automatic serialization is attempted
             for dataclasses and Pydantic models. Raw values are stored as-is.
         """
+        self._disabled = False
         if path is None:
-            path = str(pathlib.Path().home().expanduser() / "ejkernel-presistent-cache" / f"{opname}.json")
+            root = os.getenv("EJKERNEL_PERSISTENT_CACHE_DIR")
+            if root is not None:
+                path_obj = pathlib.Path(root).expanduser() / f"{opname}.json"
+            else:
+                path_obj = pathlib.Path().home().expanduser() / "ejkernel-presistent-cache" / f"{opname}.json"
+        else:
+            path_obj = pathlib.Path(path).expanduser()
 
-        pathlib.Path(os.path.dirname(os.path.abspath(path)) or ".").mkdir(exist_ok=True, parents=True)
+        # Best-effort: persistent caching is an optimization and must not crash if the
+        # default location isn't writable (e.g., sandboxed CI or read-only $HOME).
+        dir_path = path_obj.parent
+        try:
+            dir_path.mkdir(exist_ok=True, parents=True)
+        except OSError:
+            fallbacks = [
+                pathlib.Path.cwd() / ".ejkernel-presistent-cache",
+                pathlib.Path(tempfile.gettempdir()) / "ejkernel-presistent-cache",
+            ]
+            for fb in fallbacks:
+                try:
+                    fb.mkdir(exist_ok=True, parents=True)
+                    path_obj = fb / f"{opname}.json"
+                    break
+                except OSError:
+                    continue
+            else:
+                self._disabled = True
 
-        self.path = path
+        self.path = str(path_obj)
         self.loader = loader
         self.dumper = dumper
         self.cfg_type = cfg_type
+        if self._disabled:
+            self._data = {}
+            return
         try:
-            with open(path, "r") as f:
+            with open(self.path, "r") as f:
                 self._data = json.load(f)
-        except FileNotFoundError:
+        except (FileNotFoundError, PermissionError, OSError):
             self._data = {}
 
     def _key(self, device: str, op_id: str, call_key: str) -> str:
@@ -139,6 +167,8 @@ class PersistentCache(Generic[Cfg]):
             If a custom loader was provided, it will be used to deserialize
             the stored data. Otherwise, the raw JSON data is returned.
         """
+        if self._disabled:
+            return None
         raw = self._data.get(self._key(device, op_id, call_key))
         out = None if raw is None else (self.loader(raw) if self.loader else raw)
         if out is not None and isinstance(out, dict):
@@ -169,6 +199,8 @@ class PersistentCache(Generic[Cfg]):
             3. model_dump() for Pydantic v2 models
             4. Raw value (must be JSON-serializable)
         """
+        if self._disabled:
+            return
         if self.dumper is not None:
             val = self.dumper(cfg)
         else:
@@ -181,8 +213,12 @@ class PersistentCache(Generic[Cfg]):
 
         self._data[self._key(device, op_id, call_key)] = val
 
-        dir_name = os.path.dirname(os.path.abspath(self.path)) or "."
-        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False) as tmp:
-            json.dump(self._data, tmp)
-            tmp_path = tmp.name
-        os.replace(tmp_path, self.path)
+        try:
+            dir_name = os.path.dirname(os.path.abspath(self.path)) or "."
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False) as tmp:
+                json.dump(self._data, tmp)
+                tmp_path = tmp.name
+            os.replace(tmp_path, self.path)
+        except (PermissionError, OSError):
+            # Non-fatal: persistent cache is best-effort.
+            self._disabled = True

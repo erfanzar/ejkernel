@@ -24,6 +24,15 @@ Submodules:
     gpu: GPU-optimized kernels using Pallas with Triton backend
 """
 
-from . import gpu, tpu
+from . import tpu
+
+try:
+    from . import gpu
+except ModuleNotFoundError as err:  # pragma: no cover
+    if err.name not in {"triton", "jax.experimental.pallas.triton"} and not (
+        isinstance(err.name, str) and err.name.startswith("triton")
+    ):
+        raise
+    gpu = None  # type: ignore[assignment]
 
 __all__ = ("gpu", "tpu")

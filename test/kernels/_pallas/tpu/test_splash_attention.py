@@ -28,11 +28,18 @@ from ejkernel.kernels._pallas.tpu.blocksparse_attention import (
     make_chunk_attention_mask,
     make_local_attention_mask,
 )
+from ejkernel.kernels._xla.blocksparse_attention import blocksparse_attention as blocksparse_attention_xla
+from ejkernel.ops import FwdParams
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu",
-    reason="Pallas TPU tests require TPU backend",
-)
+
+def _has_tpu() -> bool:
+    try:
+        return len(jax.devices("tpu")) > 0
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
 
 
 class TestBasicFunctionality:
@@ -85,6 +92,26 @@ class TestBasicFunctionality:
 
         assert output.shape == (batch_size, num_heads, seq_len, head_dim)
         assert jnp.all(jnp.isfinite(output))
+
+    def test_numerical_correctness_vs_xla(self):
+        """Test numerical correctness against XLA fallback on a small case."""
+        key = jax.random.PRNGKey(0)
+        keys = jax.random.split(key, 3)
+
+        batch_size = 1
+        seq_len = 256
+        num_heads = 4
+        head_dim = 64
+
+        query = jax.random.normal(keys[0], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
+        key_array = jax.random.normal(keys[1], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
+        value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
+
+        out_tpu = blocksparse_attention(query=query, key=key_array, value=value, causal=True, sliding_window=64)
+        out_xla = blocksparse_attention_xla(query=query, key=key_array, value=value, causal=True, sliding_window=64)
+
+        assert out_tpu.shape == out_xla.shape
+        assert jnp.allclose(out_tpu, out_xla, rtol=0.0, atol=0.15)
 
 
 class TestSlidingWindowAttention:
@@ -340,8 +367,7 @@ class TestPerformanceTuning:
                 query=query,
                 key=key_array,
                 value=value,
-                q_blocksize=q_blocksize,
-                kv_blocksize=kv_blocksize,
+                fwd_params=FwdParams(q_blocksize=q_blocksize, kv_blocksize=kv_blocksize, num_stages=2, num_warps=4),
                 sliding_window=512,
                 causal=True,
             )
@@ -438,7 +464,8 @@ class TestSoftCapAndScale:
         key_array = jax.random.normal(keys[1], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
         value = jax.random.normal(keys[2], (batch_size, num_heads, seq_len, head_dim), dtype=jnp.bfloat16)
 
-        softmax_aux = jax.random.normal(keys[3], (batch_size, num_heads), dtype=jnp.float32)
+        num_sinks = 4
+        softmax_aux = jax.random.normal(keys[3], (num_sinks,), dtype=jnp.float32)
 
         output = blocksparse_attention(
             query=query,

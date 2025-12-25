@@ -1,11 +1,14 @@
 # ejkernels Test Suite
 
-Comprehensive test suite for ejkernels XLA and Triton implementations.
+Comprehensive test suite for ejkernels XLA, Pallas, and Triton implementations.
 
 ## Structure
 
 ```md
 test/kernels/
+├── _pallas/                # Pallas implementation tests (TPU/GPU)
+│   ├── tpu/                # TPU Pallas tests (Mosaic)
+│   └── gpu/                # GPU Pallas tests (cuDNN / Pallas+Triton)
 ├── _xla/                   # XLA implementation tests
 │   ├── test_recurrent.py       # Recurrent attention, GLA, Lightning
 │   ├── test_sparse_attention.py # Native sparse attention
@@ -30,6 +33,12 @@ python test/run_tests.py
 
 ```bash
 python test/run_tests.py --xla
+```
+
+### Pallas Tests Only
+
+```bash
+python test/run_tests.py --pallas
 ```
 
 ### Triton Tests Only
@@ -128,6 +137,10 @@ python test/run_tests.py --failfast
 - ✅ `apply_native_sparse_attention` - Custom VJP
 - ✅ `page_attention` - Inference only (no gradients tested)
 - ✅ `ragged_page_attention_v2` - Inference only
+- ✅ `prefill_page_attention` - Inference only
+- ✅ `blocksparse_attention` - Correctness vs vanilla attention
+- ✅ `scaled_dot_product_attention` - Correctness vs naive reference
+- ✅ `grouped_matmul` - Correctness vs naive reference
 
 ### Triton Implementations
 

@@ -27,10 +27,15 @@ from ejkernel.kernels import pallas
 from ejkernel.kernels._xla.attention import attention as vanilla_attention
 from ejkernel.utils import numeric_gen
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu",
-    reason="Pallas TPU tests require TPU backend",
-)
+
+def _has_tpu() -> bool:
+    try:
+        return len(jax.devices("tpu")) > 0
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
 
 
 class TestRingAttentionPallasFwd:
@@ -75,13 +80,12 @@ class TestRingAttentionPallasFwd:
         assert not jnp.any(jnp.isnan(out))
 
     def test_softmax_aux_2d(self):
-        """Test with 2D softmax_aux."""
+        """Test with 2D softmax_aux (per-head sinks)."""
         batch, seq_len, num_heads, head_dim = 2, 256, 8, 64
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 4
         softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
-
         out = pallas.tpu.ring_attention(
             q,
             k,
@@ -185,7 +189,7 @@ class TestRingAttentionPallasFwd:
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 4
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
 
         out = pallas.tpu.ring_attention(
             q,
@@ -259,7 +263,7 @@ class TestRingAttentionPallasFwd:
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 4
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
 
         out = pallas.tpu.ring_attention(
             q,
@@ -287,7 +291,7 @@ class TestRingAttentionPallasBwd:
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 2
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
 
         def loss_fn(q, k, v):
             out = pallas.tpu.ring_attention(
@@ -382,7 +386,7 @@ class TestRingAttentionPallasBwd:
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 2
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
 
         def loss_fn(q, k, v):
             out = pallas.tpu.ring_attention(
@@ -445,7 +449,7 @@ class TestRingAttentionNumericalCorrectness:
             key_chunk_size=128,
         )
 
-        out_vanilla, _ = vanilla_attention(q, k, v, causal=True)
+        out_vanilla, _ = vanilla_attention(q, k, v, causal=True, dtype=jnp.float32)
 
         assert out_ring.shape == out_vanilla.shape
         assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
@@ -501,14 +505,13 @@ class TestRingAttentionNumericalCorrectness:
         )
 
     def test_numerical_correctness_vs_vanilla_softmax_aux_2d(self):
-        """Test numerical correctness with 2D softmax_aux."""
+        """2D softmax_aux is equivalent to 1D when uniform across heads."""
         batch, seq_len, num_heads, head_dim = 2, 256, 8, 128
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 4
         softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
-
-        out_ring = pallas.tpu.ring_attention(
+        out_ring_2d = pallas.tpu.ring_attention(
             q,
             k,
             v,
@@ -517,13 +520,19 @@ class TestRingAttentionNumericalCorrectness:
             key_chunk_size=128,
         )
 
-        out_vanilla, _ = vanilla_attention(q, k, v, softmax_aux=softmax_aux)
-
-        assert out_ring.shape == out_vanilla.shape
-        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
-            f"Ring attention with 2D softmax_aux differs from vanilla. "
-            f"Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        softmax_aux_1d = softmax_aux[0]
+        out_ring_1d = pallas.tpu.ring_attention(
+            q,
+            k,
+            v,
+            softmax_aux=softmax_aux_1d,
+            query_chunk_size=128,
+            key_chunk_size=128,
         )
+        out_vanilla, _ = vanilla_attention(q, k, v, softmax_aux=softmax_aux_1d)
+
+        assert jnp.allclose(out_ring_2d, out_ring_1d, rtol=0, atol=0)
+        assert jnp.allclose(out_ring_1d, out_vanilla, rtol=1e-2, atol=1e-2)
 
     def test_numerical_correctness_vs_vanilla_logits_soft_cap(self):
         """Test numerical correctness with logit soft cap."""
@@ -555,7 +564,7 @@ class TestRingAttentionNumericalCorrectness:
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 4
-        softmax_aux = jnp.ones((num_heads, num_sinks), dtype=jnp.float32) * -2.0
+        softmax_aux = jnp.ones((num_sinks,), dtype=jnp.float32) * -2.0
         window_size = 64
         logits_soft_cap = 30.0
 
@@ -604,7 +613,8 @@ class TestRingAttentionPallasDistributed:
         batch, seq_len, num_heads, head_dim = 4, 1024, 32, 128
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
-        softmax_aux = numeric_gen(num_heads, dtype="f4") * -1.0
+        num_sinks = 4
+        softmax_aux = numeric_gen(num_sinks, dtype="f4") * -1.0
 
         out = shard_map(
             partial(pallas.tpu.ring_attention, axis_name="sp", query_chunk_size=128, key_chunk_size=128),
@@ -615,12 +625,11 @@ class TestRingAttentionPallasDistributed:
                 None,
                 None,
                 None,
-                PartitionSpec("tp"),
             ),
             out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             mesh=mesh,
             check_vma=False,
-        )(q, k, v, None, None, None, softmax_aux)
+        )(q, k, v, None, None, softmax_aux)
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
         assert not jnp.any(jnp.isnan(out))

@@ -54,6 +54,13 @@ def _ragged_paged_attention(
     else:
         padded_queries = queries
 
+    # Ensure (dynamic) per-sequence block slices never clamp out-of-bounds.
+    # We may slice/update `qblocks` rows starting at arbitrary `query_start_loc` offsets.
+    padded_queries = jnp.concatenate(
+        [padded_queries, jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=padded_queries.dtype)],
+        axis=0,
+    )
+
     attention_output = jnp.zeros_like(padded_queries)
 
     # V3 attention_sink semantics: softmax_aux has shape [num_q_heads]
@@ -77,6 +84,8 @@ def _ragged_paged_attention(
                     (q_global_start, 0, 0, 0),
                     (qblocks, num_kv_heads, q_heads_per_group, head_size),
                 )
+                valid_queries = (jax.lax.iota(jnp.int32, qblocks) + query_block_offset) < num_queries_for_seq
+                query_block = jnp.where(valid_queries[:, None, None, None], query_block, 0)
 
                 kv_cache_len_for_seq = context_lens[seq_idx]
 
@@ -168,11 +177,14 @@ def _ragged_paged_attention(
 
                 normalized_output_block = normalized_output_block.astype(padded_queries.dtype)
 
-                return jax.lax.dynamic_update_slice(
+                existing = jax.lax.dynamic_slice(
                     block_output_accumulator,
-                    normalized_output_block,
                     (q_global_start, 0, 0, 0),
+                    (qblocks, num_kv_heads, q_heads_per_group, head_size),
                 )
+                merged = jnp.where(valid_queries[:, None, None, None], normalized_output_block, existing)
+
+                return jax.lax.dynamic_update_slice(block_output_accumulator, merged, (q_global_start, 0, 0, 0))
 
             return jax.lax.fori_loop(0, num_query_blocks, _process_query_block, output_accumulator)
 

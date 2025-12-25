@@ -480,10 +480,33 @@ def ring_splash_attention(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
 ) -> jax.Array:
-    if not _has_axis(ring_axis):
-        raise ValueError(f"Ring axis '{ring_axis}' does not exist in the current context.")
-
     dq_mask_info = fwd_mask_info if block_sizes.has_backward_blocks else None
+
+    # Single-device fallback: if we're not inside a `shard_map`/`pmap` context that
+    # defines the ring axis, just run regular Splash attention on the local device.
+    if not _has_axis(ring_axis):
+        splash_segment_ids = None
+        if segment_ids is not None:
+            splash_segment_ids = splash_kernel.SegmentIds(q=segment_ids.q, kv=segment_ids.kv)
+
+        return splash_kernel._splash_attention(
+            fwd_mask_info,
+            dq_mask_info,
+            dkv_mask_info,
+            q,
+            k,
+            v,
+            splash_segment_ids,
+            sinks,
+            is_mqa=is_mqa,
+            block_sizes=block_sizes,
+            save_residuals=False,
+            mask_value=mask_value,
+            logits_soft_cap=logits_soft_cap,
+            residual_checkpoint_name=None,
+            mask_function=mask_function,
+            interpret=False,
+        )
 
     return _ring_attention_custom(
         fwd_mask_info,

@@ -21,11 +21,6 @@ from ejkernel.kernels._pallas.tpu.flash_attention import flash_attention
 from ejkernel.kernels._xla.flash_attention import flash_attention as flash_attention_xla
 from ejkernel.ops import FwdParams
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu",
-    reason="Pallas TPU tests require TPU backend",
-)
-
 
 def _has_tpu():
     try:
@@ -33,8 +28,7 @@ def _has_tpu():
     except Exception:
         return False
 
-
-pytestmark = pytest.mark.skipif(not _has_tpu(), reason="TPU/Pallas required")
+pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
 
 
 class TestFlashAttentionTPU:

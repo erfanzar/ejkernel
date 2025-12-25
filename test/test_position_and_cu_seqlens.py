@@ -1,15 +1,13 @@
 """Tests for position IDs and cu_seqlens computation in MaskInfo."""
 
-import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 
 from ejkernel.types.mask import (
     MaskInfo,
     _positions_from_segments_2d,
-    qkv_masks_to_cu_seqlens,
     cu_seqlens_to_mask,
+    qkv_masks_to_cu_seqlens,
 )
 
 
@@ -47,15 +45,19 @@ class TestPositionsFromSegments2D:
 
     def test_batched_positions(self):
         """Test with multiple batch elements."""
-        segment_ids = jnp.array([
-            [1, 1, 2, 2],
-            [1, 1, 1, -1],
-        ])
+        segment_ids = jnp.array(
+            [
+                [1, 1, 2, 2],
+                [1, 1, 1, -1],
+            ]
+        )
         positions = _positions_from_segments_2d(segment_ids, pad_value=-1)
-        expected = jnp.array([
-            [0, 1, 0, 1],  # two segments
-            [0, 1, 2, -1],  # one segment + padding
-        ])
+        expected = jnp.array(
+            [
+                [0, 1, 0, 1],  # two segments
+                [0, 1, 2, -1],  # one segment + padding
+            ]
+        )
         assert jnp.array_equal(positions, expected), f"Got {positions}, expected {expected}"
 
     def test_interleaved_padding(self):
@@ -107,17 +109,21 @@ class TestQPositionIds:
 
     def test_batched(self):
         """Test with multiple batch elements."""
-        segment_ids = jnp.array([
-            [1, 1, 1, -1],
-            [1, 1, -1, -1],
-        ])
+        segment_ids = jnp.array(
+            [
+                [1, 1, 1, -1],
+                [1, 1, -1, -1],
+            ]
+        )
         mask_info = MaskInfo.from_segments(segment_ids)
         pos = mask_info.q_position_ids
         # Valid tokens get sequential positions, padding gets -1
-        expected = jnp.array([
-            [0, 1, 2, -1],
-            [0, 1, -1, -1],
-        ])
+        expected = jnp.array(
+            [
+                [0, 1, 2, -1],
+                [0, 1, -1, -1],
+            ]
+        )
         assert jnp.array_equal(pos, expected), f"Got {pos}, expected {expected}"
 
 
@@ -129,7 +135,7 @@ class TestGetOrComputePositions:
         segment_ids = jnp.array([[1, 1, 1, 1]])
         mask_info = MaskInfo.from_segments(segment_ids)
         q_pos, kv_pos = mask_info.get_or_compute_positions()
-        
+
         expected = jnp.array([[0, 1, 2, 3]])
         assert jnp.array_equal(q_pos, expected), f"q_pos: {q_pos}, expected {expected}"
         assert jnp.array_equal(kv_pos, expected), f"kv_pos: {kv_pos}, expected {expected}"
@@ -139,7 +145,7 @@ class TestGetOrComputePositions:
         segment_ids = jnp.array([[1, 1, 2, 2]])
         mask_info = MaskInfo.from_segments(segment_ids)
         q_pos, kv_pos = mask_info.get_or_compute_positions()
-        
+
         expected = jnp.array([[0, 1, 0, 1]])
         assert jnp.array_equal(q_pos, expected), f"q_pos: {q_pos}, expected {expected}"
         assert jnp.array_equal(kv_pos, expected), f"kv_pos: {kv_pos}, expected {expected}"
@@ -149,7 +155,7 @@ class TestGetOrComputePositions:
         segment_ids = jnp.array([[1, 1, -1, -1]])
         mask_info = MaskInfo.from_segments(segment_ids)
         q_pos, _ = mask_info.get_or_compute_positions()
-        
+
         expected = jnp.array([[0, 1, -1, -1]])
         assert jnp.array_equal(q_pos, expected), f"q_pos: {q_pos}, expected {expected}"
 
@@ -158,7 +164,7 @@ class TestGetOrComputePositions:
         segment_ids = jnp.array([[1, 1, -1, -1]])
         mask_info = MaskInfo.from_segments(segment_ids)
         _, kv_pos = mask_info.get_or_compute_positions()
-        
+
         pad_val = jnp.iinfo(jnp.int32).max
         expected = jnp.array([[0, 1, pad_val, pad_val]])
         assert jnp.array_equal(kv_pos, expected), f"kv_pos: {kv_pos}, expected {expected}"
@@ -169,7 +175,7 @@ class TestGetOrComputePositions:
         kv_seg = jnp.array([[1, 1, 2, 2, -1]])  # 5 KV tokens (4 valid + 1 pad)
         mask_info = MaskInfo.from_segments(q_seg, kv_seg)
         q_pos, kv_pos = mask_info.get_or_compute_positions()
-        
+
         expected_q = jnp.array([[0, 0]])  # each in its own segment
         expected_kv = jnp.array([[0, 1, 0, 1, jnp.iinfo(jnp.int32).max]])
         assert jnp.array_equal(q_pos, expected_q), f"q_pos: {q_pos}, expected {expected_q}"
@@ -180,14 +186,10 @@ class TestGetOrComputePositions:
         segment_ids = jnp.array([[1, 1, 1, 1]])
         custom_q_pos = jnp.array([[10, 20, 30, 40]])
         custom_kv_pos = jnp.array([[100, 200, 300, 400]])
-        
-        mask_info = MaskInfo.from_segments(
-            segment_ids, 
-            q_positions=custom_q_pos,
-            kv_positions=custom_kv_pos
-        )
+
+        mask_info = MaskInfo.from_segments(segment_ids, q_positions=custom_q_pos, kv_positions=custom_kv_pos)
         q_pos, kv_pos = mask_info.get_or_compute_positions()
-        
+
         assert jnp.array_equal(q_pos, custom_q_pos), "Custom q_positions should be preserved"
         assert jnp.array_equal(kv_pos, custom_kv_pos), "Custom kv_positions should be preserved"
 
@@ -197,10 +199,12 @@ class TestCuSeqlens:
 
     def test_qkv_masks_to_cu_seqlens_basic(self):
         """Basic test for qkv_masks_to_cu_seqlens - returns start/end positions."""
-        q_mask = jnp.array([
-            [True, True, True, False],  # valid at 0-2 (start=0, end=3)
-            [True, True, False, False],  # valid at 0-1 (start=0, end=2)
-        ])
+        q_mask = jnp.array(
+            [
+                [True, True, True, False],  # valid at 0-2 (start=0, end=3)
+                [True, True, False, False],  # valid at 0-1 (start=0, end=2)
+            ]
+        )
         cu_q, cu_kv = qkv_masks_to_cu_seqlens(q_mask)
 
         # New format: [start_0, end_0, start_1, end_1]
@@ -226,10 +230,12 @@ class TestCuSeqlens:
         cu_seqlens = jnp.array([0, 3, 0, 2])  # batch 0: 0-2, batch 1: 0-1
         mask = cu_seqlens_to_mask(cu_seqlens, max_len=4)
 
-        expected = jnp.array([
-            [True, True, True, False],
-            [True, True, False, False],
-        ])
+        expected = jnp.array(
+            [
+                [True, True, True, False],
+                [True, True, False, False],
+            ]
+        )
         assert jnp.array_equal(mask, expected), f"mask: {mask}, expected {expected}"
 
     def test_cu_seqlens_to_mask_non_prefix(self):
@@ -239,25 +245,26 @@ class TestCuSeqlens:
         mask = cu_seqlens_to_mask(cu_seqlens, max_len=512)
 
         assert mask.shape == (1, 512)
-        assert mask[0, 40] == False
-        assert mask[0, 41] == True
-        assert mask[0, 168] == True
-        assert mask[0, 169] == False
+        assert not mask[0, 40]
+        assert mask[0, 41]
+        assert mask[0, 168]
+        assert not mask[0, 169]
         assert mask.sum() == 128
 
     def test_cu_seqlens_roundtrip(self):
         """Test that mask -> cu_seqlens -> mask is identity for contiguous masks."""
-        original_mask = jnp.array([
-            [True, True, True, False, False],
-            [True, True, True, True, False],
-            [True, False, False, False, False],
-        ])
+        original_mask = jnp.array(
+            [
+                [True, True, True, False, False],
+                [True, True, True, True, False],
+                [True, False, False, False, False],
+            ]
+        )
 
         cu_q, _ = qkv_masks_to_cu_seqlens(original_mask)
         reconstructed = cu_seqlens_to_mask(cu_q, max_len=5)
 
-        assert jnp.array_equal(reconstructed, original_mask), \
-            f"Roundtrip failed: {reconstructed} vs {original_mask}"
+        assert jnp.array_equal(reconstructed, original_mask), f"Roundtrip failed: {reconstructed} vs {original_mask}"
 
     def test_cu_seqlens_roundtrip_non_prefix(self):
         """Test roundtrip for masks with non-prefix valid tokens."""
@@ -269,8 +276,7 @@ class TestCuSeqlens:
         cu_q, _ = qkv_masks_to_cu_seqlens(original_mask)
         reconstructed = cu_seqlens_to_mask(cu_q, max_len=512)
 
-        assert jnp.array_equal(reconstructed, original_mask), \
-            f"Roundtrip failed for non-prefix masks"
+        assert jnp.array_equal(reconstructed, original_mask), "Roundtrip failed for non-prefix masks"
 
 
 class TestMaskInfoCuSeqlens:
@@ -279,10 +285,12 @@ class TestMaskInfoCuSeqlens:
     def test_from_segment_ids(self):
         """Test cu_seqlens computation from segment IDs."""
         # Both batch elements use segment ID 1, so they count as a single segment
-        segment_ids = jnp.array([
-            [1, 1, 1, -1],  # 3 tokens with segment ID 1
-            [1, 1, -1, -1],  # 2 tokens with segment ID 1
-        ])
+        segment_ids = jnp.array(
+            [
+                [1, 1, 1, -1],  # 3 tokens with segment ID 1
+                [1, 1, -1, -1],  # 2 tokens with segment ID 1
+            ]
+        )
         mask_info = MaskInfo.from_segments(segment_ids)
         cu_q, cu_kv = mask_info.get_or_compute_qkv_cu_seqlens(max_segments=4)
 
@@ -337,9 +345,11 @@ class TestMaskInfoCuSeqlens:
     def test_q_lens_kv_lens_properties(self):
         """Test q_lens and kv_lens properties (computed from cu_seqlens)."""
         # Use segment IDs 0, 1, 2 to get proper cumulative offsets
-        segment_ids = jnp.array([
-            [0, 0, 0, 1, 1, -1],  # 3 tokens seg0, 2 tokens seg1
-        ])
+        segment_ids = jnp.array(
+            [
+                [0, 0, 0, 1, 1, -1],  # 3 tokens seg0, 2 tokens seg1
+            ]
+        )
         mask_info = MaskInfo.from_segments(segment_ids)
 
         q_lens = mask_info.q_lens
@@ -373,7 +383,7 @@ class TestEdgeCases:
         """Test with batch size 0 (edge case)."""
         segment_ids = jnp.zeros((0, 4), dtype=jnp.int32)
         mask_info = MaskInfo.from_segments(segment_ids)
-        
+
         # Should handle empty batch gracefully
         q_pos, kv_pos = mask_info.get_or_compute_positions()
         assert q_pos.shape == (0, 4)
@@ -390,7 +400,7 @@ class TestEdgeCases:
         assert jnp.array_equal(q_pos, expected)
         assert jnp.array_equal(kv_pos, expected)
 
-        cu_q, cu_kv = mask_info.get_or_compute_qkv_cu_seqlens(max_segments=2)
+        cu_q, _cu_kv = mask_info.get_or_compute_qkv_cu_seqlens(max_segments=2)
         # Cumulative format: segment 0 has 2 tokens total (1 from each batch element)
         # With max_segments=2, output has size 3: [0, 2, 2]
         expected_cu = jnp.array([0, 2, 2])
@@ -409,7 +419,7 @@ class TestEdgeCases:
         assert jnp.array_equal(q_pos, expected_q), f"q_pos: {q_pos}"
         assert jnp.array_equal(kv_pos, expected_kv), f"kv_pos: {kv_pos}"
 
-        cu_q, cu_kv = mask_info.get_or_compute_qkv_cu_seqlens(max_segments=2)
+        cu_q, _cu_kv = mask_info.get_or_compute_qkv_cu_seqlens(max_segments=2)
         # All padding: no valid segment IDs, all counts are 0
         # With max_segments=2, output has size 3: [0, 0, 0]
         expected_cu = jnp.array([0, 0, 0])
@@ -419,8 +429,8 @@ class TestEdgeCases:
         """Test with large segment ID values."""
         segment_ids = jnp.array([[1000, 1000, 2000, 2000]])
         mask_info = MaskInfo.from_segments(segment_ids)
-        
-        q_pos, kv_pos = mask_info.get_or_compute_positions()
+
+        q_pos, _kv_pos = mask_info.get_or_compute_positions()
         expected = jnp.array([[0, 1, 0, 1]])
         assert jnp.array_equal(q_pos, expected)
 
@@ -428,8 +438,8 @@ class TestEdgeCases:
         """Test with non-contiguous segment IDs (e.g., 1, 3, 5)."""
         segment_ids = jnp.array([[1, 1, 5, 5, 3, 3]])
         mask_info = MaskInfo.from_segments(segment_ids)
-        
-        q_pos, kv_pos = mask_info.get_or_compute_positions()
+
+        q_pos, _kv_pos = mask_info.get_or_compute_positions()
         expected = jnp.array([[0, 1, 0, 1, 0, 1]])
         assert jnp.array_equal(q_pos, expected)
 

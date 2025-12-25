@@ -31,7 +31,11 @@ from typing import Literal, overload
 import jax
 import numpy
 import numpy as np
-import triton
+
+try:
+    import triton  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    triton = None  # type: ignore[assignment]
 from jax import Array
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
@@ -42,7 +46,7 @@ DEBUG_GLOBAL_RNG = None
 
 CDNA_ARCHS = ["gfx940", "gfx941", "gfx942", "gfx90a", "gfx908"]
 RDNA_ARCHS = ["gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"]
-Layouts: tp.TypeAlias = Literal["bhsd", "bshd", "thd"]
+Layouts: type = Literal["bhsd", "bshd", "thd"]
 
 
 @overload
@@ -165,7 +169,7 @@ def safe_autotune(
         ...     pass
     """
     try:
-        from triton.runtime.autotuner import Autotuner
+        from triton.runtime.autotuner import Autotuner  # type:ignore
 
         def decorator(fn):
             try:
@@ -347,6 +351,8 @@ def is_hip():
     Returns:
         True if the current Triton target uses HIP backend, False otherwise.
     """
+    if triton is None:
+        return False
     try:
         return triton.runtime.driver.active.get_current_target().backend == "hip"
     except Exception:
@@ -362,6 +368,8 @@ def is_cdna():
     Returns:
         True if running on CDNA architecture (gfx940, gfx941, etc.), False otherwise.
     """
+    if triton is None:
+        return False
     try:
         return is_hip() and triton.runtime.driver.active.get_current_target().arch in CDNA_ARCHS
     except Exception:
@@ -377,6 +385,8 @@ def is_rdna():
     Returns:
         True if running on RDNA architecture (gfx1030, gfx1100, etc.), False otherwise.
     """
+    if triton is None:
+        return False
     try:
         return is_hip() and triton.runtime.driver.active.get_current_target().arch in RDNA_ARCHS
     except Exception:
@@ -405,7 +415,7 @@ def calculate_blocksize_and_wraps(n):
         (16384, 16)
     """
     MAX_FUSED_SIZE = 65536
-    BLOCK_SIZE = triton.next_power_of_2(n)
+    BLOCK_SIZE = next_power_of_2(n)
     if BLOCK_SIZE > MAX_FUSED_SIZE:
         raise RuntimeError()
     num_warps = 4
@@ -573,6 +583,8 @@ def is_fp8(x):
 @functools.cache
 def get_gpu_arch() -> str:
     """Get current GPU architecture."""
+    if triton is None:
+        return ""
     try:
         return triton.runtime.driver.active.get_current_target().arch
     except Exception:

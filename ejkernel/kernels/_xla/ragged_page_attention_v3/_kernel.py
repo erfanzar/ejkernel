@@ -18,7 +18,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax._src import dtypes
 
 from ejkernel.callib import ejit
 
@@ -31,7 +30,7 @@ def cdiv(a, b):
 
 
 def get_dtype_bitwidth(dtype):
-    return dtypes.bit_width(dtype)
+    return jnp.dtype(dtype).itemsize * 8
 
 
 def get_dtype_packing(dtype):

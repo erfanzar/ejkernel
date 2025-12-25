@@ -102,6 +102,13 @@ def _normalize_softmax_aux(
         return None
     aux = jnp.asarray(softmax_aux, dtype=dtype)
     if aux.ndim == 1:
+        # For block-sparse (Splash) attention, `softmax_aux` acts like a per-head
+        # attention sink logit (i.e. one extra "sink" entry per head).
+        if aux.shape[0] == num_heads:
+            return aux[:, None]
+        if aux.shape[0] == num_kv_heads:
+            reps = num_heads // num_kv_heads
+            return jnp.repeat(aux, repeats=reps, axis=0)[:, None]
         return jnp.broadcast_to(aux[None, :], (num_heads, aux.shape[0]))
     if aux.ndim == 2:
         if aux.shape[0] == num_heads:
@@ -223,7 +230,8 @@ def blocksparse_attention(
     k = key
     v = value
 
-    logits = jnp.einsum("bhrqd,bhkd->bhrqk", q, k, optimize=True) * jnp.asarray(softmax_scale, dtype=query.dtype)
+    scale = jnp.asarray(softmax_scale, dtype=q.dtype)
+    logits = jnp.einsum("bhrqd,bhkd->bhrqk", q * scale, k, optimize=True)
 
     if logits_soft_cap is not None:
         cap = jnp.asarray(logits_soft_cap, dtype=logits.dtype)

@@ -29,6 +29,53 @@ from jaxtyping import Array, Bool, DTypeLike, Float, PRNGKeyArray
 from ..._registry import Backend, Platform, kernel_registry
 
 
+def _normalize_softmax_aux(
+    softmax_aux: Float[Array, "..."] | None,
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    dtype: jnp.dtype,
+) -> Float[Array, "num_kv_heads num_reps num_sinks"] | None:
+    """Normalize `softmax_aux` into per-(kv_head, rep) sink logits.
+
+    Supports:
+      - 1D: (num_sinks,) shared across heads
+      - 1D: (num_q_heads,) or (num_kv_heads,) interpreted as per-head single sink
+      - 2D: (num_q_heads, num_sinks) or (num_kv_heads, num_sinks)
+    """
+    if softmax_aux is None:
+        return None
+
+    aux = jnp.asarray(softmax_aux, dtype=dtype)
+    num_reps = num_q_heads // num_kv_heads
+
+    if aux.ndim == 1:
+        # Heuristic: if length matches head count, treat as per-head single sink.
+        if aux.shape[0] == num_q_heads:
+            per_head = aux[:, None]
+        elif aux.shape[0] == num_kv_heads:
+            per_head = jnp.repeat(aux, repeats=num_reps, axis=0)[:, None]
+        else:
+            per_head = jnp.broadcast_to(aux[None, :], (num_q_heads, aux.shape[0]))
+        return per_head.reshape(num_kv_heads, num_reps, per_head.shape[-1])
+
+    if aux.ndim == 2:
+        if aux.shape[0] == num_q_heads:
+            per_head = aux
+        elif aux.shape[0] == num_kv_heads:
+            per_head = jnp.repeat(aux, repeats=num_reps, axis=0)
+        elif aux.shape[0] == 1:
+            per_head = jnp.broadcast_to(aux, (num_q_heads, aux.shape[1]))
+        else:
+            raise ValueError(
+                f"softmax_aux first dim must be 1, num_kv_heads ({num_kv_heads}) or num_q_heads"
+                f" ({num_q_heads}); got {aux.shape[0]}"
+            )
+        return per_head.reshape(num_kv_heads, num_reps, per_head.shape[-1])
+
+    raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}")
+
+
 @kernel_registry.register("attention", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def attention(
@@ -40,7 +87,7 @@ def attention(
     init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
     dropout_rng: PRNGKeyArray | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | Float[Array, "heads num_sinks"] | None = None,
     softmax_scale: float | None = None,
     logits_soft_cap: float | None = None,
     dtype: DTypeLike | None = jnp.bfloat16,
@@ -74,7 +121,7 @@ def attention(
         deterministic: If True, disables dropout (default). If False, applies dropout.
         dropout_rng: JAX PRNG key for dropout. Required when deterministic=False
             and dropout_prob > 0 in metadata.
-        softmax_aux: Optional auxiliary tensor for softmax computation.
+        softmax_aux: Optional attention sink logits of shape [num_sinks].
         softmax_scale: Optional float for scaling attention scores. If None, uses 1/sqrt(head_dim).
         logits_soft_cap: Optional float for capping attention logits using tanh.
             When specified, applies: logits_soft_cap * tanh(logits / logits_soft_cap).
@@ -175,15 +222,12 @@ def attention(
         aw = jnp.where(attention_mask, aw, jnp.finfo(aw.dtype).min)
 
     if softmax_aux is not None:
-        if softmax_aux.ndim == 1:
-            sinks = softmax_aux.reshape(1, kh, num_reps, 1, 1)
-        else:
-            num_sinks = softmax_aux.shape[-1]
-            sinks = softmax_aux.reshape(1, kh, num_reps, 1, num_sinks)
-        sinks = jnp.broadcast_to(sinks, (b, kh, num_reps, qs, sinks.shape[-1]))
+        aux = _normalize_softmax_aux(softmax_aux, num_q_heads=qh, num_kv_heads=kh, dtype=aw.dtype)
+        sinks = jnp.broadcast_to(aux[None, :, :, None, :], (b, kh, num_reps, qs, aux.shape[-1]))
         combined_logits = jnp.concatenate([aw, sinks], axis=-1)
+        combined_logits = combined_logits.astype(softmax_dtype)
         combined_logits = combined_logits - jnp.max(combined_logits, axis=-1, keepdims=True)
-        probs = jax.nn.softmax(combined_logits.astype(softmax_dtype), axis=-1).astype(dtype)
+        probs = jax.nn.softmax(combined_logits, axis=-1).astype(dtype)
         aw = probs[..., :ks]
     else:
         aw = jax.nn.softmax(aw.astype(softmax_dtype), axis=-1).astype(dtype)

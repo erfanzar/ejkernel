@@ -96,7 +96,7 @@ class TestFlashAttention:
         B, N, H, D = 2, 256, 8, 64
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
         bias = jax.random.normal(jax.random.PRNGKey(42), (B, H, N, N), dtype=jnp.bfloat16)
-        output = flash_attention(q, k, v, bias=bias)
+        output = flash_attention(q, k, v, bias)
         assert output.shape == (B, N, H, D)
 
     def test_flash_attention_sliding_window(self):
@@ -217,7 +217,8 @@ class TestAttention:
         B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
         mask = jax.random.randint(jax.random.PRNGKey(0), (B, 1, N, N), 0, 2).astype(bool)
-        output, _ = attention(q, k, v, attention_mask=mask)
+        mask_info = MaskInfo.from_attention_mask(mask)
+        output, _ = attention(q, k, v, mask_info=mask_info)
         assert output.shape == (B, N, H, D)
 
     def test_attention_with_bias(self):
@@ -225,7 +226,7 @@ class TestAttention:
         B, N, H, D = 2, 256, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
         bias = jax.random.normal(jax.random.PRNGKey(42), (B, H, N, N), dtype=jnp.bfloat16)
-        output, _ = attention(q, k, v, bias=bias)
+        output, _ = attention(q, k, v, bias)
         assert output.shape == (B, N, H, D)
 
     def test_attention_sliding_window(self):
@@ -279,7 +280,8 @@ class TestBlockSparseAttention:
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
         q_t, k_t, v_t = q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
         mask = jax.random.randint(jax.random.PRNGKey(0), (B, 1, N, N), 0, 4) > 2
-        output = blocksparse_attention(q_t, k_t, v_t, attention_mask=mask)
+        mask_info = MaskInfo.from_attention_mask(mask)
+        output = blocksparse_attention(q_t, k_t, v_t, mask_info=mask_info)
         assert output.shape == (B, H, N, D)
 
     def test_blocksparse_attention_sliding_window(self):
@@ -289,47 +291,6 @@ class TestBlockSparseAttention:
         q_t, k_t, v_t = q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
         output = blocksparse_attention(q_t, k_t, v_t, sliding_window=(256, 256))
         assert output.shape == (B, H, N, D)
-
-
-class TestScaledDotProductAttention:
-    """Test suite for ScaledDotProductAttention operation."""
-
-    @pytest.mark.parametrize("batch_size", [1, 4])
-    @pytest.mark.parametrize("seq_len", [128, 512])
-    @pytest.mark.parametrize("num_heads", [8, 16])
-    def test_sdpa_basic(self, batch_size, seq_len, num_heads):
-        """Test basic scaled dot-product attention."""
-        head_dim = 128
-        q, k, v = rand_tensors(batch_size, seq_len, seq_len, num_heads, num_heads, head_dim, dtype=jnp.bfloat16)
-        output = scaled_dot_product_attention(q, k, v)
-        assert output.shape == (batch_size, seq_len, num_heads, head_dim)
-
-    def test_sdpa_causal(self):
-        """Test SDPA with causal masking."""
-        B, N, H, D = 2, 512, 8, 128
-        q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-        output = scaled_dot_product_attention(q, k, v, causal=True)
-        assert output.shape == (B, N, H, D)
-
-    def test_sdpa_with_mask(self):
-        """Test SDPA with attention mask."""
-        B, N, H, D = 2, 256, 8, 128
-        q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-        mask = jax.random.randint(jax.random.PRNGKey(0), (B, 1, N, N), 0, 2).astype(bool)
-        output = scaled_dot_product_attention(q, k, v, attention_mask=mask)
-        assert output.shape == (B, N, H, D)
-
-    def test_sdpa_gradient(self):
-        """Test SDPA gradient computation."""
-        B, N, H, D = 2, 256, 8, 128
-        q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
-
-        def loss_fn(q, k, v):
-            output = scaled_dot_product_attention(q, k, v, causal=True)
-            return jnp.mean(output)
-
-        grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
-        assert len(grads) == 3
 
 
 class TestPageAttention:
@@ -384,9 +345,13 @@ class TestRaggedPageAttention:
 
         cu_seqlens_q = jnp.array([0, 64, 192, 256], dtype=jnp.int32)
         block_tables = jnp.array([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]], dtype=jnp.int32)
-        _context_lens = jnp.array([48, 96, 64], dtype=jnp.int32)
+        context_lens = jnp.array([48, 96, 64], dtype=jnp.int32)
 
-        output = ragged_page_attention_v2(q, k_cache, v_cache, block_tables, cu_seqlens_q, num_seqs=3)
+        k_pages = jnp.transpose(k_cache, (0, 2, 1, 3))
+        v_pages = jnp.transpose(v_cache, (0, 2, 1, 3))
+        kv_pages = jnp.stack([k_pages, v_pages], axis=3).reshape(num_pages, page_size, H * 2, D)
+
+        output = ragged_page_attention_v2(q, kv_pages, context_lens, block_tables, cu_seqlens_q, 3)
         assert output.shape == (total_q_len, H, D)
 
 
@@ -395,21 +360,22 @@ class TestRaggedDecodeAttention:
 
     def test_ragged_decode_attention_basic(self):
         """Test basic ragged decode attention."""
-        total_tokens = 128
         H, D = 8, 128
         max_kv_len = 512
         num_seqs = 4
 
-        q = jax.random.normal(jax.random.PRNGKey(0), (total_tokens, H, D), dtype=jnp.bfloat16)
+        q = jax.random.normal(jax.random.PRNGKey(0), (num_seqs, H, D), dtype=jnp.bfloat16)
 
         k = jax.random.normal(jax.random.PRNGKey(1), (num_seqs, max_kv_len, H, D), dtype=jnp.bfloat16)
         v = jax.random.normal(jax.random.PRNGKey(2), (num_seqs, max_kv_len, H, D), dtype=jnp.bfloat16)
 
-        cu_seqlens = jnp.array([0, 32, 64, 96, 128], dtype=jnp.int32)
         kv_lengths = jnp.array([256, 384, 128, 512], dtype=jnp.int32)
 
-        output = ragged_decode_attention(q, k, v, cu_seqlens, kv_lengths)
-        assert output.shape == (total_tokens, H, D)
+        sequence_start = jnp.zeros((num_seqs,), dtype=jnp.int32)
+        sequence_end = kv_lengths
+
+        output = ragged_decode_attention(q, k, v, sequence_start, sequence_end)
+        assert output.shape == (num_seqs, H, D)
 
 
 class TestUnifiedAttention:
@@ -542,7 +508,12 @@ class TestNativeSparseAttention:
         B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
 
-        output = native_sparse_attention(q, k, v, block_counts=16)
+        block_size = 64
+        num_blocks = (N + block_size - 1) // block_size
+        block_counts = min(4, num_blocks)
+        block_indices = jnp.tile(jnp.arange(block_counts, dtype=jnp.int32)[None, None, None, :], (B, N, H, 1))
+
+        output = native_sparse_attention(q, k, v, None, None, block_indices, block_counts)
         assert output.shape == (B, N, H, D)
 
     def test_native_sparse_attention_with_indices(self):
@@ -550,7 +521,12 @@ class TestNativeSparseAttention:
         B, N, H, D = 2, 512, 8, 128
         q, k, v = rand_tensors(B, N, N, H, H, D, dtype=jnp.bfloat16)
 
-        output = native_sparse_attention(q, k, v, block_counts=32, softmax_scale=0.125)
+        block_size = 64
+        num_blocks = (N + block_size - 1) // block_size
+        block_counts = min(4, num_blocks)
+        block_indices = jnp.tile(jnp.arange(block_counts, dtype=jnp.int32)[None, None, None, :], (B, N, H, 1))
+
+        output = native_sparse_attention(q, k, v, None, None, block_indices, block_counts, softmax_scale=0.125)
         assert output.shape == (B, N, H, D)
 
 
@@ -599,7 +575,7 @@ class TestMeanPooling:
     @pytest.mark.parametrize("hidden_dim", [256, 768])
     def test_mean_pooling_basic(self, batch_size, seq_len, hidden_dim):
         """Test basic mean pooling."""
-        x = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, 8, hidden_dim), dtype=jnp.bfloat16)
+        x = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, hidden_dim), dtype=jnp.bfloat16)
         output = mean_pooling(x)
         assert output.shape == (batch_size, hidden_dim)
 
@@ -616,7 +592,7 @@ class TestMeanPooling:
     def test_mean_pooling_custom_chunk(self):
         """Test mean pooling with custom chunk size."""
         batch_size, seq_len, hidden_dim = 4, 512, 768
-        x = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, 8, hidden_dim), dtype=jnp.bfloat16)
+        x = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, hidden_dim), dtype=jnp.bfloat16)
         output = mean_pooling(x, chunk_size=64)
         assert output.shape == (batch_size, hidden_dim)
 

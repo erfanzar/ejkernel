@@ -94,7 +94,7 @@ def _grouped_matmul_bwd(
     interpret: bool,
     residual: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, int],
     grad: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, None, None, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, None, None]:
     """Backward pass for grouped matrix multiplication with custom VJP.
 
     Computes gradients with respect to lhs and rhs using the gradient of the
@@ -116,7 +116,6 @@ def _grouped_matmul_bwd(
             - grad_rhs: Gradient w.r.t. rhs, same shape as original rhs
             - None: Placeholder for group_sizes gradient (non-differentiable)
             - None: Placeholder for group_offset gradient (non-differentiable)
-            - grad: Pass-through gradient for existing_out
     """
 
     del preferred_element_type
@@ -145,7 +144,7 @@ def _grouped_matmul_bwd(
     )
 
     grad_rhs = grad_rhs.swapaxes(1, 2) if transpose_rhs else grad_rhs
-    return grad_lhs, grad_rhs, None, None, grad
+    return grad_lhs, grad_rhs, None, None
 
 
 _back_grouped_matmul.defvjp(_grouped_matmul_fwd, _grouped_matmul_bwd)

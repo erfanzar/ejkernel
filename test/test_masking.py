@@ -20,7 +20,6 @@ import pytest
 
 from ejkernel.types.mask import (
     MaskInfo,
-    attention_mask_to_qkv_cu_seqlens,
     cu_seqlens_to_mask,
     mask_to_segment_ids,
     qkv_masks_to_cu_seqlens,
@@ -415,10 +414,10 @@ def test_maskinfo_apply_causal_per_batch_offsets():
 
     # Batch 0: position 3 attends to [0,1,2,3] (offset=0)
     # Batch 1: position 3 attends to [0,1,2,3,4] (offset=1)
-    assert causal.attention_mask[0, 0, 3, 3] == True
-    assert causal.attention_mask[0, 0, 3, 4] == False
-    assert causal.attention_mask[1, 0, 3, 3] == True
-    assert causal.attention_mask[1, 0, 3, 4] == True
+    assert causal.attention_mask[0, 0, 3, 3]
+    assert not causal.attention_mask[0, 0, 3, 4]
+    assert causal.attention_mask[1, 0, 3, 3]
+    assert causal.attention_mask[1, 0, 3, 4]
 
     print("  ✓ apply_causal per-batch offsets (JIT): OK")
 
@@ -463,12 +462,12 @@ def test_maskinfo_apply_sliding_window_right_window():
 
     # Row i=3 can attend to [3-2, 3+1] = [1, 4]
     row3 = attn[3]
-    assert row3[0] == False  # Position 0 outside window
-    assert row3[1] == True  # Left boundary
-    assert row3[2] == True
-    assert row3[3] == True
-    assert row3[4] == True  # Right boundary
-    assert row3[5] == False  # Outside window
+    assert not row3[0]  # Position 0 outside window
+    assert row3[1]  # Left boundary
+    assert row3[2]
+    assert row3[3]
+    assert row3[4]  # Right boundary
+    assert not row3[5]  # Outside window
 
     print("  ✓ apply_sliding_window right_window (JIT): OK")
 
@@ -851,11 +850,11 @@ def test_maskinfo_from_segments_is_attn_mask():
     att = mask_info.attention_mask[0, 0]
     assert att.shape == (4, 4)
     # Valid positions should attend to each other
-    assert att[0, 0] == True and att[0, 1] == True
+    assert att[0, 0] and att[0, 1]
     # Valid shouldn't attend to padding
-    assert att[0, 2] == False and att[0, 3] == False
+    assert not att[0, 2] and not att[0, 3]
     # Padding shouldn't attend
-    assert att[2, 0] == False and att[2, 2] == False
+    assert not att[2, 0] and not att[2, 2]
 
     print("  ✓ from_segments with is_attn_mask=True (JIT): OK")
 
@@ -981,7 +980,7 @@ def test_is_self_attention_no_lazy_compute():
     result = mask_info.is_self_attention()
 
     # With square mask, it's considered self-attention
-    assert result == True
+    assert result
 
     # Verify segment IDs were NOT computed (no side effect)
     assert mask_info._q_segment_ids is None
@@ -1064,19 +1063,19 @@ def test_is_self_attention_with_segment_ids():
     # Self-attention: same q and kv segments
     q_seg = jnp.array([[1, 1, 2, 2]])
     mask_info_self = MaskInfo.from_segments(q_seg)
-    assert mask_info_self.is_self_attention() == True
+    assert mask_info_self.is_self_attention()
 
     # Cross-attention: different q and kv segments
     q_seg = jnp.array([[1, 2]])
     kv_seg = jnp.array([[1, 1, 2, 2]])
     mask_info_cross = MaskInfo.from_segments(q_seg, kv_seg)
-    assert mask_info_cross.is_self_attention() == False
+    assert not mask_info_cross.is_self_attention()
 
     # Same shape but different values - not self-attention
     q_seg = jnp.array([[1, 1, 2, 2]])
     kv_seg = jnp.array([[2, 2, 1, 1]])
     mask_info_diff = MaskInfo.from_segments(q_seg, kv_seg)
-    assert mask_info_diff.is_self_attention() == False
+    assert not mask_info_diff.is_self_attention()
 
     print("  ✓ is_self_attention correctness: OK")
 

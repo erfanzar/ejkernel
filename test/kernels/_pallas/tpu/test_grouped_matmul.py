@@ -20,11 +20,6 @@ import pytest
 from ejkernel.kernels._pallas.tpu.grouped_matmul import grouped_matmul
 from ejkernel.kernels._xla.grouped_matmul import grouped_matmul as grouped_matmul_xla
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu",
-    reason="Pallas TPU tests require TPU backend",
-)
-
 
 def _has_tpu():
     try:
@@ -33,7 +28,7 @@ def _has_tpu():
         return False
 
 
-pytestmark = pytest.mark.skipif(not _has_tpu(), reason="TPU/Pallas required")
+pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
 
 
 def naive_grouped_matmul_reference(

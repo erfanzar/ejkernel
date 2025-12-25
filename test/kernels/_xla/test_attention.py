@@ -36,7 +36,7 @@ def naive_attention_with_window(q, k, v, softmax_scale=None, sliding_window=None
         k = jnp.repeat(k, num_reps, axis=2)
         v = jnp.repeat(v, num_reps, axis=2)
 
-    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) * softmax_scale
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q * softmax_scale, k)
 
     if sliding_window is not None:
         if isinstance(sliding_window, int):

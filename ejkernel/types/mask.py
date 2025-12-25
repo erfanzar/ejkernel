@@ -1977,6 +1977,7 @@ class MaskInfo:
         kv_lengths: Int[Array, "batch"],
         *,
         q_len: int | None = None,
+        end_index: Int[Array, "batch"] | None = None,
         sliding_window: int | None = None,
     ) -> "MaskInfo":
         """
@@ -1993,6 +1994,8 @@ class MaskInfo:
             kv_lengths: Integer array of shape (batch,) with the number of valid KV tokens per batch element.
                 The implementation assumes kv_lengths[b] >= q_len and does not clamp indices.
             q_len: Number of query rows to keep. Must be specified and should be <= kv_lengths[b] for all b.
+            end_index: Per-example exclusive end index into the query dimension used to slice the trailing
+                query window. Required when q_len is provided.
             sliding_window: Optional maximum number of KV columns to retain after masking. If None, keeps all
                 remaining KV positions.
 
@@ -2006,15 +2009,20 @@ class MaskInfo:
 
         if q_len is None:
             raise ValueError("q_len must be provided.")
+        if end_index is None:
+            raise ValueError("end_index must be provided when slicing queries.")
 
         attn = self.get_or_compute_attention_mask(dtype=jnp.bool_)
         B, _H, Q, K = attn.shape
         kv_lengths = jnp.asarray(kv_lengths, jnp.int32).reshape(B)
+        end_index = jnp.asarray(end_index, jnp.int32).reshape(B)
 
         kv_valid = jnp.arange(K, dtype=jnp.int32)[None, :] < kv_lengths[:, None]
         attn = attn & kv_valid[:, None, None, :]
         q_seg = self._q_segment_ids
         kv_seg = self._kv_segment_ids
+        if kv_seg is not None:
+            kv_seg = jnp.where(kv_valid, kv_seg, jnp.int32(-1))
 
         def _slice_q(x, klen, seg=None):
             start_q = jnp.clip(klen - q_len, 0, jnp.maximum(Q - q_len, 0))
@@ -2024,7 +2032,7 @@ class MaskInfo:
             return x, seg
 
         seg_idx = 0 if q_seg is not None else None
-        attn, q_seg = jax.vmap(_slice_q, in_axes=(0, 0, seg_idx), out_axes=(0, seg_idx))(attn, kv_lengths, q_seg)
+        attn, q_seg = jax.vmap(_slice_q, in_axes=(0, 0, seg_idx), out_axes=(0, seg_idx))(attn, end_index, q_seg)
 
         if sliding_window is not None:
             width = min(sliding_window, K)

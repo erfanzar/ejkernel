@@ -79,6 +79,7 @@ class TestBasicFunctionality:
             v,
             query_chunk_size=64,
             key_chunk_size=64,
+            causal=True,
             causal_block_size=64,
         )
 

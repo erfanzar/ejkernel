@@ -16,7 +16,6 @@
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax._src import dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -571,7 +570,7 @@ def cdiv(a, b):
 
 
 def get_dtype_packing(dtype):
-    bits = dtypes.bit_width(dtype)
+    bits = jnp.dtype(dtype).itemsize * 8
     return 32 // bits
 
 

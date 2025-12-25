@@ -95,7 +95,7 @@ class TestSoftmaxAux:
         k = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
         v = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
 
-        sinks = jax.random.normal(key, (num_heads, num_sinks), dtype=jnp.float16) * 0.1
+        sinks = jax.random.normal(key, (num_sinks,), dtype=jnp.float16) * 0.1
 
         out_with_sinks = flash_attention(q, k, v, softmax_aux=sinks)
         out_no_sinks = flash_attention(q, k, v)
@@ -104,7 +104,7 @@ class TestSoftmaxAux:
         assert not jnp.allclose(out_with_sinks, out_no_sinks, rtol=1e-2)
 
     def test_attention_sinks_broadcast(self):
-        """Test that 1D sinks broadcast correctly."""
+        """Test that 2D sinks are rejected (softmax_aux must be 1D)."""
         batch, seq_len, num_heads, head_dim = 1, 16, 4, 32
         num_sinks = 2
         key = jax.random.PRNGKey(0)
@@ -117,9 +117,9 @@ class TestSoftmaxAux:
         out_1d = flash_attention(q, k, v, softmax_aux=sinks_1d)
 
         sinks_2d = jnp.broadcast_to(sinks_1d[None, :], (num_heads, num_sinks))
-        out_2d = flash_attention(q, k, v, softmax_aux=sinks_2d)
-
-        assert jnp.allclose(out_1d, out_2d, rtol=1e-2)
+        with pytest.raises(Exception):
+            flash_attention(q, k, v, softmax_aux=sinks_2d)
+        assert jnp.all(jnp.isfinite(out_1d))
 
     def test_attention_sinks_gradient(self):
         """Test gradients with attention sinks."""
@@ -130,7 +130,7 @@ class TestSoftmaxAux:
         q = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
         k = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
         v = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-        sinks = jax.random.normal(key, (num_heads, num_sinks), dtype=jnp.float16)
+        sinks = jax.random.normal(key, (num_sinks,), dtype=jnp.float16)
 
         def loss_fn(q, k, v):
             out = flash_attention(q, k, v, softmax_aux=sinks)
@@ -154,7 +154,7 @@ class TestCombinedFeatures:
         q = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
         k = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
         v = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-        sinks = jax.random.normal(key, (num_heads, num_sinks), dtype=jnp.float16)
+        sinks = jax.random.normal(key, (num_sinks,), dtype=jnp.float16)
 
         out = flash_attention(q, k, v, logits_soft_cap=20.0, softmax_aux=sinks)
 
@@ -170,7 +170,7 @@ class TestCombinedFeatures:
         q = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
         k = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
         v = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-        sinks = jax.random.normal(key, (num_heads, num_sinks), dtype=jnp.float16)
+        sinks = jax.random.normal(key, (num_sinks,), dtype=jnp.float16)
 
         out = flash_attention(q, k, v, causal=True, logits_soft_cap=20.0, softmax_aux=sinks)
 

@@ -220,6 +220,8 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
             The group_sizes array partitions the m dimension of lhs. Each partition
             is multiplied with the corresponding group matrix from rhs.
         """
+        if preferred_element_type is None:
+            preferred_element_type = jnp.float32
 
         if platform is not None:
             cfg = GroupedMatmulConfig(
