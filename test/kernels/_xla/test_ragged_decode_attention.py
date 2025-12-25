@@ -267,7 +267,7 @@ class TestSoftmaxAux:
         sequence_end = jnp.array([256, 256], dtype=jnp.int32)
 
         softmax_aux = jnp.ones((num_kv_heads, num_sinks), dtype=jnp.float32) * 5.0
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017
             ragged_decode_attention(
                 query=query,
                 key=key,

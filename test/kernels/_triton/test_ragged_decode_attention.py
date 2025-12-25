@@ -19,10 +19,7 @@ import pytest
 
 from ejkernel.kernels._triton.ragged_decode_attention import ragged_decode_attention as ragged_decode_triton
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 def ragged_decode_ref(

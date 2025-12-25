@@ -26,10 +26,7 @@ from einops import rearrange
 from ejkernel.kernels._triton import recurrent_gla
 from ejkernel.utils import numeric_gen
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 def run_recurrent_gla_test(

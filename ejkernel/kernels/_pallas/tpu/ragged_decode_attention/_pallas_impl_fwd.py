@@ -210,7 +210,6 @@ def inner_decode_tpu(
         sequence_start (chex.Array): Sequence start indices.
         sequence_end (chex.Array): Sequence end indices.
         softmax_scale (float | None): Scaling factor for attention logits.
-        block_size (int): Block size to tile attention computation.
 
     Returns:
         chex.Array: Output tensor of shape [B, H, D].
@@ -221,13 +220,16 @@ def inner_decode_tpu(
     batch_size = query.shape[0]
     num_heads_q = query.shape[-2]
     head_dim = query.shape[-1]
-    _, _, num_heads_kv, _ = key.shape
+    _, seqkv, num_heads_kv, _ = key.shape
     out_shape = (batch_size, 1, num_heads_q, head_dim)
     if query.ndim == 3:
         query = jnp.expand_dims(query, 1)
         out_shape = (batch_size, num_heads_q, head_dim)
     shape_dtype = (query, key, value, sequence_start, sequence_end)
     cost_estimate = get_mha_cost_estimate(shape_dtype)
+
+    if fwd_params is None:
+        fwd_params = FwdParams(q_blocksize=1, kv_blocksize=min(seqkv, 128))
 
     query = query.reshape(batch_size, num_heads_kv, num_heads_q // num_heads_kv, head_dim)
     key = jnp.swapaxes(key, 1, 2)

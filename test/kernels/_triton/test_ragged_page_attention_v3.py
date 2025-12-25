@@ -24,13 +24,12 @@ from ejkernel.kernels._xla.ragged_page_attention_v3._interface import (
     ragged_page_attention_v3 as xla_ragged_page_attention_v3,
 )
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
-def _kv_cache_shape(*, num_pages: int, page_size: int, num_kv_heads: int, head_dim_padded: int, dtype: jnp.dtype) -> tuple[int, ...]:
+def _kv_cache_shape(
+    *, num_pages: int, page_size: int, num_kv_heads: int, head_dim_padded: int, dtype: jnp.dtype
+) -> tuple[int, ...]:
     pack = 2 if jnp.dtype(dtype).itemsize == 2 else 1
     if pack == 1:
         return (num_pages, page_size, num_kv_heads * 2, 1, head_dim_padded)

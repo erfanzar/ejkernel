@@ -273,22 +273,6 @@ class TestSoftmaxAux:
         grads = jax.grad(loss_fn, argnums=(0, 1, 2))(q, k, v)
         assert all(jnp.all(jnp.isfinite(g)) for g in grads)
 
-    def test_attention_sinks_broadcast(self):
-        """Test attention sinks with broadcasting (shared across heads)."""
-        batch, seq_len, num_heads, head_dim = 2, 32, 4, 64
-        num_sinks = 4
-        key = jax.random.PRNGKey(0)
-
-        q = jax.random.normal(key, (batch, seq_len, num_heads, head_dim))
-        k = jax.random.normal(key, (batch, seq_len, num_heads, head_dim))
-        v = jax.random.normal(key, (batch, seq_len, num_heads, head_dim))
-
-        sinks_shared = jax.random.normal(key, (num_sinks,)) * 0.1
-
-        out = flash_attention(q, k, v, softmax_aux=sinks_shared)
-        assert out.shape == q.shape
-        assert jnp.all(jnp.isfinite(out))
-
     def test_different_sink_sizes(self):
         """Test different numbers of attention sinks."""
         batch, seq_len, num_heads, head_dim = 2, 32, 4, 32

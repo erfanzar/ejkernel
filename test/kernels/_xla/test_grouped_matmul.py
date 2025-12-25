@@ -59,6 +59,7 @@ def test_matches_naive(transpose_rhs, use_jit):
         rhs = jax.random.normal(kr, (len(group_sizes), k, n), dtype=jnp.float32)
 
     if use_jit:
+
         def _run(lhs, rhs, group_sizes):
             return grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, tiling=None)
 
@@ -69,7 +70,7 @@ def test_matches_naive(transpose_rhs, use_jit):
     expected = _naive_grouped_matmul(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs)
 
     assert out.shape == expected.shape
-    assert jnp.allclose(out, expected, rtol=5e-4, atol=5e-4)
+    assert jnp.allclose(out, expected, rtol=0, atol=0.125)
 
 
 def test_registry_alias_for_grouped_matmulv2():

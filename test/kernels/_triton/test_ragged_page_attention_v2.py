@@ -21,10 +21,7 @@ import pytest
 
 from ejkernel.kernels._triton.ragged_page_attention_v2._interface import ragged_page_attention_v2
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 def create_test_data(

@@ -19,10 +19,7 @@ import pytest
 
 from ejkernel.kernels._triton.mean_pooling import mean_pooling as triton_mean_pooling
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 def _block_mean_pooling_ref(x: jax.Array, chunk_size: int) -> jax.Array:
@@ -78,4 +75,3 @@ def test_mean_pooling_grad_matches_reference():
         rtol=1e-2,
         atol=1e-2,
     )
-

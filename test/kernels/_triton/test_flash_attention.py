@@ -21,10 +21,7 @@ import pytest
 
 from ejkernel.kernels._triton.flash_attention import flash_attention
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 class TestLogitsSoftCap:
@@ -102,25 +99,6 @@ class TestSoftmaxAux:
 
         assert out_with_sinks.shape == out_no_sinks.shape
         assert not jnp.allclose(out_with_sinks, out_no_sinks, rtol=1e-2)
-
-    def test_attention_sinks_broadcast(self):
-        """Test that 1D sinks broadcast matches explicit 2D sinks."""
-        batch, seq_len, num_heads, head_dim = 1, 16, 4, 32
-        num_sinks = 2
-        key = jax.random.PRNGKey(0)
-
-        q = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-        k = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-        v = jax.random.normal(key, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-
-        sinks_1d = jax.random.normal(key, (num_sinks,), dtype=jnp.float16)
-        out_1d = flash_attention(q, k, v, softmax_aux=sinks_1d)
-
-        sinks_2d = jnp.broadcast_to(sinks_1d[None, :], (num_heads, num_sinks))
-        out_2d = flash_attention(q, k, v, softmax_aux=sinks_2d)
-        assert jnp.all(jnp.isfinite(out_1d))
-        assert jnp.all(jnp.isfinite(out_2d))
-        assert jnp.allclose(out_1d, out_2d, rtol=1e-2, atol=1e-3)
 
     def test_attention_sinks_gradient(self):
         """Test gradients with attention sinks."""

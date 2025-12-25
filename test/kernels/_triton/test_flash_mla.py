@@ -18,10 +18,7 @@ import pytest
 
 from ejkernel.kernels._triton.flash_mla._interface import flash_mla_attention, flash_mla_attention_call
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 def test_flash_mla_raises_not_implemented():
@@ -36,4 +33,3 @@ def test_flash_mla_raises_not_implemented():
 
     with pytest.raises(NotImplementedError):
         flash_mla_attention(q, k, v, latent_key=latent_key, latent_value=latent_value)
-

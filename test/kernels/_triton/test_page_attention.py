@@ -24,10 +24,7 @@ import pytest
 
 from ejkernel.kernels._triton import page_attention
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 def test_page_attention_single_pass():

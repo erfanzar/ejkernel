@@ -21,10 +21,7 @@ from ejkernel.kernels._triton.ring_attention._interface import ring_attention as
 from ejkernel.kernels._xla.ring_attention._interface import ring_attention as xla_ring_attention
 from ejkernel.ops import BwdParams, FwdParams
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 def test_ring_attention_matches_xla_single_device():

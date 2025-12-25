@@ -20,10 +20,7 @@ import pytest
 
 from ejkernel.kernels._triton import unified_attention
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 def _ref_unified_attention(
@@ -72,7 +69,7 @@ def _ref_unified_attention(
             logits = float(logits_soft_cap) * jnp.tanh(logits / float(logits_soft_cap))
 
         key_pos = jnp.arange(kv_len, dtype=jnp.int32)
-        q_abs = (jnp.int32(context_len) + jnp.arange(q_len, dtype=jnp.int32))  # [q_len]
+        q_abs = jnp.int32(context_len) + jnp.arange(q_len, dtype=jnp.int32)  # [q_len]
 
         causal = key_pos[None, :] <= q_abs[:, None]
         if sliding_window > 0:
@@ -95,9 +92,7 @@ def _ref_unified_attention(
         logits = jnp.where(causal[:, None, :], logits, -jnp.inf)
 
         if attention_sink is not None:
-            sink_logits = jnp.broadcast_to(
-                attention_sink.astype(jnp.float32)[None, :, None], (q_len, num_q_heads, 1)
-            )
+            sink_logits = jnp.broadcast_to(attention_sink.astype(jnp.float32)[None, :, None], (q_len, num_q_heads, 1))
             logits_aug = jnp.concatenate([logits, sink_logits], axis=-1)
             weights = jax.nn.softmax(logits_aug, axis=-1)[..., :kv_len]
         else:
@@ -147,9 +142,9 @@ def _make_inputs(
     k1, k2, k3 = jax.random.split(key, 3)
 
     queries = jax.random.normal(k1, (total_tokens, num_q_heads, head_dim), dtype=jnp.float32).astype(dtype)
-    key_cache = jax.random.normal(
-        k2, (num_blocks_total, block_size, num_kv_heads, head_dim), dtype=jnp.float32
-    ).astype(dtype)
+    key_cache = jax.random.normal(k2, (num_blocks_total, block_size, num_kv_heads, head_dim), dtype=jnp.float32).astype(
+        dtype
+    )
     value_cache = jax.random.normal(
         k3, (num_blocks_total, block_size, num_kv_heads, head_dim), dtype=jnp.float32
     ).astype(dtype)

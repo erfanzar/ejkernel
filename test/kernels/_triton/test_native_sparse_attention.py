@@ -25,10 +25,7 @@ from ejkernel.kernels._triton.native_sparse_attention import (
 )
 from ejkernel.utils import generate_block_indices
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "gpu",
-    reason="Triton tests require GPU backend",
-)
+pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
 
 def _to_token_block_indices(block_indices, seq_len: int, block_size: int):
