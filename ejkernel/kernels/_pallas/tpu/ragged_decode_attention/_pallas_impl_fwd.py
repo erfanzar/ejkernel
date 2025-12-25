@@ -103,7 +103,13 @@ def ragged_flash_attention_kernel(
         qk = jnp.where(mask, qk, jnp.finfo(qk.dtype).min)
         m_curr = qk.max(axis=-1)
 
+        # When an entire block is masked (e.g. blocks that fall completely before
+        # `sequence_start`), `m_curr` becomes the mask fill value and
+        # `exp(qk - m_curr)` would produce 1s, incorrectly contributing to the
+        # running softmax. Explicitly zero-out masked positions to match the XLA
+        # reference behavior.
         s_curr = jnp.exp(qk - m_curr[..., None])
+        s_curr = jnp.where(mask, s_curr, 0.0)
         o_curr_times_l_curr = jnp.dot(s_curr, v)
 
         m_curr = jax.lax.broadcast_in_dim(m_curr, m_prev.shape, (0,))
@@ -113,7 +119,9 @@ def ragged_flash_attention_kernel(
         l_next = alpha * l_prev + beta * jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
         l_next_safe = jnp.where(l_next == 0.0, 1.0, l_next)
 
-        m_ref[...], l_ref[...] = m_next, l_next_safe
+        # Store the true normalizer (which may be 0 for fully-masked prefixes) and
+        # only use the safe variant for the division.
+        m_ref[...], l_ref[...] = m_next, l_next
         o_ref[...] = ((l_prev * alpha * o_ref[...] + beta * o_curr_times_l_curr) / l_next_safe).astype(o_ref.dtype)
 
 

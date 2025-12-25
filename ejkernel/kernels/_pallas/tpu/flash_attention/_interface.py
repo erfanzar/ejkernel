@@ -79,12 +79,24 @@ def flash_attention(
         raise NotImplementedError("Variable-length sequences (cum_seqlens_q) are not supported on TPU")
     if cum_seqlens_k is not None:
         raise NotImplementedError("Variable-length sequences (cum_seqlens_k) are not supported on TPU")
-    if sliding_window is not None:
-        raise NotImplementedError("Sliding window attention is not supported on TPU")
-    if logits_soft_cap is not None:
-        raise NotImplementedError("Logits soft cap is not supported on TPU")
     if softmax_aux is not None:
         raise NotImplementedError("Attention sinks (softmax_aux) are not supported on TPU")
+
+    window_tuple: tuple[int, int] | None
+    if sliding_window is None:
+        window_tuple = None
+    elif isinstance(sliding_window, int):
+        if sliding_window < 0:
+            raise ValueError("sliding_window must be non-negative.")
+        window_tuple = (int(sliding_window), int(sliding_window))
+    else:
+        window_left, window_right = sliding_window
+        if window_left < 0 or window_right < 0:
+            raise ValueError("sliding_window bounds must be non-negative.")
+        window_tuple = (int(window_left), int(window_right))
+
+    if logits_soft_cap is not None and logits_soft_cap <= 0.0:
+        raise ValueError("logits_soft_cap must be > 0.0.")
 
     if attention_mask is not None and (q_segment_ids is None or kv_segment_ids is None):
         from ejkernel.types.mask import mask_to_segment_ids
@@ -169,10 +181,12 @@ def flash_attention(
         causal,
         softmax_scale,
         block_sizes,
+        window_tuple,
+        logits_soft_cap,
     ).transpose(0, 2, 1, 3)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=range(5, 9))
+@functools.partial(jax.custom_vjp, nondiff_argnums=range(5, 11))
 def _flash_attention(
     query,
     key,
@@ -183,6 +197,8 @@ def _flash_attention(
     causal,
     softmax_scale,
     block_sizes,
+    sliding_window,
+    logits_soft_cap,
 ):
     return _flash_attention_impl(
         q=query,
@@ -193,6 +209,8 @@ def _flash_attention(
         save_residuals=save_residuals,
         causal=causal,
         softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
         block_b=block_sizes.block_b,
         block_q=block_sizes.block_q,
         block_k_major=block_sizes.block_k_major,

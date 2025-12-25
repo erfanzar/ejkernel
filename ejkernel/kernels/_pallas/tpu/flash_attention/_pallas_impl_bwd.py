@@ -54,6 +54,8 @@ def _flash_attention_dkv_kernel(
     dv_scratch_ref,
     *,
     softmax_scale: float,
+    sliding_window,
+    logits_soft_cap,
     causal: bool,
     mask_value: float,
     q_seq_len: int,
@@ -84,7 +86,7 @@ def _flash_attention_dkv_kernel(
             do = do_tile_ref[0, 0, pl.ds(start_q, block_q), :]
             di = di_tile_ref[0, 0, pl.ds(start_q, block_q), :].astype(jnp.float32)
 
-            capped_logits = lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
+            logits = lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
             if ab_tile_ref is not None:
                 ab = ab_tile_ref[
@@ -93,10 +95,15 @@ def _flash_attention_dkv_kernel(
                     pl.dslice(j * block_q, block_q),
                     pl.dslice(i * block_k, block_k),
                 ].astype(jnp.float32)
-                capped_logits += ab
+                logits += ab
 
             if softmax_scale != 1.0:
-                capped_logits *= softmax_scale
+                logits *= softmax_scale
+
+            softcap_tanh = None
+            if logits_soft_cap is not None:
+                softcap_tanh = jnp.tanh(logits / logits_soft_cap)
+                logits = logits_soft_cap * softcap_tanh
 
             mask = None
             if q_segment_ids_tile_ref is not None:
@@ -117,15 +124,28 @@ def _flash_attention_dkv_kernel(
                 causal_mask = col_ids <= row_ids
                 mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
 
-            capped_logits = capped_logits if mask is None else capped_logits + jnp.where(mask, 0.0, mask_value)
+            if sliding_window is not None:
+                window_left, window_right = sliding_window
+                mask_shape = (block_q, block_k)
+                row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+                row_ids += q_seq_index * block_q_major + start_q
+                col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+                col_ids += kv_seq_index * block_k_major + start_k
+                window_mask = (col_ids >= (row_ids - window_left)) & (col_ids <= (row_ids + window_right))
+                mask = window_mask if mask is None else jnp.logical_and(mask, window_mask)
 
-            p = jnp.exp(capped_logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))
+            logits = logits if mask is None else logits + jnp.where(mask, 0.0, mask_value)
+
+            p = jnp.exp(logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))
             p = p * pltpu.repeat(1 / l, block_k // MIN_BLOCK_SIZE, axis=1)
             dv = lax.dot(p.T.astype(do.dtype), do, preferred_element_type=jnp.float32)
             dv_scratch_ref[pl.ds(start_k, block_k), :] += dv.astype(dv_scratch_ref.dtype)
 
             dp = lax.dot_general(do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
             ds = (dp - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1)) * p
+
+            if logits_soft_cap is not None:
+                ds = ds * (1.0 - softcap_tanh * softcap_tanh)
 
             if softmax_scale != 1.0:
                 ds = ds * softmax_scale
@@ -166,6 +186,8 @@ def _flash_attention_bwd_dkv(
     block_k_major: int | None,
     block_k: int | None,
     softmax_scale: float,
+    sliding_window,
+    logits_soft_cap,
     causal: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
 ):
@@ -304,6 +326,8 @@ def _flash_attention_bwd_dkv(
         block_q=block_q,  # type: ignore
         block_k=block_k,  # type: ignore
         softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
         causal=causal,
         mask_value=mask_value,
         q_seq_len=q_seq_len,
@@ -350,6 +374,8 @@ def _flash_attention_dq_kernel(
     dq_scratch_ref,
     *,
     softmax_scale: float,
+    sliding_window,
+    logits_soft_cap,
     causal: bool,
     mask_value: float,
     kv_seq_len: int,
@@ -375,14 +401,19 @@ def _flash_attention_dq_kernel(
         do = do_tile_ref[0, 0, :, :]
         di = di_tile_ref[0, 0, :].astype(jnp.float32)
 
-        capped_logits = jax.lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        logits = jax.lax.dot_general(q, k, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
         if ab_tile_ref is not None:
             ab = ab_tile_ref[0, 0, :, pl.dslice(i * block_k, block_k)].astype(jnp.float32)
-            capped_logits += ab
+            logits += ab
 
         if softmax_scale != 1.0:
-            capped_logits *= softmax_scale
+            logits *= softmax_scale
+
+        softcap_tanh = None
+        if logits_soft_cap is not None:
+            softcap_tanh = jnp.tanh(logits / logits_soft_cap)
+            logits = logits_soft_cap * softcap_tanh
 
         mask = None
         if q_segment_ids_tile_ref is not None:
@@ -401,9 +432,20 @@ def _flash_attention_dq_kernel(
             col_ids += kv_seq_index * block_k_major + i * block_k
             causal_mask = col_ids <= row_ids
             mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-        capped_logits = capped_logits if mask is None else capped_logits + jnp.where(mask, 0.0, mask_value)
 
-        p = jnp.exp(capped_logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))
+        if sliding_window is not None:
+            window_left, window_right = sliding_window
+            mask_shape = (block_q_major, block_k)
+            row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+            row_ids += q_seq_index * block_q_major
+            col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+            col_ids += kv_seq_index * block_k_major + i * block_k
+            window_mask = (col_ids >= (row_ids - window_left)) & (col_ids <= (row_ids + window_right))
+            mask = window_mask if mask is None else jnp.logical_and(mask, window_mask)
+
+        logits = logits if mask is None else logits + jnp.where(mask, 0.0, mask_value)
+
+        p = jnp.exp(logits - pltpu.repeat(m, block_k // MIN_BLOCK_SIZE, axis=1))
         p = p * pltpu.repeat(1 / l, block_k // MIN_BLOCK_SIZE, axis=1)
 
         dp = jax.lax.dot_general(
@@ -413,6 +455,9 @@ def _flash_attention_dq_kernel(
             preferred_element_type=jnp.float32,
         )
         ds = (dp - pltpu.repeat(di, block_k // MIN_BLOCK_SIZE, axis=1)) * p
+
+        if logits_soft_cap is not None:
+            ds = ds * (1.0 - softcap_tanh * softcap_tanh)
 
         if softmax_scale != 1.0:
             ds = ds * softmax_scale
@@ -463,6 +508,8 @@ def _flash_attention_bwd_dq(
     block_k_major: int | None,
     block_k: int | None,
     softmax_scale: float,
+    sliding_window,
+    logits_soft_cap,
     causal: bool,
     mask_value: float,
 ):
@@ -590,6 +637,8 @@ def _flash_attention_bwd_dq(
     kernel = functools.partial(
         _flash_attention_dq_kernel,
         softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
         causal=causal,
         mask_value=mask_value,
         block_k=block_k,  # type: ignore
@@ -625,6 +674,8 @@ def _flash_attention_bwd(
     causal: bool,
     softmax_scale: float,
     block_sizes: BlockSizes,
+    sliding_window,
+    logits_soft_cap,
     residuals,
     do,
 ):
@@ -652,6 +703,8 @@ def _flash_attention_bwd(
         block_k=block_sizes.block_k_dkv,
         block_q=block_sizes.block_q_dkv,
         softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
     )
@@ -670,6 +723,8 @@ def _flash_attention_bwd(
         block_k_major=block_sizes.block_k_major_dq,
         block_k=block_sizes.block_k_dq,
         softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
     )

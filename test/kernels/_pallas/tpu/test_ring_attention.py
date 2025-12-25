@@ -529,15 +529,19 @@ class TestRingAttentionPallasDistributed:
 
     def test_distributed_shard_map(self):
         """Test distributed execution with shard_map - this is how Pallas should be used on TPU."""
-        pytest.importorskip("eformer.escale")
-        from eformer.escale import create_mesh  # type:ignore
 
-        try:
-            mesh = create_mesh()
-        except RuntimeError:
-            pytest.skip("Mesh creation failed")
+        mesh = jax.make_mesh(
+            (jax.process_count(), 1, 1, 1, jax.local_device_count()),
+            ("dp", "fsdp", "ep", "tp", "sp"),
+            (jax.sharding.AxisType.Auto,) * 5,
+        )
 
-        batch, seq_len, num_heads, head_dim = 4, 1024, 32, 128
+        dp_size = jax.process_count()
+        sp_size = jax.local_device_count()
+
+        batch = max(1, 2 * dp_size)
+        seq_len = 128 * sp_size
+        num_heads, head_dim = 8, 64
         q, k, v = [numeric_gen(batch, seq_len, num_heads, head_dim, dtype="f4") for _ in range(3)]
 
         num_sinks = 4
@@ -558,8 +562,13 @@ class TestRingAttentionPallasDistributed:
             check_vma=False,
         )(q, k, v, None, None, softmax_aux)
 
+        out_vanilla, _ = vanilla_attention(q, k, v, softmax_aux=softmax_aux, dtype=jnp.float32)
+
         assert out.shape == (batch, seq_len, num_heads, head_dim)
         assert not jnp.any(jnp.isnan(out))
+        assert jnp.allclose(out, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Distributed ring attention output differs from vanilla. Max diff: {jnp.max(jnp.abs(out - out_vanilla))}"
+        )
 
 
 class TestRingAttentionPallasEdgeCases:

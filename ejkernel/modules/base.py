@@ -99,13 +99,20 @@ def detect_platform(
         jax_backend = "cpu"
 
     specs = kernel_registry.list_implementations(algorithm)
-    has_triton = any(spec.platform == Platform.TRITON for spec in specs)
-    has_pallas = any(spec.platform == Platform.PALLAS for spec in specs)
+    has_triton = any(
+        spec.platform == Platform.TRITON and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs
+    )
+    has_pallas_tpu = any(
+        spec.platform == Platform.PALLAS and spec.backend in (Backend.TPU, Backend.ANY) for spec in specs
+    )
+    has_pallas_gpu = any(
+        spec.platform == Platform.PALLAS and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs
+    )
 
-    if has_pallas and jax_backend in ("gpu") and maybe_pallas:
+    if has_pallas_gpu and jax_backend in ("gpu") and maybe_pallas:
         return Platform.PALLAS
 
-    if has_pallas and jax_backend in ("tpu"):
+    if has_pallas_tpu and jax_backend in ("tpu"):
         return Platform.PALLAS
 
     if has_triton and jax_backend in ("gpu", "cuda"):

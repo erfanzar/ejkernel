@@ -48,6 +48,8 @@ def _flash_attention_fwd(
     causal,
     softmax_scale,
     block_sizes,
+    sliding_window,
+    logits_soft_cap,
 ):
     o, l, m = _flash_attention_impl(
         q,
@@ -58,6 +60,8 @@ def _flash_attention_fwd(
         True,
         causal,
         softmax_scale,
+        sliding_window,
+        logits_soft_cap,
         block_sizes.block_b,
         block_sizes.block_q,
         block_sizes.block_k_major,
@@ -94,6 +98,8 @@ def _flash_attention_kernel_single_batch(
     *,
     causal,
     softmax_scale,
+    sliding_window,
+    logits_soft_cap,
     block_k,
     kv_seq_len,
     mask_value,
@@ -134,6 +140,9 @@ def _flash_attention_kernel_single_batch(
             if softmax_scale != 1.0:
                 s *= softmax_scale
 
+            if logits_soft_cap is not None:
+                s = logits_soft_cap * jnp.tanh(s / logits_soft_cap)
+
             mask = None
             if q_segment_ids_tile_ref is not None:
                 repeats, rem = divmod(block_k, NUM_LANES)
@@ -151,6 +160,16 @@ def _flash_attention_kernel_single_batch(
                 col_ids += kv_seq_idx * block_k_major + start_k
                 causal_mask = col_ids <= row_ids
                 mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+
+            if sliding_window is not None:
+                window_left, window_right = sliding_window
+                mask_shape = (block_q, block_k)
+                row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+                row_ids += q_seq_idx * block_q
+                col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+                col_ids += kv_seq_idx * block_k_major + start_k
+                window_mask = (col_ids >= (row_ids - window_left)) & (col_ids <= (row_ids + window_right))
+                mask = window_mask if mask is None else jnp.logical_and(mask, window_mask)
 
             s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
 
@@ -212,6 +231,8 @@ def _flash_attention_kernel_single_batch_single_step(
     *,
     causal,
     softmax_scale,
+    sliding_window,
+    logits_soft_cap,
     block_k,
     kv_seq_len,
     mask_value,
@@ -229,6 +250,9 @@ def _flash_attention_kernel_single_batch_single_step(
         s += ab_tile_ref[batch_idx].astype(jnp.float32)
     if softmax_scale != 1.0:
         s *= softmax_scale
+
+    if logits_soft_cap is not None:
+        s = logits_soft_cap * jnp.tanh(s / logits_soft_cap)
 
     mask = None
     if q_segment_ids_tile_ref is not None:
@@ -248,6 +272,16 @@ def _flash_attention_kernel_single_batch_single_step(
         col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
         causal_mask = col_ids <= row_ids
         mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+
+    if sliding_window is not None:
+        window_left, window_right = sliding_window
+        q_seq_idx = pl.program_id(2)
+        mask_shape = (block_q, block_k)
+        row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
+        row_ids += q_seq_idx * block_q
+        col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
+        window_mask = (col_ids >= (row_ids - window_left)) & (col_ids <= (row_ids + window_right))
+        mask = window_mask if mask is None else jnp.logical_and(mask, window_mask)
     s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
 
     m = jnp.max(s, axis=1)[:, None]
@@ -275,6 +309,8 @@ def _flash_attention_impl(
     save_residuals,
     causal,
     softmax_scale,
+    sliding_window,
+    logits_soft_cap,
     block_b,
     block_q,
     block_k_major,
@@ -335,6 +371,8 @@ def _flash_attention_impl(
         causal=causal,
         mask_value=DEFAULT_MASK_VALUE,
         softmax_scale=softmax_scale,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
         block_k=block_k,
         kv_seq_len=kv_seq_len,
     )

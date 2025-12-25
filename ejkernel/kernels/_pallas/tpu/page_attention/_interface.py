@@ -38,6 +38,9 @@ from ._pallas_impl_fwd import (
 @kernel_registry.register("page_attention", Platform.PALLAS, Backend.TPU)
 @ejit(
     static_argnames=[
+        "attn_scale",
+        "max_context_len",
+        "num_splits",
         "pages_per_compute_block",
         "attn_logits_soft_cap",
         "mask_value",
@@ -74,7 +77,7 @@ def page_attention(
       block_tables: A i32[batch_size, pages_per_sequence] jax.Array. Each entry
         should be in the range of [0, total_num_pages), indicating where to locate
         the page in `key_cache` or `value_cache`.
-      attn_scale: Attention scaling factor (not used in PALLAS TPU implementation).
+      attn_scale: Attention scaling factor. If None, defaults to 1/sqrt(head_dim).
       max_context_len: Maximum context length (not used in PALLAS TPU implementation).
       num_splits: Number of splits for partitioned attention (not used in PALLAS TPU implementation).
       mask_value: The value used for padding in attention. By default it is a very
@@ -99,20 +102,51 @@ def page_attention(
     Returns:
       The output of attention([batch_size, num_q_heads, head_dim]).
     """
+    batch_size, num_q_heads, head_dim = query.shape
 
-    if attn_scale is not None:
-        raise NotImplementedError("attn_scale is not supported in PALLAS TPU implementation")
+    # Normalize cache layout to the TPU kernel's expected layout:
+    #   [num_kv_heads, total_num_pages, page_size, head_dim]
+    #
+    # Some callers (e.g. module operations) provide:
+    #   [total_num_pages, num_kv_heads, page_size, head_dim]
+    cache_dim0, cache_dim1 = key_cache.shape[0], key_cache.shape[1]
+    dim0_div = (num_q_heads % cache_dim0) == 0
+    dim1_div = (num_q_heads % cache_dim1) == 0
+    if dim1_div and not dim0_div:
+        key_cache = key_cache.transpose(1, 0, 2, 3)
+        value_cache = value_cache.transpose(1, 0, 2, 3)
+    elif dim0_div and dim1_div and cache_dim0 > cache_dim1:
+        # Ambiguous (e.g. both dims divide num_q_heads). Assume num_kv_heads <= total_num_pages.
+        key_cache = key_cache.transpose(1, 0, 2, 3)
+        value_cache = value_cache.transpose(1, 0, 2, 3)
+
+    batch_size_paged_indices, pages_per_sequence = block_tables.shape
+
     if max_context_len is not None:
         raise NotImplementedError("max_context_len is not supported in PALLAS TPU implementation")
     if num_splits != 0:
         raise NotImplementedError("num_splits is not supported in PALLAS TPU implementation")
 
     if pages_per_compute_block is None:
-        raise ValueError("pages_per_compute_block is required for PALLAS TPU implementation")
+        # Choose a safe default that divides pages_per_sequence to avoid invalid grid shapes.
+        for candidate in (8, 4, 2, 1):
+            if candidate <= pages_per_sequence and pages_per_sequence % candidate == 0:
+                pages_per_compute_block = candidate
+                break
 
-    batch_size, num_q_heads, head_dim = query.shape
     num_kv_heads, _, page_size, head_dim_k = key_cache.shape
-    batch_size_paged_indices, pages_per_sequence = block_tables.shape
+    query_dtype = query.dtype
+
+    # Some callers use -1 padding in block_tables. Clamp to a valid page index;
+    # masked tokens are determined by context_lens.
+    block_tables = jnp.where(block_tables < 0, 0, block_tables)
+
+    if attn_scale is None:
+        attn_scale = 1.0 / jnp.sqrt(jnp.asarray(head_dim, jnp.float32))
+    else:
+        attn_scale = jnp.asarray(attn_scale, jnp.float32)
+
+    scaled_query = query * attn_scale
 
     if key_cache.shape != value_cache.shape:
         raise ValueError(
@@ -151,7 +185,7 @@ def page_attention(
 
     num_groups = num_q_heads // num_kv_heads
     if (num_groups) % 8 != 0:
-        q = query.reshape(batch_size, num_q_heads, 1, head_dim)
+        q = scaled_query.reshape(batch_size, num_q_heads, 1, head_dim)
         if megacore_mode == "kv_head":
             q_block_spec = pl.BlockSpec(
                 (None, num_groups, None, head_dim),
@@ -184,8 +218,8 @@ def page_attention(
                 (None, num_groups, head_dim),
                 lambda core_index, b, h, *_: (b, h, 0),
             )
-        q_dtype_for_kernel_launch = query.dtype
-        q = query
+        q_dtype_for_kernel_launch = query_dtype
+        q = scaled_query
 
     dimension_semantics: Sequence[Literal["parallel", "arbitrary"]]
     if inline_seq_dim:
@@ -255,4 +289,4 @@ def page_attention(
         key_cache,
         value_cache,
     )
-    return out.reshape(batch_size, num_q_heads, head_dim).astype(query.dtype)
+    return out.reshape(batch_size, num_q_heads, head_dim).astype(query_dtype)

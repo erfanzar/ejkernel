@@ -186,10 +186,11 @@ def flash_attention_block(
 
     l_new_safe = jnp.where(l_new == 0, 1.0, l_new)
 
-    attn_weights = exp_scores / l_new_safe
-    o_curr = jnp.einsum("...qhk,...khd->...qhd", attn_weights, v_block)
-
-    o_new = (correction_prev * l_prev * o_prev + l_curr * o_curr) / l_new_safe
+    # `exp_scores` are *unnormalized* attention weights already scaled into the
+    # global max-logit frame (`m_new`). Accumulate the weighted values directly
+    # and normalize once with `l_new_safe`.
+    o_curr_times_l_curr = jnp.einsum("...qhk,...khd->...qhd", exp_scores, v_block)
+    o_new = (correction_prev * l_prev * o_prev + o_curr_times_l_curr) / l_new_safe
 
     o_new = o_new.astype(o_prev.dtype)
     m_new = m_new.astype(m_prev.dtype)

@@ -232,6 +232,11 @@ def ragged_page_attention_v2(
       The output of the attention.
     """
     del optimized, compute_dtype
+    num_seqs_arr = jnp.asarray(num_seqs, dtype=jnp.int32)
+    if num_seqs_arr.shape == ():
+        num_seqs_arr = num_seqs_arr.reshape((1,))
+    elif num_seqs_arr.shape != (1,):
+        raise ValueError(f"num_seqs must be a scalar or have shape (1,), got {num_seqs_arr.shape}")
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5
 
@@ -245,7 +250,7 @@ def ragged_page_attention_v2(
         context_lens=context_lens,
         block_tables=block_tables,
         query_start_loc=query_start_loc,
-        num_seqs=num_seqs,
+        num_seqs=num_seqs_arr,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
