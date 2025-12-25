@@ -135,6 +135,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
+        kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
         softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
@@ -195,6 +197,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
             q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
             kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+            q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
+            kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
         ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
             return self.run(
                 query=query,
@@ -202,6 +206,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
                 value=value,
                 q_segment_ids=q_segment_ids,
                 kv_segment_ids=kv_segment_ids,
+                q_position_ids=q_position_ids,
+                kv_position_ids=kv_position_ids,
                 softmax_aux=softmax_aux,
                 bias=bias,
                 mask_builder=mask_builder,
@@ -224,6 +230,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             bias,
             q_segment_ids,
             kv_segment_ids,
+            q_position_ids,
+            kv_position_ids,
         )
         assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
         shard_map_fn = shard_map(
@@ -258,6 +266,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
         q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+        q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
+        kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
         softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
@@ -327,6 +337,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             value=value,
             q_segment_ids=q_segment_ids,
             kv_segment_ids=kv_segment_ids,
+            q_position_ids=q_position_ids,
+            kv_position_ids=kv_position_ids,
             softmax_aux=softmax_aux,
             bias=bias,
             mask_builder=mask_builder,
@@ -507,18 +519,26 @@ def ring_attention(
 
     q_segment_ids = None
     kv_segment_ids = None
-
+    q_positions = None
+    kv_positions = None
     if mask_info is not None:
         q_segment_ids, kv_segment_ids = mask_info.get_or_compute_segment_ids()
+        q_positions, kv_positions = mask_info.get_or_compute_positions()
 
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
         if mask_info is None:
-            in_specs = (*in_specs, None, None)
+            in_specs = (*in_specs, None, None, None, None)
         else:
             shardings = mask_info.get_shardings(True, mesh=mesh)
-            in_specs = (*in_specs, shardings.q_segment_ids, shardings.kv_segment_ids)
+            in_specs = (
+                *in_specs,
+                shardings.q_segment_ids,
+                shardings.kv_segment_ids,
+                shardings.q_positions,
+                shardings.kv_positions,
+            )
             assert mask_info.sequence_axis_name == axis_name, "mismatch between two sequence axis names!"
 
     return _ring_executor(
@@ -530,6 +550,8 @@ def ring_attention(
         bias=bias,
         q_segment_ids=q_segment_ids,
         kv_segment_ids=kv_segment_ids,
+        q_position_ids=q_positions,
+        kv_position_ids=kv_positions,
         mask_builder=mask_builder,
         sliding_window=sliding_window,
         chunk_size=chunk_size,

@@ -20,9 +20,11 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from ejkernel.kernels._triton import page_attention
+from ejkernel.kernels._xla.page_attention import page_attention as xla_page_attention
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
@@ -207,6 +209,57 @@ def test_page_attention_auto_split():
 
     assert output.shape == query.shape, f"Shape mismatch: {output.shape} != {query.shape}"
     print("\n✓ Auto-split test passed!")
+
+
+def test_page_attention_matches_xla_basic():
+    key = jax.random.PRNGKey(0)
+    kq, kk, kv = jax.random.split(key, 3)
+
+    num_seqs = 2
+    num_kv_heads = 2
+    q_group = 2
+    num_heads = num_kv_heads * q_group
+    head_dim = 64
+    block_size = 16
+    num_blocks = 8
+
+    query = jax.random.normal(kq, (num_seqs, num_heads, head_dim), dtype=jnp.bfloat16)
+    key_cache = jax.random.normal(kk, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.bfloat16)
+    value_cache = jax.random.normal(kv, (num_blocks, num_kv_heads, block_size, head_dim), dtype=jnp.bfloat16)
+
+    context_lens = jnp.array([24, 16], dtype=jnp.int32)
+    block_tables = jnp.array([[0, 1], [2, 3]], dtype=jnp.int32)
+
+    out_triton = page_attention(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        attn_scale=None,
+        max_context_len=None,
+        num_splits=0,
+    )
+    out_xla = xla_page_attention(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        attn_scale=None,
+        max_context_len=None,
+        num_splits=0,
+    )
+
+    out_triton = jax.block_until_ready(out_triton)
+    out_xla = jax.block_until_ready(out_xla)
+
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 if __name__ == "__main__":

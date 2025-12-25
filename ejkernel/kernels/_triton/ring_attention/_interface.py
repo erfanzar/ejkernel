@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ring Attention Implementation using Triton Flash Attention.
+"""Ring Attention Implementation using Triton Block-sparse Attention.
 
 This module provides a ring attention implementation that wraps the Triton
-flash attention kernel for distributed execution across multiple GPU devices.
+block-sparse attention kernel for distributed execution across multiple GPU devices.
 
 Key features:
-- Uses flash attention as the inner kernel for optimized GPU execution
+- Uses block-sparse attention as the inner kernel for optimized GPU execution
 - Supports distributed ring topology via lax.ppermute
-- All flash attention features (causal, sliding window, dropout, etc.)
+- Supports causal and sliding-window masking via explicit positions/segment IDs
 - Full backward pass support with custom VJP
 """
 
@@ -37,7 +37,7 @@ from jaxtyping import Float, Int
 from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._ring_kernel import ring_flash_attention_call
+from ._ring_kernel import ring_blocksparse_attention_call
 
 if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
@@ -51,6 +51,8 @@ def ring_attention(
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
     softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
@@ -64,7 +66,7 @@ def ring_attention(
     bwd_params: BwdParams | None = None,
     fused_backward: bool = False,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    """Ring attention using Triton flash attention kernels.
+    """Ring attention using Triton block-sparse attention kernels.
 
     Distributes attention computation across devices using a ring topology,
     where each device holds its query partition and rotates key/value blocks
@@ -113,19 +115,25 @@ def ring_attention(
     if bwd_params is None:
         bwd_params = BwdParams(q_blocksize=128, kv_blocksize=128, num_stages=2, num_warps=4)
 
-    return ring_flash_attention_call(
+    if bias is not None:
+        raise NotImplementedError("Triton ring_attention does not currently support `bias` when using blocksparse.")
+
+    del mask_builder, fused_backward
+
+    return ring_blocksparse_attention_call(
         query=query,
         key=key,
         value=value,
-        attention_mask=None,
-        bias=bias,
+        q_segment_ids=q_segment_ids,
+        kv_segment_ids=kv_segment_ids,
+        q_position_ids=q_position_ids,
+        kv_position_ids=kv_position_ids,
+        softmax_aux=softmax_aux,
         softmax_scale=softmax_scale,
-        dropout_prob=0.0,
         causal=causal,
-        dropout_seed=None,
-        fwd_params=fwd_params,
-        bwd_params=bwd_params,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
         axis_name=axis_name,
+        fwd_params=fwd_params,
+        bwd_params=bwd_params,
     )

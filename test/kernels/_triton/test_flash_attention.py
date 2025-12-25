@@ -17,9 +17,11 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from ejkernel.kernels._triton.flash_attention import flash_attention
+from ejkernel.kernels._xla.flash_attention import flash_attention as xla_flash_attention
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
@@ -155,6 +157,29 @@ class TestCombinedFeatures:
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
         assert jnp.all(jnp.isfinite(out))
+
+def test_flash_attention_matches_xla_smoke():
+    key = jax.random.PRNGKey(0)
+    kq, kk, kv, ka = jax.random.split(key, 4)
+
+    batch, seq_len, num_heads, head_dim = 2, 64, 4, 64
+    q = jax.random.normal(kq, (batch, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
+    k = jax.random.normal(kk, (batch, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
+    v = jax.random.normal(kv, (batch, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
+    sinks = jax.random.normal(ka, (4,), dtype=jnp.float32) * 0.1
+
+    out_triton = flash_attention(q, k, v, causal=True, logits_soft_cap=20.0, softmax_aux=sinks)
+    out_xla = xla_flash_attention(q, k, v, causal=True, logits_soft_cap=20.0, softmax_aux=sinks)
+
+    out_triton = jax.block_until_ready(out_triton)
+    out_xla = jax.block_until_ready(out_xla)
+
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 if __name__ == "__main__":

@@ -16,9 +16,11 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from ejkernel.kernels._triton import unified_attention
+from ejkernel.kernels._xla.unified_attention import unified_attention as xla_unified_attention
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
@@ -249,3 +251,50 @@ def test_unified_attention_features_softcap_sliding_sinks_bias(seq_threshold_3d:
         qq_bias=qq_bias,
     )
     assert jnp.allclose(out.astype(jnp.float32), ref.astype(jnp.float32), rtol=2e-2, atol=5e-2)
+
+
+def test_unified_attention_matches_xla_smoke():
+    batch = _make_inputs(
+        rng_seed=0,
+        num_seqs=2,
+        num_q_heads=8,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_lens=[32, 24],
+        q_lens=[4, 3],
+        dtype=jnp.bfloat16,
+    )
+    scale = 1.0 / math.sqrt(batch["queries"].shape[-1])
+
+    out_triton = unified_attention(
+        batch["queries"],
+        batch["key_cache"],
+        batch["value_cache"],
+        batch["kv_lens"],
+        batch["block_tables"],
+        batch["query_start_loc"],
+        softmax_scale=scale,
+        sliding_window=16,
+        logits_soft_cap=20.0,
+    )
+    out_xla = xla_unified_attention(
+        batch["queries"],
+        batch["key_cache"],
+        batch["value_cache"],
+        batch["kv_lens"],
+        batch["block_tables"],
+        batch["query_start_loc"],
+        softmax_scale=scale,
+        sliding_window=16,
+        logits_soft_cap=20.0,
+    )
+
+    out_triton = jax.block_until_ready(out_triton)
+    out_xla = jax.block_until_ready(out_xla)
+
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )

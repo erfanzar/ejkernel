@@ -44,7 +44,7 @@ if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
-@partial(jax.custom_vjp, nondiff_argnums=[7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23])
+@partial(jax.custom_vjp, nondiff_argnums=[9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25])
 def _ring_attention(
     query: chex.Array,
     key: chex.Array,
@@ -52,6 +52,8 @@ def _ring_attention(
     bias: chex.Array | None = None,
     q_segment_ids: chex.Array | None = None,
     kv_segment_ids: chex.Array | None = None,
+    q_position_ids: chex.Array | None = None,
+    kv_position_ids: chex.Array | None = None,
     softmax_aux: chex.Array | None = None,
     axis_name: str | None = None,
     float32_logits: bool = True,
@@ -126,6 +128,8 @@ def _ring_attention(
         bias,
         q_segment_ids,
         kv_segment_ids,
+        q_position_ids,
+        kv_position_ids,
         softmax_aux,
         axis_name,
         float32_logits,
@@ -149,7 +153,9 @@ def _ring_attention(
 
 
 _ring_attention.defvjp(_ring_attention_fwd, _ring_attention_bwd)
-_ring_attention = ejit(_ring_attention, static_argnums=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23))
+_ring_attention = ejit(
+    _ring_attention, static_argnums=(9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25)
+)
 
 
 @kernel_registry.register("ring_attention", Platform.XLA, Backend.ANY)
@@ -160,6 +166,8 @@ def ring_attention(
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
     softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
@@ -210,6 +218,8 @@ def ring_attention(
         bias,
         q_segment_ids,
         kv_segment_ids,
+        q_position_ids,
+        kv_position_ids,
         softmax_aux,
         axis_name,
         True,

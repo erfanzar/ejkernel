@@ -15,9 +15,11 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from ejkernel.kernels._triton.ragged_decode_attention import ragged_decode_attention as ragged_decode_triton
+from ejkernel.kernels._xla.ragged_decode_attention import ragged_decode_attention as ragged_decode_xla
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
@@ -269,6 +271,47 @@ class TestRaggedDecodeAttentionTriton:
             softmax_scale=1.0,
         )
         assert jnp.allclose(out_tri, out_ref, rtol=2e-4, atol=2e-5)
+
+
+def test_ragged_decode_attention_matches_xla_smoke():
+    key = jax.random.PRNGKey(0)
+    kq, kk, kv, ka = jax.random.split(key, 4)
+
+    B, S, HQ, HKV, D = 2, 256, 16, 2, 64
+    q = jax.random.normal(kq, (B, HQ, D), dtype=jnp.float32)
+    k = jax.random.normal(kk, (B, S, HKV, D), dtype=jnp.float32)
+    v = jax.random.normal(kv, (B, S, HKV, D), dtype=jnp.float32)
+    starts = jnp.array([0, 32], dtype=jnp.int32)
+    ends = jnp.array([200, 180], dtype=jnp.int32)
+    sinks = jax.random.normal(ka, (4,), dtype=jnp.float32) * 0.1
+
+    out_triton = ragged_decode_triton(
+        q,
+        k,
+        v,
+        sequence_start=starts,
+        sequence_end=ends,
+        softmax_scale=1.0,
+        sliding_window=(128, 0),
+        logits_soft_cap=20.0,
+        softmax_aux=sinks,
+    )
+    out_xla = ragged_decode_xla(
+        q,
+        k,
+        v,
+        sequence_start=starts,
+        sequence_end=ends,
+        softmax_scale=1.0,
+        sliding_window=(128, 0),
+        logits_soft_cap=20.0,
+        softmax_aux=sinks,
+    )
+
+    out_triton = jax.block_until_ready(out_triton)
+    out_xla = jax.block_until_ready(out_xla)
+
+    np.testing.assert_allclose(out_triton, out_xla, rtol=2e-4, atol=2e-4)
 
 
 if __name__ == "__main__":

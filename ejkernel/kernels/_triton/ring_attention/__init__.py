@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ring Attention using Triton Flash Attention.
+"""Ring Attention using Triton Block-sparse Attention.
 
 This module provides a ring attention implementation that distributes attention
 computation across devices using a ring topology, with the Triton flash
-attention kernel as the inner attention mechanism.
+attention kernel historically used as the inner mechanism. The current
+implementation uses Triton block-sparse attention to correctly handle explicit
+positions/segment IDs under distributed causal/window masking.
 
 Features:
 - Distributed ring communication via lax.ppermute
-- All flash attention features (causal, sliding window, dropout)
+- Causal + sliding window masking with explicit positions/segment IDs
 - Logits soft capping
 - Full backward pass with custom VJP
 """

@@ -35,6 +35,8 @@ def _blockwise_attention_fwd(
     bias: chex.Array | None,
     q_segment_ids: chex.Array | None,
     kv_segment_ids: chex.Array | None,
+    q_position_ids: chex.Array | None,
+    kv_position_ids: chex.Array | None,
     softmax_aux: chex.Array | None,
     softmax_scale: float | None,
     causal_block_size: int | None,
@@ -109,6 +111,7 @@ def _blockwise_attention_fwd(
         attn_dropout = jax.random.bernoulli(attn_dropout_rng, pdrop, (batch, num_heads, q_len, kv_len))
     else:
         attn_dropout = None
+    use_positions = q_position_ids is not None and kv_position_ids is not None
     _chunk_bias_fn = partial(
         _chunk_attention_bias,
         query_chunk_size,
@@ -116,6 +119,8 @@ def _blockwise_attention_fwd(
         bias,
         q_segment_ids,
         kv_segment_ids,
+        q_position_ids,
+        kv_position_ids,
         deterministic,
         attn_dropout,
         pdrop,
@@ -211,7 +216,7 @@ def _blockwise_attention_fwd(
         def skip_upper_half(carry, args):
             _key_chunk, _value_chunk, k_chunk_idx = args
             should_run = jnp.array(True)
-            if causal_block_size is not None:
+            if causal_block_size is not None and not use_positions:
                 should_run = below_or_on_diag(
                     q_chunk_idx_start + q_chunk_idx,
                     query_chunk_size,
@@ -259,6 +264,8 @@ def _ring_attention_fwd(
     bias: chex.Array | None,
     q_segment_ids: chex.Array | None,
     kv_segment_ids: chex.Array | None,
+    q_position_ids: chex.Array | None,
+    kv_position_ids: chex.Array | None,
     softmax_aux: chex.Array | None,
     axis_name: str | None,
     float32_logits: bool,
@@ -340,14 +347,15 @@ def _ring_attention_fwd(
 
     axis_size = lax.psum(1, axis_name) if axis_name is not None else 1
     q_block_size, kv_blocksize = (q_len, kv_len)
+    use_positions = q_position_ids is not None and kv_position_ids is not None
 
     def scan_kv_block(carry, idx):
-        prev_max_score, numerator, denominator, key, value = carry
+        prev_max_score, numerator, denominator, key, value, kv_segment_ids, kv_position_ids = carry
         axis_idx = lax.axis_index(axis_name) if axis_name is not None else 0
         q_block_idx = axis_idx
-        q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
+        q_chunk_idx_start = 0 if use_positions else q_block_idx * (q_block_size // query_chunk_size)
         k_block_idx = (axis_idx - idx) % axis_size
-        k_chunk_idx_start = k_block_idx * (kv_blocksize // key_chunk_size)
+        k_chunk_idx_start = 0 if use_positions else k_block_idx * (kv_blocksize // key_chunk_size)
         numerator, denominator, max_score = _blockwise_attention_fwd(
             query,
             key,
@@ -358,6 +366,8 @@ def _ring_attention_fwd(
             bias=bias,
             q_segment_ids=q_segment_ids,
             kv_segment_ids=kv_segment_ids,
+            q_position_ids=q_position_ids,
+            kv_position_ids=kv_position_ids,
             softmax_aux=None,
             softmax_scale=softmax_scale,
             query_chunk_size=query_chunk_size,
@@ -375,17 +385,20 @@ def _ring_attention_fwd(
             attention_sink_size=attention_sink_size,
             causal=causal,
         )
-        key, value = map(
-            lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)])
-            if axis_name is not None
-            else x,
-            (key, value),
-        )
-        return (max_score, numerator, denominator, key, value), None
+        def _ppermute_or_none(x):
+            if axis_name is None or x is None:
+                return x
+            return lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)])
 
-    (max_score, numerator, denominator, _, _), _ = lax.scan(
+        key = _ppermute_or_none(key)
+        value = _ppermute_or_none(value)
+        kv_segment_ids = _ppermute_or_none(kv_segment_ids)
+        kv_position_ids = _ppermute_or_none(kv_position_ids)
+        return (max_score, numerator, denominator, key, value, kv_segment_ids, kv_position_ids), None
+
+    (max_score, numerator, denominator, _, _, _, _), _ = lax.scan(
         scan_kv_block,
-        init=(prev_max_score, numerator, denominator, key, value),
+        init=(prev_max_score, numerator, denominator, key, value, kv_segment_ids, kv_position_ids),
         xs=jnp.arange(0, axis_size),
     )
     denom_full = rearrange(denominator, "b h query -> b query h")
@@ -406,6 +419,8 @@ def _ring_attention_fwd(
         bias,
         q_segment_ids,
         kv_segment_ids,
+        q_position_ids,
+        kv_position_ids,
         denominator,
         max_score,
     )

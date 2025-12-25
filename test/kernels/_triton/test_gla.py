@@ -20,10 +20,12 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from einops import rearrange
 
 from ejkernel.kernels._triton import recurrent_gla
+from ejkernel.kernels._xla.gla import recurrent_gla as xla_recurrent_gla
 from ejkernel.utils import numeric_gen
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
@@ -81,6 +83,28 @@ def run_recurrent_gla_test(
 )
 def test_recurrent_gla_variants(scenario):
     run_recurrent_gla_test(**scenario)
+
+
+def test_recurrent_gla_matches_xla_smoke():
+    key = jax.random.PRNGKey(0)
+    kq, kk, kv, ks = jax.random.split(key, 4)
+
+    batch_size, seq_len, num_heads, key_dim, value_dim = 2, 128, 4, 64, 64
+    query = jax.random.normal(kq, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32)
+    key = jax.random.normal(kk, (batch_size, seq_len, num_heads, key_dim), dtype=jnp.float32)
+    value = jax.random.normal(kv, (batch_size, seq_len, num_heads, value_dim), dtype=jnp.float32)
+    init_state = jax.random.normal(ks, (batch_size, num_heads, key_dim, value_dim), dtype=jnp.float32)
+
+    out_tri, state_tri = recurrent_gla(query, key, value, initial_state=init_state)
+    out_xla, state_xla = xla_recurrent_gla(query, key, value, initial_state=init_state)
+
+    out_tri = jax.block_until_ready(out_tri)
+    out_xla = jax.block_until_ready(out_xla)
+    state_tri = jax.block_until_ready(state_tri)
+    state_xla = jax.block_until_ready(state_xla)
+
+    np.testing.assert_allclose(out_tri, out_xla, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(state_tri, state_xla, rtol=1e-4, atol=1e-4)
 
 
 if __name__ == "__main__":

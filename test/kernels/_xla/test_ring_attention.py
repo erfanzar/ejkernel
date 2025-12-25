@@ -431,9 +431,11 @@ class TestMaskingComparison:
         """
         if attn_mask.ndim == 4:
             attn_mask = attn_mask[:, -1, :, :]
+        q_valid = jnp.any(attn_mask, axis=-1)
+        kv_valid = jnp.any(attn_mask, axis=-2)
         return (
-            jnp.any(attn_mask, axis=-1).astype(jnp.int32),
-            jnp.any(attn_mask, axis=-2).astype(jnp.int32),
+            jnp.where(q_valid, 0, -1).astype(jnp.int32),
+            jnp.where(kv_valid, 0, -1).astype(jnp.int32),
         )
 
     def test_causal_mask_vs_vanilla(self):

@@ -26,6 +26,8 @@ def _chunk_attention_bias(
     bias: chex.Array | None,
     q_segment_ids: chex.Array | None,
     kv_segment_ids: chex.Array | None,
+    q_position_ids: chex.Array | None,
+    kv_position_ids: chex.Array | None,
     deterministic: bool,
     attn_dropout: chex.Array | None,
     pdrop: float,
@@ -86,10 +88,8 @@ def _chunk_attention_bias(
         )
 
         segment_mismatch_mask = ~jnp.equal(q_seg_chunk[:, :, None], kv_seg_chunk[:, None, :])
-
-        q_or_kv_is_zero = (q_seg_chunk[:, :, None] == 0) | (kv_seg_chunk[:, None, :] == 0)
-
-        segment_ids_mask = segment_mismatch_mask | q_or_kv_is_zero
+        q_or_kv_is_padding = (q_seg_chunk[:, :, None] < 0) | (kv_seg_chunk[:, None, :] < 0)
+        segment_ids_mask = segment_mismatch_mask | q_or_kv_is_padding
 
         segment_ids_mask = segment_ids_mask[:, None]
 
@@ -97,21 +97,49 @@ def _chunk_attention_bias(
 
         chunk_bias = chunk_bias + segment_ids_bias
 
+    use_positions = q_position_ids is not None and kv_position_ids is not None
+
     if causal_block_size is not None:
-        query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
-        query_idx += query_offset
-        key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
-        key_idx += key_offset
+        if use_positions:
+            q_pos_chunk = lax.dynamic_slice(
+                q_position_ids,
+                start_indices=(0, query_offset),
+                slice_sizes=(q_position_ids.shape[0], query_chunk_size),
+            ).astype(jnp.int32)
+            kv_pos_chunk = lax.dynamic_slice(
+                kv_position_ids,
+                start_indices=(0, key_offset),
+                slice_sizes=(kv_position_ids.shape[0], key_chunk_size),
+            ).astype(jnp.int32)
+            causal_mask_value = jnp.where(kv_pos_chunk[:, None, :] > q_pos_chunk[:, :, None], neg_inf, zero)
+            chunk_bias = chunk_bias + causal_mask_value[:, None, :, :]
+        else:
+            query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
+            query_idx += query_offset
+            key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
+            key_idx += key_offset
 
-        causal_mask_value = jnp.where(key_idx > query_idx, neg_inf, zero)
+            causal_mask_value = jnp.where(key_idx > query_idx, neg_inf, zero)
 
-        chunk_bias = chunk_bias + causal_mask_value.reshape(1, 1, *causal_mask_value.shape)
+            chunk_bias = chunk_bias + causal_mask_value.reshape(1, 1, *causal_mask_value.shape)
 
     if sliding_window is not None:
-        query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
-        query_idx += query_offset
-        key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
-        key_idx += key_offset
+        if use_positions:
+            query_idx = lax.dynamic_slice(
+                q_position_ids,
+                start_indices=(0, query_offset),
+                slice_sizes=(q_position_ids.shape[0], query_chunk_size),
+            ).astype(jnp.int32)[:, :, None]
+            key_idx = lax.dynamic_slice(
+                kv_position_ids,
+                start_indices=(0, key_offset),
+                slice_sizes=(kv_position_ids.shape[0], key_chunk_size),
+            ).astype(jnp.int32)[:, None, :]
+        else:
+            query_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(query_chunk_size, 1), dimension=0)
+            query_idx += query_offset
+            key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, key_chunk_size), dimension=1)
+            key_idx += key_offset
 
         if isinstance(sliding_window, tuple):
             left_window, right_window = sliding_window
@@ -127,7 +155,10 @@ def _chunk_attention_bias(
 
         window_mask_value = jnp.where(~window_mask, neg_inf, zero)
 
-        chunk_bias = chunk_bias + window_mask_value.reshape(1, 1, *window_mask_value.shape)
+        if use_positions:
+            chunk_bias = chunk_bias + window_mask_value[:, None, :, :]
+        else:
+            chunk_bias = chunk_bias + window_mask_value.reshape(1, 1, *window_mask_value.shape)
 
     if not deterministic and pdrop > 0.0:
         attn_dropout_slice = lax.dynamic_slice(

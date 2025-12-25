@@ -30,9 +30,8 @@ def create_attention_mask(
     sequence_start: Int[Array, "batch"],
     sequence_end: Int[Array, "batch"],
     sliding_window: tuple[int, int] | None = None,
-    num_sinks: int = 0,
 ) -> Float[Array, "batch q_len 1 kv_len"]:
-    """Creates a comprehensive attention mask with ragged sequences, sliding window, and sinks.
+    """Creates an attention mask with ragged sequences and an optional sliding window.
 
     Args:
         batch_size: Batch size
@@ -41,7 +40,6 @@ def create_attention_mask(
         sequence_start: Start indices for each sequence
         sequence_end: End indices for each sequence
         sliding_window: Optional (left, right) window size for local attention
-        num_sinks: Number of attention sink tokens (always attendable)
 
     Returns:
         Boolean mask of shape [batch, q_len, 1, kv_len]
@@ -65,11 +63,6 @@ def create_attention_mask(
 
         window_mask = (kv_positions >= (q_pos - window_left)) & (kv_positions <= (q_pos + window_right))  # (B,Q,K)
         mask = mask & window_mask
-
-    if num_sinks > 0:
-        sink_mask = (kv_positions >= start) & (kv_positions < (start + jnp.int32(num_sinks)))  # (B,1,K)
-        sink_mask = jnp.broadcast_to(sink_mask, mask.shape)
-        mask = mask | sink_mask
 
     return mask[:, :, None, :]
 
@@ -128,27 +121,23 @@ def apply_attention_sinks_block(
 
 def flash_attention_block(
     carry: tuple[Array, Array, Array],
-    block_inputs: tuple[Array, Array, Array, Array, int],
+    block_inputs: tuple[Array, Array, Array, Array],
     softmax_scale: float,
     logits_soft_cap: float | None = None,
-    sink_scores: Array | None = None,
-    num_sinks: int = 0,
 ) -> tuple[tuple[Array, Array, Array], None]:
-    """Enhanced flash attention block with soft cap and sinks.
+    """Enhanced flash attention block with soft cap.
 
     Args:
         carry: Tuple of (output, max_logits, normalizer)
-        block_inputs: Tuple of (queries, keys_block, values_block, mask_block, block_offset)
+        block_inputs: Tuple of (queries, keys_block, values_block, mask_block)
         softmax_scale: Scaling factor for attention
         logits_soft_cap: Optional soft capping value
-        sink_scores: Optional attention sink biases
-        num_sinks: Number of sink tokens
 
     Returns:
         Updated carry tuple
     """
     o_prev, m_prev, l_prev = carry
-    q, k_block, v_block, mask_block, block_offset = block_inputs
+    q, k_block, v_block, mask_block = block_inputs
 
     _batch_size, _q_len, q_heads, _head_dim = q.shape
     _, _block_size, kv_heads, _ = k_block.shape
@@ -163,9 +152,6 @@ def flash_attention_block(
 
     if logits_soft_cap is not None:
         scores = apply_logits_soft_cap(scores, logits_soft_cap)
-
-    if sink_scores is not None and num_sinks > 0:
-        scores = apply_attention_sinks_block(scores, sink_scores, num_sinks, block_offset)
 
     mask_expanded = jnp.broadcast_to(mask_block, scores.shape)
 
@@ -223,7 +209,8 @@ def ragged_flash_attention_xla(
         block_size: Size of blocks for chunked computation
         sliding_window: Optional (left, right) window for local attention
         logits_soft_cap: Optional soft capping for logits
-        softmax_aux: Optional attention sink biases [H, num_sinks] or [num_sinks]
+        softmax_aux: Optional attention sink logits of shape [num_sinks] or [num_heads, num_sinks].
+            These logits participate in softmax normalization but do not contribute to the output values.
 
     Returns:
         Attention output [B, Q, H, D]
@@ -234,24 +221,33 @@ def ragged_flash_attention_xla(
     if softmax_scale is None:
         softmax_scale = 1.0 / jnp.sqrt(head_dim)
 
-    num_sinks = 0
-    sink_scores = None
+    sink_logits = None
     if softmax_aux is not None:
-        if softmax_aux.ndim == 1:
-            num_sinks = softmax_aux.shape[0]
-        elif softmax_aux.ndim == 2:
-            num_sinks = softmax_aux.shape[-1]
-        sink_scores = softmax_aux
+        aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
+        if aux.ndim == 1:
+            sink_logits = aux.reshape(1, 1, 1, -1)
+        elif aux.ndim == 2:
+            if aux.shape[0] == 1:
+                sink_logits = aux.reshape(1, 1, 1, -1)
+            elif aux.shape[0] == num_heads:
+                sink_logits = aux.reshape(1, 1, num_heads, -1)
+            else:
+                raise ValueError(f"softmax_aux first dim must be 1 or num_heads ({num_heads}); got {aux.shape[0]}")
+        else:
+            raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}")
+        sink_logits = jnp.broadcast_to(sink_logits, (batch_size, q_len, num_heads, sink_logits.shape[-1]))
 
-    mask = create_attention_mask(
-        batch_size, q_len, kv_len, sequence_start, sequence_end, sliding_window=sliding_window, num_sinks=num_sinks
-    )
+    mask = create_attention_mask(batch_size, q_len, kv_len, sequence_start, sequence_end, sliding_window=sliding_window)
 
     num_blocks = (kv_len + block_size - 1) // block_size
 
     output_init = jnp.zeros_like(query, dtype=query.dtype)
-    max_logits_init = jnp.full((batch_size, q_len, num_heads, 1), -jnp.inf, dtype=query.dtype)
-    normalizer_init = jnp.zeros((batch_size, q_len, num_heads, 1), dtype=query.dtype)
+    if sink_logits is None:
+        max_logits_init = jnp.full((batch_size, q_len, num_heads, 1), -jnp.inf, dtype=jnp.float32)
+        normalizer_init = jnp.zeros((batch_size, q_len, num_heads, 1), dtype=jnp.float32)
+    else:
+        max_logits_init = jnp.max(sink_logits, axis=-1, keepdims=True)
+        normalizer_init = jnp.sum(jnp.exp(sink_logits - max_logits_init), axis=-1, keepdims=True)
 
     pad_len = num_blocks * block_size - kv_len
     if pad_len > 0:
@@ -278,15 +274,11 @@ def ragged_flash_attention_xla(
         v_block = value_blocks[:, block_idx]
         m_block = mask_blocks[:, block_idx]
 
-        block_offset = block_idx * block_size
-
         return flash_attention_block(
             carry,
-            (query, k_block, v_block, m_block, block_offset),
+            (query, k_block, v_block, m_block),
             softmax_scale,
             logits_soft_cap=logits_soft_cap,
-            sink_scores=sink_scores,
-            num_sinks=num_sinks,
         )
 
     (output, _, _), _ = lax.scan(scan_fn, (output_init, max_logits_init, normalizer_init), (jnp.arange(num_blocks),))

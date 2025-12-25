@@ -17,12 +17,14 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from ejkernel.kernels._triton.native_sparse_attention import (
     apply_native_sparse_attention,
     native_sparse_attention,
 )
+from ejkernel.kernels._xla.native_sparse_attention import native_sparse_attention as xla_native_sparse_attention
 from ejkernel.utils import generate_block_indices
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
@@ -261,6 +263,55 @@ class TestNativeSparseAttentionWithCompression:
         assert not jnp.any(jnp.isnan(grads[0]))
         assert not jnp.any(jnp.isnan(grads[1]))
         assert not jnp.any(jnp.isnan(grads[2]))
+
+
+def test_native_sparse_attention_matches_xla_smoke():
+    key = jax.random.PRNGKey(0)
+    kq, kk, kv = jax.random.split(key, 3)
+
+    batch_size, seq_len, num_q_heads, num_kv_heads, head_dim = 1, 128, 16, 1, 64
+    block_size = 64
+    block_counts = 2
+
+    q = jax.random.normal(kq, (batch_size, seq_len, num_q_heads, head_dim), dtype=jnp.float16)
+    k = jax.random.normal(kk, (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
+    v = jax.random.normal(kv, (batch_size, seq_len, num_kv_heads, head_dim), dtype=jnp.float16)
+
+    block_indices = jnp.broadcast_to(
+        jnp.arange(block_counts, dtype=jnp.int32)[None, None, None, :],
+        (batch_size, seq_len, num_kv_heads, block_counts),
+    )
+
+    out_triton = native_sparse_attention(
+        query=q,
+        key=k,
+        value=v,
+        g_cmp=None,
+        g_slc=None,
+        block_indices=block_indices,
+        block_counts=block_counts,
+        block_size=block_size,
+    )
+    out_xla = xla_native_sparse_attention(
+        query=q,
+        key=k,
+        value=v,
+        g_cmp=None,
+        g_slc=None,
+        block_indices=block_indices,
+        block_counts=block_counts,
+        block_size=block_size,
+    )
+
+    out_triton = jax.block_until_ready(out_triton)
+    out_xla = jax.block_until_ready(out_xla)
+
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 if __name__ == "__main__":

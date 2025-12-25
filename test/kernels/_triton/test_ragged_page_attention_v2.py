@@ -17,9 +17,11 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
-from ejkernel.kernels._triton.ragged_page_attention_v2._interface import ragged_page_attention_v2
+from ejkernel.kernels._triton.ragged_page_attention_v2 import ragged_page_attention_v2
+from ejkernel.kernels._xla.ragged_page_attention_v2 import ragged_page_attention_v2 as xla_ragged_page_attention_v2
 
 pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
 
@@ -482,6 +484,57 @@ class TestEdgeCases:
 
         diff = float(jnp.max(jnp.abs(output_no_window - output_large_window)))
         assert diff < 1e-5, "Window larger than sequence should match full attention"
+
+
+def test_ragged_page_attention_v2_matches_xla():
+    data = create_test_data(
+        num_seqs=2,
+        max_seq_len=64,
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_size=32,
+        page_size=16,
+        seed=0,
+    )
+
+    softmax_scale = float(data["queries"].shape[-1]) ** -0.5
+
+    out_triton = ragged_page_attention_v2(
+        queries=data["queries"],
+        kv_pages=data["kv_pages"],
+        context_lens=data["context_lens"],
+        block_tables=data["block_tables"],
+        query_start_loc=data["query_start_loc"],
+        num_seqs=data["num_seqs"],
+        softmax_scale=softmax_scale,
+        logits_soft_cap=None,
+        sliding_window=None,
+        optimized=False,
+    )
+    out_xla = xla_ragged_page_attention_v2(
+        queries=data["queries"],
+        kv_pages=data["kv_pages"],
+        context_lens=data["context_lens"],
+        block_tables=data["block_tables"],
+        query_start_loc=data["query_start_loc"],
+        num_seqs=data["num_seqs"],
+        softmax_scale=softmax_scale,
+        logits_soft_cap=None,
+        sliding_window=None,
+        softmax_aux=None,
+        compute_dtype=jnp.float32,
+        optimized=False,
+    )
+
+    out_triton = jax.block_until_ready(out_triton)
+    out_xla = jax.block_until_ready(out_xla)
+
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 if __name__ == "__main__":

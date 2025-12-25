@@ -19,8 +19,8 @@ import inspect
 
 import pytest
 
-from ejkernel.kernels._registry import kernel_registry
 from ejkernel.kernels._pallas.tpu.ring_attention import _interface as pallas_interface
+from ejkernel.kernels._registry import kernel_registry
 from ejkernel.kernels._xla.ring_attention import _interface as xla_interface
 
 
@@ -43,6 +43,8 @@ class TestFeatureParity:
             "value",
             "q_segment_ids",
             "kv_segment_ids",
+            "q_position_ids",
+            "kv_position_ids",
             "softmax_aux",
             "bias",
             "mask_builder",
@@ -62,6 +64,8 @@ class TestFeatureParity:
 
         assert xla_sig.parameters["q_segment_ids"].default is None
         assert xla_sig.parameters["kv_segment_ids"].default is None
+        assert xla_sig.parameters["q_position_ids"].default is None
+        assert xla_sig.parameters["kv_position_ids"].default is None
         assert xla_sig.parameters["softmax_aux"].default is None
         assert xla_sig.parameters["bias"].default is None
         assert xla_sig.parameters["mask_builder"].default is None

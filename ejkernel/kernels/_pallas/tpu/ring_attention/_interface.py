@@ -184,6 +184,8 @@ def ring_attention(
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
     softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
