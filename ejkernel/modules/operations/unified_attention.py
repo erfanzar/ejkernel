@@ -147,9 +147,13 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         causal: bool = True,
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
+        seq_threshold_3d: int | None = None,
+        num_par_softmax_segments: int | None = None,
         alibi_slopes: Float[Array, "num_q_heads"] | None = None,
         qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None = None,
         attention_sink: Float[Array, "num_q_heads"] | None = None,
+        num_warps: int | None = None,
+        num_stages: int | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         cfg: UnifiedAttentionConfig,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
@@ -196,6 +200,15 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
 
+        if seq_threshold_3d is None:
+            seq_threshold_3d = cfg.seq_threshold_3d
+        if num_par_softmax_segments is None:
+            num_par_softmax_segments = cfg.num_par_softmax_segments
+        if num_warps is None:
+            num_warps = cfg.num_warps
+        if num_stages is None:
+            num_stages = cfg.num_stages
+
         impl = self.get_impl(cfg)
         return impl(
             queries=queries,
@@ -208,13 +221,13 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
             causal=causal,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
-            seq_threshold_3d=cfg.seq_threshold_3d,
-            num_par_softmax_segments=cfg.num_par_softmax_segments,
+            seq_threshold_3d=seq_threshold_3d,
+            num_par_softmax_segments=num_par_softmax_segments,
             alibi_slopes=alibi_slopes,
             qq_bias=qq_bias,
             attention_sink=attention_sink,
-            num_warps=cfg.num_warps,
-            num_stages=cfg.num_stages,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
 
     def heuristic_cfg(self, inv: Invocation[UnifiedAttentionConfig, Array]) -> UnifiedAttentionConfig:
@@ -282,9 +295,13 @@ def unified_attention(
     causal: bool = True,
     sliding_window: int | None = None,
     logits_soft_cap: float | None = None,
+    seq_threshold_3d: int | None = None,
+    num_par_softmax_segments: int | None = None,
     alibi_slopes: Float[Array, "num_q_heads"] | None = None,
     qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None = None,
     attention_sink: Float[Array, "num_q_heads"] | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: UnifiedAttentionConfig | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
@@ -374,9 +391,13 @@ def unified_attention(
         causal=causal,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
+        seq_threshold_3d=seq_threshold_3d,
+        num_par_softmax_segments=num_par_softmax_segments,
         alibi_slopes=alibi_slopes,
         qq_bias=qq_bias,
         attention_sink=attention_sink,
+        num_warps=num_warps,
+        num_stages=num_stages,
         platform=platform,
         _cfg=cfg,
     )

@@ -143,6 +143,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
         pages_per_compute_block: int | None = None,
         megacore_mode: str | None = None,
         inline_seq_dim: bool = True,
+        sliding_window: int | None = None,
     ) -> Float[Array, "num_seqs num_heads head_dim"]:
         """Execute page attention over paged KV cache.
 
@@ -207,6 +208,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
             pages_per_compute_block=pages_per_compute_block,
             megacore_mode=megacore_mode,
             inline_seq_dim=inline_seq_dim,
+            sliding_window=sliding_window,
         )
 
     def heuristic_cfg(self, inv: Invocation[PageAttentionConfig, Array]) -> PageAttentionConfig:
@@ -264,6 +266,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
         pages_per_compute_block: int | None = None,
         megacore_mode: str | None = None,
         inline_seq_dim: bool = True,
+        sliding_window: int | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
         out_specs: PartitionSpec | None = None,
@@ -326,6 +329,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
                 pages_per_compute_block=pages_per_compute_block,
                 megacore_mode=megacore_mode,
                 inline_seq_dim=inline_seq_dim,
+                sliding_window=sliding_window,
             )
 
         shard_map_fn = shard_map(
@@ -377,6 +381,7 @@ def page_attention(
     pages_per_compute_block: int | None = None,
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
+    sliding_window: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: PageAttentionConfig | None = None,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
@@ -439,6 +444,7 @@ def page_attention(
         pages_per_compute_block=pages_per_compute_block,
         megacore_mode=megacore_mode,
         inline_seq_dim=inline_seq_dim,
+        sliding_window=sliding_window,
         platform=platform,
         _cfg=cfg,
     )

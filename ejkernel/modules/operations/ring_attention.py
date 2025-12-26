@@ -120,6 +120,10 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         - Blockwise transformer architectures
     """
 
+    # Bump for persistent-cache invalidation: heuristic block sizes now adapt to
+    # sequence lengths to satisfy SplashAttention divisibility constraints.
+    version = "1"
+
     def __init__(self):
         """Initialize Ring Attention module.
 
@@ -137,7 +141,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
-        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        softmax_aux: Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
         sliding_window: int | tuple[int, int] | None = None,
@@ -193,7 +197,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             query: Float[Array, "batch seq_len_q num_heads head_dim"],
             key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
             value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-            softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+            softmax_aux: Float[Array, "num_sinks"] | None = None,
             bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
             q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
             kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
@@ -268,7 +272,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
-        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        softmax_aux: Float[Array, "num_sinks"] | None = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         mask_builder: Callable[[int, int, int, int, int], Mask] | None = None,
         sliding_window: int | tuple[int, int] | None = None,
@@ -363,9 +367,25 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             Default RingAttentionConfig with block sizes balanced for communication
             and computation overlap in distributed settings
         """
+        try:
+            q_len = int(inv.kwargs["query"].shape[1])
+            kv_len = int(inv.kwargs["key"].shape[1])
+        except Exception:
+            q_len = 512
+            kv_len = 512
+
+        def _largest_pow2_divisor(n: int, *, max_block: int = 512) -> int:
+            n = max(1, int(n))
+            for b in (512, 256, 128, 64, 32, 16, 8, 4, 2, 1):
+                if b <= max_block and b <= n and n % b == 0:
+                    return b
+            return 1
+
+        block_q = _largest_pow2_divisor(q_len)
+        block_kv = _largest_pow2_divisor(kv_len)
         return RingAttentionConfig(
-            fwd_params=FwdParams(q_blocksize=512, kv_blocksize=512, num_stages=2, num_warps=4),
-            bwd_params=BwdParams(q_blocksize=512, kv_blocksize=512, num_stages=2, num_warps=4),
+            fwd_params=FwdParams(q_blocksize=block_q, kv_blocksize=block_kv, num_stages=2, num_warps=4),
+            bwd_params=BwdParams(q_blocksize=block_q, kv_blocksize=block_kv, num_stages=2, num_warps=4),
             platform="auto",
             backend="any",
         )
@@ -452,7 +472,7 @@ def ring_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     /,
     *,

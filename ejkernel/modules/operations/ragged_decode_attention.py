@@ -117,7 +117,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
 
     def run(
         self,
-        query: Float[Array, "batch num_heads head_dim"],
+        query: Float[Array, "batch num_q_heads head_dim"],
         key: Float[Array, "batch seq_len num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len num_kv_heads head_dim"],
         sequence_start: Int[Array, "batch"],
@@ -129,7 +129,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: RaggedDecodeAttentionConfig,
-    ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
+    ) -> Float[Array, "batch num_q_heads head_dim"]:
         """Execute ragged decode attention with variable-length sequences.
 
         Computes attention for batched queries where each sequence has a different
@@ -149,7 +149,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             cfg: Kernel configuration object containing block_size parameter
 
         Returns:
-            Attention output [total_tokens, num_q_heads, head_dim]
+            Attention output [batch, num_q_heads, head_dim]
 
         Note:
             The sequence_start and sequence_end arrays define which KV positions
@@ -388,7 +388,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
 
     def create_shard_map_wrapper(
         self,
-        query: Float[Array, "batch num_heads head_dim"],
+        query: Float[Array, "batch num_q_heads head_dim"],
         key: Float[Array, "batch seq_len num_kv_heads head_dim"],
         value: Float[Array, "batch seq_len num_kv_heads head_dim"],
         sequence_start: Int[Array, "batch"],
@@ -492,7 +492,7 @@ _ragged_decode_attention_executor: Executor[RaggedDecodeAttentionConfig, Array] 
 
 
 def ragged_decode_attention(
-    query: Float[Array, "batch num_heads head_dim"] | Float[Array, "batch 1 num_heads head_dim"],
+    query: Float[Array, "batch num_q_heads head_dim"] | Float[Array, "batch 1 num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
     sequence_start: Int[Array, "batch"],
@@ -508,7 +508,7 @@ def ragged_decode_attention(
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: PartitionSpec | None = None,
-) -> Float[Array, "total_tokens num_q_heads head_dim"]:
+) -> Float[Array, "batch num_q_heads head_dim"] | Float[Array, "batch 1 num_q_heads head_dim"]:
     """Execute ragged decode attention with automatic optimization.
 
     Efficiently computes attention for variable-length sequences during the decode phase,
@@ -528,7 +528,7 @@ def ragged_decode_attention(
         cfg: Optional config override (block_size is set via cfg)
 
     Returns:
-        Attention output [total_tokens, num_q_heads, head_dim]
+        Attention output [batch, num_q_heads, head_dim] (or [batch, 1, num_q_heads, head_dim] for 4D queries)
 
     Example:
         >>>

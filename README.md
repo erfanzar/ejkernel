@@ -507,7 +507,7 @@ pytest -k "flash_attention"
 pytest --verbose --failfast
 
 # Module operations tests
-pytest test/test_module_operations.py
+pytest test/modules/operations
 ```
 
 ### Test Categories

@@ -165,6 +165,16 @@ def ragged_decode_mqa(
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
 
+    # Ensure we run at least one block and never pick a block size larger than
+    # the available KV length (otherwise `seq_len // block_size == 0` and the
+    # kernel never executes, returning zeros).
+    block_size = min(int(block_size), int(seq_len))
+    num_blocks = (int(seq_len) + block_size - 1) // block_size
+    pad_len = (num_blocks * block_size) - int(seq_len)
+    if pad_len > 0:
+        key = jnp.pad(key, ((0, 0), (0, pad_len), (0, 0)), mode="constant")
+        value = jnp.pad(value, ((0, 0), (0, pad_len), (0, 0)), mode="constant")
+
     out, *_ = pl.pallas_call(
         functools.partial(
             ragged_flash_attention_kernel,
@@ -175,6 +185,9 @@ def ragged_decode_mqa(
             num_scalar_prefetch=2,
             in_specs=[
                 pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
+                # `i` is already the KV block index. Pallas will scale it by the
+                # `block_size` from the `BlockSpec`, so we must not multiply by
+                # `block_size` here (doing so can produce out-of-bounds DMAs).
                 pl.BlockSpec((None, block_size, head_dim), lambda b, i, *_: (b, i, 0)),
                 pl.BlockSpec((None, block_size, head_dim), lambda b, i, *_: (b, i, 0)),
             ],
@@ -183,7 +196,7 @@ def ragged_decode_mqa(
                 pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
                 pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
             ],
-            grid=(batch_size, seq_len // block_size),
+            grid=(batch_size, num_blocks),
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "arbitrary")),
         out_shape=[

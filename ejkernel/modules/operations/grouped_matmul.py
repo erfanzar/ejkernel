@@ -38,7 +38,7 @@ import jax
 from jax import numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, DTypeLike, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
@@ -101,13 +101,13 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         lhs: Float[Array, "m k"],
         rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
         group_sizes: Int[Array, "num_groups_or_shards"],
-        preferred_element_type=None,
+        preferred_element_type: DTypeLike = jnp.float32,
         group_offset: Int[Array, "..."] | None = None,
         existing_out: Float[Array, "m n"] | None = None,
         transpose_rhs: bool = False,
         interpret: bool = False,
         do_padding: bool = True,
-        precision=None,
+        precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
@@ -185,13 +185,13 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         lhs: Float[Array, "m k"],
         rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
         group_sizes: Int[Array, "num_groups_or_shards"],
-        preferred_element_type=None,
+        preferred_element_type: DTypeLike = jnp.float32,
         group_offset: Int[Array, "..."] | None = None,
         existing_out: Float[Array, "m n"] | None = None,
         transpose_rhs: bool = False,
         interpret: bool = False,
         do_padding: bool = True,
-        precision=None,
+        precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
@@ -354,11 +354,11 @@ def grouped_matmul(
     existing_out: Float[Array, "m n"] | None = None,
     /,
     *,
-    preferred_element_type=None,
+    preferred_element_type: DTypeLike = jnp.float32,
     transpose_rhs: bool = False,
     interpret: bool = False,
     do_padding: bool = True,
-    precision=None,
+    precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     use_v2: bool = False,
     out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,

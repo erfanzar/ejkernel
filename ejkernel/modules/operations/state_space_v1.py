@@ -51,6 +51,7 @@ import typing
 from collections.abc import Callable
 from typing import Literal
 
+import jax
 from jaxtyping import Array, Float
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -124,7 +125,7 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
         gate: Float[Array, "batch seq_len intermediate_size"] | None = None,
         initial_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
         conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
-        act_fn: Callable[[Array], Array] | None = None,
+        act_fn: Callable[[jax.Array], jax.Array] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: StateSpaceV1Config,
@@ -242,7 +243,7 @@ def state_space_v1(
     initial_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
     conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
     *,
-    act_fn: Callable[[Array], Array] | None = None,
+    act_fn: Callable[[jax.Array], jax.Array] | None = None,
     platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: StateSpaceV1Config | None = None,
 ) -> tuple[

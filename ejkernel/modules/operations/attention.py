@@ -25,7 +25,7 @@ leverages XLA's compiler optimizations for straightforward attention computation
 
 from __future__ import annotations
 
-import typing as tp
+from collections.abc import Callable
 
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, PRNGKeyArray
@@ -106,13 +106,13 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         self,
         query: Float[Array, "batch seq_len num_q_heads head_dim"],
         key: Float[Array, "batch kv_len num_kv_heads head_dim"],
-        value: Float[Array, "batch seq_len num_q_heads vhead_dim"],
+        value: Float[Array, "batch kv_len num_kv_heads vhead_dim"],
         attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-        init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+        init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         deterministic: bool = True,
         dropout_rng: PRNGKeyArray | None = None,
-        softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+        softmax_aux: Float[Array, "num_sinks"] | None = None,
         softmax_scale: float | None = None,
         logits_soft_cap: float | None = None,
         dtype: DTypeLike | None = jnp.bfloat16,
@@ -122,7 +122,10 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         sliding_window: int | tuple[int, int] | None = None,
         *,
         cfg: AttentionConfig,
-    ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
+    ) -> tuple[
+        Float[Array, "batch seq_len num_q_heads vhead_dim"],
+        Float[Array, "batch num_heads seq_len kv_len"],
+    ]:
         """Execute flash attention with the given configuration.
 
         Args:
@@ -214,14 +217,14 @@ _executor: Executor[AttentionConfig, tuple[Array, Array]] = Executor(
 def attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch kv_len num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len num_q_heads vhead_dim"],
+    value: Float[Array, "batch kv_len num_kv_heads vhead_dim"],
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     dropout_rng: PRNGKeyArray | None = None,
-    softmax_aux: Float[Array, "num_heads num_sinks"] | Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
     /,
     *,
     mask_info: MaskInfo | None = None,
-    init_bias: tp.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+    init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     deterministic: bool = True,
     softmax_scale: float | None = None,
     logits_soft_cap: float | None = None,
@@ -265,7 +268,7 @@ def attention(
     if mask_info is not None:
         attention_mask = mask_info.get_or_compute_attention_mask()
 
-    return _executor(
+    out, _ = _executor(
         Attention(),
         query=query,
         key=key,
@@ -284,3 +287,4 @@ def attention(
         softmax_aux=softmax_aux,
         causal=causal,
     )
+    return out

@@ -53,6 +53,7 @@ import typing
 from collections.abc import Callable
 from typing import Literal
 
+import jax
 from jax import lax
 from jaxtyping import Array, Float
 
@@ -127,7 +128,7 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
         initial_state: Float[Array, "batch num_heads head_dim ssm_state_size"] | None = None,
         conv_state: Float[Array, "batch conv_dim d_conv"] | None = None,
         n_groups: int = 1,
-        act_fn: Callable[[Array], Array] | None = None,
+        act_fn: Callable[[jax.Array], jax.Array] | None = None,
         use_gated_rmsnorm: bool = False,
         rmsnorm_eps: float = 1e-5,
         precision: lax.Precision | None = None,
@@ -263,7 +264,7 @@ def state_space_v2(
     conv_state: Float[Array, "batch conv_dim d_conv"] | None = None,
     *,
     n_groups: int = 1,
-    act_fn: Callable[[Array], Array] | None = None,
+    act_fn: Callable[[jax.Array], jax.Array] | None = None,
     use_gated_rmsnorm: bool = False,
     rmsnorm_eps: float = 1e-5,
     precision: lax.Precision | None = None,

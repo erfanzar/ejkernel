@@ -37,6 +37,7 @@ relies on platform-specific optimizations (e.g., XLA's attention primitive).
 from __future__ import annotations
 
 import typing
+from collections.abc import Callable
 
 import jax
 from jax import shard_map
@@ -125,7 +126,7 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
         value: Float[Array, "batch kv_len num_kv_heads head_dim"],
         attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | None = None,
         bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-        init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+        init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         softmax_scale: float | None = None,
         causal: bool = False,
         sliding_window: int | tuple[int, int] | None = None,
@@ -134,7 +135,7 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
         platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: ScaledDotProductAttentionConfig,
-    ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+    ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
         """Execute scaled_dot_product_attention with the given configuration.
 
         Args:
@@ -197,7 +198,7 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
         out_specs: jax.sharding.PartitionSpec,
         check_vma: bool = False,
         cfg: ScaledDotProductAttentionConfig,
-        init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+        init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
         softmax_scale: float | None = None,
         causal: bool = False,
         sliding_window: int | tuple[int, int] | None = None,
@@ -337,7 +338,7 @@ def scaled_dot_product_attention(
     /,
     *,
     mask_info: MaskInfo | None = None,
-    init_bias: typing.Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
+    init_bias: Callable[[], Float[Array, "batch num_heads seq_len kv_len"]] | None = None,
     softmax_scale: float | None = None,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
@@ -345,7 +346,7 @@ def scaled_dot_product_attention(
     mesh: jax.sharding.Mesh | None = None,
     in_specs: tuple[jax.sharding.PartitionSpec, ...] | None = None,
     out_specs: jax.sharding.PartitionSpec | None = None,
-) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """Execute scaled dot product attention with automatic optimization.
 
     Convenience function that uses a default executor and flash attention module.

@@ -288,7 +288,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         cfg: RaggedPageAttentionv3Config | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
-        out_specs: PartitionSpec | None = None,
+        out_specs: PartitionSpec | tuple[PartitionSpec, PartitionSpec] | None = None,
         check_vma: bool = False,
     ):
         """Create a shard_map wrapper for distributed ragged page attention.
@@ -366,7 +366,10 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
             distribution: Int32[Array, "3"],
             attention_sink: Float[Array, "num_q_heads"] | None,
-        ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
+        ) -> tuple[
+            Float[Array, "total_tokens num_q_heads head_dim"],
+            Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
+        ]:
             return self.run(
                 queries=queries,
                 keys=keys,
@@ -446,7 +449,10 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         *,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         cfg: RaggedPageAttentionv3Config,
-    ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
+    ) -> tuple[
+        Float[Array, "total_tokens num_q_heads head_dim"],
+        Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
+    ]:
         """Execute ragged page attention over variable-length sequences.
 
         Computes attention where queries are in ragged (concatenated) format
@@ -1025,7 +1031,7 @@ def ragged_page_attention_v3(
     cfg: RaggedPageAttentionv3Config | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
-    out_specs: PartitionSpec | None = None,
+    out_specs: PartitionSpec | tuple[PartitionSpec, PartitionSpec] | None = None,
 ) -> tuple[
     Float[Array, "total_tokens num_q_heads head_dim"],
     Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],

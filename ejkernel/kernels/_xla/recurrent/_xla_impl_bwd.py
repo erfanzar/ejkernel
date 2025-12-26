@@ -23,7 +23,7 @@ def _recurrent_attention_bwd(
     k: Float[Array, "batch seq_len num_heads head_dim"],
     v: Float[Array, "batch seq_len num_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"],
-    g_gamma: Float[Array, "num_heads"],
+    g_gamma: Float[Array, "... num_heads"],
     gk: Float[Array, "batch seq_len num_heads head_dim"],
     gv: Float[Array, "batch seq_len num_heads head_dim"],
     hidden_states: Float[Array, "batch seq_len num_heads head_dim head_dim"],
@@ -59,12 +59,29 @@ def _recurrent_attention_bwd(
     Returns:
         Tuple of (dq, dk, dv, dg, dgk, dgv, dinitial_state)
     """
-    _batch, seq_len, _num_heads, _head_dim = q.shape
+    batch, seq_len, num_heads, _head_dim = q.shape
 
     use_g = jnp.any(g != 0.0)
-    use_g_gamma = jnp.any(g_gamma != 0.0)
     use_gk = jnp.any(gk != 0.0)
     use_gv = jnp.any(gv != 0.0)
+
+    if g_gamma.ndim == 1:
+        if g_gamma.shape != (num_heads,):
+            raise ValueError(f"g_gamma.shape={g_gamma.shape} must be ({num_heads},) or ({batch}, {num_heads})")
+        g_gamma_batch = jnp.broadcast_to(g_gamma, (batch, num_heads))
+    elif g_gamma.ndim == 2:
+        if g_gamma.shape[1] != num_heads:
+            raise ValueError(f"g_gamma.shape={g_gamma.shape} must be ({num_heads},) or ({batch}, {num_heads})")
+        if g_gamma.shape[0] == 1 and batch != 1:
+            g_gamma_batch = jnp.broadcast_to(g_gamma, (batch, num_heads))
+        elif g_gamma.shape[0] == batch:
+            g_gamma_batch = g_gamma
+        else:
+            raise ValueError(f"g_gamma.shape={g_gamma.shape} must be ({num_heads},) or ({batch}, {num_heads})")
+    else:
+        raise ValueError(f"g_gamma.ndim={g_gamma.ndim} must be 1 or 2")
+
+    use_g_gamma = jnp.any(g_gamma_batch != 0.0)
 
     if reverse:
         do = jnp.flip(do, axis=1)
@@ -76,7 +93,7 @@ def _recurrent_attention_bwd(
         gv = jnp.flip(gv, axis=1)
         hidden_states = jnp.flip(hidden_states, axis=1)
 
-    def process_batch(q_b, k_b, v_b, g_b, gk_b, gv_b, hidden_b, do_b, dfinal_h):
+    def process_batch(q_b, k_b, v_b, g_b, g_gamma_b, gk_b, gv_b, hidden_b, do_b, dfinal_h):
         """Process backward for a single batch element."""
 
         dh = dfinal_h
@@ -108,7 +125,7 @@ def _recurrent_attention_bwd(
                 dh_prev = dh_prev * decay_g[:, :, None]
 
             if use_g_gamma:
-                decay_gamma = jnp.exp(g_gamma)
+                decay_gamma = jnp.exp(g_gamma_b)
                 dh_prev = dh_prev * decay_gamma[:, None, None]
 
             if use_gk:
@@ -149,7 +166,7 @@ def _recurrent_attention_bwd(
         return dq_b, dk_b, dv_b, dg_b, dgk_b, dgv_b, dh_initial
 
     dq, dk, dv, dg, dgk, dgv, dinitial_state = jax.vmap(process_batch)(
-        q, k, v, g, gk, gv, hidden_states, do, dfinal_state
+        q, k, v, g, g_gamma_batch, gk, gv, hidden_states, do, dfinal_state
     )
 
     if reverse:

@@ -145,4 +145,6 @@ def grouped_matmul(
                 rhs_group_dimensions=(0,),
             ),
         )
+    if existing_out is not None:
+        out = out + jnp.asarray(existing_out, dtype=out.dtype)
     return out

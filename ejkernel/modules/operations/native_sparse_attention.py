@@ -105,7 +105,7 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: NativeSparseAttentionConfig,
-    ) -> Float[Array, "batch seq_len num_heads head_dim"]:
+    ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
         """Execute native sparse attention with explicit block indices.
 
         Args:
@@ -348,7 +348,7 @@ def native_sparse_attention(
     softmax_scale: float | None = None,
     platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: NativeSparseAttentionConfig | None = None,
-) -> Float[Array, "batch seq_len num_heads head_dim"]:
+) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """Execute native sparse attention with automatic optimization.
 
     Sparse attention computes attention only on specified blocks or patterns,

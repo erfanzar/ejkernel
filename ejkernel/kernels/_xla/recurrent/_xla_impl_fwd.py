@@ -74,7 +74,7 @@ def _recurrent_attention_fwd(
     k: Float[Array, "batch seq_len num_heads head_dim"],
     v: Float[Array, "batch seq_len num_heads head_dim"],
     g: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "num_heads"] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
     gk: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     gv: Float[Array, "batch seq_len num_heads head_dim"] | None = None,
     softmax_scale: float | None = None,
@@ -90,7 +90,7 @@ def _recurrent_attention_fwd(
     Args:
         q, k, v: Query, key, value tensors [batch, seq_len, num_heads, head_dim]
         g: Optional gate for GLA-style gating [batch, seq_len, num_heads, head_dim]
-        g_gamma: Optional per-head decay factor [num_heads]
+        g_gamma: Optional per-head decay factor [num_heads] or [batch, num_heads]
         gk, gv: Optional gates for keys/values [batch, seq_len, num_heads, head_dim]
         softmax_scale: Query scaling factor
         initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
@@ -129,10 +129,25 @@ def _recurrent_attention_fwd(
     if gv is None:
         gv = jnp.zeros((batch, seq_len, num_heads, head_dim))
 
-    def process_batch(q_b, k_b, v_b, g_b, gk_b, gv_b, h0):
-        """Process a single batch element."""
+    if g_gamma.ndim == 1:
+        if g_gamma.shape != (num_heads,):
+            raise ValueError(f"g_gamma.shape={g_gamma.shape} must be ({num_heads},) or ({batch}, {num_heads})")
+        g_gamma_batch = jnp.broadcast_to(g_gamma, (batch, num_heads))
+    elif g_gamma.ndim == 2:
+        if g_gamma.shape[1] != num_heads:
+            raise ValueError(f"g_gamma.shape={g_gamma.shape} must be ({num_heads},) or ({batch}, {num_heads})")
+        if g_gamma.shape[0] == 1 and batch != 1:
+            g_gamma_batch = jnp.broadcast_to(g_gamma, (batch, num_heads))
+        elif g_gamma.shape[0] == batch:
+            g_gamma_batch = g_gamma
+        else:
+            raise ValueError(f"g_gamma.shape={g_gamma.shape} must be ({num_heads},) or ({batch}, {num_heads})")
+    else:
+        raise ValueError(f"g_gamma.ndim={g_gamma.ndim} must be 1 or 2")
 
-        g_gamma_seq = jnp.tile(g_gamma[None, :], (seq_len, 1))
+    def process_batch(q_b, k_b, v_b, g_b, g_gamma_b, gk_b, gv_b, h0):
+        """Process a single batch element."""
+        g_gamma_seq = jnp.broadcast_to(g_gamma_b, (seq_len, num_heads))
 
         def scan_fn(carry, inputs):
             (h,) = carry
@@ -151,7 +166,7 @@ def _recurrent_attention_fwd(
     else:
         h0_batch = jnp.zeros((batch, num_heads, head_dim, head_dim))
 
-    outputs, hidden_states, final_states = jax.vmap(process_batch)(q, k, v, g, gk, gv, h0_batch)
+    outputs, hidden_states, final_states = jax.vmap(process_batch)(q, k, v, g, g_gamma_batch, gk, gv, h0_batch)
 
     if reverse:
         outputs = jnp.flip(outputs, axis=1)
@@ -166,7 +181,7 @@ def _recurrent_attention_varlen_fwd(
     v: Float[Array, "total_tokens num_heads head_dim"],
     cu_seqlens: Int[Array, "num_seqs_plus_one"],
     g: Float[Array, "total_tokens num_heads head_dim"] | None = None,
-    g_gamma: Float[Array, "num_heads"] | None = None,
+    g_gamma: Float[Array, "... num_heads"] | None = None,
     gk: Float[Array, "total_tokens num_heads head_dim"] | None = None,
     gv: Float[Array, "total_tokens num_heads head_dim"] | None = None,
     softmax_scale: float | None = None,
@@ -205,6 +220,11 @@ def _recurrent_attention_varlen_fwd(
 
         h0 = initial_state[seq_idx] if initial_state is not None else None
 
+        if g_gamma is not None and g_gamma.ndim == 2 and g_gamma.shape[0] == num_seqs:
+            g_gamma_seq = g_gamma[seq_idx]
+        else:
+            g_gamma_seq = g_gamma
+
         q_batch = q_seq[None, ...]
         k_batch = k_seq[None, ...]
         v_batch = v_seq[None, ...]
@@ -218,7 +238,7 @@ def _recurrent_attention_varlen_fwd(
             k_batch,
             v_batch,
             g=g_batch,
-            g_gamma=g_gamma,
+            g_gamma=g_gamma_seq,
             gk=gk_batch,
             gv=gv_batch,
             softmax_scale=softmax_scale,

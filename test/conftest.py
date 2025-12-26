@@ -15,8 +15,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("EJKERNEL_AUTOTUNE_POLICY", "heuristics")
 
 _TRITON_ONLY_TEST_BASENAMES = {
     # Cross-backend comparisons that require Triton.

@@ -92,13 +92,13 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
 
     def run(
         self,
-        query: Float[Array, "batch seq_len num_heads head_dim"],
-        key: Float[Array, "batch seq_len num_kv_heads head_dim"],
-        value: Float[Array, "batch seq_len num_kv_heads head_dim"],
+        query: Float[Array, "batch seq_len num_heads qk_head_dim"],
+        key: Float[Array, "batch seq_len num_kv_heads qk_head_dim"],
+        value: Float[Array, "batch seq_len num_kv_heads v_head_dim"],
         layer_idx: int,
         num_layers: int,
         softmax_scale: float | None = None,
-        initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+        initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
@@ -106,8 +106,11 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
         *,
         cfg: LightningAttentionConfig,
     ) -> (
-        Float[Array, "batch seq_len num_heads head_dim"]
-        | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
+        Float[Array, "batch seq_len num_heads v_head_dim"]
+        | tuple[
+            Float[Array, "batch seq_len num_heads v_head_dim"],
+            Float[Array, "... num_heads qk_head_dim v_head_dim"],
+        ]
     ):
         """Execute lightning attention with layer-specific optimization.
 
@@ -236,10 +239,10 @@ _lightning_executor: Executor[LightningAttentionConfig, Array] = Executor(
 
 
 def lightning_attention(
-    query: Float[Array, "batch seq_len num_heads head_dim"],
-    key: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
+    query: Float[Array, "batch seq_len num_heads qk_head_dim"],
+    key: Float[Array, "batch seq_len num_kv_heads qk_head_dim"],
+    value: Float[Array, "batch seq_len num_kv_heads v_head_dim"],
+    initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     /,
     *,
@@ -251,8 +254,11 @@ def lightning_attention(
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: LightningAttentionConfig | None = None,
 ) -> (
-    Float[Array, "batch seq_len num_heads head_dim"]
-    | tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]
+    Float[Array, "batch seq_len num_heads v_head_dim"]
+    | tuple[
+        Float[Array, "batch seq_len num_heads v_head_dim"],
+        Float[Array, "... num_heads qk_head_dim v_head_dim"],
+    ]
 ):
     """Execute lightning attention with automatic optimization.
 

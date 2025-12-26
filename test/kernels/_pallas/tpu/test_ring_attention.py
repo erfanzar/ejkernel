@@ -556,11 +556,13 @@ class TestRingAttentionPallasDistributed:
                 None,
                 None,
                 None,
+                None,
+                None,
             ),
             out_specs=PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
             mesh=mesh,
             check_vma=False,
-        )(q, k, v, None, None, softmax_aux)
+        )(q, k, v, None, None, None, None, softmax_aux)
 
         out_vanilla, _ = vanilla_attention(q, k, v, softmax_aux=softmax_aux, dtype=jnp.float32)
 

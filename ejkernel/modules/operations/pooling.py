@@ -87,7 +87,7 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
 
     def run(
         self,
-        x: Float[Array, "batch seq_len hidden_dim"],
+        x: Float[Array, "... hidden_dim"],
         chunk_size: int = 32,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
@@ -211,7 +211,7 @@ _mean_pooling_executor: Executor[MeanPoolingConfig, Array] = Executor(
 
 
 def mean_pooling(
-    x: Float[Array, "batch seq_len hidden_dim"],
+    x: Float[Array, "... hidden_dim"],
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     /,
     *,

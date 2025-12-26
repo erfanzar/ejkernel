@@ -133,7 +133,6 @@ class KernelDeltaAttention(Kernel[KernelDeltaAttentionConfig, Array]):
         beta: Float[Array, "batch seq_len num_heads"],
         decay: Float[Array, "batch seq_len num_heads"] | None = None,
         initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
-        /,
         *,
         softmax_scale: float | None = None,
         chunk_size: int = 64,

@@ -344,7 +344,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.32"
+version = "0.0.40"
 source = { editable = "." }
 dependencies = [
     { name = "beartype" },
