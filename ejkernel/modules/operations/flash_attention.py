@@ -114,9 +114,9 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         >>> output = executor(attn, query, key, value, sliding_window=(256, 256))
     """
 
-    # Bump for persistent-cache invalidation: packed (segment-id) support and
-    # Triton kernel parameter changes.
-    version = "1"
+    # Bump for persistent-cache invalidation: wiring cfg.{fwd,bwd}_params into
+    # backend implementations changes runtime behavior for cached configs.
+    version = "2"
 
     def __init__(self):
         """Initialize Flash Attention module."""
@@ -319,6 +319,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             cum_seqlens_q=cum_seqlens_q,
             cum_seqlens_k=cum_seqlens_k,
             sliding_window=sliding_window,
+            fwd_params=cfg.fwd_params,
+            bwd_params=cfg.bwd_params,
             logits_soft_cap=logits_soft_cap,
             softmax_aux=softmax_aux,
             normalize_output=normalize_output,
@@ -349,7 +351,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         use_segments = (inv.kwargs.get("q_segment_ids") is not None) or (inv.kwargs.get("kv_segment_ids") is not None)
 
         # Conservative defaults to avoid SMEM launch failures on GPUs with ~99KiB limit.
-        kv_block = 64 if (use_segments or head_dim >= 128) else 128
+        # For head_dim=128 and/or segment masking enabled, 64x64 tiles can exceed SMEM on many GPUs.
+        kv_block = 32 if (use_segments or head_dim >= 128) else 128
 
         return FlashAttentionConfig(
             fwd_params=FwdParams(q_blocksize=64, kv_blocksize=kv_block, num_warps=4, num_stages=2),
