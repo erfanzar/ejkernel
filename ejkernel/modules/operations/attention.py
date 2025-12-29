@@ -233,7 +233,7 @@ def attention(
     dropout_prob: float = 0.0,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
-) -> Float[Array, "batch seq_len num_q_heads vhead_dim"]:
+) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
     """Execute flash attention with automatic optimization.
 
     Convenience function that uses a default executor and flash attention module.
@@ -268,7 +268,7 @@ def attention(
     if mask_info is not None:
         attention_mask = mask_info.get_or_compute_attention_mask()
 
-    out, _ = _executor(
+    out, w = _executor(
         Attention(),
         query=query,
         key=key,
@@ -287,4 +287,4 @@ def attention(
         softmax_aux=softmax_aux,
         causal=causal,
     )
-    return out
+    return out,w

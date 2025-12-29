@@ -34,7 +34,7 @@ ejKernel is a production-grade kernel library for JAX that provides highly optim
 
 ### State-of-the-Art Operations
 
-- **20+ Deep Learning Operations**: Flash Attention v2, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, State Space Models (Mamba), and more
+- **25+ Deep Learning Operations**: Flash Attention v2, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, State Space Models (Mamba), RWKV (v4/v6/v7), and more
 - **Memory Efficiency**: Custom VJP implementations with O(N) memory complexity for attention
 - **Distributed Support**: Full shard_map integration for model and data parallelism
 - **Mixed Precision**: Comprehensive dtype support with automatic gradient conversion
@@ -266,6 +266,15 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 | **Prefill Page Attention**       | Page attention prefill phase     | O(N)   | Separate prefill handling                              |
 | **Scaled Dot-Product Attention** | Standard attention               | O(N²)  | Basic reference implementation                         |
 
+### Recurrent Linear Attention (RWKV)
+
+| Operation     | Description                          | Key Features                                       |
+| ------------- | ------------------------------------ | -------------------------------------------------- |
+| **RWKV-4**    | Time-mix recurrence                  | Numerically stable (α,β,ε) state, O(N) memory      |
+| **RWKV-6**    | Multi-head linear attention          | Variable-length packing, reverse mode, O(N) memory |
+| **RWKV-7**    | DPLR (Diagonal + Low-Rank) recurrence| (a,b) parameterization, state-space inspired       |
+| **RWKV-7 Mul**| Multiplicative RWKV-7 variant        | (kk,a) reparameterization for optimized kernels    |
+
 ### Other Operations
 
 | Operation             | Description                          | Use Case                  |
@@ -307,6 +316,10 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 | Prefill Page Attention   | -            | ✅           | ✅              |
 | State Space v1           | -            | -            | ✅              |
 | State Space v2           | -            | -            | ✅              |
+| RWKV-4                   | ✅           | -            | ✅              |
+| RWKV-6                   | ✅           | -            | ✅              |
+| RWKV-7                   | ✅           | -            | ✅              |
+| RWKV-7 Mul               | ✅           | -            | ✅              |
 
 ✅ = Production ready | 🚧 = Under development | - = Not available
 

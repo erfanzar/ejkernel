@@ -406,6 +406,42 @@ class KernelDeltaAttentionConfig(BaseOperationConfig):
 
 
 @dataclass
+class RWKV4Config(BaseOperationConfig):
+    """Configuration for RWKV-4 recurrence operation."""
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RWKV6Config(BaseOperationConfig):
+    """Configuration for RWKV-6 recurrence operation."""
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RWKV7Config(BaseOperationConfig):
+    """Configuration for RWKV-7 recurrence operation."""
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RWKV7MulConfig(BaseOperationConfig):
+    """Configuration for RWKV-7 multiplicative recurrence operation."""
+
+    pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class FlashMLAConfig(BaseOperationConfig):
     """Configuration for Flash Multi-head Latent Attention operation.
 

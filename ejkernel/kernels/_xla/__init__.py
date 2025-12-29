@@ -75,6 +75,9 @@ from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .recurrent import recurrent
 from .ring_attention import ring_attention
+from .rwkv4 import rwkv4
+from .rwkv6 import rwkv6
+from .rwkv7 import rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import scaled_dot_product_attention
 from .state_space_v1 import state_space_v1
 from .state_space_v2 import state_space_v2
@@ -99,6 +102,10 @@ __all__ = [
     "recurrent",
     "recurrent_gla",
     "ring_attention",
+    "rwkv4",
+    "rwkv6",
+    "rwkv7",
+    "rwkv7_mul",
     "scaled_dot_product_attention",
     "state_space_v1",
     "state_space_v2",

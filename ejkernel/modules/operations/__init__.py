@@ -83,6 +83,10 @@ from .configs import (
     RaggedPageAttentionv3Config,
     RecurrentAttentionConfig,
     RingAttentionConfig,
+    RWKV4Config,
+    RWKV6Config,
+    RWKV7Config,
+    RWKV7MulConfig,
     ScaledDotProductAttentionConfig,
     StateSpaceV1Config,
     StateSpaceV2Config,
@@ -103,6 +107,9 @@ from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attenti
 from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attention_v3
 from .recurrent import RecurrentAttention, recurrent_attention
 from .ring_attention import RingAttention, ring_attention
+from .rwkv4 import RWKV4, rwkv4
+from .rwkv6 import RWKV6, rwkv6
+from .rwkv7 import RWKV7, RWKV7Mul, rwkv7, rwkv7_mul
 from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_product_attention
 from .state_space_v1 import StateSpaceV1, state_space_v1
 from .state_space_v2 import StateSpaceV2, state_space_v2
@@ -143,6 +150,14 @@ __all__ = (
     "RecurrentAttentionConfig",
     "RingAttention",
     "RingAttentionConfig",
+    "RWKV4",
+    "RWKV4Config",
+    "RWKV6",
+    "RWKV6Config",
+    "RWKV7",
+    "RWKV7Config",
+    "RWKV7Mul",
+    "RWKV7MulConfig",
     "ScaledDotProductAttention",
     "ScaledDotProductAttentionConfig",
     "StateSpaceV1",
@@ -170,6 +185,10 @@ __all__ = (
     "ragged_page_attention_v3",
     "recurrent_attention",
     "ring_attention",
+    "rwkv4",
+    "rwkv6",
+    "rwkv7",
+    "rwkv7_mul",
     "scaled_dot_product_attention",
     "state_space_v1",
     "state_space_v2",
