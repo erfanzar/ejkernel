@@ -125,4 +125,3 @@ def fwd_triton_impl(
         BLOCK_C=BLOCK_C,
     )
     return o, state_out
-

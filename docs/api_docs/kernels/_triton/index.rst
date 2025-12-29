@@ -17,4 +17,7 @@ ejkernel.kernels._triton package
    ragged_page_attention_v3/index
    recurrent/index
    ring_attention/index
+   rwkv4/index
+   rwkv6/index
+   rwkv7/index
    unified_attention/index

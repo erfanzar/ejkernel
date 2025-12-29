@@ -350,6 +350,7 @@ def _ring_attention_bwd(
             attention_sink_size=attention_sink_size,
             causal=causal,
         )
+
         def _ppermute_or_none(x):
             if axis_name is None or x is None:
                 return x

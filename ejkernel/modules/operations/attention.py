@@ -287,4 +287,4 @@ def attention(
         softmax_aux=softmax_aux,
         causal=causal,
     )
-    return out,w
+    return out, w

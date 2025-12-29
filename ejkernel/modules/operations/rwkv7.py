@@ -346,4 +346,3 @@ def rwkv7_mul(
         platform=platform,
         _cfg=cfg,
     )
-

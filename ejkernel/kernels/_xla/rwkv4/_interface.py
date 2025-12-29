@@ -114,7 +114,7 @@ def rwkv4(
         eps0 = jnp.full((bsz, chans), -1e30, dtype=jnp.float32)
     else:
         if state.shape != (bsz, 3, chans):
-            raise ValueError(f"`state` must have shape [B, 3, C]={ (bsz, 3, chans) }, got {state.shape}.")
+            raise ValueError(f"`state` must have shape [B, 3, C]={(bsz, 3, chans)}, got {state.shape}.")
         alpha0 = state[:, 0, :].astype(jnp.float32)
         beta0 = state[:, 1, :].astype(jnp.float32)
         eps0 = state[:, 2, :].astype(jnp.float32)
@@ -128,4 +128,3 @@ def rwkv4(
     wkv = jnp.swapaxes(wkvT, 0, 1).astype(orig_dtype)  # [B, T, C]
     final_state = jnp.stack([alphaT, betaT, epsT], axis=1)  # [B, 3, C]
     return wkv, final_state
-

@@ -95,7 +95,7 @@ def _validate_rwkv6_inputs(r: Array, k: Array, v: Array, w: Array, u: Array) -> 
     if v.shape[:3] != r.shape[:3]:
         raise ValueError(f"`v` must match [B,T,H,*], got v={v.shape}, r={r.shape}.")
     if u.ndim != 2 or u.shape[0] != r.shape[2] or u.shape[1] != r.shape[3]:
-        raise ValueError(f"`u` must have shape [H,K]={ (r.shape[2], r.shape[3]) }, got {u.shape}.")
+        raise ValueError(f"`u` must have shape [H,K]={(r.shape[2], r.shape[3])}, got {u.shape}.")
 
 
 def _rwkv6_varlen(

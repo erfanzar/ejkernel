@@ -20,4 +20,3 @@ __all__ = [
     "rwkv7",
     "rwkv7_mul",
 ]
-

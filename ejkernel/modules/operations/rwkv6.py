@@ -187,4 +187,3 @@ def rwkv6(
         platform=platform,
         _cfg=cfg,
     )
-

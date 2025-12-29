@@ -72,7 +72,10 @@ class RWKV4(Kernel[RWKV4Config, Array]):
         return_state: bool = False,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         cfg: RWKV4Config,
-    ) -> Float[Array, "batch seq_len chans"] | tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]:
+    ) -> (
+        Float[Array, "batch seq_len chans"]
+        | tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]
+    ):
         if platform is not None:
             cfg = RWKV4Config(
                 platform=platform,

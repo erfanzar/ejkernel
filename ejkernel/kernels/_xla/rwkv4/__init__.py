@@ -19,4 +19,3 @@ from ._interface import rwkv4
 __all__ = [
     "rwkv4",
 ]
-

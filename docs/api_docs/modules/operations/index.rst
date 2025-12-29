@@ -22,6 +22,9 @@ ejkernel.modules.operations package
    ragged_page_attention_v3
    recurrent
    ring_attention
+   rwkv4
+   rwkv6
+   rwkv7
    scaled_dot_product_attention
    state_space_v1
    state_space_v2
