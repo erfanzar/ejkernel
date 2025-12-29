@@ -33,6 +33,7 @@ from jaxtyping import Array, Bool, Float, Int
 from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
+from ..attention import attention as dense_attention
 
 if tp.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
@@ -225,33 +226,55 @@ def blocksparse_attention(
 
     row_has_any = jnp.any(mask, axis=-1)
 
+    if softmax_aux is None:
+        q_bthd = jnp.transpose(query, (0, 2, 1, 3))
+        k_bthd = jnp.transpose(key, (0, 2, 1, 3))
+        v_bthd = jnp.transpose(value, (0, 2, 1, 3))
+        mask_4d = mask[:, None, :, :]
+
+        out_bthd, _ = dense_attention(
+            query=q_bthd,
+            key=k_bthd,
+            value=v_bthd,
+            attention_mask=mask_4d,
+            softmax_aux=None,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            dtype=q_bthd.dtype,
+            softmax_dtype=None,
+            dropout_prob=0.0,
+            deterministic=True,
+            dropout_rng=None,
+            causal=causal,
+            sliding_window=None,
+            bias=None,
+            init_bias=None,
+        )
+
+        out_bthd = out_bthd * (row_has_any & q_valid).astype(out_bthd.dtype)[:, :, None, None]
+        return jnp.transpose(out_bthd, (0, 2, 1, 3))
+
     reps = num_heads // num_kv_heads
-    q = query.reshape(batch, num_kv_heads, reps, q_len, head_dim)
-    k = key
-    v = value
+    if reps != 1:
+        key_h = jnp.repeat(key, repeats=reps, axis=1)
+        value_h = jnp.repeat(value, repeats=reps, axis=1)
+    else:
+        key_h = key
+        value_h = value
 
-    scale = jnp.asarray(softmax_scale, dtype=q.dtype)
-    logits = jnp.einsum("bhrqd,bhkd->bhrqk", q * scale, k, optimize=True)
-
+    logits = jnp.einsum("bhtd,bhkd->bhtk", query * softmax_scale, key_h, optimize=True)
     if logits_soft_cap is not None:
-        cap = jnp.asarray(logits_soft_cap, dtype=logits.dtype)
-        logits = cap * jnp.tanh(logits / cap)
+        logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
-    neg = jnp.finfo(logits.dtype).min
-    logits = jnp.where(mask[:, None, None, :, :], logits, neg)
+    logits = jnp.where(mask[:, None, :, :], logits, jnp.finfo(logits.dtype).min)
 
     aux = _normalize_softmax_aux(softmax_aux, num_heads=num_heads, num_kv_heads=num_kv_heads, dtype=logits.dtype)
-    if aux is not None:
-        aux = aux.reshape(num_kv_heads, reps, aux.shape[-1])
-        sinks = jnp.broadcast_to(aux[None, :, :, None, :], (batch, num_kv_heads, reps, q_len, aux.shape[-1]))
-        combined = jnp.concatenate([logits, sinks], axis=-1)
-        probs = jax.nn.softmax(combined.astype(jnp.float32), axis=-1).astype(logits.dtype)
-        weights = probs[..., :kv_len]
-    else:
-        weights = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(logits.dtype)
+    assert aux is not None
+    sinks = jnp.broadcast_to(aux[None, :, None, :], (batch, num_heads, q_len, aux.shape[-1]))
+    combined = jnp.concatenate([logits, sinks], axis=-1)
+    probs = jax.nn.softmax(combined.astype(jnp.float32), axis=-1).astype(logits.dtype)
+    weights = probs[..., :kv_len]
 
-    weights = weights * row_has_any[:, None, None, :, None].astype(weights.dtype)
-
-    out = jnp.einsum("bhrqk,bhkd->bhrqd", weights, v, optimize=True).reshape(batch, num_heads, q_len, value.shape[-1])
-    out = out * q_valid[:, None, :, None].astype(out.dtype)
+    out = jnp.einsum("bhtk,bhkd->bhtd", weights, value_h, optimize=True)
+    out = out * (row_has_any & q_valid).astype(out.dtype)[:, None, :, None]
     return out
