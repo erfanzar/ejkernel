@@ -923,10 +923,10 @@ class MaskInfo:
     chunked_mask_baked_in: bool = field(default=False)
     token_type_ids_baked_in: bool = field(default=False)
 
-    batch_axis_name: tuple[str] | str | None = field(default=("dp", "fsdp"))
-    qheads_axis_name: tuple[str] | str | None = field(default="tp")
-    kvheads_axis_name: tuple[str] | str | None = field(default="tp")
-    sequence_axis_name: tuple[str] | str | None = field(default="sp")
+    batch_axis_name: tuple[str, ...] | str | None = field(default=("dp", "fsdp"))
+    qheads_axis_name: tuple[str, ...] | str | None = field(default="tp")
+    kvheads_axis_name: tuple[str, ...] | str | None = field(default="tp")
+    sequence_axis_name: tuple[str, ...] | str | None = field(default="sp")
 
     @property
     def attention_mask(self) -> Array | None:

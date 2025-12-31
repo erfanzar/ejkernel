@@ -781,7 +781,6 @@ def blocksparse_attention(
     value: Float[Array, "batch kv_num_heads kv_len vhead_dim"],
     softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-    /,
     *,
     mask_info: MaskInfo | None = None,
     attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
