@@ -41,7 +41,7 @@ Example:
 import os as _os
 
 _os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
-__version__ = "0.0.46"
+__version__ = "0.0.47"
 
 from . import kernels, modules, types, utils, xla_utils
 from .kernels import Backend, Platform, kernel_registry

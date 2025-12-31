@@ -23,7 +23,7 @@ def test_attention_matches_dense_reference_gqa_and_softmax_aux():
     )
     softmax_aux = jax.random.normal(jax.random.PRNGKey(1), (3,), dtype=jnp.float32).astype(jnp.bfloat16)
 
-    out = attention(q, k, v, None, None, softmax_aux, causal=True, softmax_scale=16**-0.5)
+    out = attention(q, k, v, None, None, softmax_aux, causal=True, softmax_scale=16**-0.5)[0]
     ref_out, _ = dense_attention_reference(q, k, v, causal=True, softmax_scale=16**-0.5, softmax_aux=softmax_aux)
 
     assert out.shape == (2, 8, 4, 16)
@@ -39,7 +39,7 @@ def test_attention_mask_info_attention_mask_matches_reference():
     mask = mask.at[1, :, :, 6:].set(False)
     mask_info = MaskInfo.from_attention_mask(mask)
 
-    out = attention(q, k, v, None, None, None, mask_info=mask_info)
+    out = attention(q, k, v, None, None, None, mask_info=mask_info)[0]
     ref_out, _ = dense_attention_reference(q, k, v, attention_mask=mask)
 
     assert out.shape == (2, 8, 4, 16)
@@ -65,7 +65,7 @@ def test_attention_bias_sliding_window_and_logits_soft_cap_match_reference():
         softmax_scale=scale,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
-    )
+    )[0]
     ref_out, _ = dense_attention_reference(
         q,
         k,
@@ -95,7 +95,7 @@ def test_attention_dropout_and_init_bias_runs():
         init_bias=init_bias,
         deterministic=False,
         dropout_prob=0.25,
-    )
+    )[0]
     out2 = attention(
         q,
         k,
@@ -106,7 +106,7 @@ def test_attention_dropout_and_init_bias_runs():
         init_bias=init_bias,
         deterministic=False,
         dropout_prob=0.25,
-    )
+    )[0]
 
     assert out1.shape == q.shape
     assert out2.shape == q.shape

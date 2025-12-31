@@ -14,7 +14,7 @@ def test_attention_variants_agree_small_xla():
 
     out_flash = flash_attention(q, k, v, causal=True, platform="xla")
     out_sdpa = scaled_dot_product_attention(q, k, v, causal=True, platform="xla")
-    out_attn = attention(q, k, v, None, None, None, causal=True)
+    out_attn = attention(q, k, v, None, None, None, causal=True)[0]
 
     assert_allclose(out_flash, out_sdpa, atol=0.2)
     assert_allclose(out_flash, out_attn, atol=0.2)
