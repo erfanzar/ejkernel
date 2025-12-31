@@ -63,7 +63,8 @@ def _validate_rwkv7_inputs(r: Array, k: Array, v: Array, w: Array, a: Array, b: 
         )
     if r.shape != k.shape or r.shape != w.shape or r.shape != a.shape or r.shape != b.shape:
         raise ValueError(
-            f"`r`, `k`, `w`, `a`, and `b` must have identical shapes, got r={r.shape}, k={k.shape}, w={w.shape}, a={a.shape}, b={b.shape}."
+            f"`r`, `k`, `w`, `a`, and `b` must have identical shapes, "
+            f"got r={r.shape}, k={k.shape}, w={w.shape}, a={a.shape}, b={b.shape}."
         )
     if v.shape[:3] != r.shape[:3]:
         raise ValueError(f"`v` must match [B,T,H,*], got v={v.shape}, r={r.shape}.")

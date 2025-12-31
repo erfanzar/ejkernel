@@ -88,7 +88,8 @@ def _rwkv6_scan(
 def _validate_rwkv6_inputs(r: Array, k: Array, v: Array, w: Array, u: Array) -> None:
     if r.ndim != 4 or k.ndim != 4 or w.ndim != 4 or v.ndim != 4:
         raise ValueError(
-            f"Expected r,k,w rank-4 [B,T,H,K] and v rank-4 [B,T,H,V], got r={r.shape}, k={k.shape}, v={v.shape}, w={w.shape}."
+            f"Expected r,k,w rank-4 [B,T,H,K] and v rank-4 [B,T,H,V], got "
+            f"r={r.shape}, k={k.shape}, v={v.shape}, w={w.shape}."
         )
     if r.shape != k.shape or r.shape != w.shape:
         raise ValueError(f"`r`, `k`, and `w` must have the same shape, got r={r.shape}, k={k.shape}, w={w.shape}.")
