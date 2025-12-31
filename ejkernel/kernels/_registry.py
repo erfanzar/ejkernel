@@ -52,6 +52,14 @@ def _normalize_type_string(type_annotation: Any) -> str:
 
     type_str = re.sub(r"\bjaxtyping\.", "", type_str)
 
+    # Normalize common JAX array type spellings.
+    #
+    # Why: with `from __future__ import annotations`, the annotation may stay as
+    # `Float[Array, ...]` (a string), while an eagerly-evaluated annotation will
+    # often render as `jaxtyping.Float[jaxlib._jax.Array, ...]`. These are
+    # semantically equivalent in this project and shouldn't trigger a mismatch.
+    type_str = re.sub(r"\b(?:jaxlib\._jax\.Array|jax\.jaxlib\._jax\.Array|jax\.Array)\b", "Array", type_str)
+
     type_str = re.sub(r"\bejkernel\.[\w\.]+\.(\w+)", r"\1", type_str)
 
     return type_str
