@@ -34,6 +34,8 @@ All implementations support:
 """
 
 from .blocksparse_attention import blocksparse_attention
+from .chunked_prefill_paged_decode import chunked_prefill_paged_decode
+from .decode_attention import decode_attention
 from .flash_attention import flash_attention
 from .gla import recurrent_gla
 from .lightning_attn import lightning_attn
@@ -53,6 +55,8 @@ from .unified_attention import unified_attention
 __all__ = (
     "apply_native_sparse_attention",
     "blocksparse_attention",
+    "chunked_prefill_paged_decode",
+    "decode_attention",
     "flash_attention",
     "lightning_attn",
     "mean_pooling",

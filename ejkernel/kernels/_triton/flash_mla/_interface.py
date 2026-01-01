@@ -12,89 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Triton interface for Flash Multi-head Latent Attention (MLA).
 
-"""Interface for Flash Multi-Latent Attention (MLA) operations."""
+The Triton implementation is currently not available in this repo. This file
+exists to reserve the kernel signature and registry entry, so the operations
+layer can select consistent implementations across backends.
+"""
 
 import jaxtyping
 from beartype import beartype
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
 
 
-@kernel_registry.register("flash_mla_attention_call", Platform.TRITON, Backend.GPU)
-@jaxtyping.jaxtyped(typechecker=beartype)
-def flash_mla_attention_call(
-    query: Float[Array, "batch num_heads seq_len head_dim"],
-    key: Float[Array, "batch num_heads seq_len head_dim"],
-    value: Float[Array, "batch num_heads seq_len head_dim"],
-    latent_key: Float[Array, "head_dim latent_dim"],
-    latent_value: Float[Array, "head_dim latent_dim"],
-    bias: Float[Array, "batch num_heads seq_len seq_len"] | None = None,
-    causal: bool = False,
-    softmax_scale: float | None = None,
-) -> Float[Array, "batch num_heads seq_len head_dim"]:
-    """
-    Execute Multi-Latent Attention using Triton kernels.
-
-    Multi-Latent Attention reduces memory and computation by projecting
-    key and value tensors to lower-dimensional latent spaces before
-    computing attention.
-
-    Args:
-        query: Query tensor of shape (batch, heads, seq_len, head_dim).
-        key: Key tensor of shape (batch, heads, seq_len, head_dim).
-        value: Value tensor of shape (batch, heads, seq_len, head_dim).
-        latent_key: Latent key projection matrix of shape (head_dim, latent_dim).
-        latent_value: Latent value projection matrix of shape (head_dim, latent_dim).
-        bias: Optional attention bias of shape (batch, heads, seq_len, seq_len).
-        causal: Whether to apply causal masking.
-        softmax_scale: Scale factor for softmax. Defaults to 1/sqrt(head_dim).
-
-    Returns:
-        Output tensor of shape (batch, heads, seq_len, head_dim).
-    """
-    raise NotImplementedError("Flash MLA attention kernel not yet implemented")
-
-
 @kernel_registry.register("flash_mla", Platform.TRITON, Backend.GPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
-def flash_mla_attention(
-    query: Float[Array, "batch num_heads seq_len head_dim"],
-    key: Float[Array, "batch num_heads seq_len head_dim"],
-    value: Float[Array, "batch num_heads seq_len head_dim"],
-    latent_key: Float[Array, "head_dim latent_dim"],
-    latent_value: Float[Array, "head_dim latent_dim"],
-    bias: Float[Array, "batch num_heads seq_len seq_len"] | None = None,
-    causal: bool = False,
+def flash_mla(
+    query: Float[Array, "batch seq_len q_heads q_head_dim"],
+    key_value: Float[Array, "batch seq_len kv_lora_rank"],
+    w_kc: Float[Array, "kv_lora_rank kv_heads qk_nope_head_dim"],
+    w_vc: Float[Array, "kv_lora_rank kv_heads v_head_dim"],
+    b_q: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
+    b_k: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
     softmax_scale: float | None = None,
-) -> Float[Array, "batch num_heads seq_len head_dim"]:
-    """
-    Multi-Latent Attention with automatic differentiation support.
-
-    This function wraps flash_mla_attention_call with JAX's custom gradient
-    support for efficient backpropagation through the attention operation.
-
-    Args:
-        query: Query tensor of shape (batch, heads, seq_len, head_dim).
-        key: Key tensor of shape (batch, heads, seq_len, head_dim).
-        value: Value tensor of shape (batch, heads, seq_len, head_dim).
-        latent_key: Latent key projection matrix of shape (head_dim, latent_dim).
-        latent_value: Latent value projection matrix of shape (head_dim, latent_dim).
-        bias: Optional attention bias of shape (batch, heads, seq_len, seq_len).
-        causal: Whether to apply causal masking.
-        softmax_scale: Scale factor for softmax. Defaults to 1/sqrt(head_dim).
-
-    Returns:
-        Output tensor of shape (batch, heads, seq_len, head_dim).
-    """
-    return flash_mla_attention_call(
-        query=query,
-        key=key,
-        value=value,
-        latent_key=latent_key,
-        latent_value=latent_value,
-        bias=bias,
-        causal=causal,
-        softmax_scale=softmax_scale,
-    )
+    causal: bool = False,
+    cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
+    raise NotImplementedError("flash_mla Triton kernel not yet implemented")

@@ -28,7 +28,19 @@ from ejkernel.ops import BwdParams, FwdParams
 
 
 def get_safe_hash_int(text, algorithm="md5"):
-    """Generate a hash of text using specified algorithm with safety checks."""
+    """Generate a hash of text using specified algorithm with safety checks.
+
+    Args:
+        text: Input text to hash. Will be converted to string if not already.
+        algorithm: Hash algorithm name (default: "md5"). Must be a valid hashlib algorithm.
+
+    Returns:
+        Integer representation of the hash digest.
+
+    Raises:
+        ValueError: If the hash algorithm is not supported.
+        Exception: If any other error occurs during hash generation.
+    """
     try:
         text_str = str(text)
         hash_object = getattr(hashlib, algorithm)(text_str.encode())
@@ -40,7 +52,20 @@ def get_safe_hash_int(text, algorithm="md5"):
 
 
 def hash_fn(self) -> int:
-    """Generate a hash for an object based on its dictionary values."""
+    """Generate a hash for an object based on its dictionary values.
+
+    This function creates a deterministic hash by concatenating string representations
+    of numeric and collection-type attributes, then hashing the result.
+
+    Args:
+        self: The object instance to hash.
+
+    Returns:
+        Integer hash value derived from the object's attribute values.
+
+    Note:
+        Only includes float, int, bool, dict, and list attributes in the hash.
+    """
     shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
     return get_safe_hash_int(shu)
 
@@ -200,6 +225,50 @@ class UnifiedAttentionConfig(BaseOperationConfig):
             decode kernel on GPU (Triton only).
         num_par_softmax_segments: Number of parallel softmax segments used by
             the segmented 3D decode kernel (Triton only).
+        num_warps: Optional Triton kernel override.
+        num_stages: Optional Triton kernel override.
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    seq_threshold_3d: int | None = None
+    num_par_softmax_segments: int | None = None
+    num_warps: int | None = None
+    num_stages: int | None = None
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class DecodeAttentionConfig(BaseOperationConfig):
+    """Configuration for vLLM-style paged decode attention operation.
+
+    Args:
+        num_kv_splits: Number of KV splits used by the Triton kernel (default: 16).
+        num_warps: Optional Triton kernel override.
+        num_stages: Optional Triton kernel override.
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    num_kv_splits: int = 16
+    num_warps: int | None = None
+    num_stages: int | None = None
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class ChunkedPrefillPagedDecodeConfig(BaseOperationConfig):
+    """Configuration for chunked prefill + paged decode attention operation.
+
+    This op updates a block-tabled KV cache and then runs unified paged attention
+    on the packed queries. On GPU, the underlying unified attention kernel may
+    use a 2D or 3D grid depending on `seq_threshold_3d`.
+
+    Args:
+        seq_threshold_3d: Threshold (#seqs) for selecting 3D segmented decode kernel (Triton only).
+        num_par_softmax_segments: Parallel softmax segments for 3D kernel (Triton only).
         num_warps: Optional Triton kernel override.
         num_stages: Optional Triton kernel override.
         platform: Target platform (triton/pallas/cuda/xla/auto)

@@ -99,10 +99,10 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
 
     def run(
         self,
-        query: Float[Array, "batch seq_len q_heads head_dim"],
+        query: Float[Array, "batch seq_len q_heads q_head_dim"],
         key_value: Float[Array, "batch seq_len kv_lora_rank"],
-        w_kc: Float[Array, "kv_lora_rank kv_heads head_dim"],
-        w_vc: Float[Array, "kv_lora_rank kv_heads head_dim"],
+        w_kc: Float[Array, "kv_lora_rank kv_heads qk_nope_head_dim"],
+        w_vc: Float[Array, "kv_lora_rank kv_heads v_head_dim"],
         b_q: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
         b_k: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
         softmax_scale: float | None = None,
@@ -111,7 +111,7 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         *,
         cfg: FlashMLAConfig,
-    ) -> Float[Array, "batch seq_len q_heads head_dim"]:
+    ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
         """Execute flash multi-head latent attention.
 
         Args:
@@ -225,11 +225,11 @@ _mla_executor: Executor[FlashMLAConfig, Array] = Executor(
 )
 
 
-def mla_attention(
-    query: Float[Array, "batch seq_len q_heads head_dim"],
+def flash_mla(
+    query: Float[Array, "batch seq_len q_heads q_head_dim"],
     key_value: Float[Array, "batch seq_len kv_lora_rank"],
-    w_kc: Float[Array, "kv_lora_rank kv_heads head_dim"],
-    w_vc: Float[Array, "kv_lora_rank kv_heads head_dim"],
+    w_kc: Float[Array, "kv_lora_rank kv_heads qk_nope_head_dim"],
+    w_vc: Float[Array, "kv_lora_rank kv_heads v_head_dim"],
     b_q: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
     b_k: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
@@ -239,40 +239,11 @@ def mla_attention(
     causal: bool = False,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: FlashMLAConfig | None = None,
-) -> Float[Array, "batch seq_len q_heads head_dim"]:
+) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
     """Execute flash multi-head latent attention with automatic optimization.
 
     MLA uses low-rank compression for key-value pairs to reduce memory
     and computation while maintaining attention quality.
-
-    Args:
-        query: Query tensor [batch, seq_len, q_heads, head_dim]
-        key_value: Compressed key-value tensor [batch, seq_len, kv_lora_rank]
-        w_kc: Key compression weights [kv_lora_rank, kv_heads, head_dim]
-        w_vc: Value compression weights [kv_lora_rank, kv_heads, head_dim]
-        b_q: Query RoPE bias [batch, seq_len, qk_rope_head_dim]
-        b_k: Key RoPE bias [batch, seq_len, qk_rope_head_dim]
-        softmax_scale: Scaling factor for attention scores
-        causal: Whether to apply causal masking
-        cu_seqlens: Cumulative sequence lengths for variable-length sequences
-        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
-        cfg: Optional kernel configuration override
-
-    Returns:
-        Attention output with same shape as query
-
-    Example:
-        >>>
-        >>> out = mla_attention(query, key_value, w_kc, w_vc)
-        >>>
-        >>>
-        >>> out = mla_attention(query, key_value, w_kc, w_vc, causal=True)
-        >>>
-        >>>
-        >>> out = mla_attention(query, key_value, w_kc, w_vc, b_q=q_rope, b_k=k_rope)
-            >>>
-        >>>
-        >>> out = mla_attention(..., platform="triton")
     """
     return _mla_executor(
         FlashMLA(),
@@ -288,3 +259,5 @@ def mla_attention(
         platform=platform,
         _cfg=cfg,
     )
+
+

@@ -13,26 +13,13 @@
 # limitations under the License.
 
 
-"""
-Flash Multi-Latent Attention (MLA) module.
+"""Flash Multi-head Latent Attention (MLA) (Triton backend).
 
-This module provides Triton-accelerated implementations of Multi-Latent Attention,
-an efficient attention mechanism that uses latent representations to reduce
-memory and computational requirements while maintaining model expressiveness.
-
-Key Features:
-- Memory-efficient attention using latent compression
-- Triton-optimized forward and backward passes
-- JAX integration with custom gradients
-- Support for causal and non-causal attention patterns
+Note:
+    The Triton implementation is not yet available; this module currently
+    exposes a stub that raises NotImplementedError.
 """
 
-from ._interface import (
-    flash_mla_attention,
-    flash_mla_attention_call,
-)
+from ._interface import flash_mla
 
-__all__ = [
-    "flash_mla_attention",
-    "flash_mla_attention_call",
-]
+__all__ = ["flash_mla"]

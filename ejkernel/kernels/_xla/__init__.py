@@ -61,7 +61,10 @@ Note:
 
 from .attention import attention
 from .blocksparse_attention import blocksparse_attention
+from .chunked_prefill_paged_decode import chunked_prefill_paged_decode
+from .decode_attention import decode_attention
 from .flash_attention import flash_attention
+from .flash_mla import flash_mla
 from .gla import recurrent_gla
 from .grouped_matmul import grouped_matmul
 from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
@@ -87,7 +90,10 @@ __all__ = [
     "apply_native_sparse_attention",
     "attention",
     "blocksparse_attention",
+    "chunked_prefill_paged_decode",
+    "decode_attention",
     "flash_attention",
+    "flash_mla",
     "grouped_matmul",
     "kda",
     "kda_decay",

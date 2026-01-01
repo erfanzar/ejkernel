@@ -66,9 +66,12 @@ Note:
 
 from .attention import Attention, attention
 from .blocksparse_attention import BlockSparseAttention, blocksparse_attention
+from .chunked_prefill_paged_decode import ChunkedPrefillPagedDecode, chunked_prefill_paged_decode
 from .configs import (
     AttentionConfig,
     BlockSparseAttentionConfig,
+    ChunkedPrefillPagedDecodeConfig,
+    DecodeAttentionConfig,
     FlashAttentionConfig,
     FlashMLAConfig,
     GLAttentionConfig,
@@ -92,12 +95,13 @@ from .configs import (
     StateSpaceV2Config,
     UnifiedAttentionConfig,
 )
+from .decode_attention import DecodeAttention, decode_attention
 from .flash_attention import FlashAttention, flash_attention
 from .gated_linear_attention import GLAttention, gla_attention
 from .grouped_matmul import GroupedMatmul, grouped_matmul
 from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
-from .multi_head_latent_attention import FlashMLA, mla_attention
+from .multi_head_latent_attention import FlashMLA, flash_mla
 from .native_sparse_attention import NativeSparseAttention, native_sparse_attention
 from .page_attention import PageAttention, page_attention
 from .pooling import MeanPooling, mean_pooling
@@ -123,6 +127,10 @@ __all__ = (
     "AttentionConfig",
     "BlockSparseAttention",
     "BlockSparseAttentionConfig",
+    "ChunkedPrefillPagedDecode",
+    "ChunkedPrefillPagedDecodeConfig",
+    "DecodeAttention",
+    "DecodeAttentionConfig",
     "FlashAttention",
     "FlashAttentionConfig",
     "FlashMLA",
@@ -168,14 +176,16 @@ __all__ = (
     "UnifiedAttentionConfig",
     "attention",
     "blocksparse_attention",
+    "chunked_prefill_paged_decode",
+    "decode_attention",
     "flash_attention",
+    "flash_mla",
     "gla_attention",
     "grouped_matmul",
     "kda_attention",
     "kernel_delta_attention",
     "lightning_attention",
     "mean_pooling",
-    "mla_attention",
     "native_sparse_attention",
     "page_attention",
     "prefill_page_attention",

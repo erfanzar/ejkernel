@@ -50,12 +50,12 @@ def test_unified_attention_basic_and_optional_features_run():
         kv_lens,
         block_tables,
         query_start_loc,
+        alibi,
+        qq_bias,
+        sink,
         causal=True,
         sliding_window=12,
         logits_soft_cap=10.0,
-        alibi_slopes=alibi,
-        qq_bias=qq_bias,
-        softmax_aux=sink,
         platform="xla",
     )
     assert out2.shape == (total_tokens, q_heads, head_dim)

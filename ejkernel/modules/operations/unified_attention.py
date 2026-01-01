@@ -396,6 +396,9 @@ def unified_attention(
     seq_threshold_3d: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: UnifiedAttentionConfig | None = None,
+    mesh: Mesh | None = None,
+    in_specs: tuple[PartitionSpec | None, ...] | None = None,
+    out_specs: PartitionSpec | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Execute unified paged attention with automatic platform selection.
 
@@ -471,6 +474,11 @@ def unified_attention(
         This kernel is optimized for inference and does not support backward passes.
         For training, use `flash_attention` instead.
     """
+
+    method = None
+    if mesh is not None and in_specs is not None and out_specs is not None:
+        method = "shard_map"
+
     return _unified_attention_executor(
         UnifiedAttention(),
         queries=queries,
@@ -488,5 +496,9 @@ def unified_attention(
         qq_bias=qq_bias,
         softmax_aux=softmax_aux,
         platform=platform,
+        method=method,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
         _cfg=cfg,
     )

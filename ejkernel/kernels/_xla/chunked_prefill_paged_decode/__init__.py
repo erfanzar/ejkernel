@@ -12,20 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import jax
-import jax.numpy as jnp
-import pytest
+"""XLA backend for chunked prefill + paged decode attention."""
 
-from ejkernel.kernels._triton.flash_mla._interface import flash_mla
+from ._interface import chunked_prefill_paged_decode
 
-pytestmark = pytest.mark.skipif(jax.devices()[0].platform != "gpu", reason="Triton tests require GPU backend")
+__all__ = ("chunked_prefill_paged_decode",)
 
-
-def test_flash_mla_raises_not_implemented():
-    query = jnp.zeros((1, 8, 2, 16), dtype=jnp.float16)
-    key_value = jnp.zeros((1, 8, 4), dtype=jnp.float16)
-    w_kc = jnp.zeros((4, 1, 16), dtype=jnp.float16)
-    w_vc = jnp.zeros((4, 1, 16), dtype=jnp.float16)
-
-    with pytest.raises(NotImplementedError):
-        flash_mla(query, key_value, w_kc, w_vc, causal=True)
