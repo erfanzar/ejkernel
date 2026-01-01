@@ -33,7 +33,7 @@ def _ref_unified_attention(
     logits_soft_cap: float | None = None,
     alibi_slopes: jax.Array | None = None,
     qq_bias: jax.Array | None = None,
-    attention_sink: jax.Array | None = None,
+    softmax_aux: jax.Array | None = None,
 ) -> jax.Array:
     total_tokens, num_q_heads, head_dim = map(int, queries.shape)
     _num_blocks, block_size, num_kv_heads, _head_dim_kv = map(int, key_cache.shape)
@@ -66,7 +66,7 @@ def _ref_unified_attention(
             logits = float(logits_soft_cap) * jnp.tanh(logits / float(logits_soft_cap))
 
         key_pos = jnp.arange(kv_len, dtype=jnp.int32)
-        q_abs = (jnp.int32(context_len) + jnp.arange(q_len, dtype=jnp.int32))  # [q_len]
+        q_abs = jnp.int32(context_len) + jnp.arange(q_len, dtype=jnp.int32)  # [q_len]
 
         causal = key_pos[None, :] <= q_abs[:, None]
         if sliding_window > 0:
@@ -88,10 +88,8 @@ def _ref_unified_attention(
 
         logits = jnp.where(causal[:, None, :], logits, -jnp.inf)
 
-        if attention_sink is not None:
-            sink_logits = jnp.broadcast_to(
-                attention_sink.astype(jnp.float32)[None, :, None], (q_len, num_q_heads, 1)
-            )
+        if softmax_aux is not None:
+            sink_logits = jnp.broadcast_to(softmax_aux.astype(jnp.float32)[None, :, None], (q_len, num_q_heads, 1))
             logits_aug = jnp.concatenate([logits, sink_logits], axis=-1)
             weights = jax.nn.softmax(logits_aug, axis=-1)[..., :kv_len]
         else:
@@ -141,9 +139,9 @@ def _make_inputs(
     k1, k2, k3 = jax.random.split(key, 3)
 
     queries = jax.random.normal(k1, (total_tokens, num_q_heads, head_dim), dtype=jnp.float32).astype(dtype)
-    key_cache = jax.random.normal(
-        k2, (num_blocks_total, block_size, num_kv_heads, head_dim), dtype=jnp.float32
-    ).astype(dtype)
+    key_cache = jax.random.normal(k2, (num_blocks_total, block_size, num_kv_heads, head_dim), dtype=jnp.float32).astype(
+        dtype
+    )
     value_cache = jax.random.normal(
         k3, (num_blocks_total, block_size, num_kv_heads, head_dim), dtype=jnp.float32
     ).astype(dtype)
@@ -211,7 +209,7 @@ def test_unified_attention_xla_features_sliding_softcap_sinks_alibi_qqbias():
     num_q_heads = int(batch["queries"].shape[1])
     key = jax.random.PRNGKey(123)
     k1, k2, k3 = jax.random.split(key, 3)
-    attention_sink = jax.random.normal(k1, (num_q_heads,), dtype=jnp.float32)
+    softmax_aux = jax.random.normal(k1, (num_q_heads,), dtype=jnp.float32)
     alibi = jax.random.normal(k2, (num_q_heads,), dtype=jnp.float32) * 0.01
     qq_bias = jax.random.normal(k3, (batch["max_q_len"], batch["max_q_len"]), dtype=jnp.float32) * 0.02
 
@@ -227,7 +225,7 @@ def test_unified_attention_xla_features_sliding_softcap_sinks_alibi_qqbias():
         logits_soft_cap=10.0,
         alibi_slopes=alibi,
         qq_bias=qq_bias,
-        attention_sink=attention_sink,
+        softmax_aux=softmax_aux,
     )
 
     ref = _ref_unified_attention(
@@ -242,7 +240,6 @@ def test_unified_attention_xla_features_sliding_softcap_sinks_alibi_qqbias():
         logits_soft_cap=10.0,
         alibi_slopes=alibi,
         qq_bias=qq_bias,
-        attention_sink=attention_sink,
+        softmax_aux=softmax_aux,
     )
     assert jnp.allclose(out.astype(jnp.float32), ref.astype(jnp.float32), rtol=1e-2, atol=3e-2)
-

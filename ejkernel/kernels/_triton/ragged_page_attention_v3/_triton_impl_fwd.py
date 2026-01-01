@@ -299,7 +299,7 @@ def ragged_paged_attention_triton(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     distribution: jax.Array,
-    attention_sink: jax.Array | None = None,
+    softmax_aux: jax.Array | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -394,13 +394,13 @@ def ragged_paged_attention_triton(
 
     qblocks_max = math.ceil(total_tokens / block_m)
 
-    has_sink = attention_sink is not None
-    if attention_sink is None:
-        attention_sink = jnp.zeros((1,), dtype=jnp.float32)
+    has_sink = softmax_aux is not None
+    if softmax_aux is None:
+        softmax_aux = jnp.zeros((1,), dtype=jnp.float32)
     else:
-        if attention_sink.shape != (num_q_heads,):
-            raise ValueError("attention_sink must have shape (num_q_heads,)")
-        attention_sink = attention_sink.astype(jnp.float32)
+        if softmax_aux.shape != (num_q_heads,):
+            raise ValueError("softmax_aux must have shape (num_q_heads,)")
+        softmax_aux = softmax_aux.astype(jnp.float32)
 
     has_sliding = sliding_window is not None
     sliding_window_val = int(sliding_window or 0)
@@ -444,7 +444,7 @@ def ragged_paged_attention_triton(
         kv_lens,
         query_start_loc,
         distribution,
-        attention_sink,
+        softmax_aux,
         float(softmax_scale),
         float(logits_soft_cap_val),
         int(sliding_window_val),

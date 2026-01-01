@@ -38,7 +38,7 @@ def _ref_unified_attention(
     logits_soft_cap: float | None = None,
     alibi_slopes: jax.Array | None = None,
     qq_bias: jax.Array | None = None,
-    attention_sink: jax.Array | None = None,
+    softmax_aux: jax.Array | None = None,
 ) -> jax.Array:
     total_tokens, num_q_heads, head_dim = map(int, queries.shape)
     _num_blocks, block_size, num_kv_heads, _head_dim_kv = map(int, key_cache.shape)
@@ -93,8 +93,8 @@ def _ref_unified_attention(
 
         logits = jnp.where(causal[:, None, :], logits, -jnp.inf)
 
-        if attention_sink is not None:
-            sink_logits = jnp.broadcast_to(attention_sink.astype(jnp.float32)[None, :, None], (q_len, num_q_heads, 1))
+        if softmax_aux is not None:
+            sink_logits = jnp.broadcast_to(softmax_aux.astype(jnp.float32)[None, :, None], (q_len, num_q_heads, 1))
             logits_aug = jnp.concatenate([logits, sink_logits], axis=-1)
             weights = jax.nn.softmax(logits_aug, axis=-1)[..., :kv_len]
         else:
@@ -215,7 +215,7 @@ def test_unified_attention_features_softcap_sliding_sinks_bias(seq_threshold_3d:
     num_q_heads = batch["queries"].shape[1]
     key = jax.random.PRNGKey(123)
     k1, k2, k3 = jax.random.split(key, 3)
-    attention_sink = jax.random.normal(k1, (num_q_heads,), dtype=jnp.float32)
+    softmax_aux = jax.random.normal(k1, (num_q_heads,), dtype=jnp.float32)
     alibi = jax.random.normal(k2, (num_q_heads,), dtype=jnp.float32) * 0.01
     qq_bias = jax.random.normal(k3, (batch["max_q_len"], batch["max_q_len"]), dtype=jnp.float32) * 0.02
 
@@ -229,7 +229,7 @@ def test_unified_attention_features_softcap_sliding_sinks_bias(seq_threshold_3d:
         softmax_scale=scale,
         sliding_window=32,
         logits_soft_cap=20.0,
-        attention_sink=attention_sink,
+        softmax_aux=softmax_aux,
         alibi_slopes=alibi,
         qq_bias=qq_bias,
         seq_threshold_3d=int(seq_threshold_3d),
@@ -246,7 +246,7 @@ def test_unified_attention_features_softcap_sliding_sinks_bias(seq_threshold_3d:
         softmax_scale=scale,
         sliding_window=32,
         logits_soft_cap=20.0,
-        attention_sink=attention_sink,
+        softmax_aux=softmax_aux,
         alibi_slopes=alibi,
         qq_bias=qq_bias,
     )

@@ -155,7 +155,7 @@ def ragged_paged_attention(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     distribution: jax.Array,
-    attention_sink: jax.Array | None = None,
+    softmax_aux: jax.Array | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -264,8 +264,8 @@ def ragged_paged_attention(
         bkv_sz = page_size if sliding_window is not None else None
 
         sinks_h = None
-        if attention_sink is not None:
-            sinks_h = attention_sink.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head).astype(jnp.float32)
+        if softmax_aux is not None:
+            sinks_h = softmax_aux.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head).astype(jnp.float32)
 
     def _seq_body(seq_idx, carry):
         o_acc, kv_cache_acc = carry

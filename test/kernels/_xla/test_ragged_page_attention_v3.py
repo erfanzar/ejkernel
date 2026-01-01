@@ -160,7 +160,7 @@ if __name__ == "__main__":
     distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
 
     # Attention Sink
-    attention_sink = jax.random.normal(k5, (num_q_heads,), dtype=q_dtype)
+    softmax_aux = jax.random.normal(k5, (num_q_heads,), dtype=q_dtype)
 
     ref_out, ref_cache = ref_ragged_paged_attention(
         queries,
@@ -171,7 +171,7 @@ if __name__ == "__main__":
         block_tables,
         query_start_loc,
         distribution,
-        attention_sink=attention_sink,
+        softmax_aux=softmax_aux,
         softmax_scale=1.0,
     )
 
@@ -184,11 +184,11 @@ if __name__ == "__main__":
         block_tables,
         query_start_loc,
         distribution,
-        attention_sink=attention_sink,
+        softmax_aux=softmax_aux,
         softmax_scale=1.0,
     )
 
     np.testing.assert_allclose(out, ref_out, rtol=1e-2, atol=1e-2)
-    print("Output matches reference with attention_sink!")
+    print("Output matches reference with softmax_aux!")
     np.testing.assert_allclose(cache, ref_cache, rtol=1e-2, atol=1e-2)
-    print("Cache matches reference with attention_sink!")
+    print("Cache matches reference with softmax_aux!")

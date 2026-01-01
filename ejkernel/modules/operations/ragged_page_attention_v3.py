@@ -103,7 +103,7 @@ _ARGUMENT_ORDER = (
     "block_tables",
     "query_start_loc",
     "distribution",
-    "attention_sink",
+    "softmax_aux",
 )
 _ARGUMENT_INDEX = {name: idx for idx, name in enumerate(_ARGUMENT_ORDER)}
 
@@ -276,7 +276,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
         query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
         distribution: Int32[Array, "3"],
-        attention_sink: Float[Array, "num_q_heads"] | None = None,
+        softmax_aux: Float[Array, "num_q_heads"] | None = None,
         softmax_scale: float = 1.0,
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
@@ -365,7 +365,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
             query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
             distribution: Int32[Array, "3"],
-            attention_sink: Float[Array, "num_q_heads"] | None,
+            softmax_aux: Float[Array, "num_q_heads"] | None,
         ) -> tuple[
             Float[Array, "total_tokens num_q_heads head_dim"],
             Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
@@ -379,7 +379,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                 block_tables=block_tables,
                 query_start_loc=query_start_loc,
                 distribution=distribution,
-                attention_sink=attention_sink,
+                softmax_aux=softmax_aux,
                 softmax_scale=softmax_scale,
                 sliding_window=sliding_window,
                 logits_soft_cap=logits_soft_cap,
@@ -400,7 +400,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             block_tables,
             query_start_loc,
             distribution,
-            attention_sink,
+            softmax_aux,
         )
         assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
         shard_map_fn = shard_map(
@@ -438,7 +438,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
         query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
         distribution: Int32[Array, "3"],
-        attention_sink: Float[Array, "num_q_heads"] | None = None,
+        softmax_aux: Float[Array, "num_q_heads"] | None = None,
         softmax_scale: float = 1.0,
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
@@ -558,7 +558,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             block_tables=block_tables,
             query_start_loc=query_start_loc,
             distribution=distribution,
-            attention_sink=attention_sink,
+            softmax_aux=softmax_aux,
             softmax_scale=softmax_scale,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
@@ -1017,7 +1017,7 @@ def ragged_page_attention_v3(
     block_tables: Int32[Array, "max_num_seqs_times_pages_per_seq"],
     query_start_loc: Int32[Array, "max_num_seqs_plus_1"],
     distribution: Int32[Array, "3"],
-    attention_sink: Float[Array, "num_q_heads"] | None = None,
+    softmax_aux: Float[Array, "num_q_heads"] | None = None,
     /,
     *,
     softmax_scale: float = 1.0,
@@ -1207,7 +1207,7 @@ def ragged_page_attention_v3(
         block_tables=block_tables,
         query_start_loc=query_start_loc,
         distribution=distribution,
-        attention_sink=attention_sink,
+        softmax_aux=softmax_aux,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,

@@ -510,7 +510,7 @@ def unified_attention_triton(
     num_par_softmax_segments: int | None,
     alibi_slopes: jax.Array | None,
     qq_bias: jax.Array | None,
-    attention_sink: jax.Array | None,
+    softmax_aux: jax.Array | None,
     num_warps: int | None,
     num_stages: int | None,
 ) -> jax.Array:
@@ -543,7 +543,7 @@ def unified_attention_triton(
 
     use_alibi = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
-    use_sinks = attention_sink is not None
+    use_sinks = softmax_aux is not None
 
     if use_alibi:
         if alibi_slopes.shape != (num_query_heads,):
@@ -562,11 +562,11 @@ def unified_attention_triton(
         qq_bias_stride_0 = 0
 
     if use_sinks:
-        if attention_sink.shape != (num_query_heads,):
-            raise ValueError("attention_sink must have shape (num_q_heads,)")
-        attention_sink = attention_sink.astype(jnp.float32)
+        if softmax_aux.shape != (num_query_heads,):
+            raise ValueError("softmax_aux must have shape (num_q_heads,)")
+        softmax_aux = softmax_aux.astype(jnp.float32)
     else:
-        attention_sink = jnp.zeros((1,), dtype=jnp.float32)
+        softmax_aux = jnp.zeros((1,), dtype=jnp.float32)
 
     num_queries_per_kv = num_query_heads // num_kv_heads
     block_m = 16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -640,7 +640,7 @@ def unified_attention_triton(
             queries,
             key_cache,
             value_cache,
-            attention_sink,
+            softmax_aux,
             block_tables,
             kv_lens,
             alibi_slopes,
@@ -698,7 +698,7 @@ def unified_attention_triton(
         queries,
         key_cache,
         value_cache,
-        attention_sink,
+        softmax_aux,
         block_tables,
         kv_lens,
         alibi_slopes,

@@ -15,7 +15,9 @@ def test_state_space_v1_shapes_and_gate_and_conv_state_passthrough():
     B = jax.random.normal(jax.random.PRNGKey(2), (b, t, n), dtype=jnp.float32).astype(jnp.bfloat16)
     C = jax.random.normal(jax.random.PRNGKey(3), (b, t, n), dtype=jnp.float32).astype(jnp.bfloat16)
     D = jax.random.normal(jax.random.PRNGKey(4), (intermediate,), dtype=jnp.float32).astype(jnp.bfloat16)
-    dt = jax.nn.softplus(jax.random.normal(jax.random.PRNGKey(5), (b, t, intermediate), dtype=jnp.float32)).astype(jnp.bfloat16)
+    dt = jax.nn.softplus(jax.random.normal(jax.random.PRNGKey(5), (b, t, intermediate), dtype=jnp.float32)).astype(
+        jnp.bfloat16
+    )
 
     out, state, conv = state_space_v1(hidden, A, B, C, D, dt, platform="xla")
     assert out.shape == (b, t, intermediate)
@@ -50,7 +52,9 @@ def test_state_space_v2_shapes_groups_gated_rmsnorm_and_single_step():
     B = jax.random.normal(jax.random.PRNGKey(12), (b, t, n_groups, n), dtype=jnp.float32).astype(jnp.bfloat16)
     C = jax.random.normal(jax.random.PRNGKey(13), (b, t, n_groups, n), dtype=jnp.float32).astype(jnp.bfloat16)
     D = jax.random.normal(jax.random.PRNGKey(14), (heads,), dtype=jnp.float32).astype(jnp.bfloat16)
-    dt = jax.nn.softplus(jax.random.normal(jax.random.PRNGKey(15), (b, t, heads), dtype=jnp.float32)).astype(jnp.bfloat16)
+    dt = jax.nn.softplus(jax.random.normal(jax.random.PRNGKey(15), (b, t, heads), dtype=jnp.float32)).astype(
+        jnp.bfloat16
+    )
     gate = jax.random.normal(jax.random.PRNGKey(16), (b, t, heads * head_dim), dtype=jnp.float32).astype(jnp.bfloat16)
 
     out, state, conv = state_space_v2(
@@ -87,4 +91,3 @@ def test_state_space_v2_shapes_groups_gated_rmsnorm_and_single_step():
     )
     assert out1.shape == (b, 1, heads * head_dim)
     assert state1.shape == (b, heads, head_dim, n)
-

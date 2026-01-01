@@ -39,7 +39,7 @@ def ref_ragged_paged_attention(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     distribution: jax.Array,
-    attention_sink: jax.Array | None = None,
+    softmax_aux: jax.Array | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -61,7 +61,7 @@ def ref_ragged_paged_attention(
         block_tables,
         query_start_loc,
         distribution,
-        attention_sink,
+        softmax_aux,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
@@ -163,8 +163,8 @@ def ref_ragged_paged_attention(
             attn = logits_soft_cap * jnp.tanh(attn / logits_soft_cap)
         attn += jnp.where(mask, mask_value, 0.0)
 
-        if attention_sink is not None:
-            reshaped_attention_sink = attention_sink.reshape(actual_num_q_heads, 1, 1)
+        if softmax_aux is not None:
+            reshaped_attention_sink = softmax_aux.reshape(actual_num_q_heads, 1, 1)
             reshaped_attention_sink = jnp.repeat(reshaped_attention_sink, q_len, axis=1)
             attn = jnp.concat([reshaped_attention_sink, attn], axis=2)
             attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
@@ -809,7 +809,7 @@ def prepare_inputs(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    attention_sink: jax.Array | None = None,
+    softmax_aux: jax.Array | None = None,
 ):
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     actual_num_kv_heads = k.shape[1]
@@ -846,11 +846,11 @@ def prepare_inputs(
 
     kv = merge_kv(k, v)
 
-    if attention_sink is not None:
-        attention_sink = attention_sink.reshape((-1, num_q_heads_per_kv_head, 1))
-        attention_sink = jnp.repeat(attention_sink, 128, -1)
+    if softmax_aux is not None:
+        softmax_aux = softmax_aux.reshape((-1, num_q_heads_per_kv_head, 1))
+        softmax_aux = jnp.repeat(softmax_aux, 128, -1)
 
-    return q, kv, attention_sink
+    return q, kv, softmax_aux
 
 
 def prepare_outputs(
@@ -887,7 +887,7 @@ def dynamic_validate_inputs(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     distribution: jax.Array,
-    attention_sink: jax.Array | None = None,
+    softmax_aux: jax.Array | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -911,7 +911,7 @@ def dynamic_validate_inputs(
         block_tables,
         query_start_loc,
         distribution,
-        attention_sink,
+        softmax_aux,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
@@ -968,7 +968,7 @@ def static_validate_inputs(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     distribution: jax.Array,
-    attention_sink: jax.Array | None = None,
+    softmax_aux: jax.Array | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -992,11 +992,11 @@ def static_validate_inputs(
         raise ValueError(f"Expected {q.shape[0]=} to be equal to {k.shape[0]=} and {v.shape[0]=}")
     if not (q.shape[2] == k.shape[2] == v.shape[2]):
         raise ValueError(f"Expected {q.shape[2]=} to be equal to {k.shape[2]=} and {v.shape[2]=}")
-    if attention_sink is not None:
-        if attention_sink.shape[0] != q.shape[1]:
-            raise ValueError(f"Expected {attention_sink.shape[0]=} to be equal to {q.shape[1]=} (num_q_heads).")
-        if attention_sink.dtype != jnp.float32:
-            raise ValueError(f"Expected {attention_sink.dtype=} to be equal to {jnp.float32=}.")
+    if softmax_aux is not None:
+        if softmax_aux.shape[0] != q.shape[1]:
+            raise ValueError(f"Expected {softmax_aux.shape[0]=} to be equal to {q.shape[1]=} (num_q_heads).")
+        if softmax_aux.dtype != jnp.float32:
+            raise ValueError(f"Expected {softmax_aux.dtype=} to be equal to {jnp.float32=}.")
 
     actual_head_dim = q.shape[2]
     actual_num_q_heads = q.shape[1]
@@ -1097,7 +1097,7 @@ def ragged_paged_attention(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     distribution: jax.Array,
-    attention_sink: jax.Array | None = None,
+    softmax_aux: jax.Array | None = None,
     *,
     softmax_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -1125,7 +1125,7 @@ def ragged_paged_attention(
       distribution: (i, j, k) represents that sequences[0:i] are decode-only,
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
         k is also the total number of sequences.
-      attention_sink: optional per-query-head sink logits used to bias the softmax.
+      softmax_aux: optional per-query-head sink logits used to bias the softmax.
       actual_head_dim: the actual head size of the attention. Here we assume k and
         v have the same actual head size.
       softmax_scale: the softmax scale which will be applied to the Q@K^T.
@@ -1153,7 +1153,7 @@ def ragged_paged_attention(
         block_tables,
         query_start_loc,
         distribution,
-        attention_sink,
+        softmax_aux,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
@@ -1172,7 +1172,7 @@ def ragged_paged_attention(
     actual_num_kv_heads = k.shape[1]
 
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
-    q, kv, attention_sink = prepare_inputs(q, k, v, attention_sink)
+    q, kv, softmax_aux = prepare_inputs(q, k, v, softmax_aux)
     (
         _,
         max_num_tokens,
@@ -1209,7 +1209,7 @@ def ragged_paged_attention(
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
-        None if attention_sink is None else pl.BlockSpec(memory_space=pltpu.VMEM),
+        None if softmax_aux is None else pl.BlockSpec(memory_space=pltpu.VMEM),
     ]
 
     out_specs = [
@@ -1293,7 +1293,7 @@ def ragged_paged_attention(
         )
     )
 
-    output, updated_kv_cache = kernel(*scalar_prefetches, q, kv, kv_cache, attention_sink)
+    output, updated_kv_cache = kernel(*scalar_prefetches, q, kv, kv_cache, softmax_aux)
     return (
         prepare_outputs(output, actual_num_q_heads_per_kv_head, actual_head_dim),
         updated_kv_cache,

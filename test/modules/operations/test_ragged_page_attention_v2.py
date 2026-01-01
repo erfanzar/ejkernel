@@ -10,9 +10,9 @@ from ._utils import assert_allclose, dense_attention_reference, device_platform
 
 
 def _make_kv_pages(*, num_pages: int, page_size: int, kv_heads: int, head_dim: int, seed: int) -> jax.Array:
-    k = jax.random.normal(jax.random.PRNGKey(seed), (num_pages, page_size, kv_heads, head_dim), dtype=jnp.float32).astype(
-        jnp.bfloat16
-    )
+    k = jax.random.normal(
+        jax.random.PRNGKey(seed), (num_pages, page_size, kv_heads, head_dim), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
     v = jax.random.normal(
         jax.random.PRNGKey(seed ^ 0xA5A5), (num_pages, page_size, kv_heads, head_dim), dtype=jnp.float32
     ).astype(jnp.bfloat16)
@@ -24,7 +24,7 @@ def _gather_seq_kv(
     kv_pages: jax.Array, block_tables_row: jax.Array, *, context_len: int
 ) -> tuple[jax.Array, jax.Array]:  # ([kv_len, kv_heads, D], [kv_len, kv_heads, D])
     pages = kv_pages[block_tables_row]  # [pages_per_seq, page_size, kv_heads*2, D]
-    page_size = pages.shape[1]
+    pages.shape[1]
     kv_heads = pages.shape[2] // 2
     head_dim = pages.shape[3]
     flat = pages.reshape(-1, kv_heads * 2, head_dim)[:context_len]
@@ -41,11 +41,12 @@ def test_ragged_page_attention_v2_matches_dense_reference_and_accepts_num_seqs_i
     num_pages = num_seqs * pages_per_seq
 
     context_lens = jnp.array([16, 8, 20], dtype=jnp.int32)
-    q_lens = [4, 1, 5]
     query_start_loc = jnp.array([0, 4, 5, 10], dtype=jnp.int32)
     total_tokens = int(query_start_loc[-1])
 
-    queries = jax.random.normal(jax.random.PRNGKey(0), (total_tokens, q_heads, head_dim), dtype=jnp.float32).astype(jnp.bfloat16)
+    queries = jax.random.normal(jax.random.PRNGKey(0), (total_tokens, q_heads, head_dim), dtype=jnp.float32).astype(
+        jnp.bfloat16
+    )
     kv_pages = _make_kv_pages(num_pages=num_pages, page_size=page_size, kv_heads=kv_heads, head_dim=head_dim, seed=1)
     block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(num_seqs, pages_per_seq)
 
@@ -125,7 +126,9 @@ def test_ragged_page_attention_v2_optimized_flag_runs():
     query_start_loc = jnp.array([0, 2, 4], dtype=jnp.int32)
     total_tokens = int(query_start_loc[-1])
 
-    queries = jax.random.normal(jax.random.PRNGKey(3), (total_tokens, q_heads, head_dim), dtype=jnp.float32).astype(jnp.bfloat16)
+    queries = jax.random.normal(jax.random.PRNGKey(3), (total_tokens, q_heads, head_dim), dtype=jnp.float32).astype(
+        jnp.bfloat16
+    )
     kv_pages = _make_kv_pages(num_pages=num_pages, page_size=page_size, kv_heads=kv_heads, head_dim=head_dim, seed=4)
     block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(num_seqs, pages_per_seq)
 
@@ -155,7 +158,9 @@ def test_ragged_page_attention_v2_pallas_matches_xla_on_tpu():
     query_start_loc = jnp.array([0, 4, 8], dtype=jnp.int32)
     total_tokens = int(query_start_loc[-1])
 
-    queries = jax.random.normal(jax.random.PRNGKey(5), (total_tokens, q_heads, head_dim), dtype=jnp.float32).astype(jnp.bfloat16)
+    queries = jax.random.normal(jax.random.PRNGKey(5), (total_tokens, q_heads, head_dim), dtype=jnp.float32).astype(
+        jnp.bfloat16
+    )
     kv_pages = _make_kv_pages(num_pages=num_pages, page_size=page_size, kv_heads=kv_heads, head_dim=head_dim, seed=6)
     block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(num_seqs, pages_per_seq)
 

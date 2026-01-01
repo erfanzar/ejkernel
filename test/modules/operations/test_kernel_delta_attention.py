@@ -19,7 +19,9 @@ def test_kernel_delta_attention_chunked_and_recurrent_match_and_return_state():
     beta = jax.nn.sigmoid(jax.random.normal(kb, (batch, seq_len, heads), dtype=jnp.float32)).astype(jnp.bfloat16)
     decay = (jax.random.normal(kd, (batch, seq_len, heads), dtype=jnp.float32) * -0.01).astype(jnp.bfloat16)
 
-    out_chunked, state = kernel_delta_attention(q, k, v, beta, decay, return_state=True, use_chunked=True, platform="xla")
+    out_chunked, state = kernel_delta_attention(
+        q, k, v, beta, decay, return_state=True, use_chunked=True, platform="xla"
+    )
     out_recurrent = kernel_delta_attention(q, k, v, beta, decay, return_state=False, use_chunked=False, platform="xla")
 
     assert out_chunked.shape == (batch, seq_len, heads, v_dim)
@@ -31,8 +33,12 @@ def test_kernel_delta_attention_chunked_and_recurrent_match_and_return_state():
     q1 = jax.random.normal(jax.random.PRNGKey(1), (batch, 1, heads, qk_dim), dtype=jnp.float32).astype(jnp.bfloat16)
     k1 = jax.random.normal(jax.random.PRNGKey(2), (batch, 1, heads, qk_dim), dtype=jnp.float32).astype(jnp.bfloat16)
     v1 = jax.random.normal(jax.random.PRNGKey(3), (batch, 1, heads, v_dim), dtype=jnp.float32).astype(jnp.bfloat16)
-    beta1 = jax.nn.sigmoid(jax.random.normal(jax.random.PRNGKey(4), (batch, 1, heads), dtype=jnp.float32)).astype(jnp.bfloat16)
-    decay1 = (jax.random.normal(jax.random.PRNGKey(5), (batch, 1, heads), dtype=jnp.float32) * -0.01).astype(jnp.bfloat16)
+    beta1 = jax.nn.sigmoid(jax.random.normal(jax.random.PRNGKey(4), (batch, 1, heads), dtype=jnp.float32)).astype(
+        jnp.bfloat16
+    )
+    decay1 = (jax.random.normal(jax.random.PRNGKey(5), (batch, 1, heads), dtype=jnp.float32) * -0.01).astype(
+        jnp.bfloat16
+    )
 
     out_next, state_next = kernel_delta_attention(
         q1, k1, v1, beta1, decay1, state, return_state=True, use_chunked=False, platform="xla"

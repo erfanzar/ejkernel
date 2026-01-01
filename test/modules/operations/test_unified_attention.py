@@ -18,7 +18,7 @@ def test_unified_attention_basic_and_optional_features_run():
     kv_lens = jnp.array([16, 9], dtype=jnp.int32)
     q_lens = [4, 1]
     max_kv = int(kv_lens.max())
-    max_blocks_per_seq = int(math.ceil(max_kv / block_size))
+    max_blocks_per_seq = math.ceil(max_kv / block_size)
     num_blocks_total = num_seqs * max_blocks_per_seq
 
     block_tables = jnp.arange(num_blocks_total, dtype=jnp.int32).reshape(num_seqs, max_blocks_per_seq)
@@ -26,7 +26,9 @@ def test_unified_attention_basic_and_optional_features_run():
     query_start_loc = jnp.array([0, q_lens[0], sum(q_lens)], dtype=jnp.int32)
     total_tokens = int(query_start_loc[-1])
 
-    queries = jax.random.normal(jax.random.PRNGKey(0), (total_tokens, q_heads, head_dim), dtype=jnp.float32).astype(jnp.bfloat16)
+    queries = jax.random.normal(jax.random.PRNGKey(0), (total_tokens, q_heads, head_dim), dtype=jnp.float32).astype(
+        jnp.bfloat16
+    )
     key_cache = jax.random.normal(
         jax.random.PRNGKey(1), (num_blocks_total, block_size, kv_heads, head_dim), dtype=jnp.float32
     ).astype(jnp.bfloat16)
@@ -53,8 +55,7 @@ def test_unified_attention_basic_and_optional_features_run():
         logits_soft_cap=10.0,
         alibi_slopes=alibi,
         qq_bias=qq_bias,
-        attention_sink=sink,
+        softmax_aux=sink,
         platform="xla",
     )
     assert out2.shape == (total_tokens, q_heads, head_dim)
-

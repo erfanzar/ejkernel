@@ -428,7 +428,7 @@ class TestRaggedPageAttentionComparison:
         softmax_aux_v2 = attention_sink_v3  # Same values for direct comparison
 
         print("\n=== Attention Sink Test ===")
-        print(f"V3 attention_sink shape: {attention_sink_v3.shape}")
+        print(f"V3 softmax_aux shape: {attention_sink_v3.shape}")
         print(f"V2 softmax_aux shape: {softmax_aux_v2.shape}")
 
         v3_inputs = to_v3_format(inputs)
@@ -441,7 +441,7 @@ class TestRaggedPageAttentionComparison:
             v3_inputs["block_tables"],
             v3_inputs["query_start_loc"],
             v3_inputs["distribution"],
-            attention_sink=attention_sink_v3,
+            softmax_aux=attention_sink_v3,
             softmax_scale=v3_inputs["softmax_scale"],
         )
 

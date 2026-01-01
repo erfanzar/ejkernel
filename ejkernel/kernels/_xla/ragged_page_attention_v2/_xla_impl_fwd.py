@@ -63,7 +63,7 @@ def _ragged_paged_attention(
 
     attention_output = jnp.zeros_like(padded_queries)
 
-    # V3 attention_sink semantics: softmax_aux has shape [num_q_heads]
+    # V3 softmax_aux semantics: softmax_aux has shape [num_q_heads]
     have_sinks = softmax_aux is not None
     if have_sinks:
         if softmax_aux.ndim != 1 or softmax_aux.shape[0] != num_q_heads:
@@ -150,7 +150,7 @@ def _ragged_paged_attention(
                     return output_block, sum_exp_block, new_max
 
                 init_output_block = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=compute_dtype)
-                # V3 attention_sink semantics: initialize with sink values
+                # V3 softmax_aux semantics: initialize with sink values
                 if have_sinks:
                     # sinks_h has shape [num_kv_heads, q_heads_per_group]
                     init_sum_exp = jnp.ones((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype)

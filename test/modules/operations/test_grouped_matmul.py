@@ -8,7 +8,9 @@ from ejkernel.modules.operations import grouped_matmul
 from ._utils import assert_allclose
 
 
-def _grouped_matmul_ref(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, transpose_rhs: bool, existing_out: jax.Array | None):
+def _grouped_matmul_ref(
+    lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, transpose_rhs: bool, existing_out: jax.Array | None
+):
     sizes = [int(x) for x in list(group_sizes)]
     offset = 0
     chunks = []
@@ -17,7 +19,11 @@ def _grouped_matmul_ref(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, 
         b = rhs[g].T if transpose_rhs else rhs[g]
         chunks.append(a @ b)
         offset += sz
-    out = jnp.concatenate(chunks, axis=0) if chunks else jnp.zeros((0, rhs.shape[2] if not transpose_rhs else rhs.shape[1]))
+    out = (
+        jnp.concatenate(chunks, axis=0)
+        if chunks
+        else jnp.zeros((0, rhs.shape[2] if not transpose_rhs else rhs.shape[1]))
+    )
     if existing_out is not None:
         out = out + existing_out
     return out

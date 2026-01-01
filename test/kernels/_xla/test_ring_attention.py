@@ -19,9 +19,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from ejkernel.ops import FwdParams
 from ejkernel.kernels._xla.attention._interface import attention
 from ejkernel.kernels._xla.ring_attention._interface import ring_attention
+from ejkernel.ops import FwdParams
 
 
 class TestBasicFunctionality:

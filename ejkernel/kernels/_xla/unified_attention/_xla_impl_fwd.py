@@ -36,7 +36,7 @@ def _unified_attention_fwd(
     logits_soft_cap: float | None,
     alibi_slopes: jax.Array | None,
     qq_bias: jax.Array | None,
-    attention_sink: jax.Array | None,
+    softmax_aux: jax.Array | None,
 ) -> jax.Array:
     if queries.ndim != 3:
         raise ValueError("queries must be rank-3: [total_tokens, num_q_heads, head_dim]")
@@ -60,7 +60,7 @@ def _unified_attention_fwd(
 
     use_alibi = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
-    use_sinks = attention_sink is not None
+    use_sinks = softmax_aux is not None
 
     if use_alibi:
         if alibi_slopes.shape != (num_q_heads,):
@@ -79,9 +79,9 @@ def _unified_attention_fwd(
         qq_bias_f32 = jnp.zeros((1, 1), dtype=jnp.float32)
 
     if use_sinks:
-        if attention_sink.shape != (num_q_heads,):
-            raise ValueError("attention_sink must have shape (num_q_heads,)")
-        sink_h = attention_sink.reshape(num_kv_heads, num_q_heads // num_kv_heads).astype(jnp.float32)
+        if softmax_aux.shape != (num_q_heads,):
+            raise ValueError("softmax_aux must have shape (num_q_heads,)")
+        sink_h = softmax_aux.reshape(num_kv_heads, num_q_heads // num_kv_heads).astype(jnp.float32)
     else:
         sink_h = jnp.zeros((1, 1), dtype=jnp.float32)
 

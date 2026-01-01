@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+from jax import shard_map
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int32
 
 from ejkernel.kernels._registry import Backend, kernel_registry
@@ -122,6 +124,108 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         """Initialize the UnifiedAttention kernel."""
         super().__init__(op_id="unified_attention")
 
+    def create_shard_map_wrapper(
+        self,
+        queries: Float[Array, "total_tokens num_q_heads head_dim"],
+        key_cache: Float[Array, "num_blocks block_size num_kv_heads head_dim"],
+        value_cache: Float[Array, "num_blocks block_size num_kv_heads head_dim"],
+        kv_lens: Int32[Array, "num_seqs"],
+        block_tables: Int32[Array, "num_seqs max_blocks_per_seq"],
+        query_start_loc: Int32[Array, "num_seqs_plus_1"],
+        alibi_slopes: Float[Array, "num_q_heads"] | None = None,
+        qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None = None,
+        softmax_aux: Float[Array, "num_q_heads"] | None = None,
+        softmax_scale: float | None = None,
+        causal: bool = True,
+        sliding_window: int | None = None,
+        logits_soft_cap: float | None = None,
+        seq_threshold_3d: int | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        cfg: UnifiedAttentionConfig | None = None,
+        mesh: Mesh | None = None,
+        in_specs: tuple[PartitionSpec, ...] | None = None,
+        out_specs: PartitionSpec | None = None,
+        check_vma: bool = False,
+    ):
+        """Create a shard_map wrapper for distributed unified attention.
+
+        Args:
+            queries: Packed query tensor [total_tokens, num_q_heads, head_dim].
+            key_cache: Paged key cache [num_blocks, block_size, num_kv_heads, head_dim].
+            value_cache: Paged value cache [num_blocks, block_size, num_kv_heads, head_dim].
+            kv_lens: Context lengths [num_seqs].
+            block_tables: Block table mapping [num_seqs, max_blocks_per_seq].
+            query_start_loc: Query start indices [num_seqs + 1].
+            alibi_slopes: Optional ALiBi slopes [num_q_heads].
+            qq_bias: Optional query-query bias [num_query_tokens, num_query_tokens].
+            softmax_aux: Optional attention sink values [num_q_heads].
+            All other args: Unified attention parameters to be fixed via partial.
+            mesh: JAX device mesh for shard_map execution.
+            in_specs: Tuple of PartitionSpec objects defining input tensor sharding.
+                (for queries, key_cache, value_cache, kv_lens, block_tables,
+                query_start_loc, alibi_slopes, qq_bias, softmax_aux)
+            out_specs: PartitionSpec defining output tensor sharding.
+            check_vma: Whether to check virtual memory alignment in shard_map.
+
+        Returns:
+            Tuple of (shard_map_fn, call_args).
+        """
+        assert mesh is not None, "mesh must be provided for shard_map execution"
+        assert in_specs is not None, "in_specs must be provided for shard_map execution"
+        assert out_specs is not None, "out_specs must be provided for shard_map execution"
+
+        def _wrapped_unified_attention(
+            queries: Float[Array, "total_tokens num_q_heads head_dim"],
+            key_cache: Float[Array, "num_blocks block_size num_kv_heads head_dim"],
+            value_cache: Float[Array, "num_blocks block_size num_kv_heads head_dim"],
+            kv_lens: Int32[Array, "num_seqs"],
+            block_tables: Int32[Array, "num_seqs max_blocks_per_seq"],
+            query_start_loc: Int32[Array, "num_seqs_plus_1"],
+            alibi_slopes: Float[Array, "num_q_heads"] | None,
+            qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None,
+            softmax_aux: Float[Array, "num_q_heads"] | None,
+        ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
+            return self.run(
+                queries=queries,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                kv_lens=kv_lens,
+                block_tables=block_tables,
+                query_start_loc=query_start_loc,
+                alibi_slopes=alibi_slopes,
+                qq_bias=qq_bias,
+                softmax_aux=softmax_aux,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                sliding_window=sliding_window,
+                logits_soft_cap=logits_soft_cap,
+                seq_threshold_3d=seq_threshold_3d,
+                platform=platform,
+                cfg=cfg,
+            )
+
+        call_args = (
+            queries,
+            key_cache,
+            value_cache,
+            kv_lens,
+            block_tables,
+            query_start_loc,
+            alibi_slopes,
+            qq_bias,
+            softmax_aux,
+        )
+        assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+        shard_map_fn = shard_map(
+            _wrapped_unified_attention,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=check_vma,
+        )
+
+        return shard_map_fn, call_args
+
     def get_impl(self, cfg: UnifiedAttentionConfig):
         """Get the platform-specific implementation.
 
@@ -142,18 +246,15 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         kv_lens: Int32[Array, "num_seqs"],
         block_tables: Int32[Array, "num_seqs max_blocks_per_seq"],
         query_start_loc: Int32[Array, "num_seqs_plus_1"],
+        alibi_slopes: Float[Array, "num_q_heads"] | None = None,
+        qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None = None,
+        softmax_aux: Float[Array, "num_q_heads"] | None = None,
         *,
         softmax_scale: float | None = None,
         causal: bool = True,
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
         seq_threshold_3d: int | None = None,
-        num_par_softmax_segments: int | None = None,
-        alibi_slopes: Float[Array, "num_q_heads"] | None = None,
-        qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None = None,
-        attention_sink: Float[Array, "num_q_heads"] | None = None,
-        num_warps: int | None = None,
-        num_stages: int | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
         cfg: UnifiedAttentionConfig,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
@@ -182,7 +283,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
                 Adds position-dependent bias: bias[i,j] = slope * (j - i).
             qq_bias: Optional query-query bias of shape [num_query_tokens, num_query_tokens].
                 Added directly to attention logits between query positions.
-            attention_sink: Optional attention sink values per head of shape [num_q_heads].
+            softmax_aux: Optional attention sink values per head of shape [num_q_heads].
                 Adds constant attention to the first token for streaming inference stability.
             platform: Override platform selection. One of "triton", "pallas", "cuda", "xla", "auto".
             cfg: Kernel configuration with tuning parameters.
@@ -202,12 +303,6 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
 
         if seq_threshold_3d is None:
             seq_threshold_3d = cfg.seq_threshold_3d
-        if num_par_softmax_segments is None:
-            num_par_softmax_segments = cfg.num_par_softmax_segments
-        if num_warps is None:
-            num_warps = cfg.num_warps
-        if num_stages is None:
-            num_stages = cfg.num_stages
 
         impl = self.get_impl(cfg)
         return impl(
@@ -222,12 +317,12 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
             seq_threshold_3d=seq_threshold_3d,
-            num_par_softmax_segments=num_par_softmax_segments,
+            num_par_softmax_segments=cfg.num_par_softmax_segments,
             alibi_slopes=alibi_slopes,
             qq_bias=qq_bias,
-            attention_sink=attention_sink,
-            num_warps=num_warps,
-            num_stages=num_stages,
+            softmax_aux=softmax_aux,
+            num_warps=cfg.num_warps,
+            num_stages=cfg.num_stages,
         )
 
     def heuristic_cfg(self, inv: Invocation[UnifiedAttentionConfig, Array]) -> UnifiedAttentionConfig:
@@ -289,6 +384,9 @@ def unified_attention(
     kv_lens: Int32[Array, "num_seqs"],
     block_tables: Int32[Array, "num_seqs max_blocks_per_seq"],
     query_start_loc: Int32[Array, "num_seqs_plus_1"],
+    alibi_slopes: Float[Array, "num_q_heads"] | None = None,
+    qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None = None,
+    softmax_aux: Float[Array, "num_q_heads"] | None = None,
     /,
     *,
     softmax_scale: float | None = None,
@@ -296,12 +394,6 @@ def unified_attention(
     sliding_window: int | None = None,
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
-    num_par_softmax_segments: int | None = None,
-    alibi_slopes: Float[Array, "num_q_heads"] | None = None,
-    qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None = None,
-    attention_sink: Float[Array, "num_q_heads"] | None = None,
-    num_warps: int | None = None,
-    num_stages: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
     cfg: UnifiedAttentionConfig | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
@@ -341,7 +433,7 @@ def unified_attention(
             Adds linear position-dependent bias to attention scores.
         qq_bias: Optional query-query attention bias [num_query_tokens, num_query_tokens].
             Directly added to attention logits for query-to-query interactions.
-        attention_sink: Optional attention sink values per head [num_q_heads].
+        softmax_aux: Optional attention sink values per head [num_q_heads].
             Provides stable attention to the first token for streaming/infinite context.
         platform: Override automatic platform selection. One of:
             - "triton": Force Triton (GPU)
@@ -392,12 +484,9 @@ def unified_attention(
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
         seq_threshold_3d=seq_threshold_3d,
-        num_par_softmax_segments=num_par_softmax_segments,
         alibi_slopes=alibi_slopes,
         qq_bias=qq_bias,
-        attention_sink=attention_sink,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        softmax_aux=softmax_aux,
         platform=platform,
         _cfg=cfg,
     )

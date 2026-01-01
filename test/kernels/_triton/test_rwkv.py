@@ -116,6 +116,9 @@ def test_rwkv7_matches_xla_and_mul_wrapper():
     out_mul_xla, st_mul_xla = xla_rwkv7_mul(r, w, k, v, kk, a, initial_state=h0)
     out_mul_tri, st_mul_tri = jax.block_until_ready(out_mul_tri), jax.block_until_ready(st_mul_tri)
     out_mul_xla, st_mul_xla = jax.block_until_ready(out_mul_xla), jax.block_until_ready(st_mul_xla)
-    np.testing.assert_allclose(np.asarray(out_mul_tri, np.float32), np.asarray(out_mul_xla, np.float32), rtol=2e-2, atol=2e-2)
-    np.testing.assert_allclose(np.asarray(st_mul_tri, np.float32), np.asarray(st_mul_xla, np.float32), rtol=2e-2, atol=2e-2)
-
+    np.testing.assert_allclose(
+        np.asarray(out_mul_tri, np.float32), np.asarray(out_mul_xla, np.float32), rtol=2e-2, atol=2e-2
+    )
+    np.testing.assert_allclose(
+        np.asarray(st_mul_tri, np.float32), np.asarray(st_mul_xla, np.float32), rtol=2e-2, atol=2e-2
+    )

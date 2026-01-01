@@ -763,7 +763,8 @@ def make_dummy_rpa_inputs(
     q_dtype: jnp.dtype | None = None,  # defaults to kv_dtype if None
     kv_len_max: int | None = None,  # cap on kv_len per sequence; defaults to pages_per_seq*page_size
     total_q: int | None = None,  # total number of query tokens (sum_q). If set, uses deterministic q/kv lengths.
-    total_num_pages: int | None = None,  # physical kv_cache pages (>= num_seqs*pages_per_seq); defaults to used pages.
+    total_num_pages: int
+    | None = None,  # physical kv_cache pages; can be < num_seqs*pages_per_seq when tables are padded.
     decode_prefill_mixed: tuple[int, int, int] | None = None,
     # (decode_end, prefill_end, mixed_end/total). Defaults to (0,0,num_seqs).
 ):
@@ -777,6 +778,11 @@ def make_dummy_rpa_inputs(
       query_start_loc: (num_seqs + 1,)                       [int32]
       distribution:    (3,)                                  [int32]
     All constraints required by the kernel/validators are satisfied.
+
+    Notes:
+      - `pages_per_seq` is treated as the (padded) page-table width.
+      - If `total_num_pages` is smaller than `num_seqs * pages_per_seq`, the page table is padded with a safe in-bounds
+        page index, and only the first ceil(kv_len/page_size) pages per sequence are actually used.
 
     Example (matches the large benchmark shapes discussed in ragged_page_attention_v3):
       - `total_q=1024`, `num_q_heads=8`, `head_dim=128`
@@ -835,14 +841,64 @@ def make_dummy_rpa_inputs(
             raise ValueError("distribution must satisfy 0 <= i <= j <= k == num_seqs.")
         distribution = jnp.array([i, j, k], dtype=jnp.int32)
 
-    # Block tables: assign each sequence a disjoint, contiguous page range
-    total_pages_used = num_seqs * pages_per_seq
-    total_pages = total_pages_used if total_num_pages is None else int(total_num_pages)
-    if total_pages < total_pages_used:
-        raise ValueError(f"total_num_pages ({total_pages}) must be >= num_seqs*pages_per_seq ({total_pages_used}).")
-    seq_bases = jnp.arange(num_seqs, dtype=jnp.int32) * jnp.int32(pages_per_seq)
-    per_seq = (seq_bases[:, None] + jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :]).reshape(-1)
-    block_tables = per_seq  # shape (num_seqs * pages_per_seq,)
+    # Block tables: map each sequence's logical pages -> physical kv_cache pages.
+    # In real workloads, `pages_per_seq` is typically a *capacity* (padded table width),
+    # while the number of actually used pages is ceil(kv_len / page_size) and can be
+    # much smaller. Support both:
+    #   - default (total_num_pages is None): allocate and use num_seqs*pages_per_seq pages (old behavior)
+    #   - if total_num_pages is provided and >= num_seqs*pages_per_seq: keep old behavior (disjoint pages)
+    #   - if total_num_pages is provided and <  num_seqs*pages_per_seq: allocate only as many pages as needed by kv_lens,
+    #     and pad table entries with a safe, unused page index so all indices stay in-bounds.
+    pages_needed = (kv_lens + jnp.int32(page_size) - jnp.int32(1)) // jnp.int32(page_size)  # (num_seqs,)
+    pages_needed_np = np.asarray(pages_needed, dtype=np.int32)
+    total_pages_needed = int(pages_needed_np.sum())
+    max_pages_needed = int(pages_needed_np.max())
+
+    total_pages_used_full = num_seqs * pages_per_seq
+
+    if total_num_pages is None:
+        total_pages = total_pages_used_full
+        total_pages_used = total_pages_used_full
+        seq_bases = jnp.arange(num_seqs, dtype=jnp.int32) * jnp.int32(pages_per_seq)
+        per_seq = (seq_bases[:, None] + jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :]).reshape(-1)
+        block_tables = per_seq  # shape (num_seqs * pages_per_seq,)
+    else:
+        total_pages = int(total_num_pages)
+        if total_pages >= total_pages_used_full:
+            # Old behavior: every sequence owns `pages_per_seq` disjoint pages.
+            total_pages_used = total_pages_used_full
+            seq_bases = jnp.arange(num_seqs, dtype=jnp.int32) * jnp.int32(pages_per_seq)
+            per_seq = (seq_bases[:, None] + jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :]).reshape(-1)
+            block_tables = per_seq  # shape (num_seqs * pages_per_seq,)
+        else:
+            if total_pages < total_pages_needed:
+                raise ValueError(
+                    f"total_num_pages ({total_pages}) must be >= total_pages_needed ({total_pages_needed}) "
+                    "given kv_lens and page_size."
+                )
+            if max_pages_needed > pages_per_seq:
+                raise ValueError(
+                    f"pages_per_seq ({pages_per_seq}) must be >= max(ceil(kv_len/page_size)) ({max_pages_needed})."
+                )
+            # If any sequence has padding slots, reserve a single unused page index for padding.
+            needs_padding = bool((pages_needed_np < pages_per_seq).any())
+            if needs_padding and total_pages == total_pages_needed:
+                raise ValueError(
+                    "total_num_pages must be > total_pages_needed when pages_per_seq is a padded capacity; "
+                    "increase total_num_pages or reduce kv_lens/pages_per_seq."
+                )
+            pad_page = np.int32(total_pages_needed) if needs_padding else np.int32(0)
+
+            block_tables_2d = np.full((num_seqs, pages_per_seq), pad_page, dtype=np.int32)
+            cursor = 0
+            for seq_idx, pn in enumerate(pages_needed_np.tolist()):
+                pn_i = int(pn)
+                if pn_i <= 0:
+                    continue
+                block_tables_2d[seq_idx, :pn_i] = np.arange(cursor, cursor + pn_i, dtype=np.int32)
+                cursor += pn_i
+            total_pages_used = cursor
+            block_tables = jnp.asarray(block_tables_2d.reshape(-1), dtype=jnp.int32)
 
     # Allocate kv_cache with random data
     kv_cache_shape = (

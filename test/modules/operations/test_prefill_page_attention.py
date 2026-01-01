@@ -24,7 +24,9 @@ def test_prefill_page_attention_xla_matches_dense_reference():
     chunk_size = 6
     context_len = 18
 
-    q = jax.random.normal(jax.random.PRNGKey(0), (chunk_size, num_heads, head_dim), dtype=jnp.float32).astype(jnp.bfloat16)
+    q = jax.random.normal(jax.random.PRNGKey(0), (chunk_size, num_heads, head_dim), dtype=jnp.float32).astype(
+        jnp.bfloat16
+    )
     k_cache = jax.random.normal(
         jax.random.PRNGKey(1), (num_kv_heads, total_pages, page_size, head_dim), dtype=jnp.float32
     ).astype(jnp.bfloat16)
@@ -71,7 +73,9 @@ def test_prefill_page_attention_pallas_matches_xla_on_tpu():
     chunk_size = 32
     context_len = 32
 
-    q = jax.random.normal(jax.random.PRNGKey(10), (chunk_size, num_heads, head_dim), dtype=jnp.float32).astype(jnp.bfloat16)
+    q = jax.random.normal(jax.random.PRNGKey(10), (chunk_size, num_heads, head_dim), dtype=jnp.float32).astype(
+        jnp.bfloat16
+    )
     k_cache = jax.random.normal(
         jax.random.PRNGKey(11), (num_kv_heads, total_pages, page_size, head_dim), dtype=jnp.float32
     ).astype(jnp.bfloat16)

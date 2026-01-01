@@ -34,7 +34,8 @@ def _has_tpu() -> bool:
 _RUN = os.getenv("EJKERNEL_RUN_PREFILL_PAGE_ATTENTION") == "1"
 pytestmark = pytest.mark.skipif(
     (not _has_tpu()) or (not _RUN),
-    reason="Prefill page attention tests are slow to compile on TPU; set EJKERNEL_RUN_PREFILL_PAGE_ATTENTION=1 to enable.",
+    reason="Prefill page attention tests are slow to compile on TPU; "
+    "set EJKERNEL_RUN_PREFILL_PAGE_ATTENTION=1 to enable.",
 )
 
 

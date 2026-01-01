@@ -28,7 +28,7 @@ def test_mean_pooling_varlen_matches_manual_and_gradient():
     out = mean_pooling(x, cu_seqlens, platform="xla")
 
     refs = []
-    for i, l in enumerate(lengths):
+    for i, _ in enumerate(lengths):
         start = int(cu_seqlens[i])
         end = int(cu_seqlens[i + 1])
         refs.append(jnp.mean(x[start:end], axis=0))
@@ -42,7 +42,7 @@ def test_mean_pooling_varlen_matches_manual_and_gradient():
 
     dx = jax.grad(loss_fn)(x.astype(jnp.float32))
     expected = []
-    for i, l in enumerate(lengths):
+    for _, l in enumerate(lengths):
         expected.append(jnp.ones((l, 8), dtype=jnp.float32) / float(l))
     expected = jnp.concatenate(expected, axis=0)
     assert_allclose(dx, expected, atol=0.0)

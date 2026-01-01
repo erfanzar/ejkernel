@@ -72,9 +72,9 @@ def _build_inputs(head_dim: int, seed: int = 0, *, with_attention_sink: bool = F
     kv_cache = jax.random.normal(cache_key, kv_cache_shape, dtype=keys.dtype)
     block_tables = jnp.arange(total_pages, dtype=jnp.int32)
     distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
-    attention_sink = None
+    softmax_aux = None
     if with_attention_sink:
-        attention_sink = jax.random.normal(sink_key, (num_q_heads,), dtype=jnp.float32)
+        softmax_aux = jax.random.normal(sink_key, (num_q_heads,), dtype=jnp.float32)
     softmax_scale = float(head_dim) ** -0.5
     return (
         queries,
@@ -85,7 +85,7 @@ def _build_inputs(head_dim: int, seed: int = 0, *, with_attention_sink: bool = F
         block_tables,
         query_start_loc,
         distribution,
-        attention_sink,
+        softmax_aux,
         softmax_scale,
     )
 
@@ -100,7 +100,7 @@ def _run_and_compare(*, head_dim: int, seed: int, sliding_window: int | None, wi
         block_tables,
         query_start_loc,
         distribution,
-        attention_sink,
+        softmax_aux,
         softmax_scale,
     ) = _build_inputs(head_dim, seed, with_attention_sink=with_attention_sink)
 
@@ -116,7 +116,7 @@ def _run_and_compare(*, head_dim: int, seed: int, sliding_window: int | None, wi
             block_tables,
             query_start_loc,
             distribution,
-            attention_sink=attention_sink,
+            softmax_aux=softmax_aux,
             softmax_scale=softmax_scale,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
@@ -131,7 +131,7 @@ def _run_and_compare(*, head_dim: int, seed: int, sliding_window: int | None, wi
             block_tables,
             query_start_loc,
             distribution,
-            attention_sink=attention_sink,
+            softmax_aux=softmax_aux,
             softmax_scale=softmax_scale,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
@@ -146,7 +146,7 @@ def _run_and_compare(*, head_dim: int, seed: int, sliding_window: int | None, wi
         block_tables,
         query_start_loc,
         distribution,
-        attention_sink=attention_sink,
+        softmax_aux=softmax_aux,
         softmax_scale=softmax_scale,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,

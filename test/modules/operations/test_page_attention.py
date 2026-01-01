@@ -21,7 +21,7 @@ def _gather_kv(
 
 
 def test_page_attention_xla_matches_dense_reference_variable_contexts():
-    key = jax.random.PRNGKey(0)
+    jax.random.PRNGKey(0)
     num_seqs, q_heads, kv_heads, head_dim = 3, 4, 2, 32
     block_size, pages_per_seq = 8, 4
     num_blocks = num_seqs * pages_per_seq
@@ -77,12 +77,12 @@ def test_page_attention_xla_rejects_attn_logits_soft_cap():
     num_blocks = num_seqs * pages_per_seq
 
     q = jax.random.normal(key, (num_seqs, q_heads, head_dim), dtype=jnp.float32).astype(jnp.bfloat16)
-    k_cache = jax.random.normal(jax.random.PRNGKey(10), (num_blocks, kv_heads, block_size, head_dim), dtype=jnp.float32).astype(
-        jnp.bfloat16
-    )
-    v_cache = jax.random.normal(jax.random.PRNGKey(11), (num_blocks, kv_heads, block_size, head_dim), dtype=jnp.float32).astype(
-        jnp.bfloat16
-    )
+    k_cache = jax.random.normal(
+        jax.random.PRNGKey(10), (num_blocks, kv_heads, block_size, head_dim), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+    v_cache = jax.random.normal(
+        jax.random.PRNGKey(11), (num_blocks, kv_heads, block_size, head_dim), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
     block_tables = jnp.arange(num_blocks, dtype=jnp.int32).reshape(num_seqs, pages_per_seq)
     context_lens = jnp.array([block_size * pages_per_seq], dtype=jnp.int32)
 
@@ -98,18 +98,20 @@ def test_page_attention_inline_seq_dim_pallas_parity_on_tpu():
     num_blocks = num_seqs * pages_per_seq
 
     q = jax.random.normal(key, (num_seqs, q_heads, head_dim), dtype=jnp.float32).astype(jnp.bfloat16)
-    k_cache = jax.random.normal(jax.random.PRNGKey(11), (num_blocks, kv_heads, block_size, head_dim), dtype=jnp.float32).astype(
-        jnp.bfloat16
-    )
-    v_cache = jax.random.normal(jax.random.PRNGKey(12), (num_blocks, kv_heads, block_size, head_dim), dtype=jnp.float32).astype(
-        jnp.bfloat16
-    )
+    k_cache = jax.random.normal(
+        jax.random.PRNGKey(11), (num_blocks, kv_heads, block_size, head_dim), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+    v_cache = jax.random.normal(
+        jax.random.PRNGKey(12), (num_blocks, kv_heads, block_size, head_dim), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
     block_tables = jnp.arange(num_blocks, dtype=jnp.int32).reshape(num_seqs, pages_per_seq)
     context_lens = jnp.array([192, 256], dtype=jnp.int32)
 
     out_xla = page_attention(q, k_cache, v_cache, context_lens, block_tables, platform="xla")
     out_inline = page_attention(q, k_cache, v_cache, context_lens, block_tables, platform="pallas", inline_seq_dim=True)
-    out_noinline = page_attention(q, k_cache, v_cache, context_lens, block_tables, platform="pallas", inline_seq_dim=False)
+    out_noinline = page_attention(
+        q, k_cache, v_cache, context_lens, block_tables, platform="pallas", inline_seq_dim=False
+    )
 
     assert_allclose(out_inline, out_xla, atol=0.25)
     assert_allclose(out_noinline, out_xla, atol=0.25)

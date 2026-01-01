@@ -32,5 +32,7 @@ def test_recurrent_attention_gating_reverse_and_return_state():
     assert out.shape == (b, t, hq, d)
     assert state.shape == (b, hq, d, d)
 
-    out2 = recurrent_attention(q[:, :1], k[:, :1], v[:, :1], None, None, None, None, state, return_state=False, platform="xla")
+    out2 = recurrent_attention(
+        q[:, :1], k[:, :1], v[:, :1], None, None, None, None, state, return_state=False, platform="xla"
+    )
     assert out2.shape == (b, 1, hq, d)

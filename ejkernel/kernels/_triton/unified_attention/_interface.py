@@ -28,7 +28,7 @@ Supported features (inference-only):
 - causal masking (required)
 - optional sliding window via `sliding_window` (window length)
 - optional logit softcap (`logits_soft_cap`)
-- optional attention sink (`attention_sink`): contributes to softmax normalizer only
+- optional attention sink (`softmax_aux`): contributes to softmax normalizer only
 - optional ALiBi slopes (`alibi_slopes`)
 - optional query-query bias (`qq_bias`) for TreeAttention-like decode
 """
@@ -52,6 +52,9 @@ def unified_attention(
     kv_lens: Int32[Array, "num_seqs"],
     block_tables: Int32[Array, "num_seqs max_blocks_per_seq"],
     query_start_loc: Int32[Array, "num_seqs_plus_1"],
+    alibi_slopes: Float[Array, "num_q_heads"] | None = None,
+    qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None = None,
+    softmax_aux: Float[Array, "num_q_heads"] | None = None,
     *,
     softmax_scale: float | None = None,
     causal: bool = True,
@@ -59,9 +62,6 @@ def unified_attention(
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
     num_par_softmax_segments: int | None = None,
-    alibi_slopes: Float[Array, "num_q_heads"] | None = None,
-    qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None = None,
-    attention_sink: Float[Array, "num_q_heads"] | None = None,
     num_warps: int | None = None,
     num_stages: int | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
@@ -80,7 +80,7 @@ def unified_attention(
         num_par_softmax_segments=num_par_softmax_segments,
         alibi_slopes=alibi_slopes,
         qq_bias=qq_bias,
-        attention_sink=attention_sink,
+        softmax_aux=softmax_aux,
         num_warps=num_warps,
         num_stages=num_stages,
     )
