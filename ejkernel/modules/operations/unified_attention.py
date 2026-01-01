@@ -395,10 +395,10 @@ def unified_attention(
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    cfg: UnifiedAttentionConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: PartitionSpec | None = None,
+    cfg: UnifiedAttentionConfig | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Execute unified paged attention with automatic platform selection.
 

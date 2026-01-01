@@ -276,10 +276,10 @@ def decode_attention(
     page_size: int = 1,
     logits_soft_cap: float | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    cfg: DecodeAttentionConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: tuple[PartitionSpec, PartitionSpec] | None = None,
+    cfg: DecodeAttentionConfig | None = None,
 ) -> tuple[
     Float[Array, "batch num_q_heads head_dim"],
     Float[Array, "batch num_q_heads"],

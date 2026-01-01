@@ -349,10 +349,10 @@ def chunked_prefill_paged_decode(
     seq_threshold_3d: int | None = None,
     num_par_softmax_segments: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
-    cfg: ChunkedPrefillPagedDecodeConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: tuple[PartitionSpec, PartitionSpec, PartitionSpec] | None = None,
+    cfg: ChunkedPrefillPagedDecodeConfig | None = None,
 ) -> tuple[
     Float[Array, "total_tokens num_q_heads head_dim"],
     Float[Array, "num_blocks block_size num_kv_heads head_dim"],
