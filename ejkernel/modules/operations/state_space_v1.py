@@ -73,22 +73,43 @@ from .configs import StateSpaceV1Config
 class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
     """SSM1 (Mamba1-style) Selective State Space operation.
 
-    Implements the original Mamba architecture with O(N) complexity.
-    Processes tokens sequentially, maintaining a hidden state that
-    accumulates information through discretized state transitions.
+    Implements the original Mamba architecture with O(N) complexity, where N is
+    the sequence length. Processes tokens sequentially, maintaining a hidden state
+    that accumulates information through discretized state transitions.
 
     Features:
         - 2D A matrix [intermediate_size, ssm_state_size]
         - Hidden state propagation across timesteps
-        - Optional gating with activation function
-        - Conv state passthrough for caching
+        - Optional gating with configurable activation function
+        - Conv state passthrough for caching during inference
         - Multiple platform support (XLA primary)
+        - Automatic platform selection for optimal performance
 
     The state update mechanism:
         dA = exp(A * dt)
         dB = dt * B
         h_t = dA * h_{t-1} + dB * x_t
         y_t = h_t @ C_t + D * x_t
+
+    Example:
+        >>> from ejkernel.modules import StateSpaceV1, create_default_executor
+        >>>
+        >>> # Basic usage
+        >>> executor = create_default_executor()
+        >>> ssm = StateSpaceV1()
+        >>> output, state, _ = executor(ssm, hidden_states, A, B, C, D, dt)
+        >>>
+        >>> # With gating
+        >>> output, state, _ = executor(
+        ...     ssm, hidden_states, A, B, C, D, dt,
+        ...     gate=gate, act_fn=jax.nn.silu
+        ... )
+        >>>
+        >>> # Streaming inference with state continuation
+        >>> output, state, conv_state = executor(
+        ...     ssm, hidden_states[:, :1], A, B[:, :1], C[:, :1], D, dt[:, :1],
+        ...     initial_state=prev_state, conv_state=prev_conv_state
+        ... )
     """
 
     def __init__(self):
