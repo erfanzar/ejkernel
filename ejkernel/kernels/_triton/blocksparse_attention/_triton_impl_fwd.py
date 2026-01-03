@@ -518,6 +518,37 @@ def _fwd_blocksparse_attn_call(
     bwd_params: BwdParams | None = None,
     logits_soft_cap: float | None = None,
 ) -> tuple[ArrayLike, Sequence[ArrayLike]]:
+    """Execute block-sparse attention forward pass using Triton kernel.
+
+    This function handles setup, validation, and dispatching for the block-sparse
+    attention forward kernel. It uses sparse masks to skip computation for
+    masked-out blocks, providing significant speedup for sparse attention patterns.
+
+    Args:
+        query: Query tensor [batch, num_heads, seq_len_q, head_dim]
+        key: Key tensor [batch, num_kv_heads, seq_len_k, head_dim]
+        value: Value tensor [batch, num_kv_heads, seq_len_k, head_dim]
+        q_positions: Query position indices [batch, seq_len_q]
+        q_segment_ids: Query segment IDs for packed sequences [batch, seq_len_q]
+        kv_positions: Key/value position indices [batch, seq_len_k]
+        kv_segment_ids: Key/value segment IDs [batch, seq_len_k]
+        qkv_layouts: Pre-computed sparse masks or None to compute on-the-fly
+        softmax_scale: Scaling factor for attention scores
+        softmax_aux: Optional attention sink values
+        bias: Attention bias (not currently supported)
+        apply_load_balance: Whether to apply load balancing
+        sequence_parallelism_mesh_axis_name: Mesh axis for sequence parallelism
+        window_left: Left window size for sliding window (-1 = unlimited)
+        window_right: Right window size for sliding window (-1 = unlimited)
+        causal: Enable causal masking
+        fwd_params: Forward pass configuration parameters
+        bwd_params: Backward pass configuration parameters
+        logits_soft_cap: Optional soft cap for logits
+
+    Returns:
+        tuple: (output, residuals) where output is attention result and
+        residuals contain values needed for backward pass
+    """
     if bias is not None:
         raise NotImplementedError("Bias is not supported in block-sparse attention")
 

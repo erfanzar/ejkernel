@@ -199,6 +199,33 @@ def _compute_sparse_mask(
     WINDOW_RIGHT: tl.constexpr,
     QUERY_IS_OUTER: tl.constexpr,
 ):
+    """Triton kernel to compute sparse attention mask boundaries.
+
+    Analyzes block-level attention patterns to determine which blocks of
+    the inner sequence each block of the outer sequence should attend to.
+    Computes both full bounds (for unmasked computation) and partial bounds
+    (where masking is needed).
+
+    Args:
+        outer_positions_ptr: Pointer to outer (query or KV) positions
+        outer_segment_id_ptr: Pointer to outer segment IDs
+        inner_positions_ptr: Pointer to inner (KV or query) positions
+        inner_segment_ids_ptr: Pointer to inner segment IDs
+        lower_block_ptr: Output pointer for lower bound indices
+        upper_block_ptr: Output pointer for upper bound indices
+        lower_full_block_ptr: Output pointer for lower fully-attended bounds
+        upper_full_block_ptr: Output pointer for upper fully-attended bounds
+        INNER_BLOCK_SIZE: Block size for inner sequence (constexpr)
+        INNER_SEQ_LEN: Total inner sequence length (constexpr)
+        OUTER_SEQ_LEN: Total outer sequence length (constexpr)
+        OUTER_BLOCK_SIZE: Block size for outer sequence (constexpr)
+        PADDING_SEGMENT_ID: ID used for padding tokens (constexpr)
+        USE_SEGMENT_MASK: Enable segment-based masking (constexpr)
+        CAUSAL: Enable causal masking (constexpr)
+        WINDOW_LEFT: Left window boundary for sliding window (constexpr)
+        WINDOW_RIGHT: Right window boundary for sliding window (constexpr)
+        QUERY_IS_OUTER: True if outer is query, False if outer is KV (constexpr)
+    """
     outer_block_id = tl.program_id(0)
     batch_size_id = tl.program_id(1)
     num_outer_block_programs = tl.num_programs(0)
@@ -349,6 +376,28 @@ def define_sparse_mask_fn(
     window_left: int = -1,
     window_right: int = -1,
 ) -> SparseMask:
+    """Generate sparse attention mask boundaries using Triton kernel.
+
+    Core function that invokes the Triton kernel to compute block-level
+    attention boundaries. Handles padding, segment ID remapping, and
+    boundary clipping for both forward and backward masks.
+
+    Args:
+        q_positions: Query token positions [batch, seq_len_q]
+        q_segment_ids: Query segment IDs [batch, seq_len_q]
+        kv_positions: Key/value token positions [batch, seq_len_k]
+        kv_segment_ids: Key/value segment IDs [batch, seq_len_k]
+        kv_blocksize: Block size for key/value sequence
+        q_blocksize: Block size for query sequence
+        calculate_dkdv_mask: If True, compute mask for dK/dV gradients
+        causal: Enable causal (lower triangular) masking
+        window_left: Left window size for sliding window (-1 = unlimited)
+        window_right: Right window size for sliding window (-1 = unlimited)
+
+    Returns:
+        tuple: (lower_block, upper_block, lower_full_block, upper_full_block)
+        boundary arrays defining which blocks each query/KV block attends to
+    """
     _, q_positions, q_segment_ids = pad_to_block_size(
         inputs=None,
         indexs=q_positions,

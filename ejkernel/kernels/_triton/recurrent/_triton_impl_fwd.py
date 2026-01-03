@@ -169,6 +169,29 @@ def fwd_triton_impl(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
+    """Execute recurrent linear attention forward pass using Triton kernel.
+
+    Implements efficient O(N) recurrent attention by maintaining a hidden state
+    that accumulates key-value information. Supports various gating mechanisms
+    including GLA-style gates, Lightning-style decay, and per-dimension gates.
+
+    Args:
+        q: Query tensor [batch, seq_len, num_heads, head_dim]
+        k: Key tensor [batch, seq_len, num_heads, head_dim]
+        v: Value tensor [batch, seq_len, num_heads, head_dim]
+        g: Optional GLA-style gate [batch, seq_len, num_heads, 1]
+        g_gamma: Optional Lightning-style decay factor [batch, num_heads]
+        gk: Optional per-key gate [batch, seq_len, num_heads, head_dim]
+        gv: Optional per-value gate [batch, seq_len, num_heads, head_dim]
+        softmax_scale: Query scaling factor (default: 1.0)
+        initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
+        reverse: Process sequence in reverse order
+        cu_seqlens: Cumulative sequence lengths for variable-length mode
+
+    Returns:
+        tuple: (output, final_state) where output is attention result and
+        final_state is the hidden state after processing
+    """
     B, T, H, K, V = *k.shape, v.shape[-1]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     key_chunk_size, blocksize_v = min(K, 64), min(V, 64)

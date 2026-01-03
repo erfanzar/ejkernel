@@ -363,9 +363,26 @@ def attention_unpack_with_static_shape(
     batch_size: int,
     seqlen: int,
 ) -> Float[Array, "batch seqlen num_heads head_dim"]:
-    """
-    Unpack back into [B, seqlen, H, D] using cum_seqlens. The 'seqlen' is a static
-    padded max length; tokens past end are left as zeros.
+    """Unpack contiguous tensor back to padded batch format.
+
+    Reverses the packing operation by distributing contiguous tokens back
+    to their original batch positions using cumulative sequence lengths.
+    Used after variable-length sequence processing.
+
+    Args:
+        x: Packed tensor of shape [1, max_tokens, num_heads, head_dim]
+        cum_seqlens: Cumulative sequence lengths of shape [batch + 1].
+            cum_seqlens[i] gives start index, cum_seqlens[i+1] gives end index.
+        batch_size: Number of sequences in the batch
+        seqlen: Padded sequence length for output
+
+    Returns:
+        Unpacked tensor of shape [batch, seqlen, num_heads, head_dim] where
+        each sequence is padded to the specified seqlen
+
+    Note:
+        Tokens beyond the actual sequence length for each batch element
+        are left as zeros (padding).
     """
     H, D = x.shape[2], x.shape[3]
     out = jnp.zeros((batch_size, seqlen, H, D), dtype=x.dtype)
