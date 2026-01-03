@@ -21,10 +21,30 @@ for kernel development. It bridges the gap between Triton's GPU programming
 model and JAX's functional array programming paradigm.
 
 Key Components:
-    - ejit: Enhanced JIT decorator for JAX functions
+    - ejit: Enhanced JIT decorator for JAX functions with persistent caching
     - triton_call: Interface for calling Triton kernels from JAX
+    - buffered_pallas_call: TPU-optimized Pallas kernel execution
     - Type conversion utilities for Triton/JAX compatibility
     - Mathematical helper functions for kernel development
+
+Functions:
+    ejit: Enhanced JIT compilation with disk caching
+    triton_call: Execute Triton kernels from JAX
+    buffered_pallas_call: Create buffered Pallas calls for TPU
+    get_triton_type: Get Triton type string for objects
+    cdiv: Ceiling division operation
+    next_power_of_2: Find next power of 2
+    strides_from_shape: Calculate array strides
+
+Example:
+    >>> from ejkernel.callib import ejit, triton_call, cdiv
+    >>>
+    >>> @ejit
+    ... def fast_matmul(a, b):
+    ...     return a @ b
+    >>>
+    >>> # Ceiling division for grid calculations
+    >>> tiles = cdiv(seq_len, block_size)
 """
 
 from __future__ import annotations
@@ -36,7 +56,18 @@ from ._pallas_call import buffered_pallas_call
 from ._utils import cdiv, next_power_of_2, strides_from_shape
 
 
-def _raise_triton_unavailable(err: Exception):
+def _raise_triton_unavailable(err: Exception) -> None:
+    """Raise an error indicating Triton is not available.
+
+    This helper function provides a consistent error message when attempting
+    to use Triton functionality without proper GPU support installed.
+
+    Args:
+        err: The original import error that caused Triton to be unavailable.
+
+    Raises:
+        ValueError: Always raised with installation instructions.
+    """
     raise ValueError(
         "`triton_call` is only available when GPU Triton support is installed "
         "(install `ejkernel[gpu]` and use a CUDA/ROCm-enabled `jaxlib`)."

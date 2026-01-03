@@ -18,8 +18,19 @@
 This module provides a simple API for benchmarking JAX kernels with automatic
 performance analysis and comparison metrics using rich for beautiful output.
 
+Key Features:
+    - Forward and backward pass timing
+    - Statistical analysis (mean, std, min, max, median)
+    - Automatic speedup comparisons between algorithms
+    - Progress bars with ETA tracking
+    - JSON export and matplotlib plotting
+    - Support for JIT static arguments
+
+Classes:
+    BenchmarkResult: Container for single benchmark measurement
+    Benchmark: Main benchmarking harness
+
 Example:
-    >>>
     >>> def flash_attn(q, k, v, causal, sliding_window):
     ...     return flash_attention(q, k, v, causal, sliding_window)
     >>>
@@ -32,10 +43,8 @@ Example:
     ...     {"batch": 8, "seq": 2048, "heads": 16, "dim": 128},
     ... ]
     >>> def input_gen(config):
-    ...
     ...     q, k, v = generate_qkv(**config)
     ...     return (q, k, v, True, 128)
-    >>>
     >>>
     >>> bench = Benchmark(
     ...     algorithms, configs, input_gen,
@@ -75,7 +84,34 @@ except ImportError:
 
 @dataclass
 class BenchmarkResult:
-    """Encapsulates a single benchmark measurement."""
+    """Container for a single benchmark measurement with timing statistics.
+
+    Stores forward pass timing statistics and optional backward pass metrics
+    for comprehensive performance analysis.
+
+    Attributes:
+        algorithm: Name of the algorithm being benchmarked.
+        config: Configuration dict used for this benchmark run.
+        mean_ms: Mean forward pass execution time in milliseconds.
+        std_ms: Standard deviation of forward pass times.
+        min_ms: Minimum forward pass time.
+        max_ms: Maximum forward pass time.
+        median_ms: Median forward pass time.
+        mean_ms_bwd: Mean backward pass time (None if not measured).
+        std_ms_bwd: Standard deviation of backward pass times.
+        min_ms_bwd: Minimum backward pass time.
+        max_ms_bwd: Maximum backward pass time.
+        median_ms_bwd: Median backward pass time.
+
+    Example:
+        >>> result = BenchmarkResult(
+        ...     algorithm="flash",
+        ...     config={"batch": 4, "seq": 1024},
+        ...     mean_ms=5.2, std_ms=0.3, min_ms=4.8, max_ms=6.1, median_ms=5.1
+        ... )
+        >>> print(f"{result.algorithm}: {result.mean_ms:.2f}ms")
+        flash: 5.20ms
+    """
 
     algorithm: str
     config: dict[str, Any]
@@ -93,7 +129,15 @@ class BenchmarkResult:
 
     @property
     def throughput_estimate(self) -> float:
-        """Calculate GFLOPS throughput for attention-like operations."""
+        """Calculate estimated GFLOPS throughput for attention-like operations.
+
+        Computes approximate FLOPS based on standard attention formula:
+        4 * batch * heads * seq^2 * dim (for QK^T matmul and softmax * V).
+
+        Returns:
+            Estimated throughput in GFLOPS, or 0.0 if config doesn't contain
+            required keys (batch, seq, heads, dim).
+        """
         if all(k in self.config for k in ["batch", "seq", "heads", "dim"]):
             b, s, h, d = self.config["batch"], self.config["seq"], self.config["heads"], self.config["dim"]
             flops = 4 * b * h * s * s * d
@@ -102,7 +146,11 @@ class BenchmarkResult:
 
     @property
     def has_backward(self) -> bool:
-        """Check if backward metrics are available."""
+        """Check if backward pass metrics are available.
+
+        Returns:
+            True if backward pass was measured (mean_ms_bwd is not None).
+        """
         return self.mean_ms_bwd is not None
 
 
@@ -112,6 +160,30 @@ class Benchmark:
     Provides automated benchmarking with warmup, statistical analysis,
     and comparative performance metrics across multiple algorithms and
     configurations.
+
+    Attributes:
+        algorithms: Dict mapping algorithm names to functions.
+        configs: List of configuration dicts to test.
+        input_generator: Function to generate inputs from config.
+        warmup: Number of warmup iterations before timing.
+        iterations: Number of timed iterations.
+        bench_bwd: Whether to also benchmark backward pass.
+        unpack_inputs: Whether to unpack inputs as *args.
+        static_kwargs: Argument names marked as static for JIT.
+        results: List of BenchmarkResult from last run.
+        console: Rich Console for output formatting.
+
+    Example:
+        >>> bench = Benchmark(
+        ...     algorithms={"flash": flash_fn, "standard": std_fn},
+        ...     configs=[{"seq": 1024}, {"seq": 2048}],
+        ...     input_generator=lambda cfg: generate_inputs(**cfg),
+        ...     warmup=5,
+        ...     iterations=50
+        ... )
+        >>> results = bench.run()
+        >>> bench.save("results.json")
+        >>> bench.plot("plots/")
     """
 
     def __init__(
@@ -125,17 +197,26 @@ class Benchmark:
         unpack_inputs: bool = True,
         static_kwargs: list[str] | None = None,
     ):
-        """
+        """Initialize the benchmark harness.
+
         Args:
-            algorithms: Dict mapping algorithm names to functions
-            configs: List of config dicts to test
-            input_generator: Function that takes config dict and returns inputs (as tuple if unpack_inputs=True)
-            warmup: Number of warmup iterations
-            iterations: Number of benchmark iterations
-            bench_bwd: If True, also benchmark backward pass
-            unpack_inputs: If True, unpack tuple/list from input_generator as *args (default: True)
-            static_kwargs: List of argument names to mark as static for JAX JIT
-                          (e.g., ['causal', 'sliding_window'])
+            algorithms: Dict mapping algorithm names to callable functions.
+                Each function should accept the inputs from input_generator.
+            configs: List of config dicts to test. Each config is passed to
+                input_generator to create test inputs.
+            input_generator: Function that takes a config dict and returns
+                inputs. Returns tuple if unpack_inputs=True, otherwise
+                a single value.
+            warmup: Number of warmup iterations before timing. Allows JIT
+                compilation to complete. Defaults to 5.
+            iterations: Number of timed iterations for statistics.
+                More iterations give more stable statistics. Defaults to 50.
+            bench_bwd: If True, also benchmark the backward pass using
+                jax.grad. Defaults to False.
+            unpack_inputs: If True, unpack tuple/list from input_generator
+                as *args to the algorithm. Defaults to True.
+            static_kwargs: List of argument names to mark as static for
+                JAX JIT (e.g., ['causal', 'sliding_window']). Defaults to None.
         """
         self.algorithms = algorithms
         self.configs = configs
@@ -165,7 +246,19 @@ class Benchmark:
     def benchmark_single(self, algo_name: str, algo_fn: Callable, config: dict[str, Any]) -> BenchmarkResult:
         """Execute performance measurement for a single algorithm/config pair.
 
-        Returns BenchmarkResult with timing statistics in milliseconds."""
+        Runs warmup iterations to ensure JIT compilation is complete, then
+        executes timed iterations and computes statistics. Optionally
+        benchmarks backward pass as well.
+
+        Args:
+            algo_name: Name identifier for the algorithm being tested.
+            algo_fn: The function to benchmark.
+            config: Configuration dict to pass to input_generator.
+
+        Returns:
+            BenchmarkResult containing timing statistics in milliseconds
+            for forward pass and optionally backward pass.
+        """
 
         inputs = self.input_generator(config)
 
@@ -266,8 +359,20 @@ class Benchmark:
     def run(self, verbose: bool = True) -> dict[str, Any]:
         """Execute complete benchmark suite and generate performance analysis.
 
-        Returns dict containing summary statistics, speedup comparisons,
-        and per-configuration results."""
+        Runs all algorithms against all configurations, collecting timing
+        statistics and performing comparative analysis.
+
+        Args:
+            verbose: If True, display progress bars and analysis tables.
+                Set to False for headless/automated runs. Defaults to True.
+
+        Returns:
+            Analysis dict containing:
+                - summary: Per-algorithm aggregated statistics
+                - comparisons: Speedup ratios between algorithms
+                - by_config: Per-configuration results and winners
+                - raw_results: List of all individual measurements
+        """
 
         self.results = []
         total = len(self.algorithms) * len(self.configs)
@@ -394,8 +499,17 @@ class Benchmark:
     def analyze(self) -> dict[str, Any]:
         """Generate comprehensive performance analysis from benchmark results.
 
-        Returns structured analysis including algorithm summaries, speedup
-        comparisons, and configuration-specific rankings."""
+        Processes collected results to compute aggregate statistics,
+        algorithm-to-algorithm speedup comparisons, and identifies
+        fastest algorithm for each configuration.
+
+        Returns:
+            Structured analysis dict with:
+                - summary: Mean/median/min/max times and throughput per algorithm
+                - comparisons: Speedup ratios (algo2_vs_algo1)
+                - by_config: Winner and times for each configuration
+                - raw_results: Original measurements for further processing
+        """
 
         analysis = {
             "summary": {},
@@ -479,8 +593,15 @@ class Benchmark:
 
         return analysis
 
-    def print_analysis(self, analysis: dict[str, Any]):
-        """Display formatted benchmark analysis to console using rich."""
+    def print_analysis(self, analysis: dict[str, Any]) -> None:
+        """Display formatted benchmark analysis to console using rich.
+
+        Renders analysis results as formatted tables including algorithm
+        performance summary, speedup comparisons, and per-configuration winners.
+
+        Args:
+            analysis: Analysis dict from analyze() method.
+        """
 
         self.console.print()
         panel = Panel(
@@ -618,8 +739,16 @@ class Benchmark:
 
         self.console.print(config_table)
 
-    def save(self, filepath: str = "benchmark_results.json"):
-        """Export benchmark results and analysis to JSON file."""
+    def save(self, filepath: str = "benchmark_results.json") -> None:
+        """Export benchmark results and analysis to JSON file.
+
+        Saves metadata (algorithms, configs, iterations) and full analysis
+        to a JSON file for later review or processing.
+
+        Args:
+            filepath: Path to save JSON file. Parent directories are
+                created if they don't exist. Defaults to "benchmark_results.json".
+        """
 
         analysis = self.analyze()
         output = {
@@ -636,12 +765,22 @@ class Benchmark:
         with open(filepath, "w") as f:
             json.dump(output, f, indent=2, default=str)
 
-    def plot(self, output_dir: str = "benchmark_plots", figsize: tuple[int, int] = (14, 7)):
+    def plot(self, output_dir: str = "benchmark_plots", figsize: tuple[int, int] = (14, 7)) -> None:
         """Create column-style comparison plots for each configuration.
 
+        Generates bar charts comparing algorithm performance for each
+        configuration. Creates separate forward/backward panels if backward
+        pass was benchmarked. Fastest algorithm is highlighted with gold border.
+
         Args:
-            output_dir: Directory to save plot images (one per config)
-            figsize: Figure size as (width, height) tuple
+            output_dir: Directory to save plot images (one PNG per config).
+                Created if it doesn't exist. Defaults to "benchmark_plots".
+            figsize: Figure size as (width, height) tuple in inches.
+                Defaults to (14, 7).
+
+        Note:
+            Requires matplotlib to be installed. Prints error message and
+            returns if matplotlib is not available.
         """
         if not HAS_MATPLOTLIB:
             self.console.print("[red]Error: matplotlib is not installed. Install it with: pip install matplotlib[/red]")

@@ -21,6 +21,28 @@ detection, performance testing, and distributed synchronization utilities.
 
 The utilities are designed to support both Triton and JAX-based kernel implementations
 with focus on GPU architectures (CDNA, RDNA) and distributed training scenarios.
+
+Key Features:
+    - Mathematical utilities (cdiv, next_power_of_2, strides)
+    - GPU architecture detection (is_hip, is_cdna, is_rdna)
+    - Triton autotuning helpers (safe_autotune)
+    - Distributed training utilities (barrier_sync)
+    - Test data generation (random_dense, numeric_gen)
+    - Sharding utilities for distributed JAX (make_mesh, get_qkv_shardings)
+
+Constants:
+    CDNA_ARCHS: List of AMD CDNA architecture identifiers
+    RDNA_ARCHS: List of AMD RDNA architecture identifiers
+    Layouts: Type alias for attention layout formats
+
+Example:
+    >>> from ejkernel.utils import cdiv, next_power_of_2, is_hip
+    >>>
+    >>> # Calculate number of tiles
+    >>> num_tiles = cdiv(seq_len, block_size)
+    >>>
+    >>> # Get optimal block size
+    >>> block_size = next_power_of_2(head_dim)
 """
 
 import functools
@@ -768,26 +790,54 @@ def make_dummy_rpa_inputs(
     decode_prefill_mixed: tuple[int, int, int] | None = None,
     # (decode_end, prefill_end, mixed_end/total). Defaults to (0,0,num_seqs).
 ):
-    """
-    Returns a dict with:
-      queries:         (sum_q, num_q_heads, head_dim)       [q_dtype]
-      keys, values:    (sum_q, num_kv_heads, head_dim)      [kv_dtype]
-      kv_cache:        (total_pages, page_size, x2_per_pack, pack, align(head_dim,128)) [kv_dtype]
-      kv_lens:         (num_seqs,)                           [int32]
-      block_tables:    (num_seqs * pages_per_seq,)           [int32]
-      query_start_loc: (num_seqs + 1,)                       [int32]
-      distribution:    (3,)                                  [int32]
-    All constraints required by the kernel/validators are satisfied.
+    """Generate dummy inputs for Ragged Paged Attention testing and benchmarking.
+
+    Creates a complete set of test inputs including queries, keys, values,
+    kv_cache, and metadata tensors that satisfy all kernel constraints.
+
+    Args:
+        rng_seed: Random seed for reproducibility.
+        num_seqs: Number of sequences in the batch.
+        pages_per_seq: Number of pages allocated per sequence (padded width).
+        page_size: Number of tokens per page.
+        num_q_heads: Number of query attention heads.
+        num_kv_heads: Number of key/value attention heads.
+        head_dim: Dimension of each attention head (will be padded to 128).
+        kv_dtype: Data type for keys and values (16/32-bit float).
+        q_dtype: Data type for queries (defaults to kv_dtype if None).
+        kv_len_max: Maximum KV length per sequence (defaults to pages_per_seq * page_size).
+        total_q: Total query tokens across all sequences. If set, uses deterministic lengths.
+        total_num_pages: Physical kv_cache pages (can be < num_seqs * pages_per_seq).
+        decode_prefill_mixed: Tuple (decode_end, prefill_end, total) for mixed batching.
+
+    Returns:
+        Dictionary containing:
+            - queries: (sum_q, num_q_heads, head_dim) [q_dtype]
+            - keys, values: (sum_q, num_kv_heads, head_dim) [kv_dtype]
+            - kv_cache: (total_pages, page_size, x2_per_pack, pack, head_dim_aligned) [kv_dtype]
+            - kv_lens: (num_seqs,) [int32]
+            - block_tables: (num_seqs * pages_per_seq,) [int32]
+            - query_start_loc: (num_seqs + 1,) [int32]
+            - distribution: (3,) [int32]
+            - _meta: Metadata dict for debugging
+
+    Raises:
+        ValueError: If total_q is invalid, page_size is not divisible by packing,
+            or total_num_pages is insufficient for the given kv_lens.
+
+    Example:
+        >>> inputs = make_dummy_rpa_inputs(
+        ...     total_q=1024, num_q_heads=8, head_dim=128,
+        ...     num_kv_heads=4, kv_dtype=jnp.bfloat16,
+        ...     page_size=64, pages_per_seq=16, total_num_pages=2**17
+        ... )
+        >>> inputs['queries'].shape
+        (1024, 8, 128)
 
     Notes:
-      - `pages_per_seq` is treated as the (padded) page-table width.
-      - If `total_num_pages` is smaller than `num_seqs * pages_per_seq`, the page table is padded with a safe in-bounds
-        page index, and only the first ceil(kv_len/page_size) pages per sequence are actually used.
-
-    Example (matches the large benchmark shapes discussed in ragged_page_attention_v3):
-      - `total_q=1024`, `num_q_heads=8`, `head_dim=128`
-      - `num_kv_heads=4`, `kv_dtype=jnp.bfloat16` (packing=2)
-      - `page_size=64`, `pages_per_seq=16`, `total_num_pages=2**17`
+        - pages_per_seq is treated as the (padded) page-table width
+        - If total_num_pages < num_seqs * pages_per_seq, the page table is padded
+          with safe in-bounds indices
     """
     if q_dtype is None:
         q_dtype = kv_dtype
@@ -943,9 +993,19 @@ def make_dummy_rpa_inputs(
 
 
 def get_tpu_generation() -> int:
-    """
-    Returns the TPU generation as an integer (e.g., 3, 4, 5).
-    Returns 0 if no TPU is detected or if the generation cannot be determined.
+    """Detect and return the current TPU generation.
+
+    Queries JAX devices to determine the TPU generation (v3, v4, v5, etc.)
+    by parsing the device_kind string.
+
+    Returns:
+        Integer representing TPU generation (3, 4, 5, etc.).
+        Returns 0 if no TPU is detected or generation cannot be determined.
+
+    Example:
+        >>> gen = get_tpu_generation()
+        >>> if gen >= 4:
+        ...     print("Using TPU v4+ optimizations")
     """
     try:
         devices = jax.devices("tpu")
