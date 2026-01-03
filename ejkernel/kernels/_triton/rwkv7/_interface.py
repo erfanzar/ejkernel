@@ -12,7 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RWKV-7 recurrent kernel (Triton)."""
+"""RWKV-7 Diagonal Plus Low Rank (DPLR) recurrence implementation using Triton.
+
+This module provides a GPU-accelerated implementation of the RWKV-7 linear
+attention mechanism. RWKV-7 introduces a Diagonal Plus Low-Rank (DPLR)
+parameterization for the state transition matrix, enabling more expressive
+state dynamics while maintaining O(N) complexity.
+
+Key improvements over RWKV-6:
+- DPLR state transition: Combines diagonal decay with low-rank updates
+- Enhanced expressiveness: Can model richer state transitions
+- Flexible parameterization: Supports both additive (a, b) and multiplicative
+  (kk, a) forms
+
+The RWKV-7 DPLR recurrence computes:
+    h_t = diag(exp(w_t)) * (h_{t-1} + a_t^T * (b_t @ h_{t-1})) + k_t^T * v_t
+    o_t = softmax_scale * (r_t @ h_{t-1})
+
+The low-rank update (a, b) allows the model to selectively modify the hidden
+state based on learned projections, providing more flexible information routing
+than simple diagonal decay.
+
+Key components:
+- Receptance (r): Query-like projection for reading from state
+- Log-decay (w): Per-timestep, per-head diagonal decay rates
+- Key (k): Used with value for rank-1 state updates
+- Value (v): The values to be accumulated in state
+- Low-rank a: First component of DPLR update (rank-1 outer product)
+- Low-rank b: Second component of DPLR update (projection vector)
+
+Alternative multiplicative parameterization (rwkv7_mul):
+- kk: Multiplicative scaling factor
+- a: Base update vector
+- Computes a' = kk * a, b' = -kk internally
+
+Key features:
+- O(N) time complexity for sequence processing
+- DPLR state dynamics for enhanced expressiveness
+- Variable sequence length support via cu_seqlens
+- Bidirectional processing via reverse flag
+- Custom Triton kernel for GPU acceleration
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.rwkv7 import rwkv7
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64
+    >>> r = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> w = jnp.zeros((batch, seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> a = jnp.zeros((batch, seq_len, num_heads, head_dim))
+    >>> b = jnp.zeros((batch, seq_len, num_heads, head_dim))
+    >>>
+    >>> output, final_state = rwkv7(r, w, k, v, a, b)
+
+Reference:
+    Eagle and Finch: RWKV with Matrix-Valued States and Dynamic Recurrence
+    https://arxiv.org/abs/2404.05892
+"""
 
 from __future__ import annotations
 
@@ -41,6 +99,26 @@ def _fwd_call(
     reverse: bool,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
 ):
+    """Forward pass for RWKV-7 DPLR recurrence in a custom VJP.
+
+    Computes the RWKV-7 recurrence with DPLR state transition and saves
+    residuals for backward pass.
+
+    Args:
+        r: Receptance tensor of shape `[B, T, H, K]`.
+        w: Log-decay tensor of shape `[B, T, H, K]`.
+        k: Key tensor of shape `[B, T, H, K]`.
+        v: Value tensor of shape `[B, T, H, V]`.
+        a: Low-rank update vector of shape `[B, T, H, K]`.
+        b: Low-rank projection vector of shape `[B, T, H, K]`.
+        softmax_scale: Scaling factor for receptance.
+        initial_state: Optional initial hidden state `[B, H, K, V]`.
+        reverse: If True, process sequence in reverse.
+        cu_seqlens: Cumulative sequence lengths for variable-length sequences.
+
+    Returns:
+        A tuple containing (output, final_state) and residuals for backward.
+    """
     if softmax_scale is None:
         softmax_scale = r.shape[-1] ** -0.5
     out, final_state = fwd_triton_impl(
@@ -66,6 +144,21 @@ def _bwd_call(
     residual,
     grads,
 ):
+    """Backward pass for RWKV-7 DPLR recurrence in a custom VJP.
+
+    Computes gradients with respect to all inputs using JAX autodiff
+    through the XLA reference implementation.
+
+    Args:
+        softmax_scale: Non-differentiable scaling factor.
+        reverse: Non-differentiable reverse flag.
+        cu_seqlens: Non-differentiable cumulative sequence lengths.
+        residual: Tensors saved from the forward pass.
+        grads: A tuple containing gradients (do, dht) of output and final state.
+
+    Returns:
+        A tuple of gradients (dr, dw, dk, dv, da, db, dh0) for all inputs.
+    """
     (r, w, k, v, a, b, softmax_scale_saved, initial_state, reverse_saved, cu_seqlens_saved) = residual
     do, dht = grads
     del reverse_saved, cu_seqlens_saved
@@ -124,6 +217,28 @@ def _rwkv7(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
+    """Core JIT-compiled RWKV-7 function with a custom VJP.
+
+    This is an internal function that directly calls the Triton implementation
+    and is registered with JAX's custom differentiation system.
+
+    Args:
+        r: Receptance tensor of shape `[B, T, H, K]`.
+        w: Log-decay tensor of shape `[B, T, H, K]`.
+        k: Key tensor of shape `[B, T, H, K]`.
+        v: Value tensor of shape `[B, T, H, V]`.
+        a: Low-rank update vector of shape `[B, T, H, K]`.
+        b: Low-rank projection vector of shape `[B, T, H, K]`.
+        softmax_scale: Scaling factor for receptance (static argument).
+        initial_state: Optional initial hidden state `[B, H, K, V]`.
+        reverse: If True, process sequence in reverse (static argument).
+        cu_seqlens: Cumulative sequence lengths for variable-length sequences.
+
+    Returns:
+        A tuple containing:
+            - output: The attention output tensor of shape `[B, T, H, V]`.
+            - final_state: The final hidden state of shape `[B, H, K, V]`.
+    """
     if softmax_scale is None:
         softmax_scale = r.shape[-1] ** -0.5
     return fwd_triton_impl(
