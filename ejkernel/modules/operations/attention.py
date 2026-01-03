@@ -21,6 +21,53 @@ masking, dropout, sliding windows, and variable-length sequences.
 
 Unlike FlashAttention which uses tiling for memory efficiency, this implementation
 leverages XLA's compiler optimizations for straightforward attention computation.
+
+Key Features:
+    - XLA-optimized attention computation
+    - Returns both attention output and attention weights
+    - Causal and bidirectional attention patterns
+    - Dropout support for training with configurable probability
+    - Sliding window attention for local context patterns
+    - Attention biasing and masking support
+    - Logit soft capping for numerical stability
+    - Lazy bias initialization for memory efficiency
+    - Grouped Query Attention (GQA) support
+
+Use Cases:
+    - Training scenarios requiring attention weight access
+    - Debugging and visualization of attention patterns
+    - Situations where XLA optimization is sufficient
+    - Research and experimentation with attention patterns
+
+Mathematical Foundation:
+    Multi-head attention:
+        head_i = softmax(Q_i @ K_i.T / sqrt(d_k)) @ V_i
+        output = Concat(head_1, ..., head_h) @ W_o
+
+    With optional features:
+        - Causal mask: mask[i,j] = 1 if j <= i else 0
+        - Sliding window: mask[i,j] = 1 if |i-j| <= window_size
+        - Bias: scores = Q @ K.T / sqrt(d_k) + bias
+        - Soft cap: scores = soft_cap * tanh(scores / soft_cap)
+
+Output Format:
+    Returns tuple of:
+        - output: [batch, seq_len, num_heads, head_dim] - attention output
+        - weights: [batch, num_heads, seq_len, kv_len] - attention probabilities
+
+    The attention weights are useful for:
+        - Visualization and interpretability
+        - Attention-based pooling
+        - Research and debugging
+
+Performance Characteristics:
+    - Memory: O(N^2) for storing attention weights
+    - Compute: O(N^2 * d) standard attention complexity
+    - Best suited for: Moderate sequence lengths, training with weight access
+
+Note:
+    For memory-efficient attention without weight access, prefer FlashAttention.
+    For inference-only workloads, prefer PageAttention or UnifiedAttention.
 """
 
 from __future__ import annotations

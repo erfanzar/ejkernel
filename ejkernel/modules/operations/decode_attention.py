@@ -14,9 +14,48 @@
 
 """Paged decode attention module with automatic platform selection.
 
-This operation wraps the vLLM-style decode attention kernel implemented in
-`ejkernel.kernels` and provides a high-level API consistent with other
-`ejkernel.modules.operations` entry points.
+This module implements decode-phase attention for LLM inference, optimized for
+autoregressive generation where each step processes a single query token per
+sequence. It operates on paged KV caches for memory-efficient serving.
+
+The decode attention kernel is designed for the token-by-token generation phase
+where throughput depends on efficiently processing many sequences in parallel,
+each with just one new query token attending to its full context history.
+
+Key Features:
+    - Single-token query optimization (batch x 1 x heads x dim)
+    - Paged KV cache support for memory efficiency
+    - Split-K parallelization for long contexts
+    - Log-sum-exp (LSE) output for numerical debugging
+    - Grouped Query Attention (GQA) and Multi-Query Attention (MQA) support
+    - Automatic platform selection (Triton/Pallas/CUDA)
+
+Use Cases:
+    - Autoregressive text generation in LLM serving
+    - Batch inference with dynamic batching
+    - High-throughput token generation
+    - Memory-efficient inference for long contexts
+
+Mathematical Foundation:
+    For each sequence i with query q_i and context of length L_i:
+        output_i = sum_{j=0}^{L_i-1} softmax(q_i @ K[pages[i,j]].T / sqrt(d)) @ V[pages[i,j]]
+
+    The kernel also returns log-sum-exp for each head:
+        lse_i = log(sum_{j=0}^{L_i-1} exp(q_i @ K[j].T / sqrt(d)))
+
+Memory Layout:
+    KV buffers use paged layout: [total_tokens, num_kv_heads, head_dim]
+    where total_tokens = num_pages * page_size. The req_to_tokens tensor
+    maps logical positions to physical positions in the buffer.
+
+Performance Characteristics:
+    - Optimized for batch sizes >> 1 (many sequences in parallel)
+    - Uses split-K to parallelize over long contexts
+    - Memory-bound for short contexts, compute-bound for long contexts
+
+References:
+    - vLLM PagedAttention: https://arxiv.org/abs/2309.06180
+    - FlashDecoding: https://crfm.stanford.edu/2023/10/12/flashdecoding.html
 """
 
 from __future__ import annotations

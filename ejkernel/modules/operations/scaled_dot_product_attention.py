@@ -22,16 +22,53 @@ which is the fundamental building block of transformer architectures. It compute
 
 where Q, K, V are the query, key, and value matrices, and d_k is the key dimension.
 
-This implementation provides:
-    - Automatic platform selection (XLA, Triton, Pallas, CUDA)
-    - Support for various attention patterns (causal, sliding window)
-    - Variable-length sequence handling
-    - Distributed execution via shard_map
-    - Attention biasing and masking
-    - Numerical stability through soft capping
+This implementation is designed for general-purpose attention computation with
+automatic platform selection and optimization, serving as a simpler alternative
+to FlashAttention when memory efficiency is not the primary concern.
 
-Unlike FlashAttention which uses tiling for memory efficiency, this implementation
-relies on platform-specific optimizations (e.g., XLA's attention primitive).
+Key Features:
+    - Automatic platform selection (XLA, Triton, Pallas, CUDA)
+    - Causal and bidirectional attention patterns
+    - Sliding window attention for local context
+    - Variable-length sequence handling via cumulative sequence lengths
+    - Distributed execution support via shard_map
+    - Attention biasing and masking
+    - Lazy bias initialization for memory efficiency
+    - Grouped Query Attention (GQA) support
+
+Use Cases:
+    - General transformer computations
+    - Research and experimentation with attention mechanisms
+    - Scenarios where XLA optimization provides sufficient performance
+    - Simple attention patterns without complex memory requirements
+    - Cross-attention between different modalities
+
+Mathematical Foundation:
+    Scaled dot-product attention computes:
+        scores = (Q @ K^T) / sqrt(d_k)         # [batch, heads, seq_len, kv_len]
+        weights = softmax(scores + bias)       # Apply masking via bias
+        output = weights @ V                   # [batch, heads, seq_len, head_dim]
+
+    With optional features:
+        - Causal mask: Only attend to previous positions (j <= i)
+        - Sliding window: Attend within a fixed window around each position
+        - Bias: Add learnable or computed bias to attention scores
+        - Soft cap: scores = soft_cap * tanh(scores / soft_cap) for stability
+
+Performance Characteristics:
+    - Memory: O(N^2) standard attention complexity
+    - Compute: O(N^2 * d) where N is sequence length, d is head dimension
+    - Platform: Uses XLA's built-in attention primitive when available
+    - Best for: Moderate sequence lengths, cross-attention, and general use
+
+Note:
+    For memory-efficient attention on long sequences, prefer FlashAttention.
+    For inference-only paged KV cache workloads, prefer PageAttention.
+
+References:
+    - Attention Is All You Need (Vaswani et al., 2017)
+      https://arxiv.org/abs/1706.03762
+    - JAX Pallas: https://jax.readthedocs.io/en/latest/pallas/
 """
 
 from __future__ import annotations
