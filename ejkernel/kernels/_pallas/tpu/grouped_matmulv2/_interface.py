@@ -13,6 +13,68 @@
 # limitations under the License.
 
 
+"""Grouped Matrix Multiplication V2 for TPU with custom VJP and input buffering.
+
+This module provides the second version of grouped matrix multiplication for TPU,
+featuring improved input buffering and custom forward/backward passes for efficient
+automatic differentiation. This is commonly used for Mixture of Experts (MoE)
+computations where different experts process different token subsets.
+
+Grouped matrix multiplication is essential for:
+1. Mixture of Experts (MoE) layers in transformers
+2. Efficient routing-based computations
+3. Sparse expert models where different groups use different weights
+4. High-throughput batched linear layers with variable group sizes
+
+Key Features:
+    - Custom VJP: Explicit forward and backward passes for efficient gradients
+    - Input buffering: Configurable buffer count for memory/compute tradeoff
+    - Flexible tiling: Configurable or auto-tuned tile dimensions
+    - Group offsetting: Support for sharded/distributed computation
+    - RHS transposition: Handle different weight layouts
+    - Interpret mode: Debug mode for kernel development
+
+Improvements over V1:
+    - Input buffer count parameter for better memory management
+    - Improved gradient computation efficiency
+    - Better support for distributed/sharded execution
+    - Simplified API for common use cases
+
+Mathematical Operation:
+    For each group i with size g_i starting at position s_i:
+        out[s_i:s_i+g_i, :] = lhs[s_i:s_i+g_i, :] @ rhs[i, :, :]
+
+    This effectively performs N separate matrix multiplications where each
+    group's rows are multiplied with a group-specific weight matrix.
+
+TPU Optimizations:
+    - Tiles sized to match TPU's Matrix Multiply Units (typically 128x128)
+    - VMEM scratch space for accumulation to minimize HBM traffic
+    - Prefetch scheduling for hiding memory latency
+    - Efficient masking for partial tiles at group boundaries
+    - Custom VJP avoids inefficient generic gradient computation
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.grouped_matmulv2 import grouped_matmulv2
+    >>>
+    >>> # MoE-style computation: 3 experts, variable tokens per expert
+    >>> total_tokens, hidden_dim, expert_dim = 300, 64, 32
+    >>> num_experts = 3
+    >>>
+    >>> lhs = jnp.ones((total_tokens, hidden_dim))  # Token features
+    >>> rhs = jnp.ones((num_experts, hidden_dim, expert_dim))  # Expert weights
+    >>> group_sizes = jnp.array([100, 150, 50], dtype=jnp.int32)  # Tokens per expert
+    >>>
+    >>> # Each expert processes its assigned tokens
+    >>> result = grouped_matmulv2(lhs, rhs, group_sizes)
+    >>> assert result.shape == (total_tokens, expert_dim)
+
+Note:
+    The existing_out parameter is not supported in this version. Use grouped_matmul
+    (v1) if you need incremental accumulation into an existing output buffer.
+"""
+
 from __future__ import annotations
 
 import typing

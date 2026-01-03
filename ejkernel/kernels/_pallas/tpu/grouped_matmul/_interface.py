@@ -13,12 +13,60 @@
 # limitations under the License.
 
 
-"""Custom VJP implementation for grouped matrix multiplication.
+"""Grouped Matrix Multiplication for TPU using Pallas kernels.
 
-This module defines the custom forward and backward passes for grouped matrix
-multiplication operations, enabling efficient automatic differentiation on TPU.
-It wraps the low-level kernel implementations with JAX's custom VJP mechanism
-to provide gradient support.
+This module provides a TPU-optimized implementation of grouped matrix multiplication
+for efficient Mixture of Experts (MoE) computations and similar routing-based
+operations. It performs batched matrix multiplications where different row slices
+of the input are multiplied with different weight matrices.
+
+Grouped matrix multiplication is essential for:
+1. Mixture of Experts (MoE) layers in transformers
+2. Efficient routing-based computations
+3. Sparse expert models where different groups use different weights
+4. High-throughput batched linear layers with variable group sizes
+
+Key Features:
+    - Custom VJP: Explicit forward and backward passes for efficient gradients
+    - Flexible tiling: Configurable or auto-tuned tile dimensions
+    - Group offsetting: Support for sharded/distributed computation
+    - RHS transposition: Handle different weight layouts
+    - Accumulation: Support for incremental output accumulation
+    - Interpret mode: Debug mode for kernel development
+
+Mathematical Operation:
+    For each group i with size g_i starting at position s_i:
+        out[s_i:s_i+g_i, :] = lhs[s_i:s_i+g_i, :] @ rhs[i, :, :]
+
+    This effectively performs N separate matrix multiplications where each
+    group's rows are multiplied with a group-specific weight matrix.
+
+TPU Optimizations:
+    - Tiles sized to match TPU's Matrix Multiply Units (typically 128x128)
+    - VMEM scratch space for accumulation to minimize HBM traffic
+    - Prefetch scheduling for hiding memory latency
+    - Efficient masking for partial tiles at group boundaries
+    - Custom VJP avoids inefficient generic gradient computation
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.grouped_matmul import grouped_matmul
+    >>>
+    >>> # MoE-style computation: 3 experts, variable tokens per expert
+    >>> total_tokens, hidden_dim, expert_dim = 300, 64, 32
+    >>> num_experts = 3
+    >>>
+    >>> lhs = jnp.ones((total_tokens, hidden_dim))  # Token features
+    >>> rhs = jnp.ones((num_experts, hidden_dim, expert_dim))  # Expert weights
+    >>> group_sizes = jnp.array([100, 150, 50], dtype=jnp.int32)  # Tokens per expert
+    >>>
+    >>> # Each expert processes its assigned tokens
+    >>> result = grouped_matmul(lhs, rhs, group_sizes)
+    >>> assert result.shape == (total_tokens, expert_dim)
+
+Reference:
+    GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding
+    https://arxiv.org/abs/2006.16668
 """
 
 from __future__ import annotations

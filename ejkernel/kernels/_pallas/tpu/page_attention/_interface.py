@@ -13,6 +13,61 @@
 # limitations under the License.
 
 
+"""Paged Attention implementation for TPU using Pallas kernels.
+
+This module provides a TPU-optimized implementation of Paged Attention for
+efficient inference with KV caching. Paged Attention enables memory-efficient
+serving of large language models by storing key-value pairs in non-contiguous
+memory pages, similar to virtual memory in operating systems.
+
+Paged Attention is essential for:
+1. Efficient LLM serving with dynamic batching
+2. Memory-efficient KV cache management
+3. Support for variable-length sequences in inference
+4. High throughput autoregressive decoding on TPU
+
+Key Features:
+    - Non-contiguous KV cache: Keys and values stored in fixed-size pages
+    - Block tables: Mapping from sequence positions to physical pages
+    - Grouped Query Attention (GQA): Efficient multi-query variants
+    - Megacore support: Parallelization across TPU cores
+    - Sliding window attention: Local attention for long sequences
+    - Logits soft capping: Numerical stability for certain models
+
+Memory Management:
+    - Pages are fixed-size blocks (e.g., 16 or 32 tokens)
+    - Block tables map logical positions to physical page indices
+    - Pages can be shared across sequences for prefix caching
+    - Memory fragmentation is reduced compared to contiguous caching
+
+Algorithm overview:
+1. Query tokens are processed in batches
+2. For each query, look up relevant pages via block_tables
+3. Load KV pairs from non-contiguous pages
+4. Compute attention scores with optional masking
+5. Apply softmax and output weighted values
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.page_attention import page_attention
+    >>>
+    >>> # Setup for inference
+    >>> batch_size, num_heads, head_dim = 8, 32, 128
+    >>> page_size, total_pages = 16, 1024
+    >>>
+    >>> query = jnp.ones((batch_size, num_heads, head_dim))
+    >>> key_cache = jnp.ones((num_heads, total_pages, page_size, head_dim))
+    >>> value_cache = jnp.ones((num_heads, total_pages, page_size, head_dim))
+    >>> context_lens = jnp.array([100, 200, 150, 50, 75, 125, 180, 90])
+    >>> block_tables = jnp.zeros((batch_size, 16), dtype=jnp.int32)
+    >>>
+    >>> output = page_attention(query, key_cache, value_cache, context_lens, block_tables)
+
+Reference:
+    vLLM: Efficient Memory Management for Large Language Model Serving
+    https://arxiv.org/abs/2309.06180
+"""
+
 import functools
 from collections.abc import Sequence
 from typing import Literal

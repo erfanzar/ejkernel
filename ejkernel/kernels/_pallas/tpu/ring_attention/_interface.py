@@ -12,10 +12,54 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ring Attention interface using Splash Attention kernels.
+"""Ring Attention implementation using Splash Attention kernels on TPU.
 
-This module provides the public API for ring attention on TPU using the
-splash attention implementation with ring communication topology.
+This module provides a distributed ring attention implementation for TPU using
+JAX's Splash Attention with ring communication topology. Ring attention enables
+efficient attention computation across multiple TPU devices by distributing
+the key-value sequences in a ring pattern and rotating them between devices.
+
+Ring attention is particularly useful for:
+1. Extremely long sequences that don't fit in single device memory
+2. Distributed training and inference across multiple TPU chips
+3. Memory-efficient attention with linear scaling across devices
+
+Key features:
+- Ring topology: KV pairs are rotated between devices in a ring pattern
+- Splash Attention backend: Uses Google's highly optimized TPU attention
+- Multi-head and multi-query attention support
+- Flexible masking: Causal, sliding window, and chunked causal masks
+- Segment-based masking for document/sequence boundaries
+- Attention sinks support for streaming inference
+
+Algorithm overview:
+1. Each device holds a shard of the sequence
+2. Queries stay local while KV pairs rotate around the ring
+3. Each device computes attention with its current KV shard
+4. Partial results are accumulated using online softmax
+5. After num_devices rotations, full attention is computed
+
+Communication pattern:
+- Uses JAX's collective operations (lax.ppermute) for ring rotation
+- Overlaps computation with communication for efficiency
+- Memory usage scales linearly with number of devices
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.ring_attention import ring_attention
+    >>>
+    >>> # Distributed attention across TPU pod
+    >>> batch, seq_len, num_heads, head_dim = 2, 8192, 16, 128
+    >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>>
+    >>> # Use within pmap/shard_map with axis_name
+    >>> output = ring_attention(q, k, v, causal=True, axis_name="batch")
+
+Reference:
+    Ring Attention with Blockwise Transformers for Near-Infinite Context
+    https://arxiv.org/abs/2310.01889
 """
 
 from __future__ import annotations
@@ -54,11 +98,28 @@ if typing.TYPE_CHECKING:
 
 
 class _AttentionSinkMask(mask_lib._ComputableMask):
-    """Allows attending to the first `attention_sink_size` KV positions."""
+    """Attention mask that allows attending to initial KV positions (attention sinks).
+
+    This mask enables "attention sink" behavior where all query positions can
+    attend to the first `attention_sink_size` key-value positions, regardless
+    of other masking patterns. This is useful for maintaining context anchors
+    in streaming/infinite context scenarios.
+
+    Attributes:
+        attention_sink_size: Number of initial KV positions to always attend to.
+    """
 
     attention_sink_size: int
 
     def __init__(self, *, shape: tuple[int, int], attention_sink_size: int, shard_count: int = 1):
+        """Initialize an attention sink mask.
+
+        Args:
+            shape: Tuple of (q_seq_len, kv_seq_len) for the attention matrix.
+            attention_sink_size: Number of initial KV positions that all queries
+                can attend to (the "sink" positions).
+            shard_count: Number of shards for distributed computation.
+        """
         self.attention_sink_size = int(attention_sink_size)
 
         def sink_mask_function(q_ids: np.ndarray, kv_ids: np.ndarray) -> np.ndarray:
