@@ -92,18 +92,39 @@ class GLAttention(Kernel[GLAttentionConfig, Array]):
 
     Implements gated linear attention combining the efficiency of linear attention
     with learnable gating mechanisms for better expressiveness. The gating controls
-    information flow at both the query-key interaction and the state update levels.
+    information flow at both the query-key interaction and the state update levels,
+    achieving O(N) complexity with O(K×V) memory per head.
 
     Features:
         - Gated attention computation with g (query gates) and g_gamma (layer-wise gates)
-        - Support for initial hidden states
+        - Support for initial hidden states for chunked/streaming processing
         - Bidirectional and reverse sequence processing
         - Variable-length sequence handling via cumulative lengths
         - Multiple platform support (Triton/Pallas/CUDA/XLA)
+        - Automatic configuration caching for consistent performance
+        - Optional autotuning to find optimal implementation
 
     The dual gating mechanism (g and g_gamma) allows fine-grained control:
         - g: Token-level gates applied to query representations
         - g_gamma: Layer-level gates controlling overall attention strength
+
+    Example:
+        >>> from ejkernel.modules import GLAttention, create_default_executor
+        >>>
+        >>> # Basic usage
+        >>> executor = create_default_executor()
+        >>> gla = GLAttention()
+        >>> output = executor(gla, query, key, value)
+        >>>
+        >>> # With gating for selective memory
+        >>> output = executor(gla, query, key, value, g=gates, g_gamma=decay)
+        >>>
+        >>> # Streaming inference with state
+        >>> output, state = executor(
+        ...     gla, query, key, value,
+        ...     initial_state=prev_state,
+        ...     return_state=True
+        ... )
     """
 
     def __init__(self):
