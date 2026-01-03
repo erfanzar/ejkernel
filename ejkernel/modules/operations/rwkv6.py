@@ -83,13 +83,41 @@ class RWKV6(Kernel[RWKV6Config, Array]):
     """RWKV-6 recurrence kernel wrapper.
 
     Implements the RWKV-6 linear attention recurrence with multi-head support
-    and optional variable-length sequence packing. The recurrence computes:
+    and optional variable-length sequence packing, achieving O(T) complexity
+    with O(K×V) memory per head.
 
+    Features:
+        - Multi-head attention with per-head state matrices
+        - Time-varying decay via learned w tensor
+        - Per-head bonus weight u for current timestep
+        - FlashAttention-style variable-length packing support
+        - Bidirectional processing with reverse option
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
+    The recurrence computes:
         kv_t = k_t^T @ v_t
         o_t = r_t^T @ (h + kv_t * u)
         h_{t+1} = h * exp(w_t) + kv_t
 
     where h is the state matrix of shape [H, K, V] per batch element.
+
+    Example:
+        >>> from ejkernel.modules import RWKV6, create_default_executor
+        >>>
+        >>> # Basic usage
+        >>> executor = create_default_executor()
+        >>> rwkv = RWKV6()
+        >>> output = executor(rwkv, r, k, v, w, u)
+        >>>
+        >>> # Streaming inference with state
+        >>> output, state = executor(
+        ...     rwkv, r, k, v, w, u,
+        ...     initial_state=prev_state,
+        ...     return_state=True
+        ... )
+        >>>
+        >>> # Variable-length sequences
+        >>> output = executor(rwkv, r, k, v, w, u, cu_seqlens=cu_seqs)
 
     Attributes:
         op_id: Operation identifier ("rwkv6").
