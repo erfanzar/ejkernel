@@ -13,7 +13,30 @@
 # limitations under the License.
 
 
-"""Flash Attention TPU kernel."""
+"""Utility functions and data structures for Flash Attention TPU kernels.
+
+This module provides common utilities, constants, and data structures used
+by the Flash Attention forward and backward pass implementations on TPU.
+
+Key components:
+- SegmentIds: Named tuple for query/KV segment IDs in packed sequences
+- BlockSizes: Dataclass for configuring attention tile sizes
+- Reference MHA implementations for testing and cost estimation
+- Helper functions for block verification and cost estimation
+
+TPU Architecture Constants:
+- NUM_LANES (128): Number of lanes in TPU vector unit
+- NUM_SUBLANES (8): Number of sublanes for segment ID handling
+- MIN_BLOCK_SIZE (128): Minimum block size for TPU efficiency
+- DEFAULT_MASK_VALUE: Large negative value for masking (~-0.7 * float32_max)
+
+Example:
+    >>> from ejkernel.kernels._pallas.tpu.flash_attention._utils import (
+    ...     BlockSizes, SegmentIds, mha_reference
+    ... )
+    >>> block_sizes = BlockSizes.get_default(batch=2, heads=8, q_len=1024, kv_len=1024, d=64)
+    >>> segment_ids = SegmentIds(q=q_segment_ids, kv=kv_segment_ids)
+"""
 
 from __future__ import annotations
 
@@ -27,10 +50,19 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
+"""Default value for masked attention positions, approximately -0.7 * float32_max."""
+
 NUM_LANES = 128
+"""Number of lanes in TPU vector processing unit."""
+
 NUM_SUBLANES = 8
+"""Number of sublanes for efficient segment ID broadcasting."""
+
 MIN_BLOCK_SIZE = 128
+"""Minimum efficient block size for TPU MXU operations."""
+
 TRANS_B_DIM_NUMBERS = (((1,), (1,)), ((), ()))
+"""Einsum dimension numbers for Q @ K^T matrix multiplication."""
 
 
 class SegmentIds(NamedTuple):
@@ -119,6 +151,21 @@ class BlockSizes:
 
 
 def _verify_block(block_name, dim_name, block, dim, should_divide=True):
+    """Verify that a block size is valid for a given dimension.
+
+    Ensures the block size doesn't exceed the dimension and optionally
+    verifies that the dimension is evenly divisible by the block size.
+
+    Args:
+        block_name: Name of the block parameter for error messages.
+        dim_name: Name of the dimension for error messages.
+        block: The block size to verify.
+        dim: The dimension size to check against.
+        should_divide: If True, require dim to be divisible by block.
+
+    Raises:
+        ValueError: If block > dim or if should_divide and dim % block != 0.
+    """
     if block > dim:
         raise ValueError(f"{block_name}={block} should be smaller or equal to {dim_name}={dim}")
     if should_divide and dim % block != 0:
@@ -126,6 +173,14 @@ def _verify_block(block_name, dim_name, block, dim, should_divide=True):
 
 
 def _bytes(x: jax.Array | jax.ShapeDtypeStruct) -> int:
+    """Calculate the total memory size of an array in bytes.
+
+    Args:
+        x: A JAX array or ShapeDtypeStruct to measure.
+
+    Returns:
+        Total size in bytes (product of shape elements times dtype itemsize).
+    """
     return math.prod(x.shape) * x.dtype.itemsize
 
 
@@ -141,6 +196,26 @@ def _fwd_cost_estimate(
     kernel_inputs_specs,
     kernel_outputs_specs,
 ) -> pl.CostEstimate | None:
+    """Estimate computational cost for the Flash Attention forward pass.
+
+    Creates a cost estimate that helps Pallas schedule kernel execution
+    and optimize memory transfers. The estimate includes FLOPs,
+    transcendental operations (exp, log), and memory bandwidth.
+
+    Args:
+        q: Query tensor for shape/dtype information.
+        k: Key tensor for shape/dtype information.
+        v: Value tensor for shape/dtype information.
+        ab: Optional attention bias tensor.
+        segment_ids: Optional segment IDs for packed sequences.
+        causal: Whether causal masking is applied.
+        softmax_scale: Softmax scaling factor.
+        kernel_inputs_specs: Input tensor specifications for byte counting.
+        kernel_outputs_specs: Output tensor specifications for byte counting.
+
+    Returns:
+        CostEstimate with FLOPs, transcendentals, and bytes_accessed.
+    """
     body_cost = pl.estimate_cost(mha_reference, q, k, v, ab, segment_ids, causal=causal, softmax_scale=softmax_scale)
     input_bytes = sum(_bytes(x) for x in jax.tree.leaves(kernel_inputs_specs))
     output_bytes = sum(_bytes(x) for x in jax.tree.leaves(kernel_outputs_specs))
@@ -163,6 +238,28 @@ def mha_reference_no_custom_vjp(
     softmax_scale: float = 1.0,
     save_residuals: bool = False,
 ):
+    """Reference multi-head attention implementation without custom VJP.
+
+    A straightforward implementation of scaled dot-product attention for
+    testing and cost estimation. This version does not have custom gradients
+    and uses standard JAX autodiff.
+
+    Args:
+        q: Query tensor [batch, num_heads, q_seq_len, head_dim].
+        k: Key tensor [batch, num_heads, kv_seq_len, head_dim].
+        v: Value tensor [batch, num_heads, kv_seq_len, head_dim].
+        ab: Optional attention bias [batch, num_heads, q_seq_len, kv_seq_len].
+        segment_ids: Optional SegmentIds for segment masking.
+        causal: Whether to apply causal masking.
+        mask_value: Value for masked positions.
+        softmax_scale: Scaling factor for attention scores.
+        save_residuals: If True, return (output, l, m) tuple.
+
+    Returns:
+        If save_residuals: Tuple of (output, l, m) where l is softmax sum
+        and m is softmax max for each position.
+        Otherwise: Just the output tensor.
+    """
     logits = jnp.einsum("bhqc,bhkc->bhqk", q, k)
     if ab is not None:
         logits += ab
@@ -207,6 +304,25 @@ def mha_reference(
     mask_value: float = DEFAULT_MASK_VALUE,
     softmax_scale=1.0,
 ):
+    """JIT-compiled reference multi-head attention with custom VJP.
+
+    This is the main reference implementation used for testing and cost
+    estimation. It wraps _mha_reference with JIT compilation and bfloat16
+    matmul precision for TPU compatibility.
+
+    Args:
+        q: Query tensor [batch, num_heads, q_seq_len, head_dim].
+        k: Key tensor [batch, num_heads, kv_seq_len, head_dim].
+        v: Value tensor [batch, num_heads, kv_seq_len, head_dim].
+        ab: Optional attention bias tensor.
+        segment_ids: Optional SegmentIds for segment masking.
+        causal: Whether to apply causal masking.
+        mask_value: Value for masked positions.
+        softmax_scale: Scaling factor for attention scores.
+
+    Returns:
+        Attention output tensor [batch, num_heads, q_seq_len, head_dim].
+    """
     return _mha_reference(
         q,
         k,
@@ -370,4 +486,21 @@ _mha_reference.defvjp(fwd=_mha_reference_fwd, bwd=_mha_reference_bwd)
 
 
 def below_or_on_diag(r, r_blk_size, c, c_blk_size):
+    """Check if a block position is below or on the causal diagonal.
+
+    Used to determine if a query block can attend to a key-value block
+    in causal attention. A query block can attend to a KV block if the
+    last row of the query block is at or after the first column of the KV block.
+
+    Args:
+        r: Row block index (query block index).
+        r_blk_size: Size of row blocks (query block size).
+        c: Column block index (KV block index).
+        c_blk_size: Size of column blocks (KV block size).
+
+    Returns:
+        Boolean indicating if the query block can attend to the KV block.
+        True if the last element of query block r can see the first element
+        of KV block c under causal masking.
+    """
     return ((r + 1) * r_blk_size - 1) > (c * c_blk_size)

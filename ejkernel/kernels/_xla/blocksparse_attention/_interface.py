@@ -14,9 +14,62 @@
 
 """Block-sparse attention interface for XLA fallback computation.
 
-This module provides the public API for block-sparse attention that
-handles packed multi-sequence inputs with segment IDs and positions.
-Acts as a correctness fallback when specialized kernels are unavailable.
+This module provides a reference implementation of block-sparse attention
+that handles packed multi-sequence inputs with segment IDs and positions.
+It serves as a correctness fallback when specialized kernels (Pallas TPU,
+Triton GPU) are unavailable.
+
+Block-sparse attention is designed for efficient processing of packed
+sequences where multiple variable-length sequences are concatenated into
+a single tensor. The attention pattern is determined by:
+1. Segment IDs: Prevent cross-sequence attention
+2. Position IDs: Enable proper causal/sliding window masking within segments
+3. Optional attention masks: Additional masking patterns
+
+This XLA fallback materializes the full token-level mask implied by these
+constraints and computes dense attention, which is correct but may use
+more memory than specialized sparse implementations.
+
+Key features:
+1. Packed sequence support: Handle multiple sequences in one tensor
+2. Segment-aware masking: Prevent attention across sequence boundaries
+3. Position-based masking: Correct causal/window masks for packed sequences
+4. GQA/MQA support: Flexible head configurations
+5. Attention sinks: Learnable auxiliary logits for probability mass absorption
+
+Use cases:
+- Inference with dynamic batching (vLLM-style)
+- Training on packed sequences for efficiency
+- Variable-length sequence processing
+- Correctness verification for sparse implementations
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._xla.blocksparse_attention import blocksparse_attention
+    >>>
+    >>> # Two packed sequences: lengths 100 and 150
+    >>> batch, num_heads, total_len, head_dim = 1, 8, 250, 64
+    >>> q = jnp.ones((batch, num_heads, total_len, head_dim))
+    >>> k = jnp.ones((batch, num_heads, total_len, head_dim))
+    >>> v = jnp.ones((batch, num_heads, total_len, head_dim))
+    >>>
+    >>> # Segment IDs: first 100 tokens are seq 0, next 150 are seq 1
+    >>> segment_ids = jnp.concatenate([
+    ...     jnp.zeros((batch, 100), dtype=jnp.int32),
+    ...     jnp.ones((batch, 150), dtype=jnp.int32)
+    ... ], axis=1)
+    >>>
+    >>> output = blocksparse_attention(
+    ...     q, k, v,
+    ...     q_segment_ids=segment_ids,
+    ...     kv_segment_ids=segment_ids,
+    ...     causal=True
+    ... )
+
+Note:
+    This is a correctness fallback that materializes the full attention mask.
+    For production use on TPU, prefer the Pallas blocksparse_attention kernel.
+    For GPU, prefer the Triton implementation.
 """
 
 from __future__ import annotations
@@ -41,6 +94,24 @@ if tp.TYPE_CHECKING:
 
 
 def _normalize_segment_ids(ids: Int[Array, "..."] | None, *, which: str) -> Int[Array, "batch seqlen"] | None:
+    """Normalize segment IDs to 2D [batch, seqlen] format.
+
+    Segment IDs identify which sequence each token belongs to in a packed
+    representation. Tokens with the same segment ID can attend to each other.
+
+    Args:
+        ids: Segment IDs in one of these formats:
+            - None: No segment masking
+            - 2D [batch, seqlen]: Standard format (returned as-is)
+            - 3D [batch, heads, seqlen]: Per-head format (uses head 0)
+        which: String identifier ("q" or "kv") for error messages.
+
+    Returns:
+        Normalized segment IDs with shape [batch, seqlen], or None.
+
+    Raises:
+        ValueError: If ids has unsupported rank.
+    """
     if ids is None:
         return None
     ids = jnp.asarray(ids, jnp.int32)
@@ -54,6 +125,25 @@ def _normalize_segment_ids(ids: Int[Array, "..."] | None, *, which: str) -> Int[
 def _normalize_positions(
     pos: Int[Array, "..."] | None, *, batch: int, seqlen: int, fill: int
 ) -> Int[Array, "batch seqlen"]:
+    """Normalize position IDs to 2D [batch, seqlen] format.
+
+    Position IDs are used for causal and sliding window masking within
+    packed sequences. Each token's position determines what it can attend to.
+
+    Args:
+        pos: Position IDs with shape [batch, seqlen], or None for default
+            sequential positions (0, 1, 2, ..., seqlen-1).
+        batch: Batch size for output shape.
+        seqlen: Sequence length for output shape.
+        fill: Value to use for NaN positions (for floating-point inputs).
+
+    Returns:
+        Position IDs with shape [batch, seqlen]. If input is None, returns
+        sequential positions.
+
+    Raises:
+        ValueError: If pos has incorrect shape.
+    """
     if pos is None:
         return jnp.broadcast_to(jnp.arange(seqlen, dtype=jnp.int32)[None, :], (batch, seqlen))
     pos = jnp.asarray(pos, jnp.int32)
@@ -69,6 +159,28 @@ def _normalize_attention_mask(
     q_len: int,
     kv_len: int,
 ) -> Bool[Array, "batch q kv"] | None:
+    """Normalize attention mask to 3D [batch, q_len, kv_len] boolean format.
+
+    Converts various attention mask formats to a consistent 3D boolean tensor
+    that can be combined with segment-based masking.
+
+    Args:
+        attention_mask: Attention mask in one of these formats:
+            - None: No additional masking
+            - 2D [batch, kv_len]: KV padding mask (broadcast to all query positions)
+            - 3D [batch, q_len, kv_len]: Standard attention mask
+            - 4D [batch, heads, q_len, kv_len]: Per-head mask (uses head 0)
+        batch: Expected batch size for validation.
+        q_len: Expected query length for validation.
+        kv_len: Expected key/value length for validation.
+
+    Returns:
+        Boolean attention mask with shape [batch, q_len, kv_len], or None.
+        True values indicate positions that CAN be attended to.
+
+    Raises:
+        ValueError: If mask has unsupported shape or dimensions don't match.
+    """
     if attention_mask is None:
         return None
     m = attention_mask
@@ -99,6 +211,30 @@ def _normalize_softmax_aux(
     num_kv_heads: int,
     dtype: jnp.dtype,
 ) -> Float[Array, "num_heads num_sinks"] | None:
+    """Normalize softmax_aux into per-head sink logits for block-sparse attention.
+
+    Attention sinks are auxiliary logits that participate in softmax normalization
+    but don't contribute to the output. They allow the model to "dump" probability
+    mass, which is useful for numerical stability and StreamingLLM-style patterns.
+
+    Args:
+        softmax_aux: Attention sink logits in one of these formats:
+            - None: No attention sinks
+            - 1D [num_heads]: One sink per head
+            - 1D [num_kv_heads]: One sink per KV head (expanded for GQA)
+            - 1D [num_sinks]: Shared sinks across all heads
+            - 2D [num_heads, num_sinks]: Per-head multiple sinks
+            - 2D [num_kv_heads, num_sinks]: Per-KV-head sinks (expanded)
+        num_heads: Total number of query heads.
+        num_kv_heads: Number of key/value heads (may be fewer for GQA).
+        dtype: Target dtype for the output tensor.
+
+    Returns:
+        Normalized sink logits with shape [num_heads, num_sinks], or None.
+
+    Raises:
+        ValueError: If softmax_aux has incompatible shape or rank > 2.
+    """
     if softmax_aux is None:
         return None
     aux = jnp.asarray(softmax_aux, dtype=dtype)
@@ -150,11 +286,78 @@ def blocksparse_attention(
     causal: bool = True,
     fused_backward: bool = False,
 ) -> Float[Array, "batch num_heads seq_len vhead_dim"]:
-    """XLA fallback for block-sparse attention with packed (multi-sequence) support.
+    """XLA fallback for block-sparse attention with packed sequence support.
 
-    This implementation is a correctness fallback: it materializes the token-level
-    mask implied by segment IDs, positions, causal/sliding-window settings (and an
-    optional attention_mask), then computes dense attention in JAX/XLA.
+    This implementation serves as a correctness reference for block-sparse attention.
+    It materializes the full token-level mask implied by segment IDs, positions,
+    causal/sliding-window settings, and computes dense attention using JAX/XLA.
+
+    The masking logic combines:
+    1. Segment masking: Tokens can only attend within the same segment
+    2. Causal masking: Each position attends only to earlier positions
+    3. Sliding window: Optional local attention within a window
+    4. Attention mask: Optional explicit attention pattern
+
+    Args:
+        query: Query tensor [batch, num_heads, seq_len, head_dim].
+            Note: Uses BHSD layout (heads before sequence).
+        key: Key tensor [batch, num_kv_heads, kv_len, head_dim].
+        value: Value tensor [batch, num_kv_heads, kv_len, head_dim].
+        q_segment_ids: Query segment IDs [batch, seq_len].
+            Identifies which sequence each query token belongs to.
+        kv_segment_ids: Key/value segment IDs [batch, kv_len].
+            If None and q_segment_ids is provided with matching length, uses q_segment_ids.
+        q_positions: Query position IDs [batch, seq_len].
+            Position within each segment for causal/window masking.
+        kv_positions: Key/value position IDs [batch, kv_len].
+        softmax_aux: Optional attention sink logits [num_sinks].
+            Participate in softmax but don't contribute to output.
+        bias: Optional attention bias [batch, num_heads, seq_len, kv_len].
+            NOT SUPPORTED in XLA fallback.
+        attention_mask: Optional additional attention mask.
+            Combined with segment/position-based masking.
+        sequence_parallelism_mesh_axis_name: Unused in XLA backend.
+        logits_soft_cap: Soft cap for attention logits via tanh.
+        qkv_layouts: Unused in XLA backend.
+        softmax_scale: Scaling factor for QK^T. Defaults to 1/sqrt(head_dim).
+        fwd_params: Unused in XLA backend.
+        bwd_params: Unused in XLA backend.
+        mask_builder: Unused in XLA backend.
+        sliding_window: Optional local attention window. Can be:
+            - int: Symmetric window (same left and right)
+            - tuple[int, int]: Asymmetric (left_window, right_window)
+        chunk_size: Unused in XLA backend.
+        causal: If True, applies causal masking based on positions. Default True.
+        fused_backward: Unused in XLA backend.
+
+    Returns:
+        Attention output [batch, num_heads, seq_len, head_dim].
+
+    Raises:
+        NotImplementedError: If bias is provided (not supported in fallback).
+        ValueError: If input tensor ranks are not 4, or if batch/head dimensions mismatch.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>>
+        >>> batch, num_heads, seq_len, head_dim = 1, 8, 256, 64
+        >>> q = jnp.ones((batch, num_heads, seq_len, head_dim))
+        >>> k = jnp.ones((batch, num_heads, seq_len, head_dim))
+        >>> v = jnp.ones((batch, num_heads, seq_len, head_dim))
+        >>>
+        >>> # Segment IDs for two sequences of length 128 each
+        >>> seg_ids = jnp.concatenate([
+        ...     jnp.zeros((batch, 128), dtype=jnp.int32),
+        ...     jnp.ones((batch, 128), dtype=jnp.int32)
+        ... ], axis=1)
+        >>>
+        >>> output = blocksparse_attention(q, k, v, q_segment_ids=seg_ids, causal=True)
+        >>> output.shape
+        (1, 8, 256, 64)
+
+    Note:
+        This fallback materializes O(seq_len²) mask, which is memory-intensive.
+        For production, use Pallas (TPU) or Triton (GPU) implementations.
     """
     del (
         fused_backward,

@@ -15,7 +15,50 @@
 # Reference: JAX Pallas PagedAttention TPU kernel
 # https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/paged_attention/paged_attention_kernel.py
 
-"""PagedAttention TPU kernel."""
+"""Paged Attention TPU kernel implementation using Pallas.
+
+This module provides an optimized paged attention implementation for Google TPUs
+designed for efficient inference with large key-value caches. Paged attention
+enables non-contiguous memory allocation for KV cache, reducing memory
+fragmentation and enabling efficient batched inference.
+
+Algorithm Overview:
+    The paged attention algorithm processes queries against a paged KV cache:
+    1. Load query for current position
+    2. Iterate through pages in the KV cache using block tables
+    3. Asynchronously prefetch next page while computing current attention
+    4. Apply online softmax for memory-efficient attention computation
+    5. Accumulate weighted values and normalize
+
+Key Features:
+    - Non-contiguous KV cache with page-based memory management
+    - Async page prefetching to hide memory latency
+    - Online softmax for O(1) memory per attention head
+    - Support for grouped-query attention (GQA)
+    - Sliding window attention support
+    - Logits soft capping for numerical stability
+    - Megacore parallelization across batch or KV heads
+
+TPU Optimizations:
+    - Double-buffered page prefetching using async DMA
+    - VMEM buffers for K/V pages to minimize HBM access
+    - Semaphore-based synchronization for async copies
+    - Optimized block sizes for TPU's systolic arrays
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.page_attention import _pallas_impl_fwd
+    >>> # Query: [batch_size, num_q_heads, head_dim]
+    >>> query = jnp.ones((4, 32, 128))
+    >>> # KV cache: [num_kv_heads, total_pages, page_size, head_dim]
+    >>> key_cache = jnp.ones((8, 1024, 16, 128))
+    >>> value_cache = jnp.ones((8, 1024, 16, 128))
+    >>> context_lens = jnp.array([100, 200, 150, 180])
+    >>> block_tables = jnp.zeros((4, 64), dtype=jnp.int32)
+    >>> output = _pallas_impl_fwd.ref_paged_attention(
+    ...     query, key_cache, value_cache, context_lens, block_tables
+    ... )
+"""
 
 import jax
 import jax.numpy as jnp

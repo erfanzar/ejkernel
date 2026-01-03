@@ -12,6 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged Paged Attention V2 TPU kernel implementation using Pallas.
+
+This module provides an optimized ragged paged attention implementation for
+Google TPUs, designed to handle variable-length (ragged) sequences within a
+batch while using a paged key-value cache. This is version 2 of the kernel
+with improved async DMA handling and double-buffering.
+
+Algorithm Overview:
+    1. Multi-page async copy: Prefetch multiple KV pages from HBM to VMEM
+       using asynchronous DMA transfers for latency hiding
+    2. Interleaved K/V storage: Keys and values are interleaved in the cache
+       (even indices = K, odd indices = V) for efficient memory access
+    3. Online softmax with Flash Attention: Process KV blocks incrementally
+       using the online softmax algorithm to maintain numerical stability
+    4. Double-buffering: Overlap computation with memory transfers using
+       two VMEM buffers for KV data
+    5. Causal masking with sliding window support: Optionally apply sliding
+       window attention for efficiency on long sequences
+
+Key Features:
+    - Ragged batch support: Efficiently handles variable query lengths within
+      a batch using cumulative query lengths (cu_q_lens)
+    - Paged KV cache: Non-contiguous memory layout using page tables for
+      efficient memory management during inference
+    - Async DMA prefetching: Overlaps memory transfers with computation for
+      better TPU utilization
+    - Softmax auxiliary logits: Optional attention sink support for streaming
+      inference patterns
+    - Logit soft capping: Optional tanh-based soft capping for numerical stability
+    - Mixed precision: Supports both bfloat16 and float32 with efficient
+      bitcast operations for packed data
+
+Memory Layout:
+    - KV pages: [num_pages, page_size, num_combined_kv_heads, head_dim]
+      where num_combined_kv_heads includes interleaved K and V
+    - Queries: [total_tokens, num_q_heads, head_dim]
+    - Block tables: [max_num_seqs, pages_per_seq] for page index lookup
+
+Example:
+    >>> # Ragged attention with multiple sequences of different lengths
+    >>> outputs = ragged_page_attention_kernel(
+    ...     context_lens_ref=context_lens,    # [4, 8, 12]
+    ...     page_indices_ref=page_indices,    # Page table for KV lookup
+    ...     cu_q_lens_ref=cu_q_lens,          # [0, 2, 5, 9] cumulative
+    ...     q_ref=queries,
+    ...     kv_pages_hbm_ref=kv_pages,
+    ...     softmax_scale=1.0 / sqrt(head_dim),
+    ... )
+
+Note:
+    This kernel is optimized for TPU v4 and later generations with enhanced
+    MXU and VMEM capabilities. The async copy descriptors enable efficient
+    page prefetching while the kernel processes previous blocks.
+"""
 
 import jax
 import jax.numpy as jnp

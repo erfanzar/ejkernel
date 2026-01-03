@@ -14,9 +14,63 @@
 
 """Standard attention interface using pure JAX/XLA operations.
 
-This module provides the public API for standard multi-head attention
-implemented using native JAX operations, suitable for fallback computation
-when specialized kernels are unavailable.
+This module provides a reference implementation of multi-head attention
+using native JAX operations. It serves as a fallback when specialized
+hardware-optimized kernels (Triton, Pallas) are unavailable, ensuring
+correct computation across all XLA-supported backends (CPU, GPU, TPU).
+
+The implementation follows the standard scaled dot-product attention
+formulation with support for modern attention variants and optimizations.
+
+Key features:
+1. Grouped-Query Attention (GQA): Supports fewer KV heads than query heads
+2. Multi-Query Attention (MQA): Single KV head shared across all query heads
+3. Attention sinks: Learnable auxiliary logits for probability mass absorption
+4. Sliding window: Local attention patterns for efficient long-context processing
+5. Logits soft capping: Numerical stability via tanh-based capping
+
+Algorithm:
+    1. Reshape queries for GQA/MQA: [B, S, H_q, D] -> [B, S, H_kv, H_q/H_kv, D]
+    2. Compute scaled attention scores: softmax_scale * Q @ K^T
+    3. Apply optional soft capping: cap * tanh(scores / cap)
+    4. Apply masks (causal, sliding window, attention mask, bias)
+    5. Concatenate softmax_aux sinks if provided
+    6. Softmax normalization (optionally in float32)
+    7. Apply dropout if training
+    8. Compute weighted values: attention_weights @ V
+
+Supported features:
+- Causal and non-causal (bidirectional) attention
+- Attention bias for relative position encodings (ALiBi, RoPE bias, etc.)
+- Boolean attention masks for padding and custom patterns
+- Dropout during training with configurable probability
+- Mixed precision with separate softmax dtype
+- Attention sinks for StreamingLLM-style attention
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._xla.attention import attention
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64
+    >>> num_kv_heads = 2  # GQA with 4:1 ratio
+    >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, seq_len, num_kv_heads, head_dim))
+    >>> v = jnp.ones((batch, seq_len, num_kv_heads, head_dim))
+    >>>
+    >>> # Standard causal attention
+    >>> output, weights = attention(q, k, v, causal=True)
+    >>>
+    >>> # With sliding window for local attention
+    >>> output, weights = attention(q, k, v, causal=True, sliding_window=256)
+    >>>
+    >>> # With attention sinks (4 sink tokens)
+    >>> sinks = jnp.zeros((4,))
+    >>> output, weights = attention(q, k, v, causal=True, softmax_aux=sinks)
+
+Note:
+    This is a reference implementation prioritizing correctness over speed.
+    For production workloads, prefer hardware-optimized kernels (flash_attention,
+    ring_attention) when available on your target platform.
 """
 
 import jax
@@ -36,12 +90,30 @@ def _normalize_softmax_aux(
     num_kv_heads: int,
     dtype: jnp.dtype,
 ) -> Float[Array, "num_kv_heads num_reps num_sinks"] | None:
-    """Normalize `softmax_aux` into per-(kv_head, rep) sink logits.
+    """Normalize softmax_aux into per-(kv_head, rep) sink logits for GQA/MQA.
 
-    Supports:
-      - 1D: (num_sinks,) shared across heads
-      - 1D: (num_q_heads,) or (num_kv_heads,) interpreted as per-head single sink
-      - 2D: (num_q_heads, num_sinks) or (num_kv_heads, num_sinks)
+    Attention sinks are auxiliary logits that participate in softmax normalization
+    but don't contribute to the output. This allows the model to "dump" probability
+    mass, improving numerical stability and enabling StreamingLLM-style patterns.
+
+    This function reshapes various input formats into a consistent shape that
+    works with the GQA/MQA attention computation.
+
+    Args:
+        softmax_aux: Attention sink logits in one of these formats:
+            - 1D (num_sinks,): Shared across all heads
+            - 1D (num_q_heads,) or (num_kv_heads,): Per-head single sink
+            - 2D (num_q_heads, num_sinks) or (num_kv_heads, num_sinks): Per-head multiple sinks
+        num_q_heads: Number of query heads.
+        num_kv_heads: Number of key/value heads (may be fewer for GQA/MQA).
+        dtype: Target dtype for the output tensor.
+
+    Returns:
+        Normalized sink logits with shape [num_kv_heads, num_reps, num_sinks]
+        where num_reps = num_q_heads // num_kv_heads, or None if input is None.
+
+    Raises:
+        ValueError: If softmax_aux has incompatible shape or rank > 2.
     """
     if softmax_aux is None:
         return None
@@ -96,12 +168,13 @@ def attention(
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
 ) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
-    """
-    Computes multi-head attention using standard JAX operations.
+    """Compute multi-head attention using standard JAX operations.
 
-    Supports GQA/MQA by reshaping the query tensor to match the number of
-    key/value heads. Applies scaling, optional bias/attention_mask, softmax (potentially
-    in float32), and optional dropout.
+    This function implements scaled dot-product attention with support for
+    Grouped-Query Attention (GQA) and Multi-Query Attention (MQA). It reshapes
+    the query tensor to match the number of key/value heads, applies scaling,
+    optional bias/attention_mask, softmax normalization (optionally in float32),
+    and optional dropout.
 
     Args:
         query: Query tensor with shape [batch, seq_len, num_q_heads, head_dim].
@@ -120,15 +193,22 @@ def attention(
             Used to lazily initialize bias if both attention_mask and bias are None.
         deterministic: If True, disables dropout (default). If False, applies dropout.
         dropout_rng: JAX PRNG key for dropout. Required when deterministic=False
-            and dropout_prob > 0 in metadata.
-        softmax_aux: Optional attention sink logits of shape [num_sinks].
-        softmax_scale: Optional float for scaling attention scores. If None, uses 1/sqrt(head_dim).
+            and dropout_prob > 0.
+        softmax_aux: Optional attention sink logits. Supports shapes:
+            - [num_sinks]: Shared across all heads
+            - [num_heads]: One sink per head
+            - [num_heads, num_sinks]: Multiple sinks per head
+            These auxiliary logits participate in softmax but don't contribute to output.
+        softmax_scale: Scaling factor for attention scores. If None, uses 1/sqrt(head_dim).
         logits_soft_cap: Optional float for capping attention logits using tanh.
             When specified, applies: logits_soft_cap * tanh(logits / logits_soft_cap).
-            This prevents attention scores from becoming too large.
+            This prevents attention scores from becoming too large (common in Gemma2).
         dtype: Data type for computation. Defaults to bfloat16.
-        softmax_dtype: Data type for softmax computation. Defaults to float32.
+        softmax_dtype: Data type for softmax computation. Defaults to float32 for
+            numerical stability.
         dropout_prob: Dropout probability. Only applied when deterministic=False.
+        causal: If True, applies causal masking where each query position can only
+            attend to previous key positions.
         sliding_window: Optional sliding window attention constraint. Can be:
             - int: Symmetric window (same left and right window size)
             - tuple[int, int]: Asymmetric window (left_window, right_window)
@@ -136,15 +216,30 @@ def attention(
             When specified, each query position can only attend to keys within the window.
 
     Returns:
-        AttentionOutput containing:
-            - attention_outputs: Float[Array, "batch seq_len num_q_heads head_dim"]
+        A tuple containing:
+            - attention_output: Float[Array, "batch seq_len num_q_heads head_dim"]
               The attended representation.
-            - attention_weights: Float[Array, "batch num_heads seq_len kv_len"] | None
-              The attention weights (if return_weights is True in metadata).
+            - attention_weights: Float[Array, "batch num_heads seq_len kv_len"]
+              The attention weights after softmax and dropout.
 
     Raises:
         NotImplementedError: If the bias head dimension cannot be reshaped correctly
             to match the query head structure for GQA/MQA.
+        ValueError: If attention_mask has unsupported shape.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from ejkernel.kernels._xla.attention import attention
+        >>>
+        >>> # GQA: 8 query heads, 2 KV heads
+        >>> batch, seq_len = 2, 512
+        >>> q = jnp.ones((batch, seq_len, 8, 64))
+        >>> k = jnp.ones((batch, seq_len, 2, 64))
+        >>> v = jnp.ones((batch, seq_len, 2, 64))
+        >>>
+        >>> output, weights = attention(q, k, v, causal=True)
+        >>> output.shape
+        (2, 512, 8, 64)
     """
 
     softmax_scale = softmax_scale if softmax_scale is not None else query.shape[-1] ** -0.5

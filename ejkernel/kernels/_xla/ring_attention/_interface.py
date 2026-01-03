@@ -12,11 +12,67 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ring attention interface for distributed sequence processing.
+"""Ring attention implementation for distributed sequence processing.
 
-This module provides the public API for ring attention using blockwise
-transformers with KV cache rotation across devices. Supports chunked
-computation with custom VJP for gradient computation.
+This module provides an implementation of Ring Attention, a technique for
+computing attention across extremely long sequences by distributing the
+computation across multiple devices in a ring topology.
+
+Ring Attention enables processing sequences that exceed the memory capacity
+of a single device by:
+1. Partitioning query, key, and value tensors across devices
+2. Rotating key-value pairs around the ring in a pipeline fashion
+3. Computing local attention blocks and accumulating results
+4. Using online softmax for numerically stable accumulation
+
+This is particularly useful for:
+- Training on very long documents (100K+ tokens)
+- Distributed inference with sequence parallelism
+- Memory-efficient attention for large context windows
+
+Key features:
+1. Sequence parallelism: Distributes sequence dimension across devices
+2. Memory efficiency: O(N/P) memory per device for P-way parallelism
+3. Blockwise computation: Processes attention in query/key chunks
+4. Online softmax: Numerically stable accumulation across blocks
+5. Custom VJP: Efficient gradient computation for training
+
+Algorithm overview:
+- Each device holds a shard of Q, K, V along the sequence dimension
+- Key-value pairs are rotated using collective ppermute operations
+- Each device computes attention for its query shard against all K-V shards
+- Results are accumulated using online softmax algorithm
+- After P rotations, each device has complete attention output for its queries
+
+Supported features:
+- Causal and non-causal attention modes
+- Segment IDs for packed sequence processing
+- Sliding window attention for local patterns
+- Attention sinks via softmax_aux parameter
+- Logits soft capping for numerical stability
+- Dropout with configurable probability
+- Configurable chunk sizes for memory/compute trade-off
+
+Example:
+    >>> import jax
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._xla.ring_attention import ring_attention
+    >>>
+    >>> # Assuming 4-way sequence parallelism
+    >>> batch, local_seq_len, num_heads, head_dim = 2, 512, 8, 64
+    >>> q = jnp.ones((batch, local_seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, local_seq_len, num_heads, head_dim))
+    >>> v = jnp.ones((batch, local_seq_len, num_heads, head_dim))
+    >>>
+    >>> # Run without axis_name for single-device testing
+    >>> output = ring_attention(q, k, v, causal=True)
+    >>>
+    >>> # In distributed setting with pmap/shard_map:
+    >>> # output = ring_attention(q, k, v, causal=True, axis_name="seq")
+
+Reference:
+    Ring Attention with Blockwise Transformers for Near-Infinite Context
+    https://arxiv.org/abs/2310.01889
 """
 
 from __future__ import annotations
@@ -181,6 +237,72 @@ def ring_attention(
     bwd_params: BwdParams | None = None,
     fused_backward: bool = False,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+    """Compute ring attention for distributed long-sequence processing.
+
+    Ring attention distributes attention computation across devices by rotating
+    key-value pairs in a ring topology. Each device computes attention for its
+    local query shard against all key-value shards.
+
+    Args:
+        query: Query tensor [batch, seq_len_q, num_heads, head_dim].
+            In distributed mode, this is the local shard of queries.
+        key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim].
+            In distributed mode, this is the local shard of keys.
+        value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim].
+            In distributed mode, this is the local shard of values.
+        q_segment_ids: Optional query segment IDs [batch, seq_len_q].
+            Used for packed sequence processing to prevent cross-sequence attention.
+        kv_segment_ids: Optional key/value segment IDs [batch, seq_len_k].
+            If only one of q/kv segment IDs is provided, it's used for both.
+        q_position_ids: Optional query position IDs [batch, seq_len_q].
+            Used for position-based masking in packed sequences.
+        kv_position_ids: Optional key/value position IDs [batch, seq_len_k].
+            Used for position-based masking in packed sequences.
+        softmax_aux: Optional attention sink logits [num_sinks].
+            Participate in softmax normalization but don't contribute to output.
+        bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k].
+            Additive bias applied to attention scores before softmax.
+        mask_builder: Optional mask builder function (unused in XLA backend).
+        sliding_window: Optional local attention window. Can be:
+            - int: Symmetric window (same left and right)
+            - tuple[int, int]: Asymmetric (left_window, right_window)
+            - None: Full attention (default)
+        chunk_size: Size for both query and key chunks. If None, uses
+            min(512, seq_len) as default.
+        causal: If True, applies causal masking. Default False.
+        logits_soft_cap: Soft cap for attention logits via tanh.
+            Applies: cap * tanh(logits / cap).
+        softmax_scale: Scaling factor for QK^T. Defaults to 1/sqrt(head_dim).
+        axis_name: Name of the JAX collective axis for ring communication.
+            Required for distributed execution with pmap/shard_map.
+            If None, runs in single-device mode.
+        fwd_params: Forward pass parameters (q_blocksize, kv_blocksize).
+        bwd_params: Backward pass parameters (unused in XLA backend).
+        fused_backward: Whether to fuse backward pass (unused in XLA backend).
+
+    Returns:
+        Attention output [batch, seq_len_q, num_heads, head_dim].
+        In distributed mode, this is the complete output for the local query shard.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from ejkernel.kernels._xla.ring_attention import ring_attention
+        >>>
+        >>> # Single-device mode (axis_name=None)
+        >>> batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64
+        >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>>
+        >>> output = ring_attention(q, k, v, causal=True, chunk_size=256)
+        >>> output.shape
+        (2, 1024, 8, 64)
+
+    Note:
+        - For distributed execution, use within jax.pmap or jax.shard_map
+        - The chunk_size should evenly divide the sequence length
+        - Memory usage scales as O(chunk_size² + seq_len * head_dim) per device
+    """
     del mask_builder, bwd_params, fused_backward
 
     if fwd_params is None:

@@ -13,7 +13,50 @@
 # limitations under the License.
 
 
-"""Mini-mask creation library."""
+"""Mask information processing for Splash (block-sparse) attention on TPU.
+
+This module provides utilities for transforming dense attention masks into
+efficient sparse representations for TPU computation. The key data structures
+enable the Splash attention kernel to skip computation for masked regions
+while maintaining correctness for partial blocks.
+
+Key Components:
+    MaskInfo: Named tuple containing all runtime masking information including
+        data_next/mask_next prefetch arrays, block_mask indicators, and
+        partial mask blocks for mixed-zero-one regions.
+
+    process_mask: Transform a dense MultiHeadMask into sparse MaskInfo with
+        support for sharding across heads and sequence dimensions.
+
+    process_dynamic_mask: Handle dynamic (traced) masks that cannot be
+        analyzed at compile time.
+
+Algorithm Overview:
+    The mask processing pipeline:
+    1. Analyze each block in the dense mask to classify as:
+       - Empty (all zeros): Skip entirely
+       - Full (all ones): No masking needed
+       - Partial (mixed): Store actual mask for runtime application
+    2. Build lookup tables (data_next, mask_next) for efficient prefetching
+    3. Optimize scalar memory usage by downcasting to int8/int16 when possible
+    4. Support grid shrinking to eliminate empty blocks from computation
+
+TPU Memory Considerations:
+    - data_next, mask_next, block_mask: Stored in TPU scalar memory (scarce)
+    - partial_mask_blocks: Stored in HBM, loaded as needed
+    - Arrays are downcasted to smallest possible dtype (int8/int16/int32)
+
+Example:
+    >>> from ejkernel.kernels._pallas.tpu.blocksparse_attention import _masks, _info
+    >>> # Create a causal mask
+    >>> mask = _masks.CausalMask(shape=(512, 512))
+    >>> multi_head_mask = _masks.MultiHeadMask(masks=(mask,) * 8)
+    >>> # Process into sparse representation
+    >>> mask_info, mask_fn = _info.process_mask(
+    ...     multi_head_mask,
+    ...     block_shape=(128, 128),
+    ... )
+"""
 
 from __future__ import annotations
 

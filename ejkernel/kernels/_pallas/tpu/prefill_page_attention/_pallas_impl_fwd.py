@@ -15,7 +15,52 @@
 # Reference: JetStream chunked prefill attention
 # https://github.com/AI-Hypercomputer/JetStream/blob/main/experimental/jax/inference/kernel/attention/tpu/chunked_prefill_attention.py
 
-"""Chunked Prefill PagedAttention TPU kernel."""
+"""Chunked Prefill Paged Attention TPU kernel implementation.
+
+This module provides an optimized chunked prefill attention implementation
+for Google TPUs, designed for processing the last chunk of tokens during
+the prefill phase while using a paged KV cache.
+
+Unlike standard paged attention (which handles single-token decode), chunked
+prefill processes multiple query tokens simultaneously, enabling efficient
+batch processing during the initial prompt encoding phase.
+
+Algorithm Overview:
+    The chunked prefill algorithm processes a chunk of query tokens:
+    1. Query positions span [context_len - chunk_size, context_len - 1]
+    2. Each query can attend to all KV positions up to its own position (causal)
+    3. KV cache is loaded page-by-page with async prefetching
+    4. Online softmax accumulates attention across KV chunks
+    5. Final output is rescaled by accumulated softmax denominators
+
+Key Features:
+    - Processes multiple query tokens in a single kernel call
+    - Causal masking where each query attends to current and past positions
+    - Paged KV cache with efficient page-based memory access
+    - Sliding window attention support for local attention patterns
+    - Async page prefetching using double-buffering
+    - Grouped-query attention (GQA) support
+
+TPU Optimizations:
+    - Double-buffered async DMA for K/V page loading
+    - VMEM scratch for softmax accumulators (m, l values)
+    - Semaphore-based synchronization for async operations
+    - Efficient handling of partial KV chunks at sequence boundaries
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.prefill_page_attention import _pallas_impl_fwd
+    >>> # Query chunk: [chunk_size, num_q_heads, head_dim]
+    >>> query = jnp.ones((128, 32, 128))
+    >>> # KV cache: [num_kv_heads, total_pages, page_size, head_dim]
+    >>> key_cache = jnp.ones((8, 1024, 16, 128))
+    >>> value_cache = jnp.ones((8, 1024, 16, 128))
+    >>> context_len = jnp.array([256])
+    >>> page_indices = jnp.zeros((16,), dtype=jnp.int32)
+    >>> output = _pallas_impl_fwd.ref_prefill_page_attention(
+    ...     query, key_cache, value_cache, context_len, page_indices
+    ... )
+"""
 
 import jax
 import jax.numpy as jnp

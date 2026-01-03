@@ -12,6 +12,76 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utility functions and tuned block sizes for Ragged Paged Attention V3.
+
+This module provides utility functions for TPU device detection, block size
+selection, memory alignment, and performance tuning for the ragged paged
+attention V3 kernel. It includes extensive pre-tuned block size configurations
+for different TPU generations, workload characteristics, and head dimensions.
+
+Key Components:
+    - cdiv: Ceiling division utility for block calculations
+    - align_to: Memory alignment helper for TPU tile requirements
+    - get_dtype_bitwidth/get_dtype_packing: Data type packing calculations
+    - next_power_of_2: Power-of-2 alignment for block sizes
+    - get_device_name: TPU device identification with variant support
+    - get_tpu_version: Numeric TPU version extraction
+    - get_tuned_block_sizes: Block size lookup for head_dim >= 128
+    - get_tuned_block_sizes_h64: Specialized block sizes for head_dim=64
+
+Block Size Parameters:
+    - bkv (num_kv_pages_per_block): Number of KV cache pages processed per
+      Flash Attention block. Larger values improve HBM bandwidth utilization
+    - bq (num_queries_per_block): Number of query tokens processed per block
+
+Tuning Structure:
+    TUNED_BLOCK_SIZES is organized hierarchically:
+    - TPU device name (e.g., "TPU v6e", "TPU v5e", "TPU v5p")
+    - Page size (16, 32, 64, 128, etc.)
+    - dtype combination ("q_bfloat16_kv_bfloat16", "q_bfloat16_kv_int8")
+    - Head configuration ("q_head-128_kv_head-8_head-128")
+    - max_kv_len -> (bkv_pages, bq_size)
+
+TPU Device Support:
+    - TPU v5e/v5 lite: Entry-level TPU configurations
+    - TPU v5p: High-performance TPU variant
+    - TPU v6e: Latest generation optimizations
+    - TPU v7/7x: Future-ready configurations
+
+Head Dimension Variants:
+    - head_dim=64: Use get_tuned_block_sizes_h64() for K/V concatenated layout
+    - head_dim>=128: Use get_tuned_block_sizes() for standard layout
+
+Example:
+    >>> # Get block sizes for standard attention
+    >>> bkv, bq = get_tuned_block_sizes(
+    ...     q_dtype=jnp.bfloat16,
+    ...     kv_dtype=jnp.bfloat16,
+    ...     num_q_heads=32,
+    ...     num_kv_heads=8,
+    ...     head_dim=128,
+    ...     page_size=64,
+    ...     max_num_tokens=2048,
+    ...     pages_per_seq=256,
+    ... )
+
+    >>> # Get block sizes for head_dim=64 variant
+    >>> bkv_h64, bq_h64 = get_tuned_block_sizes_h64(
+    ...     q_dtype=jnp.bfloat16,
+    ...     kv_dtype=jnp.bfloat16,
+    ...     num_q_heads=12,
+    ...     num_kv_heads=12,
+    ...     head_dim=64,
+    ...     page_size=32,
+    ...     max_num_tokens=1024,
+    ...     pages_per_seq=128,
+    ... )
+
+Note:
+    The tuned block sizes are empirically determined through extensive
+    benchmarking on various TPU configurations. Default fallback values
+    are provided when exact matches are not found in the tuning tables.
+"""
 
 import jax
 import jax.numpy as jnp
