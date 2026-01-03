@@ -12,6 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ring Attention forward pass implementation using XLA/JAX.
+
+This module provides the forward pass for ring attention, enabling distributed
+attention computation across multiple devices by splitting the sequence into
+blocks that are communicated in a ring topology.
+
+Key Components:
+    - _blockwise_attention_fwd: Single block attention computation
+    - _ring_attention_fwd: Full ring attention with collective communication
+
+Algorithm:
+    Ring attention processes sequences distributed across devices:
+    1. Each device holds a Q block and circulates K/V blocks around the ring
+    2. For each ring step:
+       - Compute local attention between Q and current K/V block
+       - Send K/V to next device, receive from previous
+       - Accumulate outputs using online softmax
+    3. After num_devices steps, each device has complete attention output
+
+Features:
+    - Distributed sequence processing across devices
+    - Memory-efficient chunked computation
+    - Causal masking with proper block handling
+    - Online softmax for numerical stability
+    - Segment-based masking for packed sequences
+    - Optional dropout with reproducible keys
+
+Communication Pattern:
+    - Uses collective permute for K/V exchange
+    - Ring topology: device i sends to (i+1) % num_devices
+    - Full ring requires num_devices collective operations
+
+Note:
+    This implementation uses JAX collective operations for multi-device
+    communication. For single-device blockwise attention, the ring
+    communication reduces to simple iteration over blocks.
+"""
 
 from functools import partial
 

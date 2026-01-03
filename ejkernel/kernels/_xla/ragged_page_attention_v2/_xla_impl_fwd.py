@@ -12,6 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged Paged Attention V2 forward pass using XLA/JAX.
+
+This module provides the forward pass for ragged paged attention V2,
+combining variable-length sequence support with paged KV cache management.
+
+Key Components:
+    - _ragged_paged_attention: Main forward function
+
+Algorithm:
+    Ragged paged attention for variable-length sequences:
+    1. Handle batches with variable query lengths (ragged)
+    2. Use block_tables to look up KV cache pages
+    3. Apply attention with proper masking for sequence boundaries
+    4. Accumulate output using online softmax
+
+Features:
+    - Ragged batch support with cumulative query lengths
+    - Paged KV cache with indirect addressing
+    - Interleaved K/V storage for memory efficiency
+    - Optional sliding window attention
+    - Logit soft capping for numerical stability
+
+Memory Layout:
+    - kv_pages: [num_pages, page_size, num_kv_heads * 2, head_dim]
+      where K and V are interleaved
+    - block_tables: [num_seqs, max_pages] for page lookup
+    - cu_q_lens: [num_seqs + 1] cumulative query lengths
+
+Note:
+    This is a correctness-focused XLA fallback. For TPU-optimized
+    implementation with async DMA, see the Pallas version.
+"""
 
 import jax
 import jax.numpy as jnp

@@ -12,6 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Paged Attention forward pass implementation using XLA/JAX.
+
+This module provides the forward pass for paged attention, enabling efficient
+inference with non-contiguous key-value caches organized into fixed-size pages.
+
+Key Components:
+    - _page_attention_fwd: Main forward function with page-based KV lookup
+
+Algorithm:
+    Paged attention for inference with non-contiguous KV cache:
+    1. For each sequence, look up which pages contain its KV cache
+    2. Iterate over pages using block_tables for indirect addressing
+    3. Apply attention only over valid tokens (up to context_lens)
+    4. Accumulate output using online softmax for numerical stability
+
+Features:
+    - Page-based KV cache with configurable block_size
+    - Efficient memory utilization via non-contiguous storage
+    - GQA/MQA support with head broadcasting
+    - Variable context lengths per sequence
+
+Memory Layout:
+    - key_cache: [num_blocks, num_kv_heads, block_size, head_dim]
+    - value_cache: [num_blocks, num_kv_heads, block_size, head_dim]
+    - block_tables: [num_seqs, max_blocks] mapping sequence to page indices
+
+Note:
+    This is a correctness-focused XLA implementation. For TPU-optimized
+    paged attention, see the Pallas implementations.
+"""
 
 import jax
 import jax.numpy as jnp

@@ -44,6 +44,24 @@ def _sparse_attention_with_vjp(
     block_size: int,
     softmax_scale: float,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
+    """Block-sparse attention with custom VJP for gradient computation.
+
+    Computes sparse attention where each query attends to a subset of key
+    blocks specified by block_indices. Custom VJP enables efficient gradients.
+
+    Args:
+        query: Query tensor [batch, seq_len, num_q_heads, head_dim]
+        key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
+        value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
+        block_indices: Per-token indices of blocks to attend to
+            [batch, seq_len, num_kv_heads, num_selected_blocks]
+        block_counts: Number of blocks per token [batch, seq_len, num_kv_heads]
+        block_size: Size of each attention block
+        softmax_scale: Attention scaling factor
+
+    Returns:
+        Sparse attention output [batch, seq_len, num_q_heads, head_dim]
+    """
     return _sparse_attention_fwd(query, key, value, block_indices, block_counts, block_size, softmax_scale)
 
 
@@ -56,6 +74,19 @@ def _sparse_attention_fwd_vjp(
     block_size: int,
     softmax_scale: float,
 ):
+    """Forward rule for sparse attention VJP.
+
+    Computes sparse attention output and saves residuals for backward pass.
+
+    Args:
+        query, key, value: Input tensors for attention
+        block_indices, block_counts: Sparsity pattern specification
+        block_size: Attention block size
+        softmax_scale: Attention scaling factor
+
+    Returns:
+        Tuple of (output, residuals) for gradient computation
+    """
     output = _sparse_attention_fwd(query, key, value, block_indices, block_counts, block_size, softmax_scale)
     residuals = (query, key, value, block_indices, block_counts, block_size, softmax_scale)
     return output, residuals
@@ -67,6 +98,20 @@ def _sparse_attention_bwd_vjp(
     residuals: tuple,
     do: Float[Array, "batch seq_len num_q_heads head_dim"],
 ):
+    """Backward rule for sparse attention VJP.
+
+    Computes gradients with respect to query, key, and value tensors.
+    Block indices and counts don't contribute gradients.
+
+    Args:
+        block_size: Attention block size (nondiff)
+        softmax_scale: Scaling factor (nondiff)
+        residuals: Saved tensors from forward pass
+        do: Gradient of loss with respect to output
+
+    Returns:
+        Tuple of gradients (dq, dk, dv, None, None)
+    """
     query, key, value, block_indices, block_counts, block_size_, softmax_scale_ = residuals
     dq, dk, dv = _sparse_attention_bwd(query, key, value, block_indices, block_counts, block_size_, softmax_scale_, do)
 
@@ -142,9 +187,27 @@ def _nsa_topk_xla(
     block_size: int,
     softmax_scale: float,
 ) -> Int[Array, "batch seq_len num_kv_heads num_selected_blocks"]:
-    """
-    Per-token top-k selection matching Triton:
-    p = exp(score - lse), force-include current block (p=1.0), sum over groups G, top-k across blocks.
+    """Select top-k blocks for each query token based on attention scores.
+
+    Implements the block selection algorithm for Native Sparse Attention:
+    1. Compute attention probabilities using compressed keys and LSE
+    2. Force-include the current block (probability = 1.0)
+    3. Sum probabilities across query head groups for GQA
+    4. Select top-k blocks based on aggregated scores
+
+    This matches Triton semantics where ties are broken by block index.
+
+    Args:
+        query: Query tensor [batch, seq_len, num_q_heads, head_dim]
+        k_cmp: Compressed (mean-pooled) keys [batch, num_blocks, num_kv_heads, head_dim]
+        lse: Log-sum-exp from compressed attention [batch, seq_len, num_q_heads]
+        block_counts: Number of blocks to select per query token
+        block_size: Size of each attention block
+        softmax_scale: Attention scaling factor
+
+    Returns:
+        Block indices for each token [batch, seq_len, num_kv_heads, num_selected_blocks]
+        Invalid blocks (beyond current position) are marked with -1.
     """
     B, T, HQ, _D = query.shape
     C = k_cmp.shape[1]

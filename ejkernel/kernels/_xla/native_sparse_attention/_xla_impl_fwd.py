@@ -12,6 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Native Sparse Attention forward pass implementation using XLA/JAX.
+
+This module provides the forward pass for Native Sparse Attention (NSA),
+implementing block-sparse attention where each query only attends to a
+selected subset of key-value blocks.
+
+Key Components:
+    - _sparse_attention_fwd: Main forward function with block selection
+
+Algorithm:
+    Block-sparse attention with dynamic block selection:
+    1. For each query token, look up which K/V blocks to attend to
+    2. Gather the selected K/V blocks using block_indices
+    3. Compute attention only over selected blocks
+    4. Apply softmax and weighted sum over selected blocks
+
+Features:
+    - Dynamic block selection via block_indices
+    - GQA/MQA support with head broadcasting
+    - Variable block counts per query via block_counts
+    - Efficient JAX vmap/scan implementation
+
+Memory Complexity:
+    - O(N * S * B) where N=seq_len, S=num_selected_blocks, B=block_size
+    - Much less than full O(N²) for sparse patterns
+
+Note:
+    Uses ejit decorator for efficient JIT compilation with
+    static argument handling.
+"""
 
 import jax
 import jax.numpy as jnp

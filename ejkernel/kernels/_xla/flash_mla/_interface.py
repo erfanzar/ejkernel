@@ -14,13 +14,51 @@
 
 """Flash Multi-head Latent Attention (MLA) interface for XLA backend.
 
-This is a correctness-focused JAX/XLA fallback implementation that matches the
-MLA kernel signature used by `ejkernel.modules.operations.flash_mla`.
+This module provides a pure JAX/XLA implementation of Flash Multi-head Latent
+Attention (MLA), a memory-efficient attention mechanism used in DeepSeek-V2
+and similar architectures.
 
-The core idea is to avoid materializing full K/V by:
-  - storing a compressed KV representation (`key_value`)
-  - reconstructing per-head keys/values on the fly with `w_kc` / `w_vc`
-  - optionally adding a RoPE-derived term via `b_q` / `b_k`
+MLA achieves memory efficiency by using a low-rank factorization of the KV cache:
+instead of storing full key and value tensors, it stores a compressed latent
+representation that is projected on-the-fly during attention computation.
+
+Key Features:
+1. Low-rank KV compression: Stores [batch, seq_len, kv_lora_rank] instead of
+   full [batch, seq_len, num_heads, head_dim] for keys and values
+2. On-the-fly projection: Reconstructs K and V using learned projection matrices
+3. RoPE integration: Supports separate RoPE components via b_q/b_k tensors
+4. GQA support: Handles grouped-query attention with kv_heads < q_heads
+
+The attention computation is:
+    K = key_value @ w_kc  (project to per-head keys)
+    V = key_value @ w_vc  (project to per-head values)
+    If using RoPE:
+        K_full = concat(K_nope, K_rope) where K_rope comes from b_k
+        Q_full = concat(Q_nope, Q_rope) where Q_rope comes from b_q or query
+    output = softmax(Q @ K^T / sqrt(d)) @ V
+
+Memory savings come from kv_lora_rank << num_heads * head_dim, typically
+achieving 2-4x reduction in KV cache size.
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._xla.flash_mla import flash_mla
+    >>>
+    >>> batch, seq_len, q_heads, kv_heads = 2, 1024, 32, 8
+    >>> head_dim, kv_lora_rank = 64, 512
+    >>>
+    >>> query = jnp.ones((batch, seq_len, q_heads, head_dim))
+    >>> key_value = jnp.ones((batch, seq_len, kv_lora_rank))
+    >>> w_kc = jnp.ones((kv_lora_rank, kv_heads, head_dim))
+    >>> w_vc = jnp.ones((kv_lora_rank, kv_heads, head_dim))
+    >>>
+    >>> output = flash_mla(query, key_value, w_kc, w_vc, causal=True)
+    >>> output.shape
+    (2, 1024, 32, 64)
+
+Reference:
+    DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model
+    https://arxiv.org/abs/2405.04434
 """
 
 from __future__ import annotations
@@ -37,7 +75,24 @@ from ..._registry import Backend, Platform, kernel_registry
 
 
 def _repeat_kv_for_gqa(x: Array, q_heads: int) -> Array:
-    """Repeat KV heads to match query head count (GQA/MQA support)."""
+    """Repeat KV heads to match query head count for GQA/MQA support.
+
+    In grouped-query attention (GQA) and multi-query attention (MQA), the
+    number of key-value heads is less than query heads. This function
+    replicates KV heads to match the query head count.
+
+    Args:
+        x: Input tensor with KV heads at axis 2.
+            Shape: [batch, seq_len, kv_heads, head_dim]
+        q_heads: Number of query heads to match.
+
+    Returns:
+        Tensor with repeated KV heads to match q_heads.
+            Shape: [batch, seq_len, q_heads, head_dim]
+
+    Raises:
+        ValueError: If q_heads is not divisible by kv_heads.
+    """
     kv_heads = int(x.shape[2])
     if kv_heads == q_heads:
         return x
@@ -57,6 +112,30 @@ def _flash_mla_xla(
     softmax_scale: float | None,
     causal: bool,
 ) -> Array:
+    """Core XLA implementation of Flash MLA attention.
+
+    Performs the MLA attention computation by:
+    1. Projecting compressed key_value to full keys and values
+    2. Optionally incorporating RoPE components from b_q/b_k
+    3. Computing scaled dot-product attention with optional causal masking
+    4. Handling GQA by repeating KV heads to match query heads
+
+    Args:
+        query: Query tensor [batch, seq_len, q_heads, q_head_dim]
+        key_value: Compressed KV latent [batch, seq_len, kv_lora_rank]
+        w_kc: Key projection [kv_lora_rank, kv_heads, qk_nope_head_dim]
+        w_vc: Value projection [kv_lora_rank, kv_heads, v_head_dim]
+        b_q: Optional query RoPE component [batch, seq_len, qk_rope_head_dim]
+        b_k: Optional key RoPE component [batch, seq_len, qk_rope_head_dim]
+        softmax_scale: Attention scale factor. If None, computed from dimensions.
+        causal: Apply causal masking if True.
+
+    Returns:
+        Attention output [batch, seq_len, q_heads, v_head_dim]
+
+    Raises:
+        ValueError: On shape mismatches or invalid configurations.
+    """
     if query.ndim != 4:
         raise ValueError("query must have shape (batch, seq_len, q_heads, head_dim).")
     if key_value.ndim != 3:
@@ -175,12 +254,81 @@ def flash_mla(
     causal: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
-    """Flash MLA (XLA fallback).
+    """Flash Multi-head Latent Attention (MLA) using XLA backend.
+
+    Computes attention using a compressed key-value representation, achieving
+    significant memory savings compared to standard multi-head attention.
+    Keys and values are reconstructed on-the-fly from the low-rank latent
+    using learned projection matrices.
+
+    The computation flow is:
+        K_nope = key_value @ w_kc  (project to keys, no positional encoding)
+        V = key_value @ w_vc  (project to values)
+
+        If b_k is provided (RoPE case):
+            K = [K_nope; K_rope] where K_rope from b_k
+            Q = [Q_nope; Q_rope] where Q_rope from b_q or query
+
+        output = softmax((Q @ K^T) * scale) @ V
+
+    Args:
+        query: Query tensor. If b_k is None, expected shape is
+            [batch, seq_len, q_heads, qk_nope_head_dim].
+            If b_k is provided and b_q is None, expected shape is
+            [batch, seq_len, q_heads, qk_nope_head_dim + qk_rope_head_dim].
+            If both b_q and b_k are provided, expected shape is
+            [batch, seq_len, q_heads, qk_nope_head_dim].
+        key_value: Compressed key-value latent representation.
+            Shape: [batch, seq_len, kv_lora_rank]
+        w_kc: Projection matrix for keys (non-RoPE component).
+            Shape: [kv_lora_rank, kv_heads, qk_nope_head_dim]
+        w_vc: Projection matrix for values.
+            Shape: [kv_lora_rank, kv_heads, v_head_dim]
+        b_q: Optional pre-computed query RoPE component (shared across heads).
+            Shape: [batch, seq_len, qk_rope_head_dim]
+        b_k: Optional pre-computed key RoPE component (shared across heads).
+            Shape: [batch, seq_len, qk_rope_head_dim]
+        softmax_scale: Scaling factor for attention scores. If None, computed
+            automatically based on the effective head dimension.
+        causal: Whether to apply causal masking for autoregressive attention.
+        cu_seqlens: Cumulative sequence lengths for packed variable-length
+            sequences. Currently not supported in XLA implementation.
+
+    Returns:
+        Attention output tensor.
+            Shape: [batch, seq_len, q_heads, v_head_dim]
+
+    Raises:
+        ValueError: On shape mismatches between query, key_value, and projections.
+        NotImplementedError: If cu_seqlens is provided.
 
     Notes:
-        - `cu_seqlens` is currently not supported in this XLA implementation.
-        - If `b_k` is provided and `b_q` is None, `query` is expected to contain
-          both qk_nope and qk_rope concatenated on the last axis.
+        - The kv_lora_rank is typically much smaller than num_heads * head_dim,
+          providing significant memory savings (e.g., 512 vs 2048).
+        - GQA is supported: q_heads can be a multiple of kv_heads.
+        - RoPE components (b_q, b_k) are shared across heads for efficiency.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>>
+        >>> batch, seq_len, q_heads, kv_heads = 2, 1024, 32, 8
+        >>> head_dim, kv_lora_rank = 64, 512
+        >>>
+        >>> # Without RoPE
+        >>> query = jnp.ones((batch, seq_len, q_heads, head_dim))
+        >>> key_value = jnp.ones((batch, seq_len, kv_lora_rank))
+        >>> w_kc = jnp.ones((kv_lora_rank, kv_heads, head_dim))
+        >>> w_vc = jnp.ones((kv_lora_rank, kv_heads, head_dim))
+        >>>
+        >>> output = flash_mla(query, key_value, w_kc, w_vc, causal=True)
+        >>> output.shape
+        (2, 1024, 32, 64)
+        >>>
+        >>> # With RoPE
+        >>> rope_dim = 32
+        >>> query_with_rope = jnp.ones((batch, seq_len, q_heads, head_dim + rope_dim))
+        >>> b_k = jnp.ones((batch, seq_len, rope_dim))
+        >>> output = flash_mla(query_with_rope, key_value, w_kc, w_vc, b_k=b_k, causal=True)
     """
     if cu_seqlens is not None:
         raise NotImplementedError("cu_seqlens is not supported for XLA flash_mla yet.")

@@ -12,6 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Decode Attention forward pass implementation using XLA/JAX.
+
+This module provides the forward pass for decode-phase attention, optimized
+for single-token generation with cached key-value tensors.
+
+Key Components:
+    - _decode_attention_fwd: Main forward function for decode phase
+
+Algorithm:
+    Decode attention for autoregressive generation:
+    1. Query is a single token per sequence (batch dim represents sequences)
+    2. KV buffer contains cached keys/values from previous tokens
+    3. req_to_tokens maps each request to its token indices in the buffer
+    4. Compute attention over the cached sequence up to seq_lens
+
+Features:
+    - Single-token query optimization (seq_len_q = 1)
+    - Page-based KV buffer with req_to_tokens indirection
+    - Variable sequence lengths per request
+    - Optional logit soft capping for numerical stability
+    - GQA/MQA support with head broadcasting
+
+Memory Layout:
+    - query: [batch, num_q_heads, head_dim] (single token per sequence)
+    - key_buffer/value_buffer: [total_pages, page_size, num_kv_heads, head_dim]
+    - req_to_tokens: [batch, max_seq_len] indirect addressing
+
+Note:
+    This kernel is optimized for the decode phase where each sequence
+    generates one token at a time. For prefill (multiple tokens), use
+    the chunked_prefill_paged_decode kernel.
+"""
+
 from __future__ import annotations
 
 import jax

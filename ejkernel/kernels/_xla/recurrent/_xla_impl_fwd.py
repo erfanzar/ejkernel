@@ -12,6 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Recurrent linear attention forward pass implementation using XLA/JAX.
+
+This module provides the forward pass for recurrent linear attention using
+JAX scan operations. It implements O(N) linear attention with various
+gating mechanisms for GLA, Lightning, and other linear attention variants.
+
+Key Components:
+    - _recurrent_attention_step: Single timestep update
+    - _recurrent_attention_fwd: Full sequence forward pass
+    - _recurrent_attention_varlen_fwd: Variable-length sequence support
+
+Algorithm:
+    The recurrent formulation maintains a hidden state matrix h:
+    1. For each timestep t:
+       - Apply decay: h = decay * h (from g, g_gamma, or gk/gv gates)
+       - Outer product update: h = h + k_t^T @ v_t
+       - Query output: o_t = h @ (q_t * scale)
+    2. Return outputs and final state
+
+Gating Mechanisms:
+    - g: GLA-style gating with learned per-element decay
+    - g_gamma: Lightning attention with per-head scalar decay
+    - gk/gv: Separate key and value gating
+
+Features:
+    - O(N) complexity via recurrent formulation
+    - Multiple gating variants (GLA, Lightning, etc.)
+    - Variable-length sequence support via cu_seqlens
+    - Bidirectional support via reverse flag
+    - Hidden state tracking for chunked inference
+
+Note:
+    This uses jax.lax.scan for efficient sequential computation.
+    The hidden state h has shape [batch, heads, key_dim, value_dim].
+"""
 
 import jax
 import jax.numpy as jnp
