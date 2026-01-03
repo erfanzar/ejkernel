@@ -18,6 +18,41 @@
 This module defines configuration dataclasses for each attention operation,
 providing type-safe, operation-specific parameters for kernel execution
 and autotuning.
+
+Configuration Hierarchy:
+    BaseOperationConfig
+    ├── FlashAttentionConfig (block sizes via FwdParams/BwdParams)
+    ├── BlockSparseAttentionConfig (sparse patterns + block sizes)
+    ├── NativeSparseAttentionConfig (block_q, block_k, block_d, block_size)
+    ├── PageAttentionConfig (num_splits, pages_per_compute_block)
+    ├── RingAttentionConfig (distributed attention)
+    ├── FlashMLAConfig (block_q, block_k for MLA)
+    ├── GroupedMatmulConfig (block_m, block_n, block_k for MoE)
+    ├── MeanPoolingConfig (block_size for pooling)
+    ├── KernelDeltaAttentionConfig (linear attention)
+    ├── RWKV4Config, RWKV6Config, RWKV7Config (recurrent models)
+    └── StateSpaceV1Config, StateSpaceV2Config (Mamba-style SSMs)
+
+Common Parameters:
+    All configs inherit from BaseOperationConfig which provides:
+        - platform: Target execution platform (triton/pallas/cuda/xla/auto)
+        - backend: Hardware backend (gpu/tpu/cpu/any)
+
+Block Size Guidelines:
+    - GPU (Triton): 64-256 for query/key blocks, 4-8 warps
+    - TPU (Pallas): 128-256 for larger tiles to leverage matrix units
+    - XLA: Block sizes are hints; XLA compiler optimizes automatically
+
+Example:
+    >>> from ejkernel.modules.operations import FlashAttention, FlashAttentionConfig
+    >>> from ejkernel.ops import FwdParams
+    >>>
+    >>> # Custom configuration for flash attention
+    >>> cfg = FlashAttentionConfig(
+    ...     fwd_params=FwdParams(q_blocksize=128, kv_blocksize=128),
+    ...     platform="triton",
+    ... )
+    >>> output = flash_attention(q, k, v, causal=True, cfg=cfg)
 """
 
 import hashlib
@@ -72,7 +107,29 @@ def hash_fn(self) -> int:
 
 @dataclass
 class BaseOperationConfig:
-    """Base configuration for all operations."""
+    """Base configuration for all operations.
+
+    This is the parent class for all operation-specific configurations.
+    It provides common platform and backend selection parameters that
+    are inherited by all specialized configurations.
+
+    Args:
+        platform: Target execution platform for kernel dispatch.
+            - "triton": Triton GPU kernels (NVIDIA/AMD GPUs)
+            - "pallas": Pallas kernels (TPU/GPU)
+            - "cuda": CUDA-specific implementations
+            - "xla": XLA compiler-based implementations (most portable)
+            - "auto": Automatic platform selection based on hardware (default)
+        backend: Target hardware backend specification.
+            - "gpu": GPU-specific optimizations
+            - "tpu": TPU-specific optimizations
+            - "cpu": CPU-specific optimizations
+            - "any": No backend preference (default)
+
+    Note:
+        When platform is "xla", the backend is automatically set to "any"
+        since XLA handles backend selection internally.
+    """
 
     platform: Literal["triton", "pallas", "cuda", "xla", "auto"] = "auto"
     backend: str = "any"
@@ -476,7 +533,22 @@ class KernelDeltaAttentionConfig(BaseOperationConfig):
 
 @dataclass
 class RWKV4Config(BaseOperationConfig):
-    """Configuration for RWKV-4 recurrence operation."""
+    """Configuration for RWKV-4 recurrence operation.
+
+    RWKV-4 uses a linear attention mechanism with time-decay factors and
+    gating for efficient language modeling without quadratic complexity.
+
+    The core operation computes:
+        wkv_t = sum_{i<t} exp(-w*(t-i)) * k_i * v_i + u * k_t * v_t
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+
+    Note:
+        This operation currently uses XLA implementation without
+        tunable block sizes.
+    """
 
     pass
 
@@ -485,7 +557,23 @@ class RWKV4Config(BaseOperationConfig):
 
 @dataclass
 class RWKV6Config(BaseOperationConfig):
-    """Configuration for RWKV-6 recurrence operation."""
+    """Configuration for RWKV-6 recurrence operation.
+
+    RWKV-6 extends RWKV-4 with token-dependent decay factors (w parameter),
+    allowing the model to learn how long to retain information per token.
+
+    Key improvements over RWKV-4:
+        - Token-dependent time decay (learned per-position)
+        - Improved receptance gating mechanism
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+
+    Note:
+        This operation currently uses XLA implementation without
+        tunable block sizes.
+    """
 
     pass
 
@@ -494,7 +582,19 @@ class RWKV6Config(BaseOperationConfig):
 
 @dataclass
 class RWKV7Config(BaseOperationConfig):
-    """Configuration for RWKV-7 recurrence operation."""
+    """Configuration for RWKV-7 recurrence operation.
+
+    RWKV-7 introduces additional improvements to the RWKV architecture
+    with enhanced state update mechanisms and gating operations.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+
+    Note:
+        This operation currently uses XLA implementation without
+        tunable block sizes.
+    """
 
     pass
 
@@ -503,7 +603,20 @@ class RWKV7Config(BaseOperationConfig):
 
 @dataclass
 class RWKV7MulConfig(BaseOperationConfig):
-    """Configuration for RWKV-7 multiplicative recurrence operation."""
+    """Configuration for RWKV-7 multiplicative recurrence operation.
+
+    This variant of RWKV-7 uses multiplicative state updates instead
+    of additive updates, providing different expressiveness characteristics
+    for sequence modeling tasks.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+
+    Note:
+        This operation currently uses XLA implementation without
+        tunable block sizes.
+    """
 
     pass
 

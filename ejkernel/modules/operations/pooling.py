@@ -22,8 +22,40 @@ for JAX execution. Mean pooling is particularly useful for:
     - Feature aggregation across time steps
     - Dimensionality reduction in transformer outputs
 
-The implementation supports variable-length sequences via cumulative sequence
-lengths, enabling efficient batched processing of sequences with different lengths.
+Key Features:
+    - Efficient mean computation over sequence dimension
+    - Support for variable-length sequences via cu_seqlens
+    - Configurable chunk size for memory-efficient processing
+    - Automatic platform selection (Triton/Pallas/XLA/CUDA)
+    - Proper handling of padding in variable-length scenarios
+
+Mathematical Formulation:
+    For fixed-length sequences:
+        output[b, :] = mean(x[b, :seq_len, :], axis=0)
+
+    For variable-length sequences with cu_seqlens:
+        output[i, :] = mean(x[cu_seqlens[i]:cu_seqlens[i+1], :], axis=0)
+
+Use Cases:
+    - Sentence-BERT style embeddings (pooling token representations)
+    - Text classification (reducing sequence to fixed-size representation)
+    - Document embedding for retrieval systems
+    - Feature aggregation in encoder-only models
+
+Example:
+    >>> from ejkernel.modules.operations import mean_pooling
+    >>> import jax.numpy as jnp
+    >>>
+    >>> # Basic mean pooling
+    >>> x = jnp.ones((2, 128, 768))  # batch=2, seq_len=128, hidden=768
+    >>> pooled = mean_pooling(x)  # [2, 768]
+    >>>
+    >>> # With variable-length sequences
+    >>> cu_seqlens = jnp.array([0, 50, 128])  # two sequences of lengths 50 and 78
+    >>> pooled = mean_pooling(x, cu_seqlens=cu_seqlens)
+
+References:
+    - Sentence-BERT: https://arxiv.org/abs/1908.10084
 """
 
 from __future__ import annotations
@@ -67,7 +99,11 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
     """
 
     def __init__(self):
-        """Initialize Mean Pooling module."""
+        """Initialize Mean Pooling module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="mean_pooling")
 
     def get_impl(self, cfg: MeanPoolingConfig):

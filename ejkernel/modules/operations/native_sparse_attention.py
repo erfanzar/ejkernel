@@ -19,14 +19,53 @@ This module implements native sparse attention using explicit block indices to
 define sparsity patterns. Unlike block-sparse attention which uses mask builders,
 this implementation directly specifies which blocks to attend to via index arrays.
 
+Key Features:
+    - Direct block index specification for maximum sparsity control
+    - Configurable block sizes for compute/memory trade-offs
+    - Support for Grouped Query Attention (GQA)
+    - Gating mechanisms (g_cmp, g_slc) for hybrid attention patterns
+    - Variable-length sequence support via cu_seqlens
+    - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
 This approach is particularly efficient when:
     - The sparse pattern is known ahead of time
     - Block indices can be precomputed and reused
     - Fine-grained control over sparsity is needed
+    - Long sequences require sub-quadratic complexity
 
-The sparse pattern is defined by block_indices and block_counts arrays, allowing
-flexible sparse attention patterns like local windows, strided patterns, or
-custom document-structure-aware sparsity.
+The Sparsity Pattern:
+    The sparse pattern is defined by block_indices and block_counts arrays:
+        - block_indices[batch, num_kv_heads, q_block, k_block]: Which key blocks to attend
+        - block_counts: Number of key blocks per query block (int or per-block array)
+
+    Example patterns:
+        - Local window: Attend to nearby blocks only
+        - Strided: Attend to every N-th block for global context
+        - Document-aware: Custom patterns based on document structure
+
+Use Cases:
+    - Long document processing (>32K tokens)
+    - Efficient inference with structured sparsity
+    - Hybrid local-global attention patterns
+    - Memory-constrained deployment
+
+Example:
+    >>> from ejkernel.modules.operations import native_sparse_attention
+    >>>
+    >>> # Basic sparse attention with default block pattern
+    >>> output = native_sparse_attention(query, key, value)
+    >>>
+    >>> # Custom sparse pattern with explicit indices
+    >>> output = native_sparse_attention(
+    ...     query, key, value,
+    ...     block_indices=custom_indices,
+    ...     block_counts=num_selected_blocks,
+    ... )
+
+References:
+    - Longformer: https://arxiv.org/abs/2004.05150
+    - BigBird: https://arxiv.org/abs/2007.14062
+    - Native Sparse Attention (NSA): https://arxiv.org/abs/2502.11089
 """
 
 from __future__ import annotations
@@ -73,7 +112,11 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
     """
 
     def __init__(self):
-        """Initialize Native Sparse Attention module."""
+        """Initialize Native Sparse Attention module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="native_sparse_attention")
 
     def get_impl(self, cfg: NativeSparseAttentionConfig):
@@ -112,6 +155,12 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
             query: Query tensor [batch, seq_len, num_heads, head_dim]
             key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
             value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
+            g_cmp: Optional compression gate weights [batch, seq_len, num_q_heads].
+                Used for gated sparse attention to modulate the compressed path.
+                When provided, scales the attention output from compressed tokens.
+            g_slc: Optional selection gate weights [batch, seq_len, num_q_heads].
+                Used for gated sparse attention to modulate the selected path.
+                When provided, scales the attention output from selected tokens.
             block_indices: Indices of key blocks to attend to for each query block
                 [batch, num_kv_heads, num_query_blocks, num_keys_blocks]
             block_counts: Number of key blocks per query block (can be int or array)
@@ -352,30 +401,48 @@ def native_sparse_attention(
     """Execute native sparse attention with automatic optimization.
 
     Sparse attention computes attention only on specified blocks or patterns,
-    reducing computational cost for long sequences.
+    reducing computational cost for long sequences. This is particularly useful
+    for models that need to process very long contexts efficiently.
 
     Args:
         query: Query tensor [batch, seq_len, num_heads, head_dim]
         key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
         value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
-        block_indices: Indices of blocks to attend to
+        g_cmp: Optional compression gate weights [batch, seq_len, num_q_heads]
+            for gated sparse attention patterns
+        g_slc: Optional slice gate weights [batch, seq_len, num_q_heads]
+            for controlling attention slice contributions
+        block_indices: Indices of blocks to attend to for each query block
+            [batch, num_kv_heads, num_query_blocks, num_keys_blocks]
         block_counts: Number of blocks per query block (default: 16)
-        softmax_scale: Scaling factor for attention
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
+        softmax_scale: Scaling factor for attention (default: 1/sqrt(head_dim))
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        cfg: Optional configuration override
 
     Returns:
-        Attention output with same shape as query
+        Attention output [batch, seq_len, num_q_heads, head_dim]
 
     Example:
-        >>>
+        >>> # Basic sparse attention with default block pattern
         >>> out = native_sparse_attention(query, key, value)
-        >>>
-        >>>
+
+        >>> # With custom block count
         >>> out = native_sparse_attention(query, key, value, block_counts=32)
-        >>>
-        >>>
+
+        >>> # With explicit block indices for custom sparse pattern
+        >>> out = native_sparse_attention(
+        ...     query, key, value,
+        ...     block_indices=custom_indices,
+        ...     block_counts=num_selected,
+        ... )
+
+        >>> # Force specific platform
         >>> out = native_sparse_attention(query, key, value, platform="triton")
+
+    Note:
+        When block_indices is None, a default sparse pattern is used.
+        Providing explicit indices gives full control over the sparsity pattern.
     """
     return _sparse_executor(
         NativeSparseAttention(),

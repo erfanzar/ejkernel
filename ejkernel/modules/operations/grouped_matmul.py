@@ -20,12 +20,53 @@ batched matrix multiplication with variable group sizes. This is particularly
 useful for mixture-of-experts models, grouped convolutions, and other scenarios
 where different groups of inputs need to be multiplied with different weight matrices.
 
+Key Features:
+    - Variable group size support for dynamic routing
+    - Configurable tiling (block_m, block_n, block_k) for cache optimization
+    - Support for RHS transposition (for weight matrix layouts)
+    - Optional output accumulation for multi-pass operations
+    - Distributed execution via shard_map wrapper
+    - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
 Unlike standard batched matrix multiplication which assumes uniform batch sizes,
 grouped matmul handles variable-sized groups efficiently by:
     1. Processing groups of different sizes in a single operation
     2. Optimized memory access patterns for grouped computation
     3. Support for both transposed and non-transposed RHS matrices
     4. Optional accumulation into existing output tensors
+
+Mathematical Formulation:
+    Given:
+        - lhs: [m, k] where m = sum(group_sizes)
+        - rhs: [num_groups, k, n] (or [num_groups, n, k] if transposed)
+        - group_sizes: [num_groups] defining partitions of lhs
+
+    Output[i:j, :] = lhs[i:j, :] @ rhs[g, :, :]
+    where i:j spans the g-th group
+
+Use Cases:
+    - Mixture-of-Experts (MoE) layers with dynamic token routing
+    - Grouped linear layers with different weights per group
+    - Dynamic routing architectures in transformers
+    - Efficient expert parallelism in large models
+
+Example:
+    >>> from ejkernel.modules.operations import grouped_matmul
+    >>> import jax.numpy as jnp
+    >>>
+    >>> # MoE-style grouped computation
+    >>> lhs = jnp.ones((100, 64))  # 100 tokens, 64 features
+    >>> rhs = jnp.ones((4, 64, 128))  # 4 experts, input->output
+    >>> group_sizes = jnp.array([30, 25, 25, 20])  # tokens per expert
+    >>> output = grouped_matmul(lhs, rhs, group_sizes)  # [100, 128]
+    >>>
+    >>> # With transposed weights
+    >>> rhs_t = jnp.ones((4, 128, 64))  # transposed layout
+    >>> output = grouped_matmul(lhs, rhs_t, group_sizes, transpose_rhs=True)
+
+References:
+    - Mixture of Experts (Switch Transformer): https://arxiv.org/abs/2101.03961
+    - Megablocks: https://arxiv.org/abs/2211.15841
 """
 
 from __future__ import annotations
@@ -78,7 +119,15 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
     """
 
     def __init__(self, use_v2: bool = False):
-        """Initialize Grouped Matmul module."""
+        """Initialize Grouped Matmul module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+
+        Args:
+            use_v2: If True, use the v2 implementation of grouped matmul
+                which may have different performance characteristics.
+        """
         super().__init__(op_id="grouped_matmulv2" if use_v2 else "grouped_matmul")
 
     def get_impl(self, cfg: GroupedMatmulConfig):
@@ -117,17 +166,33 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         out_specs: PartitionSpec | None = None,
         check_vma: bool = False,
     ):
-        """Create a shard_map wrapper specifically for blocksparse attention.
+        """Create a shard_map wrapper for distributed grouped matmul execution.
+
+        Wraps the grouped matrix multiplication operation for execution across
+        a distributed device mesh using JAX's shard_map primitive.
 
         Args:
-            mesh: JAX device mesh
+            lhs: Left-hand side matrix [m, k] (typically activations)
+            rhs: Right-hand side grouped matrices [num_groups, k, n] or [num_groups, n, k]
+            group_sizes: Size of each group [num_groups], sum(group_sizes) == m
+            preferred_element_type: Preferred dtype for computation (default: float32)
+            group_offset: Optional offset into groups for partial computation
+            existing_out: Optional existing output to accumulate into [m, n]
+            transpose_rhs: Whether RHS matrices are transposed
+            interpret: Use interpreted mode (for debugging)
+            do_padding: Whether to pad lhs to block_m alignment
+            precision: Computation precision setting
+            out_shard_callback: Optional callback to apply to output after computation
+            platform: Platform to use for kernel execution
+            cfg: Configuration for the kernel (block sizes, etc.)
+            mesh: JAX device mesh for distributed execution
             in_specs: Input partition specs (must match length of tensor args)
             out_specs: Output partition spec
-            query, key, value: Input tensors to be sharded
-            All other args: Blocksparse attention parameters
+            check_vma: Whether to check for valid memory access patterns
 
         Returns:
-            Tuple of (shard_map_fn, call_args)
+            Tuple of (shard_map_fn, call_args, callback) where callback handles
+            unpadding of the result if padding was applied
         """
         assert mesh is not None, "mesh must be provided for shard_map execution"
         assert in_specs is not None, "in_specs must be provided for shard_map execution"
@@ -138,11 +203,11 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
             padded_size = cfg.block_m - mSize % cfg.block_m
             lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
 
-        def _wrapped_blocksparse_attn(
+        def _wrapped_grouped_matmul(
             lhs: Float[Array, "m k"],
             rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
             group_sizes: Int[Array, "num_groups_or_shards"],
-        ) -> Float[Array, "batch seq_len num_heads head_dim"]:
+        ) -> Float[Array, "m n"]:
             out = self.run(
                 lhs=lhs,
                 rhs=rhs,
@@ -166,7 +231,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
 
         shard_map_fn = shard_map(
-            _wrapped_blocksparse_attn,
+            _wrapped_grouped_matmul,
             mesh=mesh,
             in_specs=in_specs,
             out_specs=out_specs,

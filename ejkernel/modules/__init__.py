@@ -18,29 +18,58 @@
 This module provides user-friendly interfaces for kernel operations using the
 ejkernel.ops framework for automatic configuration management and performance tuning.
 
-Available Modules:
-    Operations:
-        - FlashAttention: Memory-efficient exact attention
-        - BlockSparseAttention: Memory-efficient Sparse attention
-        - PageAttention: Paged KV cache attention for serving
-        - RaggedPageAttentionv2: Variable-length page attention
-        - NativeSparseAttention: Block-wise sparse attention
-        - Recurrent: Linear-time recurrent attention
-        - GLAttention: Gated linear attention
+Available Attention Modules:
+    Standard Attention:
+        - Attention: Standard multi-head attention with XLA optimization
+        - FlashAttention: Memory-efficient O(N) complexity attention
+        - ScaledDotProductAttention: Standard scaled dot-product attention
+
+    Paged/Serving Attention:
+        - PageAttention: Paged KV cache for decode phase
+        - PrefillPageAttention: Chunked prefill with paged KV cache
+        - RaggedPageAttentionv2: Page attention for variable-length sequences
+        - RaggedPageAttentionv3: Advanced variable-length page attention
+
+    Sparse Attention:
+        - BlockSparseAttention: Memory-efficient block-sparse attention
+        - NativeSparseAttention: Sparse attention with explicit block patterns
+
+    Linear/Recurrent Attention:
+        - GLAttention: Gated linear attention mechanism
         - LightningAttention: Lightning attention with decay
-        - RingAttention: Distributed ring attention
-        - MeanPooling: Efficient sequence mean pooling
-        - GroupedMatmul: Grouped matrix multiplication
+        - KernelDeltaAttention: Linear attention with delta rule updates
+        - RecurrentAttention: Stateful recurrent attention
+
+    Distributed Attention:
+        - RingAttention: Distributed attention with ring topology
+
+    Memory-Efficient Attention:
+        - FlashMLA: Multi-head latent attention with low-rank KV compression
+
+Linear Recurrent Models:
+    - RWKV4: Linear attention with time-decay
+    - RWKV6: Enhanced RWKV with token-dependent decay
+    - RWKV7: Latest RWKV with improved state updates
+    - RWKV7Mul: RWKV-7 with multiplicative state updates
+
+State Space Models:
+    - StateSpaceV1: Mamba-1 style selective state space model
+    - StateSpaceV2: Mamba-2 style selective state space model
+
+Additional Operations:
+    - GroupedMatmul: Efficient grouped matrix multiplication (for MoE)
+    - MeanPooling: Sequence mean pooling operation
 
 Example:
-    >>> from ejkernel.modules import FlashAttention, create_default_executor
+    >>> from ejkernel.modules import FlashAttention
     >>>
-    >>>
-    >>> executor = create_default_executor("/tmp/kernel_cache")
-    >>>
-    >>>
+    >>> # Basic usage
     >>> attn = FlashAttention()
-    >>> output = executor(attn, q, k, v, causal=True)
+    >>> output = attn.run(q, k, v, causal=True, cfg=attn.heuristic_cfg(None))
+
+    >>> # Using the functional interface with auto-optimization
+    >>> from ejkernel.modules import flash_attention
+    >>> output = flash_attention(q, k, v, causal=True)
 """
 
 from .operations import (
@@ -68,6 +97,7 @@ from .operations import (
     LightningAttention,
     LightningAttentionConfig,
     MeanPooling,
+    MeanPoolingConfig,
     NativeSparseAttention,
     NativeSparseAttentionConfig,
     PageAttention,
@@ -152,6 +182,7 @@ __all__ = (
     "LightningAttention",
     "LightningAttentionConfig",
     "MeanPooling",
+    "MeanPoolingConfig",
     "NativeSparseAttention",
     "NativeSparseAttentionConfig",
     "PageAttention",

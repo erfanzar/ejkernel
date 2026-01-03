@@ -22,19 +22,31 @@ platform selection (XLA, Triton, Pallas, CUDA) and optional autotuning.
 Available Attention Variants:
     - Attention: Standard multi-head attention with XLA optimization
     - FlashAttention: Memory-efficient O(N) complexity attention
-    - FlashMLA: Multi-head latent attention with low-rank compression
+    - FlashMLA: Multi-head latent attention with low-rank KV compression
     - GLAttention: Gated linear attention mechanism
+    - KernelDeltaAttention: Linear attention with delta rule updates (O(N))
     - LightningAttention: Layer-aware attention optimization
-    - NativeSparseAttention: Sparse attention with block patterns
+    - NativeSparseAttention: Sparse attention with explicit block patterns
     - PageAttention: Paged KV cache for serving workloads
+    - PrefillPageAttention: Chunked prefill attention with paged KV cache
     - RaggedPageAttentionv2: Page attention for variable-length sequences
     - RaggedPageAttentionv3: Advanced page attention for variable-length sequences v3
     - RecurrentAttention: Stateful recurrent attention
     - RingAttention: Distributed attention with ring topology
     - ScaledDotProductAttention: Standard scaled dot-product attention
 
+Linear Recurrent Models:
+    - RWKV4: Linear attention with time-decay (efficient language modeling)
+    - RWKV6: Enhanced RWKV with token-dependent decay
+    - RWKV7: Latest RWKV with improved state updates
+    - RWKV7Mul: RWKV-7 with multiplicative state updates
+
+State Space Models:
+    - StateSpaceV1: Mamba-1 style selective state space model
+    - StateSpaceV2: Mamba-2 style selective state space model
+
 Additional Operations:
-    - GroupedMatmul: Efficient grouped matrix multiplication
+    - GroupedMatmul: Efficient grouped matrix multiplication (for MoE)
     - MeanPooling: Sequence mean pooling operation
 
 Features:
@@ -48,16 +60,24 @@ Features:
 Example:
     >>> from ejkernel.modules.operations import flash_attention
     >>>
-    >>>
+    >>> # Basic causal attention
     >>> output = flash_attention(query, key, value, causal=True)
     >>>
-    >>>
+    >>> # With all features
     >>> output = flash_attention(
     ...     query, key, value,
     ...     softmax_scale=0.125,
     ...     dropout_prob=0.1,
     ...     sliding_window=(256, 256)
     ... )
+
+    >>> # Using MLA for memory-efficient inference
+    >>> from ejkernel.modules.operations import flash_mla
+    >>> output = flash_mla(query, key_value, w_kc, w_vc, causal=True)
+
+    >>> # Using linear attention for O(N) complexity
+    >>> from ejkernel.modules.operations import kernel_delta_attention
+    >>> output = kernel_delta_attention(query, key, value, beta, decay)
 
 Note:
     All attention functions automatically handle mixed precision and
@@ -78,6 +98,7 @@ from .configs import (
     GroupedMatmulConfig,
     KernelDeltaAttentionConfig,
     LightningAttentionConfig,
+    MeanPoolingConfig,
     NativeSparseAttentionConfig,
     PageAttentionConfig,
     PrefillPageAttentionConfig,
@@ -144,6 +165,7 @@ __all__ = (
     "LightningAttention",
     "LightningAttentionConfig",
     "MeanPooling",
+    "MeanPoolingConfig",
     "NativeSparseAttention",
     "NativeSparseAttentionConfig",
     "PageAttention",
