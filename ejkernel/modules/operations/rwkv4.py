@@ -85,12 +85,32 @@ class RWKV4(Kernel[RWKV4Config, Array]):
 
     Implements the numerically-stable RWKV-4 recurrence as described in
     Flash-Linear-Attention's fused recurrent formulation. The state tracks
-    three components (alpha, beta, eps) for numerical stability.
+    three components (alpha, beta, eps) for numerical stability, achieving
+    O(N) complexity with O(C) memory where C is the channel dimension.
+
+    Features:
+        - Numerically stable log-space computation
+        - Three-component state tracking (alpha, beta, eps)
+        - Support for chunked processing via state continuation
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+        - Automatic platform selection for optimal performance
 
     The recurrence computes:
         tau = max(u + k_t, eps)
         wkv_t = (exp(eps - tau) * alpha + exp(u + k_t - tau) * v_t) /
                 (exp(eps - tau) * beta + exp(u + k_t - tau))
+
+    Example:
+        >>> from ejkernel.modules import RWKV4, create_default_executor
+        >>>
+        >>> # Basic usage
+        >>> executor = create_default_executor()
+        >>> rwkv = RWKV4()
+        >>> output = executor(rwkv, w, u, k, v)
+        >>>
+        >>> # Chunked processing with state
+        >>> output, state = executor(rwkv, w, u, k, v, return_state=True)
+        >>> output2, state = executor(rwkv, w, u, k2, v2, state=state, return_state=True)
 
     Attributes:
         op_id: Operation identifier ("rwkv4").
