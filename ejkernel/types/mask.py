@@ -321,15 +321,34 @@ def mask_to_segment_ids(mask: jnp.ndarray, per_head: bool = False) -> tuple[jnp.
 
 def _positions_from_segments_2d(segment_ids: jnp.ndarray, *, pad_value: int) -> jnp.ndarray:
     """
-    Compute 0-based positions per segment (reset at boundaries).
-    Padding (-1) gets pad_value.
+    Compute 0-based positions per segment with reset at segment boundaries.
+
+    For each token, computes its position within its segment. Position counting
+    starts at 0 for the first token of each segment and increments for subsequent
+    tokens in the same segment. Padding tokens (segment_id == -1) receive the
+    specified pad_value instead.
+
+    This is useful for computing relative position encodings in packed sequences
+    where multiple segments are concatenated together.
 
     Args:
-        segment_ids: int32 array (batch, seqlen), -1 = padding, non-negative = segment id
-        pad_value: value for padding positions (e.g. -1 for Q, int32_max for KV)
+        segment_ids: int32 array of shape (batch, seqlen) where:
+            - Non-negative values indicate segment membership
+            - -1 indicates padding tokens
+        pad_value: Value to assign to padding positions. Common choices:
+            - -1 for query positions (to distinguish from valid positions)
+            - int32_max for KV positions (to create large distances)
 
     Returns:
-        positions: int32 array (batch, seqlen)
+        positions: int32 array of shape (batch, seqlen) with per-segment positions
+
+    Example:
+        >>> segment_ids = jnp.array([[-1, -1, 0, 0, 0, 1, 1, -1]])
+        >>> positions = _positions_from_segments_2d(segment_ids, pad_value=-1)
+        >>> positions
+        Array([[-1, -1, 0, 1, 2, 0, 1, -1]], dtype=int32)
+        >>> # Segment 0 has positions [0, 1, 2], segment 1 has positions [0, 1]
+        >>> # Padding tokens get -1
     """
     segment_ids = jnp.asarray(segment_ids, jnp.int32)
 
@@ -529,6 +548,24 @@ def segment_ids_to_qkv_masks(
 
 
 def _to_bool_mask(x: Array) -> Bool[Array, "..."]:
+    """
+    Convert an array to a boolean mask.
+
+    Converts any input array to a boolean array where non-zero values become True
+    and zero values become False. If the input is already boolean, returns it unchanged.
+
+    Args:
+        x: Input array of any dtype. Can be boolean, integer, or float.
+
+    Returns:
+        Boolean array with the same shape as input, where True indicates non-zero values
+
+    Example:
+        >>> _to_bool_mask(jnp.array([1, 0, 2, 0]))
+        Array([True, False, True, False], dtype=bool)
+        >>> _to_bool_mask(jnp.array([True, False]))  # Already boolean
+        Array([True, False], dtype=bool)
+    """
     x = jnp.asarray(x)
     return x if x.dtype == jnp.bool_ else (x != 0)
 
@@ -775,6 +812,32 @@ def qkv_cu_seqlens_to_qkv_masks(
 ) -> tuple[Array, Array]:
     """
     Convert Q/KV cumulative sequence lengths back into 2D padding masks.
+
+    Reconstructs per-token validity masks from start/end position pairs encoded
+    in cumulative sequence length format. This is the inverse operation of
+    qkv_masks_to_cu_seqlens.
+
+    Args:
+        cu_seqlens_q: Query cumulative sequence lengths of shape (batch * 2,) with
+            interleaved [start_0, end_0, start_1, end_1, ...] format.
+        max_q_len: Maximum query sequence length for the output mask.
+        cu_seqlens_kv: Key-value cumulative sequence lengths of shape (batch * 2,).
+            If None, uses cu_seqlens_q (self-attention case).
+        max_kv_len: Maximum key-value sequence length. If None, uses max_q_len.
+        dtype: Output dtype for the masks. Default: jnp.bool_
+
+    Returns:
+        Tuple of (q_mask, kv_mask) where:
+        - q_mask: (batch, max_q_len) mask with True for valid query positions
+        - kv_mask: (batch, max_kv_len) mask with True for valid key-value positions
+
+    Example:
+        >>> cu_seqlens = jnp.array([1, 4, 0, 3])  # Batch 0: [1,4), Batch 1: [0,3)
+        >>> q_mask, kv_mask = qkv_cu_seqlens_to_qkv_masks(cu_seqlens, max_q_len=5)
+        >>> q_mask[0]  # Valid at positions 1, 2, 3
+        Array([False, True, True, True, False], dtype=bool)
+        >>> q_mask[1]  # Valid at positions 0, 1, 2
+        Array([True, True, True, False, False], dtype=bool)
     """
     if max_kv_len is None:
         max_kv_len = max_q_len
@@ -795,10 +858,34 @@ def qkv_cu_seqlens_to_attention_mask(
     dtype: DTypeLike = jnp.bool_,
 ) -> Array:
     """
-    Convert Q/KV cumulative sequence lengths into a broadcastable 4D outer-product attention mask.
+    Convert Q/KV cumulative sequence lengths into a broadcastable 4D attention mask.
+
+    Constructs a pairwise attention mask from start/end position pairs, where
+    attention is allowed between valid query and key-value positions (outer product).
+    The resulting mask has a head dimension of 1 for broadcasting across attention heads.
+
+    Args:
+        cu_seqlens_q: Query cumulative sequence lengths of shape (batch * 2,) with
+            interleaved [start_0, end_0, start_1, end_1, ...] format.
+        max_q_len: Maximum query sequence length for the output mask.
+        cu_seqlens_kv: Key-value cumulative sequence lengths of shape (batch * 2,).
+            If None, uses cu_seqlens_q (self-attention case).
+        max_kv_len: Maximum key-value sequence length. If None, uses max_q_len.
+        dtype: Output dtype for the mask. Default: jnp.bool_
 
     Returns:
-        (batch, 1, max_q_len, max_kv_len) mask.
+        4D attention mask of shape (batch, 1, max_q_len, max_kv_len) where:
+        - The second dimension is 1 for broadcasting across heads
+        - True/1 indicates valid attention positions
+        - False/0 indicates masked positions
+
+    Example:
+        >>> cu_seqlens = jnp.array([0, 3, 1, 4])  # Batch 0: [0,3), Batch 1: [1,4)
+        >>> attn_mask = qkv_cu_seqlens_to_attention_mask(cu_seqlens, max_q_len=5)
+        >>> attn_mask.shape
+        (2, 1, 5, 5)
+        >>> attn_mask[0, 0, 0, 0]  # Query 0, KV 0 - both valid
+        Array(True, dtype=bool)
     """
     q_mask, kv_mask = qkv_cu_seqlens_to_qkv_masks(
         cu_seqlens_q,
@@ -821,10 +908,36 @@ def attention_mask_to_qkv_cu_seqlens(
     """
     Derive Q/KV cumulative sequence lengths from an attention mask.
 
-    Supported input shapes:
-        - (batch, seq_len): padding mask (self-attention)
-        - (batch, q_len, kv_len): pairwise mask
-        - (batch, heads, q_len, kv_len): pairwise mask
+    Extracts start/end position pairs from an attention mask by determining which
+    positions have valid attention. This is useful for converting dense attention
+    masks to the compact cumulative length format used by FlashAttention.
+
+    Args:
+        attention_mask: Attention mask array. Supported shapes:
+            - (batch, seq_len): 2D padding mask (self-attention)
+            - (batch, q_len, kv_len): 3D pairwise mask
+            - (batch, heads, q_len, kv_len): 4D multi-head mask
+        reduce_heads: Strategy for reducing across heads in 4D masks:
+            - "any": Position is valid if any head has valid attention (default)
+            - "all": Position is valid only if all heads have valid attention
+            - "first": Use only the first head (head index 0)
+        out_dtype: Output dtype for cumulative lengths. Default: jnp.int32
+
+    Returns:
+        Tuple of (cu_seqlens_q, cu_seqlens_kv), each with shape (batch * 2,) containing
+        interleaved [start_0, end_0, start_1, end_1, ...] where valid tokens for
+        batch i are at positions cu_seqlens[2*i] to cu_seqlens[2*i+1]-1.
+
+    Raises:
+        ValueError: If attention_mask is not 2D, 3D, or 4D, or if reduce_heads
+            is not one of ['any', 'all', 'first']
+
+    Example:
+        >>> # 2D padding mask
+        >>> mask = jnp.array([[True, True, True, False, False]])
+        >>> cu_q, cu_kv = attention_mask_to_qkv_cu_seqlens(mask)
+        >>> cu_q  # [start=0, end=3]
+        Array([0, 3], dtype=int32)
 
     Notes:
         For pairwise masks, a token is considered "present" if it participates in at least one
@@ -1112,6 +1225,23 @@ class MaskInfo:
 
     @property
     def q_attention_mask(self):
+        """
+        Get a 1D query attention mask from segment IDs.
+
+        Converts query segment IDs to a binary mask where valid tokens
+        (segment_id >= 0) get value 1 and padding tokens (segment_id == -1)
+        get value 0.
+
+        Returns:
+            Integer array of shape (batch, q_len) where:
+            - 1 indicates valid (non-padding) query positions
+            - 0 indicates padding positions
+
+        Example:
+            >>> mask_info = MaskInfo.from_segments(jnp.array([[1, 1, -1, -1]]))
+            >>> mask_info.q_attention_mask
+            Array([[1, 1, 0, 0]], dtype=int32)
+        """
         return jnp.where(self.q_segment_ids == -1, 0, 1)
 
     @property
@@ -1133,6 +1263,31 @@ class MaskInfo:
 
     @_debug_trace
     def materialize_attention_mask(self, dtype: DTypeLike = jnp.bool_) -> "MaskInfo":
+        """
+        Ensure the attention mask is materialized and return a new MaskInfo.
+
+        If an attention mask is already stored, returns self (or a dtype-converted copy).
+        If only segment IDs are available, computes the attention mask from them.
+        This is useful when you need to guarantee the attention mask exists before
+        performing mask-based operations.
+
+        Args:
+            dtype: Desired dtype for the attention mask. Default: jnp.bool_
+
+        Returns:
+            MaskInfo with a materialized attention mask. Returns self if mask already
+            exists with matching dtype, otherwise returns a new instance.
+
+        Raises:
+            ValueError: If neither attention_mask nor segment IDs are available
+                to compute the mask from.
+
+        Example:
+            >>> mask_info = MaskInfo.from_segments(jnp.array([[1, 1, 2, 2]]))
+            >>> materialized = mask_info.materialize_attention_mask()
+            >>> materialized.attention_mask is not None
+            True
+        """
         if self._attention_mask is not None:
             return (
                 self
@@ -1151,6 +1306,34 @@ class MaskInfo:
 
     @_debug_trace
     def materialize_segment_ids(self, per_head: bool = False) -> "MaskInfo":
+        """
+        Ensure segment IDs are materialized and return a new MaskInfo.
+
+        If segment IDs are already stored, returns self unchanged. If only an attention
+        mask is available, computes segment IDs from it by analyzing the attention pattern.
+        This is useful when you need to guarantee segment IDs exist for operations that
+        require segment-based representation.
+
+        Args:
+            per_head: If True and the attention mask is 4D, compute segment IDs separately
+                for each head, resulting in 3D segment IDs (batch, heads, seq). If False,
+                computes a single set of 2D segment IDs shared across heads. Default: False
+
+        Returns:
+            MaskInfo with materialized segment IDs. Returns self if segment IDs already
+            exist, otherwise returns a new instance with computed segment IDs.
+
+        Raises:
+            ValueError: If neither segment IDs nor attention_mask are available
+                to compute segment IDs from.
+
+        Example:
+            >>> mask = jnp.array([[[[1, 1, 0], [1, 1, 0], [0, 0, 1]]]], dtype=jnp.bool_)
+            >>> mask_info = MaskInfo.from_attention_mask(mask)
+            >>> materialized = mask_info.materialize_segment_ids()
+            >>> materialized.q_segment_ids is not None
+            True
+        """
         if self._q_segment_ids is not None and self._kv_segment_ids is not None:
             return self
         if self._attention_mask is None:
