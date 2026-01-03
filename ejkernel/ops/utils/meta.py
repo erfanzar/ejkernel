@@ -101,6 +101,8 @@ def label(op_id: str, call_hash: str, prefix: str | None = None) -> str:
     Args:
         op_id: Operation identifier with version (e.g., 'matmul@v1')
         call_hash: 16-character hash of the call signature
+        prefix: Optional custom prefix (default: 'ejkernel_ops#' or from
+            EJKERNEL_OPS_PREFIX environment variable)
 
     Returns:
         Formatted label string following ejkernel convention
@@ -108,6 +110,8 @@ def label(op_id: str, call_hash: str, prefix: str | None = None) -> str:
     Examples:
         >>> label('matmul@v1', '1a2b3c4d5e6f7g8h')
         'ejkernel_ops#matmul@v1:1a2b3c4d5e6f7g8h'
+        >>> label('conv@v2', 'abcd1234efgh5678', prefix='custom#')
+        'custom#conv@v2:abcd1234efgh5678'
     """
     chosen_prefix = prefix or os.getenv("EJKERNEL_OPS_PREFIX") or os.getenv("EJKERNEL_OPS_PREFIX") or "ejkernel_ops#"
     return f"{chosen_prefix}{op_id}:{call_hash}"

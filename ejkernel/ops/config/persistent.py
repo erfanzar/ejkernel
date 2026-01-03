@@ -88,13 +88,22 @@ class PersistentCache(Generic[Cfg]):
         """Initialize persistent cache with file path and optional serializers.
 
         Args:
-            path: File path for JSON storage
+            opname: Operation name used to generate default cache filename
+            path: File path for JSON storage (default: auto-generated from opname)
             loader: Optional function to deserialize stored data to Cfg type
             dumper: Optional function to serialize Cfg type for storage
+            cfg_type: Optional configuration type for automatic deserialization
 
         Note:
+            If path is not provided, the cache file is created at:
+            - $EJKERNEL_PERSISTENT_CACHE_DIR/{opname}.json (if env var set)
+            - ~/ejkernel-presistent-cache/{opname}.json (default)
+            - ./.ejkernel-presistent-cache/{opname}.json (fallback)
+            - $TMPDIR/ejkernel-presistent-cache/{opname}.json (last resort)
+
             If loader/dumper are not provided, automatic serialization is attempted
-            for dataclasses and Pydantic models. Raw values are stored as-is.
+            for dataclasses and Pydantic models. When cfg_type is provided and
+            loader is not, retrieved dicts are automatically converted to cfg_type.
         """
         self._disabled = False
         if path is None:
