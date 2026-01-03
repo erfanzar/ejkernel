@@ -13,6 +13,35 @@
 # limitations under the License.
 
 
+"""Pallas forward kernel implementation for ragged decode attention on GPU.
+
+This module contains the low-level Pallas kernel implementation for computing
+multi-head attention during the decoding phase with variable-length (ragged)
+sequences. The implementation uses JAX's Pallas with Triton backend for
+GPU-optimized execution.
+
+The kernel uses a tiled approach with configurable block sizes for heads and
+keys, enabling efficient parallel computation across GPU thread blocks. It
+implements online softmax (FlashAttention-style) to maintain numerical stability
+while minimizing memory access.
+
+Key Components:
+    AttentionConfigError: Custom exception for invalid kernel configurations.
+    forward_kernel: The core Pallas kernel that computes attention scores.
+    decode_attn_sequence: Orchestrates kernel execution for a single sequence.
+    _ragged_decode_attention_call: JIT-compiled entry point for batched execution.
+
+Implementation Details:
+    - Uses block-wise tiling for memory efficiency
+    - Implements online softmax for numerical stability
+    - Supports variable-length sequences via sequence_start/sequence_end
+    - Handles MHA, MQA, and GQA head configurations
+
+Note:
+    This is an internal module. Use the public API through
+    `ragged_decode_attention` from the parent package.
+"""
+
 from __future__ import annotations
 
 import functools
