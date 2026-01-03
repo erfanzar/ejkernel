@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Triton backend for RWKV-4 time-mix recurrence."""
+"""Triton backend for RWKV-4 Time-Mix Recurrence.
+
+This submodule provides GPU-optimized RWKV-4 time-mix computation using
+Triton kernels. RWKV-4 replaces quadratic attention with a recurrent
+formulation achieving O(N) complexity for sequence processing.
+
+Key Features:
+    - O(N) time complexity through recurrent state updates
+    - Numerically stable computation using log-space decay
+    - Stateful processing for autoregressive generation
+    - Custom forward pass with JAX VJP support
+"""
 
 from ._interface import rwkv4
 

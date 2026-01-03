@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Triton backend for RWKV-6 recurrence."""
+"""Triton backend for RWKV-6 Linear Attention Recurrence.
+
+This submodule provides GPU-optimized RWKV-6 linear attention using Triton
+kernels. RWKV-6 extends RWKV-4 with multi-head architecture and per-timestep
+time-decay parameters for more expressive sequence modeling.
+
+Key Features:
+    - O(N) time complexity with multi-head recurrent state
+    - Per-timestep, per-head decay rates for flexible information routing
+    - Variable sequence length support via cumulative lengths
+    - Bidirectional processing via reverse flag
+    - Custom Triton kernel with JAX VJP support
+"""
 
 from ._interface import rwkv6
 
