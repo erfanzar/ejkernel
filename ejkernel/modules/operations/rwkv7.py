@@ -86,8 +86,11 @@ from .configs import RWKV7Config, RWKV7MulConfig
 class RWKV7(Kernel[RWKV7Config, Array]):
     """RWKV-7 (a,b) DPLR recurrence wrapper.
 
-    Implements the RWKV-7 Diagonal + Low-Rank (DPLR) state update:
+    Implements the RWKV-7 Diagonal + Low-Rank (DPLR) state update, achieving
+    O(T) complexity with O(K×V) memory per head. The DPLR mechanism provides
+    richer state dynamics than purely diagonal decay.
 
+    State update equation:
         h_t = diag(exp(w_t)) @ h_{t-1} + a_t (b_t^T h_{t-1}) + k_t v_t^T
         o_t = r_t^T @ h_t
 
@@ -100,10 +103,29 @@ class RWKV7(Kernel[RWKV7Config, Array]):
         - Variable-length sequence handling via cumulative lengths
         - Bidirectional processing with reverse option
         - Multiple platform support (Triton/Pallas/CUDA/XLA)
+        - Automatic platform selection for optimal performance
 
     The low-rank term a_t (b_t^T h_{t-1}) enables selective mixing of
     information across the key dimension, providing richer dynamics than
     purely diagonal decay.
+
+    Example:
+        >>> from ejkernel.modules import RWKV7, create_default_executor
+        >>>
+        >>> # Basic usage
+        >>> executor = create_default_executor()
+        >>> rwkv = RWKV7()
+        >>> output = executor(rwkv, r, w, k, v, a, b)
+        >>>
+        >>> # Streaming inference with state
+        >>> output, state = executor(
+        ...     rwkv, r, w, k, v, a, b,
+        ...     initial_state=prev_state,
+        ...     return_state=True
+        ... )
+        >>>
+        >>> # Variable-length sequences
+        >>> output = executor(rwkv, r, w, k, v, a, b, cu_seqlens=cu_seqs)
 
     Attributes:
         op_id: Operation identifier ("rwkv7").
