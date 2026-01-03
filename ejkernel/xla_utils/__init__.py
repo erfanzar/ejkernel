@@ -13,10 +13,13 @@
 # limitations under the License.
 
 
-"""XLA-specific utilities for sequence processing and sharding.
+"""
+XLA-specific utilities for sequence processing and sharding.
 
 This module provides utilities for working with packed sequences, cumulative
-operations, and sharding specifications in JAX/XLA computations.
+operations, and sharding specifications in JAX/XLA computations. These utilities
+are essential for efficient transformer implementations with variable-length
+sequences and distributed training.
 
 Key Features:
     - Packed sequence utilities for efficient batch processing
@@ -24,29 +27,66 @@ Key Features:
     - Sharding utilities for distributed computation
     - Sequence reordering for ring attention patterns
 
+Packed Sequences:
+    Packed sequences concatenate multiple variable-length sequences into a single
+    tensor, using cumulative sequence lengths (cu_seqlens) to track boundaries.
+    This is more memory-efficient than padding all sequences to maximum length.
+
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.xla_utils import prepare_lens, prepare_position_ids
+    >>>
+    >>> # Three sequences of lengths 3, 2, 4 packed together
+    >>> cu_seqlens = jnp.array([0, 3, 5, 9])
+    >>> lens = prepare_lens(cu_seqlens)  # [3, 2, 4]
+    >>> pos_ids = prepare_position_ids(cu_seqlens)  # [0,1,2, 0,1, 0,1,2,3]
+
 Sequence Utilities:
+    - cdiv: Ceiling division for computing chunk/block counts
     - prepare_lens: Calculate sequence lengths from cumulative lengths
+    - prepare_lens_from_mask: Calculate lengths from attention mask
     - prepare_position_ids: Generate position IDs for packed sequences
     - prepare_sequence_ids: Generate sequence IDs for packed sequences
     - prepare_token_indices: Generate (seq_id, pos_id) pairs
     - prepare_chunk_indices: Generate chunk indices for tiled processing
+    - prepare_chunk_offsets: Generate cumulative chunk offsets
     - prepare_cu_seqlens_from_mask: Create cumulative lengths from masks
+    - identity_dtype_convert: Identity function with gradient dtype conversion
 
 Cumulative Sum Operations:
-    - chunk_local_cumsum: Chunked local cumulative sum for attention
-    - chunk_global_cumsum: Global cumulative sum with sequence boundaries
+    Used in linear attention mechanisms (GLA, RetNet, etc.) for computing
+    running sums of gating values or state accumulations.
+
+    - chunk_local_cumsum: Cumsum within fixed-size chunks (resets at boundaries)
+    - chunk_global_cumsum: Cumsum across entire sequence (respects boundaries)
+
+    >>> from ejkernel.xla_utils import chunk_local_cumsum
+    >>> # Chunked cumsum resets every chunk_size positions
+    >>> result = chunk_local_cumsum(g, chunk_size=128)
 
 Sharding Utilities:
-    - get_corrected_named_sharding: Create valid shardings for array shapes
-    - reorder_sequence: Reorder sequences for ring attention patterns
+    For distributed training with JAX device meshes.
+
+    - get_corrected_named_sharding: Create valid shardings by correcting specs
+    - reorder_sequence: Reorder sequences for ring attention communication
+
+    >>> from ejkernel.xla_utils import get_corrected_named_sharding
+    >>> from jax.sharding import PartitionSpec, Mesh
+    >>> sharding = get_corrected_named_sharding(shape, spec, mesh)
 
 Example:
-    >>> from ejkernel.xla_utils import prepare_position_ids
+    >>> from ejkernel.xla_utils import (
+    ...     prepare_position_ids,
+    ...     prepare_sequence_ids,
+    ...     prepare_cu_seqlens_from_mask,
+    ... )
     >>> import jax.numpy as jnp
     >>>
-    >>> cu_seqlens = jnp.array([0, 3, 5, 9])  # 3 sequences of lengths [3, 2, 4]
-    >>> position_ids = prepare_position_ids(cu_seqlens)
-    >>> # Returns: [0, 1, 2, 0, 1, 0, 1, 2, 3]
+    >>> # From attention mask to packed sequence utilities
+    >>> mask = jnp.array([[True, True, True, False],
+    ...                   [True, True, False, False]])
+    >>> cu_seqlens = prepare_cu_seqlens_from_mask(mask)  # [0, 3, 5]
+    >>> pos_ids = prepare_position_ids(cu_seqlens)  # [0, 1, 2, 0, 1]
+    >>> seq_ids = prepare_sequence_ids(cu_seqlens)  # [0, 0, 0, 1, 1]
 """
 
 from .cumsum import chunk_global_cumsum, chunk_local_cumsum
