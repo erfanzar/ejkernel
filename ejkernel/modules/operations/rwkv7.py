@@ -268,8 +268,9 @@ class RWKV7(Kernel[RWKV7Config, Array]):
 class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
     """RWKV-7 multiplicative (kk, a) parameterization wrapper.
 
-    A reparameterization of RWKV-7 using (kk, a) inputs instead of (a, b).
-    Internally converts to the standard DPLR form via:
+    A reparameterization of RWKV-7 using (kk, a) inputs instead of (a, b),
+    achieving O(T) complexity with O(K×V) memory per head. Internally converts
+    to the standard DPLR form via:
 
         a' = kk * a
         b' = -kk
@@ -282,9 +283,25 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
         - Automatic conversion to standard (a, b) form internally
         - Same multi-head and variable-length support as RWKV7
         - Multiple platform support (Triton/Pallas/CUDA/XLA)
+        - Automatic platform selection for optimal performance
 
     The multiplicative form can be more numerically stable in certain
     scenarios and is the preferred interface for some kernel implementations.
+
+    Example:
+        >>> from ejkernel.modules import RWKV7Mul, create_default_executor
+        >>>
+        >>> # Basic usage with multiplicative parameterization
+        >>> executor = create_default_executor()
+        >>> rwkv = RWKV7Mul()
+        >>> output = executor(rwkv, r, w, k, v, kk, a)
+        >>>
+        >>> # Streaming inference with state
+        >>> output, state = executor(
+        ...     rwkv, r, w, k, v, kk, a,
+        ...     initial_state=prev_state,
+        ...     return_state=True
+        ... )
 
     Attributes:
         op_id: Operation identifier ("rwkv7_mul").
