@@ -12,6 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Native Sparse Attention (NSA) forward pass Triton kernels.
+
+This module implements the forward pass for Native Sparse Attention,
+a learned sparse attention mechanism that dynamically selects which
+KV blocks to attend to based on compressed attention scores.
+
+Algorithm Overview:
+------------------
+1. Top-K Selection (nsa_kernel_topk):
+   - Compute attention scores against compressed (mean-pooled) keys
+   - Use bitonic sort to find top-K highest-scoring blocks
+   - Store block indices for selective attention
+
+2. Sparse Attention (nsa_fwd_kernel):
+   - For each query, attend only to selected KV blocks
+   - Accumulate results using online softmax
+   - Produces attention output and LSE for backward pass
+
+Sorting Utilities:
+-----------------
+- _compare_and_swap: Bitonic sort primitive
+- _bitonic_merge: Merge step of bitonic sort
+- argsort: GPU-friendly sorting returning indices
+
+Key Features:
+- Dynamic sparse attention patterns (not fixed masks)
+- Efficient top-K selection using bitonic sort
+- Variable-length sequence support (cu_seqlens)
+- Optional per-token block counts for adaptive sparsity
+- Grouped-query attention (GQA) support
+
+Memory Layout:
+-------------
+- Queries: [batch, seq_len, num_q_heads, head_dim]
+- Keys: [batch, seq_len, num_kv_heads, head_dim]
+- Values: [batch, seq_len, num_kv_heads, head_dim_v]
+- Block Indices: [batch, seq_len, num_kv_heads, max_blocks]
+
+Functions:
+- nsa_topk: Select top-K blocks per query position
+- fwd_triton_impl: Compute sparse attention output
+"""
 
 import jax
 import triton

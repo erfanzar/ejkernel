@@ -12,6 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Backward pass Triton kernels for mean pooling operations.
+
+This module provides gradient computation for mean pooling, enabling
+end-to-end training with GPU-accelerated pooling layers.
+
+Algorithm Overview:
+------------------
+The backward pass distributes the output gradient evenly across the sequence:
+    dx[i] = do / seq_length  for i in range(seq_start, seq_end)
+
+Since mean pooling averages over the sequence dimension, each input position
+receives an equal fraction of the output gradient.
+
+Memory Layout:
+-------------
+- do (output gradient): [batch, heads, dim] - gradient per sequence
+- dx (input gradient): [batch, sequence, heads, dim] or packed format
+- cu_seqlens: Cumulative sequence lengths for variable-length mode
+
+Key Features:
+------------
+- Efficient gradient broadcasting with chunked writes
+- Variable-length sequence support matching forward pass
+- Autotuned configurations for optimal performance
+- Memory-coalesced access patterns
+
+Functions:
+---------
+- bwd_kernel: Triton kernel for backward gradient computation
+- bwd_kernel_call: Python wrapper that handles kernel launch configuration
+"""
 
 import jax
 import triton

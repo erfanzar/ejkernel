@@ -12,6 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Chunked prefill with paged decode attention implementation.
+
+This module implements a hybrid attention strategy that combines chunked prefill
+for initial token processing with paged decode for efficient autoregressive generation.
+
+Algorithm Overview:
+------------------
+The algorithm operates in two phases:
+
+1. **Prefill Phase (Chunked)**: For new sequences, tokens are processed in chunks
+   using unified attention. This amortizes the cost of computing attention over
+   multiple tokens at once.
+
+2. **Decode Phase (Paged)**: For autoregressive generation, single tokens attend
+   to the block-tabled KV cache using paged attention patterns.
+
+Memory Layout:
+-------------
+- KV Cache: Block-tabled format [num_blocks, block_size, num_kv_heads, head_dim]
+- Block Tables: Logical-to-physical mapping [num_seqs, max_blocks_per_seq]
+- Queries/Keys/Values: Packed format [total_tokens, num_heads, head_dim]
+
+Key Features:
+------------
+- Efficient block-tabled KV cache updates with scatter operations
+- Support for grouped-query attention (GQA) configurations
+- Variable-length sequence support via cumulative position indices
+- Seamless integration of prefill and decode phases
+
+Functions:
+---------
+- _update_block_tabled_kv_cache: Update KV cache with new key/value pairs
+- chunked_prefill_paged_decode_attention: Main entry point for hybrid attention
+"""
+
 from __future__ import annotations
 
 import jax

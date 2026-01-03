@@ -12,6 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged paged attention v3 with inline KV cache updates.
+
+This module implements an advanced paged attention variant that performs
+KV cache updates inline with attention computation. It uses a 5D packed
+KV cache format optimized for memory efficiency and dtype packing.
+
+Core Algorithm:
+--------------
+1. Scatter new keys/values into the paged KV cache using block tables
+2. Compute attention over the updated cache with causal masking
+3. Support optional features: sliding window, attention sinks, FP8 scaling
+
+Memory Layout:
+-------------
+KV Cache (5D): [num_pages, page_size, heads_per_pack, pack_factor, head_dim_padded]
+  - Packs multiple KV heads for memory-efficient access
+  - Supports FP16/BF16 with 2x packing or FP32 with 1x packing
+  - Head dimension padded to 128 for aligned access
+
+Block Tables: [max_num_seqs * pages_per_seq] (flattened)
+  - Maps (sequence, page_index) to physical page numbers
+
+Distribution: [3] tensor containing [prefill_count, decode_count, num_seqs]
+  - Controls workload distribution between prefill and decode
+
+Key Features:
+- Inline KV cache scatter updates (donates cache buffer)
+- FP8 quantization support with Q/K/V scales
+- Sliding window attention with left-bound truncation
+- Attention sink integration for persistent tokens
+- Logit soft-capping for bounded attention scores
+
+Helper Functions:
+- _align_to: Round up to alignment multiple
+- _dtype_packing: Get packing factor for dtype
+- _merge_kv: Interleave and pack keys/values
+- _kv_update_scatter: Scatter new KV into cache
+
+Main Entry:
+- ragged_paged_attention_triton: Full interface with cache update
+"""
 
 from __future__ import annotations
 

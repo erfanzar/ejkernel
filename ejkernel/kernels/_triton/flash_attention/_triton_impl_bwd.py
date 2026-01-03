@@ -225,6 +225,41 @@ def _attn_bwd_dkdv(
     USE_SINKS: tl.constexpr,
     USE_SEGMENTS: tl.constexpr,
 ):
+    """Inner loop for computing dK and dV gradients in backward pass.
+
+    Accumulates gradients for key and value tensors across query blocks.
+    Recomputes attention weights from saved log-sum-exp values and applies
+    gradients from the output gradient tensor.
+
+    Args:
+        index_start_m: Starting query block index
+        k: Key block [BLOCK_N, head_dim]
+        v: Value block [BLOCK_N, head_dim]
+        dk: Accumulated key gradient [BLOCK_N, head_dim]
+        dv: Accumulated value gradient [BLOCK_N, head_dim]
+        M: Log-sum-exp values from forward pass
+        D: Delta values for efficient gradient computation
+        offs_m, offs_n, offs_d: Block offsets
+        q_ptrs: Pointer to query tensor
+        bias_ptrs: Pointer to optional bias tensor
+        dropout_offs: Offset for dropout mask
+        do_ptrs: Pointer to output gradient tensor
+        softmax_scale: Scaling factor for attention scores
+        stride_qm, stride_bm, stride_dom: Tensor strides
+        actual_seqlen_q, actual_seqlen_k: Actual sequence lengths
+        fully_masked_lines: Number of fully masked query lines
+        headdim: Head dimension size
+        q_segment_ids_ptr, kv_segment_ids_ptr: Segment ID pointers
+        stride_qsm, stride_ksn: Segment ID strides
+        window_left, window_right: Sliding window boundaries
+        logits_soft_cap: Soft cap value for logits
+        softmax_aux_ptrs: Attention sink values pointer
+        num_sinks: Number of sink tokens
+        MASKED, IS_CAUSAL, etc.: Compile-time configuration flags
+
+    Returns:
+        Updated (dk, dv) gradients
+    """
     BIG_NEG: tl.constexpr = -2147483648
     LN2: tl.constexpr = 1.44269504089
 
@@ -595,6 +630,41 @@ def _attn_bwd_dq(
     USE_SINKS: tl.constexpr,
     USE_SEGMENTS: tl.constexpr,
 ):
+    """Inner loop for computing dQ gradients in backward pass.
+
+    Accumulates gradients for query tensors across key-value blocks.
+    Recomputes attention weights from saved log-sum-exp values and applies
+    gradients from the output gradient tensor.
+
+    Args:
+        index_start_n: Starting KV block index
+        q: Query block [BLOCK_M, head_dim]
+        dq: Accumulated query gradient [BLOCK_M, head_dim]
+        do: Output gradient block [BLOCK_M, head_dim]
+        me_i: Log-sum-exp values from forward pass
+        de_i: Delta values for efficient gradient computation
+        offs_m, offs_n, offs_d: Block offsets
+        k_ptrs: Pointer to key tensor
+        v_ptrs: Pointer to value tensor
+        bias_ptrs: Pointer to optional bias tensor
+        dropout_offs: Offset for dropout mask
+        softmax_scale: Scaling factor for attention scores
+        dropout_prob: Dropout probability
+        dropout_seed: Random seed for dropout
+        stride_kn, stride_vn: Key/value strides
+        actual_seqlen_q, actual_seqlen_k: Actual sequence lengths
+        headdim: Head dimension size
+        q_segment_ids_ptr, kv_segment_ids_ptr: Segment ID pointers
+        stride_qsm, stride_ksn: Segment ID strides
+        window_left, window_right: Sliding window boundaries
+        logits_soft_cap: Soft cap value for logits
+        softmax_aux_ptrs: Attention sink values pointer
+        num_sinks: Number of sink tokens
+        MASKED, IS_CAUSAL, etc.: Compile-time configuration flags
+
+    Returns:
+        Updated dq gradient
+    """
     BIG_NEG: tl.constexpr = -2147483648
     LN2: tl.constexpr = 1.44269504089
 

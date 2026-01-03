@@ -12,6 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Forward pass Triton kernels for mean pooling operations.
+
+This module provides GPU-accelerated mean pooling over sequence dimensions,
+supporting both fixed-length and variable-length sequences.
+
+Algorithm Overview:
+------------------
+Mean pooling computes the average of hidden states across the sequence dimension:
+    output = sum(x[seq_start:seq_end], dim=0) / seq_length
+
+For variable-length sequences, each sequence in the batch may have a different
+length, and the pooling is done independently for each sequence.
+
+Memory Layout:
+-------------
+- Input: [batch, sequence, heads, dim] or packed [total_tokens, heads, dim]
+- Output: [batch, heads, dim] - one vector per sequence
+- cu_seqlens: Cumulative sequence lengths for variable-length mode
+
+Key Features:
+------------
+- Chunked processing for efficient memory access patterns
+- Autotuned block sizes for optimal GPU utilization
+- Variable-length sequence support via cumulative indices
+- Fused kernel implementation for reduced memory bandwidth
+
+Functions:
+---------
+- fwd_kernel: Triton kernel for forward mean pooling computation
+- fwd_kernel_call: Python wrapper that handles kernel launch configuration
+"""
 
 import jax
 import triton

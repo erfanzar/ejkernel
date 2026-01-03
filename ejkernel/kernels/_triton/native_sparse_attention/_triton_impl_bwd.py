@@ -12,6 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Native Sparse Attention (NSA) backward pass Triton kernels.
+
+This module implements gradient computation for Native Sparse Attention,
+enabling end-to-end training of models using learned sparse attention
+patterns.
+
+Backward Pass Algorithm:
+-----------------------
+1. Preprocess (bwd_kernel_preprocess):
+   - Compute delta = sum(output * d_output) per position
+   - Required for stable gradient computation
+
+2. Query Gradients (nsa_bwd_kernel_dq):
+   - Iterate over selected KV blocks for each query
+   - Accumulate dQ contributions using attention weights
+   - Scale by softmax_scale for proper gradient flow
+
+3. Key/Value Gradients (nsa_bwd_kernel_dkv):
+   - Use block mask to identify which queries attend to each KV block
+   - Compute dK and dV by iterating over attending queries
+   - Accumulate gradients across the value dimension splits
+
+Key Kernels:
+-----------
+nsa_bwd_kernel_dq:
+    Computes query gradients by recomputing attention weights and
+    propagating gradients through the softmax operation.
+
+nsa_bwd_kernel_dkv:
+    Computes key and value gradients using a transposed attention
+    pattern defined by the block mask.
+
+bwd_kernel_preprocess:
+    Preprocessing step computing element-wise product sum for
+    numerically stable softmax gradients.
+
+Memory Layout:
+-------------
+Same as forward pass, with additional:
+- Output: [batch, seq_len, num_q_heads, head_dim_v]
+- LSE: [batch, seq_len, num_q_heads] log-sum-exp values
+- Delta: [batch, seq_len, num_q_heads] precomputed for gradients
+- Block Mask: Boolean mask indicating valid (query, block) pairs
+
+Functions:
+- bwd_triton_impl: Main backward pass orchestrator
+"""
 
 import jax
 import triton

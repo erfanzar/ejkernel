@@ -12,6 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged decode attention with multi-query attention (MQA) support.
+
+This module implements decode attention for variable-length sequences
+using a ragged tensor layout. Each sequence can have different context
+lengths, specified by (start, end) indices into a shared KV buffer.
+
+Core Algorithm (ragged_decode_mqa_fwd_kernel):
+---------------------------------------------
+For each query position in a batch:
+1. Load query vector and determine valid KV range from (starts, ends)
+2. Iterate over KV blocks, applying sliding window constraints
+3. Compute QK^T scores with optional soft-capping
+4. Accumulate attention output using streaming softmax
+5. Optionally incorporate attention sink logits
+
+Key Features:
+- Variable-length sequence support via start/end indices
+- Sliding window attention with configurable left/right bounds
+- Attention sink support for persistent token importance
+- Logit soft-capping via stable tanh implementation
+- Multi-query attention (MQA) and grouped-query attention (GQA)
+
+Memory Layout:
+-------------
+- Queries: [batch, num_groups, head_dim]
+- Keys/Values: [batch, max_seq_len, head_dim] (ragged)
+- Starts/Ends: [batch] indices marking valid KV ranges
+- Auxiliary sinks: Optional [num_groups, num_sinks] for attention sinks
+
+The streaming softmax maintains running (max, sum, output) accumulators
+for numerically stable computation without materializing full attention
+matrices.
+
+Functions:
+- ragged_decode_mqa_fwd_kernel: Triton kernel for MQA decode
+- ragged_decode_mqa_triton: Python wrapper launching the kernel
+- inner_decode_triton: High-level interface handling GQA reshaping
+"""
 
 import jax
 import jax.numpy as jnp

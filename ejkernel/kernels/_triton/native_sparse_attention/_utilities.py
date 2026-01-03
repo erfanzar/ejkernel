@@ -12,6 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utility functions for Native Sparse Attention.
+
+This module provides helper functions for Native Sparse Attention,
+primarily for generating block masks used in the backward pass.
+
+Block Mask Generation:
+---------------------
+The block mask is a boolean tensor indicating which (query, KV block)
+pairs are valid attention targets. This is derived from the sparse
+block indices selected during the forward pass.
+
+For each query position:
+- Look up its selected block indices
+- Check if the block index is valid (within bounds and causal)
+- Optionally check against block_counts for adaptive sparsity
+
+Key Components:
+--------------
+nsa_kernel_mask:
+    Triton kernel that converts block indices to a dense mask format.
+    For each (query, selected_block) pair, marks the corresponding
+    position in the output mask as True.
+
+nsa_block_mask:
+    Python function that launches the mask generation kernel.
+    Handles variable-length sequences via cu_seqlens.
+
+Memory Layout:
+-------------
+- Block Indices: [batch, seq_len, num_kv_heads, num_selected_blocks]
+  Selected block indices per query position
+- Block Counts: [batch, seq_len, num_kv_heads] or int
+  Number of valid blocks per query (optional)
+- Block Mask: [batch, seq_len, num_kv_heads, num_blocks]
+  Output boolean mask for backward pass
+"""
 
 import jax
 import triton

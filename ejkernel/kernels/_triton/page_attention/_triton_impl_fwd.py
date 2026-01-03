@@ -12,6 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Paged attention kernels with optional partitioning for Triton.
+
+This module provides Triton kernels for paged attention computation, supporting
+both single-pass and partitioned attention modes. The partitioned mode splits
+large context windows across multiple partitions for improved parallelism.
+
+Kernel Components:
+-----------------
+_paged_attn_kernel:
+    Main attention kernel with autotune configurations. Computes attention
+    over block-tabled KV cache with optional partitioning for long contexts.
+    Uses log2-based softmax for numerical stability.
+
+_paged_attn_v2_reduce_kernel:
+    Reduction kernel for partitioned attention. Combines partial results
+    from multiple partitions using log-sum-exp weighted averaging.
+
+get_autotune_configs:
+    Generates Triton autotune configurations optimized for different
+    GPU architectures and workload sizes.
+
+Memory Layout:
+-------------
+KV caches use a block-tabled layout where:
+- Physical blocks are indexed via block_tables
+- Each block contains KV_BLOCK_SIZE tokens
+- Supports grouped-query attention (GQA) with QUERY_GROUP_SIZE
+
+Partitioning Strategy:
+---------------------
+For contexts exceeding PARTITION_SIZE tokens:
+1. Context is divided into ceil(context_len / PARTITION_SIZE) partitions
+2. Each partition computes local attention and stores (output, max, sum)
+3. Reduce kernel combines partitions using numerically stable reduction
+
+Key Features:
+- Autotuned for various GPU configurations
+- Supports GQA/MQA with flexible query group sizes
+- Efficient block-tabled memory access
+- Optional partitioning for very long sequences
+"""
 
 import triton
 import triton.language as tl
