@@ -15,13 +15,53 @@
 
 """GLA (Gated Linear Attention) module with automatic optimization.
 
-This module implements Gated Linear Attention, an efficient attention mechanism
+This module implements Gated Linear Attention (GLA), an efficient attention mechanism
 that uses gating to control information flow. GLA combines linear attention
 properties with learned gates to achieve both efficiency and expressiveness.
 
-The gating mechanism allows the model to dynamically control which information
-to retain or discard, making it particularly effective for long-range dependencies
-while maintaining linear complexity in certain configurations.
+Key features of Gated Linear Attention:
+    - Linear complexity: O(T) time and O(K×V) memory per head
+    - Dual gating mechanism: Token-level (g) and layer-level (g_gamma) gates
+    - Recurrent formulation with explicit state management
+    - Support for variable-length sequences and bidirectional processing
+    - Seamless integration with transformer architectures
+
+The algorithm implements a gated recurrent attention mechanism:
+    At each timestep t:
+        kv_t = k_t^T @ v_t                    (outer product)
+        g_t = sigmoid(g) * g_gamma            (combined gating)
+        h_t = g_t * h_{t-1} + (1 - g_t) * kv_t  (gated state update)
+        o_t = q_t^T @ h_t                     (output computation)
+
+    where:
+        - h is the state matrix [num_heads, K, V] per batch
+        - g controls how much of the previous state to retain
+        - The gating allows selective memory of past information
+
+The gating mechanism provides fine-grained control:
+    - g (token-level gates): Applied to query representations, controlling
+      information flow at each position [batch, seq_len, num_heads, head_dim]
+    - g_gamma (layer-level gates): Scalar gates controlling overall attention
+      strength per head [batch, num_heads]
+
+Mathematical formulation:
+    GLA can be viewed as a gated variant of linear attention:
+        o_t = Σ_{i≤t} α_i(t) · (k_i^T · v_i) · q_t
+
+    where α_i(t) are data-dependent decay factors computed from the gates,
+    enabling the model to learn optimal retention patterns.
+
+Supports:
+    - Variable sequence lengths via cu_seqlens (cumulative sequence lengths)
+    - Reverse processing for bidirectional models
+    - Initial state for continuation across chunks
+    - Multi-head and grouped-query attention patterns
+    - Custom softmax scaling
+
+References:
+    - Gated Linear Attention Transformers with Hardware-Efficient Training
+      (Yang et al., 2023) https://arxiv.org/abs/2312.06635
+    - Flash-Linear-Attention: https://github.com/sustcsonglin/flash-linear-attention
 """
 
 from __future__ import annotations

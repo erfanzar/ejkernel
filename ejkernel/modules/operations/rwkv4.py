@@ -12,7 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RWKV-4 time-mix recurrence operation module."""
+"""RWKV-4 time-mix recurrence operation module.
+
+This module implements the RWKV-4 time-mixing recurrence mechanism, a core component
+of the RWKV (Receptance Weighted Key Value) architecture. RWKV-4 achieves efficient
+sequential processing with linear complexity while maintaining expressive power.
+
+Key features of RWKV-4:
+    - Numerically stable recurrence using log-space computations
+    - Single-channel architecture (no multi-head attention)
+    - Three-component state (alpha, beta, eps) for numerical stability
+    - Time decay controlled by learned parameter w
+    - Efficient sequential processing suitable for inference
+
+The algorithm computes a numerically-stable WKV (Weighted Key Value) operation:
+    State tracking:
+        alpha_t: Accumulated weighted values (in log space)
+        beta_t: Accumulated weights (in log space)
+        eps_t: Maximum log-weight seen so far (for numerical stability)
+
+    Recurrence at each timestep:
+        tau = max(u + k_t, eps_{t-1})
+        wkv_t = (exp(eps_{t-1} - tau) * alpha_{t-1} + exp(u + k_t - tau) * v_t) /
+                (exp(eps_{t-1} - tau) * beta_{t-1} + exp(u + k_t - tau))
+        alpha_t = exp(w + eps_{t-1} - eps_t) * alpha_{t-1} + exp(w + k_t - eps_t) * v_t
+        beta_t = exp(w + eps_{t-1} - eps_t) * beta_{t-1} + exp(w + k_t - eps_t)
+        eps_t = max(w + eps_{t-1}, w + k_t)
+
+Mathematical formulation:
+    The time-mix mechanism computes weighted attention over past tokens:
+        wkv_t = Σ_{i<t} exp(w(t-i-1) + k_i + u·δ_{i,t-1}) · v_i /
+                Σ_{i<t} exp(w(t-i-1) + k_i + u·δ_{i,t-1})
+
+    where:
+        - w < 0 controls exponential decay (learned per channel)
+        - u is the time-mix bias (learned per channel)
+        - k, v are the key and value from input projections
+
+References:
+    - RWKV: Reinventing RNNs for the Transformer Era
+      (Peng et al., 2023) https://arxiv.org/abs/2305.13048
+    - Flash-Linear-Attention implementation
+      https://github.com/sustcsonglin/flash-linear-attention
+"""
 
 from __future__ import annotations
 
@@ -55,9 +97,25 @@ class RWKV4(Kernel[RWKV4Config, Array]):
     """
 
     def __init__(self) -> None:
+        """Initialize RWKV-4 kernel module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="rwkv4")
 
     def get_impl(self, cfg: RWKV4Config):
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for RWKV-4 recurrence
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("rwkv4", cfg.platform)
         return kernel_registry.get("rwkv4", platform=platform, backend=cfg.backend)
 
@@ -76,6 +134,36 @@ class RWKV4(Kernel[RWKV4Config, Array]):
         Float[Array, "batch seq_len chans"]
         | tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]
     ):
+        """Execute RWKV-4 time-mix recurrence.
+
+        Computes the numerically-stable WKV operation over a sequence,
+        maintaining a three-component state for numerical stability.
+
+        Args:
+            w: Time-decay parameter in log space [channels].
+                Controls exponential decay rate. Internally uses -exp(w).
+            u: Time-mix bias [channels].
+                Bonus weight for the current timestep's key-value pair.
+            k: Key tensor [batch, seq_len, channels].
+                Log-space keys from input projection.
+            v: Value tensor [batch, seq_len, channels].
+                Values to be aggregated.
+            state: Optional initial state [batch, 3, channels].
+                Contains (alpha, beta, eps) for continuing from previous chunk.
+                If None, initializes with alpha=0, beta=0, eps=-1e30.
+            return_state: If True, also return the final state.
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla").
+            cfg: Kernel configuration object.
+
+        Returns:
+            If return_state=False: Output tensor [batch, seq_len, channels].
+            If return_state=True: Tuple of (output, final_state) where
+                final_state is [batch, 3, channels] containing (alpha, beta, eps).
+
+        Note:
+            RWKV-4 operates on single channels without multi-head structure.
+            The state enables efficient chunked processing for long sequences.
+        """
         if platform is not None:
             cfg = RWKV4Config(
                 platform=platform,
@@ -89,10 +177,30 @@ class RWKV4(Kernel[RWKV4Config, Array]):
         return out
 
     def heuristic_cfg(self, inv: Invocation[RWKV4Config, Array]) -> RWKV4Config:
+        """Provide default configuration.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default configuration with auto platform selection
+        """
         del inv
         return RWKV4Config(platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[RWKV4Config, Array]):
+        """Generate candidate configurations for autotuning.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Empty list as RWKV-4 has minimal configuration options
+
+        Note:
+            RWKV-4's simple recurrence pattern means platform selection
+            is the primary optimization lever.
+        """
         del inv
         return []
 

@@ -12,7 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RWKV-7 recurrence operation modules."""
+"""RWKV-7 recurrence operation modules.
+
+This module implements the RWKV-7 architecture, featuring a Diagonal + Low-Rank (DPLR)
+state update mechanism. RWKV-7 enhances expressiveness through low-rank state
+corrections while maintaining linear complexity.
+
+Key features of RWKV-7:
+    - Diagonal + Low-Rank (DPLR) state update
+    - Two parameterizations: (a, b) direct and (kk, a) multiplicative
+    - Multi-head attention with per-head state matrices
+    - Time-varying decay through learned w tensor
+    - Variable-length sequence packing support (FlashAttention-style)
+    - Bidirectional processing with reverse option
+
+The DPLR algorithm implements an enhanced state update:
+    At each timestep t:
+        h_t = diag(exp(w_t)) @ h_{t-1} + a_t @ (b_t^T @ h_{t-1}) + k_t @ v_t^T
+        o_t = r_t^T @ h_t
+
+    where:
+        - h is the state matrix [num_heads, K, V] per batch
+        - diag(exp(w_t)) provides diagonal (element-wise) decay
+        - a_t @ (b_t^T @ h_{t-1}) is the low-rank correction term
+        - k_t @ v_t^T is the standard outer product update
+
+    The low-rank term enables richer state dynamics compared to RWKV-6's
+    purely diagonal decay, allowing the model to selectively mix information
+    across the key dimension.
+
+Two parameterizations are provided:
+    1. RWKV7 (a, b): Direct parameterization where a and b are explicit inputs
+    2. RWKV7Mul (kk, a): Multiplicative form where:
+        a' = kk * a
+        b' = -kk
+       This is often used by optimized kernel implementations.
+
+Supports:
+    - Variable sequence lengths via cu_seqlens (cumulative sequence lengths)
+    - Reverse processing for bidirectional models
+    - Initial state for continuation across chunks
+    - Custom softmax scaling
+
+References:
+    - RWKV-7: https://github.com/BlinkDL/RWKV-LM (RWKV-7 architecture)
+    - Eagle and Finch paper: https://arxiv.org/abs/2404.05892
+"""
 
 from __future__ import annotations
 
@@ -49,14 +94,41 @@ class RWKV7(Kernel[RWKV7Config, Array]):
     where h is the state matrix of shape [H, K, V] per batch element.
     This is the (a, b) parameterization where a and b are explicit inputs.
 
+    Features:
+        - DPLR state update combining diagonal decay with low-rank correction
+        - Multi-head attention with per-head state matrices
+        - Variable-length sequence handling via cumulative lengths
+        - Bidirectional processing with reverse option
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
+    The low-rank term a_t (b_t^T h_{t-1}) enables selective mixing of
+    information across the key dimension, providing richer dynamics than
+    purely diagonal decay.
+
     Attributes:
         op_id: Operation identifier ("rwkv7").
     """
 
     def __init__(self) -> None:
+        """Initialize RWKV-7 kernel module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="rwkv7")
 
     def get_impl(self, cfg: RWKV7Config):
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for RWKV-7 DPLR recurrence
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("rwkv7", cfg.platform)
         return kernel_registry.get("rwkv7", platform=platform, backend=cfg.backend)
 
@@ -83,6 +155,45 @@ class RWKV7(Kernel[RWKV7Config, Array]):
             Float[Array, "... num_heads qk_head_dim v_head_dim"],
         ]
     ):
+        """Execute RWKV-7 DPLR recurrence with (a, b) parameterization.
+
+        Computes the Diagonal + Low-Rank state update over a sequence,
+        combining exponential decay with low-rank corrections.
+
+        Args:
+            r: Receptance (query) tensor [batch, seq_len, num_heads, qk_head_dim].
+                Acts as the query for output computation.
+            w: Log decay tensor [batch, seq_len, num_heads, qk_head_dim].
+                Controls diagonal exponential decay.
+            k: Key tensor [batch, seq_len, num_heads, qk_head_dim].
+                Combined with values for outer product update.
+            v: Value tensor [batch, seq_len, num_heads, v_head_dim].
+                Values to be aggregated over time.
+            a: Low-rank update vector [batch, seq_len, num_heads, qk_head_dim].
+                First component of the low-rank correction.
+            b: Low-rank projection vector [batch, seq_len, num_heads, qk_head_dim].
+                Second component of the low-rank correction.
+            softmax_scale: Optional scale for receptance; defaults to K^(-0.5).
+            initial_state: Optional initial state [batch, num_heads, K, V].
+                For continuing from previous chunk.
+            reverse: If True, process sequence in reverse order.
+            cu_seqlens: Optional cumulative sequence lengths [num_seqs + 1].
+                Enables FlashAttention-style variable-length packing.
+            return_state: If True, also return the final state.
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla").
+            cfg: Kernel configuration object.
+
+        Returns:
+            If return_state=False: Output tensor [batch, seq_len, num_heads, v_head_dim].
+            If return_state=True: Tuple of (output, final_state) where
+                final_state is [batch, num_heads, qk_head_dim, v_head_dim] in float32.
+
+        Note:
+            The DPLR update combines three terms:
+            1. Diagonal decay: diag(exp(w)) @ h
+            2. Low-rank correction: a @ (b^T @ h)
+            3. Outer product: k @ v^T
+        """
         if platform is not None:
             cfg = RWKV7Config(platform=platform, backend=Backend.ANY if platform == "xla" else cfg.backend)
 
@@ -104,10 +215,30 @@ class RWKV7(Kernel[RWKV7Config, Array]):
         return out
 
     def heuristic_cfg(self, inv: Invocation[RWKV7Config, Array]) -> RWKV7Config:
+        """Provide default configuration.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default configuration with auto platform selection
+        """
         del inv
         return RWKV7Config(platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[RWKV7Config, Array]):
+        """Generate candidate configurations for autotuning.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Empty list as RWKV-7 has minimal configuration options
+
+        Note:
+            RWKV-7's recurrence pattern relies primarily on platform selection
+            for optimization.
+        """
         del inv
         return []
 
@@ -121,16 +252,42 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
         a' = kk * a
         b' = -kk
 
-    This is often used by optimized kernel implementations.
+    This is often used by optimized kernel implementations that benefit from
+    this particular parameterization for numerical stability or efficiency.
+
+    Features:
+        - Alternative parameterization of DPLR state update
+        - Automatic conversion to standard (a, b) form internally
+        - Same multi-head and variable-length support as RWKV7
+        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+
+    The multiplicative form can be more numerically stable in certain
+    scenarios and is the preferred interface for some kernel implementations.
 
     Attributes:
         op_id: Operation identifier ("rwkv7_mul").
     """
 
     def __init__(self) -> None:
+        """Initialize RWKV-7 Mul kernel module.
+
+        Sets up the kernel with the operation identifier for registry lookup
+        and configuration management.
+        """
         super().__init__(op_id="rwkv7_mul")
 
     def get_impl(self, cfg: RWKV7MulConfig):
+        """Get kernel implementation from registry.
+
+        Args:
+            cfg: Configuration specifying platform and backend
+
+        Returns:
+            Callable kernel implementation for RWKV-7 Mul recurrence
+
+        Raises:
+            ValueError: If no matching implementation is found
+        """
         platform = detect_platform("rwkv7_mul", cfg.platform)
         return kernel_registry.get("rwkv7_mul", platform=platform, backend=cfg.backend)
 
@@ -157,6 +314,46 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
             Float[Array, "... num_heads qk_head_dim v_head_dim"],
         ]
     ):
+        """Execute RWKV-7 DPLR recurrence with (kk, a) multiplicative parameterization.
+
+        Computes the Diagonal + Low-Rank state update using the alternative
+        multiplicative parameterization, converting internally to (a', b') form.
+
+        Args:
+            r: Receptance (query) tensor [batch, seq_len, num_heads, qk_head_dim].
+                Acts as the query for output computation.
+            w: Log decay tensor [batch, seq_len, num_heads, qk_head_dim].
+                Controls diagonal exponential decay.
+            k: Key tensor [batch, seq_len, num_heads, qk_head_dim].
+                Combined with values for outer product update.
+            v: Value tensor [batch, seq_len, num_heads, v_head_dim].
+                Values to be aggregated over time.
+            kk: Multiplicative factor [batch, seq_len, num_heads, qk_head_dim].
+                Used to compute a' = kk * a and b' = -kk.
+            a: Low-rank update base [batch, seq_len, num_heads, qk_head_dim].
+                Scaled by kk to get the actual low-rank update vector.
+            softmax_scale: Optional scale for receptance; defaults to K^(-0.5).
+            initial_state: Optional initial state [batch, num_heads, K, V].
+                For continuing from previous chunk.
+            reverse: If True, process sequence in reverse order.
+            cu_seqlens: Optional cumulative sequence lengths [num_seqs + 1].
+                Enables FlashAttention-style variable-length packing.
+            return_state: If True, also return the final state.
+            platform: Optional platform override ("triton", "pallas", "cuda", "xla").
+            cfg: Kernel configuration object.
+
+        Returns:
+            If return_state=False: Output tensor [batch, seq_len, num_heads, v_head_dim].
+            If return_state=True: Tuple of (output, final_state) where
+                final_state is [batch, num_heads, qk_head_dim, v_head_dim] in float32.
+
+        Note:
+            The conversion from (kk, a) to (a', b') is:
+                a' = kk * a
+                b' = -kk
+            This parameterization can be more numerically stable for certain
+            model configurations.
+        """
         if platform is not None:
             cfg = RWKV7MulConfig(platform=platform, backend=Backend.ANY if platform == "xla" else cfg.backend)
 
@@ -178,10 +375,30 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
         return out
 
     def heuristic_cfg(self, inv: Invocation[RWKV7MulConfig, Array]) -> RWKV7MulConfig:
+        """Provide default configuration.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Default configuration with auto platform selection
+        """
         del inv
         return RWKV7MulConfig(platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[RWKV7MulConfig, Array]):
+        """Generate candidate configurations for autotuning.
+
+        Args:
+            inv: Invocation object containing arguments and metadata
+
+        Returns:
+            Empty list as RWKV-7 Mul has minimal configuration options
+
+        Note:
+            RWKV-7 Mul's recurrence pattern relies primarily on platform
+            selection for optimization.
+        """
         del inv
         return []
 
