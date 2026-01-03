@@ -12,7 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""XLA backend for paged decode attention."""
+"""XLA backend for paged decode attention.
+
+This submodule provides XLA-optimized implementation of decode-phase
+attention optimized for single-token autoregressive generation.
+
+Key Features:
+    - Optimized for seq_len_q=1 (single token generation)
+    - Paged KV buffer with indirect token addressing
+    - Variable context lengths per request
+    - Efficient memory layout for serving workloads
+
+Algorithm:
+    Decode attention computes attention for one query token against
+    the full KV cache built during prefill and previous decode steps.
+    Uses req_to_tokens for flexible memory management across requests.
+"""
 
 from ._interface import decode_attention
 
