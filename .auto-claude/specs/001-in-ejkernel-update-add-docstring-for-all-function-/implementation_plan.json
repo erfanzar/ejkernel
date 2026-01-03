@@ -911,12 +911,23 @@
       ]
     }
   },
-  "qa_signoff": {"status": "approved", "timestamp": "2026-01-03T22:45:00+00:00", "qa_session": 2, "report_file": "qa_report.md", "tests_passed": {"unit": "N/A", "integration": "N/A", "e2e": "N/A"}, "verified_by": "qa_agent"},
-  "status": "completed",
-  "planStatus": "completed",
+  "qa_signoff": {
+    "status": "approved",
+    "qa_session": 2,
+    "issues_found": [
+      {
+        "description": "None - all verification passed"
+      }
+    ],
+    "tests_passed": {},
+    "timestamp": "2026-01-03T22:41:37.764352+00:00",
+    "ready_for_qa_revalidation": false
+  },
+  "status": "human_review",
+  "planStatus": "review",
   "updated_at": "2026-01-03T13:37:24.491Z",
   "recoveryNote": "Task recovered from stuck state at 2026-01-03T13:37:24.491Z",
-  "last_updated": "2026-01-03T22:28:06.076960+00:00",
+  "last_updated": "2026-01-03T22:41:37.764363+00:00",
   "qa_iteration_history": [
     {
       "iteration": 1,
