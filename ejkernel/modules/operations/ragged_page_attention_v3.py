@@ -84,6 +84,22 @@ from .configs import RaggedPageAttentionv3Config
 
 @dataclass(frozen=True)
 class _RPAWorkload:
+    """Internal dataclass representing workload characteristics for ragged page attention.
+
+    This class encapsulates the key dimensions and data types of a ragged page attention
+    workload, used for selecting optimal kernel configurations and autotuning.
+
+    Attributes:
+        q_dtype: Data type of query tensors (e.g., jnp.bfloat16, jnp.float32).
+        kv_dtype: Data type of KV cache tensors.
+        num_q_heads: Number of query attention heads.
+        num_kv_heads: Number of key-value attention heads (for GQA, num_q_heads % num_kv_heads == 0).
+        head_dim: Dimension of each attention head.
+        page_size: Number of tokens per page in the paged KV cache.
+        max_num_tokens: Maximum number of tokens in the ragged query tensor.
+        pages_per_seq: Maximum number of pages allocated per sequence.
+    """
+
     q_dtype: object
     kv_dtype: object
     num_q_heads: int
@@ -109,6 +125,21 @@ _ARGUMENT_INDEX = {name: idx for idx, name in enumerate(_ARGUMENT_ORDER)}
 
 
 def _resolve_inv_arg(inv: Invocation, name: str):
+    """Resolve an argument from an Invocation by name.
+
+    Looks up arguments first in kwargs, then in positional args based on
+    the predefined argument order.
+
+    Args:
+        inv: Invocation object containing the function call arguments.
+        name: Name of the argument to resolve.
+
+    Returns:
+        The resolved argument value.
+
+    Raises:
+        KeyError: If the argument is not found in kwargs or positional args.
+    """
     if name in inv.kwargs:
         return inv.kwargs[name]
     idx = _ARGUMENT_INDEX.get(name)
@@ -118,12 +149,36 @@ def _resolve_inv_arg(inv: Invocation, name: str):
 
 
 def _round_up_to_step(value: int, step: int) -> int:
+    """Round a value up to the nearest multiple of step.
+
+    Args:
+        value: The value to round up.
+        step: The step size to round to. If <= 0, returns the value unchanged.
+
+    Returns:
+        The smallest multiple of step that is >= value.
+    """
     if step <= 0:
         return int(value)
     return ((int(value) + step - 1) // step) * step
 
 
 def _suggest_block_sizes(workload: _RPAWorkload, aggressive: bool) -> tuple[int, int]:
+    """Suggest initial block sizes based on workload characteristics.
+
+    Computes reasonable default block sizes for KV pages and query tokens
+    based on the workload dimensions. These serve as starting points for
+    autotuning or as fallback heuristic values.
+
+    Args:
+        workload: Workload characteristics including head_dim, page_size, etc.
+        aggressive: If True, prefer larger block sizes for potentially better
+            performance at the cost of higher memory usage.
+
+    Returns:
+        Tuple of (num_kv_pages_per_block, num_queries_per_block) representing
+        the suggested block sizes.
+    """
     pages_per_seq = max(1, workload.pages_per_seq)
     page_size = max(1, workload.page_size)
     page_budget = max(1, 2048 // page_size)
@@ -161,6 +216,22 @@ def _expand_axis_candidates(
     min_value: int = 1,
     step: int | None = None,
 ) -> list[int]:
+    """Expand a base value into a list of candidate values for autotuning.
+
+    Generates candidate values by exploring variations around a base value
+    (e.g., base/2, base*2) and adding seed values, all constrained to the
+    given limits.
+
+    Args:
+        base: Initial base value to expand from. If None, only seeds are used.
+        limit: Maximum allowed value (candidates will be clamped to this).
+        seeds: Tuple of seed values to include as candidates.
+        min_value: Minimum allowed value (candidates will be clamped to this).
+        step: If provided, candidates will be rounded up to multiples of step.
+
+    Returns:
+        List of unique candidate values, ordered by preference.
+    """
     limit = int(limit) if limit > 0 else 1
     effective_min = min(max(1, min_value), limit)
 
@@ -192,6 +263,11 @@ def _expand_axis_candidates(
 
 
 def _is_tpu() -> bool:
+    """Check if the current JAX backend is TPU.
+
+    Returns:
+        True if the default JAX device is a TPU, False otherwise.
+    """
     try:
         return jax.devices()[0].platform == "tpu"
     except Exception:
@@ -199,7 +275,18 @@ def _is_tpu() -> bool:
 
 
 def _lookup_tuned_pair(workload: _RPAWorkload) -> tuple[int, int] | None:
-    """Try to fetch tuned block sizes from the kernel's TPU utils."""
+    """Look up pre-tuned block sizes for the given workload.
+
+    Attempts to retrieve optimal block sizes from TPU-specific tuning tables
+    based on the workload characteristics.
+
+    Args:
+        workload: Workload characteristics for the lookup.
+
+    Returns:
+        Tuple of (num_kv_pages_per_block, num_queries_per_block) if found,
+        None if no tuned configuration exists or not running on TPU.
+    """
     if not _is_tpu():
         return None
     try:
@@ -572,6 +659,17 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         )
 
     def _extract_workload(self, inv: Invocation[RaggedPageAttentionv3Config, Array]) -> _RPAWorkload | None:
+        """Extract workload characteristics from an invocation.
+
+        Parses the input tensors from the invocation to determine the workload
+        dimensions needed for configuration selection.
+
+        Args:
+            inv: Invocation object containing the attention arguments.
+
+        Returns:
+            _RPAWorkload with extracted dimensions, or None if extraction fails.
+        """
         try:
             queries = _resolve_inv_arg(inv, "queries")
             keys = _resolve_inv_arg(inv, "keys")
@@ -616,6 +714,19 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         prefer_tuned: bool,
         max_candidates: int,
     ) -> list[tuple[int, int]]:
+        """Generate candidate (kv_pages, query_tokens) block size pairs.
+
+        Combines tuned values (if available) with heuristic-based suggestions
+        to produce a list of block size pairs for autotuning.
+
+        Args:
+            inv: Invocation object containing the attention arguments.
+            prefer_tuned: If True, prioritize pre-tuned block sizes from lookup tables.
+            max_candidates: Maximum number of candidate pairs to return.
+
+        Returns:
+            List of (num_kv_pages_per_block, num_queries_per_block) tuples.
+        """
         workload = self._extract_workload(inv)
         if workload is None:
             return []
@@ -635,6 +746,19 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         *,
         max_candidates: int,
     ) -> list[tuple[int, int]]:
+        """Generate candidate block size pairs from a base configuration.
+
+        Expands the base pair into multiple candidates by exploring variations
+        along both the KV and query axes, respecting workload constraints.
+
+        Args:
+            workload: Workload characteristics for constraint checking.
+            base_pair: Base (kv_pages, query_tokens) pair to expand from.
+            max_candidates: Maximum number of pairs to generate.
+
+        Returns:
+            List of (num_kv_pages_per_block, num_queries_per_block) tuples.
+        """
         base_kv, base_q = base_pair
         kv_limit = max(1, workload.pages_per_seq)
         kv_seed_tuple = (16, 32, 64) if _is_tpu() else (16, 32, 64, 128, 256)
@@ -683,6 +807,21 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         num_warps: int | None,
         num_stages: int | None,
     ) -> list[RaggedPageAttentionv3Config]:
+        """Convert block size pairs into configuration objects.
+
+        Creates RaggedPageAttentionv3Config objects from (kv_pages, query_tokens)
+        pairs, applying the specified platform and backend settings.
+
+        Args:
+            pairs: List of (num_kv_pages_per_block, num_queries_per_block) tuples.
+            platform: Target platform for kernel execution.
+            backend: Backend specification (e.g., "gpu", "tpu", "any").
+            num_warps: Number of warps for Triton kernels (GPU-specific).
+            num_stages: Number of pipeline stages for Triton kernels (GPU-specific).
+
+        Returns:
+            List of RaggedPageAttentionv3Config objects ready for autotuning.
+        """
         if not pairs:
             return [
                 RaggedPageAttentionv3Config(
@@ -720,6 +859,23 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         prefer_tuned: bool,
         max_candidates: int,
     ) -> list[RaggedPageAttentionv3Config]:
+        """Build candidate configurations for autotuning from an invocation.
+
+        Combines pair generation and materialization to produce a complete list
+        of configuration candidates for the given invocation.
+
+        Args:
+            inv: Invocation object containing the attention arguments.
+            platform: Target platform for kernel execution.
+            backend: Backend specification (e.g., "gpu", "tpu", "any").
+            num_warps: Number of warps for Triton kernels (GPU-specific).
+            num_stages: Number of pipeline stages for Triton kernels (GPU-specific).
+            prefer_tuned: If True, prioritize pre-tuned block sizes.
+            max_candidates: Maximum number of configurations to generate.
+
+        Returns:
+            List of RaggedPageAttentionv3Config objects for autotuning.
+        """
         return self._materialize_configs(
             self._candidate_pairs(inv, prefer_tuned=prefer_tuned, max_candidates=max_candidates),
             platform=platform,
@@ -948,11 +1104,29 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
     def candidate_cfgs_tpu(self, inv: Invocation[RaggedPageAttentionv3Config, Array]):
         """Generate candidate configurations for autotuning on TPU (Pallas backend).
 
+        Produces configurations optimized for TPU execution with Pallas backend.
+        Uses power-of-2 block sizes within strict bounds to ensure efficient
+        TPU tile execution.
+
         Heuristics:
-        - Enforce power-of-2 block sizes.
-        - Restrict Q and KV block sizes to max 64.
-        - Min KV block size 16, Min Q block size 4.
-        - chunk_prefill_size always None.
+            - Enforces power-of-2 block sizes for TPU efficiency
+            - Restricts Q and KV block sizes to max 64
+            - Minimum KV block size: 16, minimum Q block size: 4
+            - chunk_prefill_size always set to None
+
+        Args:
+            inv: Invocation object containing input tensors and metadata.
+                Used to determine optimal block sizes based on workload shape
+                including queries, keys, kv_cache, kv_lens, and block_tables.
+
+        Returns:
+            List of RaggedPageAttentionv3Config objects optimized for TPU.
+            Each configuration uses power-of-2 block sizes within the
+            specified bounds. Returns empty list if workload extraction fails.
+
+        Note:
+            KV page candidates: 16, 32, 64 (bounded by pages_per_seq)
+            Query candidates: 4, 8, 16, 32, 64 (bounded by max_num_tokens, capped at 512)
         """
         workload = self._extract_workload(inv)
         if workload is None:
