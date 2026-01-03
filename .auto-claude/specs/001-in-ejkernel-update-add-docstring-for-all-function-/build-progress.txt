@@ -1,0 +1,34 @@
+# Build Progress
+
+## Completed Subtasks
+
+### subtask-1-2: Document ragged and prefill operations
+- **Status**: Completed
+- **Date**: 2025-01-03
+- **Notes**: All ragged and prefill operation files already have comprehensive documentation following the pattern from prefill_page_attention.py.
+- **Files verified**:
+  - `ejkernel/modules/operations/prefill_page_attention.py` (pattern file)
+  - `ejkernel/modules/operations/ragged_page_attention_v2.py` (12 docstrings)
+  - `ejkernel/modules/operations/ragged_page_attention_v3.py` (23 docstrings)
+  - `ejkernel/modules/operations/ragged_decode_attention.py` (10 docstrings)
+  - `ejkernel/modules/operations/chunked_prefill_paged_decode.py` (8 docstrings)
+- **Documentation includes**:
+  - Module docstrings with Key Features, Use Cases, Memory Layout, Mathematical Foundation
+  - Class docstrings with Features lists
+  - Method docstrings with Args, Returns, Examples, Notes sections
+
+### subtask-2-1: Document ops core types and kernel infrastructure
+- **Status**: Completed
+- **Date**: 2025-01-03
+- **Notes**: All ops core types and kernel infrastructure files already have comprehensive documentation.
+- **Files verified**:
+  - `ejkernel/ops/core/kernel.py` (42 docstring blocks covering Invocation, Kernel classes and all methods)
+  - `ejkernel/ops/core/types.py` (module docstring documenting Cfg/Out type vars)
+  - `ejkernel/ops/core/__init__.py` (module docstring with classes, type vars, functions)
+  - `ejkernel/ops/registry.py` (module docstring + function docstrings for record_invocation, get_invocations)
+  - `ejkernel/ops/__init__.py` (module docstring describing framework and components)
+- **Documentation includes**:
+  - Module docstrings with Key Classes, Key Features, Example Usage sections
+  - Class docstrings with Attributes lists and method naming conventions
+  - Method docstrings with Args, Returns, Raises, Examples, Notes sections
+  - Function docstrings with Args, Returns, Examples sections
