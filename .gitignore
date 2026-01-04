@@ -178,3 +178,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Auto Claude data directory
+# Auto Claude is used to document and create examples for ejkernel/easydel.
+.auto-claude/
+.worktrees/*
+.claude_settings.json
