@@ -12,6 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Flash Attention backward pass implementation using XLA/JAX.
+
+This module provides the backward pass (gradient computation) for Flash
+Attention using JAX's automatic differentiation. The gradients are computed
+with respect to queries, keys, and values.
+
+Key Components:
+    - _flash_attention_bwd: Main backward function using JAX autodiff
+
+Algorithm:
+    The backward pass uses JAX's grad transformation on the forward pass:
+    1. Reconstruct forward computation with saved residuals
+    2. Apply chain rule through attention computation
+    3. Accumulate gradients for Q, K, V
+
+Features:
+    - Supports all forward pass features (causal, sliding window, dropout)
+    - Uses same precision settings as forward pass
+    - Handles optional bias gradients
+
+Note:
+    This implementation uses JAX autodiff rather than a custom backward
+    kernel. While this may be less memory-efficient than a fused backward
+    kernel, it ensures correctness and supports all forward pass features.
+"""
 
 import chex
 import jax

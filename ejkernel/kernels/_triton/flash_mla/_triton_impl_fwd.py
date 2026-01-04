@@ -12,8 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Forward pass Triton kernels for Flash Multi-Latent Attention (MLA).
 
-"""Forward pass Triton kernels for Flash Multi-Latent Attention."""
+This module implements the forward pass of Multi-Latent Attention, which
+reduces memory and computation by projecting keys and values through
+low-rank latent spaces before computing attention.
+
+Algorithm Overview:
+------------------
+Multi-Latent Attention operates in three phases:
+
+1. **Latent Projection**: Project K and V to lower-dimensional latent spaces:
+   - K_latent = K @ W_k where W_k: [D, L] projects D-dim to L-dim (L << D)
+   - V_latent = V @ W_v where W_v: [D, L] projects D-dim to L-dim
+
+2. **Attention in Latent Space**: Compute attention with reduced dimensions:
+   - scores = (Q @ K_latent^T) * scale
+   - attn = softmax(scores)
+   - out_latent = attn @ V_latent
+
+3. **Output Projection**: Project back to original dimension if needed
+
+Memory Complexity:
+-----------------
+- Standard attention: O(N * D) for KV cache
+- MLA: O(N * L) for latent KV cache, where L << D
+- Typical compression: 8x-16x reduction in KV cache size
+
+Key Features:
+------------
+- Online softmax for numerical stability
+- Fused latent projection with attention computation
+- Support for causal masking in latent space
+- Block-wise processing for GPU efficiency
+
+Functions:
+---------
+- _mla_attn_fwd_inner: Inner loop computing attention for one query block
+- _mla_attn_fwd_kernel: Main forward kernel for MLA computation
+- _fwd_mla_attention_kernel_call: Python wrapper for kernel invocation
+"""
 
 import triton
 import triton.language as tl

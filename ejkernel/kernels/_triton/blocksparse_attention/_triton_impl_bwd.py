@@ -418,6 +418,33 @@ def blocksparse_attn_bwd_dq(
     IS_CONTEXT_PARALLELISM: tl.constexpr,
     SOFTCAP: tl.constexpr,
 ):
+    """Triton kernel for computing dQ gradients in block-sparse backward pass.
+
+    Computes query gradients by iterating over sparse KV blocks as determined
+    by the pre-computed mask boundaries. Uses the same block-sparse pattern
+    as the forward pass for efficiency.
+
+    Args:
+        q, k, v: Input tensor pointers from forward pass
+        q_positions, q_segment_ids: Query positions and segment IDs
+        kv_positions, kv_segment_ids: Key/value positions and segment IDs
+        dout: Output gradient pointer
+        lse: Log-sum-exp values from forward pass
+        delta: Delta values for efficient gradient computation
+        lower_blocks, upper_blocks: Sparse mask boundaries
+        lower_full_blocks, upper_full_blocks: Fully-attended block boundaries
+        query_global_offset: Global query offset for context parallelism
+        softmax_scale: Attention scaling factor
+        logits_soft_cap: Soft cap value for logits
+        stride_*: Tensor strides
+        dq: Output gradient pointer for queries
+        Q_SEQ_LEN, KV_SEQ_LEN: Sequence lengths (constexpr)
+        QK_HEAD_DIM, V_HEAD_DIM: Head dimensions (constexpr)
+        BLOCK_M, BLOCK_N: Block sizes (constexpr)
+        NUM_GROUPS: Number of head groups (constexpr)
+        IS_CONTEXT_PARALLELISM: Enable context parallelism (constexpr)
+        SOFTCAP: Enable logit soft capping (constexpr)
+    """
     LOG2_CONST: tl.constexpr = 1.4426950408889634
     query_block_id = tl.program_id(0)
     batch_size_id = tl.program_id(1).to(tl.int64)
@@ -670,6 +697,34 @@ def blocksparse_attn_bwd_dkdv(
     IS_CONTEXT_PARALLELISM: tl.constexpr,
     SOFTCAP: tl.constexpr,
 ):
+    """Triton kernel for computing dK and dV gradients in block-sparse backward pass.
+
+    Computes key and value gradients by iterating over sparse query blocks as
+    determined by the pre-computed mask boundaries. Uses the transposed block-sparse
+    pattern for efficient gradient accumulation.
+
+    Args:
+        q, k, v: Input tensor pointers from forward pass
+        q_positions, q_segment_ids: Query positions and segment IDs
+        kv_positions, kv_segment_ids: Key/value positions and segment IDs
+        dout: Output gradient pointer
+        lse: Log-sum-exp values from forward pass
+        delta: Delta values for efficient gradient computation
+        lower_blocks, upper_blocks: Sparse mask boundaries (transposed view)
+        lower_full_blocks, upper_full_blocks: Fully-attended block boundaries
+        query_global_offset: Global query offset for context parallelism
+        softmax_scale: Attention scaling factor
+        logits_soft_cap: Soft cap value for logits
+        stride_*: Tensor strides for all inputs and outputs
+        dk, dv: Output gradient pointers for keys and values
+        Q_SEQ_LEN, KV_SEQ_LEN: Sequence lengths (constexpr)
+        QK_HEAD_DIM, V_HEAD_DIM: Head dimensions (constexpr)
+        BLOCK_M, BLOCK_N: Block sizes (constexpr)
+        LOAD_SECOND_OFFSET: Secondary loading offset (constexpr)
+        NUM_GROUPS: Number of head groups (constexpr)
+        IS_CONTEXT_PARALLELISM: Enable context parallelism (constexpr)
+        SOFTCAP: Enable logit soft capping (constexpr)
+    """
     LOG2_CONST: tl.constexpr = 1.4426950408889634
     kv_block_id = tl.program_id(0)
     batch_size_id = tl.program_id(1).to(tl.int64)
@@ -1097,6 +1152,29 @@ def _bwd_blocksparse_attn_call(
     res: ArrayLike,
     dout: ArrayLike,
 ):
+    """Execute block-sparse attention backward pass using Triton kernels.
+
+    This function orchestrates the backward pass by dispatching to the
+    preprocessing kernel, dQ kernel, and dK/dV kernel. Uses sparse masks
+    to skip computation for masked-out blocks.
+
+    Args:
+        softmax_scale: Attention scaling factor
+        apply_load_balance: Whether to apply load balancing
+        sequence_parallelism_mesh_axis_name: Mesh axis for sequence parallelism
+        window_left: Left window size for sliding window (-1 = unlimited)
+        window_right: Right window size for sliding window (-1 = unlimited)
+        causal: Enable causal masking
+        fwd_params: Forward pass configuration parameters
+        bwd_params: Backward pass configuration parameters
+        logits_soft_cap: Optional soft cap for logits
+        res: Residuals from forward pass (q, k, v, positions, segments, output, lse, mask)
+        dout: Gradient of output tensor
+
+    Returns:
+        tuple: (dq, dk, dv, None...) gradients with respect to query, key, value
+        and None for position/segment inputs
+    """
     (
         query,
         key,

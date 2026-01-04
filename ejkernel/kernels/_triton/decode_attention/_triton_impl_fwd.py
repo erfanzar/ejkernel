@@ -12,6 +12,64 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Paged decode attention forward pass using Triton kernels.
+
+This module implements a two-stage paged attention mechanism optimized for
+decode-phase inference where each sequence has a single query token that
+attends to its full KV context stored in a paged memory buffer.
+
+Two-Stage Algorithm:
+-------------------
+Stage 1 (_decode_stage1):
+    - Splits each sequence's KV context into NUM_KV_SPLITS partitions
+    - Computes partial attention outputs and LSE values for each partition
+    - Uses paged memory layout with block tables for efficient KV access
+    - Supports grouped-query attention (GQA) and logit soft-capping
+
+Stage 2 (_decode_stage2):
+    - Combines partial results from all KV splits
+    - Uses numerically stable log-sum-exp reduction
+    - Produces final attention output and global LSE values
+
+Paged Memory Layout:
+-------------------
+Keys and values are stored in a paged buffer where:
+- Each page contains PAGE_SIZE consecutive tokens
+- Block tables (req_to_tokens) map logical pages to physical page indices
+- This allows efficient memory management for variable-length sequences
+
+Key Features:
+- Efficient for batched decode with heterogeneous sequence lengths
+- Supports grouped-query attention (GQA/MQA)
+- Optional logit soft-capping for numerical stability
+- Parallel processing across KV splits for large contexts
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.decode_attention import decode_attention_triton
+    >>>
+    >>> batch, num_heads, head_dim = 4, 12, 64
+    >>> query = jnp.ones((batch, num_heads, head_dim))
+    >>> key_buffer = jnp.ones((1024, 12, head_dim))  # Paged KV buffer
+    >>> value_buffer = jnp.ones((1024, 12, head_dim))
+    >>> req_to_tokens = jnp.zeros((batch, 16), dtype=jnp.int32)
+    >>> seq_lens = jnp.array([128, 256, 512, 64], dtype=jnp.int32)
+    >>>
+    >>> output, lse = decode_attention_triton(
+    ...     query=query,
+    ...     key_buffer=key_buffer,
+    ...     value_buffer=value_buffer,
+    ...     req_to_tokens=req_to_tokens,
+    ...     seq_lens=seq_lens,
+    ...     softmax_scale=None,  # Defaults to 1/sqrt(head_dim)
+    ...     num_kv_splits=8,
+    ...     page_size=16,
+    ...     logits_soft_cap=None,
+    ...     num_warps=None,
+    ...     num_stages=None,
+    ... )
+"""
+
 from __future__ import annotations
 
 import math

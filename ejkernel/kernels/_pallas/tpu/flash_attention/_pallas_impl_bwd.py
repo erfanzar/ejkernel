@@ -13,7 +13,41 @@
 # limitations under the License.
 
 
-"""Flash Attention TPU kernel."""
+"""Flash Attention backward pass TPU kernel implementation using Pallas.
+
+This module provides the gradient computation kernels for Flash Attention on
+Google TPUs. The backward pass is split into two main computations:
+1. dKV kernel: Computes gradients with respect to keys and values
+2. dQ kernel: Computes gradients with respect to queries
+
+The backward pass follows the memory-efficient approach of the forward pass,
+never materializing the full attention matrix. Instead, it recomputes attention
+weights on-the-fly using the saved softmax statistics (l and m) from the
+forward pass.
+
+Algorithm overview:
+1. Compute di = sum(O * dO) for each query position
+2. For dK/dV: Iterate over query blocks, accumulating gradients
+   - Recompute attention weights P from saved statistics
+   - dV += P^T @ dO
+   - dK += (dP * P)^T @ Q where dP = dO @ V^T - di
+3. For dQ: Iterate over KV blocks, accumulating gradients
+   - Recompute attention weights P
+   - dQ += (dP * P) @ K
+
+TPU-specific optimizations:
+- Separate kernels for dKV and dQ to maximize parallelism
+- Uses scratch memory to accumulate gradients across iterations
+- Efficient memory prefetching with Pallas BlockSpecs
+- Supports parallel execution across batch and head dimensions
+
+Supported features:
+- Causal and non-causal attention gradients
+- Attention bias gradients (dAB)
+- Segment ID masking
+- Sliding window attention
+- Logits soft capping gradient correction
+"""
 
 from __future__ import annotations
 
@@ -62,6 +96,40 @@ def _flash_attention_dkv_kernel(
     block_q: int,
     block_k: int,
 ):
+    """Pallas kernel for computing dK and dV gradients.
+
+    This kernel computes gradients with respect to keys (dK) and values (dV)
+    by iterating over query blocks and accumulating contributions. For each
+    query block, it recomputes attention weights and applies the chain rule.
+
+    The gradient formulas are:
+    - dV = P^T @ dO (attention weights transposed times output gradient)
+    - dK = (dS * P)^T @ Q where dS = softmax_scale * (dP - di)
+
+    Args:
+        q_tile_ref: Query tile reference for gradient computation.
+        k_tile_ref: Key tile reference (input, not modified).
+        v_tile_ref: Value tile reference (input, not modified).
+        ab_tile_ref: Optional attention bias tile.
+        q_segment_ids_tile_ref: Optional query segment IDs.
+        kv_segment_ids_tile_ref: Optional KV segment IDs.
+        l_tile_ref: Saved softmax denominator from forward pass.
+        m_tile_ref: Saved softmax max from forward pass.
+        do_tile_ref: Output gradient tile reference.
+        di_tile_ref: Precomputed sum(O * dO) for each position.
+        dk_tile_ref: Output reference for key gradients.
+        dv_tile_ref: Output reference for value gradients.
+        dk_scratch_ref: VMEM scratch for accumulating dK.
+        dv_scratch_ref: VMEM scratch for accumulating dV.
+        softmax_scale: Scaling factor used in forward pass.
+        sliding_window: Optional sliding window configuration.
+        logits_soft_cap: Optional soft cap value for gradient correction.
+        causal: Whether causal masking was applied.
+        mask_value: Value used for masked positions.
+        q_seq_len: Total query sequence length.
+        block_q: Query block size for inner loop.
+        block_k: Key block size for inner loop.
+    """
     _, _, block_q_major, _ = q_tile_ref.shape
     _, _, block_k_major, _ = k_tile_ref.shape
 
@@ -191,6 +259,35 @@ def _flash_attention_bwd_dkv(
     causal: bool = False,
     mask_value: float = DEFAULT_MASK_VALUE,
 ):
+    """Compute gradients with respect to keys and values.
+
+    Sets up and executes the Pallas kernel for computing dK and dV gradients.
+    The computation iterates over query blocks while processing each KV block,
+    accumulating gradients in scratch memory.
+
+    Args:
+        q: Query tensor [batch, num_heads, q_seq_len, head_dim].
+        k: Key tensor [batch, num_heads, kv_seq_len, head_dim].
+        v: Value tensor [batch, num_heads, kv_seq_len, head_dim].
+        ab: Optional attention bias tensor.
+        segment_ids: Optional SegmentIds for packed sequences.
+        l: Saved softmax denominator from forward pass [batch, num_heads, q_seq_len].
+        m: Saved softmax max from forward pass [batch, num_heads, q_seq_len].
+        do: Output gradient [batch, num_heads, q_seq_len, head_dim].
+        di: Precomputed sum(O * dO) [batch, num_heads, q_seq_len].
+        block_q_major: Major query block size for memory prefetching.
+        block_q: Inner query block size for computation.
+        block_k_major: Major KV block size for memory prefetching.
+        block_k: Inner KV block size for computation.
+        softmax_scale: Scaling factor from forward pass.
+        sliding_window: Optional sliding window configuration.
+        logits_soft_cap: Optional soft cap value.
+        causal: Whether causal masking was used.
+        mask_value: Value for masked positions.
+
+    Returns:
+        Tuple of (dK, dV) gradient tensors with same shapes as k and v.
+    """
     batch_size, num_heads, q_seq_len, head_dim = q.shape
     _, _, kv_seq_len, _ = k.shape
     _verify_block("block_q_major_dkv", "q_seq_len", block_q_major, q_seq_len)
@@ -381,6 +478,37 @@ def _flash_attention_dq_kernel(
     kv_seq_len: int,
     block_k: int,
 ):
+    """Pallas kernel for computing dQ gradients.
+
+    This kernel computes gradients with respect to queries (dQ) by iterating
+    over KV blocks and accumulating contributions. It also optionally computes
+    gradients for the attention bias (dS/dAB).
+
+    The gradient formula is:
+    - dQ = (dS * P) @ K where dS = softmax_scale * (dP - di)
+
+    Args:
+        q_tile_ref: Query tile reference.
+        k_tile_ref: Key tile reference.
+        v_tile_ref: Value tile reference.
+        ab_tile_ref: Optional attention bias tile.
+        q_segment_ids_tile_ref: Optional query segment IDs.
+        kv_segment_ids_tile_ref: Optional KV segment IDs.
+        l_tile_ref: Saved softmax denominator.
+        m_tile_ref: Saved softmax max.
+        do_tile_ref: Output gradient tile.
+        di_tile_ref: Precomputed sum(O * dO).
+        dq_tile_ref: Output reference for query gradients.
+        ds_tile_ref: Optional output for attention score gradients (dAB).
+        dq_scratch_ref: VMEM scratch for accumulating dQ.
+        softmax_scale: Scaling factor from forward pass.
+        sliding_window: Optional sliding window configuration.
+        logits_soft_cap: Optional soft cap for gradient correction.
+        causal: Whether causal masking was used.
+        mask_value: Value for masked positions.
+        kv_seq_len: Total KV sequence length.
+        block_k: KV block size for inner loop.
+    """
     _, _, block_k_major, _ = k_tile_ref.shape
     _, _, block_q_major, _ = q_tile_ref.shape
 
@@ -513,6 +641,34 @@ def _flash_attention_bwd_dq(
     causal: bool,
     mask_value: float,
 ):
+    """Compute gradients with respect to queries and attention bias.
+
+    Sets up and executes the Pallas kernel for computing dQ and optionally
+    dAB (attention bias gradient). The computation iterates over KV blocks
+    while processing each query block.
+
+    Args:
+        q: Query tensor [batch, num_heads, q_seq_len, head_dim].
+        k: Key tensor [batch, num_heads, kv_seq_len, head_dim].
+        v: Value tensor [batch, num_heads, kv_seq_len, head_dim].
+        ab: Optional attention bias tensor.
+        segment_ids: Optional SegmentIds for packed sequences.
+        l: Saved softmax denominator from forward pass.
+        m: Saved softmax max from forward pass.
+        do: Output gradient tensor.
+        di: Precomputed sum(O * dO).
+        block_q_major: Query block size for memory prefetching.
+        block_k_major: Major KV block size for memory prefetching.
+        block_k: Inner KV block size for computation.
+        softmax_scale: Scaling factor from forward pass.
+        sliding_window: Optional sliding window configuration.
+        logits_soft_cap: Optional soft cap value.
+        causal: Whether causal masking was used.
+        mask_value: Value for masked positions.
+
+    Returns:
+        Tuple of (dQ, dAB) where dAB is None if ab was None.
+    """
     batch_size, num_heads, q_seq_len, head_dim = q.shape
     _, _, kv_seq_len, _ = k.shape
     _verify_block("block_q_dq", "q_seq_len", block_q_major, q_seq_len)

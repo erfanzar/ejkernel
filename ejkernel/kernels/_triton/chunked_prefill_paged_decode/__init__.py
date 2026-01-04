@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Triton backend for chunked prefill + paged decode attention."""
+"""Triton backend for Chunked Prefill + Paged Decode Attention.
+
+This submodule provides GPU-optimized attention for mixed prefill and decode
+workloads using Triton kernels. It updates a block-tabled KV cache with new
+keys/values, then computes unified paged attention outputs for packed queries.
+
+Key Features:
+    - Unified handling of chunked prefill and decode in single operation
+    - In-place KV cache update with block table management
+    - Support for causal masking and sliding window attention
+    - ALiBi positional encoding support
+    - Logit soft-capping for numerical stability
+"""
 
 from ._interface import chunked_prefill_paged_decode
 

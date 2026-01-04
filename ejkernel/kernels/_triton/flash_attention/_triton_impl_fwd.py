@@ -41,6 +41,19 @@ def config_prune_kernel(
     named_args: dict[str, Any],
     **kwargs: Any,
 ) -> list[Config]:
+    """Prune autotuning configurations for forward pass kernel.
+
+    Filters out configurations where block dimensions exceed sequence lengths.
+    Falls back to small default configs if all configs are pruned.
+
+    Args:
+        configs: List of triton autotuning configurations
+        named_args: Dictionary with kernel arguments including QSeq and KSeq
+        **kwargs: Additional unused arguments
+
+    Returns:
+        list[Config]: Valid configurations for the given problem size
+    """
     kept_configs = []
     for config in configs:
         largerst_m = config.kwargs["BLOCK_M"] > named_args["QSeq"]
@@ -105,6 +118,58 @@ def _attn_fwd_inner(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    """Inner loop for flash attention forward pass.
+
+    Computes attention scores and accumulates weighted values for a range of KV blocks.
+    Uses online softmax algorithm for numerical stability without materializing full
+    attention matrix. Supports optional bias, dropout, causal/sliding window masking,
+    logit soft capping, and attention sinks.
+
+    Args:
+        q: Query block [BLOCK_M, head_dim]
+        m_i: Maximum logits for numerical stability [BLOCK_M]
+        me_i: Exponentiated max for rescaling [BLOCK_M]
+        k_ptrs: Pointer to key tensor
+        v_ptrs: Pointer to value tensor
+        bias_ptrs: Pointer to optional bias tensor
+        acc_o: Accumulated attention output [BLOCK_M, head_dim]
+        offs_m: Query position offsets [BLOCK_M]
+        offs_n: KV position offsets [BLOCK_N]
+        offs_d: Head dimension offsets
+        softmax_scale: Scale factor for attention scores (1/sqrt(d))
+        dropout_prob: Dropout probability for attention weights
+        dropout_seed: Random seed for dropout
+        dropout_offs: Offset for dropout random generation
+        window_left: Left window size for sliding window attention
+        window_right: Right window size for sliding window attention
+        logits_soft_cap: Soft cap value for logits (Gemma-2 style capping)
+        softmax_aux_ptrs: Pointer to auxiliary softmax values (attention sinks)
+        num_sinks: Number of sink tokens for attention sinks
+        stride_kn, stride_vn: Key/value sequence strides
+        index_start_n: Starting KV block index
+        actual_seqlen_q, actual_seqlen_k: Actual sequence lengths
+        headdim: Head dimension size
+        q_segment_ids_ptr: Pointer to query segment IDs
+        kv_segment_ids_ptr: Pointer to KV segment IDs
+        stride_qsm, stride_ksn: Segment ID strides
+        USE_SEGMENTS: Enable segment masking (constexpr)
+        USE_DROPOUT: Enable dropout (constexpr)
+        IS_CAUSAL: Enable causal masking (constexpr)
+        BIAS_ON: Enable attention bias (constexpr)
+        BOOL_BIAS: Treat bias as boolean mask (constexpr)
+        MASKED: Apply masking logic (constexpr)
+        SLIDING: Enable sliding window (constexpr)
+        SOFTCAP: Enable logit soft capping (constexpr)
+        USE_SINKS: Enable attention sinks (constexpr)
+        PADDED_COLS: KV dimension needs padding check (constexpr)
+        PADDED_HEADS: Head dimension needs padding check (constexpr)
+        BLOCK_M: Query block size (constexpr)
+        BLOCK_N: KV block size (constexpr)
+
+    Returns:
+        Updated (m_i, me_i, acc_o) tuple with updated softmax statistics and
+        accumulated attention output
+    """
     LN2: tl.constexpr = 1.44269504089
     index_start_n = tl.multiple_of(index_start_n, BLOCK_N)
     offset_k_ptrs = k_ptrs + index_start_n * stride_kn
@@ -614,6 +679,36 @@ def _fwd_attention_kernel_call(
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len_q num_heads head_dim"], Float[Array, "batch num_heads max_seqlen_q_rounded"]]:
+    """Execute flash attention forward pass using Triton kernel.
+
+    This function handles all setup, validation, and dispatching for the flash
+    attention forward kernel. It supports multiple modes including variable-length
+    sequences, attention masks, sliding windows, and more.
+
+    Args:
+        q: Query tensor of shape [batch, seq_len_q, num_heads, head_dim]
+        k: Key tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
+        v: Value tensor of shape [batch, seq_len_k, num_kv_heads, head_dim]
+        attention_mask: Optional boolean or integer attention mask
+        bias: Optional attention bias tensor
+        softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
+        dropout_prob: Dropout probability applied to attention weights
+        causal: Whether to apply causal (autoregressive) masking
+        dropout_seed: Random seed for dropout
+        fwd_params: Forward pass configuration parameters
+        bwd_params: Backward pass configuration parameters (for compatibility)
+        cum_seqlens_q: Cumulative sequence lengths for variable-length queries
+        cum_seqlens_k: Cumulative sequence lengths for variable-length keys
+        sliding_window: Sliding window size (int or tuple of left/right)
+        logits_soft_cap: Soft cap value for attention logits
+        softmax_aux: Auxiliary softmax values for attention sinks
+        q_segment_ids: Query segment IDs for packed sequences
+        kv_segment_ids: Key/value segment IDs for packed sequences
+
+    Returns:
+        tuple: (output, lse) where output is attention result and lse is
+            log-sum-exp values for backward pass
+    """
     if sliding_window is None:
         window_left = 0
         window_right = 0

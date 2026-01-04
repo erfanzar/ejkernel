@@ -13,7 +13,8 @@
 # limitations under the License.
 
 
-"""Sharding utilities for distributed JAX computation.
+"""
+Sharding utilities for distributed JAX computation.
 
 This module provides utilities for managing array shardings across distributed
 devices, with automatic correction of partition specifications based on
@@ -30,6 +31,12 @@ Sharding Correction:
     - Divisibility of array dimensions by mesh axis sizes
     - Proper handling of multi-axis sharding
 
+    Common scenarios handled:
+    - PartitionSpec axis not in mesh -> axis becomes replicated (None)
+    - Array dimension not divisible by mesh size -> axis becomes replicated
+    - PartitionSpec longer than array rank -> truncated
+    - PartitionSpec shorter than array rank -> padded with None
+
 Ring Attention Reordering:
     The reorder_sequence function rearranges sequence dimensions to enable
     efficient ring attention communication patterns, alternating between
@@ -38,11 +45,17 @@ Ring Attention Reordering:
 Example:
     >>> from ejkernel.xla_utils import get_corrected_named_sharding
     >>> from jax.sharding import PartitionSpec, Mesh
+    >>> import jax
     >>>
-    >>> mesh = Mesh(devices, ('dp', 'mp'))
+    >>> # Create a 2D mesh with data and model parallelism
+    >>> devices = jax.devices()
+    >>> mesh = Mesh(devices.reshape(2, 4), ('dp', 'mp'))
+    >>>
+    >>> # Get a valid sharding for a tensor
     >>> shape = (8, 1024, 512)
     >>> spec = PartitionSpec('dp', None, 'mp')
     >>> sharding = get_corrected_named_sharding(shape, spec, mesh)
+    >>> # If 512 % 4 != 0, 'mp' would be corrected to None
 """
 
 from functools import partial
@@ -58,29 +71,55 @@ def get_corrected_named_sharding(
     mesh: Mesh,
 ) -> NamedSharding:
     """
-    Calculates the corrected PartitionSpec based on shape and mesh, returns NamedSharding.
+    Create a valid NamedSharding by correcting PartitionSpec based on shape and mesh.
 
-    This function takes an array shape and a desired PartitionSpec.
-    It determines the effective PartitionSpec by correcting the input based on:
-      - Axis names present in the current mesh.
-      - Divisibility of array dimensions by the product of corresponding mesh axis sizes.
+    This function takes an array shape and a desired PartitionSpec, then
+    automatically corrects invalid axis specifications to ensure the resulting
+    sharding is valid. This is essential when the same sharding spec is used
+    across tensors with different shapes.
 
-    It does NOT correct based on mesh axes having size 1, allowing such axes
-    to persist in the spec if explicitly provided and divisibility holds.
+    Correction Rules:
+        1. Axis names not in mesh -> replaced with None (replicated)
+        2. Array dimension not divisible by mesh axis size -> replaced with None
+        3. PartitionSpec longer than array rank -> truncated
+        4. PartitionSpec shorter than array rank -> padded with None
 
     Args:
-        shape: The shape of the target JAX array.
-        partition_spec: The desired PartitionSpec.
-        raise_mesh_error: If True, raises an error if no mesh is active.
-                          If False, returns a replicated NamedSharding on an
-                          empty mesh if no mesh is found.
+        shape: The shape of the target JAX array as a tuple of integers.
+        partition_spec: The desired PartitionSpec. Can contain axis names (str),
+            tuples of axis names for multi-axis sharding, or None for replication.
+        mesh: The JAX Mesh defining the device topology and axis names.
 
     Returns:
-        A NamedSharding object containing the current mesh and the corrected
-        PartitionSpec.
+        A NamedSharding object containing the mesh and the corrected PartitionSpec.
+        The corrected spec is guaranteed to be valid for the given shape and mesh.
 
-    Raises:
-        AssertionError: If no mesh is active and raise_mesh_error is True.
+    Examples:
+        >>> import jax
+        >>> import jax.numpy as jnp
+        >>> from jax.sharding import PartitionSpec, Mesh
+        >>> from ejkernel.xla_utils import get_corrected_named_sharding
+        >>>
+        >>> # Setup mesh with 8 devices (2x4)
+        >>> devices = jax.devices()[:8]
+        >>> mesh = Mesh(devices.reshape(2, 4), ('dp', 'mp'))
+        >>>
+        >>> # Valid sharding - all axes exist and dimensions are divisible
+        >>> shape = (8, 1024, 512)
+        >>> spec = PartitionSpec('dp', None, 'mp')
+        >>> sharding = get_corrected_named_sharding(shape, spec, mesh)
+        >>> # Returns: NamedSharding(mesh, PartitionSpec('dp', None, 'mp'))
+        >>>
+        >>> # Invalid axis name - 'tp' not in mesh, gets corrected to None
+        >>> spec = PartitionSpec('dp', 'tp', None)
+        >>> sharding = get_corrected_named_sharding(shape, spec, mesh)
+        >>> # Returns: NamedSharding(mesh, PartitionSpec('dp', None, None))
+        >>>
+        >>> # Non-divisible dimension - 100 % 4 != 0, 'mp' corrected to None
+        >>> shape = (8, 100, 512)
+        >>> spec = PartitionSpec('dp', 'mp', None)
+        >>> sharding = get_corrected_named_sharding(shape, spec, mesh)
+        >>> # Returns: NamedSharding(mesh, PartitionSpec('dp', None, None))
     """
 
     ndim = len(shape)
@@ -140,28 +179,56 @@ def get_corrected_named_sharding(
 
 @partial(jax.jit, static_argnames=("cp_size", "seq_dim", "to_contiguous"))
 def reorder_sequence(tensor, cp_size: int, seq_dim: int = 1, to_contiguous: bool = False):
-    """Reorder sequence dimension for ring attention communication patterns.
+    """
+    Reorder sequence dimension for ring attention communication patterns.
 
     Rearranges the sequence dimension to enable efficient ring attention
-    communication, alternating between forward and backward sequence chunks
-    to minimize communication overhead during context parallel processing.
+    communication patterns. The reordering alternates between forward and
+    backward sequence chunks to minimize communication overhead during
+    context parallel (CP) processing.
+
+    Ring attention distributes sequence processing across multiple devices,
+    where each device processes a chunk of the sequence and communicates
+    with neighboring devices in a ring topology. This function prepares
+    the sequence layout for efficient bidirectional communication.
 
     Args:
-        tensor: Input tensor with a sequence dimension to reorder.
-        cp_size: Context parallelism size (must be even).
-        seq_dim: Dimension index of the sequence axis (default: 1).
-        to_contiguous: If True, reorder for contiguous memory layout;
-            if False, reorder for ring attention pattern.
+        tensor: Input tensor with a sequence dimension to reorder. Can be
+            any tensor with at least seq_dim+1 dimensions (e.g., queries,
+            keys, values in attention).
+        cp_size: Context parallelism size - the number of devices in the
+            ring. Must be an even number >= 2.
+        seq_dim: Dimension index of the sequence axis. Default is 1, which
+            corresponds to the sequence dimension in [batch, seq, ...] layouts.
+        to_contiguous: Direction of reordering:
+            - False (default): Convert from contiguous to ring-optimized layout
+            - True: Convert from ring-optimized back to contiguous layout
 
     Returns:
-        Tensor with reordered sequence dimension for ring communication.
+        Tensor with same shape as input but with reordered sequence dimension.
+        The reordering interleaves chunks for efficient ring communication.
 
     Raises:
-        ValueError: If cp_size is not even or seq_len not divisible by 2*cp_size.
+        ValueError: If cp_size is not even (must be multiple of 2).
+        ValueError: If sequence length is not divisible by 2*cp_size.
 
     Note:
-        The reordering interleaves forward and backward chunks to enable
-        efficient bidirectional communication in ring attention patterns.
+        The reordering pattern interleaves forward chunks [0, 1, 2, ...] with
+        reversed backward chunks [..., cp_size+2, cp_size+1, cp_size] to enable
+        efficient bidirectional communication where each device can send/receive
+        to both neighbors simultaneously.
+
+    Examples:
+        >>> import jax.numpy as jnp
+        >>> from ejkernel.xla_utils import reorder_sequence
+        >>>
+        >>> # Reorder a tensor for 4-way context parallelism
+        >>> x = jnp.zeros((2, 128, 64))  # [batch, seq, hidden]
+        >>> x_reordered = reorder_sequence(x, cp_size=4, seq_dim=1)
+        >>> # Sequence chunks are now interleaved for ring communication
+        >>>
+        >>> # Convert back to contiguous layout
+        >>> x_contiguous = reorder_sequence(x_reordered, cp_size=4, to_contiguous=True)
     """
     if tensor is None:
         return tensor

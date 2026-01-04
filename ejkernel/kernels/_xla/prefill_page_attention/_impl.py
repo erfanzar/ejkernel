@@ -13,7 +13,16 @@
 # limitations under the License.
 
 
-"""XLA reference implementation of chunked prefill paged attention."""
+"""XLA reference implementation of chunked prefill paged attention.
+
+This module contains the core implementation of paged attention for the
+prefill phase. It uses standard JAX operations (gather, einsum, softmax)
+to compute attention over a paged KV cache.
+
+The implementation is designed for correctness and portability across
+all XLA backends (CPU, GPU, TPU), serving as a reference for optimized
+platform-specific implementations.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -40,23 +49,60 @@ def prefill_page_attention(
     attn_logits_soft_cap: float | None = None,
     sliding_window: int | None = None,
 ) -> Float[Array, "chunk_size num_heads head_dim"]:
-    """XLA reference implementation of chunked prefill paged attention.
+    """Compute chunked prefill paged attention using XLA operations.
 
-    This processes a chunk of query tokens during prefill phase with paged KV cache.
+    This function processes a chunk of query tokens during the prefill phase,
+    computing attention against a paged KV cache. It supports the standard
+    attention features needed for LLM inference: causal masking, GQA/MQA,
+    sliding window, and logits soft capping.
+
+    The query positions are assumed to be the last `chunk_size` positions
+    of the current context. For example, if context_len=512 and chunk_size=128,
+    the query positions are 384, 385, ..., 511.
 
     Args:
-        query: Query tensor [chunk_size, num_q_heads, head_dim] for prefill tokens.
+        query: Query tensor [chunk_size, num_q_heads, head_dim].
+            The chunk of tokens being processed in this prefill step.
         key_cache: Paged key cache [num_kv_heads, total_num_pages, page_size, head_dim].
+            Contains keys for all pages, indexed by page_indices for this sequence.
         value_cache: Paged value cache [num_kv_heads, total_num_pages, page_size, head_dim].
+            Same structure as key_cache.
         context_len: Total context length including this chunk [1].
-        page_indices: Page indices for this sequence [num_pages].
-        softmax_scale: Attention scaling factor (default: 1/sqrt(head_dim)).
-        mask_value: Value used for masked positions in attention.
+            Scalar array indicating how many tokens are valid in the KV cache.
+        page_indices: Physical page indices for this sequence [num_pages].
+            Maps logical page positions to physical pages in the cache.
+        softmax_scale: Attention scaling factor. Defaults to 1/sqrt(head_dim).
+        mask_value: Value used for masked (invalid) positions.
+            Defaults to a large negative value for numerical stability.
         attn_logits_soft_cap: Optional soft cap for attention logits.
-        sliding_window: If set, only attend to the last `sliding_window` tokens.
+            If set, applies: cap * tanh(logits / cap).
+        sliding_window: Optional sliding window size.
+            If set, each query can only attend to the last `sliding_window` tokens.
 
     Returns:
         Attention output [chunk_size, num_q_heads, head_dim].
+        Same dtype as input query.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>>
+        >>> chunk_size, num_heads, head_dim = 64, 8, 64
+        >>> query = jnp.ones((chunk_size, num_heads, head_dim))
+        >>> key_cache = jnp.ones((num_heads, 50, 16, head_dim))
+        >>> value_cache = jnp.ones((num_heads, 50, 16, head_dim))
+        >>> context_len = jnp.array([256])
+        >>> page_indices = jnp.arange(16)
+        >>>
+        >>> output = prefill_page_attention(
+        ...     query, key_cache, value_cache, context_len, page_indices
+        ... )
+        >>> output.shape
+        (64, 8, 64)
+
+    Note:
+        - GQA is supported: num_q_heads can be a multiple of num_kv_heads
+        - Causal masking is always applied (prefill is autoregressive)
+        - Page size is inferred from key_cache.shape[2]
     """
     chunk_size, num_q_heads, head_dim = query.shape
     num_kv_heads, _total_num_pages, page_size, _ = key_cache.shape

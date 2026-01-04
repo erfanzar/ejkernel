@@ -18,20 +18,53 @@
 This module implements recurrent-style attention mechanisms that maintain and update
 hidden states across sequence positions. Unlike standard attention which computes
 all positions independently, recurrent attention processes sequences sequentially
-with stateful computation.
+with stateful computation, achieving O(N) complexity.
 
-Features:
-    - Stateful attention with initial_state support
+Key features of Recurrent Attention:
+    - Stateful attention with initial_state support for chunked processing
     - Separate gating for queries (g), keys (gk), and values (gv)
     - Layer-wise gating control via g_gamma
     - Bidirectional processing support (forward and reverse)
-    - Variable-length sequence handling
+    - Variable-length sequence handling via cumulative lengths
+
+The algorithm implements a gated recurrent attention mechanism:
+    At each timestep t:
+        kv_t = k_t^T @ v_t           (outer product, shape [K, V])
+        g_t = sigmoid(g) if g else 1  (optional gating)
+        h_t = h_{t-1} * g_gamma + kv_t * g_t  (state update)
+        o_t = q_t^T @ h_t             (output computation)
+
+    where:
+        - h is the state matrix [num_heads, qk_head_dim, v_head_dim] per batch
+        - g, gk, gv provide fine-grained gating control
+        - g_gamma controls layer-level decay of the hidden state
+
+Mathematical formulation:
+    The recurrence computes gated attention:
+        o_t = Σ_{i≤t} g_gamma^(t-i) · (g_i · k_i^T · v_i) · q_t
+
+    This achieves O(T) complexity while maintaining expressive attention patterns.
+
+Supports:
+    - Variable sequence lengths via cu_seqlens (cumulative sequence lengths)
+    - Reverse processing for bidirectional models
+    - Initial state for continuation across chunks
+    - Multi-gating mechanisms for expressive control
+    - Custom softmax scaling
 
 This is particularly useful for:
     - Linear-time attention mechanisms
     - Models requiring sequential dependency modeling
     - Architectures with explicit state propagation
     - Efficient inference with incremental state updates
+    - Long-context processing with bounded memory
+
+Reference:
+    Based on linear attention and gated recurrent mechanisms from:
+    - Linear Transformers Are Secretly Fast Weight Programmers
+      (Schlag et al., 2021) https://arxiv.org/abs/2102.11174
+    - Flash-Linear-Attention implementation
+      https://github.com/sustcsonglin/flash-linear-attention
 """
 
 from __future__ import annotations
@@ -63,21 +96,42 @@ class RecurrentAttention(Kernel[RecurrentAttentionConfig, Array]):
 
     Implements attention with recurrent state updates, enabling linear-time complexity
     for certain attention patterns. The mechanism maintains a hidden state that is
-    updated at each sequence position.
+    updated at each sequence position, providing O(N) complexity with O(d²) memory
+    per head.
 
     Features:
         - Stateful computation with hidden state propagation
         - Multiple gating mechanisms (g, gk, gv, g_gamma)
         - Forward and reverse processing modes
-        - Support for initial states
+        - Support for initial states for chunked/streaming processing
         - Variable-length sequence handling via cu_seqlens
         - Multiple platform support (Triton/Pallas/CUDA/XLA)
+        - Automatic configuration caching for consistent performance
+        - Optional autotuning to find optimal implementation
 
     The gating mechanisms provide fine-grained control:
-        - g: Query-level gates
-        - gk: Key-level gates
-        - gv: Value-level gates
-        - g_gamma: Layer-level gates
+        - g: Query-level gates controlling input relevance
+        - gk: Key-level gates modulating key contributions
+        - gv: Value-level gates filtering value information
+        - g_gamma: Layer-level decay controlling state persistence
+
+    Example:
+        >>> from ejkernel.modules import RecurrentAttention, create_default_executor
+        >>>
+        >>> # Basic usage
+        >>> executor = create_default_executor()
+        >>> attn = RecurrentAttention()
+        >>> output = executor(attn, query, key, value)
+        >>>
+        >>> # With gating for more expressive attention
+        >>> output = executor(attn, query, key, value, g=gates, g_gamma=decay)
+        >>>
+        >>> # Streaming inference with state
+        >>> output, state = executor(
+        ...     attn, query, key, value,
+        ...     initial_state=prev_state,
+        ...     return_state=True
+        ... )
     """
 
     def __init__(self):

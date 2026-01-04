@@ -13,6 +13,61 @@
 # limitations under the License.
 
 
+"""Chunked Prefill Attention with Paged KV Cache for TPU.
+
+This module provides a TPU-optimized implementation of chunked prefill attention
+that reads from a paged KV cache. Unlike decode-phase page attention which
+processes single tokens, this kernel handles multiple query tokens during the
+prefill phase of LLM inference.
+
+Chunked prefill is essential for:
+1. Efficient prompt processing with paged KV cache
+2. Continuous batching where prefill and decode coexist
+3. Memory-efficient handling of long input sequences
+4. Low-latency first-token generation
+
+Key Features:
+    - Chunked processing: Handles multiple query tokens at once
+    - Paged KV cache integration: Reads from non-contiguous pages
+    - Causal masking: Each query only attends to itself and past tokens
+    - Grouped Query Attention (GQA): Efficient multi-query variants
+    - Sliding window: Local attention for long sequences
+    - Logits soft capping: Numerical stability for certain models
+
+Difference from Decode Attention:
+    - Prefill: Multiple query tokens, building up the KV cache
+    - Decode: Single query token per sequence, reading from full cache
+    - This kernel bridges both phases in continuous batching
+
+Algorithm overview:
+1. Query chunk is processed against existing KV cache pages
+2. Causal masking ensures queries only see valid context
+3. Pages are loaded via page_indices mapping
+4. Attention is computed with flash attention tiling
+5. Results are accumulated and returned
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.prefill_page_attention import prefill_page_attention
+    >>>
+    >>> # Prefill a chunk of tokens
+    >>> chunk_size, num_heads, head_dim = 64, 32, 128
+    >>> num_pages, page_size = 16, 16
+    >>>
+    >>> query = jnp.ones((chunk_size, num_heads, head_dim))
+    >>> key_cache = jnp.ones((num_heads, 256, page_size, head_dim))
+    >>> value_cache = jnp.ones((num_heads, 256, page_size, head_dim))
+    >>> context_len = jnp.array([chunk_size])
+    >>> page_indices = jnp.arange(num_pages)
+    >>>
+    >>> output = prefill_page_attention(
+    ...     query, key_cache, value_cache, context_len, page_indices
+    ... )
+
+Note:
+    chunk_size must be divisible by page_size for correct operation.
+"""
+
 import functools
 
 import jax

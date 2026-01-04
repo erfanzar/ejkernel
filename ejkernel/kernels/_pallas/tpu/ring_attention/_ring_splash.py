@@ -16,7 +16,37 @@
 """Ring Attention implementation using Splash Attention kernels.
 
 This module provides ring attention by wrapping JAX's splash attention kernels
-with a ring communication topology for distributed attention computation.
+with a ring communication topology for distributed attention computation across
+multiple TPU devices.
+
+Ring attention enables processing of very long sequences by distributing the
+sequence across devices and using a ring communication pattern to share KV
+pairs. Each device holds a shard of the sequence and iteratively receives
+KV data from neighboring devices, computing local attention and accumulating
+results using numerically stable online softmax.
+
+Algorithm overview:
+1. Each device starts with its local Q, K, V shards
+2. In each iteration:
+   - Compute local attention using Splash Attention kernel
+   - Merge results with running output using log-sum-exp correction
+   - Send K, V to next device in the ring (ppermute)
+3. After N iterations (N = ring size), all Q have seen all K, V
+
+Key features:
+- Memory-efficient: Only local K, V shards in memory at once
+- Numerically stable: Uses log-sum-exp trick for softmax accumulation
+- Supports causal attention across device boundaries
+- Compatible with Splash Attention's block-sparse optimizations
+- Automatic fallback to single-device Splash when not in ring context
+
+Example:
+    >>> from ejkernel.kernels._pallas.tpu.ring_attention import make_ring_attention
+    >>> from jax.experimental.shard_map import shard_map
+    >>>
+    >>> kernel = make_ring_attention(mask, block_sizes=block_sizes, is_mqa=False)
+    >>> sharded_fn = shard_map(kernel, mesh, in_specs=..., out_specs=...)
+    >>> output = sharded_fn(q, k, v)
 """
 
 from __future__ import annotations
@@ -58,6 +88,25 @@ def _update_out_and_lse(
     block_out: jax.Array,
     block_lse: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
+    """Numerically stable update of attention output and log-sum-exp.
+
+    Combines the current accumulated output with a new block's output using
+    the log-sum-exp trick to maintain numerical stability. This enables
+    incremental computation of softmax across multiple blocks.
+
+    The update formula uses:
+    - new_lse = lse + log(1 + exp(block_lse - lse))
+    - new_out = out + sigmoid(block_lse - lse) * (block_out - out)
+
+    Args:
+        out: Current accumulated output [num_heads, q_seq_len, head_dim].
+        lse: Current log-sum-exp [num_heads, q_seq_len].
+        block_out: New block's attention output.
+        block_lse: New block's log-sum-exp.
+
+    Returns:
+        Tuple of (updated_out, updated_lse) with merged results.
+    """
     is_first = lse == -jnp.inf
     block_lse_expanded = block_lse[..., None]
     lse_expanded = lse[..., None]
@@ -84,6 +133,31 @@ def _ring_attention_forward(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+    """Forward pass for ring attention over distributed devices.
+
+    Executes a ring communication pattern where each device computes
+    local attention and passes its K, V to the next device. Results are
+    accumulated using numerically stable log-sum-exp merging.
+
+    Args:
+        fwd_mask_info: Mask information for Splash Attention.
+        q: Local query shard [num_heads, q_seq_len, head_dim].
+        k: Local key shard [kv_seq_len, head_dim] for MQA or [num_heads, kv_seq_len, head_dim].
+        v: Local value shard with same shape as k.
+        segment_ids: Optional segment IDs for segment masking.
+        sinks: Optional attention sink logits.
+        mask_value: Value for masked positions.
+        is_mqa: Whether using multi-query attention (shared KV heads).
+        block_sizes: Tile sizes for Splash Attention kernel.
+        mask_function: Optional custom mask function.
+        logits_soft_cap: Optional soft cap for logits.
+        ring_axis: Name of the axis for ring communication.
+        causal: Whether to apply causal masking across ring iterations.
+
+    Returns:
+        Tuple of (output, (lse, lse)) where lse is the final log-sum-exp
+        for each query position.
+    """
     ring_axis_size = lax.psum(1, ring_axis)
     device_idx = lax.axis_index(ring_axis)
 
@@ -480,6 +554,31 @@ def ring_splash_attention(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
 ) -> jax.Array:
+    """Compute ring attention using Splash Attention kernels.
+
+    Main entry point for ring attention computation. Automatically detects
+    whether running in a distributed context (shard_map/pmap) and falls back
+    to single-device Splash Attention if not.
+
+    Args:
+        fwd_mask_info: Pre-computed mask info for forward pass.
+        dkv_mask_info: Optional mask info for dKV backward pass.
+        q: Query tensor, local shard if distributed.
+        k: Key tensor, local shard if distributed.
+        v: Value tensor, local shard if distributed.
+        segment_ids: Optional segment IDs for packed sequence masking.
+        sinks: Optional attention sink logits for StreamingLLM-style attention.
+        is_mqa: Whether using multi-query attention (shared KV across heads).
+        block_sizes: Tile sizes for kernel execution.
+        mask_value: Value for masked attention positions.
+        mask_function: Optional custom mask function.
+        logits_soft_cap: Optional soft cap for attention logits.
+        ring_axis: Axis name for ring communication (default: "sp").
+        causal: Whether to apply causal masking.
+
+    Returns:
+        Attention output tensor with same shape as query.
+    """
     dq_mask_info = fwd_mask_info if block_sizes.has_backward_blocks else None
 
     # Single-device fallback: if we're not inside a `shard_map`/`pmap` context that
@@ -586,6 +685,30 @@ def make_ring_attention(
     ring_axis: str = RING_AXIS,
     q_seq_shards: int = 1,
 ) -> RingSplashAttentionKernel:
+    """Create a ring attention kernel from an attention mask.
+
+    Factory function that preprocesses the mask and creates a callable
+    kernel object for ring attention. The kernel can be used directly
+    or wrapped in shard_map for distributed execution.
+
+    Args:
+        mask: Attention mask as numpy array, JAX array, or Mask object.
+            Shape should be [q_seq_len, kv_seq_len].
+        block_sizes: Optional tile sizes for kernel. Uses defaults if None.
+        is_mqa: Whether using multi-query attention.
+        mask_value: Value for masked positions in attention.
+        logits_soft_cap: Optional soft cap for attention logits.
+        ring_axis: Axis name for ring communication pattern.
+        q_seq_shards: Number of shards for query sequence (for mask processing).
+
+    Returns:
+        RingSplashAttentionKernel that can be called with (q, k, v) tensors.
+
+    Example:
+        >>> mask = make_causal_mask((seq_len, seq_len))
+        >>> kernel = make_ring_attention(mask, is_mqa=False)
+        >>> output = kernel(q, k, v)
+    """
     if len(mask.shape) != 2:
         raise ValueError(f"Expected 2D mask, got shape: {mask.shape}")
 

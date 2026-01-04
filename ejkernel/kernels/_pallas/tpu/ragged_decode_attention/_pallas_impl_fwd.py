@@ -12,6 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged Decode Attention TPU kernel implementation using Pallas.
+
+This module provides an optimized Flash Attention implementation for decode-phase
+attention on Google TPUs, designed to handle variable-length (ragged) sequences
+within a batch. Each sequence in the batch can have different start/end positions,
+enabling efficient batched inference without padding.
+
+Algorithm Overview:
+    The ragged attention algorithm processes variable-length sequences:
+    1. Each batch element has sequence_start and sequence_end boundaries
+    2. Queries are computed against KV within those boundaries only
+    3. Positions outside boundaries are masked to negative infinity
+    4. Online softmax accumulates attention weights across KV blocks
+    5. Masked blocks are zeroed to avoid contributing to normalization
+
+Key Features:
+    - Ragged sequence support with per-batch start/end indices
+    - Block-wise Flash Attention with O(N) memory complexity
+    - Online softmax for numerically stable attention
+    - Multi-query attention (MQA) optimized kernel
+    - Automatic KV padding handling for block alignment
+    - Cost estimation for efficient Pallas scheduling
+
+TPU Optimizations:
+    - Prefetch scalar grid specification for sequence boundaries
+    - Block-wise processing to maximize TPU MXU utilization
+    - Dimension semantics hints for parallel/arbitrary axes
+    - Efficient masking using broadcasted iota operations
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.ragged_decode_attention import _pallas_impl_fwd
+    >>> # Query: [batch, num_heads, head_dim]
+    >>> query = jnp.ones((4, 32, 128))
+    >>> # Key/Value: [batch, seq_len, num_heads, head_dim]
+    >>> key = jnp.ones((4, 512, 32, 128))
+    >>> value = jnp.ones((4, 512, 32, 128))
+    >>> start = jnp.array([0, 50, 100, 150], dtype=jnp.int32)
+    >>> end = jnp.array([100, 150, 200, 250], dtype=jnp.int32)
+    >>> output = _pallas_impl_fwd.inner_decode_tpu(
+    ...     query, key, value, start, end
+    ... )
+"""
 
 import functools
 

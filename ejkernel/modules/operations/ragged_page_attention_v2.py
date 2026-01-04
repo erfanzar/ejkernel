@@ -78,7 +78,26 @@ from .configs import RaggedPageAttentionv2Config
 
 
 def _xla_block_candidates_v2(inv: Invocation[RaggedPageAttentionv2Config, Array]) -> list[RaggedPageAttentionv2Config]:
-    """Generate power-of-2 XLA configs with larger blocks."""
+    """Generate power-of-2 XLA configurations with larger block sizes.
+
+    Creates candidate configurations optimized for XLA backend execution by
+    exploring power-of-2 block sizes for both KV pages and query tokens.
+    These configurations are designed to reduce XLA loop overhead through
+    larger tile sizes.
+
+    Args:
+        inv: Invocation object containing the attention arguments including
+            queries tensor and block_tables for shape extraction.
+
+    Returns:
+        List of RaggedPageAttentionv2Config objects with XLA-optimized block
+        sizes. Returns empty list if required arguments are missing or have
+        invalid shapes.
+
+    Note:
+        KV page candidates: 16, 32, 64 (bounded by pages_per_seq)
+        Query candidates: 64, 128, 256 (bounded by total_tokens)
+    """
     try:
         queries = inv.kwargs["queries"]
         block_tables = inv.kwargs["block_tables"]
@@ -415,7 +434,31 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedPageAttentionv2Config, Array]):
         """Generate candidate configurations for autotuning on GPU (Triton).
 
+        Produces a set of kernel configurations optimized for GPU execution with
+        Triton backend. The heuristics balance memory efficiency and parallelism
+        for ragged page attention workloads.
+
         Heuristics:
+            - For small head_dim (<=64): BLOCK_M up to 128 is efficient
+            - For medium head_dim (65-128): BLOCK_M 32-128 works well
+            - For large head_dim (>128): Prefer smaller BLOCK_M (32-64)
+            - More KV pages per block helps small page_size (<=32)
+            - Constrain S_block = page_size * num_kv_pages_per_block <= 256
+            - Higher warps (4-8) for larger blocks
+            - Stages 2-4 for multi-page blocks
+
+        Args:
+            inv: Invocation object containing input tensors and metadata.
+                Used to determine optimal block sizes based on workload shape.
+
+        Returns:
+            List of RaggedPageAttentionv2Config objects optimized for GPU.
+            Currently returns XLA fallback configs as Triton implementation
+            is under development.
+
+        Note:
+            The generated configs prioritize high-value combinations first
+            (empirically good block sizes), then explore a broader grid.
         """
         q = inv.kwargs["queries"]
         kv = inv.kwargs["kv_pages"]
@@ -538,11 +581,27 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
     def candidate_cfgs_tpu(self, inv: Invocation[RaggedPageAttentionv2Config, Array]):
         """Generate candidate configurations for autotuning on TPU (Pallas backend).
 
+        Produces configurations optimized for TPU execution with Pallas backend.
+        The heuristics balance memory efficiency and parallelism for ragged page
+        attention workloads on TPU hardware.
+
         Heuristics:
-        - For small head_dim, larger BLOCK_M is fine (64-128).
-        - For large head_dim (>=160), prefer smaller BLOCK_M (32-64).
-        - More KV pages per block helps small page_size (<=32).
-        - Constrain S_block = page_size * num_kv_pages_per_block <= 256 to keep tiles reasonable.
+            - For small head_dim, larger BLOCK_M is efficient (64-128)
+            - For large head_dim (>=160), prefer smaller BLOCK_M (32-64)
+            - More KV pages per block helps with small page_size (<=32)
+            - Constrains S_block = page_size * num_kv_pages_per_block <= 256
+
+        Args:
+            inv: Invocation object containing input tensors and metadata.
+                Used to determine optimal block sizes based on workload shape.
+
+        Returns:
+            List of RaggedPageAttentionv2Config objects optimized for TPU.
+            Returns empty list if required arguments are missing or invalid.
+
+        Note:
+            KV page candidates: 16, 32, 64 (bounded by pages_per_seq)
+            Query candidates: 4, 8, 16, 32, 64 (bounded by total_tokens)
         """
 
         try:

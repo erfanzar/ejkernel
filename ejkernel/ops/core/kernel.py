@@ -202,6 +202,31 @@ class Kernel(Generic[Cfg, Out]):
     version: str = "0"
 
     def __init__(self, op_id: str | None = None):
+        """Initialize a new Kernel instance with an operation identifier.
+
+        Sets up the kernel with a unique operation ID for caching, profiling,
+        and identification purposes. The op_id can be explicitly provided,
+        inherited from a class attribute, or auto-generated from the class name.
+
+        Args:
+            op_id: Optional unique identifier for this operation. If not provided,
+                uses the class attribute op_id if set, otherwise generates an ID
+                from the module and class name (e.g., 'mymodule.MyKernel').
+
+        Example:
+            >>> class MatMulKernel(Kernel):
+            ...     pass
+            >>>
+            >>> # Explicit op_id
+            >>> kernel = MatMulKernel("custom_matmul")
+            >>> kernel.op_id
+            'custom_matmul'
+            >>>
+            >>> # Auto-generated op_id
+            >>> kernel = MatMulKernel()
+            >>> kernel.op_id
+            '__main__.MatMulKernel'
+        """
         if op_id is not None:
             self.op_id = op_id
         elif getattr(self, "op_id", None):
@@ -458,21 +483,83 @@ class Kernel(Generic[Cfg, Out]):
         """Execute operation in shard_map context on GPU. Optional override.
 
         Most specific implementation combining shard_map execution context with
-        GPU platform optimizations.
+        GPU platform optimizations. This method is automatically selected when
+        running with method='shard_map' on a GPU device.
+
+        Args:
+            *args: Positional arguments (after prepare() preprocessing)
+            cfg: Configuration object specifying how to execute the operation
+            **kwargs: Keyword arguments (after prepare() preprocessing)
+
+        Returns:
+            Result of the operation
+
+        Raises:
+            NotImplementedError: Only implement if providing GPU-specific shard_map execution
 
         Example:
             >>> def run_shard_map_gpu(self, x, y, cfg: MyConfig) -> jax.Array:
-            ...
+            ...     # Use GPU-specific CUDA kernels in sharded context
             ...     return gpu_sharded_operation(x, y, cfg)
+
+        Note:
+            This is the highest priority method for shard_map execution on GPU,
+            following the priority chain: composite > context > platform > generic.
         """
         raise NotImplementedError
 
     def fwd_with_residuals_shard_map_gpu(self, *args, cfg: Cfg, **kwargs) -> tuple[Out, Any]:
-        """Forward pass with residuals for shard_map on GPU. Optional override."""
+        """Forward pass with residuals for shard_map on GPU. Optional override.
+
+        Specialized forward pass that combines shard_map context with GPU platform
+        optimizations. Returns both the result and residuals needed for the backward
+        pass in custom gradient computations.
+
+        Args:
+            *args: Positional arguments for the operation
+            cfg: Configuration object
+            **kwargs: Keyword arguments for the operation
+
+        Returns:
+            Tuple of (operation_result, residuals)
+            - operation_result: Same as run_shard_map_gpu() method output
+            - residuals: Any values needed for the backward pass
+
+        Raises:
+            NotImplementedError: Only implement if providing custom gradients for
+                GPU-specific shard_map execution
+
+        Note:
+            Must be implemented together with vjp_shard_map_gpu() method for custom
+            gradients in GPU shard_map contexts.
+        """
         raise NotImplementedError
 
     def vjp_shard_map_gpu(self, residuals: Any, y: Out, dy: Out, *args, cfg: Cfg, **kwargs):
-        """Backward pass for shard_map on GPU. Optional override."""
+        """Backward pass for shard_map on GPU. Optional override.
+
+        Specialized backward pass that combines shard_map context with GPU platform
+        optimizations. Computes gradients with respect to positional arguments.
+
+        Args:
+            residuals: Values returned from fwd_with_residuals_shard_map_gpu()
+            y: Forward pass output (from fwd_with_residuals_shard_map_gpu())
+            dy: Incoming gradients (cotangents) with respect to y
+            *args: Original positional arguments
+            cfg: Configuration object
+            **kwargs: Original keyword arguments
+
+        Returns:
+            Tuple of gradients for each positional argument
+            (None for arguments that don't need gradients)
+
+        Raises:
+            NotImplementedError: Only implement if providing custom gradients for
+                GPU-specific shard_map execution
+
+        Note:
+            Must be implemented together with fwd_with_residuals_shard_map_gpu() method.
+        """
         raise NotImplementedError
 
     def create_shard_map_wrapper(

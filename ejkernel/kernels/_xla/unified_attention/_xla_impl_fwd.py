@@ -12,6 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Unified Attention forward pass using XLA/JAX.
+
+This module provides the forward pass for unified attention, a flexible
+attention implementation that supports various use cases including
+prefill, decode, and mixed operations with paged KV cache.
+
+Key Components:
+    - _unified_attention_fwd: Main forward function
+
+Algorithm:
+    Unified attention combines multiple attention patterns:
+    1. Support both contiguous and paged KV cache layouts
+    2. Handle variable-length sequences with proper masking
+    3. Apply sliding window attention when configured
+    4. Optionally apply logit soft capping
+
+Features:
+    - Flexible query/key/value shapes for different use cases
+    - Paged KV cache with req_to_tokens indirection
+    - Sliding window support for long sequences
+    - Logit soft capping for numerical stability
+    - GQA/MQA support with automatic head broadcasting
+
+Memory Layout:
+    - queries: [batch, seq_len_q, num_q_heads, head_dim]
+    - key_cache/value_cache: [total_tokens, num_kv_heads, head_dim]
+    - req_to_tokens: [batch, max_seq_len] token index mapping
+    - seq_lens: [batch] sequence lengths
+
+Note:
+    This unified kernel reduces code duplication by handling
+    multiple attention patterns in a single implementation.
+"""
+
 from __future__ import annotations
 
 import jax

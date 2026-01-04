@@ -46,7 +46,26 @@ def _recurrent_core(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "... num_heads head_dim head_dim"]]:
-    """Core recurrent attention with custom VJP."""
+    """Core recurrent attention computation with custom VJP for gradients.
+
+    This is the main computational entry point that dispatches to either
+    variable-length or fixed-length implementations based on cu_seqlens.
+    Custom VJP enables efficient gradient computation for training.
+
+    Args:
+        query, key, value: Standard attention tensors [batch, seq_len, heads, dim]
+        g: GLA-style gate tensor for gated linear attention
+        g_gamma: Per-head decay factor for Lightning attention (nondiff)
+        gk: Gate applied to keys
+        gv: Gate applied to values
+        softmax_scale: Query scaling factor (nondiff)
+        initial_state: Initial hidden state for continuation
+        reverse: Process sequence in reverse order (nondiff)
+        cu_seqlens: Cumulative sequence lengths for packed mode (nondiff)
+
+    Returns:
+        Tuple of (output, final_state)
+    """
     if cu_seqlens is not None:
         return _recurrent_attention_varlen_fwd(
             query, key, value, cu_seqlens, g, g_gamma, gk, gv, softmax_scale, initial_state, reverse
@@ -74,7 +93,23 @@ def _recurrent_fwd(
     tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]],
     tuple,
 ]:
-    """Forward with residuals for backward."""
+    """Forward rule for recurrent attention VJP.
+
+    Computes the recurrent attention output and saves residuals needed
+    for the backward pass. Handles default initialization for optional
+    parameters.
+
+    Args:
+        query, key, value: Input tensors for attention
+        g, g_gamma, gk, gv: Optional gating parameters
+        softmax_scale: Query scaling (defaults to 1/sqrt(head_dim))
+        initial_state: Starting hidden state (defaults to zeros)
+        reverse: Process sequence backwards
+        cu_seqlens: For variable-length mode
+
+    Returns:
+        Tuple of ((output, final_state), residuals)
+    """
 
     if softmax_scale is None:
         softmax_scale = 1.0 / jnp.sqrt(query.shape[-1]).astype(jnp.float32)
@@ -108,7 +143,25 @@ def _recurrent_bwd(
     residuals: tuple,
     grads: tuple,
 ) -> tuple:
-    """Backward pass with custom implementation."""
+    """Backward rule for recurrent attention VJP.
+
+    Computes gradients with respect to query, key, value, gates, and
+    initial state using the custom backward implementation.
+
+    Args:
+        g_gamma_nondiff: Per-head decay (nondiff, from closure)
+        scale_nondiff: Softmax scale (nondiff, from closure)
+        reverse: Whether forward was reversed (nondiff)
+        cu_seqlens: Sequence lengths (nondiff, currently unsupported)
+        residuals: Saved tensors from forward pass
+        grads: (do, dfinal_state) gradients from downstream
+
+    Returns:
+        Tuple of gradients (dq, dk, dv, dg, dgk, dgv, dinitial_state)
+
+    Raises:
+        NotImplementedError: If cu_seqlens was provided (not yet supported)
+    """
     query, key, value, g, g_gamma, gk, gv, hidden_states, initial_state = residuals
     do, dfinal_state = grads
 

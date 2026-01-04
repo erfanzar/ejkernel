@@ -255,6 +255,33 @@ def bwd_triton_impl(
     Float[Array, "batch seq_len num_heads head_dim"] | None,
     Float[Array, "batch num_heads head_dim head_dim"] | None,
 ]:
+    """Execute recurrent linear attention backward pass using Triton kernel.
+
+    Computes gradients for queries, keys, values, and optional gating
+    parameters. Uses cumulative sum operations for gate gradients when
+    applicable. Processes sequence in reverse order from forward pass.
+
+    Args:
+        q: Query tensor [batch, seq_len, num_heads, head_dim]
+        k: Key tensor [batch, seq_len, num_heads, head_dim]
+        v: Value tensor [batch, seq_len, num_heads, head_dim]
+        g: Optional GLA-style gate [batch, seq_len, num_heads, 1]
+        g_gamma: Optional Lightning-style decay factor [batch, num_heads]
+        gk: Optional per-key gate [batch, seq_len, num_heads, head_dim]
+        gv: Optional per-value gate [batch, seq_len, num_heads, head_dim]
+        o: Output from forward pass (needed for gv gradient computation)
+        do: Gradient of output tensor
+        dht: Optional gradient of final hidden state
+        softmax_scale: Query scaling factor (default: 1.0)
+        initial_state: Initial hidden state from forward pass
+        reverse: Whether forward pass was reversed
+        cu_seqlens: Cumulative sequence lengths for variable-length mode
+
+    Returns:
+        tuple: (dq, dk, dv, dg, dgk, dgv, dh0) gradients for each input.
+            Gate gradients (dg, dgk, dgv) are computed using cumulative sums
+            over the sequence. dh0 is the initial state gradient.
+    """
     Z, SEQUENCE, HEAD, DIM_K, DIM_V = *k.shape, v.shape[-1]
     N = Z if cu_seqlens is None else len(cu_seqlens) - 1
 

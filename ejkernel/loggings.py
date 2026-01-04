@@ -23,6 +23,26 @@ This module provides enhanced logging capabilities including:
 
 The logging system automatically adjusts for distributed training scenarios,
 suppressing output from non-primary processes to avoid clutter.
+
+Key Components:
+    LazyLogger: Lazy-initialized logger with JAX process awareness
+    ProgressLogger: Terminal progress bars with ETA calculations
+    ColorFormatter: ANSI color formatting for log messages
+    Profiler utilities: JAX trace profiler with Perfetto support
+
+Constants:
+    COLORS: ANSI color code mappings
+    LEVEL_COLORS: Log level to color mappings
+
+Example:
+    >>> from ejkernel.loggings import get_logger, ProgressLogger
+    >>>
+    >>> logger = get_logger(__name__)
+    >>> logger.info("Starting training")
+    >>>
+    >>> with ProgressLogger("Training") as progress:
+    ...     for i, batch in enumerate(batches):
+    ...         progress.update(i, len(batches), f"Batch {i}")
 """
 
 from __future__ import annotations
@@ -388,32 +408,62 @@ def create_step_profiler(
     duration_steps: int,
     enable_perfetto: bool,
 ) -> tp.Callable[[int], None]:
-    """
-    Creates a step-aware profiler that activates during a specific training window.
+    """Create a step-aware profiler that activates during a specific training window.
+
+    Creates a callback function that can be called at each training step to
+    automatically start/stop JAX profiling at the specified step range.
 
     Args:
-        profile_path: Directory to store profiling results
-        start_step: Step number to begin profiling (inclusive)
-        duration_steps: How many steps to profile
-        enable_perfetto: Whether to generate Perfetto UI links
+        profile_path: Directory to store profiling results (trace files).
+        start_step: Step number to begin profiling (inclusive).
+        duration_steps: Number of steps to profile.
+        enable_perfetto: Whether to generate Perfetto UI links (primary process only).
 
     Returns:
-        A callback function for training step profiling
+        Callback function that takes step number and manages profiler lifecycle.
+        Call this function at each training step with the current step number.
+
+    Example:
+        >>> profiler = create_step_profiler(
+        ...     profile_path="./profiles",
+        ...     start_step=100,
+        ...     duration_steps=10,
+        ...     enable_perfetto=True
+        ... )
+        >>> for step in range(1000):
+        ...     profiler(step)
+        ...     train_step(batch)
     """
     from ejkernel.utils import barrier_sync
 
     class ProfilerState:
-        """State tracker for profiler lifecycle management."""
+        """State tracker for profiler lifecycle management.
+
+        Tracks whether the profiler is currently active and whether
+        profiling has been completed to prevent re-activation.
+
+        Attributes:
+            active: True if profiler is currently running.
+            completed: True if profiling has finished.
+        """
 
         def __init__(self):
-            """Initialize profiler state as inactive."""
+            """Initialize profiler state as inactive and not completed."""
             self.active = False
             self.completed = False
 
     state = ProfilerState()
 
-    def profile_step(step) -> None:
-        """Handles profiling lifecycle based on current step."""
+    def profile_step(step: int) -> None:
+        """Handle profiling lifecycle based on current step.
+
+        Starts profiling one step before the target range and stops
+        at the end of the duration. This function is idempotent after
+        profiling completes.
+
+        Args:
+            step: Current training step number.
+        """
         if state.completed:
             return
 
@@ -432,23 +482,37 @@ def create_step_profiler(
 
 
 def ignite_profiler(profile_path: str, enable_perfetto: bool = False) -> None:
-    """
-    Ignites the JAX profiler with optional Perfetto integration.
+    """Start the JAX profiler with optional Perfetto integration.
+
+    Begins tracing JAX operations for performance analysis. Trace files
+    are written to the specified path and can be viewed in Perfetto UI.
 
     Args:
-        profile_path: Directory to store profiling results
-        enable_perfetto: Whether to generate Perfetto UI links (only on primary process)
+        profile_path: Directory to store profiling results (trace files).
+        enable_perfetto: Whether to generate Perfetto UI links. Only enabled
+            on primary process (process_index == 0) to avoid duplicate links.
+
+    Note:
+        Call extinguish_profiler() to stop tracing and finalize results.
     """
     should_enable_perfetto = enable_perfetto and jax.process_index() == 0
     jax.profiler.start_trace(profile_path, create_perfetto_link=should_enable_perfetto, create_perfetto_trace=True)
 
 
 def extinguish_profiler(enable_perfetto: bool) -> None:
-    """
-    Safely stops the profiler and handles Perfetto link generation.
+    """Stop the profiler and handle Perfetto link generation.
+
+    Safely stops JAX tracing and finalizes trace files. When Perfetto
+    is enabled, keeps output streams alive during the potentially
+    long finalization process.
 
     Args:
-        enable_perfetto: Whether Perfetto links were enabled
+        enable_perfetto: Whether Perfetto links were enabled during profiling.
+            Used to determine if output pulsing is needed during shutdown.
+
+    Note:
+        This function should be called after ignite_profiler() to stop
+        tracing and write results to disk.
     """
     completion_signal = threading.Event()
     if enable_perfetto and jax.process_index() == 0:
@@ -461,14 +525,23 @@ def extinguish_profiler(enable_perfetto: bool) -> None:
 
 
 def _pulse_output_during_wait(completion_signal: threading.Event) -> None:
-    """
-    Keeps output streams alive during blocking profiler shutdown.
+    """Keep output streams alive during blocking profiler shutdown.
+
+    Spawns a daemon thread that periodically flushes stdout/stderr
+    to prevent connection timeouts during long-running profiler
+    finalization.
 
     Args:
-        completion_signal: Event signaling when to stop pulsing
+        completion_signal: Event that signals when to stop pulsing.
+            The thread runs until this event is set.
+
+    Note:
+        This is an internal function used by extinguish_profiler().
+        The spawned thread is a daemon and will not block program exit.
     """
 
     def pulse_output() -> None:
+        """Periodically flush output streams until completion signal is set."""
         sys.stdout.flush()
         sys.stderr.flush()
         time.sleep(5)

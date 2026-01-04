@@ -12,6 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Native Sparse Attention backward pass implementation using XLA/JAX.
+
+This module provides the backward pass (gradient computation) for Native
+Sparse Attention, computing gradients dQ, dK, dV for the block-sparse
+attention pattern.
+
+Key Components:
+    - _sparse_attention_bwd: Main backward function
+
+Algorithm:
+    Gradient computation for sparse attention:
+    1. For each query, compute dQ from do and selected K/V blocks
+    2. Scatter dK, dV gradients back to original positions using block_indices
+    3. Handle gradient accumulation for overlapping block selections
+
+Gradient Equations:
+    - dQ: dL/dQ = do @ K^T (only selected K blocks)
+    - dK: dL/dK = Q^T @ do * attention_weights (scattered to block positions)
+    - dV: dL/dV = attention_weights^T @ do (scattered to block positions)
+
+Features:
+    - Efficient scatter-based gradient accumulation
+    - Handles variable block_counts per query
+    - GQA/MQA gradient broadcasting
+
+Note:
+    Uses ejit decorator for efficient JIT compilation. The scatter
+    operations for dK/dV can be memory-intensive for highly overlapping
+    block selection patterns.
+"""
 
 import jax
 import jax.numpy as jnp

@@ -12,7 +12,54 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RWKV-4 recurrent time-mix kernel (Triton)."""
+"""RWKV-4 recurrent time-mix kernel implementation using Triton.
+
+This module provides a GPU-accelerated implementation of the RWKV-4 time-mix
+recurrence mechanism. RWKV-4 is a linear attention variant that replaces the
+quadratic attention mechanism with a recurrent formulation, achieving O(N)
+complexity for sequence processing.
+
+RWKV-4 computes attention through a weighted combination of key-value pairs
+using exponential decay, where the decay rate is learned per channel. The
+model maintains a running state that accumulates information from previous
+tokens, allowing efficient sequential processing.
+
+Key components:
+- Time decay (w): Controls how quickly past information decays, stored in
+  log-space for numerical stability
+- Time-mix bias (u): Adds a direct contribution from the current timestep
+- State: A 3-tuple (alpha, beta, eps) tracking the accumulated numerator,
+  denominator, and max logit for numerical stability
+
+Algorithm:
+    For each timestep t:
+        wkv_t = (exp(u + k_t) * v_t + alpha_t) / (exp(u + k_t) + beta_t)
+        alpha_{t+1} = exp(w) * alpha_t + exp(k_t) * v_t
+        beta_{t+1} = exp(w) * beta_t + exp(k_t)
+
+Key features:
+- O(N) time complexity for sequence processing
+- Numerically stable through log-space computation
+- Custom Triton kernel for GPU acceleration
+- Stateful processing for autoregressive generation
+- Compatible with standard RWKV model architectures
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.rwkv4 import rwkv4
+    >>>
+    >>> batch, seq_len, channels = 2, 1024, 512
+    >>> w = jnp.zeros((channels,))  # Time decay parameters
+    >>> u = jnp.zeros((channels,))  # Time-mix bias
+    >>> k = jnp.ones((batch, seq_len, channels))
+    >>> v = jnp.ones((batch, seq_len, channels))
+    >>>
+    >>> output, final_state = rwkv4(w, u, k, v)
+
+Reference:
+    RWKV: Reinventing RNNs for the Transformer Era
+    https://arxiv.org/abs/2305.13048
+"""
 
 from __future__ import annotations
 
@@ -36,6 +83,21 @@ def _fwd_call(
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"] | None,
 ):
+    """Forward pass for RWKV-4 time-mix in a custom VJP.
+
+    Computes the RWKV-4 recurrence and saves residuals for backward pass.
+    Initializes state if not provided.
+
+    Args:
+        w: Time decay parameter in log-space of shape `[C]`.
+        u: Time-mix bias parameter of shape `[C]`.
+        k: Key tensor of shape `[B, T, C]`.
+        v: Value tensor of shape `[B, T, C]`.
+        state: Optional initial state `[B, 3, C]` containing (alpha, beta, eps).
+
+    Returns:
+        A tuple containing (output, final_state) and residuals for backward.
+    """
     state_was_none = state is None
     if state is None:
         bsz, _, chans = k.shape
@@ -54,6 +116,18 @@ def _bwd_call(
     residual,
     grads,
 ):
+    """Backward pass for RWKV-4 time-mix in a custom VJP.
+
+    Computes gradients with respect to all inputs using JAX autodiff
+    through the XLA reference implementation.
+
+    Args:
+        residual: Tensors saved from the forward pass (w, u, k, v, state).
+        grads: A tuple containing gradients (do, dstate) of output and final state.
+
+    Returns:
+        A tuple of gradients (dw, du, dk, dv, dstate_in) for all inputs.
+    """
     (w, u, k, v, state, state_was_none) = residual
     do, dstate = grads
 
@@ -76,6 +150,24 @@ def _rwkv4(
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]:
+    """Core RWKV-4 function with custom VJP.
+
+    This internal function directly calls the Triton implementation and is
+    registered with JAX's custom differentiation system for memory-efficient
+    gradient computation.
+
+    Args:
+        w: Time decay parameter in log-space of shape `[C]`.
+        u: Time-mix bias parameter of shape `[C]`.
+        k: Key tensor of shape `[B, T, C]`.
+        v: Value tensor of shape `[B, T, C]`.
+        state: Optional initial state `[B, 3, C]` containing (alpha, beta, eps).
+
+    Returns:
+        A tuple containing:
+            - output: The WKV output tensor of shape `[B, T, C]`.
+            - final_state: The final recurrent state of shape `[B, 3, C]`.
+    """
     if state is None:
         bsz, _, chans = k.shape
         alpha0 = jnp.zeros((bsz, chans), dtype=jnp.float32)

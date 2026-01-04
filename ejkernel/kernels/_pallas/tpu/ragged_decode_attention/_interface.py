@@ -13,6 +13,57 @@
 # limitations under the License.
 
 
+"""Ragged Decode Attention for TPU using Flash Attention.
+
+This module provides a TPU-optimized implementation of ragged decode attention
+for autoregressive decoding with variable-length sequences. Unlike standard
+batch attention, this kernel handles sequences with different lengths within
+the same batch efficiently through explicit sequence boundary tracking.
+
+Ragged decode attention is essential for:
+1. Batched autoregressive decoding with variable context lengths
+2. Continuous batching in inference serving
+3. Memory-efficient handling of heterogeneous sequence lengths
+4. High-throughput token generation on TPU
+
+Key Features:
+    - Variable sequence lengths: Each batch element can have different lengths
+    - Explicit boundaries: sequence_start and sequence_end define valid ranges
+    - Flash Attention tiling: Memory-efficient attention computation
+    - Grouped Query Attention (GQA): Support for multi-query attention variants
+    - Sliding window: Local attention for long sequences
+    - Logits soft capping: Numerical stability for certain models
+    - Attention sinks: Streaming inference with fixed context anchors
+
+Sequence Layout:
+    - Keys and values have shape [batch, max_seq_len, num_kv_heads, head_dim]
+    - Each sequence uses positions [sequence_start[i]:sequence_end[i]]
+    - Positions outside this range are masked/ignored
+    - Enables efficient batching without padding overhead
+
+Algorithm overview:
+1. Single query token per sequence attends to variable-length KV cache
+2. Sequence boundaries mask invalid positions
+3. Flash attention tiling reduces memory usage
+4. Results are computed independently per batch element
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.ragged_decode_attention import ragged_decode_attention
+    >>>
+    >>> batch, max_seq_len, num_heads, head_dim = 4, 2048, 32, 128
+    >>>
+    >>> query = jnp.ones((batch, num_heads, head_dim))
+    >>> key = jnp.ones((batch, max_seq_len, num_heads, head_dim))
+    >>> value = jnp.ones((batch, max_seq_len, num_heads, head_dim))
+    >>> sequence_start = jnp.array([0, 0, 0, 0])
+    >>> sequence_end = jnp.array([100, 500, 250, 1000])
+    >>>
+    >>> output = ragged_decode_attention(
+    ...     query, key, value, sequence_start, sequence_end
+    ... )
+"""
+
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Float, Int

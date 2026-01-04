@@ -14,12 +14,66 @@
 
 """Unified (paged) attention module with automatic platform selection.
 
+This module implements unified paged attention that handles both prefill and decode
+phases with a single kernel. It supports ragged query packing (variable-length
+sequences without padding) and paged KV caches for memory-efficient inference.
+
 This operation wraps the vLLM-style unified attention kernel implemented in
 `ejkernel.kernels` and provides a high-level API consistent with other
 `ejkernel.modules.operations` entry points.
 
-The unified attention kernel targets inference workloads that use a paged KV
-cache and ragged query packing (variable-length sequences without padding).
+Key Features:
+    - Unified prefill and decode in a single kernel
+    - Ragged query packing (no padding required for variable-length sequences)
+    - Paged KV cache with block tables for memory efficiency
+    - Automatic 2D/3D grid selection based on sequence characteristics
+    - Grouped Query Attention (GQA) and Multi-Query Attention (MQA) support
+    - Optional ALiBi positional biases
+    - Optional attention sinks for streaming inference
+    - Sliding window attention support
+    - Logit soft capping (Gemma-2 style)
+
+Use Cases:
+    - High-throughput LLM serving with continuous batching
+    - Mixed prefill + decode batches (chunked prefill)
+    - Variable-length sequence processing without padding overhead
+    - Streaming inference with attention sinks
+
+Memory Layout:
+    Queries: Packed tensor [total_tokens, num_q_heads, head_dim]
+        - All sequences concatenated without padding
+        - Boundaries defined by query_start_loc
+
+    KV Cache: Paged layout [num_blocks, block_size, num_kv_heads, head_dim]
+        - Fixed-size blocks that can be allocated/freed dynamically
+        - Block tables map logical positions to physical blocks
+
+    Block Tables: [num_seqs, max_blocks_per_seq]
+        - Maps each sequence's logical block indices to physical block IDs
+
+Mathematical Foundation:
+    For each query token at position i in sequence s:
+        context_start = query_start_loc[s]
+        context_end = query_start_loc[s+1]
+
+        For causal:
+            output[i] = Attention(Q[i], K[:kv_lens[s]], V[:kv_lens[s]])
+
+        Where K, V are gathered from paged cache via block_tables[s]
+
+Grid Selection Heuristics:
+    - Short sequences (< threshold): 2D grid for better parallelism
+    - Long sequences (>= threshold): 3D grid with parallel softmax reduction
+    - Threshold adapts based on num_kv_heads to maintain occupancy
+
+Performance Characteristics:
+    - No padding overhead: Processes exactly the required tokens
+    - Memory efficient: Paged KV cache with dynamic allocation
+    - Continuous batching friendly: Supports mixed prefill/decode
+
+References:
+    - vLLM: https://arxiv.org/abs/2309.06180
+    - Continuous Batching: https://www.anyscale.com/blog/continuous-batching
 """
 
 from __future__ import annotations

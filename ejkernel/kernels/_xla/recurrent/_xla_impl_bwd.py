@@ -12,6 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Recurrent linear attention backward pass implementation using XLA/JAX.
+
+This module provides the backward pass (gradient computation) for recurrent
+linear attention. Computes gradients for Q, K, V, and all gating parameters.
+
+Key Components:
+    - _recurrent_attention_bwd: Main backward function
+
+Algorithm:
+    The backward pass processes the sequence in reverse order:
+    1. Initialize gradient accumulator for hidden state (dh)
+    2. For each timestep t (in reverse):
+       - Compute dq, dk, dv from do and saved hidden states
+       - Compute dg, dgk, dgv for gating parameters
+       - Propagate dh backward through decay operation
+    3. Aggregate gradients for all parameters
+
+Gradient Equations:
+    - dq: dL/dq_t = h_t^T @ do_t * softmax_scale
+    - dk: dL/dk_t = dh_t @ v_t^T
+    - dv: dL/dv_t = k_t^T @ dh_t
+    - dg: dL/dg_t = dh_t * h_{t-1} * exp(g_t)
+    - d_initial_state: dL/dh_0 = dh after reverse scan
+
+Features:
+    - Supports all gating mechanisms from forward pass
+    - Uses saved hidden states for efficiency
+    - Returns gradients for initial_state if provided
+
+Note:
+    This uses a custom backward implementation rather than JAX autodiff
+    for better memory efficiency with the recurrent structure.
+"""
 
 import jax
 import jax.numpy as jnp

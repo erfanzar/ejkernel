@@ -12,6 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Unified attention kernels supporting both prefill and decode phases.
+
+This module implements a unified attention mechanism that handles both
+prefill (processing multiple query tokens) and decode (single token
+generation) phases with a shared kernel architecture.
+
+Kernel Variants:
+---------------
+_unified_attention_2d:
+    Standard 2D attention kernel for moderate sequence lengths.
+    Processes query blocks against the full KV context using
+    tiled matrix operations with online softmax.
+
+_unified_attention_3d:
+    Segmented 3D kernel for decode-heavy workloads with long contexts.
+    Splits KV context into segments processed in parallel, then
+    reduced to final output.
+
+_reduce_segments:
+    Reduction kernel for 3D attention. Combines segment-level
+    outputs using numerically stable log-sum-exp weighted averaging.
+
+Supported Features:
+------------------
+- Causal masking for autoregressive attention
+- Sliding window attention for local context patterns
+- ALiBi positional biases (alibi_slopes)
+- Query-query biases (qq_bias) for specialized attention patterns
+- Attention sinks (softmax_aux) for initial token importance
+- Logit soft-capping for numerical stability
+- Grouped-query attention (GQA) and multi-query attention (MQA)
+
+Memory Layout:
+-------------
+Uses block-tabled KV cache with:
+- Packed query tensor [total_tokens, num_q_heads, head_dim]
+- Block-tabled KV cache [num_blocks, block_size, num_kv_heads, head_dim]
+- Block tables mapping sequences to physical blocks
+
+Selection Logic:
+---------------
+The implementation automatically selects between 2D and 3D kernels based on:
+- Batch size and sequence lengths
+- Whether in decode-only mode (single query per sequence)
+- Configurable thresholds for optimal performance
+"""
+
 from __future__ import annotations
 
 import math

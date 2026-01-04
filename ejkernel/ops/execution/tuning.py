@@ -270,20 +270,47 @@ class AutotuningResult:
 
 
 def autotune_recorded(hyperparameter_selector, *, show_progress=False, repetition_count=1):
-    """Record and replay optimal hyperparameters for functions.
+    """Autotune all kernel invocations recorded for the current device.
 
-    This function provides caching and replay functionality for previously
-    optimized hyperparameters, avoiding redundant tuning operations.
+    This function iterates through all kernel invocations that have been recorded
+    in the global registry for the current device and runs autotuning to find
+    optimal configurations for each unique operation/call-key combination.
+
+    The autotuning process:
+        1. Retrieves all recorded invocations for the current device
+        2. For each recorded kernel call, prepares arguments and generates candidates
+        3. Benchmarks each candidate configuration
+        4. Stores the optimal configuration in both memory and persistent caches
+        5. Returns results as an AutotuningResult for context manager usage
 
     Args:
-        hyperparameter_selector: Function to select hyperparameters from recorded data
+        hyperparameter_selector: ConfigSelectorChain instance with cache and
+            persistent storage for storing optimization results
         show_progress: Whether to display progress bars during optimization
+            (currently unused, reserved for future implementation)
         repetition_count: Number of times to repeat the optimization process
+            (currently unused, reserved for future implementation)
 
     Returns:
-        Decorated function with recorded hyperparameter optimization
+        AutotuningResult containing all optimal configurations found. Can be
+        used as a context manager to temporarily apply the configurations.
+
+    Example:
+        >>> from ejkernel.ops.config import ConfigCache, ConfigSelectorChain
+        >>> cache = ConfigCache()
+        >>> selector = ConfigSelectorChain(cache)
+        >>>
+        >>> # Record invocations by running with EJKERNEL_OPS_RECORD=1
+        >>> # Then autotune all recorded operations:
+        >>> result = autotune_recorded(selector)
+        >>> with result:
+        ...     # Runs with optimized configurations
+        ...     output = my_model(input_data)
+
+    Note:
+        Requires invocations to be previously recorded using the
+        EJKERNEL_OPS_RECORD=1 environment variable during initial runs.
     """
-    """Autotune all recorded invocations for the current device."""
     from ..registry import get_invocations
 
     dev = device_fingerprint()
@@ -379,18 +406,47 @@ def benchmark(fn, *args, warmup=1, iters=5, **kwargs) -> float:
 
 @dataclass
 class TimingResult:
+    """Statistical timing result for a single hyperparameter configuration.
+
+    Stores the measured execution time statistics for a specific set of
+    hyperparameters, including both mean and standard deviation for
+    reliability analysis.
+
+    Attributes:
+        hyperparams: Dictionary of hyperparameter names to their tested values
+        t_mean: Mean execution time in seconds across timing iterations
+        t_std: Standard deviation of execution times in seconds
+    """
+
     hyperparams: dict[Any, Any]
     t_mean: float
     t_std: float
 
 
 def _get_global_mesh():
+    """Retrieve the current global mesh from JAX thread resources.
+
+    Accesses JAX's internal thread-local resources to get the currently
+    active device mesh for distributed computation. Returns None if no
+    mesh is configured or the mesh is empty.
+
+    Returns:
+        The current JAX mesh object, or None if no active mesh exists
+    """
     env = pxla.thread_resources.env
     mesh = env.physical_mesh
     return None if mesh.empty else mesh
 
 
 def _get_default_device():
+    """Get the default device for JAX computation.
+
+    Returns the explicitly configured default device if set, otherwise
+    falls back to the first available device in the system.
+
+    Returns:
+        The default JAX device for computation
+    """
     if jax.config.values["jax_default_device"] is not None:
         return jax.config.values["jax_default_device"]
     return jax.devices()[0]
@@ -398,6 +454,19 @@ def _get_default_device():
 
 @contextlib.contextmanager
 def _suppress_stdout_stderr():
+    """Context manager to temporarily suppress stdout and stderr output.
+
+    Redirects both stdout and stderr to /dev/null for the duration of the
+    context, then restores them afterward. Useful for silencing noisy
+    library output during compilation or benchmarking.
+
+    Yields:
+        None - This is a context manager with no return value
+
+    Note:
+        Uses file descriptor duplication to ensure proper restoration
+        even if exceptions occur within the context.
+    """
     devnull = open(os.devnull, "w")
     stdout_fd, stderr_fd = os.dup(1), os.dup(2)
     try:
@@ -450,6 +519,17 @@ def _normalize_sharding(
 
 
 def _ensure_dtype(dt):
+    """Extract dtype from an array or return the input if already a dtype.
+
+    Safely extracts the dtype attribute from arrays, handling edge cases
+    where the dtype extraction might fail.
+
+    Args:
+        dt: JAX array, NumPy array, or dtype-like object
+
+    Returns:
+        The dtype of the input array, or the input itself if not an array
+    """
     try:
         return dt.dtype if isinstance(dt, jax.Array | np.ndarray) else dt
     except Exception:
@@ -458,6 +538,24 @@ def _ensure_dtype(dt):
 
 @partial(jax.jit, static_argnames=("sds", "sharding"))
 def _get_random_value(sds, sharding=None):
+    """Generate random values matching a shape/dtype specification.
+
+    Creates random data matching the shape and dtype of the input specification.
+    For floating point types, generates normally distributed random values.
+    For integer types, generates zeros. Supports optional output sharding.
+
+    Args:
+        sds: Shape/dtype specification (ShapeDtypeStruct or similar object with
+            shape and dtype attributes), or any other value to return unchanged
+        sharding: Optional sharding specification for the output array
+
+    Returns:
+        Random array matching the specification, or the input unchanged if
+        it doesn't have shape/dtype attributes
+
+    Raises:
+        ValueError: If the dtype is not floating point or integer
+    """
     if hasattr(sds, "shape") and hasattr(sds, "dtype"):
         dt = _ensure_dtype(sds.dtype)
         if jnp.issubdtype(dt, jnp.floating):
@@ -471,18 +569,37 @@ def _get_random_value(sds, sharding=None):
 
 
 def _try_hash_input(args, kws, must_be_concrete: bool = True):
+    """Attempt to create a hashable key from function input arguments.
+
+    Creates a hash key based on the structure and types of input arguments,
+    which can be used for caching autotuning results. Arrays are hashed
+    based on their shape, dtype, and sharding rather than their values.
+
+    Args:
+        args: Positional arguments to hash
+        kws: Keyword arguments to hash
+        must_be_concrete: If True, returns None when any arrays are abstract
+            (e.g., inside JAX transformations). Default is True.
+
+    Returns:
+        A hash integer uniquely identifying the input signature, or None if:
+        - must_be_concrete is True and arguments contain abstract arrays
+        - Hashing fails for any reason (e.g., unhashable types)
+    """
     flat_vals, struct = jax.tree.flatten((args, kws))
     all_concrete = all(jax.core.is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
     if not all_concrete and must_be_concrete:
         return None
 
     def _get_sharding(x):
+        """Extract sharding from array or its abstract type."""
         try:
             return x.sharding
         except AttributeError:
             return jax.typeof(x).sharding
 
     def array_to_hashable(x):
+        """Convert array to hashable representation based on type and sharding."""
         return x if not isinstance(x, jax.Array) else hash((jax.typeof(x), _get_sharding(x)))
 
     try:
@@ -492,7 +609,41 @@ def _try_hash_input(args, kws, must_be_concrete: bool = True):
 
 
 class FNAutotuner:
-    """Class-based JAX autotuner with profiler-first timing and Python fallback."""
+    """Advanced class-based JAX autotuner with profiler-first timing and Python fallback.
+
+    Provides comprehensive hyperparameter optimization for JAX functions using
+    JAX's native profiling infrastructure when available, with automatic fallback
+    to Python-level timing. Supports parallel compilation, statistical timing
+    analysis, and intelligent caching of optimization results.
+
+    Key Features:
+        - Profiler-based timing for accurate GPU/TPU measurements
+        - Python-level timing fallback when profiler unavailable
+        - Parallel compilation of hyperparameter configurations
+        - Statistical analysis with outlier removal
+        - Thread-safe caching of optimal configurations
+        - Optional automatic memory layout optimization
+
+    The autotuner works by:
+        1. Generating all hyperparameter combinations
+        2. Compiling each configuration in parallel
+        3. Timing execution using profiler or Python fallback
+        4. Selecting the configuration with best performance
+        5. Caching results for future calls
+
+    Attributes:
+        allow_fallback_timing: Whether to use Python timing when profiler fails
+        profiling_samples: Number of profiling iterations for statistics
+        must_find_profiler_fraction: Minimum fraction of configs needing profiler results
+        enable_detailed_logging: Enable verbose error logging
+        find_optimal_layouts_automatically: Auto-discover optimal memory layouts
+        max_compilation_time_seconds: Maximum compilation time per config
+        timing_warmup_iterations: Warmup iterations before timing
+        timing_rounds: Number of timing rounds for statistics
+        calls_per_round: Function calls per timing round
+        cache_size_limit: Maximum cached optimization results
+        profiler: Profiler instance for trace capture and analysis
+    """
 
     PREFIX_FN = "autotune_fn_{}"
 
@@ -515,6 +666,27 @@ class FNAutotuner:
         profiler_max_events: int | None = 10000,
         profiler_verbose: bool = False,
     ):
+        """Initialize the autotuner with timing and profiling configuration.
+
+        Args:
+            allow_fallback_timing: Enable Python timing fallback if profiler fails
+            profiling_samples: Number of profiling iterations for statistical accuracy
+            must_find_profiler_fraction: Minimum fraction of configs needing profiler
+                results (0.0-1.0). Falls back to Python timing if not met.
+            enable_detailed_logging: Enable detailed error logging with tracebacks
+            find_optimal_layouts_automatically: Auto-discover optimal memory layouts
+                for distributed computation
+            max_compilation_time_seconds: Maximum compilation time per configuration
+            timing_warmup_iterations: Warmup iterations before timing measurements
+            timing_rounds: Number of timing rounds for statistical analysis
+            calls_per_round: Function calls per timing round
+            cache_size_limit: Maximum number of cached optimization results
+            profiler_prefix_filter: Event name prefix filter for profiler
+            profiler_event_regex: Optional regex filter for profiler events
+            profiler_min_duration_ns: Minimum event duration for profiler inclusion
+            profiler_max_events: Maximum events per profile to prevent memory issues
+            profiler_verbose: Enable verbose profiler output
+        """
         self.allow_fallback_timing = allow_fallback_timing
         self.profiling_samples = profiling_samples
         self.must_find_profiler_fraction = must_find_profiler_fraction
@@ -740,7 +912,40 @@ class FNAutotuner:
         event_filter_regex: str | None = None,
         timeout: float | None = None,
     ) -> tuple[Callable[..., Any], dict[str, Any], list[tuple[int, TimingResult]]]:
-        """Return (parameterized_fn, optimal_hyperparams, timing_results_sorted)."""
+        """Tune hyperparameters for a function and return optimal configuration.
+
+        Performs comprehensive hyperparameter optimization by testing all
+        candidate configurations in parallel, measuring their performance,
+        and returning the best-performing configuration.
+
+        Args:
+            fn: Function to optimize (must accept hyperparameters as keyword args)
+            args: Positional arguments for the function (can be abstract shapes)
+            kwargs: Keyword arguments for the function (excluding hyperparameters)
+            hyperparams: Dictionary mapping hyperparameter names to lists of candidate
+                values to test. Each combination will be evaluated.
+            max_workers: Maximum number of parallel workers for compilation
+            in_shardings: Input sharding specifications for distributed computation
+            out_shardings: Output sharding specifications for distributed computation
+            device: Target device or device string for computation
+            example_args: Concrete example arguments when args are abstract
+            example_kws: Concrete example kwargs when kwargs are abstract
+            sample_num: Maximum number of hyperparameter combinations to test.
+                If fewer than total combinations, samples randomly.
+            event_filter_regex: Optional regex filter for profiler events
+            timeout: Optional compilation timeout override
+
+        Returns:
+            Tuple of (parameterized_fn, optimal_hyperparams, timing_results_sorted):
+            - parameterized_fn: JIT-compiled function with optimal hyperparameters
+            - optimal_hyperparams: Dictionary of optimal hyperparameter values
+            - timing_results_sorted: List of (index, TimingResult) sorted by performance
+
+        Raises:
+            TypeError: If fn is not callable
+            ValueError: If max_workers <= 0, sample_num < 0, or hyperparameters invalid
+            RuntimeError: If all hyperparameter configurations fail to compile
+        """
         if not callable(fn):
             raise TypeError("fn must be callable")
         if max_workers <= 0:
@@ -933,6 +1138,35 @@ class FNAutotuner:
         timeout: float | None = None,
         cache_key: str | None = None,
     ):
+        """Create a decorated version of a function with automatic hyperparameter tuning.
+
+        Wraps a function so that the first call triggers hyperparameter optimization,
+        and subsequent calls with the same input signature use cached optimal values.
+
+        Args:
+            fn: Function to decorate with autotuning capabilities
+            hyperparams: Dictionary mapping hyperparameter names to lists of candidate
+                values to test during optimization
+            max_workers: Maximum number of parallel workers for compilation
+            in_shardings: Input sharding specifications for distributed computation
+            out_shardings: Output sharding specifications for distributed computation
+            device: Target device or device string for computation
+            example_args: Concrete example arguments when function args are abstract
+            example_kws: Concrete example kwargs when function kwargs are abstract
+            sample_num: Maximum number of hyperparameter combinations to test
+            event_filter_regex: Optional regex filter for profiler events
+            timeout: Optional compilation timeout override
+            cache_key: Optional custom cache key prefix for disambiguation
+
+        Returns:
+            Decorated function with automatic hyperparameter optimization.
+            The returned function has additional attributes after first execution:
+            - timing_results: List of all timing measurements from optimization
+            - optimal_hyperparams: Dictionary of optimal parameter values
+
+        Raises:
+            TypeError: If fn is not callable
+        """
         if not callable(fn):
             raise TypeError("fn must be callable")
 

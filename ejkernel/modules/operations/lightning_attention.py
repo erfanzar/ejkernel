@@ -15,13 +15,56 @@
 
 """Lightning Attention module with automatic optimization.
 
-This module implements Lightning Attention, a layer-aware attention mechanism that
-adapts computation based on the layer position in the network. It's particularly
-efficient for deep transformers where different layers may benefit from different
-attention strategies.
+This module implements Lightning Attention, a linear attention mechanism that
+combines intra-block and inter-block attention computations. It adapts behavior
+based on layer position in deep transformer networks.
 
-Lightning Attention uses layer-specific optimizations and can maintain state across
-sequence processing for improved efficiency in recurrent-style computation.
+Key features of Lightning Attention:
+    - Linear complexity: O(T) time through chunk-based processing
+    - Layer-aware optimization: Adapts computation based on layer position
+    - Hybrid attention: Combines causal intra-chunk with cross-chunk attention
+    - Recurrent state: Maintains cumulative KV states across chunks
+    - Variable-length sequence support via cumulative sequence lengths
+
+The algorithm combines two attention components:
+    1. Intra-block attention (causal within each chunk):
+        - Standard attention within fixed-size blocks
+        - Computes local dependencies efficiently
+        - Uses causal masking for autoregressive generation
+
+    2. Inter-block attention (linear attention across chunks):
+        - Maintains cumulative state: S_t = Σ_{i<t} k_i @ v_i^T
+        - Output from accumulated state: o_inter = q @ S
+        - Enables long-range dependencies with O(1) memory per position
+
+    The final output combines both components:
+        o_t = o_intra_t + o_inter_t
+
+Mathematical formulation:
+    For a sequence divided into chunks of size C:
+        Intra-chunk: o_intra = softmax(Q_c @ K_c^T / √d) @ V_c  (causal)
+        Inter-chunk: o_inter = Q_c @ S_{c-1}  where S_c = S_{c-1} + K_c^T @ V_c
+        Output: o = o_intra + o_inter
+
+    This achieves O(T·C + T/C·K·V) = O(T) complexity for appropriate chunk sizes.
+
+Layer-aware optimization:
+    The layer_idx and num_layers parameters enable:
+    - Different attention patterns for early vs. late layers
+    - Optimized computation based on layer characteristics
+    - Potential for mixed precision across depths
+
+Supports:
+    - Variable sequence lengths via cu_seqlens (cumulative sequence lengths)
+    - Reverse processing for bidirectional models
+    - Initial state for continuation across chunks
+    - Multi-head and grouped-query attention patterns
+    - Custom softmax scaling
+
+References:
+    - Lightning Attention-2: A Free Lunch for Handling Unlimited Sequence Lengths
+      in Large Language Models (Qin et al., 2024) https://arxiv.org/abs/2401.04658
+    - TransNormerLLM: https://github.com/OpenNLPLab/TransnormerLLM
 """
 
 from __future__ import annotations
@@ -50,21 +93,49 @@ from .configs import LightningAttentionConfig
 class LightningAttention(Kernel[LightningAttentionConfig, Array]):
     """Lightning Attention with custom optimization logic.
 
-    Implements a layer-aware attention mechanism optimized for deep transformer
-    architectures. The attention computation adapts based on the layer index,
-    allowing for more efficient processing in multi-layer networks.
+    Implements a layer-aware linear attention mechanism optimized for deep transformer
+    architectures. The attention computation combines intra-block causal attention
+    with inter-block linear attention, achieving O(N) complexity with O(K×V) memory
+    per head.
 
     Features:
-        - Layer-specific optimization strategies
+        - Hybrid attention: Causal intra-chunk + linear inter-chunk computation
+        - Layer-specific optimization strategies based on layer position
         - Support for stateful computation with initial states
         - Bidirectional and reverse sequence processing
-        - Variable-length sequence handling
+        - Variable-length sequence handling via cumulative lengths
         - Automatic platform selection (Triton/Pallas/XLA/CUDA)
+        - Automatic configuration caching for consistent performance
+        - Optional autotuning to find optimal implementation
 
     This is particularly useful for:
         - Very deep transformers where layer position matters
         - Models with recurrent-style attention patterns
-        - Scenarios requiring different attention behavior per layer
+        - Long-context processing with bounded memory
+        - Streaming inference with state continuation
+
+    Example:
+        >>> from ejkernel.modules import LightningAttention, create_default_executor
+        >>>
+        >>> # Basic usage with layer information
+        >>> executor = create_default_executor()
+        >>> attn = LightningAttention()
+        >>> output = executor(attn, query, key, value, layer_idx=5, num_layers=32)
+        >>>
+        >>> # Streaming inference with state
+        >>> output, state = executor(
+        ...     attn, query, key, value,
+        ...     layer_idx=0, num_layers=24,
+        ...     initial_state=prev_state,
+        ...     return_state=True
+        ... )
+        >>>
+        >>> # Variable-length sequences
+        >>> output = executor(
+        ...     attn, query, key, value,
+        ...     layer_idx=10, num_layers=32,
+        ...     cu_seqlens=cu_seqs
+        ... )
     """
 
     def __init__(self):

@@ -12,6 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Attention mask implementations for Splash (block-sparse) Attention.
+
+This module provides lazy and dense mask implementations for controlling
+attention patterns in Splash Attention kernels. Masks define which query-key
+pairs can attend to each other.
+
+Key mask types:
+- FullMask: Allows all tokens to attend to all other tokens
+- CausalMask: Autoregressive mask (query can only attend to earlier keys)
+- LocalMask: Sliding window attention with configurable left/right context
+- ChunkedCausalMask: Causal within fixed-size chunks
+- MultiHeadMask: Per-head mask specification
+- NumpyMask: Dense mask backed by numpy array
+
+Lazy masks (_ComputableMask subclasses) compute mask values on-the-fly
+during kernel execution, avoiding memory overhead of materializing the
+full [q_seq_len, kv_seq_len] boolean matrix.
+
+Example:
+    >>> from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import (
+    ...     CausalMask, LocalMask, MultiHeadMask
+    ... )
+    >>> # Causal mask for autoregressive attention
+    >>> causal = CausalMask((2048, 2048))
+    >>>
+    >>> # Sliding window attention
+    >>> local = LocalMask((2048, 2048), window_size=(128, 0), offset=0)
+    >>>
+    >>> # Combine with causal
+    >>> combined = causal & local
+"""
 
 from __future__ import annotations
 
@@ -74,7 +105,21 @@ def make_local_attention_mask(
     *,
     offset: int = 0,
 ) -> np.ndarray:
-    """Makes a local attention mask."""
+    """Create a local (sliding window) attention mask.
+
+    Creates a mask where each query position can only attend to key positions
+    within a specified window around it. Useful for efficient attention over
+    long sequences where full attention is too expensive.
+
+    Args:
+        shape: Shape of the mask (q_seq_len, kv_seq_len).
+        window_size: Tuple of (left_size, right_size) defining the window.
+            None means no limit in that direction.
+        offset: Offset of query start relative to key sequence.
+
+    Returns:
+        Boolean numpy array where True means attention is allowed.
+    """
     q_seq_len, kv_seq_len = shape
     q_idx = np.arange(q_seq_len, dtype=np.int32)
     kv_idx = np.arange(kv_seq_len, dtype=np.int32)
@@ -114,7 +159,19 @@ def make_chunk_attention_mask(shape: tuple[int, int], chunk_size: int) -> np.nda
 
 
 def make_random_mask(shape: tuple[int, int], sparsity: float, seed: int) -> np.ndarray:
-    """Makes a random attention mask."""
+    """Create a random attention mask with specified sparsity.
+
+    Useful for testing and experimenting with sparse attention patterns.
+    Each position is independently sampled.
+
+    Args:
+        shape: Shape of the mask (q_seq_len, kv_seq_len).
+        sparsity: Fraction of positions to mask (0.0 = no masking, 1.0 = all masked).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        Boolean numpy array with approximately (1 - sparsity) fraction of True values.
+    """
     np.random.seed(seed)  # noqa: NPY002
     return np.random.binomial(n=1, p=1.0 - sparsity, size=shape).astype(np.bool_)  # noqa: NPY002
 

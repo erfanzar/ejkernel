@@ -20,15 +20,51 @@ variant that uses low-rank compression for key-value pairs. MLA reduces the KV c
 size by projecting keys and values through a low-rank bottleneck while maintaining
 attention quality.
 
-The key innovation is compressing the KV representations:
-    1. Keys and values are projected to a low-rank space (kv_lora_rank)
-    2. Compressed representations are stored efficiently
-    3. Full-rank keys/values are reconstructed on-the-fly using learned weights
+Key Features:
+    - Low-rank KV compression reducing memory by up to 93.3%
+    - On-the-fly key-value reconstruction using learned weights
+    - Compatible with RoPE positional encoding via bias terms
+    - Flash attention-style tiling for memory efficiency
+    - Support for variable-length sequences and causal masking
 
-This is particularly beneficial for:
+The Compression Scheme:
+    The key innovation is compressing the KV representations:
+        1. Keys and values are projected to a low-rank space (kv_lora_rank)
+        2. Compressed representations are stored efficiently
+        3. Full-rank keys/values are reconstructed on-the-fly using learned weights
+
+    Mathematical formulation:
+        - Compressed KV: c_kv = [h_1, h_2, ..., h_n] where h_i in R^{kv_lora_rank}
+        - Key reconstruction: K = c_kv @ W_kc  (W_kc in R^{kv_lora_rank x d_k})
+        - Value reconstruction: V = c_kv @ W_vc  (W_vc in R^{kv_lora_rank x d_v})
+        - With RoPE: K = concat(c_kv @ W_kc, RoPE(b_k))
+
+Use Cases:
     - Long context inference where KV cache dominates memory
     - Multi-query or grouped-query attention patterns
     - Deployment scenarios with memory constraints
+    - Models requiring efficient inference with large context windows
+
+Example:
+    >>> from ejkernel.modules.operations import flash_mla
+    >>>
+    >>> # Basic MLA with low-rank compression
+    >>> output = flash_mla(
+    ...     query, key_value, w_kc, w_vc,
+    ...     causal=True,
+    ... )
+    >>>
+    >>> # With RoPE positional encoding
+    >>> output = flash_mla(
+    ...     query, key_value, w_kc, w_vc,
+    ...     b_q=rope_query_bias,
+    ...     b_k=rope_key_bias,
+    ...     causal=True,
+    ... )
+
+References:
+    - DeepSeek-V2: https://arxiv.org/abs/2405.04434
+    - Flash Attention: https://arxiv.org/abs/2205.14135
 """
 
 from __future__ import annotations
@@ -243,7 +279,44 @@ def flash_mla(
     """Execute flash multi-head latent attention with automatic optimization.
 
     MLA uses low-rank compression for key-value pairs to reduce memory
-    and computation while maintaining attention quality.
+    and computation while maintaining attention quality. The key innovation
+    is compressing KV representations through a low-rank bottleneck and
+    reconstructing them on-the-fly during attention computation.
+
+    Args:
+        query: Query tensor [batch, seq_len, q_heads, q_head_dim]
+        key_value: Compressed key-value tensor [batch, seq_len, kv_lora_rank]
+        w_kc: Key decompression weights [kv_lora_rank, kv_heads, qk_nope_head_dim]
+        w_vc: Value decompression weights [kv_lora_rank, kv_heads, v_head_dim]
+        b_q: Optional query RoPE bias [batch, seq_len, qk_rope_head_dim]
+        b_k: Optional key RoPE bias [batch, seq_len, qk_rope_head_dim]
+        cu_seqlens: Cumulative sequence lengths for variable-length sequences
+        softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
+        causal: Whether to apply causal masking (default: False)
+        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        cfg: Optional configuration override
+
+    Returns:
+        Attention output [batch, seq_len, q_heads, v_head_dim]
+
+    Example:
+        >>> # Basic MLA with low-rank compression
+        >>> output = flash_mla(
+        ...     query, key_value, w_kc, w_vc,
+        ...     causal=True,
+        ... )
+
+        >>> # With RoPE positional encoding
+        >>> output = flash_mla(
+        ...     query, key_value, w_kc, w_vc,
+        ...     b_q=rope_query_bias,
+        ...     b_k=rope_key_bias,
+        ...     causal=True,
+        ... )
+
+    Note:
+        The kv_lora_rank determines the compression ratio. Lower ranks
+        save more memory but may reduce quality. Typical values: 64-256.
     """
     return _mla_executor(
         FlashMLA(),

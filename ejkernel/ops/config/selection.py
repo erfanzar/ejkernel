@@ -87,10 +87,21 @@ autotune_logger = get_logger("ejKernel-Selection")
 class AutotunePolicy:
     """Configuration policy for autotuning behavior.
 
+    Controls how the configuration selection system behaves when making
+    optimization decisions, including whether to run autotuning, use
+    heuristics, and validate backward pass correctness.
+
     Attributes:
-        allow_autotune: Whether autotuning is permitted
-        allow_heuristics: Whether heuristic configurations are allowed
-        cache_miss_fallback: Strategy when no cached config is found ("heuristics" or "autotune")
+        allow_autotune: Whether autotuning is permitted. When True, the system
+            can benchmark multiple configurations to find the optimal one.
+        allow_heuristics: Whether heuristic configurations are allowed as a
+            fallback when no cached configuration is available.
+        cache_miss_fallback: Strategy when no cached config is found. Either
+            "autotune" to benchmark candidates or "heuristics" to use defaults.
+        validate_backward: Whether to validate backward pass during autotuning.
+            When True, autotuning will measure gradient computation time in
+            addition to forward pass, ensuring the selected configuration
+            performs well for training workloads.
     """
 
     allow_autotune: bool = True
@@ -166,6 +177,12 @@ class Tuner(Generic[Cfg]):
     """
 
     def __init__(self, warmup=1, iters=3):
+        """Initialize tuner with warmup and iteration settings.
+
+        Args:
+            warmup: Number of warmup iterations before timing (default: 1)
+            iters: Number of timed iterations to average over (default: 3)
+        """
         self.warmup, self.iters = warmup, iters
 
     def measure(self, fn, *args, **kwargs) -> float:
@@ -378,6 +395,17 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
         on_event: callable | None = None,
         forbid_reautotune: bool = True,
     ):
+        """Initialize configuration selector with cache and policy settings.
+
+        Args:
+            cache: In-memory configuration cache for fast lookups
+            policy: Autotuning behavior policy (default: AutotunePolicy())
+            tuner: Performance benchmarking tool (default: Tuner())
+            persistent: Optional disk-based cache for cross-run persistence
+            persist_autotune: Save autotuned configs to persistent storage (default: True)
+            on_event: Optional callback for selection events (monitoring/debugging)
+            forbid_reautotune: Prevent re-autotuning same operation (default: True)
+        """
         self.cache = cache
         self.policy = policy or AutotunePolicy()
         self.tuner = tuner or Tuner()

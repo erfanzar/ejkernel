@@ -14,11 +14,45 @@
 
 """RWKV-6 recurrent kernel (XLA).
 
+This module provides a pure JAX/XLA implementation of the RWKV-6 time-mix
+recurrence. RWKV-6 extends RWKV-4/5 with multi-head attention and a more
+expressive state transition that uses per-timestep decay and a bonus term.
+
+RWKV-6 introduces several architectural improvements over RWKV-4:
+1. Multi-head structure: State is per-head [H, K, V] instead of per-channel
+2. Per-timestep decay: w is [B, T, H, K] instead of global [C]
+3. Bonus term: u provides per-head key dimension bonuses
+4. Receptance: r (query) is separate from k (key)
+
+The core recurrence is:
+    kv_t = k_t^T ⊗ v_t  (outer product, [H, K, V])
+    o_t = r_t^T @ (h_{t-1} + kv_t * u)  (bonus-enhanced attention)
+    h_t = h_{t-1} * exp(w_t) + kv_t  (exponential decay update)
+
 This matches the semantics of Flash-Linear-Attention's RWKV-6 fused recurrent op:
-    - inputs in `[B, T, H, ...]` (head-last) format
+    - inputs in `[B, T, H, ...]` (batch, time, head) format
     - optional packed variable-length mode via `cu_seqlens`
-    - optional reverse recurrence
+    - optional reverse recurrence for bidirectional processing
     - returns `(o, final_state)` where final_state is float32
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._xla.rwkv6 import rwkv6
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 100, 8, 64
+    >>> r = jnp.ones((batch, seq_len, num_heads, head_dim))  # receptance
+    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))  # key
+    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))  # value
+    >>> w = jnp.zeros((batch, seq_len, num_heads, head_dim))  # log decay
+    >>> u = jnp.zeros((num_heads, head_dim))  # bonus
+    >>>
+    >>> output, final_state = rwkv6(r, k, v, w, u)
+    >>> output.shape
+    (2, 100, 8, 64)
+
+Reference:
+    RWKV-6: Linear Transformers with Enhanced Expressivity
+    https://github.com/BlinkDL/RWKV-LM
 """
 
 from __future__ import annotations
@@ -40,11 +74,29 @@ def _rwkv6_update(
     w_t: Array,
     u: Array,
 ) -> tuple[Array, Array]:
-    # h: [B, H, K, V]
-    # q_t,k_t,w_t: [B, H, K]
-    # v_t: [B, H, V]
+    """Single step of the RWKV-6 recurrence with bonus-enhanced attention.
+
+    Computes one timestep of the RWKV-6 mechanism with multi-head state
+    and per-timestep exponential decay.
+
+    Args:
+        h: Hidden state [B, H, K, V] - key-value memory matrix per head
+        q_t: Query/receptance at time t [B, H, K]
+        k_t: Key at time t [B, H, K]
+        v_t: Value at time t [B, H, V]
+        w_t: Log decay at time t [B, H, K]
+        u: Bonus term for current token [H, K]
+
+    Returns:
+        Tuple of:
+            - h_next: Updated hidden state [B, H, K, V]
+            - o_t: Output at time t [B, H, V]
+    """
+    # Outer product of key and value
     kv = k_t[..., :, None] * v_t[..., None, :]  # [B, H, K, V]
+    # Query against state with bonus for current token
     o_t = jnp.einsum("bhk,bhkv->bhv", q_t, h + kv * u[None, :, :, None])  # [B, H, V]
+    # Exponential decay update
     h_next = h * jnp.exp(w_t)[..., :, None] + kv
     return h_next, o_t
 
@@ -60,6 +112,21 @@ def _rwkv6_scan(
     initial_state: Array,
     reverse: bool,
 ) -> tuple[Array, Array]:
+    """Sequential scan for RWKV-6 over full sequence.
+
+    Args:
+        r: Receptance/query [B, T, H, K]
+        k: Key [B, T, H, K]
+        v: Value [B, T, H, V]
+        w: Log decay [B, T, H, K]
+        u: Bonus term [H, K]
+        softmax_scale: Scale factor for receptance
+        initial_state: Initial hidden state [B, H, K, V]
+        reverse: If True, process sequence in reverse
+
+    Returns:
+        Tuple of (output [B, T, H, V], final_state [B, H, K, V])
+    """
     # Shapes:
     # r,k,w: [B, T, H, K]
     # v:     [B, T, H, V]
@@ -86,6 +153,18 @@ def _rwkv6_scan(
 
 
 def _validate_rwkv6_inputs(r: Array, k: Array, v: Array, w: Array, u: Array) -> None:
+    """Validate RWKV-6 input tensor shapes and dimensions.
+
+    Args:
+        r: Receptance tensor, expected [B, T, H, K]
+        k: Key tensor, expected [B, T, H, K]
+        v: Value tensor, expected [B, T, H, V]
+        w: Log decay tensor, expected [B, T, H, K]
+        u: Bonus tensor, expected [H, K]
+
+    Raises:
+        ValueError: If any tensor has incorrect rank or mismatched shapes.
+    """
     if r.ndim != 4 or k.ndim != 4 or w.ndim != 4 or v.ndim != 4:
         raise ValueError(
             f"Expected r,k,w rank-4 [B,T,H,K] and v rank-4 [B,T,H,V], got "
@@ -111,6 +190,28 @@ def _rwkv6_varlen(
     initial_state: Array,
     reverse: bool,
 ) -> tuple[Array, Array]:
+    """RWKV-6 scan for variable-length packed sequences.
+
+    Processes multiple sequences packed into a single tensor, using
+    cumulative sequence lengths to determine boundaries.
+
+    Args:
+        r: Receptance [1, total_tokens, H, K]
+        k: Key [1, total_tokens, H, K]
+        v: Value [1, total_tokens, H, V]
+        w: Log decay [1, total_tokens, H, K]
+        u: Bonus [H, K]
+        cu_seqlens: Cumulative sequence lengths [num_seqs + 1]
+        softmax_scale: Scale for receptance
+        initial_state: Initial states [num_seqs, H, K, V]
+        reverse: If True, process each sequence in reverse
+
+    Returns:
+        Tuple of (output [1, total_tokens, H, V], final_states [num_seqs, H, K, V])
+
+    Raises:
+        ValueError: If batch size is not 1 or initial_state count mismatches.
+    """
     # Packed mode expects B==1 and T==total_tokens.
     if r.shape[0] != 1:
         raise ValueError(f"Packed mode expects batch size 1, got {r.shape[0]}.")
@@ -182,22 +283,68 @@ def rwkv6(
     Float[Array, "batch seq_len num_heads v_head_dim"],
     Float[Array, "... num_heads qk_head_dim v_head_dim"],
 ]:
-    """RWKV-6 recurrence in JAX/XLA.
+    """RWKV-6 recurrent time-mix attention using XLA backend.
+
+    Implements the RWKV-6 multi-head recurrent mechanism with O(N) complexity.
+    Each head maintains a [K, V] state matrix that is updated via exponential
+    decay and key-value outer products. The receptance (r) queries against
+    this state with a bonus term (u) for the current token.
+
+    The recurrence is:
+        kv_t = k_t^T ⊗ v_t  (outer product)
+        o_t = r_t^T @ (h_{t-1} + kv_t * u)  (query with bonus)
+        h_t = h_{t-1} * exp(w_t) + kv_t  (decay and accumulate)
 
     Args:
-        r: Query/receptance `[B, T, H, K]`.
-        k: Key `[B, T, H, K]`.
-        v: Value `[B, T, H, V]`.
-        w: Log decay `[B, T, H, K]`.
-        u: Bonus `[H, K]`.
-        softmax_scale: Optional scale for `r`; defaults to `K**-0.5`.
-        initial_state: Optional initial state `[B,H,K,V]` (or `[N,H,K,V]` in packed mode).
-        reverse: If True, process the recurrence in reverse order.
-        cu_seqlens: Optional packed variable-length description (FlashAttention-style).
+        r: Receptance/query tensor for attention retrieval.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        k: Key tensor for memory addressing.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        v: Value tensor for memory content.
+            Shape: [batch, seq_len, num_heads, v_head_dim]
+        w: Log decay tensor controlling how fast history fades.
+            Negative values mean slower decay (longer memory).
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        u: Bonus tensor that boosts the current token's contribution.
+            Shape: [num_heads, qk_head_dim]
+        softmax_scale: Optional scale for receptance. If None, uses K^-0.5.
+        initial_state: Optional initial hidden state for continuation.
+            Shape: [batch, num_heads, qk_head_dim, v_head_dim]
+            or [num_seqs, num_heads, qk_head_dim, v_head_dim] for packed mode.
+        reverse: If True, process sequence in reverse order.
+        cu_seqlens: Optional cumulative sequence lengths for packed variable-length
+            sequences (FlashAttention-style). Shape: [num_seqs + 1]
 
     Returns:
-        o: Output `[B, T, H, V]` (dtype matches `v`).
-        final_state: `[B,H,K,V]` (or `[N,H,K,V]` in packed mode), float32.
+        Tuple of:
+            - output: Attention output matching input dtype.
+                Shape: [batch, seq_len, num_heads, v_head_dim]
+            - final_state: Final hidden state in float32.
+                Shape: [batch, num_heads, qk_head_dim, v_head_dim]
+                or [num_seqs, num_heads, qk_head_dim, v_head_dim] for packed mode.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>>
+        >>> batch, seq_len, num_heads, head_dim = 2, 100, 8, 64
+        >>> r = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> w = -jnp.ones((batch, seq_len, num_heads, head_dim)) * 0.1
+        >>> u = jnp.zeros((num_heads, head_dim))
+        >>>
+        >>> output, state = rwkv6(r, k, v, w, u)
+        >>> output.shape
+        (2, 100, 8, 64)
+        >>>
+        >>> # Variable-length sequences
+        >>> total_tokens = 300
+        >>> r_packed = jnp.ones((1, total_tokens, num_heads, head_dim))
+        >>> k_packed = jnp.ones((1, total_tokens, num_heads, head_dim))
+        >>> v_packed = jnp.ones((1, total_tokens, num_heads, head_dim))
+        >>> w_packed = jnp.zeros((1, total_tokens, num_heads, head_dim))
+        >>> cu_seqlens = jnp.array([0, 100, 200, 300])
+        >>> output, states = rwkv6(r_packed, k_packed, v_packed, w_packed, u, cu_seqlens=cu_seqlens)
     """
     _validate_rwkv6_inputs(r, k, v, w, u)
 

@@ -13,6 +13,62 @@
 # limitations under the License.
 
 
+"""Ragged Paged Attention V2 for TPU with mixed prefill and decode support.
+
+This module provides a TPU-optimized implementation of ragged paged attention
+that supports simultaneous prefill and decode operations within the same batch.
+This is the second version of the ragged paged attention kernel with improved
+performance and additional features.
+
+Ragged paged attention v2 is essential for:
+1. Continuous batching with mixed prefill/decode requests
+2. High-throughput inference serving with dynamic batching
+3. Memory-efficient KV cache with paging
+4. Variable-length sequence handling without padding overhead
+
+Key Features:
+    - Mixed prefill/decode: Handle both phases in single kernel launch
+    - Paged KV cache: Non-contiguous memory pages for efficient caching
+    - Dynamic sequence counts: num_seqs can vary per batch
+    - Query start locations: Cumulative positions for ragged batching
+    - Grouped Query Attention (GQA): Support for multi-query variants
+    - Sliding window: Local attention for long sequences
+    - Logits soft capping: Numerical stability for certain models
+    - Attention sinks: Streaming inference support
+
+Data Layout:
+    - queries: Concatenated tokens [total_tokens, num_heads, head_dim]
+    - kv_pages: Paged cache [num_pages, page_size, num_kv_heads*2, head_dim]
+    - query_start_loc: Cumulative query positions [num_seqs+1]
+    - context_lens: KV lengths per sequence [num_seqs]
+    - block_tables: Page mappings per sequence [num_seqs, pages_per_seq]
+
+Algorithm overview:
+1. Queries are concatenated across sequences (ragged layout)
+2. query_start_loc indicates where each sequence's queries start
+3. Each sequence looks up its KV pages via block_tables
+4. Attention is computed with causal masking per sequence
+5. Results are written back to the ragged output layout
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.ragged_page_attention_v2 import ragged_page_attention_v2
+    >>>
+    >>> # Mixed batch: 2 prefill (10 tokens each), 2 decode (1 token each)
+    >>> total_tokens = 22
+    >>> num_heads, head_dim = 32, 128
+    >>>
+    >>> queries = jnp.ones((total_tokens, num_heads, head_dim))
+    >>> kv_pages = jnp.ones((256, 16, num_heads * 2, head_dim))
+    >>> context_lens = jnp.array([100, 200, 50, 150])
+    >>> block_tables = jnp.zeros((4, 16), dtype=jnp.int32)
+    >>> query_start_loc = jnp.array([0, 10, 20, 21, 22])
+    >>>
+    >>> output = ragged_page_attention_v2(
+    ...     queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs=4
+    ... )
+"""
+
 import functools
 
 import jax
@@ -209,27 +265,43 @@ def ragged_page_attention_v2(
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
     """Ragged paged attention that supports mixed prefill and decode.
 
+    This kernel processes concatenated queries from multiple sequences with
+    different lengths, reading from a paged KV cache. It efficiently handles
+    mixed prefill/decode batches in continuous batching scenarios.
+
     Args:
-      queries: concatenated all sequences' queries.
-      kv_pages: paged KV cache. Normally in HBM.
-      context_lens: padded kv lengths. Only the first num_seqs values are valid.
-      block_tables: the first index indicates which page to use in the kv cache
-        for each sequence. Only the first num_seqs values are valid.
-      query_start_loc: the cumulative sum of the effective query lengths. Similar to
-        context_lens, only the first num_seqs+1 values are valid.
-      num_seqs: the dynamic number of sequences.
-      softmax_scale: the softmax softmax_scale which will be applied to the Q@K^T.
-      sliding_window: the sliding window size for the attention.
-      logits_soft_cap: the logit soft cap for the attention.
-      mask_value: mask value for causal mask.
-      num_kv_pages_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-      num_queries_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-      vmem_limit_bytes: the vmem limit for the pallas kernel.
+        queries: Concatenated query tokens [total_tokens, num_q_heads, head_dim].
+            All sequences' queries are packed together.
+        kv_pages: Paged KV cache [num_pages, page_size, num_kv_heads*2, head_dim].
+            Keys and values are interleaved in dim 2.
+        context_lens: KV context lengths per sequence [num_seqs]. Specifies how
+            many KV tokens each sequence has.
+        block_tables: Page table mapping [num_seqs, pages_per_seq]. Maps each
+            sequence's logical pages to physical page indices.
+        query_start_loc: Cumulative query positions [num_seqs+1]. Position i gives
+            the starting index in queries for sequence i.
+        num_seqs: Dynamic number of sequences in this batch.
+        softmax_scale: Scaling factor for QK^T (default: 1/sqrt(head_dim)).
+        logits_soft_cap: Optional soft cap value for attention logits.
+        compute_dtype: Dtype for computation (ignored in this implementation).
+        optimized: Whether to use optimized kernel (ignored in this implementation).
+        sliding_window: Size of sliding window for local attention.
+        softmax_aux: Optional attention sink logits [num_q_heads] for streaming.
+        mask_value: Value for masked positions in attention matrix.
+        num_kv_pages_per_block: Number of KV pages per compute block in kernel.
+        num_queries_per_block: Number of queries per compute block in kernel.
+        vmem_limit_bytes: VMEM budget limit for the Pallas kernel.
+        num_warps: Number of warps (ignored in TPU implementation).
+        num_stages: Number of stages (ignored in TPU implementation).
 
     Returns:
-      The output of the attention.
+        Attention output [total_tokens, num_q_heads, head_dim] with same layout
+        as input queries.
+
+    Note:
+        - Only the first num_seqs entries in context_lens and block_tables are valid
+        - Query positions outside [query_start_loc[i], query_start_loc[i+1]) are
+          masked for sequence i
     """
     del optimized, compute_dtype
     num_seqs_arr = jnp.asarray(num_seqs, dtype=jnp.int32)

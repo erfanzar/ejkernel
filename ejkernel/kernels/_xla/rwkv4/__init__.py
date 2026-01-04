@@ -12,7 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""XLA backend for RWKV-4 time-mix recurrence."""
+"""XLA backend for RWKV-4 time-mix recurrence.
+
+This submodule provides XLA-optimized implementation of RWKV-4's
+time-mix mechanism, a linear-complexity attention alternative.
+
+Key Features:
+    - O(N) complexity through channel-wise recurrence
+    - Time-mixing with learnable decay and receptance gates
+    - Efficient token mixing without attention matrices
+    - State caching for autoregressive generation
+
+Algorithm:
+    RWKV-4 computes per-channel recurrence:
+        wkv_t = exp(w + k_t) * v_t + exp(u + k_t) * v_t
+        y_t = sigmoid(r_t) * wkv_t
+    where w is the learned decay and u provides bonus for current token.
+
+Reference:
+    RWKV: Reinventing RNNs for the Transformer Era
+    https://arxiv.org/abs/2305.13048
+"""
 
 from ._interface import rwkv4
 

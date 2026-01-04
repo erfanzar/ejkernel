@@ -13,24 +13,69 @@
 # limitations under the License.
 
 
-"""Flash Attention interface for XLA backend.
+"""Flash Attention implementation using XLA/JAX operations.
 
-This module provides the public API for Flash Attention using XLA,
-including the main `flash_attention` function with custom VJP support.
+This module provides a memory-efficient implementation of Flash Attention
+using pure JAX operations that compiles to XLA. It implements the online
+softmax algorithm to compute attention in chunks, reducing memory usage
+from O(N²) to O(N) for sequence length N.
 
-The implementation supports:
-    - Configurable chunk sizes for query and key processing
-    - Causal and non-causal attention modes
-    - Sliding window attention
-    - Attention masks and bias tensors
-    - Segment IDs for packed sequence processing
-    - Dropout with reproducible randomness
-    - Multiple precision modes (DEFAULT, HIGH, HIGHEST)
+Flash Attention is a breakthrough algorithm that maintains exact attention
+semantics while dramatically reducing memory footprint. The key insight is
+to split the attention computation into blocks and use online softmax to
+avoid materializing the full attention matrix.
+
+Key advantages over standard attention:
+1. Subquadratic memory: O(N) instead of O(N²) for sequence length N
+2. Hardware-agnostic: Works on any XLA-supported backend (CPU, GPU, TPU)
+3. Exact attention: No approximation, produces identical results to standard attention
+4. Custom VJP: Efficient gradient computation through custom backward pass
+
+Algorithm overview:
+- Query sequence is processed in chunks of size chunk_size_q
+- For each query chunk, iterate through key/value chunks of size chunk_size_k
+- Online softmax accumulates partial results without full materialization
+- Numerically stable using log-sum-exp trick with running maximum
+
+Supported features:
+- Causal and non-causal (bidirectional) attention
+- Attention bias for relative position encodings
+- Boolean attention masks for padding
+- Segment IDs for packed sequence processing
+- Sliding window attention for local patterns
+- Grouped-query attention (GQA) and multi-query attention (MQA)
+- Attention sinks via softmax_aux parameter
+- Logits soft capping for numerical stability
+- Dropout with reproducible randomness
+- Multiple precision modes (DEFAULT, HIGH, HIGHEST)
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._xla.flash_attention import flash_attention
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 2048, 8, 64
+    >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>>
+    >>> # Basic causal attention
+    >>> output = flash_attention(q, k, v, causal=True)
+    >>>
+    >>> # With sliding window
+    >>> output = flash_attention(q, k, v, causal=True, sliding_window=256)
+    >>>
+    >>> # With attention sinks (4 sink tokens)
+    >>> sinks = jnp.zeros((4,))
+    >>> output = flash_attention(q, k, v, causal=True, softmax_aux=sinks)
+
+Reference:
+    FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness
+    https://arxiv.org/abs/2205.14135
 
 Internal Functions:
-    _make_core_func: Creates specialized attention cores for given static params
-    _precision_to_code: Convert JAX precision to integer code
-    _dtype_to_code: Convert dtype to integer code for JIT compilation
+    _make_core_func: Creates specialized attention cores with custom VJP for given static params
+    _precision_to_code: Convert JAX precision enum to integer code for caching
+    _dtype_to_code: Convert dtype to integer code for JIT compilation caching
 """
 
 import math
@@ -75,7 +120,21 @@ _CODE_TO_DTYPE = {
 
 
 def _precision_to_code(precision) -> int:
-    """Convert precision to code."""
+    """Convert JAX precision enum to integer code for function caching.
+
+    This enables caching of compiled attention cores based on precision settings,
+    since JAX precision enums are not hashable in the same way across sessions.
+
+    Args:
+        precision: JAX precision setting (jax.lax.Precision.DEFAULT/HIGH/HIGHEST)
+            or an integer code (0, 1, 2).
+
+    Returns:
+        Integer code representing the precision level.
+
+    Raises:
+        ValueError: If precision is not a valid JAX precision enum or int code.
+    """
     if isinstance(precision, int):
         return int(precision)
     try:
@@ -85,7 +144,20 @@ def _precision_to_code(precision) -> int:
 
 
 def _dtype_to_code(dtype) -> int:
-    """Convert dtype to code."""
+    """Convert dtype to integer code for function caching.
+
+    This enables caching of compiled attention cores based on logits dtype,
+    since dtypes need to be converted to hashable values for the cache key.
+
+    Args:
+        dtype: JAX/NumPy dtype (float16, bfloat16, float32, or float64).
+
+    Returns:
+        Integer code representing the dtype.
+
+    Raises:
+        ValueError: If dtype is not one of the supported types.
+    """
     d = jnp.dtype(dtype)
     try:
         return _DTYPE_TO_CODE[d]
@@ -102,7 +174,28 @@ def _make_core_func(
     causal_val: bool,
     dropout_prob_val: float,
 ):
-    """Create a specialized core function for given static parameters."""
+    """Create a specialized flash attention core function with custom VJP.
+
+    This factory function creates a specialized attention function with the given
+    static parameters baked in. The returned function has a custom VJP (Vector-Jacobian
+    Product) defined for efficient gradient computation.
+
+    The specialization enables XLA to optimize the computation for the specific
+    configuration, and the caching mechanism (_CORE_FUNC_CACHE) ensures each
+    unique configuration is compiled only once.
+
+    Args:
+        precision_code_val: Integer code for JAX precision setting.
+        logits_dtype_code_val: Integer code for logits computation dtype.
+        chunk_size_q_val: Number of query tokens to process per chunk.
+        chunk_size_k_val: Number of key/value tokens to process per chunk.
+        normalize_output_val: Whether to normalize output by attention weights sum.
+        causal_val: Whether to apply causal masking.
+        dropout_prob_val: Dropout probability for attention weights.
+
+    Returns:
+        A specialized flash attention function with custom VJP defined.
+    """
     precision = _CODE_TO_PREC[precision_code_val]
     logits_dtype = _CODE_TO_DTYPE[logits_dtype_code_val]
 
@@ -121,7 +214,29 @@ def _make_core_func(
         logits_soft_cap: float | None,
         dropout_key: PRNGKeyArray | None,
     ) -> chex.Array:
-        """Core flash attention with custom_vjp and attention sinks."""
+        """Core flash attention computation with custom VJP.
+
+        This inner function performs the actual chunked attention computation
+        using online softmax. Static parameters (precision, chunk sizes, etc.)
+        are captured from the enclosing scope.
+
+        Args:
+            query: Query tensor [batch, seq_len_q, num_heads, head_dim].
+            key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim].
+            value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim].
+            bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k].
+            attention_mask: Optional boolean mask [batch, 1, seq_len_q, seq_len_k].
+            q_segment_ids: Optional query segment IDs [batch, seq_len_q].
+            kv_segment_ids: Optional key/value segment IDs [batch, seq_len_k].
+            softmax_aux: Optional attention sink logits [num_sinks].
+            sliding_window: Optional (left, right) window bounds.
+            softmax_scale: Scaling factor for attention scores.
+            logits_soft_cap: Optional soft cap for attention logits.
+            dropout_key: Optional PRNG key for dropout.
+
+        Returns:
+            Attention output [batch, seq_len_q, num_heads, head_dim].
+        """
         return _flash_attention_fwd(
             query,
             key,
@@ -158,7 +273,16 @@ def _make_core_func(
         logits_soft_cap: float | None,
         dropout_key: PRNGKeyArray | None,
     ):
-        """Forward pass for custom_vjp: compute y and stash residuals."""
+        """Forward pass for custom VJP: compute output and save residuals.
+
+        This function is called during the forward pass of differentiation.
+        It computes the attention output and returns residuals (context) needed
+        for the backward pass gradient computation.
+
+        Returns:
+            Tuple of (attention_output, residuals) where residuals contain all
+            values needed for backward pass gradient computation.
+        """
         y = _flash_attention_fwd(
             query,
             key,
@@ -203,7 +327,22 @@ def _make_core_func(
         return y, ctx
 
     def _bwd(ctx, g):
-        """Backward pass wrapper for custom_vjp."""
+        """Backward pass for custom VJP: compute gradients from residuals.
+
+        This function computes gradients with respect to query, key, and value
+        tensors using the saved residuals from the forward pass.
+
+        Args:
+            ctx: Residuals tuple from forward pass containing (bias, attention_mask,
+                q_segment_ids, kv_segment_ids, softmax_aux, sliding_window, softmax_scale,
+                logits_soft_cap, chunk_size_q, chunk_size_k, normalize_output,
+                query, key, value, causal, dropout_prob, dropout_key).
+            g: Gradient of the loss with respect to the attention output.
+
+        Returns:
+            Tuple of gradients for each input argument. Non-differentiable inputs
+            (masks, segment_ids, etc.) return None.
+        """
         (
             bias,
             attention_mask,
@@ -288,7 +427,36 @@ def _flash_attention_core(
     dropout_prob: float,
     dropout_key: PRNGKeyArray | None,
 ) -> chex.Array:
-    """Core flash attention dispatcher."""
+    """Dispatch flash attention to cached specialized core function.
+
+    This function looks up or creates a specialized attention function for the
+    given static configuration and calls it with the dynamic tensor arguments.
+    The caching mechanism ensures each unique configuration is compiled only once.
+
+    Args:
+        query: Query tensor [batch, seq_len_q, num_heads, head_dim].
+        key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim].
+        value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim].
+        bias: Optional attention bias.
+        attention_mask: Optional boolean attention mask.
+        q_segment_ids: Optional query segment IDs.
+        kv_segment_ids: Optional key/value segment IDs.
+        softmax_aux: Optional attention sink logits.
+        sliding_window: Optional (left, right) window bounds.
+        softmax_scale: Scaling factor for attention scores.
+        logits_soft_cap: Optional soft cap for attention logits.
+        chunk_size_q: Query chunk size for blocked computation.
+        chunk_size_k: Key/value chunk size for blocked computation.
+        normalize_output: Whether to normalize by attention weight sum.
+        precision_code: Integer code for JAX precision.
+        logits_dtype_code: Integer code for logits dtype.
+        causal: Whether to apply causal masking.
+        dropout_prob: Dropout probability.
+        dropout_key: Optional PRNG key for dropout.
+
+    Returns:
+        Attention output [batch, seq_len_q, num_heads, head_dim].
+    """
     cache_key = (precision_code, logits_dtype_code, chunk_size_q, chunk_size_k, normalize_output, causal, dropout_prob)
     if cache_key not in _CORE_FUNC_CACHE:
         _CORE_FUNC_CACHE[cache_key] = _make_core_func(
@@ -354,12 +522,71 @@ def flash_attention(
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    """
-    Flash attention with memory-efficient chunked computation and attention sinks.
+    """Compute flash attention with memory-efficient chunked computation.
 
     This implementation uses online softmax to compute attention in chunks,
-    reducing memory usage from O(N²) to O(N). Supports sliding window attention,
-    logit soft capping, grouped query attention (GQA/MQA), and attention sinks.
+    reducing memory usage from O(N²) to O(N). It supports all modern attention
+    features including sliding window, logit soft capping, GQA/MQA, and
+    attention sinks.
+
+    The algorithm processes queries in blocks and maintains running statistics
+    (max and sum) for numerically stable softmax computation without ever
+    materializing the full attention matrix.
+
+    Args:
+        query: Query tensor [batch, seq_len_q, num_heads, head_dim].
+        key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim].
+        value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim].
+        attention_mask: Optional boolean/int mask [batch, 1, seq_len_q, seq_len_k].
+            True/1 values indicate positions to attend to.
+        bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k].
+        softmax_scale: Scaling factor for QK^T. Defaults to 1/sqrt(head_dim).
+        dropout_prob: Dropout probability for attention weights. Default 0.0.
+        causal: If True, applies causal masking. Default False.
+        dropout_seed: Integer seed for dropout PRNG. Required if dropout_prob > 0.
+        cum_seqlens_q: Not implemented in XLA backend.
+        cum_seqlens_k: Not implemented in XLA backend.
+        sliding_window: Local attention window. Can be:
+            - int: Symmetric window (same left and right)
+            - tuple[int, int]: Asymmetric (left_window, right_window)
+            - None: Full attention (default)
+        fwd_params: Forward pass parameters (q_blocksize, kv_blocksize, etc.).
+        bwd_params: Backward pass parameters (unused in XLA backend).
+        logits_soft_cap: Soft cap for attention logits via tanh.
+            Applies: cap * tanh(logits / cap). Common in Gemma2.
+        softmax_aux: Attention sink logits [num_sinks] or [num_heads, num_sinks].
+            Participate in softmax but don't contribute to output.
+        normalize_output: Whether to normalize output by sum of weights. Default True.
+        precision: JAX precision for matrix multiplications.
+            One of: Precision.DEFAULT, Precision.HIGH, Precision.HIGHEST.
+        logits_dtype: Dtype for logits computation. Default float32.
+        q_segment_ids: Query segment IDs [batch, seq_len_q] for packed sequences.
+        kv_segment_ids: Key/value segment IDs [batch, seq_len_k] for packed sequences.
+
+    Returns:
+        Attention output [batch, seq_len_q, num_heads, head_dim].
+
+    Raises:
+        NotImplementedError: If cum_seqlens_q or cum_seqlens_k are provided.
+        ValueError: If sliding_window contains negative values.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from ejkernel.kernels._xla.flash_attention import flash_attention
+        >>>
+        >>> batch, seq_len, num_heads, head_dim = 2, 2048, 8, 64
+        >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>>
+        >>> output = flash_attention(q, k, v, causal=True)
+        >>> output.shape
+        (2, 2048, 8, 64)
+
+    Note:
+        This is the XLA/JAX reference implementation. For GPU workloads with
+        CUDA support, consider using the Triton-based flash_attention for
+        potentially better performance.
     """
     if cum_seqlens_k is not None and attention_mask is None:
         raise NotImplementedError("`cum_seqlens_k` is not implemented in xla!")

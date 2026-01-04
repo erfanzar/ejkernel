@@ -12,6 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ring Attention backward pass implementation using XLA/JAX.
+
+This module provides the backward pass (gradient computation) for ring
+attention, computing gradients for Q, K, V in a distributed manner matching
+the forward pass communication pattern.
+
+Key Components:
+    - _blockwise_attention_bwd: Single block gradient computation
+    - _ring_attention_bwd: Full ring backward with collective communication
+
+Algorithm:
+    The backward pass mirrors the forward ring topology:
+    1. Circulate K/V blocks (and their gradients) around the ring
+    2. For each ring step:
+       - Compute local dQ, dK, dV for current block pair
+       - Accumulate dK, dV as they circulate
+       - Rotate K/V and dK/dV to next device
+    3. After full rotation, gradients are accumulated correctly
+
+Communication Pattern:
+    - Same ring topology as forward pass
+    - K/V circulate forward, gradients accumulate backward
+    - Requires same number of collective operations as forward
+
+Features:
+    - Distributed gradient computation matching forward pass
+    - Proper handling of causal masking gradients
+    - Segment-based masking gradient support
+    - Dropout gradient with same PRNG key as forward
+
+Note:
+    The backward pass requires more communication than a naive
+    implementation because dK/dV must be accumulated across all
+    devices that contributed to their corresponding K/V blocks.
+"""
 
 from functools import partial
 

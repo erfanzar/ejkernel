@@ -14,16 +14,55 @@
 
 """RWKV-7 recurrent kernel (XLA).
 
-RWKV-7 can be expressed as a DPLR (Diagonal + Low-Rank) state update:
+This module provides a pure JAX/XLA implementation of the RWKV-7 time-mix
+recurrence using a DPLR (Diagonal + Low-Rank) state transition. RWKV-7
+is the latest evolution of the RWKV architecture with enhanced expressivity
+through low-rank state updates.
 
-    h_t = diag(exp(w_t)) @ h_{t-1} + a_t (b_t^T h_{t-1}) + k_t v_t^T
-    o_t = r_t^T h_t
+RWKV-7 extends RWKV-6 with a more expressive state transition:
+1. Diagonal term: exp(w_t) * h_{t-1} (exponential decay)
+2. Low-rank term: a_t * (b_t^T @ h_{t-1}) (rank-1 read-write)
+3. Key-value term: k_t ⊗ v_t (standard outer product)
 
-where `h` has shape [K, V] per head (we store it as [K, V]).
+The DPLR formulation allows the model to:
+- Selectively read from previous state (via b_t)
+- Selectively write to state (via a_t)
+- Forget with per-dimension rates (via w_t)
+- Store new information (via k_t, v_t)
 
-This file provides:
-    - `rwkv7`: (a,b) parameterization
-    - `rwkv7_mul`: (kk,a) parameterization used by some optimized kernels
+Core recurrence:
+    h_t = diag(exp(w_t)) @ h_{t-1} + a_t @ (b_t^T @ h_{t-1}) + k_t @ v_t^T
+    o_t = r_t^T @ h_t
+
+Where:
+    - h is the state matrix [K, V] per head
+    - w controls diagonal decay (log space)
+    - a, b provide low-rank read-write mechanism
+    - k, v add new key-value pairs
+    - r queries the accumulated state
+
+This file provides two parameterizations:
+    - `rwkv7`: Standard (a, b) parameterization
+    - `rwkv7_mul`: Multiplicative (kk, a) parameterization where b = -kk
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._xla.rwkv7 import rwkv7
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 100, 8, 64
+    >>> r = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> w = jnp.zeros((batch, seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> a = jnp.zeros((batch, seq_len, num_heads, head_dim))
+    >>> b = jnp.zeros((batch, seq_len, num_heads, head_dim))
+    >>>
+    >>> output, final_state = rwkv7(r, w, k, v, a, b)
+    >>> output.shape
+    (2, 100, 8, 64)
+
+Reference:
+    RWKV-7: https://github.com/BlinkDL/RWKV-LM
 """
 
 from __future__ import annotations
@@ -46,16 +85,53 @@ def _rwkv7_update(
     a_t: Array,
     b_t: Array,
 ) -> tuple[Array, Array]:
-    # h: [B,H,K,V]
-    # r_t,k_t,w_t,a_t,b_t: [B,H,K]
-    # v_t: [B,H,V]
-    hb = jnp.einsum("bhk,bhkv->bhv", b_t, h)  # b^T h -> [B,H,V]
+    """Single step of the RWKV-7 DPLR recurrence.
+
+    Computes one timestep of the RWKV-7 mechanism using the Diagonal + Low-Rank
+    state transition that enables selective reading and writing to memory.
+
+    The update consists of three components:
+    1. Diagonal decay: h * exp(w_t) - controls forgetting
+    2. Low-rank update: a_t @ (b_t^T @ h) - selective read-write
+    3. Key-value: k_t @ v_t^T - new information injection
+
+    Args:
+        h: Hidden state [B, H, K, V] - key-value memory matrix per head
+        r_t: Receptance/query at time t [B, H, K]
+        k_t: Key at time t [B, H, K]
+        v_t: Value at time t [B, H, V]
+        w_t: Log decay at time t [B, H, K]
+        a_t: Low-rank write vector [B, H, K]
+        b_t: Low-rank read vector [B, H, K]
+
+    Returns:
+        Tuple of:
+            - h_next: Updated hidden state [B, H, K, V]
+            - o_t: Output at time t [B, H, V]
+    """
+    # Low-rank read: b^T @ h -> [B, H, V]
+    hb = jnp.einsum("bhk,bhkv->bhv", b_t, h)
+    # DPLR update: diagonal + low-rank + key-value
     h = h * jnp.exp(w_t)[..., :, None] + a_t[..., :, None] * hb[..., None, :] + k_t[..., :, None] * v_t[..., None, :]
+    # Query the updated state
     o_t = jnp.einsum("bhk,bhkv->bhv", r_t, h)
     return h, o_t
 
 
 def _validate_rwkv7_inputs(r: Array, k: Array, v: Array, w: Array, a: Array, b: Array) -> None:
+    """Validate RWKV-7 input tensor shapes and dimensions.
+
+    Args:
+        r: Receptance tensor, expected [B, T, H, K]
+        k: Key tensor, expected [B, T, H, K]
+        v: Value tensor, expected [B, T, H, V]
+        w: Log decay tensor, expected [B, T, H, K]
+        a: Low-rank write tensor, expected [B, T, H, K]
+        b: Low-rank read tensor, expected [B, T, H, K]
+
+    Raises:
+        ValueError: If any tensor has incorrect rank or mismatched shapes.
+    """
     if r.ndim != 4 or k.ndim != 4 or w.ndim != 4 or a.ndim != 4 or b.ndim != 4 or v.ndim != 4:
         raise ValueError(
             "Expected r,k,w,a,b rank-4 [B,T,H,K] and v rank-4 [B,T,H,V], "
@@ -82,6 +158,22 @@ def _rwkv7_scan(
     initial_state: Array,
     reverse: bool,
 ) -> tuple[Array, Array]:
+    """Sequential scan for RWKV-7 over full sequence.
+
+    Args:
+        r: Receptance/query [B, T, H, K]
+        k: Key [B, T, H, K]
+        v: Value [B, T, H, V]
+        w: Log decay [B, T, H, K]
+        a: Low-rank write [B, T, H, K]
+        b: Low-rank read [B, T, H, K]
+        softmax_scale: Scale factor for receptance
+        initial_state: Initial hidden state [B, H, K, V]
+        reverse: If True, process sequence in reverse
+
+    Returns:
+        Tuple of (output [B, T, H, V], final_state [B, H, K, V])
+    """
     if reverse:
         r = r[:, ::-1, :, :]
         k = k[:, ::-1, :, :]
@@ -124,6 +216,29 @@ def _rwkv7_varlen(
     initial_state: Array,
     reverse: bool,
 ) -> tuple[Array, Array]:
+    """RWKV-7 scan for variable-length packed sequences.
+
+    Processes multiple sequences packed into a single tensor, using
+    cumulative sequence lengths to determine boundaries.
+
+    Args:
+        r: Receptance [1, total_tokens, H, K]
+        k: Key [1, total_tokens, H, K]
+        v: Value [1, total_tokens, H, V]
+        w: Log decay [1, total_tokens, H, K]
+        a: Low-rank write [1, total_tokens, H, K]
+        b: Low-rank read [1, total_tokens, H, K]
+        cu_seqlens: Cumulative sequence lengths [num_seqs + 1]
+        softmax_scale: Scale for receptance
+        initial_state: Initial states [num_seqs, H, K, V]
+        reverse: If True, process each sequence in reverse
+
+    Returns:
+        Tuple of (output [1, total_tokens, H, V], final_states [num_seqs, H, K, V])
+
+    Raises:
+        ValueError: If batch size is not 1 or initial_state count mismatches.
+    """
     if r.shape[0] != 1:
         raise ValueError(f"Packed mode expects batch size 1, got {r.shape[0]}.")
     total_tokens = r.shape[1]
@@ -204,7 +319,61 @@ def rwkv7(
     Float[Array, "batch seq_len num_heads v_head_dim"],
     Float[Array, "... num_heads qk_head_dim v_head_dim"],
 ]:
-    """RWKV-7 DPLR recurrence in JAX/XLA."""
+    """RWKV-7 DPLR recurrent attention using XLA backend.
+
+    Implements the RWKV-7 Diagonal + Low-Rank state update with O(N) complexity.
+    The DPLR formulation provides enhanced expressivity by allowing the model
+    to selectively read from and write to memory through low-rank projections.
+
+    The recurrence is:
+        hb_t = b_t^T @ h_{t-1}  (low-rank read)
+        h_t = exp(w_t) * h_{t-1} + a_t @ hb_t^T + k_t @ v_t^T  (DPLR update)
+        o_t = r_t^T @ h_t  (query)
+
+    Args:
+        r: Receptance/query tensor for attention retrieval.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        w: Log decay tensor controlling diagonal forgetting.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        k: Key tensor for memory addressing.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        v: Value tensor for memory content.
+            Shape: [batch, seq_len, num_heads, v_head_dim]
+        a: Low-rank write vector controlling what to write.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        b: Low-rank read vector controlling what to read from previous state.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        softmax_scale: Optional scale for receptance. If None, uses K^-0.5.
+        initial_state: Optional initial hidden state for continuation.
+            Shape: [batch, num_heads, qk_head_dim, v_head_dim]
+            or [num_seqs, num_heads, qk_head_dim, v_head_dim] for packed mode.
+        reverse: If True, process sequence in reverse order.
+        cu_seqlens: Optional cumulative sequence lengths for packed variable-length
+            sequences. Shape: [num_seqs + 1]
+
+    Returns:
+        Tuple of:
+            - output: Attention output matching input dtype.
+                Shape: [batch, seq_len, num_heads, v_head_dim]
+            - final_state: Final hidden state in float32.
+                Shape: [batch, num_heads, qk_head_dim, v_head_dim]
+                or [num_seqs, num_heads, qk_head_dim, v_head_dim] for packed mode.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>>
+        >>> batch, seq_len, num_heads, head_dim = 2, 100, 8, 64
+        >>> r = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> w = jnp.zeros((batch, seq_len, num_heads, head_dim))
+        >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> a = jnp.zeros((batch, seq_len, num_heads, head_dim))
+        >>> b = jnp.zeros((batch, seq_len, num_heads, head_dim))
+        >>>
+        >>> output, state = rwkv7(r, w, k, v, a, b)
+        >>> output.shape
+        (2, 100, 8, 64)
+    """
     _validate_rwkv7_inputs(r, k, v, w, a, b)
 
     if softmax_scale is None:
@@ -278,11 +447,54 @@ def rwkv7_mul(
     Float[Array, "batch seq_len num_heads v_head_dim"],
     Float[Array, "... num_heads qk_head_dim v_head_dim"],
 ]:
-    """RWKV-7 multiplicative parameterization wrapper.
+    """RWKV-7 multiplicative parameterization using XLA backend.
 
-    Uses the same DPLR update as `rwkv7` with:
-        a' = kk * a
-        b' = -kk
+    Alternative parameterization of RWKV-7 DPLR that uses a multiplicative
+    form for the low-rank components. This is equivalent to the standard
+    (a, b) parameterization but with different learned parameters.
+
+    The transformation from (kk, a) to (a', b') is:
+        a' = kk * a  (element-wise multiplication)
+        b' = -kk     (negated kk)
+
+    This parameterization is used by some optimized kernel implementations
+    and may provide different training dynamics.
+
+    Args:
+        r: Receptance/query tensor.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        w: Log decay tensor.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        k: Key tensor.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        v: Value tensor.
+            Shape: [batch, seq_len, num_heads, v_head_dim]
+        kk: Key-key tensor used to compute both a' and b'.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        a: Scaling tensor multiplied with kk to get a'.
+            Shape: [batch, seq_len, num_heads, qk_head_dim]
+        softmax_scale: Optional scale for receptance. If None, uses K^-0.5.
+        initial_state: Optional initial hidden state.
+        reverse: If True, process sequence in reverse.
+        cu_seqlens: Optional cumulative sequence lengths for packed sequences.
+
+    Returns:
+        Tuple of:
+            - output: Attention output [batch, seq_len, num_heads, v_head_dim]
+            - final_state: Final hidden state [batch, num_heads, qk_head_dim, v_head_dim]
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>>
+        >>> batch, seq_len, num_heads, head_dim = 2, 100, 8, 64
+        >>> r = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> w = jnp.zeros((batch, seq_len, num_heads, head_dim))
+        >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> kk = jnp.ones((batch, seq_len, num_heads, head_dim))
+        >>> a = jnp.zeros((batch, seq_len, num_heads, head_dim))
+        >>>
+        >>> output, state = rwkv7_mul(r, w, k, v, kk, a)
     """
     return rwkv7(
         r=r,

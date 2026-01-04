@@ -12,6 +12,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utility functions and tuned block sizes for Ragged Paged Attention V2.
+
+This module provides utility functions for TPU device detection, block size
+selection, and performance tuning for the ragged paged attention V2 kernel.
+It includes pre-tuned block size configurations for different TPU generations
+and workload characteristics.
+
+Key Components:
+    - TUNED_BLOCK_SIZES: Dictionary of empirically tuned (bkv, bq) block sizes
+      indexed by TPU version and workload parameters
+    - next_power_of_2: Helper for power-of-2 alignment calculations
+    - simplify_key: Normalizes workload parameters for block size lookup
+    - get_tpu_version: Detects TPU generation from device info
+    - get_tuned_block_sizes: Retrieves optimal block sizes for given workload
+
+Block Size Parameters:
+    - bkv (num_kv_pages_per_block): Number of KV cache pages processed per
+      Flash Attention block. Larger values improve HBM bandwidth utilization
+      but increase VMEM usage
+    - bq (num_queries_per_block): Number of query tokens processed per block.
+      Affects parallelism and memory footprint
+
+Tuning Dimensions:
+    The tuned configurations are indexed by:
+    - q_dtype, kv_dtype: Data types for queries and KV cache
+    - num_q_heads_per_blk: Query heads per processing block
+    - num_kv_heads_per_blk: KV heads per processing block
+    - head_dim: Attention head dimension (128, 256, etc.)
+    - page_size: KV cache page size (16, 32, 64, etc.)
+    - max_num_batched_tokens: Maximum tokens in a batch
+    - pages_per_seq: Maximum pages per sequence
+
+TPU Version Support:
+    - TPU v4: Conservative block sizes for older architecture
+    - TPU v5: Optimized for enhanced memory bandwidth
+    - TPU v6: Maximum performance with larger block sizes
+
+Example:
+    >>> # Get optimal block sizes for a workload
+    >>> bkv_pages, bq_size = get_tuned_block_sizes(
+    ...     q_dtype=jnp.bfloat16,
+    ...     kv_dtype=jnp.bfloat16,
+    ...     num_q_heads_per_blk=32,
+    ...     num_kv_heads_per_blk=8,
+    ...     head_dim=128,
+    ...     page_size=64,
+    ...     max_num_batched_tokens=2048,
+    ...     pages_per_seq=256,
+    ... )
+    >>> print(f"Block sizes: KV pages={bkv_pages}, queries={bq_size}")
+
+Note:
+    The tuned block sizes are empirically determined through benchmarking
+    and may not be optimal for all workloads. The simplify_key function
+    normalizes parameters to reduce the tuning space while maintaining
+    good performance across similar configurations.
+"""
 
 import jax
 import jax.numpy as jnp

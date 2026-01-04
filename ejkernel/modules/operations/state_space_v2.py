@@ -76,21 +76,46 @@ from .configs import StateSpaceV2Config
 class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
     """SSM2 (Mamba2-style) Selective State Space operation.
 
-    Implements the Mamba2 architecture with O(N) complexity.
-    Processes tokens sequentially with per-head scalar decay.
+    Implements the Mamba2 architecture with O(N) complexity, where N is the
+    sequence length. Processes tokens sequentially with per-head scalar decay
+    for improved efficiency and expressiveness.
 
     Features:
         - 1D A vector [num_heads] (per-head scalar)
-        - n_groups for B, C grouping
+        - n_groups for B, C grouping (broadcast to num_heads)
         - Hidden state shape [batch, num_heads, head_dim, ssm_state_size]
         - Gated RMSNorm output normalization option
+        - Conv state passthrough for caching during inference
         - Multiple platform support (XLA primary)
+        - Automatic platform selection for optimal performance
 
     The state update mechanism:
         dA = exp(A * dt)  where A is per-head scalar
         dBx = dt * B * x (outer product form)
         h_t = dA * h_{t-1} + dBx
         y_t = einsum(h_t, C_t) + x_t * D
+
+    Example:
+        >>> from ejkernel.modules import StateSpaceV2, create_default_executor
+        >>>
+        >>> # Basic usage
+        >>> executor = create_default_executor()
+        >>> ssm = StateSpaceV2()
+        >>> output, state, _ = executor(ssm, x, A, B, C, D, dt, n_groups=1)
+        >>>
+        >>> # With gated RMSNorm
+        >>> output, state, _ = executor(
+        ...     ssm, x, A, B, C, D, dt,
+        ...     gate=gate, n_groups=1,
+        ...     use_gated_rmsnorm=True, act_fn=jax.nn.silu
+        ... )
+        >>>
+        >>> # Streaming inference with state continuation
+        >>> output, state, conv_state = executor(
+        ...     ssm, x[:, :1], A, B[:, :1], C[:, :1], D, dt[:, :1],
+        ...     initial_state=prev_state, conv_state=prev_conv_state,
+        ...     n_groups=1
+        ... )
     """
 
     def __init__(self):

@@ -13,7 +13,50 @@
 # limitations under the License.
 
 
-"""Kernel registry system for managing multi-platform implementations."""
+"""Kernel registry system for managing multi-platform implementations.
+
+This module provides the core registry infrastructure for ejkernel's
+multi-platform kernel dispatch system. It enables registration and
+lookup of kernel implementations across different platforms (Triton,
+Pallas, CUDA, XLA) and backends (GPU, TPU, CPU).
+
+Key Components:
+    - Platform: Enum for implementation platforms (TRITON, PALLAS, CUDA, XLA)
+    - Backend: Enum for hardware backends (GPU, TPU, CPU, ANY)
+    - KernelSpec: Dataclass describing a registered kernel implementation
+    - KernelRegistry: Registry class for managing kernel implementations
+    - kernel_registry: Global singleton registry instance
+
+Usage:
+    Registration:
+        @kernel_registry.register("flash_attention", Platform.TRITON, Backend.GPU)
+        def flash_attention_triton(q, k, v): ...
+
+    Lookup:
+        impl = kernel_registry.get("flash_attention", platform="triton", backend="gpu")
+        result = impl(q, k, v)
+
+Priority System:
+    Multiple implementations of the same algorithm can coexist with different
+    priorities. When looking up a kernel, the highest priority match is returned.
+    This enables optimized implementations to take precedence over fallbacks.
+
+Signature Validation:
+    The validate_signatures() method ensures all implementations of an algorithm
+    have compatible signatures, catching registration errors early.
+
+Example:
+    >>> from ejkernel.kernels._registry import kernel_registry, Platform, Backend
+    >>>
+    >>> # List all registered algorithms
+    >>> algorithms = kernel_registry.list_algorithms()
+    >>>
+    >>> # Get implementations for an algorithm
+    >>> impls = kernel_registry.list_implementations("flash_attention")
+    >>>
+    >>> # Get best implementation for current platform
+    >>> impl = kernel_registry.get("flash_attention", platform=Platform.XLA)
+"""
 
 from __future__ import annotations
 

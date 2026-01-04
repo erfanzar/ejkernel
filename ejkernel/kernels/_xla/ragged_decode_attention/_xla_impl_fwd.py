@@ -12,6 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged Decode Attention forward pass using XLA/JAX.
+
+This module provides the forward pass for decode attention with variable-length
+(ragged) sequences packed into a single batch for efficient processing.
+
+Key Components:
+    - create_attention_mask: Generate masks for variable-length sequences
+    - _ragged_decode_attention_fwd: Main forward function
+
+Algorithm:
+    Ragged decode attention for packed sequences:
+    1. Pack multiple variable-length sequences into contiguous memory
+    2. Use sequence_start/sequence_end to track boundaries
+    3. Create attention masks that respect sequence boundaries
+    4. Compute attention efficiently over packed representation
+
+Features:
+    - Packed sequence representation for batch efficiency
+    - Dynamic sequence lengths within a batch
+    - Proper masking to prevent cross-sequence attention
+    - GQA/MQA support with head broadcasting
+    - Optional logit soft capping
+
+Memory Layout:
+    - Queries/Keys/Values packed as [total_tokens, num_heads, head_dim]
+    - sequence_start: [batch] start indices in packed representation
+    - sequence_end: [batch] end indices in packed representation
+
+Note:
+    Ragged batching improves GPU/TPU utilization by eliminating
+    padding waste when sequences have varying lengths.
+"""
 
 import chex
 import jax

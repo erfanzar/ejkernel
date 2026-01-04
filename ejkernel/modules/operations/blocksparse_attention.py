@@ -22,6 +22,41 @@ cost for long sequences while maintaining important attention patterns.
 The block-sparse pattern is defined by a mask builder function that determines
 which blocks should be computed. This is particularly useful for document-level
 attention, local attention patterns, and sparse attention architectures.
+
+Key Features:
+    - Sparse block patterns via customizable mask builders
+    - Computational complexity reduction from O(N^2) to O(N * B)
+    - Support for causal masking and sliding windows
+    - Automatic platform selection (Triton/Pallas/XLA)
+    - Gradient support with custom VJP for efficient training
+    - Logit soft capping for numerical stability (Gemma-2 style)
+
+Use Cases:
+    - Long document processing where full attention is prohibitive
+    - Architectures with specific attention patterns (e.g., Longformer, BigBird)
+    - Custom sparsity patterns based on document structure
+    - Efficient attention for sequences with known locality properties
+
+Mathematical Foundation:
+    Standard attention computes the full N x N attention matrix:
+        A_ij = softmax(Q_i @ K_j^T / sqrt(d)) @ V_j for all i, j
+
+    Block-sparse attention only computes blocks where mask_builder returns True:
+        A_ij = softmax(Q_i @ K_j^T / sqrt(d)) @ V_j for (i,j) in sparse_pattern
+
+    This reduces computation from O(N^2 * d) to O(B * block_size^2 * d)
+    where B is the number of active blocks.
+
+Sparse Patterns Supported:
+    - Local attention: each token attends to nearby tokens
+    - Global + local: special tokens attend globally, others locally
+    - Strided patterns: attend to every nth position
+    - Document structure: based on paragraph/section boundaries
+
+References:
+    - Longformer: https://arxiv.org/abs/2004.05150
+    - BigBird: https://arxiv.org/abs/2007.14062
+    - Splash Attention (TPU): https://arxiv.org/abs/2309.08630
 """
 
 from __future__ import annotations

@@ -14,22 +14,53 @@
 
 """RWKV-4 recurrent time-mix kernel (XLA).
 
-Implements the numerically-stable RWKV-4 recurrence used in Flash-Linear-Attention's
-`fla/ops/rwkv4/fused_recurrent.py`, but as a pure JAX/XLA implementation.
+This module provides a pure JAX/XLA implementation of the RWKV-4 time-mix
+recurrence, compatible with Flash-Linear-Attention's fused recurrent operation.
+RWKV-4 achieves O(N) complexity through a numerically-stable recurrent formulation
+that avoids the quadratic attention matrix.
+
+RWKV-4 is a recurrent language model architecture that combines the efficient
+parallelizable training of Transformers with the efficient inference of RNNs.
+The time-mix mechanism uses exponential moving averages with learned decay rates.
 
 State layout follows the common RWKV-4 formulation:
-    state[:, 0, :] = alpha
-    state[:, 1, :] = beta
-    state[:, 2, :] = eps
+    state[:, 0, :] = alpha (numerator accumulator)
+    state[:, 1, :] = beta (denominator accumulator)
+    state[:, 2, :] = eps (log-scale normalization term)
 
-Shapes:
-    w:     [C]   (time_decay parameter in log space; internally uses `-exp(w)`)
-    u:     [C]
-    k, v:  [B, T, C]
-    state: [B, 3, C]
-Returns:
-    wkv:        [B, T, C]
-    final_state:[B, 3, C]   (float32)
+The core recurrence computes WKV (Weighted Key-Value) attention:
+    tau_t = max(u + k_t, eps_{t-1})
+    wkv_t = (exp(eps_{t-1} - tau_t) * alpha_{t-1} + exp(u + k_t - tau_t) * v_t) /
+            (exp(eps_{t-1} - tau_t) * beta_{t-1} + exp(u + k_t - tau_t))
+
+    eps_t = max(w + eps_{t-1}, k_t)
+    alpha_t = exp(w + eps_{t-1} - eps_t) * alpha_{t-1} + exp(k_t - eps_t) * v_t
+    beta_t = exp(w + eps_{t-1} - eps_t) * beta_{t-1} + exp(k_t - eps_t)
+
+Where:
+    - w is the time-decay parameter (log space, uses -exp(w) internally)
+    - u is the bonus/bias for current token attention
+    - The log-sum-exp trick via eps ensures numerical stability
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._xla.rwkv4 import rwkv4
+    >>>
+    >>> batch, seq_len, channels = 2, 100, 512
+    >>> w = jnp.zeros(channels)  # time decay
+    >>> u = jnp.zeros(channels)  # bonus
+    >>> k = jnp.ones((batch, seq_len, channels))
+    >>> v = jnp.ones((batch, seq_len, channels))
+    >>>
+    >>> wkv, final_state = rwkv4(w, u, k, v)
+    >>> wkv.shape
+    (2, 100, 512)
+    >>> final_state.shape
+    (2, 3, 512)
+
+Reference:
+    RWKV: Reinventing RNNs for the Transformer Era
+    https://arxiv.org/abs/2305.13048
 """
 
 from __future__ import annotations
@@ -50,6 +81,28 @@ def _rwkv4_step(
     w: Array,
     u: Array,
 ) -> tuple[tuple[Array, Array, Array], Array]:
+    """Single step of the RWKV-4 recurrence with log-sum-exp stability.
+
+    Computes one timestep of the RWKV-4 time-mix mechanism using the
+    numerically stable formulation that tracks a log-scale normalization
+    term (eps) to prevent overflow/underflow.
+
+    Args:
+        carry: Tuple of (alpha, beta, eps) state tensors, each [B, C]:
+            - alpha: Numerator accumulator (weighted sum of values)
+            - beta: Denominator accumulator (sum of weights)
+            - eps: Log-scale normalization term for stability
+        x: Tuple of (k_t, v_t) for current timestep, each [B, C]:
+            - k_t: Key vector at time t
+            - v_t: Value vector at time t
+        w: Time-decay parameter in log space [C], uses -exp(w) internally
+        u: Bonus/bias for current token attention [C]
+
+    Returns:
+        Tuple of:
+            - Updated (alpha_next, beta_next, eps_next) state
+            - wkv_t: Output for current timestep [B, C]
+    """
     alpha, beta, eps = carry
     kt, vt = x
 
@@ -78,19 +131,61 @@ def rwkv4(
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"] | None = None,
 ) -> tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]:
-    """RWKV-4 recurrent time-mix.
+    """RWKV-4 recurrent time-mix attention using XLA backend.
+
+    Implements the RWKV-4 time-mixing mechanism which computes a weighted
+    key-value (WKV) attention using an O(N) recurrent formulation. This
+    replaces the O(N^2) attention matrix with a sequential scan that
+    maintains running statistics.
+
+    The mechanism uses exponential decay controlled by `w` and adds a
+    bonus term `u` for the current token's contribution. The computation
+    is numerically stabilized using log-sum-exp tracking.
 
     Args:
-        w: Time-decay parameter in log space (will use `-exp(w)` internally).
-        u: Time-mix bias.
-        k: Key tensor `[B, T, C]`.
-        v: Value tensor `[B, T, C]`.
-        state: Optional initial state `[B, 3, C]` (alpha, beta, eps).
-            If None, initializes alpha=0, beta=0, eps=-1e30.
+        w: Time-decay parameter in log space. The actual decay used is
+            -exp(w), so larger w values mean faster decay (less memory
+            of past tokens). Shape: [channels]
+        u: Time-mix bonus/bias that controls how much the current token
+            contributes relative to historical context. Shape: [channels]
+        k: Key tensor representing input features to match against.
+            Shape: [batch, seq_len, channels]
+        v: Value tensor representing content to aggregate.
+            Shape: [batch, seq_len, channels]
+        state: Optional initial state tuple packed as [B, 3, C] where:
+            - state[:, 0, :] = alpha (numerator accumulator)
+            - state[:, 1, :] = beta (denominator accumulator)
+            - state[:, 2, :] = eps (log-scale normalization)
+            If None, initializes with alpha=0, beta=0, eps=-1e30.
 
     Returns:
-        wkv: `[B, T, C]` (dtype matches `v`).
-        final_state: `[B, 3, C]` (float32).
+        Tuple of:
+            - wkv: Weighted key-value output matching input dtype.
+                Shape: [batch, seq_len, channels]
+            - final_state: Final state for continuation, always float32.
+                Shape: [batch, 3, channels]
+
+    Raises:
+        ValueError: If k and v shapes don't match, or dimension mismatches.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>>
+        >>> # Basic usage
+        >>> batch, seq_len, channels = 2, 100, 512
+        >>> w = -jnp.ones(channels) * 0.5  # moderate decay
+        >>> u = jnp.zeros(channels)
+        >>> k = jnp.ones((batch, seq_len, channels))
+        >>> v = jnp.ones((batch, seq_len, channels))
+        >>>
+        >>> wkv, state = rwkv4(w, u, k, v)
+        >>> wkv.shape
+        (2, 100, 512)
+        >>>
+        >>> # Incremental inference with state
+        >>> k_next = jnp.ones((batch, 1, channels))
+        >>> v_next = jnp.ones((batch, 1, channels))
+        >>> wkv_next, state_next = rwkv4(w, u, k_next, v_next, state=state)
     """
     if k.shape != v.shape:
         raise ValueError(f"`k` and `v` must have the same shape, got k={k.shape}, v={v.shape}.")

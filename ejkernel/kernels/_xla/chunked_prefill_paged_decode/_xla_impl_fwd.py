@@ -12,6 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Chunked Prefill with Paged Decode forward pass using XLA/JAX.
+
+This module provides the forward pass for combined chunked prefill and
+paged decode attention, supporting mixed batches with both prefill and
+decode sequences.
+
+Key Components:
+    - _update_block_tabled_kv_cache: Update paged KV cache with new tokens
+    - _chunked_prefill_paged_decode_fwd: Main forward function
+
+Algorithm:
+    Combined prefill and decode in a single batch:
+    1. Separate batch into prefill and decode sequences
+    2. For prefill: Process multiple query tokens against cached KV
+    3. For decode: Process single query token per sequence
+    4. Update KV cache with new tokens using block tables
+
+Features:
+    - Mixed prefill/decode batching for throughput optimization
+    - Block-based KV cache with configurable page size
+    - Efficient cache updates using scatter operations
+    - Supports variable prefill chunk sizes
+
+Memory Layout:
+    - key_cache/value_cache: [num_blocks, page_size, num_kv_heads, head_dim]
+    - block_tables: [num_seqs, max_blocks] for page index lookup
+    - kv_lens: [num_seqs] current sequence lengths
+
+Note:
+    This kernel enables efficient batching of prefill and decode
+    operations, reducing scheduling overhead in serving scenarios.
+"""
+
 from __future__ import annotations
 
 import jax

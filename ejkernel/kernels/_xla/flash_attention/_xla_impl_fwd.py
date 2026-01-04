@@ -12,6 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Flash Attention forward pass implementation using XLA/JAX.
+
+This module provides the forward pass implementation for Flash Attention using
+pure JAX operations that compile to efficient XLA code. It supports various
+attention features including GQA/MQA, causal masking, sliding window, dropout,
+and logit soft capping.
+
+Key Components:
+    - _flash_attention_fwd: Main forward function with chunked computation
+    - _apply_logits_transforms: Logit scaling, bias, soft cap, and masking
+    - _maybe_broadcast_kv_to_q_heads: GQA/MQA head broadcasting
+
+Algorithm:
+    The implementation uses chunked attention to reduce memory usage:
+    1. Split Q into chunks of size chunk_size_q
+    2. For each Q chunk, iterate over K/V chunks of size chunk_size_k
+    3. Compute attention scores, apply transforms, and accumulate output
+    4. Use online softmax for numerical stability
+
+Features:
+    - GQA/MQA support via head broadcasting
+    - Causal and sliding window masking
+    - Segment-based masking for packed sequences
+    - Logit soft capping (tanh-based)
+    - Dropout with reproducible PRNG key handling
+    - Configurable precision for matmul operations
+
+Note:
+    This implementation prioritizes correctness and compatibility over
+    maximum performance. For TPU-optimized kernels, see the Pallas
+    implementations in ejkernel.kernels._pallas.
+"""
 
 import chex
 import jax

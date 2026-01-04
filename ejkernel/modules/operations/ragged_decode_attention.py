@@ -206,13 +206,33 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         )
 
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]):
-        """GPU/Triton candidates for ragged decode attention (bigger blocks + higher warps).
+        """Generate candidate configurations for autotuning on GPU (Pallas backend).
 
-        - Explores kv_blocksize up to 256 (when split_len allows)
-        - Tries blocksize_heads in {4, 8, 16} if grouped-heads permit
-        - Warps up to 8 (depending on kv_block/head_dim)
-        - Stages in {1, 2, 3} (kept low; smem-guarded)
-        - Prefers split_len near {128, 256, 512}; ensures split_len % kv_blocksize == 0
+        Produces GPU-optimized configurations for ragged decode attention with
+        larger block sizes and higher warp counts. The heuristics balance shared
+        memory usage with parallelism for efficient GPU execution.
+
+        Configuration Space:
+            - kv_blocksize: Up to 256 (when split_len allows)
+            - blocksize_heads: {4, 8, 16} if grouped-heads permit
+            - num_warps: Up to 8 (depending on kv_block/head_dim)
+            - num_stages: {1, 2, 3} (kept low; smem-guarded)
+            - split_len: Prefers {128, 256, 512}; ensures split_len % kv_blocksize == 0
+
+        Args:
+            inv: Invocation object containing input tensors (query, key, value)
+                and metadata. Used to determine optimal block sizes based on
+                sequence length, head dimensions, and grouped query attention ratio.
+
+        Returns:
+            List of RaggedDecodeAttentionConfig objects optimized for GPU execution.
+            Each configuration specifies blocksize_heads, num_key_splits, kv_blocksize,
+            num_warps, and num_stages parameters.
+
+        Note:
+            Shared memory usage is estimated and configurations exceeding the limit
+            (default 99KB, configurable via EJKERNEL_TRITON_SMEM_LIMIT) are filtered.
+            Maximum candidates controlled by EJKERNEL_RDA_MAX_CANDIDATES (default 32).
         """
         q = inv.kwargs["query"]
         k = inv.kwargs["key"]

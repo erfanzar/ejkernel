@@ -13,6 +13,69 @@
 # limitations under the License.
 
 
+"""Ragged Paged Attention V3 for TPU with KV cache write and quantization support.
+
+This module provides the third generation of ragged paged attention for TPU,
+featuring simultaneous KV cache updates during attention computation. Unlike
+v2 which only reads from the KV cache, v3 can write new keys and values while
+computing attention, enabling true continuous batching.
+
+Ragged paged attention v3 is essential for:
+1. Single-pass prefill with KV cache population
+2. Continuous batching with online KV cache updates
+3. Quantized inference with scaling factors
+4. Optimized kernels for different head dimensions (64 and 128)
+
+Key Features:
+    - KV cache write: Updates cache during attention computation
+    - Dual head dimension support: Optimized kernels for head_dim=64 and 128
+    - Quantization support: q_scale, k_scale, v_scale for quantized inference
+    - Distribution tensor: Dynamic batch composition information
+    - Chunked prefill: Configurable prefill chunk sizes
+    - Attention sinks: Streaming inference support
+    - Sliding window: Local attention for long sequences
+
+Improvements over V2:
+    - Simultaneous attention compute and KV cache write
+    - Separate key/value inputs for new tokens
+    - Distribution tensor for dynamic workload balancing
+    - Better support for quantized models
+    - Specialized kernels for head_dim=64 vs 128
+
+Data Layout:
+    - queries: New query tokens [total_tokens, num_q_heads, head_dim]
+    - keys: New key tokens [total_tokens, num_kv_heads, head_dim]
+    - values: New value tokens [total_tokens, num_kv_heads, head_dim]
+    - kv_cache: Existing cache [num_pages, page_size, num_kv_heads*2/packing, packing, head_dim]
+    - distribution: Batch composition info [3] (prefill/decode/total counts)
+
+Returns:
+    Tuple of:
+        - Attention output [total_tokens, num_q_heads, head_dim]
+        - Updated KV cache with new tokens written
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.ragged_page_attention_v3 import ragged_page_attention_v3
+    >>>
+    >>> # Process new tokens and update cache
+    >>> total_tokens = 22
+    >>> num_heads, head_dim = 32, 128
+    >>>
+    >>> queries = jnp.ones((total_tokens, num_heads, head_dim))
+    >>> keys = jnp.ones((total_tokens, num_heads, head_dim))
+    >>> values = jnp.ones((total_tokens, num_heads, head_dim))
+    >>> kv_cache = jnp.ones((256, 16, num_heads, 2, head_dim))
+    >>> kv_lens = jnp.array([100, 200, 50, 150])
+    >>> block_tables = jnp.zeros((64,), dtype=jnp.int32)
+    >>> query_start_loc = jnp.array([0, 10, 20, 21, 22])
+    >>> distribution = jnp.array([2, 2, 4])  # 2 prefill, 2 decode, 4 total
+    >>>
+    >>> output, updated_cache = ragged_page_attention_v3(
+    ...     queries, keys, values, kv_cache, kv_lens, block_tables, query_start_loc, distribution
+    ... )
+"""
+
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Float, Int32
@@ -49,29 +112,51 @@ def ragged_page_attention_v3(
     Float[Array, "total_tokens num_q_heads head_dim"],
     Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
 ]:
-    """Ragged paged attention that supports mixed prefill and decode.
+    """Ragged paged attention with KV cache write for mixed prefill and decode.
+
+    This kernel processes queries, keys, and values together, simultaneously
+    computing attention and updating the KV cache. This enables single-pass
+    prefill operations and efficient continuous batching.
 
     Args:
-      queries: concatenated all sequences' queries.
-      kv_pages: paged KV cache. Normally in HBM.
-      context_lens: padded kv lengths. Only the first num_seqs values are valid.
-      block_tables: the first index indicates which page to use in the kv cache
-        for each sequence. Only the first num_seqs values are valid.
-      query_start_loc: the cumulative sum of the effective query lengths. Similar to
-        context_lens, only the first num_seqs+1 values are valid.
-      num_seqs: the dynamic number of sequences.
-      softmax_scale: the softmax softmax_scale which will be applied to the Q@K^T.
-      sliding_window: the sliding window size for the attention.
-      logits_soft_cap: the logit soft cap for the attention.
-      mask_value: mask value for causal mask.
-      num_kv_pages_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-      num_queries_per_block: number of kv pages to be processed in one flash
-        attention block in the pallas kernel.
-      vmem_limit_bytes: the vmem limit for the pallas kernel.
+        queries: Concatenated query tokens [total_tokens, num_q_heads, head_dim].
+        keys: Concatenated key tokens [total_tokens, num_kv_heads, head_dim]
+            to be written to cache and used for attention.
+        values: Concatenated value tokens [total_tokens, num_kv_heads, head_dim]
+            to be written to cache and used for attention.
+        kv_cache: Existing KV cache [num_pages, page_size, num_kv_heads*2/packing,
+            packing, head_dim]. Keys and values are stored with packing factor.
+        kv_lens: KV context lengths per sequence [max_num_seqs]. Specifies the
+            existing KV length for each sequence before this operation.
+        block_tables: Flattened page table [max_num_seqs * pages_per_seq]. Maps
+            logical pages to physical page indices.
+        query_start_loc: Cumulative query positions [max_num_seqs+1]. Position i
+            gives the starting index in queries for sequence i.
+        distribution: Batch composition info [3] containing:
+            - [0]: Number of prefill sequences
+            - [1]: Number of decode sequences
+            - [2]: Total number of sequences
+        softmax_aux: Optional attention sink logits [num_q_heads] for streaming.
+        softmax_scale: Scaling factor for QK^T (default: 1/sqrt(head_dim)).
+        sliding_window: Size of sliding window for local attention.
+        logits_soft_cap: Optional soft cap value for attention logits.
+        q_scale: Quantization scale for queries (for quantized models).
+        k_scale: Quantization scale for keys (for quantized models).
+        v_scale: Quantization scale for values (for quantized models).
+        chunk_prefill_size: Chunk size for prefill processing.
+        num_kv_pages_per_block: Number of KV pages per compute block in kernel.
+        num_queries_per_block: Number of queries per compute block in kernel.
+        vmem_limit_bytes: VMEM budget limit for the Pallas kernel.
 
     Returns:
-      The output of the attention.
+        Tuple of:
+            - Attention output [total_tokens, num_q_heads, head_dim]
+            - Updated KV cache with new keys/values written
+
+    Note:
+        - Automatically selects optimized kernel based on head_dim (64 or 128)
+        - New keys and values are written to cache at positions [kv_lens[i]:kv_lens[i]+num_new_tokens]
+        - Supports quantized inference via q_scale, k_scale, v_scale parameters
     """
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5

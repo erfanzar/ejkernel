@@ -12,6 +12,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged Paged Attention V3 TPU kernel for head_dim=64 using Pallas.
+
+This module provides a specialized implementation of the ragged paged attention
+V3 kernel optimized for models with head_dim=64. This is a common configuration
+in transformer models like GPT-2, and this kernel takes advantage of the smaller
+head dimension for improved memory efficiency and performance.
+
+Algorithm Overview:
+    1. Merged K/V representation: Keys and values are concatenated along the
+       head dimension (K,V -> 128-dim) for efficient memory layout
+    2. Mixed operation batching: Handles decode-only, prefill-only, and mixed
+       sequences within a single kernel invocation
+    3. Double-buffered async DMA: Overlaps memory transfers with computation
+    4. In-place KV cache updates: Updates cache during prefill operations
+    5. Optimized tiling: Special block sizes tuned for 64-dim heads
+
+Key Features:
+    - head_dim=64 optimization: Memory layout concatenates K and V to form
+      128-dim vectors, matching TPU tile sizes perfectly
+    - Mixed prefill/decode: Single kernel handles both operation types
+    - Chunked prefill: Processes prefill tokens in configurable chunk sizes
+    - Sliding window attention: Optional window-based masking for long sequences
+    - Quantization support: Optional q_scale, k_scale, v_scale parameters
+    - Attention sinks: Optional softmax auxiliary logits for streaming
+
+Memory Layout (head_dim=64 specific):
+    - KV cache: [total_pages, page_size, num_kv_heads // packing, packing, 128]
+      where the last dimension is K(64) + V(64) concatenated
+    - Queries: [num_kv_heads, max_tokens, num_q_per_kv // packing, packing, 64]
+
+Performance Considerations:
+    - The 64->128 dimension packing enables efficient use of 128-wide TPU MXU
+    - Reduced VMEM footprint compared to head_dim=128 variant
+    - Tuned block sizes in _utils.py via get_tuned_block_sizes_h64()
+
+Example:
+    >>> # Attention for GPT-2 style model (head_dim=64)
+    >>> output, updated_cache = ragged_paged_attention_hd64(
+    ...     queries=q,                        # [tokens, 12, 64]
+    ...     keys=k,                           # [tokens, 12, 64]
+    ...     values=v,                         # [tokens, 12, 64]
+    ...     kv_cache=cache,                   # Paged, K/V concatenated to 128
+    ...     kv_lens=seq_lens,
+    ...     block_tables=page_indices,
+    ...     query_start_loc=cu_q_lens,
+    ...     distribution=jnp.array([1, 2, 3]),
+    ...     softmax_scale=1.0 / sqrt(64),
+    ... )
+
+Note:
+    This kernel requires head_dim=64 and will assert if called with other
+    dimensions. For head_dim=128 or larger, use the standard _pallas_impl_fwd.py
+    implementation. The K/V concatenation to 128 dimensions is handled
+    internally by the merge_kv function.
+"""
 
 import functools
 

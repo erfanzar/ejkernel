@@ -13,7 +13,42 @@
 # limitations under the License.
 
 
-"""Implementation of Sparse Flash Attention, a.k.a. "Splash" attention."""
+"""Implementation of Sparse Flash Attention (Splash Attention) for TPU.
+
+This module provides an optimized block-sparse attention implementation for
+Google TPUs using the Pallas kernel framework. Splash Attention extends
+Flash Attention to support arbitrary sparsity patterns defined by block masks.
+
+Splash Attention achieves efficiency by:
+1. Pre-computing which blocks have all-zeros, all-ones, or partial masks
+2. Skipping computation for fully-masked blocks entirely
+3. Using efficient Pallas kernels for partial blocks
+4. Leveraging TPU MXU for dense block operations
+
+Key features:
+- Arbitrary block-sparse attention patterns via Mask objects
+- Multi-head and multi-query attention support
+- Segment IDs for packed sequence masking
+- Attention sinks for StreamingLLM-style decoding
+- Logits soft capping for numerical stability
+- Custom VJP for efficient gradient computation
+
+Architecture:
+- Forward pass computes attention with block-level sparsity
+- dQ/dKV backward passes handle gradient computation
+- MaskInfo preprocessing identifies block types at trace time
+
+Example:
+    >>> from ejkernel.kernels._pallas.tpu.blocksparse_attention import (
+    ...     splash_attention, BlockSizes, CausalMask
+    ... )
+    >>> mask = CausalMask((seq_len, seq_len))
+    >>> output = splash_attention(
+    ...     q, k, v, mask=mask,
+    ...     block_sizes=BlockSizes.get_default(),
+    ...     is_mqa=False
+    ... )
+"""
 
 from __future__ import annotations
 

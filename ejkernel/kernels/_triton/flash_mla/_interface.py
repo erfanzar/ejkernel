@@ -12,11 +12,69 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Triton interface for Flash Multi-head Latent Attention (MLA).
+"""Flash Multi-head Latent Attention (MLA) interface for Triton.
 
-The Triton implementation is currently not available in this repo. This file
-exists to reserve the kernel signature and registry entry, so the operations
-layer can select consistent implementations across backends.
+This module provides the interface for Flash Multi-head Latent Attention (MLA),
+an efficient attention mechanism that uses low-rank key-value projections to
+reduce the memory footprint of the KV cache during inference.
+
+MLA Architecture:
+-----------------
+MLA factorizes the key and value projections through a shared low-rank latent
+representation, significantly reducing KV cache memory requirements:
+
+Standard Attention KV cache: O(batch * seq * num_heads * head_dim)
+MLA KV cache: O(batch * seq * kv_lora_rank)
+
+The key insight is that keys and values are projected through a shared
+compressed representation:
+    latent = W_down @ hidden_states  # Compress to low rank
+    keys = W_kc @ latent              # Expand to key space
+    values = W_vc @ latent            # Expand to value space
+
+Additionally, MLA supports Rotary Position Embeddings (RoPE) through separate
+"rope" components (b_q, b_k) that are added to a portion of the query/key
+dimensions.
+
+Key Benefits:
+-------------
+1. **Reduced KV cache**: Up to 90% reduction in KV cache memory
+2. **Efficient inference**: Faster decoding with smaller memory footprint
+3. **RoPE support**: Compatible with rotary position embeddings
+4. **Maintained quality**: Low-rank approximation preserves model quality
+
+Key components:
+- query: Full query tensor with all heads
+- key_value: Compressed latent representation (shared for K and V)
+- w_kc: Key decompression weights
+- w_vc: Value decompression weights
+- b_q: Optional RoPE query bias component
+- b_k: Optional RoPE key bias component
+
+Note:
+    The Triton GPU implementation is not yet available. This file serves as a
+    placeholder to reserve the kernel signature and registry entry, ensuring
+    consistent API across backends.
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._triton.flash_mla import flash_mla
+    >>>
+    >>> batch, seq_len, q_heads, kv_heads = 2, 1024, 32, 8
+    >>> q_head_dim, kv_lora_rank = 128, 512
+    >>> qk_nope_head_dim, qk_rope_head_dim, v_head_dim = 96, 32, 128
+    >>>
+    >>> query = jnp.ones((batch, seq_len, q_heads, q_head_dim))
+    >>> key_value = jnp.ones((batch, seq_len, kv_lora_rank))
+    >>> w_kc = jnp.ones((kv_lora_rank, kv_heads, qk_nope_head_dim))
+    >>> w_vc = jnp.ones((kv_lora_rank, kv_heads, v_head_dim))
+    >>>
+    >>> # Note: This will raise NotImplementedError until implemented
+    >>> # output = flash_mla(query, key_value, w_kc, w_vc)
+
+Reference:
+    DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts LLM
+    https://arxiv.org/abs/2405.04434
 """
 
 import jaxtyping
@@ -39,4 +97,41 @@ def flash_mla(
     causal: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
+    """Flash Multi-head Latent Attention (Triton GPU implementation placeholder).
+
+    Computes attention using low-rank key-value decomposition for memory-efficient
+    inference. Keys and values are reconstructed from a shared compressed latent
+    representation, reducing KV cache memory requirements.
+
+    The attention computation:
+        K = w_kc @ key_value + [b_k if provided]
+        V = w_vc @ key_value
+        output = softmax(Q @ K^T / scale) @ V
+
+    Args:
+        query: Query tensor of shape `[batch, seq_len, q_heads, q_head_dim]`.
+            The full query representation with all attention heads.
+        key_value: Compressed key-value latent of shape `[batch, seq_len, kv_lora_rank]`.
+            This shared representation is decompressed into separate keys and values.
+        w_kc: Key decompression weights of shape `[kv_lora_rank, kv_heads, qk_nope_head_dim]`.
+            Projects the latent representation to key space (non-RoPE portion).
+        w_vc: Value decompression weights of shape `[kv_lora_rank, kv_heads, v_head_dim]`.
+            Projects the latent representation to value space.
+        b_q: Optional RoPE query bias of shape `[batch, seq_len, qk_rope_head_dim]`.
+            Added to the RoPE portion of queries for position encoding.
+        b_k: Optional RoPE key bias of shape `[batch, seq_len, qk_rope_head_dim]`.
+            Added to the RoPE portion of keys for position encoding.
+        softmax_scale: Scaling factor for attention scores. If None, defaults
+            to `1 / sqrt(q_head_dim)`.
+        causal: If True, applies causal masking to prevent attending to future tokens.
+        cu_seqlens: Cumulative sequence lengths for variable-length batching.
+            Shape `[num_seqs + 1]` where each entry marks sequence boundaries.
+
+    Returns:
+        Attention output of shape `[batch, seq_len, q_heads, v_head_dim]`.
+
+    Raises:
+        NotImplementedError: This Triton kernel is not yet implemented.
+            Use the XLA backend implementation instead.
+    """
     raise NotImplementedError("flash_mla Triton kernel not yet implemented")

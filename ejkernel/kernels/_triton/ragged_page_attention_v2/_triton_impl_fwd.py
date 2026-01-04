@@ -12,6 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged paged attention v2 with combined KV pages for Triton.
+
+This module implements paged attention for variable-length sequences
+where keys and values are stored in interleaved format within pages.
+Supports both prefill and decode phases with packed query tensors.
+
+Kernel Variants:
+---------------
+_ragged_paged_attn_fwd:
+    Token-level kernel processing BLOCK_M queries at a time.
+    Iterates over all sequences, computing attention for tokens
+    belonging to each sequence based on cumulative query lengths.
+
+_ragged_paged_attn_qblock_fwd:
+    Query-block level kernel using binary search to find sequence
+    boundaries. More efficient for workloads with many sequences.
+
+Memory Layout:
+-------------
+- Queries: [total_tokens, num_q_heads, head_dim] (packed)
+- KV Pages: [num_pages, page_size, 2*num_kv_heads, head_dim]
+  Keys and values are interleaved: pages[..., 2*h, :] = keys,
+                                   pages[..., 2*h+1, :] = values
+- Block Tables: [num_seqs, pages_per_seq] mapping to physical pages
+- Context Lens: [num_seqs] full KV lengths including context
+- Query Start Loc: [num_seqs + 1] cumulative query positions
+
+Key Features:
+- Interleaved KV storage for better memory locality
+- Causal masking with optional sliding window
+- Logit soft-capping for numerical stability
+- GQA/MQA support via NUM_REPEATS
+- Optional LSE computation for gradient checkpointing
+
+Functions:
+- _ragged_paged_attn_fwd: Token-level forward kernel
+- _ragged_paged_attn_qblock_fwd: Block-level forward kernel
+- ragged_paged_attention_triton_call: Main entry point (token-level)
+- ragged_paged_attention_triton_call_qblock: Block-level entry point
+"""
 
 import math
 

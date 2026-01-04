@@ -450,10 +450,29 @@ class Executor(Generic[Cfg, Out]):
         return self.chooser.choose(inv, kernel)
 
     def _choose_heuristics_only(self, inv: Invocation[Cfg, Out], kernel: Kernel[Cfg, Out]) -> Cfg:
-        """Fast path: overlay -> memory cache -> persistent -> heuristics.
+        """Select configuration using fast heuristics path without autotuning.
 
-        Never calls the full selector.choose and never autotunes.
-        Writes back the chosen config to memory/persistent caches if needed.
+        This method provides a fast configuration selection path that bypasses
+        the full autotuning system. It checks caches in the following order:
+        1. Cache overlay (temporary overrides)
+        2. In-memory cache
+        3. Persistent cache
+        4. Kernel heuristics (fallback)
+
+        This is used when the policy is set to use heuristics-only on cache miss,
+        avoiding expensive autotuning operations in production scenarios.
+
+        Args:
+            inv: Invocation object containing operation arguments and metadata
+            kernel: Kernel implementation requiring configuration
+
+        Returns:
+            Configuration selected from cache or computed via heuristics
+
+        Note:
+            Unlike the full selector.choose path, this method never triggers
+            autotuning. Selected configurations are written back to caches
+            for future use.
         """
         dev = device_fingerprint()
         op_id_v = f"{kernel.op_id}@v{getattr(kernel, 'version', '0')}"

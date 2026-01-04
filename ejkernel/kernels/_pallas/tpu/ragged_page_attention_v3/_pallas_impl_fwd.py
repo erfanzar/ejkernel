@@ -12,6 +12,69 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ragged Paged Attention V3 TPU kernel implementation using Pallas.
+
+This module provides an advanced ragged paged attention implementation for
+Google TPUs, supporting mixed prefill and decode operations with optimized
+KV cache management. Version 3 introduces enhanced features for production
+inference workloads including sliding window attention and quantized KV cache.
+
+Algorithm Overview:
+    1. Mixed operation batching: Efficiently handles decode-only, prefill-only,
+       and mixed sequences within a single kernel invocation
+    2. Distribution-based scheduling: Uses a 3-tuple (decode_end, prefill_end,
+       mixed_end) to partition sequences by operation type
+    3. Double-buffered async DMA: Overlaps KV cache reads, query fetches, and
+       output writes with computation
+    4. In-place KV cache updates: Merges new K/V values directly into the
+       paged cache during prefill operations
+    5. Quantization support: Optional q_scale, k_scale, v_scale for INT8/FP8
+       quantized inference
+
+Key Features:
+    - Mixed prefill/decode: Single kernel handles both operation types with
+      optimized code paths for each
+    - Chunked prefill: Processes prefill tokens in configurable chunk sizes
+      for memory efficiency
+    - Sliding window attention: Optional window-based masking for efficiency
+      on long sequences
+    - Attention sinks: Optional softmax auxiliary logits for streaming patterns
+    - Logit soft capping: tanh-based capping for numerical stability
+    - Quantized KV cache: Supports scaled quantization with separate k/v scales
+    - Efficient memory layout: TPU-optimized packed tensor formats with
+      dtype-specific packing factors
+
+Memory Layout:
+    - Queries: [num_kv_heads, max_tokens, num_q_per_kv // packing, packing, head_dim]
+    - KV cache: [total_pages, page_size, num_kv_heads_x2 // packing, packing, head_dim]
+    - Distribution: [3] containing (decode_end, prefill_end, mixed_end) indices
+
+Kernel Grid:
+    - Single dimension over sequences: grid = (num_seqs,)
+    - Each program instance processes one complete sequence
+    - Sequences are partitioned by type based on distribution array
+
+Example:
+    >>> # Mixed prefill and decode batch
+    >>> output, updated_cache = ragged_paged_attention(
+    ...     queries=q,                        # [max_tokens, num_q_heads, head_dim]
+    ...     keys=k,                           # [max_tokens, num_kv_heads, head_dim]
+    ...     values=v,                         # [max_tokens, num_kv_heads, head_dim]
+    ...     kv_cache=cache,                   # Paged KV cache
+    ...     kv_lens=jnp.array([128, 256, 1]), # Sequence lengths
+    ...     block_tables=page_indices,        # Page lookup table
+    ...     query_start_loc=jnp.array([0, 1, 33, 34]),  # Cumulative
+    ...     distribution=jnp.array([1, 2, 3]),  # 1 decode, 1 prefill, 1 mixed
+    ...     softmax_scale=1.0 / sqrt(head_dim),
+    ...     chunk_prefill_size=32,
+    ... )
+
+Note:
+    This kernel requires TPU v4 or later. For head_dim=64, use the specialized
+    _pallas_impl_fwd_h64.py implementation which has optimizations for smaller
+    head dimensions. The kernel automatically manages KV cache updates during
+    prefill, writing new tokens to the appropriate pages.
+"""
 
 import functools
 

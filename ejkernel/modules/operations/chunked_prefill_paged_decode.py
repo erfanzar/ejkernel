@@ -14,8 +14,39 @@
 
 """Chunked prefill + paged decode module with automatic platform selection.
 
-This operation updates a block-tabled KV cache with packed `keys`/`values` and
-then runs causal unified paged attention over the updated cache.
+This module implements a fused operation that combines KV cache updates with
+causal paged attention in a single pass, optimized for LLM serving workloads.
+It updates a block-tabled KV cache with packed keys/values and computes
+attention outputs simultaneously.
+
+Key Features:
+    - Fused KV cache update and attention computation
+    - Block-tabled (paged) memory for efficient KV cache management
+    - Support for variable-length sequences via packed tensor format
+    - Causal masking for autoregressive generation
+    - Sliding window attention for long contexts
+    - Optional ALiBi positional bias support
+    - Logit soft capping for numerical stability
+
+Use Cases:
+    - LLM inference serving with dynamic batching
+    - Combined prefill and decode phases in a single operation
+    - Memory-efficient serving with paged KV cache
+    - Variable-length sequence processing without padding
+
+Memory Layout:
+    Queries/Keys/Values: Packed format [total_tokens, num_heads, head_dim]
+    KV Cache: Block-tabled format [num_blocks, block_size, num_heads, head_dim]
+    Block Tables: Logical to physical mapping [num_seqs, max_blocks_per_seq]
+
+The operation flow:
+    1. Insert new keys/values into the block-tabled cache at appropriate positions
+    2. Compute causal attention over the updated cache for each query
+    3. Return attention outputs along with the updated cache
+
+References:
+    - PagedAttention (vLLM): https://arxiv.org/abs/2309.06180
+    - FlashAttention: https://arxiv.org/abs/2205.14135
 """
 
 from __future__ import annotations

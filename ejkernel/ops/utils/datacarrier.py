@@ -37,7 +37,29 @@ from dataclasses import dataclass
 
 
 def get_safe_hash_int(text, algorithm="md5"):
-    """Generate a hash of text using specified algorithm with safety checks."""
+    """Generate an integer hash of text using the specified algorithm.
+
+    Converts any input to a string and computes a hash using the specified
+    algorithm from the hashlib module. The hash digest is then converted
+    to a big-endian integer.
+
+    Args:
+        text: Input to hash (will be converted to string)
+        algorithm: Hash algorithm name from hashlib (default: "md5")
+
+    Returns:
+        Integer representation of the hash digest
+
+    Raises:
+        ValueError: If the specified algorithm is not supported by hashlib
+        Exception: If any other error occurs during hash generation
+
+    Example:
+        >>> get_safe_hash_int("test_string")
+        123456789012345678901234567890
+        >>> get_safe_hash_int("test", algorithm="sha256")
+        987654321098765432109876543210
+    """
     try:
         text_str = str(text)
         hash_object = getattr(hashlib, algorithm)(text_str.encode())
@@ -49,7 +71,26 @@ def get_safe_hash_int(text, algorithm="md5"):
 
 
 def hash_fn(self) -> int:
-    """Generate a hash for an object based on its dictionary values."""
+    """Generate a hash for an object based on its dictionary values.
+
+    Creates a deterministic hash by concatenating string representations
+    of all hashable-type values in the object's __dict__ attribute.
+    Only includes values that are float, int, bool, dict, or list types.
+
+    This function is designed to be used as a __hash__ method replacement
+    for dataclasses that need consistent hashing for configuration caching.
+
+    Args:
+        self: Object instance with __dict__ attribute containing configuration
+
+    Returns:
+        Integer hash value derived from the object's attribute values
+
+    Note:
+        Only primitive types (float, int, bool) and collections (dict, list)
+        are included in the hash. Other types (e.g., None, str, objects) are
+        excluded to ensure stable hashing across different configurations.
+    """
     shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
     return get_safe_hash_int(shu)
 

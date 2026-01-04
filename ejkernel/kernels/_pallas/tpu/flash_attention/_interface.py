@@ -13,6 +13,65 @@
 # limitations under the License.
 
 
+"""Flash Attention implementation using Pallas TPU kernels.
+
+This module provides a TPU-optimized implementation of Flash Attention using
+JAX's Pallas library with Mosaic backend. Flash Attention is an IO-aware exact
+attention algorithm that reduces memory usage from O(N²) to O(N) through tiling
+and recomputation strategies.
+
+The TPU implementation leverages the high-bandwidth memory (HBM) and on-chip
+vector memory (VMEM) hierarchy to maximize throughput. Unlike the Triton GPU
+implementation, this version is specifically optimized for TPU's systolic
+array architecture and memory system.
+
+Key advantages over standard attention on TPU:
+1. Subquadratic memory: O(N) instead of O(N²) for sequence length N
+2. Efficient VMEM utilization: Minimizes HBM-VMEM data movement
+3. Exact attention: No approximation, produces identical results to standard attention
+4. Better scaling: Enables processing of much longer sequences on TPU
+
+Algorithm overview:
+- Query and key-value sequences are split into blocks matching TPU tile sizes
+- Attention is computed block-by-block using online softmax
+- Partial results are accumulated incrementally in VMEM
+- No full attention matrix is ever materialized in HBM
+
+Supported features:
+- Causal and non-causal attention
+- Attention bias and segment-based masking
+- Sliding window attention for local patterns
+- Grouped-query attention (GQA) and multi-query attention (MQA)
+- Logits soft capping for numerical stability
+
+TPU-specific limitations:
+- Variable-length sequences (cu_seqlens) are not supported
+- Dropout is not supported (TPU-specific optimization)
+- Attention sinks (softmax_aux) are not supported
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from ejkernel.kernels._pallas.tpu.flash_attention import flash_attention
+    >>>
+    >>> batch, seq_len, num_heads, head_dim = 2, 2048, 12, 64
+    >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
+    >>>
+    >>> # Basic attention
+    >>> output = flash_attention(q, k, v)
+    >>>
+    >>> # Causal attention for autoregressive models
+    >>> output = flash_attention(q, k, v, causal=True)
+    >>>
+    >>> # Sliding window attention
+    >>> output = flash_attention(q, k, v, sliding_window=512)
+
+Reference:
+    FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness
+    https://arxiv.org/abs/2205.14135
+"""
+
 import functools
 
 import jax
@@ -72,7 +131,55 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-):
+) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+    """Compute flash attention on TPU using Pallas kernels.
+
+    Flash Attention is a memory-efficient and fast implementation of exact
+    attention that uses tiling and recomputation to reduce memory usage
+    from O(N²) to O(N) where N is sequence length. This TPU implementation
+    uses Pallas with Mosaic backend for optimal performance.
+
+    Args:
+        query: Query tensor of shape [batch, seq_len_q, num_heads, head_dim].
+        key: Key tensor of shape [batch, seq_len_k, num_kv_heads, head_dim].
+        value: Value tensor of shape [batch, seq_len_k, num_kv_heads, head_dim].
+        attention_mask: Optional attention mask. If provided without segment IDs,
+            it will be converted to segment IDs internally.
+        bias: Attention bias tensor of shape [batch, num_heads, seq_len_q, seq_len_k].
+        softmax_scale: Scaling factor for QK^T (default: 1/sqrt(head_dim)).
+        dropout_prob: Dropout probability (not supported on TPU, ignored).
+        causal: Whether to apply causal masking for autoregressive models.
+        dropout_seed: Random seed for dropout (not supported on TPU, ignored).
+        cum_seqlens_q: Cumulative sequence lengths for queries (not supported on TPU).
+        cum_seqlens_k: Cumulative sequence lengths for keys (not supported on TPU).
+        sliding_window: Size of local attention window as int or (left, right) tuple.
+        fwd_params: Forward pass block size configuration (FwdParams).
+        bwd_params: Backward pass block size configuration (BwdParams).
+        logits_soft_cap: Optional soft cap value for attention logits (e.g., 20.0).
+        softmax_aux: Attention sink logits (not supported on TPU).
+        normalize_output: Whether to normalize output (ignored on TPU).
+        precision: Matrix multiplication precision (ignored on TPU).
+        logits_dtype: Dtype for logits computation (ignored on TPU).
+        q_segment_ids: Segment IDs for queries [batch, seq_len_q] for cross-segment masking.
+        kv_segment_ids: Segment IDs for keys/values [batch, seq_len_k] for cross-segment masking.
+
+    Returns:
+        Attention output tensor with shape [batch, seq_len_q, num_heads, head_dim].
+
+    Raises:
+        NotImplementedError: If cum_seqlens_q, cum_seqlens_k, or softmax_aux are provided.
+        ValueError: If sliding_window values are negative or logits_soft_cap <= 0.
+
+    Example:
+        >>> # Causal attention for transformer decoder
+        >>> out = flash_attention(query, key, value, causal=True)
+        >>>
+        >>> # Sliding window attention for efficient long sequences
+        >>> out = flash_attention(query, key, value, sliding_window=512)
+        >>>
+        >>> # With logits soft capping (e.g., Gemma models)
+        >>> out = flash_attention(query, key, value, logits_soft_cap=20.0)
+    """
     del normalize_output, precision, logits_dtype, dropout_prob, dropout_seed
 
     if cum_seqlens_q is not None:
@@ -200,6 +307,33 @@ def _flash_attention(
     sliding_window,
     logits_soft_cap,
 ):
+    """Internal flash attention with custom VJP for gradient computation.
+
+    This is the core implementation that handles the actual attention computation
+    with custom forward and backward passes for efficient gradient computation.
+    The function is decorated with custom_vjp to define explicit forward and
+    backward implementations.
+
+    Args:
+        query: Query tensor [batch, num_heads, seq_len_q, head_dim] (transposed layout).
+        key: Key tensor [batch, num_heads, seq_len_k, head_dim] (transposed layout).
+        value: Value tensor [batch, num_heads, seq_len_k, head_dim] (transposed layout).
+        ab: Optional attention bias tensor.
+        segment_ids: Optional SegmentIds for cross-segment masking.
+        save_residuals: Whether to save residuals for backward pass.
+        causal: Whether to apply causal masking.
+        softmax_scale: Scaling factor for attention logits.
+        block_sizes: BlockSizes configuration for tiling.
+        sliding_window: Optional sliding window size tuple (left, right).
+        logits_soft_cap: Optional soft cap for logits.
+
+    Returns:
+        Attention output tensor [batch, num_heads, seq_len_q, head_dim].
+
+    Note:
+        This function expects inputs in transposed layout [batch, num_heads, seq_len, head_dim]
+        rather than the public API layout [batch, seq_len, num_heads, head_dim].
+    """
     return _flash_attention_impl(
         q=query,
         k=key,

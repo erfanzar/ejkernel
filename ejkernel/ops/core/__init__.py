@@ -19,15 +19,37 @@ This module provides the fundamental building blocks for implementing JAX operat
 with automatic configuration management and performance optimization.
 
 Classes:
-    Kernel: Abstract base class for implementing custom operations
-    Invocation: Represents a specific call to a kernel with arguments and metadata
+    Kernel: Abstract base class for implementing custom operations with configuration
+        management, autotuning support, and optional custom gradient implementations.
+        Supports platform-specific and context-specific method dispatch.
+    Invocation: Represents a specific call to a kernel with arguments, metadata,
+        and execution context (standard, shard_map, etc.). Provides cache key
+        generation for configuration lookups.
 
 Type Variables:
-    Cfg: Configuration type parameter for kernels
-    Out: Output type parameter for kernels
+    Cfg: Configuration type parameter for kernels. Can be any type (dataclass,
+        dict, NamedTuple, etc.) that specifies how the operation should execute.
+    Out: Output type parameter for kernels. Can be any type (JAX arrays, tuples,
+        nested structures) that the operation returns.
 
 Functions:
-    _has_custom_vjp: Utility to detect custom VJP implementations
+    _has_custom_vjp: Utility to detect if a kernel has implemented custom VJP
+        (vector-Jacobian product) methods for gradient computation. Supports
+        checking for context-specific and platform-specific implementations.
+    _get_platform_method: Utility to retrieve the most specific method implementation
+        for a given platform and/or execution context, following the priority chain:
+        composite ({method}_{context}_{platform}) > context ({method}_{context}) >
+        platform ({method}_{platform}) > generic ({method}).
+
+Example:
+    >>> from ejkernel.ops.core import Kernel, Invocation, Cfg, Out
+    >>>
+    >>> class MyKernel(Kernel[dict, jax.Array]):
+    ...     def run(self, x, cfg: dict) -> jax.Array:
+    ...         return x * cfg['scale']
+    ...
+    ...     def heuristic_cfg(self, inv: Invocation) -> dict:
+    ...         return {'scale': 1.0}
 """
 
 from .kernel import Invocation, Kernel, _get_platform_method, _has_custom_vjp
