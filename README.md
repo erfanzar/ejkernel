@@ -9,6 +9,10 @@
 
 ejKernel is a production-grade kernel library for JAX that provides highly optimized implementations of deep learning operations with automatic multi-backend support. The library features a sophisticated configuration management system with autotuning, comprehensive type safety, and seamless execution across GPUs, TPUs, and CPUs.
 
+> [!NOTE]
+> eJkernel contains **no AI-generated code**. All kernels, modules, and core logic are manually designed and implemented by human developers.
+> AI tooling (Opus 4.5) is used **exclusively for documentation**, which may therefore contain minor inaccuracies. There is no “vibe coding” or automated code generation anywhere in the codebase.
+
 ## Table of Contents
 
 - [Key Features](#key-features)
@@ -22,6 +26,7 @@ ejKernel is a production-grade kernel library for JAX that provides highly optim
 - [Contributing](#contributing)
 - [Citation](#citation)
 - [License](#license)
+
 
 ## Key Features
 
