@@ -131,6 +131,7 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    block_tables: Int[Array, "batch max_blocks"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention on TPU using Pallas kernels.
 
@@ -160,6 +161,8 @@ def flash_attention(
         normalize_output: Whether to normalize output (ignored on TPU).
         precision: Matrix multiplication precision (ignored on TPU).
         logits_dtype: Dtype for logits computation (ignored on TPU).
+        block_tables: Optional paged-KV block table of shape
+            ``(batch, max_blocks)``. Unsupported on the TPU backend.
         q_segment_ids: Segment IDs for queries [batch, seq_len_q] for cross-segment masking.
         kv_segment_ids: Segment IDs for keys/values [batch, seq_len_k] for cross-segment masking.
 
@@ -182,6 +185,8 @@ def flash_attention(
     """
     del normalize_output, precision, logits_dtype, dropout_prob, dropout_seed
 
+    if block_tables is not None:
+        raise ValueError("paged_kv is only supported by the CUDA flash attention backend.")
     if cum_seqlens_q is not None:
         raise NotImplementedError("Variable-length sequences (cum_seqlens_q) are not supported on TPU")
     if cum_seqlens_k is not None:

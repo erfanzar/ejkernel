@@ -85,4 +85,3 @@ def decode_attention(
         page_size=int(page_size),
         logits_soft_cap=logits_soft_cap,
     )
-

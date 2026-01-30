@@ -332,5 +332,3 @@ def flash_mla(
         platform=platform,
         _cfg=cfg,
     )
-
-

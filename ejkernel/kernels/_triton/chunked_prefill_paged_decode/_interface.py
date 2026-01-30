@@ -111,4 +111,3 @@ def chunked_prefill_paged_decode(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-

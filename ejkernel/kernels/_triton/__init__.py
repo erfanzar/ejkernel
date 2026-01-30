@@ -26,6 +26,7 @@ Available kernels:
 - lightning_attn: Lightning Attention with layer-adaptive decay
 - mean_pooling: Efficient mean pooling over sequence dimension
 - native_sparse_attention: Sparse attention with dynamic block selection
+- quantized_matmul: Packed uint32 quantized matmul
 
 All implementations support:
 - Variable-length sequences via cumulative sequence lengths
@@ -42,6 +43,7 @@ from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
 from .native_sparse_attention import apply_native_sparse_attention, native_sparse_attention
 from .page_attention import page_attention
+from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
@@ -62,6 +64,7 @@ __all__ = (
     "mean_pooling",
     "native_sparse_attention",
     "page_attention",
+    "quantized_matmul",
     "ragged_decode_attention",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",

@@ -59,7 +59,7 @@ from jax import numpy as jnp
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     BwdParams,
@@ -137,6 +137,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         dropout_seed: int | None = None,
         cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
         cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+        block_tables: Int[Array, "batch max_blocks"] | None = None,
         sliding_window: int | tuple[int, int] | None = None,
         logits_soft_cap: float | None = None,
         softmax_aux: Float[Array, "num_sinks"] | None = None,
@@ -177,6 +178,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
             cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
             attention_mask: Int[Array, "batch num_heads seq_len kv_len"] | None = None,
+            block_tables: Int[Array, "batch max_blocks"] | None = None,
             q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
             kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         ) -> Float[Array, "batch num_heads seq_len head_dim"]:
@@ -188,6 +190,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
                 softmax_aux=softmax_aux,
                 cum_seqlens_k=cum_seqlens_k,
                 cum_seqlens_q=cum_seqlens_q,
+                block_tables=block_tables,
                 attention_mask=attention_mask,
                 softmax_scale=softmax_scale,
                 dropout_prob=dropout_prob,
@@ -213,6 +216,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             cum_seqlens_q,
             cum_seqlens_k,
             attention_mask,
+            block_tables,
             q_segment_ids,
             kv_segment_ids,
         )
@@ -260,6 +264,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         dropout_seed: int | None = None,
         cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
         cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+        block_tables: Int[Array, "batch max_blocks"] | None = None,
         sliding_window: int | tuple[int, int] | None = None,
         logits_soft_cap: float | None = None,
         softmax_aux: Float[Array, "num_sinks"] | None = None,
@@ -286,6 +291,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             dropout_seed: Random seed for dropout
             cum_seqlens_q: Cumulative sequence lengths for variable-length queries
             cum_seqlens_k: Cumulative sequence lengths for variable-length keys
+            block_tables: Optional paged-KV block table of shape
+                ``(batch, max_blocks)``.
             sliding_window: Window size for local attention
             logits_soft_cap: Optional soft cap value for logits
             softmax_aux: Optional attention sink logits
@@ -318,6 +325,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             dropout_seed=dropout_seed,
             cum_seqlens_q=cum_seqlens_q,
             cum_seqlens_k=cum_seqlens_k,
+            block_tables=block_tables,
             sliding_window=sliding_window,
             fwd_params=cfg.fwd_params,
             bwd_params=cfg.bwd_params,
@@ -785,6 +793,7 @@ def flash_attention(
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     softmax_aux: Float[Array, "num_sinks"] | None = None,
+    block_tables: Int[Array, "batch max_blocks"] | None = None,
     /,
     *,
     mask_info: MaskInfo | None = None,
@@ -821,6 +830,10 @@ def flash_attention(
         cum_seqlens_k: Cumulative sequence lengths for variable-length keys
         sliding_window: Window size for local attention (int or (left, right) tuple)
         logits_soft_cap: Optional soft cap value for logits
+        block_tables: Optional paged-KV block table of shape
+            ``(batch, max_blocks)``. When provided, *key* and *value* are
+            interpreted as paged KV caches with shape
+            ``(num_blocks, block_size, num_kv_heads, head_dim)``.
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
         cfg: Optional configuration override
         mesh: JAX device mesh for shard_map execution (optional)
@@ -855,16 +868,23 @@ def flash_attention(
         elif attention_mask is None:
             attention_mask = mask_info.get_or_compute_attention_mask()
 
+    if block_tables is not None:
+        if platform not in (None, "auto", "cuda"):
+            raise ValueError("paged_kv flash attention is only supported on the CUDA backend.")
+        if platform in (None, "auto"):
+            platform = "cuda"
+
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
         if mask_info is None:
-            in_specs = (*in_specs, None, None, None)
+            in_specs = (*in_specs, None, None, None, None)
         else:
             shardings = mask_info.get_shardings(False, mesh=mesh)
             in_specs = (
                 *in_specs,
                 shardings.attention_mask if attention_mask is not None else None,
+                None,
                 shardings.q_segment_ids if q_segment_ids is not None else None,
                 shardings.kv_segment_ids if kv_segment_ids is not None else None,
             )
@@ -882,6 +902,7 @@ def flash_attention(
         dropout_seed=dropout_seed,
         cum_seqlens_q=cum_seqlens_q,
         cum_seqlens_k=cum_seqlens_k,
+        block_tables=block_tables,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
         softmax_aux=softmax_aux,

@@ -1,0 +1,103 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Grouping utilities for quantization.
+
+This module provides helper functions for group-wise quantization operations,
+including codebook quantization and tensor reshaping for per-group statistics.
+"""
+
+from __future__ import annotations
+
+import jax
+from jax import numpy as jnp
+
+
+def _quantize_to_codebook(values: jax.Array, codebook: jax.Array) -> jax.Array:
+    """Quantize values to nearest codebook entries.
+
+    For each value, finds the index of the closest codebook entry using
+    absolute difference as the distance metric.
+
+    Args:
+        values: Input values to quantize, arbitrary shape.
+        codebook: 1D array of codebook entries to quantize to.
+
+    Returns:
+        Array of codebook indices (uint32) with same shape as values.
+
+    Example:
+        >>> codebook = jnp.array([-1.0, 0.0, 1.0])
+        >>> values = jnp.array([0.3, -0.8, 0.9])
+        >>> indices = _quantize_to_codebook(values, codebook)  # [1, 0, 2]
+    """
+    diffs = jnp.abs(values[..., None] - codebook)
+    return jnp.argmin(diffs, axis=-1).astype(jnp.uint32)
+
+
+def _reshape_groups(w: jax.Array, group_size: int) -> tuple[jax.Array, int]:
+    """Reshape tensor for group-wise quantization.
+
+    Splits the last dimension into groups of `group_size` elements,
+    allowing per-group statistics (min, max, scale) to be computed.
+
+    Args:
+        w: Input tensor with at least 2 dimensions. The last dimension
+            must be divisible by `group_size`.
+        group_size: Number of elements per group.
+
+    Returns:
+        Tuple of (reshaped_tensor, n_groups) where:
+            - reshaped_tensor has shape (*w.shape[:-1], n_groups, group_size)
+            - n_groups is w.shape[-1] // group_size
+
+    Raises:
+        ValueError: If w has fewer than 2 dimensions.
+        ValueError: If the last dimension is not divisible by group_size.
+
+    Example:
+        >>> w = jnp.ones((4, 128))
+        >>> w_groups, n_groups = _reshape_groups(w, group_size=32)
+        >>> w_groups.shape  # (4, 4, 32)
+        >>> n_groups  # 4
+    """
+    if w.ndim < 2:
+        raise ValueError("quantize expects inputs with two or more dimensions.")
+    if w.shape[-1] % group_size != 0:
+        raise ValueError("The last dimension of `w` must be divisible by `group_size`.")
+    n_groups = w.shape[-1] // group_size
+    return w.reshape(*w.shape[:-1], n_groups, group_size), n_groups
+
+
+def _require_bits(bits: int, allowed: set[int]) -> int:
+    """Validate and return the bit-width parameter.
+
+    Args:
+        bits: Requested bit-width for quantization.
+        allowed: Set of allowed bit-width values.
+
+    Returns:
+        The validated bit-width as an integer.
+
+    Raises:
+        ValueError: If bits is not in the allowed set.
+
+    Example:
+        >>> _require_bits(4, {2, 4, 8})  # Returns 4
+        >>> _require_bits(5, {2, 4, 8})  # Raises ValueError
+    """
+    bits = int(bits)
+    if bits not in allowed:
+        raise ValueError(f"Unsupported bit-width {bits}; allowed: {sorted(allowed)}.")
+    return bits

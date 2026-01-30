@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "ejkernel"
-version = "0.0.50"
+version = "0.0.55"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
@@ -32,8 +32,8 @@ dependencies = [
     "beartype>=0.22.2",
     "chex>=0.1.91",
     "einops>=0.8.1",
-    "jax~=0.8.2",
-    "jaxlib~=0.8.2",
+    "jax~=0.9.0",
+    "jaxlib~=0.9.0",
     "jaxtyping>=0.3.2",
     "pydantic>=2.11.10",
 ]
@@ -46,6 +46,8 @@ dependencies = [
 [tool.uv.build-backend]
 module-name = "ejkernel"
 module-root = "."
+source-include = ["csrc/**"]
+data = { purelib = "csrc" }
 
 [tool.setuptools]
 package-dir = { "" = "." }
@@ -58,8 +60,9 @@ where = ["."]
 
 [project.optional-dependencies]
 
-gpu = ["jax[cuda12]>=0.8.2", "triton==3.4.0"]
-tpu = ["jax[tpu]>=0.8.2"]
+gpu = ["jax[cuda13]>=0.9.0", "triton==3.4.0"]
+cuda = ["jax[cuda13]>=0.9.0", "triton==3.4.0"]
+tpu = ["jax[tpu]>=0.9.0"]
 triton = ["triton==3.4.0"]
 profile = [
     "xprof>=2.20.6",

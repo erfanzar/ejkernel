@@ -112,7 +112,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         Raises:
             ValueError: If no matching implementation is found for the configuration
         """
-        platform = detect_platform("ragged_decode_attention", cfg.platform, maybe_pallas=True)
+        platform = detect_platform("ragged_decode_attention", cfg.platform, prefer_pallas=True)
         return kernel_registry.get("ragged_decode_attention", platform=platform, backend=cfg.backend)
 
     def run(

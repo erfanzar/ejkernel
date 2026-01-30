@@ -170,8 +170,7 @@ def _flash_mla_xla(
     else:
         if b_k.ndim != 3 or b_k.shape[0] != batch or b_k.shape[1] != seq_len_k:
             raise ValueError(
-                "b_k must have shape (batch, seq_len, qk_rope_head_dim). "
-                f"Got b_k shape={getattr(b_k, 'shape', None)}."
+                f"b_k must have shape (batch, seq_len, qk_rope_head_dim). Got b_k shape={getattr(b_k, 'shape', None)}."
             )
         rope_dim = int(b_k.shape[2])
         expected_q_dim = d_nope + rope_dim

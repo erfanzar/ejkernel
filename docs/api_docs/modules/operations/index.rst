@@ -6,7 +6,9 @@ ejkernel.modules.operations package
 
    attention
    blocksparse_attention
+   chunked_prefill_paged_decode
    configs
+   decode_attention
    flash_attention
    gated_linear_attention
    grouped_matmul
@@ -17,6 +19,7 @@ ejkernel.modules.operations package
    page_attention
    pooling
    prefill_page_attention
+   quantized_matmul
    ragged_decode_attention
    ragged_page_attention_v2
    ragged_page_attention_v3

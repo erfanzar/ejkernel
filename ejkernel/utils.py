@@ -785,8 +785,8 @@ def make_dummy_rpa_inputs(
     q_dtype: jnp.dtype | None = None,  # defaults to kv_dtype if None
     kv_len_max: int | None = None,  # cap on kv_len per sequence; defaults to pages_per_seq*page_size
     total_q: int | None = None,  # total number of query tokens (sum_q). If set, uses deterministic q/kv lengths.
-    total_num_pages: int
-    | None = None,  # physical kv_cache pages; can be < num_seqs*pages_per_seq when tables are padded.
+    total_num_pages: int | None = None,
+    # physical kv_cache pages; can be < num_seqs*pages_per_seq when tables are padded.
     decode_prefill_mixed: tuple[int, int, int] | None = None,
     # (decode_end, prefill_end, mixed_end/total). Defaults to (0,0,num_seqs).
 ):

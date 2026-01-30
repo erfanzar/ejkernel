@@ -521,6 +521,7 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    block_tables: Int[Array, "batch max_blocks"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention with memory-efficient chunked computation.
 
@@ -560,6 +561,8 @@ def flash_attention(
         precision: JAX precision for matrix multiplications.
             One of: Precision.DEFAULT, Precision.HIGH, Precision.HIGHEST.
         logits_dtype: Dtype for logits computation. Default float32.
+        block_tables: Optional paged-KV block table of shape
+            ``(batch, max_blocks)``. Unsupported by the XLA backend.
         q_segment_ids: Query segment IDs [batch, seq_len_q] for packed sequences.
         kv_segment_ids: Key/value segment IDs [batch, seq_len_k] for packed sequences.
 
@@ -592,6 +595,8 @@ def flash_attention(
         raise NotImplementedError("`cum_seqlens_k` is not implemented in xla!")
     if cum_seqlens_q is not None and attention_mask is None:
         raise NotImplementedError("`cum_seqlens_q` is not implemented in xla!")
+    if block_tables is not None:
+        raise ValueError("paged_kv is only supported by the CUDA flash attention backend.")
 
     dropout_key = None
     if dropout_prob > 0.0:

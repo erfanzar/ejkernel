@@ -21,4 +21,3 @@ It is inspired by vLLM's `triton_decode_attention.py`, adapted to JAX via `trito
 from ._interface import decode_attention
 
 __all__ = ("decode_attention",)
-

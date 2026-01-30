@@ -89,7 +89,7 @@ def _normalize_type_string(type_annotation: Any) -> str:
     if type_annotation is inspect._empty:
         return "inspect._empty"
 
-    type_str = str(type_annotation)
+    type_str = type_annotation if isinstance(type_annotation, str) else str(type_annotation)
 
     type_str = re.sub(r"<class '(.+)'>", r"\1", type_str)
 
@@ -102,8 +102,17 @@ def _normalize_type_string(type_annotation: Any) -> str:
     # often render as `jaxtyping.Float[jaxlib._jax.Array, ...]`. These are
     # semantically equivalent in this project and shouldn't trigger a mismatch.
     type_str = re.sub(r"\b(?:jaxlib\._jax\.Array|jax\.jaxlib\._jax\.Array|jax\.Array)\b", "Array", type_str)
+    type_str = re.sub(r"\bjax\._src\.lax\.lax\.", "", type_str)
+    type_str = re.sub(r"\bjax\._src\.typing\.", "", type_str)
+    type_str = re.sub(r"\bjax\.typing\.", "", type_str)
+    type_str = re.sub(r"\bjax\.lax\.", "lax.", type_str)
 
     type_str = re.sub(r"\bejkernel\.[\w\.]+\.(\w+)", r"\1", type_str)
+
+    if "PrecisionLike" in type_str or "DotAlgorithm" in type_str or "DotAlgorithmPreset" in type_str:
+        return "PrecisionLike"
+    if "DTypeLike" in type_str or "SupportsDType" in type_str:
+        return "DTypeLike"
 
     return type_str
 

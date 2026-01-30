@@ -90,9 +90,11 @@ def _jax_fwd_attention_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | None = None,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None
+    ) = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -256,9 +258,11 @@ def flash_attention_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | None = None,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None
+    ) = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -334,9 +338,11 @@ def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | None = None,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None
+    ) = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -355,6 +361,7 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    block_tables: Int[Array, "batch max_blocks"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention for efficient scaled dot-product attention.
 
@@ -378,6 +385,8 @@ def flash_attention(
         logits_soft_cap: Optional soft cap value for logits (e.g., 20.0 for Gemma)
         softmax_aux: Optional attention sink logits of shape [num_sinks]
         q_segment_ids/kv_segment_ids: Optional packed-sequence segment IDs (mask cross-segment attention)
+        block_tables: Optional paged-KV block table of shape
+            ``(batch, max_blocks)``. Unsupported by the Triton backend.
 
     Returns:
         chex.Array: Attention output with shape [batch, seq_len, num_heads, head_dim]
@@ -393,6 +402,8 @@ def flash_attention(
         >>> out = flash_attention(query, key, value, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
     """
     del precision, logits_dtype, normalize_output
+    if block_tables is not None:
+        raise ValueError("paged_kv is only supported by the CUDA flash attention backend.")
 
     return flash_attention_call(
         query=query,

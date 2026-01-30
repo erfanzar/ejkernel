@@ -24,6 +24,7 @@ Usage:
     python test/run_tests.py --xla
     python test/run_tests.py --pallas
     python test/run_tests.py --triton
+    python test/run_tests.py --cuda
     python test/run_tests.py --types
     python test/run_tests.py --verbose
 """
@@ -76,6 +77,7 @@ def main():
     parser.add_argument("--xla", action="store_true", help="Run only XLA kernel tests")
     parser.add_argument("--pallas", action="store_true", help="Run only Pallas kernel tests")
     parser.add_argument("--triton", action="store_true", help="Run only Triton kernel tests")
+    parser.add_argument("--cuda", action="store_true", help="Run only CUDA kernel tests")
     parser.add_argument("--types", action="store_true", help="Run only types tests")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("-k", "--keyword", type=str, help="Only run tests matching keyword")
@@ -98,6 +100,7 @@ def main():
             args.xla,
             args.pallas,
             args.triton,
+            args.cuda,
             args.types,
         ]
     )
@@ -120,6 +123,8 @@ def main():
             kernel_paths.append(test_dir / "kernels" / "_pallas")
         if args.triton:
             kernel_paths.append(test_dir / "kernels" / "_triton")
+        if args.cuda:
+            kernel_paths.append(test_dir / "kernels" / "_cuda")
         if args.types:
             kernel_paths.append(test_dir / "kernels" / "types")
         if args.kernels and not kernel_paths:

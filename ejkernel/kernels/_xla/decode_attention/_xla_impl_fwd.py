@@ -165,4 +165,3 @@ def _decode_attention_fwd(
     lse = jnp.where(sum_exp > 0.0, m_safe + jnp.log(sum_exp_safe), -jnp.inf)
     lse = jnp.squeeze(lse, axis=-1).reshape(batch, num_q_heads).astype(jnp.float32)
     return out, lse
-

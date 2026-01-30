@@ -62,8 +62,10 @@ Example Usage:
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from collections.abc import Callable
+from enum import Enum
 from typing import Generic, Literal, Protocol
 
 import jax
@@ -75,6 +77,7 @@ from ..config.cache import _cache_overlay
 from ..core import Invocation, Kernel, _get_platform_method, _has_custom_vjp
 from ..core.types import Cfg, Out
 from ..utils.fingerprint import abstractify, device_fingerprint, get_device_platform, stable_json
+from ...kernels._registry import Backend, Platform, kernel_registry
 
 
 class ConfigChooser(Protocol):
@@ -127,6 +130,93 @@ class Executor(Generic[Cfg, Out]):
         """
         self.chooser = chooser
         self.stamp_prefix = stamp_prefix
+
+    @staticmethod
+    def _platform_value(val) -> str | None:
+        if val is None:
+            return None
+        if isinstance(val, Enum):
+            return str(val.value).lower()
+        return str(val).lower()
+
+    @staticmethod
+    def _is_nvidia_gpu() -> bool:
+        try:
+            from jax.lib import xla_bridge
+
+            platform_version = xla_bridge.get_backend().platform_version
+            if isinstance(platform_version, str):
+                pv = platform_version.lower()
+                if "cuda" in pv:
+                    return True
+                if "rocm" in pv:
+                    return False
+        except Exception:
+            pass
+
+        try:
+            devices = jax.devices("gpu")
+        except Exception:
+            devices = []
+        if not devices:
+            try:
+                devices = jax.devices()
+            except Exception:
+                devices = []
+        for dev in devices:
+            kind = (getattr(dev, "device_kind", "") or "").lower()
+            if any(token in kind for token in ("nvidia", "tesla", "geforce", "rtx", "quadro")):
+                return True
+        return False
+
+    @staticmethod
+    def _has_cuda_impl(algorithm: str) -> bool:
+        try:
+            specs = kernel_registry.list_implementations(algorithm)
+        except Exception:
+            return False
+        return any(spec.platform == Platform.CUDA and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
+
+    def _prefer_cuda_cfg(self, cfg: Cfg, kernel: Kernel[Cfg, Out], inv: Invocation[Cfg, Out]) -> Cfg:
+        platform_val = self._platform_value(getattr(cfg, "platform", None))
+        if platform_val is None or platform_val == "cuda":
+            return cfg
+        if platform_val not in ("auto", "triton"):
+            return cfg
+        if inv.override_cfg is not None:
+            return cfg
+        explicit_platform = None
+        if isinstance(inv.kwargs, dict):
+            explicit_platform = self._platform_value(inv.kwargs.get("platform", None))
+        if explicit_platform not in (None, "auto"):
+            return cfg
+        if get_device_platform() != "gpu":
+            return cfg
+        if not self._is_nvidia_gpu():
+            return cfg
+        if not self._has_cuda_impl(kernel.op_id):
+            return cfg
+
+        if dataclasses.is_dataclass(cfg):
+            fields = {field.name for field in dataclasses.fields(cfg)}
+            updates = {}
+            if "platform" in fields:
+                updates["platform"] = "cuda"
+            if "backend" in fields:
+                updates["backend"] = "gpu"
+            if updates:
+                try:
+                    return dataclasses.replace(cfg, **updates)
+                except Exception:
+                    pass
+        try:
+            if hasattr(cfg, "platform"):
+                setattr(cfg, "platform", "cuda")
+            if hasattr(cfg, "backend"):
+                setattr(cfg, "backend", "gpu")
+        except Exception:
+            return cfg
+        return cfg
 
     def _stamp_hash(self, kernel, inv, fn, cfg):
         """Add hash-based profiling metadata to function.
@@ -279,6 +369,7 @@ class Executor(Generic[Cfg, Out]):
             chosen = self._choose_heuristics_only(inv, kernel)
         else:
             chosen = self.chooser.choose(inv, kernel)
+        chosen = self._prefer_cuda_cfg(chosen, kernel, inv)
 
         platform = get_device_platform()
         context = "shard_map" if method == "shard_map" else None
@@ -446,8 +537,10 @@ class Executor(Generic[Cfg, Out]):
         )
         policy = getattr(self.chooser, "policy", None)
         if policy is not None and getattr(policy, "cache_miss_fallback", "heuristics") == "heuristics":
-            return self._choose_heuristics_only(inv, kernel)
-        return self.chooser.choose(inv, kernel)
+            cfg = self._choose_heuristics_only(inv, kernel)
+        else:
+            cfg = self.chooser.choose(inv, kernel)
+        return self._prefer_cuda_cfg(cfg, kernel, inv)
 
     def _choose_heuristics_only(self, inv: Invocation[Cfg, Out], kernel: Kernel[Cfg, Out]) -> Cfg:
         """Select configuration using fast heuristics path without autotuning.

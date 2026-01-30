@@ -28,6 +28,7 @@ Configuration Hierarchy:
     ├── RingAttentionConfig (distributed attention)
     ├── FlashMLAConfig (block_q, block_k for MLA)
     ├── GroupedMatmulConfig (block_m, block_n, block_k for MoE)
+    ├── QuantizedMatmulConfig (block_m, block_n, block_k for quantized matmul)
     ├── MeanPoolingConfig (block_size for pooling)
     ├── KernelDeltaAttentionConfig (linear attention)
     ├── RWKV4Config, RWKV6Config, RWKV7Config (recurrent models)
@@ -381,6 +382,33 @@ class GroupedMatmulConfig(BaseOperationConfig):
     num_warps: int = 4
     num_stages: int = 2
     bypass_xla_tiling: bool = False
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class QuantizedMatmulConfig(BaseOperationConfig):
+    """Configuration for Quantized Matrix Multiplication operation.
+
+    Args:
+        block_m: M dimension block size (default: 128)
+        block_n: N dimension block size (default: 128)
+        block_k: K dimension block size (default: 64)
+        num_warps: Number of warps for Triton kernels (default: 4)
+        num_stages: Number of pipeline stages (default: 3)
+        use_bf16: Use BF16 for the dot input tiles (default: True)
+        split_k: Optional split-K factor for Triton kernels (default: None)
+        platform: Target platform (triton/pallas/cuda/xla/auto)
+        backend: Backend specification (default: "any")
+    """
+
+    block_m: int = 128
+    block_n: int = 128
+    block_k: int = 64
+    num_warps: int = 4
+    num_stages: int = 3
+    use_bf16: bool = True
+    split_k: int | None = None
 
     __hash__ = hash_fn
 

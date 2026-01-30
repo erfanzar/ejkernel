@@ -212,4 +212,3 @@ def _chunked_prefill_paged_decode_fwd(
 
     assert out.shape == (total_tokens, num_q_heads, head_dim)
     return out, new_key_cache, new_value_cache
-
