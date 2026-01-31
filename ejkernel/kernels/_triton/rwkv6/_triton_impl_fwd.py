@@ -59,6 +59,37 @@ def _rwkv6_fwd_kernel(
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """RWKV-6 forward pass Triton kernel with multi-head recurrence.
+
+    Processes the RWKV-6 recurrence with per-timestep log-decay and bonus
+    term. Each program instance handles one (value_block, key_block, batch*head)
+    tuple and iterates through all timesteps sequentially.
+
+    The recurrence computes:
+        kv_t = k_t[:, None] * v_t[None, :]  (outer product)
+        o_t = sum((h + kv_t * u[:, None]) * r_t[:, None], axis=0)
+        h = h * exp(w_t)[:, None] + kv_t
+
+    Output is tiled across key blocks and later summed to produce the final
+    output, since each key block contributes a partial sum to the output.
+
+    Args:
+        r: Receptance tensor pointer, shape (B, T, H, K).
+        k: Key tensor pointer, shape (B, T, H, K).
+        v: Value tensor pointer, shape (B, T, H, V).
+        w: Log-decay tensor pointer, shape (B, T, H, K).
+        u: Bonus tensor pointer, shape (H, K).
+        h0: Initial hidden state pointer, shape (N, H, K, V).
+        cu_seqlens: Cumulative sequence lengths pointer.
+        scale: Receptance scaling factor.
+        o: Output tensor pointer, shape (NK, B, T, H, V).
+        ht: Final state output pointer, shape (N, H, K, V).
+        T, B, H, K, V: Tensor dimensions.
+        BK, BV: Block sizes for key and value dimensions.
+        REVERSE: Whether to process sequence in reverse.
+        USE_INITIAL_STATE: Whether to load initial hidden state.
+        IS_VARLEN: Whether using variable-length sequences.
+    """
     i_v, i_k, i_nh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
 

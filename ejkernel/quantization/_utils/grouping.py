@@ -42,8 +42,39 @@ def _quantize_to_codebook(values: jax.Array, codebook: jax.Array) -> jax.Array:
         >>> values = jnp.array([0.3, -0.8, 0.9])
         >>> indices = _quantize_to_codebook(values, codebook)  # [1, 0, 2]
     """
-    diffs = jnp.abs(values[..., None] - codebook)
-    return jnp.argmin(diffs, axis=-1).astype(jnp.uint32)
+    # Avoid materializing values[..., None] - codebook for large tensors.
+    # A streaming argmin keeps memory O(values) instead of O(values * codebook).
+    codebook = jnp.asarray(codebook)
+    if codebook.ndim != 1:
+        raise ValueError("codebook must be 1D.")
+    if codebook.shape[0] == 0:
+        raise ValueError("codebook must be non-empty.")
+
+    min_dist = jnp.abs(values - codebook[0])
+    min_idx = jnp.zeros(values.shape, dtype=jnp.int32)
+
+    def _body(i: int, state: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+        """Update running argmin state for codebook entry ``i``.
+
+        Compares each value against ``codebook[i]`` and updates the running
+        minimum distance and best index arrays where the new entry is closer.
+
+        Args:
+            i: Current codebook index being evaluated.
+            state: Tuple of (current_min_distances, current_best_indices).
+
+        Returns:
+            Updated tuple of (min_distances, best_indices).
+        """
+        cur_min_dist, cur_min_idx = state
+        dist = jnp.abs(values - codebook[i])
+        better = dist < cur_min_dist
+        cur_min_dist = jnp.where(better, dist, cur_min_dist)
+        cur_min_idx = jnp.where(better, i, cur_min_idx)
+        return cur_min_dist, cur_min_idx
+
+    _, min_idx = jax.lax.fori_loop(1, codebook.shape[0], _body, (min_dist, min_idx))
+    return min_idx.astype(jnp.uint32)
 
 
 def _reshape_groups(w: jax.Array, group_size: int) -> tuple[jax.Array, int]:

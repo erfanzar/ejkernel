@@ -86,7 +86,8 @@ def test_blocksparse_attention_cuda_softcap_sinks():
     k = jax.random.normal(kk, (batch, num_kv_heads, kv_len, head_dim), dtype=jnp.float16)
     v = jax.random.normal(kv, (batch, num_kv_heads, kv_len, head_dim), dtype=jnp.float16)
 
-    softmax_aux = jnp.linspace(-0.5, 0.5, num_heads, dtype=jnp.float32)
+    num_sinks = 4
+    softmax_aux = jnp.linspace(-0.5, 0.5, num_sinks, dtype=jnp.float32).reshape(num_sinks)
 
     fwd_params = FwdParams(q_blocksize=16, kv_blocksize=16, num_warps=4, num_stages=2)
     bwd_params = BwdParams(q_blocksize=16, kv_blocksize=16, num_warps=4, num_stages=2)

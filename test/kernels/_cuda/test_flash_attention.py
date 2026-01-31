@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.kernels._cuda.flash_attention import flash_attention as cuda_flash_attention
 from ejkernel.kernels._xla.flash_attention import flash_attention as xla_flash_attention
 
@@ -60,67 +61,7 @@ class TestFlashAttentionCuda:
 
         _assert_close(out_cuda, out_xla)
 
-    def test_bias_mask_sinks(self):
-        key = jax.random.PRNGKey(1)
-        kq, kk, kv, kb, ks = jax.random.split(key, 5)
-        batch, seq_len, num_heads, head_dim = 1, 32, 4, 32
-        num_sinks = 3
-
-        q = jax.random.normal(kq, (batch, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
-        k = jax.random.normal(kk, (batch, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
-        v = jax.random.normal(kv, (batch, seq_len, num_heads, head_dim), dtype=jnp.bfloat16)
-
-        bias = jax.random.normal(kb, (batch, num_heads, seq_len, seq_len), dtype=jnp.float32) * 0.01
-        sinks = jax.random.normal(ks, (num_sinks,), dtype=jnp.float32) * 0.1
-
-        out_cuda = cuda_flash_attention(
-            q,
-            k,
-            v,
-            bias=bias,
-            causal=True,
-            logits_soft_cap=20.0,
-            softmax_aux=sinks,
-        )
-        out_xla = xla_flash_attention(
-            q,
-            k,
-            v,
-            bias=bias,
-            causal=True,
-            logits_soft_cap=20.0,
-            softmax_aux=sinks,
-        )
-
-        out_cuda = jax.block_until_ready(out_cuda)
-        out_xla = jax.block_until_ready(out_xla)
-
-        _assert_close(out_cuda, out_xla, rtol=3e-2, atol=3e-2)
-
-    def test_mask_only_matches_xla(self):
-        import warnings
-
-        key = jax.random.PRNGKey(4)
-        kq, kk, kv, km = jax.random.split(key, 4)
-        batch, seq_len, num_heads, head_dim = 2, 24, 2, 64
-
-        q = jax.random.normal(kq, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-        k = jax.random.normal(kk, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-        v = jax.random.normal(kv, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
-
-        mask = jax.random.bernoulli(km, p=0.7, shape=(batch, 1, seq_len, seq_len))
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            out_cuda = cuda_flash_attention(q, k, v, attention_mask=mask, causal=False)
-        out_xla = xla_flash_attention(q, k, v, attention_mask=mask, causal=False)
-
-        out_cuda = jax.block_until_ready(out_cuda)
-        out_xla = jax.block_until_ready(out_xla)
-
-        _assert_close(out_cuda, out_xla, rtol=3e-2, atol=3e-2)
-
-    def test_sliding_window_tuple(self):
+    def test_sliding_window_tuple_matches_xla(self):
         key = jax.random.PRNGKey(5)
         kq, kk, kv = jax.random.split(key, 3)
         batch, seq_len, num_heads, head_dim = 1, 32, 4, 64
@@ -138,7 +79,33 @@ class TestFlashAttentionCuda:
 
         _assert_close(out_cuda, out_xla, rtol=3e-2, atol=3e-2)
 
-    def test_segment_ids(self):
+    def test_rejects_attention_mask(self):
+        key = jax.random.PRNGKey(4)
+        kq, kk, kv, km = jax.random.split(key, 4)
+        batch, seq_len, num_heads, head_dim = 1, 24, 2, 64
+
+        q = jax.random.normal(kq, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        k = jax.random.normal(kk, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        v = jax.random.normal(kv, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        mask = jax.random.bernoulli(km, p=0.7, shape=(batch, 1, seq_len, seq_len))
+
+        with pytest.raises(EjkernelRuntimeError):
+            _ = cuda_flash_attention(q, k, v, attention_mask=mask, causal=False)
+
+    def test_rejects_softmax_aux(self):
+        key = jax.random.PRNGKey(6)
+        kq, kk, kv, ks = jax.random.split(key, 4)
+        batch, seq_len, num_heads, head_dim = 1, 16, 2, 32
+
+        q = jax.random.normal(kq, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        k = jax.random.normal(kk, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        v = jax.random.normal(kv, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        sinks = jax.random.normal(ks, (num_heads,), dtype=jnp.float32)
+
+        with pytest.raises(EjkernelRuntimeError):
+            _ = cuda_flash_attention(q, k, v, softmax_aux=sinks, causal=True)
+
+    def test_rejects_segment_ids(self):
         key = jax.random.PRNGKey(2)
         kq, kk, kv = jax.random.split(key, 3)
         batch, seq_len, num_heads, head_dim = 1, 24, 2, 32
@@ -148,32 +115,36 @@ class TestFlashAttentionCuda:
         v = jax.random.normal(kv, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
 
         q_segment_ids = jnp.concatenate(
-            [jnp.zeros((batch, seq_len // 2), dtype=jnp.int32), jnp.ones((batch, seq_len - seq_len // 2), dtype=jnp.int32)],
+            [
+                jnp.zeros((batch, seq_len // 2), dtype=jnp.int32),
+                jnp.ones((batch, seq_len - seq_len // 2), dtype=jnp.int32),
+            ],
             axis=1,
         )
         kv_segment_ids = q_segment_ids.copy()
 
-        out_cuda = cuda_flash_attention(
-            q,
-            k,
-            v,
-            causal=False,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
-        )
-        out_xla = xla_flash_attention(
-            q,
-            k,
-            v,
-            causal=False,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
-        )
+        with pytest.raises(EjkernelRuntimeError):
+            _ = cuda_flash_attention(
+                q,
+                k,
+                v,
+                causal=False,
+                q_segment_ids=q_segment_ids,
+                kv_segment_ids=kv_segment_ids,
+            )
 
-        out_cuda = jax.block_until_ready(out_cuda)
-        out_xla = jax.block_until_ready(out_xla)
+    def test_rejects_non_alibi_bias(self):
+        key = jax.random.PRNGKey(7)
+        kq, kk, kv, kb = jax.random.split(key, 4)
+        batch, seq_len, num_heads, head_dim = 1, 16, 2, 32
 
-        _assert_close(out_cuda, out_xla)
+        q = jax.random.normal(kq, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        k = jax.random.normal(kk, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        v = jax.random.normal(kv, (batch, seq_len, num_heads, head_dim), dtype=jnp.float16)
+        bias = jax.random.normal(kb, (batch, num_heads, seq_len, seq_len), dtype=jnp.float32)
+
+        with pytest.raises(EjkernelRuntimeError):
+            _ = cuda_flash_attention(q, k, v, bias=bias, causal=True)
 
     def test_gradients_finite(self):
         key = jax.random.PRNGKey(3)

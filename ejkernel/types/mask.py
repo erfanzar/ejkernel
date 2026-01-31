@@ -81,6 +81,7 @@ from jaxtyping import Array, Bool, DTypeLike, Float, Int
 from ejkernel.xla_utils import get_corrected_named_sharding
 
 mdim_t = "batch nheads_or_1 qlen kvlen"
+"""Type annotation string for 4D attention mask dimensions used in jaxtyping."""
 
 # Debug mode flag - set via environment variable
 _DEBUG_MODE = os.environ.get("EJKERNEL_MASK_DEBUG", "0") == "1"
@@ -141,7 +142,18 @@ def get_debug_mode() -> bool:
 
 
 def _debug_trace(func):
-    """Decorator to trace function calls when debug mode is enabled."""
+    """Decorator that logs function calls to stdout when debug mode is enabled.
+
+    When ``_DEBUG_MODE`` is ``True``, prints a trace message before executing the
+    wrapped function. If the first positional argument has a ``__class__`` attribute
+    (i.e. the function is a method), the message includes the class name.
+
+    Args:
+        func: The function or method to wrap with debug tracing.
+
+    Returns:
+        The wrapped function that conditionally logs calls before execution.
+    """
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -1043,6 +1055,17 @@ class MaskInfo:
 
     @property
     def attention_mask(self) -> Array | None:
+        """Get the 4D attention mask, computing it from segment IDs if necessary.
+
+        Lazily materializes the attention mask on first access when only segment
+        IDs were provided at construction time. Subsequent accesses return the
+        cached result.
+
+        Returns:
+            Boolean or integer array of shape ``(batch, heads_or_1, q_len, kv_len)``
+            where ``True``/1 indicates valid attention positions, or ``None`` if the
+            MaskInfo is completely empty (no source data).
+        """
         if _DEBUG_MODE:
             print("[MaskInfo Debug] Property access: attention_mask")
         if self._attention_mask is None:
@@ -1051,6 +1074,17 @@ class MaskInfo:
 
     @property
     def q_segment_ids(self) -> Array | None:
+        """Get query segment IDs, computing them from the attention mask if necessary.
+
+        Lazily derives segment IDs on first access when only an attention mask was
+        provided at construction time. Both ``q_segment_ids`` and ``kv_segment_ids``
+        are computed together and cached.
+
+        Returns:
+            Int32 array of shape ``(batch, q_len)`` where non-negative values
+            indicate segment membership and ``-1`` marks padding tokens, or
+            ``None`` if segment IDs cannot be determined.
+        """
         if _DEBUG_MODE:
             print("[MaskInfo Debug] Property access: q_segment_ids")
         if self._q_segment_ids is None:
@@ -1059,6 +1093,17 @@ class MaskInfo:
 
     @property
     def kv_segment_ids(self) -> Array | None:
+        """Get key-value segment IDs, computing them from the attention mask if necessary.
+
+        Lazily derives segment IDs on first access when only an attention mask was
+        provided at construction time. Both ``q_segment_ids`` and ``kv_segment_ids``
+        are computed together and cached.
+
+        Returns:
+            Int32 array of shape ``(batch, kv_len)`` where non-negative values
+            indicate segment membership and ``-1`` marks padding tokens, or
+            ``None`` if segment IDs cannot be determined.
+        """
         if _DEBUG_MODE:
             print("[MaskInfo Debug] Property access: kv_segment_ids")
         if self._kv_segment_ids is None:
@@ -1067,6 +1112,17 @@ class MaskInfo:
 
     @property
     def cu_seqlens_q(self) -> Array | None:
+        """Get cumulative query sequence lengths, computing them if necessary.
+
+        Lazily computes cumulative sequence lengths from segment IDs or the
+        attention mask on first access. Both ``cu_seqlens_q`` and ``cu_seqlens_kv``
+        are derived together and cached.
+
+        Returns:
+            Int32 array of cumulative sequence lengths suitable for
+            FlashAttention-style variable-length batching, or ``None`` if
+            the MaskInfo is completely empty.
+        """
         if _DEBUG_MODE:
             print("[MaskInfo Debug] Property access: cu_seqlens_q")
         if self._cu_seqlens_q is None or self._cu_seqlens_kv is None:
@@ -1075,6 +1131,17 @@ class MaskInfo:
 
     @property
     def cu_seqlens_kv(self) -> Array | None:
+        """Get cumulative key-value sequence lengths, computing them if necessary.
+
+        Lazily computes cumulative sequence lengths from segment IDs or the
+        attention mask on first access. Both ``cu_seqlens_q`` and ``cu_seqlens_kv``
+        are derived together and cached.
+
+        Returns:
+            Int32 array of cumulative sequence lengths suitable for
+            FlashAttention-style variable-length batching, or ``None`` if
+            the MaskInfo is completely empty.
+        """
         if _DEBUG_MODE:
             print("[MaskInfo Debug] Property access: cu_seqlens_kv")
         if self._cu_seqlens_q is None or self._cu_seqlens_kv is None:
@@ -1384,6 +1451,11 @@ class MaskInfo:
                 Default: "tp"
             sequence_axis_name: Axis name(s) for sequence dimension in distributed sharding.
                 Default: "sp"
+            is_attn_mask: If ``True``, treats the ``q_segment_ids`` (and ``kv_segment_ids``)
+                inputs as flat padding masks (non-zero = valid, 0 = padding) rather than
+                segment IDs. A pairwise outer-product attention mask is built from the
+                validity flags, and segment IDs are derived as 0 for valid / -1 for
+                padding. Default: ``False``.
 
         Returns:
             MaskInfo with segment IDs, computed attention mask, optional positions, and sharding configuration
@@ -1463,6 +1535,11 @@ class MaskInfo:
             kv_positions: Optional key-value position indices (batch, kvlen)
             mask_is_valid: If False, treats True/1 entries as masked-out (disallowed) positions
                 and inverts the mask (PyTorch-style attn_mask semantics).
+            batch_axis_name: Axis name(s) for batch dimension in distributed sharding.
+                Default: ("dp", "fsdp")
+            qheads_axis_name: Axis name(s) for query heads dimension. Default: "tp"
+            kvheads_axis_name: Axis name(s) for key-value heads dimension. Default: "tp"
+            sequence_axis_name: Axis name(s) for sequence dimension. Default: "sp"
 
         Returns:
             MaskInfo with derived segment IDs, original attention mask, and optional positions
@@ -1538,12 +1615,39 @@ class MaskInfo:
         kvheads_axis_name: tuple[str] | str | None = "tp",
         sequence_axis_name: tuple[str] | str | None = "sp",
     ) -> "MaskInfo":
-        """
-        Create a padding-style MaskInfo from cumulative sequence lengths.
+        """Create a padding-style MaskInfo from cumulative sequence lengths.
 
-        This reconstructs 2D padding masks (valid tokens are a prefix) and stores a compact
-        padding-style segment-id representation (0 for valid tokens, -1 for padding). The
-        pairwise attention mask can be materialized on demand via ``attention_mask``.
+        Reconstructs 2D padding masks (valid tokens are a contiguous range) and stores
+        a compact padding-style segment-ID representation (0 for valid tokens, -1 for
+        padding). The pairwise 4D attention mask is not materialized eagerly; it is
+        computed on demand via the ``attention_mask`` property.
+
+        Args:
+            cu_seqlens_q: Cumulative query sequence lengths with shape ``(batch * 2,)``
+                in interleaved ``[start_0, end_0, start_1, end_1, ...]`` format, where
+                valid tokens for batch element *i* span positions
+                ``cu_seqlens_q[2*i]`` to ``cu_seqlens_q[2*i+1] - 1``.
+            max_q_len: Maximum query sequence length for the output mask.
+            cu_seqlens_kv: Cumulative key-value sequence lengths with same format as
+                ``cu_seqlens_q``. If ``None``, uses ``cu_seqlens_q`` (self-attention).
+            max_kv_len: Maximum key-value sequence length. If ``None``, uses ``max_q_len``.
+            q_positions: Optional query position indices of shape ``(batch, qlen)``.
+            kv_positions: Optional key-value position indices of shape ``(batch, kvlen)``.
+            batch_axis_name: Axis name(s) for batch dimension in distributed sharding.
+                Default: ``("dp", "fsdp")``.
+            qheads_axis_name: Axis name(s) for query heads dimension. Default: ``"tp"``.
+            kvheads_axis_name: Axis name(s) for key-value heads dimension. Default: ``"tp"``.
+            sequence_axis_name: Axis name(s) for sequence dimension. Default: ``"sp"``.
+
+        Returns:
+            MaskInfo with padding-style segment IDs (0 for valid, -1 for padding),
+            stored cumulative sequence lengths, and deferred attention mask computation.
+
+        Example:
+            >>> cu_seqlens = jnp.array([0, 5, 2, 6])  # batch 0: [0,5), batch 1: [2,6)
+            >>> mask_info = MaskInfo.from_cu_seqlens(cu_seqlens, max_q_len=8)
+            >>> mask_info.q_segment_ids[0]  # 0,0,0,0,0,-1,-1,-1
+            >>> mask_info.q_segment_ids[1]  # -1,-1,0,0,0,0,-1,-1
         """
         if max_kv_len is None:
             max_kv_len = max_q_len
@@ -1609,6 +1713,11 @@ class MaskInfo:
             seed: Random seed for reproducibility. Default: 0
             q_positions: Optional query position indices (batch, qlen)
             kv_positions: Optional key-value position indices (batch, kvlen)
+            batch_axis_name: Axis name(s) for batch dimension in distributed sharding.
+                Default: ("dp", "fsdp")
+            qheads_axis_name: Axis name(s) for query heads dimension. Default: "tp"
+            kvheads_axis_name: Axis name(s) for key-value heads dimension. Default: "tp"
+            sequence_axis_name: Axis name(s) for sequence dimension. Default: "sp"
 
         Returns:
             MaskInfo with random attention pattern and optional positions

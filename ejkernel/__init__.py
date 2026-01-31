@@ -44,9 +44,20 @@ _os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 
 __version__ = "0.0.55"
 
-from . import kernels, modules, types, utils, xla_utils
+from . import errors, kernels, modules, types, utils, xla_utils
+from .errors import EjkernelRuntimeError
 from .kernels import Backend, Platform, kernel_registry
 
 kernel_registry.validate_signatures(None)
 
-__all__ = ("Backend", "Platform", "kernel_registry", "kernels", "modules", "types", "utils", "xla_utils")
+__all__ = (
+    "Backend",
+    "Platform",
+    "EjkernelRuntimeError",
+    "kernel_registry",
+    "kernels",
+    "modules",
+    "types",
+    "utils",
+    "xla_utils",
+)

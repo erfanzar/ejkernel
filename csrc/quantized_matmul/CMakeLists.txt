@@ -20,6 +20,9 @@ if(NOT EJKERNEL_JAX_FFI_INCLUDE)
 endif()
 
 set(QMM_SRC_DIR "${CMAKE_CURRENT_LIST_DIR}/src")
+set(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
+set(CUTLASS_ROOT "${REPO_ROOT}/csrc/cutlass")
+set(CUTLASS_INCLUDE "${CUTLASS_ROOT}/include")
 file(GLOB QMM_DEQUANT_SOURCES "${QMM_SRC_DIR}/qmm_dequant_*.cu")
 set(QMM_SOURCES
   "${QMM_SRC_DIR}/qmm_cuda.cu"
@@ -50,7 +53,9 @@ foreach(arch IN LISTS _arch_list)
   target_include_directories(${target_name} PRIVATE
     "${QMM_SRC_DIR}"
     "${EJKERNEL_JAX_FFI_INCLUDE}"
+    "${CUTLASS_INCLUDE}"
   )
 
-  target_link_libraries(${target_name} PRIVATE CUDA::cudart CUDA::cublas)
+  target_link_libraries(${target_name} PRIVATE CUDA::cudart CUDA::cublas
+                                               CUDA::cublasLt)
 endforeach()

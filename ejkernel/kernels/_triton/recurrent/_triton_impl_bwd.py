@@ -13,6 +13,36 @@
 # limitations under the License.
 
 
+"""Backward pass Triton kernels for recurrent linear attention.
+
+This module provides gradient computation for the recurrent linear attention
+forward pass. The backward kernel processes sequences in the reverse direction
+of the forward pass and computes gradients for queries, keys, values, and
+optional gating parameters.
+
+Algorithm Overview:
+------------------
+The backward pass consists of two sequential phases within a single kernel:
+
+Phase 1 - Compute dQ:
+    Replay the forward hidden state evolution, using the chain rule to
+    compute dq_t = sum(h_t * do_t, axis=value_dim) * scale
+
+Phase 2 - Compute dK, dV:
+    Process in reverse order (opposite to phase 1), accumulating a backward
+    hidden state dh that flows from the output gradients back through the
+    gated recurrence to produce dk and dv.
+
+Gate Gradients:
+    Gradients for gating parameters (g, gk, gv) are computed via cumulative
+    sums over the dq*q - dk*k products, leveraging the structure of the
+    exponential gating mechanism.
+
+Functions:
+- bwd_kernel: Triton JIT kernel for combined dQ/dK/dV backward computation
+- bwd_triton_impl: Python wrapper that launches the kernel and computes gate gradients
+"""
+
 import jax
 import triton
 import triton.language as tl

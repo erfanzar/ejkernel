@@ -616,6 +616,7 @@ class Kernel(Generic[Cfg, Out]):
         """
 
         def _wrapped(*call_args):
+            """Inner function that calls fn with positional args and fixed kwargs inside shard_map."""
             return fn(*call_args, **kwargs)
 
         shard_map_fn = shard_map(

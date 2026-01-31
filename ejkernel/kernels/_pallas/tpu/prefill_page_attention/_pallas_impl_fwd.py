@@ -167,7 +167,24 @@ def ref_prefill_page_attention(
 
 
 class MultiPageAsyncCopyDescriptor:
-    """Descriptor for async copy of multiple K/V pages from HBM."""
+    """Descriptor for asynchronous DMA copy of multiple KV cache pages from HBM to VMEM.
+
+    Manages the async transfer of multiple contiguous pages from the paged KV cache
+    stored in HBM into a VMEM buffer on TPU. Uses DMA semaphores for synchronization
+    between the copy engine and compute engine.
+
+    This enables double-buffered prefetching where the next chunk's pages are loaded
+    while the current chunk is being processed, hiding memory latency.
+
+    Attributes:
+        _vmem_buffer: VMEM buffer reference to copy pages into.
+        _num_pages_to_load: Number of pages to transfer in this operation.
+        _pages_hbm_ref: HBM reference to the source pages (possibly indexed by head).
+        _sem: DMA semaphore for synchronization.
+        _page_indices: Array mapping logical page positions to physical page indices.
+        _page_offset: Starting offset into page_indices for this chunk.
+        _async_copies: List of individual async copy operations, one per page.
+    """
 
     def __init__(
         self,
@@ -191,16 +208,37 @@ class MultiPageAsyncCopyDescriptor:
         self._async_copies = [self._make_async_copy(i) for i in range(self._num_pages_to_load)]
 
     def _make_async_copy(self, i):
+        """Create an async DMA copy operation for a single page.
+
+        Args:
+            i: Local page index within this chunk (0 to num_pages_to_load - 1).
+
+        Returns:
+            A Pallas async copy descriptor for the i-th page transfer.
+        """
         page_index = self._page_indices[self._page_offset + i]
         return pltpu.make_async_copy(self._pages_hbm_ref.at[page_index], self._vmem_buffer.at[i], self._sem)
 
     def start(self):
-        """Starts the async copies."""
+        """Initiate all asynchronous DMA copy operations.
+
+        Starts the transfer of all pages from HBM to VMEM. The transfers
+        proceed asynchronously and must be completed by calling
+        ``wait_and_get_loaded`` before accessing the data.
+        """
         for async_copy in self._async_copies:
             async_copy.start()
 
     def wait_and_get_loaded(self) -> jax.Array:
-        """Wait async copies and gets the loaded buffer as a jax.Array."""
+        """Wait for all async copies to complete and return the loaded data.
+
+        Blocks until all page transfers are finished, then reshapes the
+        loaded pages into a 2D matrix suitable for attention computation.
+
+        Returns:
+            A float32 array of shape [num_pages * page_size, head_dim]
+            containing the loaded and flattened page data.
+        """
         for async_copy in self._async_copies:
             async_copy.wait()
         head_dim = self._vmem_buffer.shape[-1]
@@ -231,9 +269,39 @@ def chunked_prefill_attention_kernel(
 ):
     """Pallas kernel for chunked prefill attention with paged KV cache.
 
-    This kernel processes the last `chunk_size` tokens of a sequence during prefill.
-    The query positions are: [length - chunk_size, length - chunk_size + 1, ..., length - 1]
-    Each query position can attend to all KV positions from 0 to its own position (causal).
+    This kernel processes the last ``chunk_size`` tokens of a sequence during the
+    prefill phase. It implements online softmax with flash-attention-style
+    accumulation across KV chunks loaded from a paged cache.
+
+    The query positions span [length - chunk_size, ..., length - 1]. Each query
+    position can attend to all KV positions from 0 up to its own position (causal).
+    KV pages are loaded asynchronously using double-buffered DMA to hide memory
+    latency.
+
+    The kernel iterates over KV chunks, and within each chunk iterates over
+    GQA groups. For each group, it computes attention scores, applies causal
+    and optional sliding window masks, and updates the running softmax
+    statistics (m for max, l for sum of exponentials).
+
+    Args:
+        length_ref: Scalar prefetch ref containing the total context length.
+        page_indices_ref: Scalar prefetch ref containing page index mapping.
+        buffer_index_ref: Scalar prefetch ref for double-buffer index tracking.
+        q_ref: Query tensor ref of shape [1, group_size, chunk_size, head_dim].
+        k_pages_hbm_ref: Key cache HBM ref [num_kv_heads, total_pages, page_size, head_dim].
+        v_pages_hbm_ref: Value cache HBM ref [num_kv_heads, total_pages, page_size, head_dim].
+        out_ref: Output ref of shape [1, group_size, chunk_size, head_dim].
+        l_ref: Softmax denominator accumulator ref [1, group_size, chunk_size, 1].
+        m_ref: Softmax max accumulator ref [1, group_size, chunk_size, 1].
+        k_vmem_buffer: VMEM scratch for double-buffered key page loading.
+        v_vmem_buffer: VMEM scratch for double-buffered value page loading.
+        sem: DMA semaphore for async copy synchronization.
+        chunk_size: Number of query tokens in this prefill chunk.
+        page_size: Number of tokens stored per cache page.
+        num_kv_chunks: Total number of KV chunks to iterate over.
+        mask_value: Large negative value for masked attention positions.
+        attn_logits_soft_cap: Optional soft cap for attention logits stability.
+        sliding_window: Optional window size for local attention.
     """
     h = pl.program_id(0)
     head_dim = k_pages_hbm_ref.shape[3]

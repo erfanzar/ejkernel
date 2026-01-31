@@ -70,6 +70,7 @@ def to_json(obj: Any) -> str:
     """
 
     def default(o):
+        """JSON serialization fallback for dataclasses and non-serializable objects."""
         if dataclasses.is_dataclass(o):
             return dataclasses.asdict(o)
         return repr(o)

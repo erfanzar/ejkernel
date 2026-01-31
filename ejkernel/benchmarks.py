@@ -230,9 +230,19 @@ class Benchmark:
         self.console = Console()
 
     def _make_scalar_loss(self, output: Any) -> Any:
-        """Convert function output to scalar for gradient computation.
+        """Convert function output to a scalar loss value for gradient computation.
 
-        Handles tuple/list outputs by taking first element and applying mean if needed.
+        Handles various output formats from algorithm functions by extracting
+        the first element from tuple/list outputs and reducing non-scalar
+        tensors via mean. This is necessary for ``jax.grad`` which requires
+        a scalar-valued function.
+
+        Args:
+            output: Raw output from an algorithm function. Can be a scalar,
+                array, tuple, or list.
+
+        Returns:
+            A scalar JAX value suitable for gradient computation.
         """
 
         if isinstance(output, tuple | list):
@@ -552,7 +562,7 @@ class Benchmark:
             }
 
         if len(by_algo) > 1:
-            baseline_algo = next(iter(by_algo.keys()))
+            baseline_algo = "xla" if "xla" in by_algo else next(iter(by_algo.keys()))
             baseline_results = {str(sorted(r.config.items())): r.mean_ms for r in by_algo[baseline_algo]}
 
             for algo in by_algo:
@@ -852,6 +862,18 @@ class Benchmark:
         config_items_by_key: dict[tuple[tuple[str, Any], ...], list[tuple[str, Any]]] = {}
 
         def _freeze_config_value(value: Any) -> Any:
+            """Recursively convert mutable config values to hashable types.
+
+            Converts dicts, lists, tuples, and sets into nested tuples
+            so that configuration values can be used as dictionary keys.
+
+            Args:
+                value: Configuration value to freeze. Supports nested
+                    dicts, lists, tuples, sets, and scalar values.
+
+            Returns:
+                A hashable representation of the value.
+            """
             if isinstance(value, dict):
                 return tuple((k, _freeze_config_value(v)) for k, v in sorted(value.items()))
             if isinstance(value, (list, tuple)):

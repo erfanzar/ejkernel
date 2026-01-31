@@ -13,6 +13,19 @@
 # limitations under the License.
 
 
+"""Utility functions for Flash Attention Triton kernels.
+
+This module provides helper functions used by both the forward and backward
+pass implementations of Flash Attention, including:
+
+    - ``padded_load``: Triton JIT helper for conditionally masked memory loads
+    - ``calc_bias_strides``: Computes memory strides for bias tensors with broadcasting
+    - ``attention_pack_with_static_shape``: Packs variable-length sequences using attention masks
+    - ``attention_pack_from_cu_static``: Packs using cumulative sequence lengths
+    - ``attention_unpack_with_static_shape``: Reverses packing to restore padded batches
+    - ``basic_attention_refrence``: Reference JAX attention for testing and validation
+"""
+
 import math
 
 import jax

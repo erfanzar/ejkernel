@@ -63,12 +63,19 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
 
 F = tp.TypeVar("F", bound=tp.Callable[..., tp.Any])
+"""TypeVar bound to ``Callable`` for use in decorator type annotations."""
 
 DEBUG_GLOBAL_RNG = None
+"""Global RNG key used by :func:`numeric_gen` and :func:`random_dense` for reproducible test generation."""
 
 CDNA_ARCHS = ["gfx940", "gfx941", "gfx942", "gfx90a", "gfx908"]
+"""AMD CDNA (Compute DNA) architecture identifiers: MI100, MI200, MI300 series GPUs."""
+
 RDNA_ARCHS = ["gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"]
+"""AMD RDNA (Radeon DNA) architecture identifiers: RX 6000, RX 7000 series GPUs."""
+
 Layouts: type = Literal["bhsd", "bshd", "thd"]
+"""Type alias for supported attention tensor layout formats."""
 
 
 @overload
@@ -193,7 +200,8 @@ def safe_autotune(
     try:
         from triton.runtime.autotuner import Autotuner  # type:ignore
 
-        def decorator(fn):
+        def decorator(fn: F) -> F:
+            """Wrap ``fn`` with Triton Autotuner, falling back to ``fn`` on failure."""
             try:
                 return Autotuner(
                     fn,
@@ -215,7 +223,8 @@ def safe_autotune(
     except (Exception, RuntimeError) as err:
         print(f"Couldn't autotune given function due to {err}")
 
-        def decorator(fn):
+        def decorator(fn: F) -> F:
+            """No-op fallback decorator when Triton autotuning is unavailable."""
             return fn
 
         return decorator
@@ -249,13 +258,17 @@ def dtype_index(x: jnp.array) -> int:
 
 
 def get_sharding(arr: jax.Array):
-    """Gets the sharding of an array.
+    """Retrieve the sharding specification of a JAX array.
+
+    Safely extracts the ``sharding`` attribute from a JAX array without
+    raising an error if the array is not sharded.
 
     Args:
-            arr: Array to get sharding from.
+        arr: A JAX array, possibly distributed across devices.
 
     Returns:
-            Sharding of the array.
+        The ``jax.sharding.Sharding`` object if the array is sharded,
+        or ``None`` if the array has no sharding attribute.
     """
     return getattr(arr, "sharding", None)
 
@@ -350,15 +363,17 @@ def narrow(x, dim: int, start: int, length: int):
     return x[tuple(slices)]
 
 
-def get_input_shapes():
+def get_input_shapes() -> list[tuple[int, int, int, int, int, int]]:
     """Generate test input shapes for benchmarking and testing.
 
     Creates a list of input shape configurations with varying batch sizes
-    and sequence lengths for comprehensive kernel testing.
+    and sequence lengths for comprehensive kernel testing. Batch size
+    decreases as sequence length increases to keep total work roughly
+    constant.
 
     Returns:
-        List of tuples containing (batch, ?, seq_len, ?, ?, ?) dimensions
-        for testing various input configurations.
+        List of 6-tuples ``(batch, num_groups, seq_len, heads, gqa_ratio, head_dim)``
+        covering sequence lengths from 256 to 131072 with GQA ratios of 1 and 2.
     """
     cases = [(max(1, 2 ** (16 - i)), 1, 2**i, 16, 1, 128) for i in range(8, 18)] + [
         (max(1, 2 ** (16 - i)), 1, 2**i, 16, 2, 128) for i in range(8, 18)
@@ -604,7 +619,15 @@ def is_fp8(x):
 
 @functools.cache
 def get_gpu_arch() -> str:
-    """Get current GPU architecture."""
+    """Get the architecture identifier string of the current GPU.
+
+    Queries the Triton runtime driver for the active GPU target architecture.
+    Results are cached for the lifetime of the process.
+
+    Returns:
+        Architecture identifier string (e.g., "gfx942", "sm_80"), or an
+        empty string if Triton is not available or the query fails.
+    """
     if triton is None:
         return ""
     try:
@@ -613,11 +636,15 @@ def get_gpu_arch() -> str:
         return ""
 
 
-def arch_supports_fp8():
-    """Check if current GPU architecture supports FP8 operations.
+def arch_supports_fp8() -> bool:
+    """Check if the current GPU architecture supports FP8 arithmetic.
+
+    Currently only AMD MI300 series (gfx942) on the HIP backend provides
+    hardware FP8 support. This function is used as a guard before invoking
+    FP8-specific kernel paths.
 
     Returns:
-        True if running on AMD gfx942 architecture with FP8 support, False otherwise.
+        True if running on AMD HIP with gfx942 architecture, False otherwise.
     """
     return is_hip() and get_gpu_arch() in ("gfx942")
 
@@ -674,6 +701,7 @@ def generate_block_indices(
 
 
 _sync_counter = 0
+"""Global counter for generating unique barrier names in :func:`barrier_sync`."""
 
 
 def barrier_sync(timeout: float = 200):

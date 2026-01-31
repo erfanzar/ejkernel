@@ -40,6 +40,7 @@ from beartype import beartype
 from jaxtyping import Array, Float, Int32
 
 from ejkernel.callib._ejit import ejit
+from ejkernel.errors import EjkernelRuntimeError
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._cuda_impl import unified_attention_cuda
@@ -132,6 +133,18 @@ def unified_attention(
         all registered attention kernel backends.
     """
     del seq_threshold_3d, num_par_softmax_segments, num_warps, num_stages
+
+    reasons: list[str] = []
+    if alibi_slopes is not None:
+        reasons.append("alibi_slopes is not supported")
+    if qq_bias is not None:
+        reasons.append("qq_bias is not supported")
+    if not causal:
+        reasons.append("causal must be True")
+    if queries.shape[-1] > 256:
+        reasons.append("head_dim must be <= 256")
+    if reasons:
+        raise EjkernelRuntimeError("unified_attention (platform=cuda): " + "; ".join(reasons))
 
     return ejit(
         func=unified_attention_cuda,

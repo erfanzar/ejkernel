@@ -84,7 +84,7 @@ from ejkernel.callib import next_power_of_2, strides_from_shape, triton_call
 
 @triton.jit
 def _tanh(x):
-    # Stable tanh via sigmoid.
+    """Compute numerically stable tanh using sigmoid identity: tanh(x) = 2*sigmoid(2x) - 1."""
     return 2 * tl.sigmoid(2 * x) - 1
 
 
@@ -124,6 +124,14 @@ def _decode_stage1(
     HEAD_DIM: tl.constexpr,
     LOGIT_CAP: tl.constexpr,
 ):
+    """Stage 1 Triton kernel: compute partial attention outputs per KV split.
+
+    Each thread block processes one (batch, head, kv_split) combination. It loads
+    the query, iterates over the assigned portion of the KV context using paged
+    addressing, and writes partial attention output and log-sum-exp values.
+
+    The grid shape is (batch, num_q_heads, num_kv_splits).
+    """
     b = tl.program_id(0)
     h = tl.program_id(1)
     split = tl.program_id(2)
@@ -220,6 +228,14 @@ def _decode_stage2(
     NUM_KV_SPLITS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
+    """Stage 2 Triton kernel: combine partial results from all KV splits.
+
+    Each thread block processes one (batch, head) combination. It loads the partial
+    outputs and LSE values from all KV splits, performs numerically stable log-sum-exp
+    reduction, and writes the final attention output and combined LSE.
+
+    The grid shape is (batch, num_q_heads).
+    """
     b = tl.program_id(0)
     h = tl.program_id(1)
 

@@ -54,6 +54,20 @@ def _available_platforms(algorithm: str) -> list[str]:
     return sorted(set(platforms))
 
 
+def _parse_platform_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item for item in value.replace(",", " ").split() if item]
+
+
+def _ignored_platforms(extra: list[str] | None = None) -> set[str]:
+    env_value = os.getenv("EJKERNEL_BENCH_IGNORE_PLATFORMS")
+    items = _parse_platform_list(env_value)
+    if extra:
+        items.extend(extra)
+    return {item.lower() for item in items}
+
+
 def _wrap_op(op_fn: Callable[..., Any], platform: str) -> Callable[..., Any]:
     def _fn(*args):
         out = op_fn(*args, platform=platform)
@@ -236,13 +250,13 @@ def _cfgs_rpa_v2():
 
 def _cfgs_rpa_v3():
     configs = _grid(
-        num_seqs=[2, 4, 8],
-        pages_per_seq=[2, 4],
-        page_size=[16, 32],
-        qheads=[4, 8],
-        kvheads=[2, 4],
-        dim=[64, 128],
-        total_q=[8, 16, 32],
+        num_seqs=[8],
+        pages_per_seq=[128],
+        page_size=[32, 64],
+        qheads=[8],
+        kvheads=[4],
+        dim=[128],
+        total_q=[2048],
     )
     return _limit_configs(configs)
 
@@ -308,9 +322,9 @@ def _cfgs_grouped_matmul():
 
 def _cfgs_quantized_matmul():
     configs = _grid(
-        m=[512, 1024, 2048, 4096, 8192],
-        k=[512, 1024, 2048, 4096, 8192],
-        n=[512, 1024, 2048, 4096, 8192],
+        m=[6144, 8192],
+        k=[4096, 8192],
+        n=[4096, 8192],
         mode=["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"],
     )
     return _limit_configs(configs)
@@ -835,8 +849,14 @@ def _gen_unified_inputs(config: dict[str, Any]):
     return _make_unified_inputs(config)
 
 
-def _build_algorithms(spec: OpBenchmarkSpec) -> dict[str, Callable[..., Any]]:
+def _build_algorithms(
+    spec: OpBenchmarkSpec,
+    *,
+    ignore_platforms: set[str] | None = None,
+) -> dict[str, Callable[..., Any]]:
     platforms = _available_platforms(spec.algorithm)
+    if ignore_platforms:
+        platforms = [platform for platform in platforms if platform.lower() not in ignore_platforms]
     if not platforms:
         return {}
     algorithms: dict[str, Callable[..., Any]] = {}
@@ -851,13 +871,13 @@ def _build_algorithms(spec: OpBenchmarkSpec) -> dict[str, Callable[..., Any]]:
     return algorithms
 
 
-def run_benchmark(op_name: str) -> int:
+def run_benchmark(op_name: str, *, ignore_platforms: list[str] | None = None) -> int:
     spec = SPECS.get(op_name)
     if spec is None:
         print(f"No benchmark spec registered for {op_name}")
         return 1
 
-    algorithms = _build_algorithms(spec)
+    algorithms = _build_algorithms(spec, ignore_platforms=_ignored_platforms(ignore_platforms))
     if not algorithms:
         print(f"No implementations found for {spec.algorithm} on this backend.")
         return 1

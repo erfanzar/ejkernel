@@ -29,6 +29,7 @@ NF4_DTYPES = ("f32", "f16", "bf16")
 
 MXFP_GROUP_SIZE = 32
 NVFP_GROUP_SIZE = 16
+GROUP_SIZES = list(range(8, 1025))
 
 PRELUDE = """// Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 //
@@ -54,6 +55,8 @@ void {func_name}({signature}) {{
   dequant_affine_int<{bits}, {ctype}, {ctype}><<<grid, block, 0, stream>>>(
       wq, scales, biases, out, K, N, n_words, group_size, n_groups);
 }}
+
+{gs_wrappers}
 """
 
 NF4_TEMPLATE = """#include \"qmm_dequant_kernels.h\"
@@ -62,6 +65,8 @@ void {func_name}({signature}) {{
   dequant_nf4_int<4, {ctype}><<<grid, block, 0, stream>>>(
       wq, scales, out, K, N, n_words, group_size, n_groups);
 }}
+
+{gs_wrappers}
 """
 
 MXFP_TEMPLATE = """#include \"qmm_dequant_kernels.h\"
@@ -147,19 +152,62 @@ class Kernel:
             "dim3 grid, dim3 block, cudaStream_t stream"
         )
 
+    def gs_func_name(self, group_size: int) -> str:
+        if self.kind == "affine":
+            return (
+                f"LaunchDequantAffineBits{self.bits}"
+                f"{DTYPE_SUFFIX[self.dtype]}Gs{group_size}"
+            )
+        if self.kind == "nf4":
+            return f"LaunchDequantNf4{DTYPE_SUFFIX[self.dtype]}Gs{group_size}"
+        raise ValueError(f"Group size specialization not supported: {self.kind}")
+
     def render(self) -> str:
         if self.kind == "affine":
+            gs_wrappers = []
+            for group_size in GROUP_SIZES:
+                gs_wrappers.append(
+                    "void {func_name}({signature}) {{\n"
+                    "  (void)group_size;\n"
+                    "  dequant_affine_int_gs<{bits}, {group_size}, {ctype}, {ctype}>"
+                    "<<<grid, block, 0, stream>>>(wq, scales, biases, out, K, N, "
+                    "n_words, n_groups);\n"
+                    "}}\n".format(
+                        func_name=self.gs_func_name(group_size),
+                        signature=self.signature(),
+                        bits=self.bits,
+                        group_size=group_size,
+                        ctype=self.ctype,
+                    )
+                )
             return AFFINE_TEMPLATE.format(
                 func_name=self.func_name,
                 signature=self.signature(),
                 bits=self.bits,
                 ctype=self.ctype,
+                gs_wrappers="".join(gs_wrappers),
             )
         if self.kind == "nf4":
+            gs_wrappers = []
+            for group_size in GROUP_SIZES:
+                gs_wrappers.append(
+                    "void {func_name}({signature}) {{\n"
+                    "  (void)group_size;\n"
+                    "  dequant_nf4_int_gs<4, {group_size}, {ctype}>"
+                    "<<<grid, block, 0, stream>>>(wq, scales, out, K, N, n_words, "
+                    "n_groups);\n"
+                    "}}\n".format(
+                        func_name=self.gs_func_name(group_size),
+                        signature=self.signature(),
+                        group_size=group_size,
+                        ctype=self.ctype,
+                    )
+                )
             return NF4_TEMPLATE.format(
                 func_name=self.func_name,
                 signature=self.signature(),
                 ctype=self.ctype,
+                gs_wrappers="".join(gs_wrappers),
             )
         if self.kind == "mxfp4":
             return MXFP_TEMPLATE.format(
@@ -217,6 +265,73 @@ def _render_dispatch_header(kernels: list[Kernel]) -> str:
     lines = [PRELUDE, DISPATCH_HEADER_PREAMBLE]
     for kernel in kernels:
         lines.append(f"void {kernel.func_name}({kernel.signature()});\n")
+        if kernel.kind in ("affine", "nf4"):
+            for group_size in GROUP_SIZES:
+                lines.append(
+                    f"void {kernel.gs_func_name(group_size)}("
+                    f"{kernel.signature()});\n"
+                )
+    lines.append("\n")
+    lines.append("using DequantAffineF32Fn = void (*)(")
+    lines.append(
+        "const uint32_t *, const float *, const float *, half *, int64_t, int64_t,"
+        " int64_t, int64_t, int64_t, dim3, dim3, cudaStream_t);\n"
+    )
+    lines.append("using DequantAffineF16Fn = void (*)(")
+    lines.append(
+        "const uint32_t *, const half *, const half *, half *, int64_t, int64_t,"
+        " int64_t, int64_t, int64_t, dim3, dim3, cudaStream_t);\n"
+    )
+    lines.append("using DequantAffineBF16Fn = void (*)(")
+    lines.append(
+        "const uint32_t *, const __nv_bfloat16 *, const __nv_bfloat16 *, half *,"
+        " int64_t, int64_t, int64_t, int64_t, int64_t, dim3, dim3, cudaStream_t);\n"
+    )
+    lines.append("using DequantNf4F32Fn = void (*)(")
+    lines.append(
+        "const uint32_t *, const float *, half *, int64_t, int64_t, int64_t,"
+        " int64_t, int64_t, dim3, dim3, cudaStream_t);\n"
+    )
+    lines.append("using DequantNf4F16Fn = void (*)(")
+    lines.append(
+        "const uint32_t *, const half *, half *, int64_t, int64_t, int64_t,"
+        " int64_t, int64_t, dim3, dim3, cudaStream_t);\n"
+    )
+    lines.append("using DequantNf4BF16Fn = void (*)(")
+    lines.append(
+        "const uint32_t *, const __nv_bfloat16 *, half *, int64_t, int64_t,"
+        " int64_t, int64_t, int64_t, dim3, dim3, cudaStream_t);\n"
+    )
+    lines.append("\n")
+
+    for kernel in kernels:
+        if kernel.kind not in ("affine", "nf4"):
+            continue
+        if kernel.kind == "affine":
+            if kernel.dtype == "f32":
+                ret = "DequantAffineF32Fn"
+            elif kernel.dtype == "f16":
+                ret = "DequantAffineF16Fn"
+            else:
+                ret = "DequantAffineBF16Fn"
+        else:
+            if kernel.dtype == "f32":
+                ret = "DequantNf4F32Fn"
+            elif kernel.dtype == "f16":
+                ret = "DequantNf4F16Fn"
+            else:
+                ret = "DequantNf4BF16Fn"
+        lines.append(
+            f"inline {ret} Resolve{kernel.func_name}(int64_t group_size) {{\n"
+        )
+        lines.append("  switch (group_size) {\n")
+        for group_size in GROUP_SIZES:
+            lines.append(
+                f"  case {group_size}: return &{kernel.gs_func_name(group_size)};\n"
+            )
+        lines.append(f"  default: return &{kernel.func_name};\n")
+        lines.append("  }\n")
+        lines.append("}\n\n")
     return "".join(lines)
 
 

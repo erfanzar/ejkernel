@@ -68,6 +68,39 @@ def _ragged_paged_attention(
     sliding_window: int | None = None,
     softmax_aux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
+    """Compute ragged paged attention V2 forward pass.
+
+    Processes variable-length sequences packed together, where each
+    sequence's KV cache is stored in non-contiguous pages. Uses online
+    softmax for memory-efficient attention computation over blocked
+    query and KV tiles.
+
+    The algorithm processes sequences one at a time, with each sequence's
+    queries divided into blocks of size ``qblocks`` and KV pages grouped
+    into blocks of size ``kvblocks``. Attention is accumulated using the
+    online softmax trick (maintaining running max and sum-of-exp) to avoid
+    materializing the full attention matrix.
+
+    Args:
+        queries: Packed query tokens [total_query_tokens, num_q_heads, head_size].
+        kv_pages: Interleaved KV cache pages
+            [num_pages, page_size, num_kv_heads * 2, head_dim] where K and V
+            are interleaved along the head dimension.
+        context_lens: Context length for each sequence [num_seqs].
+        block_tables: Page table mapping [num_seqs, max_pages].
+            Maps logical pages to physical pages for each sequence.
+        query_start_loc: Cumulative query token counts [num_seqs + 1].
+        num_seqs: Number of sequences in the batch (scalar or 1-element array).
+        softmax_scale: Scaling factor for QK^T dot products.
+        logits_soft_cap: Optional soft cap for attention logits via tanh.
+        compute_dtype: Data type for intermediate computations.
+        sliding_window: Optional sliding window size for local attention.
+        softmax_aux: Optional per-head attention sink logits [num_q_heads].
+            Initializes the online softmax with sink contributions.
+
+    Returns:
+        Attention output [total_query_tokens, num_q_heads, head_size].
+    """
     total_query_tokens, num_q_heads, head_size = queries.shape
     page_size = kv_pages.shape[1]
     num_kv_heads = kv_pages.shape[2] // 2
@@ -103,12 +136,45 @@ def _ragged_paged_attention(
         sinks_h = softmax_aux.reshape(num_kv_heads, q_heads_per_group)
 
     def _compute_attention_for_sequence(seq_idx, output_accumulator):
+        """Process attention for a single sequence in the ragged batch.
+
+        Determines the query range for this sequence and dispatches to
+        the block-level attention computation if there are queries.
+
+        Args:
+            seq_idx: Index of the current sequence.
+            output_accumulator: Running output buffer being updated.
+
+        Returns:
+            Updated output_accumulator with this sequence's results.
+        """
         num_queries_for_seq = query_start_loc[seq_idx + 1] - query_start_loc[seq_idx]
 
         def _process_sequence_with_queries():
+            """Execute attention computation for a sequence with one or more queries.
+
+            Divides the sequence's queries into blocks and processes each
+            block against the full KV cache using the online softmax algorithm.
+
+            Returns:
+                Updated output_accumulator with this sequence's attention results.
+            """
             num_query_blocks = (num_queries_for_seq + qblocks - 1) // qblocks
 
             def _process_query_block(query_block_idx, block_output_accumulator):
+                """Process one query block against the entire KV cache.
+
+                Loads a block of queries, iterates over all KV blocks using
+                online softmax to accumulate the attention output, then
+                writes the normalized result back to the output buffer.
+
+                Args:
+                    query_block_idx: Index of the current query block.
+                    block_output_accumulator: Output buffer being updated.
+
+                Returns:
+                    Updated block_output_accumulator.
+                """
                 query_block_offset = query_block_idx * qblocks
                 q_global_start = query_start_loc[seq_idx] + query_block_offset
                 query_block = jax.lax.dynamic_slice(
@@ -129,6 +195,20 @@ def _ragged_paged_attention(
                 num_kv_blocks = (kv_cache_len_for_seq + kv_tokens_per_block - 1) // kv_tokens_per_block
 
                 def _process_kv_block(kv_block_idx, online_softmax_carry):
+                    """Process one KV block and update the online softmax state.
+
+                    Gathers KV pages for this block, computes attention scores
+                    with causal and validity masking, and updates the running
+                    max, sum-of-exponentials, and weighted value accumulator.
+
+                    Args:
+                        kv_block_idx: Index of the current KV block.
+                        online_softmax_carry: Tuple of (output_block, sum_exp_block,
+                            max_score_block) representing the online softmax state.
+
+                    Returns:
+                        Updated (output_block, sum_exp_block, max_score_block).
+                    """
                     output_block, sum_exp_block, max_score_block = online_softmax_carry
 
                     page_map_start = kv_block_idx * kvblocks

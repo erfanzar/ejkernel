@@ -78,6 +78,8 @@ Internal Functions:
     _dtype_to_code: Convert dtype to integer code for JIT compilation caching
 """
 
+from __future__ import annotations
+
 import math
 
 import chex
@@ -88,7 +90,12 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int, PRNGKeyArray
 
+PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
+DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
+BlockTables = Int[Array, "batch max_blocks"]
+
 from ejkernel.callib._ejit import ejit
+from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -498,8 +505,8 @@ def _flash_attention_core(
 @jaxtyping.jaxtyped(typechecker=beartype)
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+    key: DenseKV | PagedKV,
+    value: DenseKV | PagedKV,
     attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
     | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
     | None = None,
@@ -521,7 +528,7 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-    block_tables: Int[Array, "batch max_blocks"] | None = None,
+    block_tables: BlockTables | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention with memory-efficient chunked computation.
 
@@ -591,12 +598,15 @@ def flash_attention(
         CUDA support, consider using the Triton-based flash_attention for
         potentially better performance.
     """
+    reasons: list[str] = []
     if cum_seqlens_k is not None and attention_mask is None:
-        raise NotImplementedError("`cum_seqlens_k` is not implemented in xla!")
+        reasons.append("cum_seqlens_k requires attention_mask on XLA")
     if cum_seqlens_q is not None and attention_mask is None:
-        raise NotImplementedError("`cum_seqlens_q` is not implemented in xla!")
+        reasons.append("cum_seqlens_q requires attention_mask on XLA")
     if block_tables is not None:
-        raise ValueError("paged_kv is only supported by the CUDA flash attention backend.")
+        reasons.append("block_tables (paged_kv) is not supported")
+    if reasons:
+        raise EjkernelRuntimeError("flash_attention (platform=xla): " + "; ".join(reasons))
 
     dropout_key = None
     if dropout_prob > 0.0:

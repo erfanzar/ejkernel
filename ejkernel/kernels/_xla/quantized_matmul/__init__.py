@@ -12,7 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""XLA quantized matmul implementation."""
+"""XLA backend for quantized matrix multiplication.
+
+This submodule provides an XLA/JAX implementation of quantized matrix
+multiplication supporting multiple quantization modes: affine (linear
+scale+bias), NF4 (NormalFloat codebook), MXFP4/MXFP8 (Microscaling),
+and NVFP4/NVFP8 (NVIDIA floating point).
+
+When possible, a blocked algorithm with fused on-the-fly dequantization
+is used to avoid materializing the full weight matrix. For incompatible
+shapes or bit-widths, it falls back to a two-step dequantize+matmul path.
+
+Key Features:
+    - Multiple quantization modes (affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8)
+    - Blocked tiled matmul with fused dequantization
+    - Automatic fallback for unsupported configurations
+    - Configurable tile sizes and compute precision
+"""
 
 from ._interface import quantized_matmul
 

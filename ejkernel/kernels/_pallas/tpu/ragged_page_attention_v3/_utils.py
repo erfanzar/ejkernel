@@ -88,15 +88,44 @@ import jax.numpy as jnp
 
 
 def cdiv(a, b):
+    """Compute ceiling division of a by b.
+
+    Args:
+        a: Dividend (numerator).
+        b: Divisor (denominator). Must be non-zero.
+
+    Returns:
+        The smallest integer >= a/b.
+    """
     assert b != 0
     return (a + b - 1) // b
 
 
 def align_to(x, a):
+    """Round x up to the nearest multiple of a.
+
+    Args:
+        x: Value to align.
+        a: Alignment boundary. Must be non-zero.
+
+    Returns:
+        The smallest multiple of a that is >= x.
+    """
     return cdiv(x, a) * a
 
 
 def get_dtype_bitwidth(dtype):
+    """Return the bit width of a JAX/NumPy dtype.
+
+    Handles both floating-point and integer types by trying finfo first,
+    then falling back to iinfo.
+
+    Args:
+        dtype: A JAX or NumPy dtype (e.g., jnp.bfloat16, jnp.int8).
+
+    Returns:
+        Number of bits per element for the given dtype.
+    """
     try:
         return jnp.finfo(dtype).bits
     except Exception:
@@ -104,6 +133,19 @@ def get_dtype_bitwidth(dtype):
 
 
 def get_dtype_packing(dtype):
+    """Compute the packing factor for a dtype relative to 32-bit words.
+
+    Determines how many elements of the given dtype fit within a single
+    32-bit word. Used for TPU's packed memory layout where sub-32-bit
+    types are packed together.
+
+    Args:
+        dtype: A JAX or NumPy dtype.
+
+    Returns:
+        Number of elements that pack into a 32-bit word (e.g., 1 for
+        float32, 2 for bfloat16/float16, 4 for int8).
+    """
     bits = get_dtype_bitwidth(dtype)
     return 32 // bits
 
@@ -124,6 +166,23 @@ def next_power_of_2(x: int):
 
 
 def get_device_name(num_devices: int | None = None):
+    """Detect the TPU device name with normalized variant suffix.
+
+    Normalizes device kind strings from JAX into a canonical form like
+    "TPU v5e", "TPU v5p", "TPU v6e", or "TPU v7". Optionally appends
+    the device count for multi-chip configurations.
+
+    Args:
+        num_devices: Optional device count to append (e.g., 4 yields
+            "TPU v5e-4"). Defaults to None (no suffix).
+
+    Returns:
+        Normalized TPU device name string.
+
+    Raises:
+        RuntimeError: If no TPU devices are found.
+        AssertionError: If device kind string is malformed.
+    """
     kind = jax.devices()[0].device_kind
     if "TPU" not in kind:
         raise RuntimeError("Expected TPU devices")
@@ -4412,7 +4471,29 @@ def get_tuned_block_sizes_h64(
     max_num_tokens,
     pages_per_seq,
 ) -> tuple[int, int]:
-    """Search tuned values for (num_kv_pages_per_blk, num_queries_per_blk)."""
+    """Search tuned block sizes for head_dim=64 attention configurations.
+
+    Looks up empirically tuned (bkv_pages, bq_size) values from the
+    TUNED_BLOCK_SIZES table for head_dim=64 models. Falls back to
+    TPU-version-specific defaults when no exact match is found.
+
+    Args:
+        q_dtype: Query tensor dtype (e.g., jnp.bfloat16).
+        kv_dtype: KV cache dtype (e.g., jnp.bfloat16, jnp.int8).
+        actual_num_q_heads: Number of query attention heads.
+        actual_num_kv_heads: Number of KV attention heads.
+        head_dim: Head dimension (must be 64).
+        page_size: Number of tokens per KV cache page.
+        max_num_tokens: Maximum number of tokens in the batch.
+        pages_per_seq: Maximum pages allocated per sequence.
+
+    Returns:
+        Tuple of (num_kv_pages_per_block, num_queries_per_block),
+        clamped to the available pages_per_seq and max_num_tokens.
+
+    Raises:
+        NotImplementedError: If TPU version is less than 4.
+    """
 
     tpu_version = get_tpu_version()
     if tpu_version < 4:
@@ -4453,7 +4534,24 @@ def get_lookup_keys_h64(
     head_dim,
     max_model_len,
 ):
-    """Get the lookup keys for tuned block sizes."""
+    """Build hierarchical lookup keys for the head_dim=64 tuning table.
+
+    Constructs a tuple of keys used to index into TUNED_BLOCK_SIZES.
+    Keys are normalized using power-of-2 rounding and dtype-aware
+    packing for consistent lookup across similar configurations.
+
+    Args:
+        page_size: Number of tokens per KV cache page.
+        q_dtype: Query dtype.
+        kv_dtype: KV cache dtype.
+        num_q_heads: Number of query attention heads.
+        num_kv_heads: Number of KV attention heads.
+        head_dim: Head dimension (must be 64).
+        max_model_len: Maximum model context length in tokens.
+
+    Returns:
+        Tuple of (device_name, page_size, dtype_key, head_key, max_len).
+    """
     (
         page_size,
         q_dtype_name,
@@ -4490,7 +4588,26 @@ def get_simplified_raw_key_h64(
     head_dim,
     max_model_len,
 ):
-    """Get the simplified key."""
+    """Compute simplified, normalized key components for head_dim=64 lookup.
+
+    Normalizes attention configuration parameters into canonical forms
+    for consistent tuning table lookup. Unlike the standard variant,
+    this uses single-head KV packing (no x2 interleaving) since
+    head_dim=64 concatenates K and V within one head dimension.
+
+    Args:
+        page_size: Number of tokens per KV cache page.
+        q_dtype: Query dtype.
+        kv_dtype: KV cache dtype.
+        actual_num_q_heads: Number of query attention heads.
+        actual_num_kv_heads: Number of KV attention heads.
+        head_dim: Head dimension (must be 64).
+        max_model_len: Maximum model context length in tokens.
+
+    Returns:
+        Tuple of (page_size, q_dtype_name, kv_dtype_name, num_q_heads,
+        num_kv_heads, head_dim, max_model_len) all normalized.
+    """
     assert head_dim == 64
     assert actual_num_q_heads % actual_num_kv_heads == 0
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
@@ -4520,7 +4637,30 @@ def get_tuned_block_sizes(
     max_num_tokens,
     pages_per_seq,
 ) -> tuple[int, int]:
-    """Search tuned values for (num_kv_pages_per_blk, num_queries_per_blk)."""
+    """Search tuned block sizes for standard attention configurations (head_dim >= 128).
+
+    Looks up empirically tuned (bkv_pages, bq_size) values from the
+    TUNED_BLOCK_SIZES table for standard head dimensions (128, 256).
+    Falls back to TPU-version-specific defaults when no exact match
+    is found in the tuning table.
+
+    Args:
+        q_dtype: Query tensor dtype (e.g., jnp.bfloat16).
+        kv_dtype: KV cache dtype (e.g., jnp.bfloat16, jnp.int8).
+        actual_num_q_heads: Number of query attention heads.
+        actual_num_kv_heads: Number of KV attention heads.
+        head_dim: Head dimension (typically 128 or 256, already padded).
+        page_size: Number of tokens per KV cache page.
+        max_num_tokens: Maximum number of tokens in the batch.
+        pages_per_seq: Maximum pages allocated per sequence.
+
+    Returns:
+        Tuple of (num_kv_pages_per_block, num_queries_per_block),
+        clamped to the available pages_per_seq and max_num_tokens.
+
+    Raises:
+        NotImplementedError: If TPU version is less than 4.
+    """
 
     tpu_version = get_tpu_version()
     if tpu_version < 4:
@@ -4560,7 +4700,24 @@ def get_lookup_keys(
     head_dim,
     max_model_len,
 ):
-    """Get the lookup keys for tuned block sizes."""
+    """Build hierarchical lookup keys for the standard tuning table.
+
+    Constructs a tuple of keys used to index into TUNED_BLOCK_SIZES
+    for head_dim >= 128 configurations. Keys are normalized using
+    power-of-2 rounding and dtype-aware packing.
+
+    Args:
+        page_size: Number of tokens per KV cache page.
+        q_dtype: Query dtype.
+        kv_dtype: KV cache dtype.
+        num_q_heads: Number of query attention heads.
+        num_kv_heads: Number of KV attention heads.
+        head_dim: Head dimension (128 or 256).
+        max_model_len: Maximum model context length in tokens.
+
+    Returns:
+        Tuple of (device_name, page_size, dtype_key, head_key, max_len).
+    """
     (
         page_size,
         q_dtype_name,
@@ -4597,7 +4754,25 @@ def get_simplified_raw_key(
     head_dim,
     max_model_len,
 ):
-    """Get the simplified key."""
+    """Compute simplified, normalized key components for standard lookup.
+
+    Normalizes attention configuration parameters into canonical forms
+    for consistent tuning table lookup. Uses x2 interleaved KV head
+    packing where keys and values are stored together per head.
+
+    Args:
+        page_size: Number of tokens per KV cache page.
+        q_dtype: Query dtype.
+        kv_dtype: KV cache dtype.
+        actual_num_q_heads: Number of query attention heads.
+        actual_num_kv_heads: Number of KV attention heads.
+        head_dim: Head dimension (128 or 256).
+        max_model_len: Maximum model context length in tokens.
+
+    Returns:
+        Tuple of (page_size, q_dtype_name, kv_dtype_name, num_q_heads,
+        num_kv_heads, head_dim, max_model_len) all normalized.
+    """
     assert actual_num_q_heads % actual_num_kv_heads == 0
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     q_packing = get_dtype_packing(q_dtype)

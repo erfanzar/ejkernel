@@ -178,21 +178,31 @@ def ragged_decode_mqa(
     block_size: int = 256,
     cost_estimate: pl.CostEstimate | None = None,
 ) -> jax.Array:
-    """
-    Runs ragged MQA decoding using a Flash Attention Pallas kernel.
+    """Run ragged multi-query attention decoding using a Flash Attention Pallas kernel.
+
+    Processes a single-head group (after vmapping over KV heads). Each batch element
+    has variable sequence boundaries, and the kernel processes KV blocks respecting
+    those boundaries with masking.
+
+    The KV sequence is padded to align with block_size and processed in blocks.
+    Each block computes partial attention scores, applies boundary masking, and
+    updates running softmax statistics (max and normalization factor).
 
     Args:
-        query (chex.Array): Query tensor of shape [B, H, D].
-        key (chex.Array): Key tensor of shape [B, S, H, D].
-        value (chex.Array): Value tensor of shape [B, S, H, D].
-        sequence_start (chex.Array): Start indices of each sequence [B].
-        sequence_end (chex.Array): End indices of each sequence [B].
-        softmax_scale (float | None): Optional scale for attention logits.
-        block_size (int): Number of tokens processed per block.
-        cost_estimate (pl.CostEstimate | None): Optional cost model for Pallas.
+        query: Query tensor of shape [batch, num_heads_per_group, head_dim] for
+            a single KV head group.
+        key: Key tensor of shape [batch, seq_len, head_dim] for one KV head.
+        value: Value tensor of shape [batch, seq_len, head_dim] for one KV head.
+        sequence_start: Int32 array of shape [batch] with start indices.
+        sequence_end: Int32 array of shape [batch] with end indices.
+        softmax_scale: Scaling factor for attention logits. Defaults to
+            1/sqrt(head_dim) if None.
+        block_size: Number of KV tokens processed per Pallas grid iteration.
+            Clamped to seq_len if larger. Defaults to 256.
+        cost_estimate: Optional Pallas cost estimate for scheduling optimization.
 
     Returns:
-        jax.Array: output array.
+        Attention output of shape [batch, num_heads_per_group, head_dim] in float32.
     """
     batch_size, num_heads, head_dim = query.shape
 
@@ -267,16 +277,28 @@ def inner_decode_tpu(
 ) -> chex.Array:
     """JIT-compiled core implementation of ragged MQA Flash Attention for TPU.
 
+    Orchestrates the ragged decode attention by reshaping queries for GQA,
+    transposing KV tensors, and vmapping ``ragged_decode_mqa`` over KV head
+    groups. Handles both 3D [B, H, D] and 4D [B, 1, H, D] query formats.
+
     Args:
-        query (chex.Array): Query tensor, optionally with leading singleton dimension.
-        key (chex.Array): Key tensor of shape [B, S, H, D].
-        value (chex.Array): Value tensor of shape [B, S, H, D].
-        sequence_start (chex.Array): Sequence start indices.
-        sequence_end (chex.Array): Sequence end indices.
-        softmax_scale (float | None): Scaling factor for attention logits.
+        query: Query tensor of shape [batch, num_q_heads, head_dim] or
+            [batch, 1, num_q_heads, head_dim].
+        key: Key tensor of shape [batch, seq_len, num_kv_heads, head_dim].
+        value: Value tensor of shape [batch, seq_len, num_kv_heads, head_dim].
+        sequence_start: Int32 array of shape [batch] with per-sequence start indices.
+        sequence_end: Int32 array of shape [batch] with per-sequence end indices.
+        softmax_scale: Scaling factor for attention logits. Defaults to
+            1/sqrt(head_dim) if None.
+        fwd_params: Forward pass parameters controlling block sizes. If None,
+            defaults to q_blocksize=1, kv_blocksize=min(seq_len, 128).
+        sliding_window: Optional (left, right) window sizes for local attention.
+        logits_soft_cap: Optional soft capping value for attention logits.
+        softmax_aux: Optional auxiliary logits for attention sinks.
 
     Returns:
-        chex.Array: Output tensor of shape [B, H, D].
+        Attention output tensor reshaped to match the input query format,
+        either [batch, num_q_heads, head_dim] or [batch, 1, num_q_heads, head_dim].
     """
 
     if softmax_scale is None:

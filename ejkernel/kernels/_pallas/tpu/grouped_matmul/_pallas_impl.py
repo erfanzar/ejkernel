@@ -13,6 +13,23 @@
 # limitations under the License.
 
 
+"""Pallas TPU kernel implementations for grouped matrix multiplication.
+
+This module contains the low-level Pallas kernel implementations for both
+grouped_matmul and transposed_grouped_matmul operations on TPU. These kernels
+handle the tiled computation, group metadata management, and efficient memory
+access patterns required for high-performance grouped matrix operations.
+
+Key components:
+- ``grouped_matmul``: Core JIT-compiled grouped matmul with TPU-optimized kernels
+- ``transposed_grouped_matmul``: Transposed variant for backward pass gradient computation
+- ``make_group_metadata``: Creates tile-to-group mapping metadata for the kernel grid
+- Helper functions for validation, masking, and memory management
+
+The kernels use Pallas BlockSpecs for memory prefetching and VMEM scratch space
+for accumulation, minimizing HBM bandwidth requirements.
+"""
+
 import functools
 from collections.abc import Callable
 from functools import partial

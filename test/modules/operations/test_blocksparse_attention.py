@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.modules.operations import blocksparse_attention
 from ejkernel.types import MaskInfo
 
@@ -90,5 +91,5 @@ def test_blocksparse_attention_bias_raises_on_xla():
     v_t = v.transpose(0, 2, 1, 3)
 
     bias = jnp.zeros((1, 4, 8, 8), dtype=jnp.bfloat16)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(EjkernelRuntimeError):
         blocksparse_attention(q_t, k_t, v_t, None, bias, platform="xla")

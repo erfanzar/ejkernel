@@ -59,7 +59,8 @@ from jax import numpy as jnp
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
-from ejkernel.kernels._registry import Backend, Platform, kernel_registry
+from ejkernel.errors import EjkernelRuntimeError
+from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     BwdParams,
@@ -76,6 +77,10 @@ from ejkernel.types.mask import MaskInfo
 
 from ..base import detect_platform
 from .configs import FlashAttentionConfig
+
+PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
+DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
+BlockTables = Int[Array, "batch max_blocks"]
 
 
 class FlashAttention(Kernel[FlashAttentionConfig, Array]):
@@ -125,11 +130,13 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
     def create_shard_map_wrapper(
         self,
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
-        key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-        | None = None,
+        key: DenseKV | PagedKV,
+        value: DenseKV | PagedKV,
+        attention_mask: (
+            Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+            | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+            | None
+        ) = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         softmax_scale: float | None = None,
         dropout_prob: float = 0.0,
@@ -137,7 +144,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         dropout_seed: int | None = None,
         cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
         cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
-        block_tables: Int[Array, "batch max_blocks"] | None = None,
+        block_tables: BlockTables | None = None,
         sliding_window: int | tuple[int, int] | None = None,
         logits_soft_cap: float | None = None,
         softmax_aux: Float[Array, "num_sinks"] | None = None,
@@ -178,7 +185,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
             cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
             attention_mask: Int[Array, "batch num_heads seq_len kv_len"] | None = None,
-            block_tables: Int[Array, "batch max_blocks"] | None = None,
+            block_tables: BlockTables | None = None,
             q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
             kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         ) -> Float[Array, "batch num_heads seq_len head_dim"]:
@@ -245,18 +252,24 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         """
         return kernel_registry.get(
             algorithm="flash_attention",
-            platform=detect_platform("flash_attention", cfg.platform),
+            platform=detect_platform(
+                "flash_attention",
+                cfg.platform,
+                prefer_cuda=True,
+            ),
             backend=cfg.backend,
         )
 
     def run(
         self,
         query: Float[Array, "batch seq_len_q num_heads head_dim"],
-        key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-        | None = None,
+        key: DenseKV | PagedKV,
+        value: DenseKV | PagedKV,
+        attention_mask: (
+            Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+            | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+            | None
+        ) = None,
         bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
         softmax_scale: float | None = None,
         dropout_prob: float = 0.0,
@@ -264,7 +277,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         dropout_seed: int | None = None,
         cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
         cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
-        block_tables: Int[Array, "batch max_blocks"] | None = None,
+        block_tables: BlockTables | None = None,
         sliding_window: int | tuple[int, int] | None = None,
         logits_soft_cap: float | None = None,
         softmax_aux: Float[Array, "num_sinks"] | None = None,
@@ -787,13 +800,13 @@ _flash_executor: Executor[FlashAttentionConfig, Array] = Executor(
 
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+    key: DenseKV | PagedKV,
+    value: DenseKV | PagedKV,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
     cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
     softmax_aux: Float[Array, "num_sinks"] | None = None,
-    block_tables: Int[Array, "batch max_blocks"] | None = None,
+    block_tables: BlockTables | None = None,
     /,
     *,
     mask_info: MaskInfo | None = None,
@@ -870,7 +883,9 @@ def flash_attention(
 
     if block_tables is not None:
         if platform not in (None, "auto", "cuda"):
-            raise ValueError("paged_kv flash attention is only supported on the CUDA backend.")
+            raise EjkernelRuntimeError(
+                f"flash_attention (platform={platform}): block_tables (paged_kv) is only supported on CUDA"
+            )
         if platform in (None, "auto"):
             platform = "cuda"
 

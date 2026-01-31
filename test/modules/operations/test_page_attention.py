@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.modules.operations import page_attention
 
 from ._utils import assert_allclose, dense_attention_reference, device_platform
@@ -86,7 +87,7 @@ def test_page_attention_xla_rejects_attn_logits_soft_cap():
     block_tables = jnp.arange(num_blocks, dtype=jnp.int32).reshape(num_seqs, pages_per_seq)
     context_lens = jnp.array([block_size * pages_per_seq], dtype=jnp.int32)
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(EjkernelRuntimeError):
         page_attention(q, k_cache, v_cache, context_lens, block_tables, attn_logits_soft_cap=10.0, platform="xla")
 
 

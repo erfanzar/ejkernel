@@ -73,12 +73,25 @@ from ejkernel.callib import triton_call
 
 @triton.jit
 def _cdiv(x, y):
+    """Compute ceiling division of x by y in Triton device code."""
     return (x + y - 1) // y
 
 
 @triton.jit
 def _apply_softcap(scores, cap):
-    # stable tanh via exp
+    """Apply logit soft-capping via stable tanh using exponentials.
+
+    Computes ``cap * tanh(scores / cap)`` to bound attention logits, using
+    the identity ``tanh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))``
+    for numerical stability on GPU.
+
+    Args:
+        scores: Attention logit scores to be capped.
+        cap: Soft-cap value controlling the maximum logit magnitude.
+
+    Returns:
+        Capped scores bounded to the range ``(-cap, +cap)``.
+    """
     s = scores / cap
     p1 = tl.exp(s)
     p2 = tl.exp(-s)
@@ -93,6 +106,29 @@ def _find_seq_idx(
     BLOCK_Q: tl.constexpr,
     use_q_block_mode: tl.constexpr,
 ):
+    """Find the sequence index that owns a given query position via binary search.
+
+    Performs a binary search over the ``query_start_len_ptr`` cumulative-offset
+    array to locate which sequence owns the given ``target_idx``.
+
+    When ``use_q_block_mode`` is True, the search operates on block-level
+    indices: the cumulative start value is converted to a block index via
+    ``val // BLOCK_Q + seq_idx`` to account for the inter-sequence block
+    padding. When False, the raw token-level values are compared directly.
+
+    Args:
+        query_start_len_ptr: Pointer to cumulative query start offsets,
+            shape ``(num_seqs + 1,)``.
+        target_idx: The global query block index (block mode) or token
+            index (token mode) to locate.
+        num_seqs: Number of sequences in the batch.
+        BLOCK_Q: Number of query tokens per block (compile-time constant).
+        use_q_block_mode: If True, search in block-index space; if False,
+            search in token-index space.
+
+    Returns:
+        The 0-based sequence index that contains ``target_idx``.
+    """
     left: tl.int32 = 0  # type:ignore
     right = num_seqs
     while left < right:
@@ -149,6 +185,55 @@ def _unified_attention_2d(
     BLOCK_Q: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
+    """Standard 2D unified attention kernel for prefill and moderate-length decode.
+
+    Each program instance handles one (query_block, kv_head) pair. It iterates
+    through the full KV context (up to the causal boundary) using tiled matrix
+    operations and online softmax accumulation. Supports grouped-query attention
+    (GQA) by interleaving multiple query heads within a single block.
+
+    The kernel uses online softmax to compute attention in a single forward pass
+    without materializing the full attention matrix. For each KV tile, it
+    computes QK^T scores, applies optional modifiers (soft-cap, ALiBi,
+    query-query bias, sliding window, causal mask), and updates the running
+    softmax statistics (max, exp-sum) and accumulated output.
+
+    Grid: ``(total_q_blocks, num_kv_heads)``
+
+    Args:
+        query_ptr: Query tensor pointer, shape ``(total_tokens, num_q_heads, head_dim)``.
+        key_cache_ptr: Key cache pointer, shape ``(num_blocks, block_size, num_kv_heads, head_dim)``.
+        value_cache_ptr: Value cache pointer, same shape as key cache.
+        sink_ptr: Attention sink scores pointer, shape ``(num_q_heads,)``.
+        block_tables_ptr: Block table pointer mapping sequences to physical blocks.
+        seq_lens_ptr: Total sequence lengths (context + query) per sequence.
+        alibi_slopes_ptr: ALiBi slope pointer, shape ``(num_q_heads,)``.
+        qq_bias_ptr: Query-query bias matrix pointer.
+        query_start_len_ptr: Cumulative query start offsets, shape ``(num_seqs + 1,)``.
+        scale: Softmax scaling factor (typically ``1/sqrt(head_dim)``).
+        softcap: Logit soft-capping value (0 to disable).
+        block_table_stride: Stride between block table rows.
+        query_stride_0, query_stride_1: Query tensor strides.
+        output_stride_0, output_stride_1: Output tensor strides.
+        qq_bias_stride_0: Row stride of the query-query bias matrix.
+        stride_k_cache_0..3: Key cache strides for each dimension.
+        stride_v_cache_0..3: Value cache strides for each dimension.
+        num_seqs: Number of sequences in the batch.
+        out_ptr: Output tensor pointer, same shape as queries.
+        num_query_heads: Total number of query heads (compile-time constant).
+        num_queries_per_kv: Number of query heads per KV head for GQA.
+        BLOCK_SIZE: Physical KV cache block size.
+        TILE_SIZE: Number of KV positions processed per tile iteration.
+        HEAD_SIZE: Actual head dimension.
+        HEAD_SIZE_PADDED: Padded head dimension (next power of 2).
+        USE_ALIBI_SLOPES: Whether ALiBi positional biases are active.
+        USE_QQ_BIAS: Whether query-query biases are active.
+        USE_SOFTCAP: Whether logit soft-capping is active.
+        USE_SINKS: Whether attention sinks are active.
+        SLIDING_WINDOW: Sliding window size (0 to disable).
+        BLOCK_Q: Number of KV-aligned query positions per block.
+        BLOCK_M: Total query head slots per block (``BLOCK_Q * num_queries_per_kv``).
+    """
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
@@ -334,6 +419,59 @@ def _unified_attention_3d(
     BLOCK_M: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
 ):
+    """Segmented 3D unified attention kernel for decode-heavy workloads.
+
+    Extends the 2D kernel by splitting the KV context into parallel segments
+    along the third grid dimension (``segm_idx``). Each program instance
+    processes a subset of KV tiles for a given (query_block, kv_head, segment)
+    triple, producing partial softmax statistics (output accumulator, max,
+    exp-sum) that are later combined by ``_reduce_segments``.
+
+    This approach achieves higher GPU occupancy for long-context decode
+    scenarios where a single query attends to many KV positions: by splitting
+    the KV range into ``NUM_SEGMENTS_PER_SEQ`` parallel segments, multiple
+    thread blocks can work on the same query concurrently.
+
+    Grid: ``(total_q_blocks, num_kv_heads, NUM_SEGMENTS_PER_SEQ)``
+
+    Args:
+        query_ptr: Query tensor pointer, shape ``(total_tokens, num_q_heads, head_dim)``.
+        key_cache_ptr: Key cache pointer, shape ``(num_blocks, block_size, num_kv_heads, head_dim)``.
+        value_cache_ptr: Value cache pointer, same shape as key cache.
+        sink_ptr: Attention sink scores pointer (used only in segment 0).
+        block_tables_ptr: Block table pointer mapping sequences to physical blocks.
+        seq_lens_ptr: Total sequence lengths per sequence.
+        alibi_slopes_ptr: ALiBi slope pointer, shape ``(num_q_heads,)``.
+        qq_bias_ptr: Query-query bias matrix pointer.
+        query_start_len_ptr: Cumulative query start offsets.
+        scale: Softmax scaling factor.
+        softcap: Logit soft-capping value.
+        block_table_stride: Stride between block table rows.
+        query_stride_0, query_stride_1: Query tensor strides.
+        qq_bias_stride_0: Row stride of query-query bias.
+        stride_k_cache_0..3: Key cache strides.
+        stride_v_cache_0..3: Value cache strides.
+        num_seqs: Number of sequences in the batch.
+        segm_output_ptr: Segment output accumulator pointer,
+            shape ``(total_tokens, num_q_heads, NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED)``.
+        segm_max_ptr: Per-segment running max pointer,
+            shape ``(total_tokens, num_q_heads, NUM_SEGMENTS_PER_SEQ)``.
+        segm_expsum_ptr: Per-segment exponential sum pointer (same shape as max).
+        num_query_heads: Total number of query heads.
+        num_queries_per_kv: Number of query heads per KV head.
+        BLOCK_SIZE: Physical KV cache block size.
+        TILE_SIZE: KV positions per tile iteration.
+        HEAD_SIZE: Actual head dimension.
+        HEAD_SIZE_PADDED: Padded head dimension.
+        USE_ALIBI_SLOPES: Whether ALiBi biases are active.
+        USE_QQ_BIAS: Whether query-query biases are active.
+        USE_SOFTCAP: Whether logit soft-capping is active.
+        USE_SINKS: Whether attention sinks are active (segment 0 only).
+        SLIDING_WINDOW: Sliding window size (0 to disable).
+        BLOCK_Q: KV-aligned query positions per block.
+        BLOCK_M: Total query head slots per block.
+        NUM_SEGMENTS_PER_SEQ: Number of parallel KV segments.
+    """
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
@@ -500,6 +638,40 @@ def _reduce_segments(
     BLOCK_Q: tl.constexpr,
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,
 ):
+    """Reduce segment-level outputs from the 3D kernel into final attention output.
+
+    Combines the partial softmax outputs produced by ``_unified_attention_3d``
+    using numerically stable log-sum-exp weighted averaging. Each program
+    instance handles one (query_token, query_head) pair, reading the partial
+    outputs, max values, and exp-sums from all segments and producing the
+    final normalized output.
+
+    The reduction computes:
+        overall_max = max(segm_max[s] for s in segments)
+        rescaled_expsum[s] = segm_expsum[s] * exp(segm_max[s] - overall_max)
+        overall_expsum = sum(rescaled_expsum)
+        output = sum(segm_output[s] * exp(segm_max[s] - overall_max)) / overall_expsum
+
+    Grid: ``(total_tokens, num_query_heads)``
+
+    Args:
+        segm_output_ptr: Segment output accumulator from 3D kernel,
+            shape ``(total_tokens, num_q_heads, NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED)``.
+        segm_max_ptr: Per-segment max values,
+            shape ``(total_tokens, num_q_heads, NUM_SEGMENTS_PER_SEQ)``.
+        segm_expsum_ptr: Per-segment exp-sums (same shape as max).
+        seq_lens_ptr: Total sequence lengths per sequence.
+        query_start_len_ptr: Cumulative query start offsets.
+        num_seqs: Number of sequences in the batch.
+        output_stride_0, output_stride_1: Output tensor strides.
+        out_ptr: Final output tensor pointer.
+        num_query_heads: Total number of query heads.
+        TILE_SIZE: KV tile size (used to compute active segment count).
+        HEAD_SIZE: Actual head dimension.
+        HEAD_SIZE_PADDED: Padded head dimension.
+        BLOCK_Q: KV-aligned query positions per block.
+        NUM_SEGMENTS_PER_SEQ: Maximum number of parallel segments.
+    """
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
@@ -561,6 +733,55 @@ def unified_attention_triton(
     num_warps: int | None,
     num_stages: int | None,
 ) -> jax.Array:
+    """Launch unified attention Triton kernels for prefill and decode phases.
+
+    Automatically selects between the 2D kernel (standard) and the 3D
+    segmented kernel (decode-optimized) based on batch characteristics.
+    The 3D kernel is used when all sequences have a single query token
+    (pure decode), the batch is small enough, and segmentation parameters
+    are provided. Otherwise, the 2D kernel handles both prefill and decode.
+
+    The function validates input shapes and types, computes strides for the
+    block-tabled KV cache layout, and configures GQA interleaving within
+    query blocks.
+
+    Args:
+        queries: Packed query tensor of shape
+            ``(total_tokens, num_q_heads, head_dim)``.
+        key_cache: Block-tabled key cache of shape
+            ``(num_blocks, block_size, num_kv_heads, head_dim)``.
+        value_cache: Block-tabled value cache, same shape as key_cache.
+        block_tables: Mapping from (sequence, logical_block) to physical
+            block index, shape ``(num_seqs, max_blocks_per_seq)``, int32.
+        kv_lens: Total KV length (context + query) per sequence,
+            shape ``(num_seqs,)``, int32.
+        query_start_loc: Cumulative query start offsets,
+            shape ``(num_seqs + 1,)``, int32.
+        softmax_scale: Attention scaling factor. Defaults to
+            ``1 / sqrt(head_dim)`` if None.
+        causal: Must be True (non-causal not implemented).
+        sliding_window: Sliding window size in tokens. None or 0 disables.
+        logits_soft_cap: Logit soft-capping value. None or 0.0 disables.
+        seq_threshold_3d: Maximum batch size for 3D kernel selection.
+            None disables the 3D path.
+        num_par_softmax_segments: Number of parallel KV segments for the
+            3D kernel. None disables the 3D path.
+        alibi_slopes: Per-head ALiBi slopes, shape ``(num_q_heads,)``.
+            None disables ALiBi.
+        qq_bias: Square query-query bias matrix. None disables.
+        softmax_aux: Attention sink pre-scores, shape ``(num_q_heads,)``.
+            None disables sinks.
+        num_warps: Triton num_warps override. None uses default.
+        num_stages: Triton num_stages override. None uses default.
+
+    Returns:
+        Output tensor of shape ``(total_tokens, num_q_heads, head_dim)``
+        with the same dtype as ``queries``.
+
+    Raises:
+        NotImplementedError: If ``causal`` is False.
+        ValueError: If input shapes or dtypes are invalid.
+    """
     if not causal:
         raise NotImplementedError("unified_attention_triton only supports causal attention.")
 

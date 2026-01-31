@@ -13,6 +13,26 @@
 # limitations under the License.
 
 
+"""Utility functions for block-sparse attention Triton kernels.
+
+This module provides helper functions shared by the forward and backward pass
+implementations of block-sparse attention, including:
+
+    - ``padded_load``: Triton JIT helper for conditionally masked memory loads
+    - ``calc_bias_strides``: Computes memory strides for bias tensors with broadcasting
+    - ``attention_pack_with_static_shape``: Packs variable-length sequences using attention masks
+    - ``attention_pack_from_cu_static``: Packs using cumulative sequence lengths
+    - ``attention_unpack_with_static_shape``: Reverses packing to restore padded batches
+    - ``make_segment_mask``: Creates segment mask for packed sequences
+    - ``make_causal_mask``: Creates causal (autoregressive) attention mask
+    - ``make_sliding_window_mask``: Creates sliding window attention mask
+    - ``pad_to_block_size``: Pads tensors to be divisible by block size
+    - ``basic_attention_refrence``: Reference JAX attention for testing and validation
+
+Constants:
+    PADDING_SEGMENT_ID: Sentinel value (-1) used for padding segment IDs.
+"""
+
 import math
 from collections.abc import Sequence
 

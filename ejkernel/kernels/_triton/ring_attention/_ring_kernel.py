@@ -322,6 +322,14 @@ class RingBlocksparseResiduals(NamedTuple):
 
 
 def _window_to_bounds(sliding_window: int | tuple[int, int] | None) -> tuple[int, int]:
+    """Convert sliding window specification to (left, right) bounds.
+
+    Args:
+        sliding_window: Window size as int (symmetric), tuple (asymmetric), or None.
+
+    Returns:
+        Tuple of (left_bound, right_bound). Returns (-1, -1) for None (no window).
+    """
     if sliding_window is None:
         return -1, -1
     if isinstance(sliding_window, int):
@@ -380,6 +388,32 @@ def ring_blocksparse_attention_call(
     fwd_params: FwdParams | None,
     bwd_params: BwdParams | None,
 ) -> jax.Array:
+    """Ring block-sparse attention with custom VJP for efficient gradients.
+
+    Wraps the forward and backward passes of ring block-sparse attention
+    with JAX's custom_vjp mechanism to enable gradient computation through
+    the distributed ring communication pattern.
+
+    Args:
+        query: Query tensor [batch, seq_len_q, num_heads, head_dim].
+        key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim].
+        value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim].
+        q_segment_ids: Optional query segment IDs for packed sequences.
+        kv_segment_ids: Optional KV segment IDs for packed sequences.
+        q_position_ids: Optional explicit query positions.
+        kv_position_ids: Optional explicit KV positions.
+        softmax_aux: Optional attention sink logits.
+        softmax_scale: Attention scaling factor.
+        causal: Whether to apply causal masking.
+        sliding_window: Optional sliding window configuration.
+        logits_soft_cap: Optional soft capping value.
+        axis_name: Ring communication axis name.
+        fwd_params: Forward pass kernel parameters.
+        bwd_params: Backward pass kernel parameters.
+
+    Returns:
+        Attention output tensor [batch, seq_len_q, num_heads, head_dim].
+    """
     o, _ = _ring_blocksparse_attention_fwd(
         query,
         key,
@@ -417,6 +451,23 @@ def _ring_blocksparse_attention_fwd(
     fwd_params: FwdParams | None,
     bwd_params: BwdParams | None,
 ) -> tuple[jax.Array, RingBlocksparseResiduals]:
+    """Forward pass of ring block-sparse attention.
+
+    Distributes attention across devices using a ring topology. In each
+    ring step, computes block-sparse attention between local queries and
+    the current KV block, combines with running output using online
+    log-sum-exp, and rotates KV/positions/segments to the next device.
+
+    The block-sparse mask is recomputed at each ring step using the
+    rotated KV positions and segment IDs, ensuring correct causal and
+    sliding window masking across distributed positions.
+
+    Args:
+        query..bwd_params: See ring_blocksparse_attention_call.
+
+    Returns:
+        Tuple of (output, residuals) where residuals are saved for backward.
+    """
     batch, q_seq_len, num_heads, _ = query.shape
     kv_seq_len = key.shape[1]
 
@@ -598,6 +649,23 @@ def _ring_blocksparse_attention_bwd(
     res: RingBlocksparseResiduals,
     do: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Backward pass of ring block-sparse attention.
+
+    Computes gradients for query, key, and value tensors by running the
+    block-sparse attention backward kernel at each ring step. KV gradients
+    are accumulated and rotated through the ring along with the KV blocks.
+
+    Uses the same ring scan pattern as the forward pass, recomputing
+    block-sparse masks at each step from the stored positions and segment IDs.
+
+    Args:
+        q_segment_ids..bwd_params: Non-differentiable arguments (from nondiff_argnums).
+        res: Residuals saved from the forward pass.
+        do: Output gradient tensor.
+
+    Returns:
+        Tuple of (dq, dk, dv) gradient tensors.
+    """
     del q_segment_ids, kv_segment_ids, q_position_ids, kv_position_ids, softmax_aux
     (
         q,

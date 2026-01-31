@@ -223,7 +223,15 @@ def _decode_tile_nvfp4(q: jax.Array, scale_tile: jax.Array) -> jax.Array:
 
 
 def _decode_tile_nvfp8(q: jax.Array, scale_tile: jax.Array) -> jax.Array:
-    """Decode NVFP8 (E4M3 with E4M3 scale) quantized tile."""
+    """Decode NVFP8 (E4M3 with E4M3 scale) quantized tile.
+
+    Args:
+        q: E4M3 codes tile (0-255).
+        scale_tile: E4M3 per-group scales as uint8.
+
+    Returns:
+        Dequantized weight tile.
+    """
     e4m3_table, _ = _get_e4m3_table()
     vals = e4m3_table[q.astype(jnp.int32)]
     scale = e4m3_table[scale_tile.astype(jnp.int32)]
@@ -336,6 +344,18 @@ def _blocked_quantized_matmul(
     num_k = K_pad // block_k
 
     def load_q_tile(off_k: int, off_n: int) -> jax.Array:
+        """Load and unpack a tile of quantized weight codes.
+
+        Slices the packed uint32 weight array and unpacks it into
+        individual quantized codes for the tile at (off_k, off_n).
+
+        Args:
+            off_k: Offset along the K dimension (reduction axis).
+            off_n: Offset along the N dimension (output axis).
+
+        Returns:
+            Unpacked quantized codes of shape (block_k, block_n).
+        """
         if transpose:
             word_start = off_k // values_per_word
             words_tile = block_k // values_per_word
@@ -350,6 +370,19 @@ def _blocked_quantized_matmul(
         return q
 
     def load_group_tile(off_k: int, off_n: int) -> tuple[jax.Array, jax.Array | None]:
+        """Load per-group scales and biases for a weight tile.
+
+        Slices the scales (and optionally biases) arrays and repeats
+        them to match the tile dimensions for element-wise dequantization.
+
+        Args:
+            off_k: Offset along the K dimension.
+            off_n: Offset along the N dimension.
+
+        Returns:
+            Tuple of (scale_tile, bias_tile) where scale_tile has shape
+            (block_k, block_n) and bias_tile is the same shape or None.
+        """
         if transpose:
             group_start = off_k // group_size
             groups_tile = block_k // group_size
@@ -373,6 +406,19 @@ def _blocked_quantized_matmul(
         return scale_tile, bias_tile
 
     def decode_tile(off_k: int, off_n: int) -> jax.Array:
+        """Dequantize a single weight tile using the configured quantization mode.
+
+        Loads packed codes and group parameters, then applies the
+        mode-specific decoding formula (affine, nf4, mxfp4, etc.)
+        to produce a float tile.
+
+        Args:
+            off_k: Offset along the K dimension.
+            off_n: Offset along the N dimension.
+
+        Returns:
+            Dequantized weight tile of shape (block_k, block_n) in compute_dtype.
+        """
         q = load_q_tile(off_k, off_n)
         scale_tile, bias_tile = load_group_tile(off_k, off_n)
         if mode == "affine":
@@ -392,6 +438,20 @@ def _blocked_quantized_matmul(
         return w.astype(compute_dtype)
 
     def k_loop(k_idx: int, acc: jax.Array, *, off_m: int, off_n: int) -> jax.Array:
+        """Accumulate one K-dimension tile into the output accumulator.
+
+        Loads the activation tile and dequantized weight tile, performs
+        a dot product, and adds the result to the running accumulator.
+
+        Args:
+            k_idx: K-dimension block index.
+            acc: Running accumulator of shape (block_m, block_n) in float32.
+            off_m: M-dimension offset for the current tile.
+            off_n: N-dimension offset for the current tile.
+
+        Returns:
+            Updated accumulator with this K-tile's contribution added.
+        """
         off_k = k_idx * block_k
         x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k)).astype(compute_dtype)
         w_tile = decode_tile(off_k, off_n)
@@ -399,13 +459,46 @@ def _blocked_quantized_matmul(
         return acc
 
     def n_loop(n_idx: int, out_buf: jax.Array) -> jax.Array:
+        """Process one N-dimension block column across all M rows.
+
+        Iterates over all M-dimension blocks and accumulates the full
+        K-dimension reduction for each (M, N) output tile.
+
+        Args:
+            n_idx: N-dimension block index.
+            out_buf: Output buffer of shape (M_pad, N_pad) being filled.
+
+        Returns:
+            Updated output buffer with this N column computed.
+        """
         off_n = n_idx * block_n
 
         def m_loop(m_idx: int, out_local: jax.Array) -> jax.Array:
+            """Process one M-dimension block row for a fixed N column.
+
+            Accumulates the dot product over all K-dimension tiles and
+            writes the result to the output buffer.
+
+            Args:
+                m_idx: M-dimension block index.
+                out_local: Output buffer being updated.
+
+            Returns:
+                Updated output buffer with this (M, N) tile written.
+            """
             off_m = m_idx * block_m
             acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
 
             def k_body(idx: int, carry: jax.Array) -> jax.Array:
+                """Inner loop body for K-dimension accumulation.
+
+                Args:
+                    idx: K-dimension block index.
+                    carry: Running accumulator.
+
+                Returns:
+                    Updated accumulator.
+                """
                 return k_loop(idx, carry, off_m=off_m, off_n=off_n)
 
             acc = jax.lax.fori_loop(0, num_k, k_body, acc)
@@ -445,6 +538,30 @@ def _operate(
     block_k,
     use_bf16,
 ):
+    """Execute quantized matmul with automatic path selection.
+
+    Attempts the blocked fused dequantize-and-matmul path first for
+    4-bit and 8-bit modes with valid block sizes. If the fused path
+    raises a ValueError (e.g., due to shape or tiling mismatches),
+    falls back to a two-step dequantize+matmul approach.
+
+    Args:
+        x: Input activation matrix of shape (M, K).
+        w: Packed uint32 weights.
+        scales: Per-group scale parameters.
+        biases: Per-group bias parameters (affine mode) or None.
+        transpose: Whether weights are in NxK (transposed) layout.
+        group_size: Elements per quantization group.
+        bits: Bit-width per quantized element.
+        mode: Quantization mode string.
+        block_m: Tile size for M dimension.
+        block_n: Tile size for N dimension.
+        block_k: Tile size for K dimension.
+        use_bf16: Whether to use BF16 for intermediate computations.
+
+    Returns:
+        Matrix multiplication result of shape (M, N) in float32.
+    """
     can_fuse = bits in (4, 8)
     can_fuse = can_fuse and block_m > 0 and block_n > 0 and block_k > 0
 

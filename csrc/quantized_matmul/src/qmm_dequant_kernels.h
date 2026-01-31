@@ -21,6 +21,8 @@
 #include <cmath>
 #include <cstdint>
 
+constexpr int kDequantElemsPerThread = 4;
+
 static __device__ __constant__ float kNF4Table[16] = {
     -1.0f,
     -0.6961928009986877f,
@@ -317,33 +319,79 @@ __global__ void dequant_affine_int(const uint32_t *wq, const ScaleT *scales,
                                    const BiasT *biases, half *out, int64_t K,
                                    int64_t N, int64_t n_words,
                                    int64_t group_size, int64_t n_groups) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = K * N;
-  if (idx >= total) {
-    return;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    int64_t bit_offset = n * Bits;
+    int64_t word_idx = bit_offset >> 5;
+    int32_t shift = static_cast<int32_t>(bit_offset & 31);
+    const uint32_t *row = wq + k * n_words;
+    uint32_t low_word = row[word_idx];
+    int32_t low_bits = (shift + Bits > 32) ? (32 - shift) : Bits;
+    int32_t high_bits = Bits - low_bits;
+    uint32_t low_mask = (uint32_t(1) << low_bits) - 1u;
+    uint32_t low = (low_word >> shift) & low_mask;
+    uint32_t high = 0;
+    if (high_bits > 0) {
+      uint32_t high_mask = (uint32_t(1) << high_bits) - 1u;
+      high = row[word_idx + 1] & high_mask;
+    }
+    uint32_t q = low | (high << low_bits);
+    int64_t g = n / group_size;
+    float scale = ToFloat(scales[k * n_groups + g]);
+    float bias = ToFloat(biases[k * n_groups + g]);
+    float val = static_cast<float>(q) * scale + bias;
+    out[idx] = ToHalf(val);
   }
-  int64_t k = idx / N;
-  int64_t n = idx - k * N;
-  int64_t bit_offset = n * Bits;
-  int64_t word_idx = bit_offset >> 5;
-  int32_t shift = static_cast<int32_t>(bit_offset & 31);
-  const uint32_t *row = wq + k * n_words;
-  uint32_t low_word = row[word_idx];
-  int32_t low_bits = (shift + Bits > 32) ? (32 - shift) : Bits;
-  int32_t high_bits = Bits - low_bits;
-  uint32_t low_mask = (uint32_t(1) << low_bits) - 1u;
-  uint32_t low = (low_word >> shift) & low_mask;
-  uint32_t high = 0;
-  if (high_bits > 0) {
-    uint32_t high_mask = (uint32_t(1) << high_bits) - 1u;
-    high = row[word_idx + 1] & high_mask;
+}
+
+template <int Bits, int GroupSize, typename ScaleT, typename BiasT>
+__global__ void dequant_affine_int_gs(const uint32_t *wq, const ScaleT *scales,
+                                      const BiasT *biases, half *out,
+                                      int64_t K, int64_t N, int64_t n_words,
+                                      int64_t n_groups) {
+  int64_t total = K * N;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    int64_t bit_offset = n * Bits;
+    int64_t word_idx = bit_offset >> 5;
+    int32_t shift = static_cast<int32_t>(bit_offset & 31);
+    const uint32_t *row = wq + k * n_words;
+    uint32_t low_word = row[word_idx];
+    int32_t low_bits = (shift + Bits > 32) ? (32 - shift) : Bits;
+    int32_t high_bits = Bits - low_bits;
+    uint32_t low_mask = (uint32_t(1) << low_bits) - 1u;
+    uint32_t low = (low_word >> shift) & low_mask;
+    uint32_t high = 0;
+    if (high_bits > 0) {
+      uint32_t high_mask = (uint32_t(1) << high_bits) - 1u;
+      high = row[word_idx + 1] & high_mask;
+    }
+    uint32_t q = low | (high << low_bits);
+    int64_t g = n / GroupSize;
+    float scale = ToFloat(scales[k * n_groups + g]);
+    float bias = ToFloat(biases[k * n_groups + g]);
+    float val = static_cast<float>(q) * scale + bias;
+    out[idx] = ToHalf(val);
   }
-  uint32_t q = low | (high << low_bits);
-  int64_t g = n / group_size;
-  float scale = ToFloat(scales[k * n_groups + g]);
-  float bias = ToFloat(biases[k * n_groups + g]);
-  float val = static_cast<float>(q) * scale + bias;
-  out[idx] = ToHalf(val);
 }
 
 template <int Bits, typename ScaleT>
@@ -351,113 +399,172 @@ __global__ void dequant_nf4_int(const uint32_t *wq, const ScaleT *scales,
                                 half *out, int64_t K, int64_t N,
                                 int64_t n_words, int64_t group_size,
                                 int64_t n_groups) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = K * N;
-  if (idx >= total) {
-    return;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    constexpr int32_t values_per_word = 32 / Bits;
+    int64_t word_idx = n / values_per_word;
+    int32_t lane = static_cast<int32_t>(n % values_per_word);
+    uint32_t word = wq[k * n_words + word_idx];
+    constexpr uint32_t mask = (Bits == 8) ? 0xFFu : 0xFu;
+    uint32_t q = (word >> (lane * Bits)) & mask;
+    int64_t g = n / group_size;
+    float scale = ToFloat(scales[k * n_groups + g]);
+    float val = kNF4Table[q] * scale;
+    out[idx] = ToHalf(val);
   }
-  int64_t k = idx / N;
-  int64_t n = idx - k * N;
-  constexpr int32_t values_per_word = 32 / Bits;
-  int64_t word_idx = n / values_per_word;
-  int32_t lane = static_cast<int32_t>(n % values_per_word);
-  uint32_t word = wq[k * n_words + word_idx];
-  constexpr uint32_t mask = (Bits == 8) ? 0xFFu : 0xFu;
-  uint32_t q = (word >> (lane * Bits)) & mask;
-  int64_t g = n / group_size;
-  float scale = ToFloat(scales[k * n_groups + g]);
-  float val = kNF4Table[q] * scale;
-  out[idx] = ToHalf(val);
+}
+
+template <int Bits, int GroupSize, typename ScaleT>
+__global__ void dequant_nf4_int_gs(const uint32_t *wq, const ScaleT *scales,
+                                   half *out, int64_t K, int64_t N,
+                                   int64_t n_words, int64_t n_groups) {
+  int64_t total = K * N;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    constexpr int32_t values_per_word = 32 / Bits;
+    int64_t word_idx = n / values_per_word;
+    int32_t lane = static_cast<int32_t>(n % values_per_word);
+    uint32_t word = wq[k * n_words + word_idx];
+    constexpr uint32_t mask = (Bits == 8) ? 0xFFu : 0xFu;
+    uint32_t q = (word >> (lane * Bits)) & mask;
+    int64_t g = n / GroupSize;
+    float scale = ToFloat(scales[k * n_groups + g]);
+    float val = kNF4Table[q] * scale;
+    out[idx] = ToHalf(val);
+  }
 }
 
 template <int GroupSize>
 __global__ void dequant_mxfp4(const uint32_t *wq, const uint8_t *scales,
                               half *out, int64_t K, int64_t N, int64_t n_words,
                               int64_t n_groups) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = K * N;
-  if (idx >= total) {
-    return;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    int32_t values_per_word = 8;
+    int64_t word_idx = n / values_per_word;
+    int32_t lane = static_cast<int32_t>(n % values_per_word);
+    uint32_t word = wq[k * n_words + word_idx];
+    uint32_t q = (word >> (lane * 4)) & 0xFu;
+    int64_t g = n / GroupSize;
+    int8_t exp = static_cast<int8_t>(scales[k * n_groups + g]);
+    float scale = exp2f(static_cast<float>(exp));
+    float val = kE2M1Table[q] * scale;
+    out[idx] = ToHalf(val);
   }
-  int64_t k = idx / N;
-  int64_t n = idx - k * N;
-  int32_t values_per_word = 8;
-  int64_t word_idx = n / values_per_word;
-  int32_t lane = static_cast<int32_t>(n % values_per_word);
-  uint32_t word = wq[k * n_words + word_idx];
-  uint32_t q = (word >> (lane * 4)) & 0xFu;
-  int64_t g = n / GroupSize;
-  int8_t exp = static_cast<int8_t>(scales[k * n_groups + g]);
-  float scale = exp2f(static_cast<float>(exp));
-  float val = kE2M1Table[q] * scale;
-  out[idx] = ToHalf(val);
 }
 
 template <int GroupSize>
 __global__ void dequant_mxfp8(const uint32_t *wq, const uint8_t *scales,
                               half *out, int64_t K, int64_t N, int64_t n_words,
                               int64_t n_groups) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = K * N;
-  if (idx >= total) {
-    return;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    int32_t values_per_word = 4;
+    int64_t word_idx = n / values_per_word;
+    int32_t lane = static_cast<int32_t>(n % values_per_word);
+    uint32_t word = wq[k * n_words + word_idx];
+    uint32_t q = (word >> (lane * 8)) & 0xFFu;
+    int64_t g = n / GroupSize;
+    int8_t exp = static_cast<int8_t>(scales[k * n_groups + g]);
+    float scale = exp2f(static_cast<float>(exp));
+    float val = kE4M3Table[q] * scale;
+    out[idx] = ToHalf(val);
   }
-  int64_t k = idx / N;
-  int64_t n = idx - k * N;
-  int32_t values_per_word = 4;
-  int64_t word_idx = n / values_per_word;
-  int32_t lane = static_cast<int32_t>(n % values_per_word);
-  uint32_t word = wq[k * n_words + word_idx];
-  uint32_t q = (word >> (lane * 8)) & 0xFFu;
-  int64_t g = n / GroupSize;
-  int8_t exp = static_cast<int8_t>(scales[k * n_groups + g]);
-  float scale = exp2f(static_cast<float>(exp));
-  float val = kE4M3Table[q] * scale;
-  out[idx] = ToHalf(val);
 }
 
 template <int GroupSize>
 __global__ void dequant_nvfp4(const uint32_t *wq, const uint8_t *scales,
                               half *out, int64_t K, int64_t N, int64_t n_words,
                               int64_t n_groups) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = K * N;
-  if (idx >= total) {
-    return;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    int32_t values_per_word = 8;
+    int64_t word_idx = n / values_per_word;
+    int32_t lane = static_cast<int32_t>(n % values_per_word);
+    uint32_t word = wq[k * n_words + word_idx];
+    uint32_t q = (word >> (lane * 4)) & 0xFu;
+    int64_t g = n / GroupSize;
+    uint8_t scale_code = scales[k * n_groups + g];
+    float scale = kE4M3Table[scale_code];
+    float val = kE2M1Table[q] * scale;
+    out[idx] = ToHalf(val);
   }
-  int64_t k = idx / N;
-  int64_t n = idx - k * N;
-  int32_t values_per_word = 8;
-  int64_t word_idx = n / values_per_word;
-  int32_t lane = static_cast<int32_t>(n % values_per_word);
-  uint32_t word = wq[k * n_words + word_idx];
-  uint32_t q = (word >> (lane * 4)) & 0xFu;
-  int64_t g = n / GroupSize;
-  uint8_t scale_code = scales[k * n_groups + g];
-  float scale = kE4M3Table[scale_code];
-  float val = kE2M1Table[q] * scale;
-  out[idx] = ToHalf(val);
 }
 
 template <int GroupSize>
 __global__ void dequant_nvfp8(const uint32_t *wq, const uint8_t *scales,
                               half *out, int64_t K, int64_t N, int64_t n_words,
                               int64_t n_groups) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = K * N;
-  if (idx >= total) {
-    return;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    int32_t values_per_word = 4;
+    int64_t word_idx = n / values_per_word;
+    int32_t lane = static_cast<int32_t>(n % values_per_word);
+    uint32_t word = wq[k * n_words + word_idx];
+    uint32_t q = (word >> (lane * 8)) & 0xFFu;
+    int64_t g = n / GroupSize;
+    uint8_t scale_code = scales[k * n_groups + g];
+    float scale = kE4M3Table[scale_code];
+    float val = kE4M3Table[q] * scale;
+    out[idx] = ToHalf(val);
   }
-  int64_t k = idx / N;
-  int64_t n = idx - k * N;
-  int32_t values_per_word = 4;
-  int64_t word_idx = n / values_per_word;
-  int32_t lane = static_cast<int32_t>(n % values_per_word);
-  uint32_t word = wq[k * n_words + word_idx];
-  uint32_t q = (word >> (lane * 8)) & 0xFFu;
-  int64_t g = n / GroupSize;
-  uint8_t scale_code = scales[k * n_groups + g];
-  float scale = kE4M3Table[scale_code];
-  float val = kE4M3Table[q] * scale;
-  out[idx] = ToHalf(val);
 }

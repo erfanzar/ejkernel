@@ -133,6 +133,18 @@ class Executor(Generic[Cfg, Out]):
 
     @staticmethod
     def _platform_value(val) -> str | None:
+        """Convert a platform value to a lowercase string representation.
+
+        Normalizes platform identifiers from various formats (Enum, string, etc.)
+        into a consistent lowercase string for comparison and matching.
+
+        Args:
+            val: Platform value to normalize. Can be None, an Enum member,
+                or any object convertible to string.
+
+        Returns:
+            Lowercase string representation of the platform, or None if val is None.
+        """
         if val is None:
             return None
         if isinstance(val, Enum):
@@ -141,6 +153,23 @@ class Executor(Generic[Cfg, Out]):
 
     @staticmethod
     def _is_nvidia_gpu() -> bool:
+        """Detect whether the current GPU device is an NVIDIA GPU.
+
+        Checks the JAX backend platform version and device properties to
+        determine if the system has an NVIDIA (CUDA-capable) GPU. Distinguishes
+        NVIDIA GPUs from AMD (ROCm) GPUs by examining platform version strings
+        and device kind identifiers.
+
+        Returns:
+            True if an NVIDIA GPU is detected, False otherwise (including AMD
+            GPUs, no GPUs, or detection failure).
+
+        Note:
+            First checks the XLA backend platform version for 'cuda' or 'rocm'
+            strings. If inconclusive, falls back to inspecting individual device
+            kind attributes for NVIDIA-specific keywords (nvidia, tesla, geforce,
+            rtx, quadro).
+        """
         try:
             from jax.lib import xla_bridge
 
@@ -171,6 +200,18 @@ class Executor(Generic[Cfg, Out]):
 
     @staticmethod
     def _has_cuda_impl(algorithm: str) -> bool:
+        """Check if a native CUDA implementation exists for the given algorithm.
+
+        Queries the kernel registry to determine whether a CUDA-platform
+        implementation is registered for the specified algorithm name.
+
+        Args:
+            algorithm: Algorithm/kernel name to look up (typically kernel.op_id).
+
+        Returns:
+            True if a CUDA implementation exists in the registry, False if not
+            found or if the registry query fails.
+        """
         try:
             specs = kernel_registry.list_implementations(algorithm)
         except Exception:
@@ -178,6 +219,32 @@ class Executor(Generic[Cfg, Out]):
         return any(spec.platform == Platform.CUDA and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
 
     def _prefer_cuda_cfg(self, cfg: Cfg, kernel: Kernel[Cfg, Out], inv: Invocation[Cfg, Out]) -> Cfg:
+        """Upgrade configuration to prefer native CUDA when conditions are met.
+
+        Automatically switches the platform field in a configuration from 'auto'
+        or 'triton' to 'cuda' when all of the following conditions are satisfied:
+        - The current configuration platform is 'auto' or 'triton'
+        - No explicit override configuration was provided
+        - No explicit platform was specified in invocation kwargs
+        - The current device is a GPU
+        - The GPU is an NVIDIA GPU (not AMD ROCm)
+        - A native CUDA implementation exists in the kernel registry
+
+        This enables transparent use of optimized native CUDA kernels when
+        available, while gracefully falling back to Triton implementations
+        on unsupported platforms.
+
+        Args:
+            cfg: Current configuration object (may have 'platform' and/or
+                'backend' attributes).
+            kernel: Kernel instance being executed.
+            inv: Current invocation with arguments and metadata.
+
+        Returns:
+            Modified configuration with platform set to 'cuda' and backend
+            set to 'gpu' if upgrade conditions are met, otherwise the
+            original configuration unchanged.
+        """
         platform_val = self._platform_value(getattr(cfg, "platform", None))
         if platform_val is None or platform_val == "cuda":
             return cfg
@@ -269,6 +336,7 @@ class Executor(Generic[Cfg, Out]):
         )
 
         def wrapped(*a, **k):
+            """Execute the function within a JAX named scope containing the JSON payload."""
             with jax.named_scope(f"{self.stamp_prefix}:{payload}"):
                 return fn(*a, **k)
 
@@ -291,6 +359,7 @@ class Executor(Generic[Cfg, Out]):
             return jax.named_call(fn, name=name)
 
         def wrapped(*a, **k):
+            """Execute the function within a JAX named scope for profiling."""
             with jax.named_scope(name):
                 return fn(*a, **k)
 
@@ -412,6 +481,7 @@ class Executor(Generic[Cfg, Out]):
                     )
 
                 def align_arg_grad(x, g):
+                    """Align gradient structure with argument structure, using None for missing grads."""
                     if g is None:
                         return jtu.tree_map(lambda t: None, x)
                     return jtu.tree_map(lambda _t, gg: gg, x, g)
@@ -437,12 +507,14 @@ class Executor(Generic[Cfg, Out]):
                 return tuple(grad_out)
 
             def primal_only_arrays(*array_inputs):
+                """Compute forward pass output only, discarding residuals for custom VJP."""
                 return fwd_arrays(*array_inputs)[0]
 
             g = jax.custom_vjp(primal_only_arrays)
             g.defvjp(fwd_arrays, bwd_arrays)
 
             def fn(*a, **k):
+                """Extract array leaves from args/kwargs and route through the custom VJP wrapper."""
                 flat_call, _ = jtu.tree_flatten((a, k))
                 array_in = [x for x, m in zip(flat_call, is_arr, strict=False) if m]
                 return g(*array_in)
@@ -450,6 +522,7 @@ class Executor(Generic[Cfg, Out]):
             run_method = _get_platform_method(kernel, "run", platform, context) or kernel.run
 
             def fn(*a, **k):
+                """Execute the kernel run method with the pre-selected configuration."""
                 return run_method(*a, cfg=chosen, **k)
 
         if os.getenv("EJKERNEL_OPS_RECORD", "0") == "1":
@@ -621,6 +694,7 @@ class Executor(Generic[Cfg, Out]):
         chosen = self.choose_config(kernel, *example_args, cfg=cfg, **example_kwargs)
 
         def run(*a, **k):
+            """Execute the kernel with the pre-selected optimal configuration."""
             return kernel.run(*a, cfg=chosen, **k)
 
         return jax.jit(run)

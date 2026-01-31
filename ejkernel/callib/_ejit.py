@@ -151,26 +151,42 @@ def ejit(
 ):
     """Enhanced JIT compilation with persistent caching.
 
-    Drop-in replacement for jax.jit that caches compiled functions
+    Drop-in replacement for ``jax.jit`` that caches compiled functions
     to disk for reuse across script runs, significantly reducing
-    compilation overhead.
+    compilation overhead. Can be used as a bare decorator or called
+    with keyword arguments.
 
     Features:
-        - Two-level caching (in-memory LRU + persistent disk cache)
-        - Automatic cache invalidation on signature changes
-        - Graceful fallback to standard jax.jit on errors
-        - Support for all jax.jit parameters
+        - Two-level caching (in-memory dict + persistent disk cache)
+        - Automatic cache invalidation on source, hardware, or signature changes
+        - Graceful fallback to standard ``jax.jit`` on errors
+        - Support for all ``jax.jit`` parameters
 
     Args:
-        func: Function to JIT-compile and cache.
-        static_argnums: Indices of static arguments.
-        static_argnames: Names of static arguments.
-        donate_argnums: Indices of donated arguments.
-        in_shardings: Input sharding specifications.
-        out_shardings: Output sharding specifications.
+        func: Function to JIT-compile and cache. When ``None``, returns a
+            partial decorator so that ``@ejit(...)`` syntax works.
+        static_argnums: Indices of arguments to treat as compile-time constants.
+        static_argnames: Names of arguments to treat as compile-time constants.
+        donate_argnums: Indices of arguments whose buffers may be donated to outputs.
+        in_shardings: Input sharding specifications for distributed execution.
+        out_shardings: Output sharding specifications for distributed execution.
+        donate_argnames: Names of arguments whose buffers may be donated.
+        keep_unused: Whether to keep unused arguments in the compiled function.
+        backend: JAX backend to use (e.g., ``'cpu'``, ``'gpu'``, ``'tpu'``).
+        inline: Whether to inline the function into the caller.
+        compiler_options: Dictionary of additional XLA compiler options.
 
     Returns:
-        JIT-compiled function with caching.
+        JIT-compiled function with persistent caching when ``EASYDEL_CACHE_COMPILES``
+        is set, otherwise a standard ``jax.jit``-compiled function with XLA cache
+        directory configured.
+
+    Note:
+        Caching behavior is controlled by two environment variables:
+
+        - ``EASYDEL_CACHE_COMPILES``: Enable the custom two-level cache (default: off).
+        - ``EASYDEL_RECOMPILE_FORCE``: Force recompilation ignoring cache (default: off).
+        - ``ALLOW_FULL_CACHE``: Enable full XLA persistent caching (default: off).
 
     Example:
         >>> @ejit
@@ -179,6 +195,9 @@ def ejit(
         >>>
         >>> result = fast_matmul(x, y)
         >>>
+        >>> @ejit(static_argnums=(2,))
+        ... def scaled_matmul(a, b, scale):
+        ...     return a @ b * scale
     """
     if func is None:
         return functools.partial(
@@ -314,6 +333,19 @@ def ejit(
 
     @functools.wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        """Execute the cached compiled function or fall back to jitted version.
+
+        Attempts to resolve a cached compiled executable for the given
+        argument signature. If caching or compilation fails at any stage,
+        transparently falls back to the standard ``jax.jit`` path.
+
+        Args:
+            *args: Positional arguments forwarded to the original function.
+            **kwargs: Keyword arguments forwarded to the original function.
+
+        Returns:
+            The result of calling the compiled (or jitted) function.
+        """
         try:
             args_sig = _get_args_signature(args, kwargs)
             compiled_func = get_compiled_and_cache(args_sig, args, kwargs)
@@ -447,13 +479,50 @@ def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
 
 
 def hash_fn(self) -> int:
-    """Generate a hash for an object based on its dictionary values."""
+    """Generate a deterministic integer hash for an object based on its attribute values.
+
+    Concatenates the string representations of all hashable-type attribute values
+    (``float``, ``int``, ``bool``, ``dict``, ``list``) from the object's ``__dict__``
+    and produces an MD5-based integer hash.
+
+    Args:
+        self: Any object with a ``__dict__`` containing primitive-typed values.
+
+    Returns:
+        Deterministic positive integer hash derived from the object's attributes.
+
+    Note:
+        Only attributes of type ``float``, ``int``, ``bool``, ``dict``, or ``list``
+        contribute to the hash. Other attribute types are silently ignored.
+    """
     shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
     return get_safe_hash_int(shu)
 
 
 def get_safe_hash_int(text, algorithm="md5"):
-    """Generate a hash of text using specified algorithm with safety checks."""
+    """Generate a deterministic integer hash of text using the specified algorithm.
+
+    Converts the input to a string, hashes it with the given ``hashlib``
+    algorithm, and returns the digest as a big-endian unsigned integer.
+
+    Args:
+        text: Input to hash. Will be converted to ``str`` before hashing.
+        algorithm: Name of a ``hashlib`` algorithm (e.g., ``'md5'``, ``'sha256'``).
+            Defaults to ``'md5'``.
+
+    Returns:
+        Non-negative integer representing the hash digest.
+
+    Raises:
+        ValueError: If the specified algorithm is not supported by ``hashlib``.
+        Exception: For any other hashing failure.
+
+    Example:
+        >>> get_safe_hash_int("hello world")  # doctest: +SKIP
+        295242985...
+        >>> get_safe_hash_int("hello world", algorithm="sha256")  # doctest: +SKIP
+        805318394...
+    """
     try:
         text_str = str(text)
         hash_object = getattr(hashlib, algorithm)(text_str.encode())

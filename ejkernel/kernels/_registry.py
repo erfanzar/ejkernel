@@ -60,17 +60,183 @@ Example:
 
 from __future__ import annotations
 
+import ast
+import functools
 import inspect
 import re
+import textwrap
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal, TypeVar, overload
 
 import jax
 
+from ejkernel.errors import EjkernelRuntimeError
+
 F = TypeVar("F", bound=Callable)
+"""TypeVar bound to Callable, used for preserving function signatures in decorators."""
+
+_IGNORED_PARAM_CACHE: dict[Callable[..., Any], set[str]] = {}
+"""Cache mapping functions to the set of parameter names explicitly deleted within their body."""
+
+_TUNING_PARAM_NAMES: set[str] = {
+    # Kernel tuning/autotuning parameter names that are excluded from unsupported-parameter
+    # checks. These parameters control low-level execution behaviour (block sizes, warp
+    # counts, etc.) and may be silently ignored by implementations that do not use them.
+    "block_m",
+    "block_n",
+    "block_k",
+    "block_q",
+    "block_kv",
+    "block_size",
+    "num_warps",
+    "num_stages",
+    "num_ctas",
+    "num_waves",
+    "num_sms",
+    "num_splits",
+    "split_k",
+    "use_bf16",
+    "seq_threshold_3d",
+    "num_par_softmax_segments",
+    "max_warps",
+    "num_queries_per_block",
+    "num_kv_pages_per_block",
+    "num_kv_splits",
+    "fwd_params",
+    "bwd_params",
+}
+
+
+def _get_ignored_params(func: Callable[..., Any]) -> set[str]:
+    """Detect parameter names explicitly deleted inside a function body.
+
+    Parses the source code of *func* using the ``ast`` module and collects
+    all names that appear in ``del`` statements. These names typically
+    represent parameters the implementation chooses to discard, signaling
+    that the corresponding feature is unsupported.
+
+    Results are cached per function in ``_IGNORED_PARAM_CACHE`` to avoid
+    repeated source parsing.
+
+    Args:
+        func: The callable whose source code will be inspected.
+
+    Returns:
+        A set of parameter names found in ``del`` statements within
+        *func*. Returns an empty set if the source cannot be retrieved
+        or parsed.
+    """
+    cached = _IGNORED_PARAM_CACHE.get(func)
+    if cached is not None:
+        return cached
+    try:
+        source = inspect.getsource(func)
+    except OSError:
+        _IGNORED_PARAM_CACHE[func] = set()
+        return _IGNORED_PARAM_CACHE[func]
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        _IGNORED_PARAM_CACHE[func] = set()
+        return _IGNORED_PARAM_CACHE[func]
+
+    ignored: set[str] = set()
+
+    class _DelVisitor(ast.NodeVisitor):
+        """AST visitor that collects names from ``del`` statements."""
+
+        def visit_Delete(self, node: ast.Delete) -> None:
+            """Record every ``ast.Name`` target in a ``del`` statement."""
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    ignored.add(target.id)
+            self.generic_visit(node)
+
+    _DelVisitor().visit(tree)
+    _IGNORED_PARAM_CACHE[func] = ignored
+    return ignored
+
+
+def _is_non_default(value: Any, default: Any) -> bool:
+    """Determine whether a supplied argument value differs from its default.
+
+    Uses identity checks for ``None`` and ``inspect._empty``, equality
+    checks for common scalar types (``bool``, ``int``, ``float``, ``str``),
+    and falls back to identity comparison for all other types.
+
+    Args:
+        value: The argument value that was actually passed by the caller.
+        default: The parameter's default value from its signature. If the
+            parameter has no default, this should be ``inspect._empty``.
+
+    Returns:
+        ``True`` if *value* is considered different from *default*,
+        ``False`` otherwise.
+    """
+    if default is inspect._empty:
+        return True
+    if default is None:
+        return value is not None
+    if isinstance(default, (bool, int, float, str)):
+        return value != default
+    return value is not default
+
+
+def _collect_unsupported_reasons(
+    func: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> list[str]:
+    """Collect human-readable reasons why a kernel call is unsupported.
+
+    This function checks two sources of unsupported-feature information:
+
+    1. **Ignored parameters** -- Parameters whose names appear in ``del``
+       statements within *func* (detected by ``_get_ignored_params``).  If the
+       caller supplied a non-default value for such a parameter and it is not
+       a tuning parameter, a reason string is generated.
+    2. **Explicit unsupported hook** -- If *func* carries an
+       ``__ejkernel_unsupported__`` attribute, it is invoked (or iterated)
+       to produce additional reason strings.
+
+    Args:
+        func: The kernel implementation function to inspect.
+        args: Positional arguments passed to the kernel call.
+        kwargs: Keyword arguments passed to the kernel call.
+
+    Returns:
+        A list of human-readable reason strings. An empty list means the
+        call is fully supported.
+    """
+    reasons: list[str] = []
+    sig = inspect.signature(func)
+    bound = sig.bind_partial(*args, **kwargs)
+    ignored = _get_ignored_params(func)
+    for name in ignored:
+        if name in _TUNING_PARAM_NAMES:
+            continue
+        if name in bound.arguments and _is_non_default(bound.arguments[name], sig.parameters[name].default):
+            reasons.append(f"{name} is not supported")
+
+    extra = getattr(func, "__ejkernel_unsupported__", None)
+    if extra is not None:
+        if callable(extra):
+            try:
+                result = extra(**bound.arguments)
+            except TypeError:
+                result = extra(bound.arguments)
+            if isinstance(result, str):
+                reasons.append(result)
+            elif isinstance(result, Iterable):
+                reasons.extend([str(item) for item in result if item])
+        elif isinstance(extra, str):
+            reasons.append(extra)
+        elif isinstance(extra, Iterable):
+            reasons.extend([str(item) for item in extra if item])
+    return reasons
 
 
 def _normalize_type_string(type_annotation: Any) -> str:
@@ -144,7 +310,17 @@ def _types_are_equivalent(type1: Any, type2: Any) -> bool:
 
 
 class Platform(str, Enum):
-    """Supported kernel implementation platforms."""
+    """Supported kernel implementation platforms.
+
+    Each member identifies a compilation/execution framework used to
+    implement a kernel.
+
+    Attributes:
+        TRITON: OpenAI Triton GPU kernels.
+        PALLAS: JAX Pallas kernels (supports both GPU and TPU).
+        CUDA: Native CUDA C/C++ kernels compiled ahead-of-time.
+        XLA: XLA HLO-based implementations using JAX primitives.
+    """
 
     TRITON = "triton"
     PALLAS = "pallas"
@@ -153,7 +329,18 @@ class Platform(str, Enum):
 
 
 class Backend(str, Enum):
-    """Target hardware backends for kernel execution."""
+    """Target hardware backends for kernel execution.
+
+    Used to tag kernel implementations with the hardware they target.
+    During lookup, ``Backend.ANY`` acts as a wildcard that matches every
+    backend query, making it suitable for platform-agnostic implementations.
+
+    Attributes:
+        GPU: NVIDIA (or compatible) GPU backend.
+        TPU: Google TPU backend.
+        CPU: CPU-only backend.
+        ANY: Wildcard backend matching any hardware target.
+    """
 
     GPU = "gpu"
     TPU = "tpu"
@@ -163,14 +350,20 @@ class Backend(str, Enum):
 
 @dataclass(frozen=True)
 class KernelSpec:
-    """Specification for a registered kernel implementation.
+    """Immutable specification describing a single registered kernel implementation.
+
+    Each ``KernelSpec`` binds a concrete callable to its algorithm name,
+    target platform, and hardware backend.  The ``priority`` field governs
+    selection order when multiple implementations match a lookup query --
+    higher values are preferred.
 
     Attributes:
-        platform: The implementation platform (triton, pallas, cuda, xla)
-        backend: Target hardware backend (gpu, tpu, cpu, any)
-        algorithm: Algorithm name (e.g., 'flash_attention')
-        implementation: The actual kernel function
-        priority: Selection priority (higher values preferred)
+        platform: The implementation platform (e.g., ``Platform.TRITON``).
+        backend: Target hardware backend (e.g., ``Backend.GPU``).
+        algorithm: Canonical algorithm name (e.g., ``'flash_attention'``).
+        implementation: The wrapped kernel callable.
+        priority: Selection priority; higher values are preferred during
+            lookup.  Defaults to ``0``.
     """
 
     platform: Platform
@@ -181,22 +374,35 @@ class KernelSpec:
 
 
 class KernelRegistry:
-    """Registry for managing kernel implementations across platforms and backends.
+    """Central registry for managing kernel implementations across platforms and backends.
 
-    Supports registering multiple implementations of the same algorithm for different
-    platforms and backends, with priority-based selection.
+    ``KernelRegistry`` is the backbone of ejkernel's multi-platform dispatch
+    system.  It stores ``KernelSpec`` objects keyed by algorithm name and
+    provides decorator-based registration, priority-aware lookup, and
+    cross-implementation signature validation.
+
+    The typical usage pattern is:
+
+    1. **Register** implementations via the ``register`` decorator.
+    2. **Look up** the best implementation for a given algorithm / platform /
+       backend combination via ``get``.
+    3. (Optional) **Validate** that all implementations of an algorithm share
+       a compatible signature via ``validate_signatures``.
+
+    Attributes:
+        _registry: Internal mapping from lower-cased algorithm names to
+            lists of ``KernelSpec`` objects sorted by descending priority.
 
     Example:
         >>> registry = KernelRegistry()
         >>> @registry.register("flash_attention", Platform.TRITON, Backend.GPU)
         ... def flash_attention_triton(q, k, v): ...
         >>>
-        >>>
         >>> impl = registry.get("flash_attention", platform="triton", backend="gpu")
     """
 
     def __init__(self) -> None:
-        """Initialize an empty kernel registry."""
+        """Initialize an empty kernel registry with no registered algorithms."""
         self._registry: dict[str, list[KernelSpec]] = {}
 
     @overload
@@ -217,14 +423,24 @@ class KernelRegistry:
     ) -> Callable[[F], F]:
         """Decorator to register a kernel implementation.
 
+        Wraps *func* in a validation layer that checks for unsupported
+        parameters before dispatch and converts certain runtime exceptions
+        into ``EjkernelRuntimeError``.  The wrapped function is stored in a
+        ``KernelSpec`` and appended to the internal registry under
+        *algorithm* (case-insensitive).
+
         Args:
-            algorithm: Name of the algorithm (e.g., 'flash_attention')
-            platform: Implementation platform
-            backend: Target hardware backend
-            priority: Selection priority (default: 0). Higher values are preferred.
+            algorithm: Name of the algorithm (e.g., ``'flash_attention'``).
+            platform: Implementation platform.  Accepts a ``Platform``
+                enum member or its string value.
+            backend: Target hardware backend.  Accepts a ``Backend``
+                enum member or its string value.
+            priority: Selection priority (default: ``0``). Higher values
+                are preferred during lookup.
 
         Returns:
-            Decorator function that registers the kernel and returns it unchanged
+            A decorator that registers the kernel and returns the
+            wrapped callable (preserving the original signature).
 
         Example:
             >>> @registry.register("flash_attention", Platform.TRITON, Backend.GPU, priority=10)
@@ -233,21 +449,52 @@ class KernelRegistry:
         """
 
         def decorator(func: F) -> F:
+            """Inner decorator that wraps and registers *func*."""
             key = algorithm.lower()
             if key not in self._registry:
                 self._registry[key] = []
 
+            plat = Platform(platform) if isinstance(platform, str) else platform
+            back = Backend(backend) if isinstance(backend, str) else backend
+
+            @functools.wraps(func)
+            def _wrapped(*args, **kwargs):
+                """Validation wrapper that guards the kernel call.
+
+                Before forwarding to the original implementation, this
+                wrapper checks for unsupported parameter usage and
+                re-raises certain exceptions as ``EjkernelRuntimeError``.
+                """
+                reasons = _collect_unsupported_reasons(func, args, kwargs)
+                if reasons:
+                    raise EjkernelRuntimeError(
+                        f"{algorithm} (platform={plat.value}): " + "; ".join(reasons)
+                    )
+                try:
+                    return func(*args, **kwargs)
+                except EjkernelRuntimeError:
+                    raise
+                except (NotImplementedError, ValueError) as exc:
+                    msg = str(exc)
+                    if "not supported" in msg.lower() or "unsupported" in msg.lower():
+                        raise EjkernelRuntimeError(
+                            f"{algorithm} (platform={plat.value}): {msg}"
+                        ) from exc
+                    raise
+
+            _wrapped.__signature__ = inspect.signature(func)
+
             spec = KernelSpec(
-                platform=Platform(platform) if isinstance(platform, str) else platform,
-                backend=Backend(backend) if isinstance(backend, str) else backend,
+                platform=plat,
+                backend=back,
                 algorithm=algorithm,
-                implementation=func,
+                implementation=_wrapped,
                 priority=priority,
             )
             self._registry[key].append(spec)
 
             self._registry[key].sort(key=lambda x: x.priority, reverse=True)
-            return func
+            return _wrapped  # type: ignore[return-value]
 
         return decorator
 
@@ -259,20 +506,32 @@ class KernelRegistry:
     ) -> Callable:
         """Retrieve the best matching kernel implementation.
 
-        Searches for implementations matching the specified algorithm, platform,
-        and backend. Returns the highest priority match. If backend is not specified,
-        any backend will match. Backend.ANY implementations match all backend queries.
+        Searches for implementations matching the specified algorithm,
+        platform, and backend.  Returns the highest-priority match among
+        all candidates.
+
+        Matching rules:
+            - If *platform* is ``None``, any platform matches.
+            - If *backend* is ``None``, any backend matches.
+            - ``Backend.ANY`` implementations match every backend query.
+            - When *platform* is ``Platform.XLA`` and no direct match is
+              found, a fallback lookup with ``Backend.ANY`` is attempted.
+            - When *backend* is ``Backend.ANY`` and no match is found, a
+              fallback lookup using ``jax.default_backend()`` is attempted.
 
         Args:
-            algorithm: Algorithm name to look up
-            platform: Optional platform filter
-            backend: Optional backend filter
+            algorithm: Algorithm name to look up (case-insensitive).
+            platform: Optional platform filter.  Accepts a ``Platform``
+                enum member, its string value, or ``"auto"``.
+            backend: Optional backend filter.  Accepts a ``Backend``
+                enum member or its string value.
 
         Returns:
-            The matching kernel implementation function
+            The matching kernel implementation callable.
 
         Raises:
-            ValueError: If no matching implementation is found
+            ValueError: If no matching implementation is found after all
+                fallback attempts.
 
         Example:
             >>> impl = registry.get("flash_attention", platform="triton", backend="gpu")
@@ -306,37 +565,55 @@ class KernelRegistry:
         """List all registered algorithm names.
 
         Returns:
-            Sorted list of algorithm names
+            A sorted list of lower-cased algorithm name strings currently
+            present in the registry.
         """
         return sorted(self._registry.keys())
 
     def list_implementations(self, algorithm: str) -> list[KernelSpec]:
-        """List all implementations for a given algorithm.
+        """List all registered implementations for a given algorithm.
 
         Args:
-            algorithm: Algorithm name to query
+            algorithm: Algorithm name to query (case-insensitive).
 
         Returns:
-            List of KernelSpec objects, sorted by priority (descending)
+            A shallow copy of the ``KernelSpec`` list for the algorithm,
+            sorted by priority in descending order.  Returns an empty
+            list if the algorithm has not been registered.
         """
         key = algorithm.lower()
         return self._registry.get(key, []).copy()
 
     def validate_signatures(self, algorithm: str | None, verbose: bool = False) -> bool:
-        """Validate that all implementations of an algorithm have matching signatures.
+        """Validate that all implementations of an algorithm have compatible signatures.
 
-        Compares parameter names, order, and defaults across all implementations.
-        Issues warnings for any mismatches found.
+        Uses the first registered implementation (highest priority) as the
+        reference and compares every subsequent implementation against it.
+        The following properties are checked for each parameter:
+
+        - **Name** -- parameter names must match in order.
+        - **Kind** -- positional-only, keyword-only, etc. must agree.
+        - **Default value** -- default values must be equal.
+        - **Type annotation** -- annotations are compared after
+          normalization via ``_types_are_equivalent``.
+
+        Any mismatch emits a ``UserWarning`` describing the discrepancy.
+
+        When *algorithm* is ``None``, **all** registered algorithms are
+        validated in turn (the return value is ``None`` in this case).
 
         Args:
-            algorithm: Algorithm name to validate
-            verbose: If True, log all parameter signatures before comparison
+            algorithm: Algorithm name to validate (case-insensitive), or
+                ``None`` to validate every registered algorithm.
+            verbose: If ``True``, print detailed parameter information for
+                every implementation before running comparisons.
 
         Returns:
-            True if all signatures match, False otherwise
+            ``True`` if all signatures match, ``False`` otherwise.
+            Returns ``None`` implicitly when *algorithm* is ``None``.
 
         Raises:
-            ValueError: If algorithm is not registered
+            ValueError: If the specified algorithm has not been registered.
         """
         if algorithm is None:
             for algo in self.list_algorithms():
@@ -435,3 +712,9 @@ class KernelRegistry:
 
 
 kernel_registry = KernelRegistry()
+"""Global singleton ``KernelRegistry`` instance.
+
+All built-in kernel implementations register themselves against this
+instance at import time.  User code should typically interact with this
+object rather than creating a new ``KernelRegistry``.
+"""

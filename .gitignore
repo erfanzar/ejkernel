@@ -8,6 +8,7 @@ __pycache__/
 exp.py
 env.py
 run_test.py
+benchmark_plots/*
 # Distribution / packaging
 .Python
 build/

@@ -124,13 +124,33 @@ class ShapeDtype(Protocol):
 
     This protocol defines the interface for array-like objects that provide
     shape and dtype information, commonly used in tensor operations.
+    Compatible types include ``jax.ShapeDtypeStruct``, ``jax.Array``,
+    and ``numpy.ndarray``.
+
+    Example:
+        >>> def process(x: ShapeDtype) -> None:
+        ...     print(f"Shape: {x.shape}, Dtype: {x.dtype}")
+        >>> process(jax.ShapeDtypeStruct((4, 8), jnp.float32))
+        Shape: (4, 8), Dtype: float32
     """
 
     @property
-    def shape(self) -> tuple[int, ...]: ...
+    def shape(self) -> tuple[int, ...]:
+        """Return the dimensions of the array-like object.
+
+        Returns:
+            Tuple of integers representing the size of each dimension.
+        """
+        ...
 
     @property
-    def dtype(self) -> np.dtype: ...
+    def dtype(self) -> np.dtype:
+        """Return the data type of the array-like object.
+
+        Returns:
+            NumPy dtype describing the element type.
+        """
+        ...
 
 
 def get_cache_dir() -> Path:
@@ -170,11 +190,21 @@ class DummyStream:
     """
 
     def write(self, *args, **kwargs):
-        """Discard all write operations."""
+        """Discard all write operations.
+
+        Args:
+            *args: Ignored positional arguments.
+            **kwargs: Ignored keyword arguments.
+        """
         pass
 
     def flush(self, *args, **kwargs):
-        """Discard all flush operations."""
+        """Discard all flush operations.
+
+        Args:
+            *args: Ignored positional arguments.
+            **kwargs: Ignored keyword arguments.
+        """
         pass
 
 

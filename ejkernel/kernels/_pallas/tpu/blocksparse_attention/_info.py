@@ -862,6 +862,22 @@ def _shrink_mask_info(
     mask_next: np.ndarray,
     head_shards: int,
 ):
+    """Shrink forward/dQ mask info by removing empty KV columns.
+
+    Compresses the mask metadata arrays by identifying and removing columns
+    (KV blocks) that are entirely zero across all query blocks. This reduces
+    the effective grid size and improves kernel performance.
+
+    Args:
+        block_mask: Block mask array of shape [head_shards, q_blocks, kv_blocks].
+        data_next: Data prefetch indices of same shape as block_mask.
+        mask_next: Mask prefetch indices of same shape, or None.
+        head_shards: Number of head shards.
+
+    Returns:
+        Tuple of (shrunk_block_mask, shrunk_data_next, shrunk_mask_next) with
+        the KV dimension reduced to only non-empty columns.
+    """
     assert block_mask.ndim == 3
     assert data_next.ndim == 3
     assert mask_next is None or mask_next.ndim == 3
@@ -924,6 +940,22 @@ def _shrink_mask_info_dkv(
     mask_next: np.ndarray,
     head_shards: int,
 ):
+    """Shrink dKV mask info by removing empty Q rows.
+
+    Similar to ``_shrink_mask_info`` but operates on the transposed layout
+    used by the dKV backward kernel. Removes query block rows that are
+    entirely zero for each KV column to reduce the backward grid size.
+
+    Args:
+        block_mask: Block mask array of shape [head_shards, q_blocks, kv_blocks].
+        data_next: Data prefetch indices of same shape as block_mask.
+        mask_next: Mask prefetch indices of same shape, or None.
+        head_shards: Number of head shards.
+
+    Returns:
+        Tuple of (shrunk_block_mask, shrunk_data_next, shrunk_mask_next) with
+        the Q dimension reduced to only non-empty rows per KV column.
+    """
     assert block_mask.ndim == 3
     assert data_next.ndim == 3
     assert mask_next is None or mask_next.ndim == 3
@@ -986,6 +1018,22 @@ def _slice_mask_info(
     head_shards: int,
     slice_function: Callable[[np.ndarray], np.ndarray],
 ):
+    """Apply a slicing function to mask info arrays across all head shards.
+
+    Helper that applies a row/column selection function to block_mask,
+    data_next, and mask_next arrays for each head shard independently,
+    then re-stacks the results.
+
+    Args:
+        block_mask: Block mask array of shape [head_shards, ...].
+        data_next: Data prefetch indices of same shape.
+        mask_next: Mask prefetch indices of same shape, or None.
+        head_shards: Number of head shards to iterate over.
+        slice_function: Function that selects rows or columns from a 2D array.
+
+    Returns:
+        Tuple of (sliced_block_mask, sliced_data_next, sliced_mask_next).
+    """
     new_block_mask = []
     new_data_next = []
     new_mask_next = []

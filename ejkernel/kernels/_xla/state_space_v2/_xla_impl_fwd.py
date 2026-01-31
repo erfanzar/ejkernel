@@ -126,9 +126,32 @@ def _ssm2_fwd(
         )
 
     def process_batch(x_b, B_b, C_b, dt_b, h0):
-        """Process a single batch element."""
+        """Process a single batch element through the full SSM2 sequence.
+
+        Runs the recurrence h_t = dA * h_{t-1} + dBx using lax.scan
+        and collects all hidden states for the backward pass.
+
+        Args:
+            x_b: Input for this batch [seq_len, num_heads, head_dim].
+            B_b: B parameter [seq_len, num_heads, ssm_state_size].
+            C_b: C parameter [seq_len, num_heads, ssm_state_size].
+            dt_b: Time step [seq_len, num_heads].
+            h0: Initial hidden state [num_heads, head_dim, ssm_state_size].
+
+        Returns:
+            Tuple of (outputs, hidden_states_all, h_final).
+        """
 
         def scan_fn(carry, inputs):
+            """Single SSM2 recurrence step within lax.scan.
+
+            Args:
+                carry: Tuple of (hidden_state,).
+                inputs: Tuple of (x_t, B_t, C_t, dt_t) for the current step.
+
+            Returns:
+                Updated carry and outputs (hidden_state, output).
+            """
             x_t, B_t, C_t, dt_t = inputs
             (h,) = carry
 

@@ -110,6 +110,48 @@ def _ragged_paged_attn_fwd(
     PAGE_SIZE_TILE: tl.constexpr,
     COMPUTE_LSE: tl.constexpr,
 ):
+    """Token-level ragged paged attention forward kernel.
+
+    Processes BLOCK_M query tokens at a time, iterating over all sequences
+    and their KV pages. Uses streaming softmax for numerically stable
+    attention computation without materializing full attention matrices.
+
+    Each program instance handles one (query_block, head) pair and scans
+    through all sequences, computing attention only for tokens belonging
+    to the current query block.
+
+    Args:
+        q_ptr: Query tensor pointer, shape (total_tokens, num_q_heads, head_dim).
+        kv_pages_ptr: KV pages pointer with interleaved K/V format.
+        block_tables_ptr: Block table pointer mapping to physical pages.
+        context_lens_ptr: Per-sequence KV context lengths.
+        cu_q_lens_ptr: Cumulative query lengths for sequence boundaries.
+        softmax_scale: Attention scaling factor.
+        logits_soft_cap: Soft capping value for logits (0 if disabled).
+        total_tokens: Total number of query tokens across all sequences.
+        num_seqs: Number of sequences in the batch.
+        num_q_heads: Number of query attention heads.
+        num_kv_heads: Number of key-value attention heads.
+        pages_per_seq: Maximum pages per sequence.
+        head_dim: Head dimension size.
+        total_tokens_rounded: Rounded total tokens for LSE storage.
+        window_left, window_right: Sliding window bounds.
+        *_stride_*: Tensor stride parameters.
+        o_ptr: Output attention tensor pointer.
+        lse_ptr: Log-sum-exp output pointer (for gradient checkpointing).
+        NUM_REPEATS: GQA repeat factor (num_q_heads // num_kv_heads).
+        IS_CAUSAL: Whether to apply causal masking.
+        SLIDING: Whether sliding window is active.
+        SOFTCAP: Whether logit soft capping is active.
+        BLOCK_M: Query block size.
+        BLOCK_NPAGES: Number of pages processed per inner iteration.
+        BLOCK_DMODEL: Padded head dimension (power of 2).
+        MAX_NUM_SEQS: Maximum number of sequences (loop bound).
+        PAGES_PER_SEQ: Maximum pages per sequence (loop bound).
+        PAGE_SIZE: Tokens per page.
+        PAGE_SIZE_TILE: Padded page size for aligned access.
+        COMPUTE_LSE: Whether to compute and store log-sum-exp values.
+    """
     pid_m = tl.program_id(0)
     pid_h = tl.program_id(1)
 
@@ -248,22 +290,40 @@ def _ragged_paged_attn_fwd(
 
 
 def _contig_strides_3(shape):
+    """Compute contiguous strides for a 3D tensor shape (M, H, D)."""
     _M, H, D = shape
     return (H * D, D, 1)
 
 
 def _contig_strides_4(shape):
+    """Compute contiguous strides for a 4D tensor shape (P, S, C, D)."""
     _P, S, C, D = shape
     return (S * C * D, C * D, D, 1)
 
 
 @triton.jit
 def _cdiv_fn(x, y):
+    """Compute ceiling division: ceil(x / y)."""
     return (x + y - 1) // y
 
 
 @triton.jit
 def _find_seq_idx(query_start_len_ptr, target_idx, num_seqs, BLOCK_Q: tl.constexpr):
+    """Find the sequence index for a given global query block index using binary search.
+
+    Maps a global query block index to the corresponding sequence index
+    by searching through cumulative query lengths. This avoids iterating
+    through all sequences to find which one owns a particular query block.
+
+    Args:
+        query_start_len_ptr: Pointer to cumulative query start positions.
+        target_idx: Global query block index to locate.
+        num_seqs: Total number of sequences.
+        BLOCK_Q: Query block size (compile-time constant).
+
+    Returns:
+        Sequence index (0-based) that contains the target query block.
+    """
     left = 0
     right = num_seqs
     while left < right:
@@ -313,6 +373,42 @@ def _ragged_paged_attn_qblock_fwd(
     TILE_SIZE: tl.constexpr,
     HEAD_SIZE_PADDED: tl.constexpr,
 ):
+    """Query-block level ragged paged attention forward kernel.
+
+    Processes queries in fixed-size blocks (BLOCK_Q), using binary search
+    to efficiently locate the sequence for each query block. More efficient
+    than the token-level kernel for workloads with many sequences, as it
+    avoids iterating through all sequences per program instance.
+
+    Each program instance handles one (global_q_block, head) pair, first
+    determining which sequence the block belongs to via _find_seq_idx,
+    then computing attention over the relevant KV pages using FlashAttention-
+    style online softmax.
+
+    Args:
+        q_ptr: Query tensor pointer, shape (total_tokens, num_q_heads, head_dim).
+        kv_pages_ptr: KV pages pointer with interleaved K/V format.
+        block_tables_ptr: Block table pointer mapping to physical pages.
+        seq_lens_ptr: Per-sequence total lengths (context + query).
+        cu_q_lens_ptr: Cumulative query lengths for sequence boundaries.
+        softmax_scale: Attention scaling factor.
+        logits_soft_cap: Soft capping value for logits (0 if disabled).
+        num_seqs: Number of sequences in the batch.
+        num_q_heads: Number of query attention heads.
+        num_kv_heads: Number of key-value attention heads.
+        pages_per_seq: Maximum pages per sequence.
+        page_size: Tokens per page.
+        head_dim: Head dimension size.
+        *_stride_*: Tensor stride parameters.
+        o_ptr: Output attention tensor pointer.
+        NUM_REPEATS: GQA repeat factor (num_q_heads // num_kv_heads).
+        IS_CAUSAL: Whether to apply causal masking.
+        SLIDING: Whether sliding window is active.
+        SOFTCAP: Whether logit soft capping is active.
+        BLOCK_Q: Query block size.
+        TILE_SIZE: KV tile size for inner loop.
+        HEAD_SIZE_PADDED: Padded head dimension for aligned access.
+    """
     q_block_global_idx = tl.program_id(0)
     q_head_idx = tl.program_id(1)
 
@@ -441,6 +537,29 @@ def ragged_paged_attention_triton_call_qblock(
     num_warps: int | None = None,
     num_stages: int | None = None,
 ):
+    """Launch the query-block level ragged paged attention Triton kernel.
+
+    Uses binary search for sequence identification, making it more efficient
+    for workloads with many sequences. Each kernel instance processes a
+    fixed-size query block and locates its owning sequence dynamically.
+
+    Args:
+        queries: Packed queries of shape (total_tokens, num_q_heads, head_dim).
+        kv_pages: Paged KV cache of shape (num_pages, page_size, 2*num_kv_heads, head_dim).
+        context_lens: Per-sequence context lengths, shape (num_seqs,).
+        block_tables: Page table of shape (num_seqs, pages_per_seq).
+        query_start_loc: Cumulative query offsets, shape (num_seqs + 1,).
+        softmax_scale: Attention scaling factor. Defaults to 1/sqrt(head_dim).
+        logits_soft_cap: Optional logit soft capping value.
+        causal: Whether to apply causal masking.
+        block_q: Query block size for the kernel.
+        tile_size: KV tile size for inner loop.
+        num_warps: Optional Triton warps per program.
+        num_stages: Optional Triton pipeline stages.
+
+    Returns:
+        Attention output of shape (total_tokens, num_q_heads, head_dim).
+    """
     assert queries.ndim == 3 and kv_pages.ndim == 4
     assert queries.dtype in (jnp.float16, jnp.bfloat16) and kv_pages.dtype == queries.dtype
     assert context_lens.dtype == jnp.int32 and block_tables.dtype == jnp.int32 and query_start_loc.dtype == jnp.int32
@@ -538,6 +657,31 @@ def ragged_paged_attention_triton_call(
     num_stages: int | None = None,
     compute_lse: bool = False,
 ):
+    """Launch the token-level ragged paged attention Triton kernel.
+
+    Processes packed variable-length queries against paged KV caches with
+    interleaved key-value storage. Supports causal masking, sliding window,
+    logit soft capping, and optional LSE computation.
+
+    Args:
+        queries: Packed queries of shape (total_tokens, num_q_heads, head_dim).
+        kv_pages: Paged KV cache of shape (num_pages, page_size, 2*num_kv_heads, head_dim).
+        context_lens: Per-sequence context lengths, shape (num_seqs,).
+        block_tables: Page table of shape (num_seqs, pages_per_seq).
+        query_start_loc: Cumulative query offsets, shape (num_seqs + 1,).
+        softmax_scale: Attention scaling factor. Defaults to 1/sqrt(head_dim).
+        sliding_window: Optional sliding window size as int or (left, right) tuple.
+        logits_soft_cap: Optional logit soft capping value.
+        causal: Whether to apply causal masking.
+        block_m: Query block size.
+        block_npages: Number of KV pages per inner iteration.
+        num_warps: Optional Triton warps per program.
+        num_stages: Optional Triton pipeline stages.
+        compute_lse: Whether to compute log-sum-exp values for checkpointing.
+
+    Returns:
+        Attention output of shape (total_tokens, num_q_heads, head_dim).
+    """
     assert queries.ndim == 3 and kv_pages.ndim == 4
     assert queries.dtype in (jnp.float16, jnp.bfloat16, jnp.float32) and kv_pages.dtype == queries.dtype
     assert context_lens.dtype == jnp.int32 and block_tables.dtype == jnp.int32 and query_start_loc.dtype == jnp.int32

@@ -59,39 +59,75 @@ def quantize(
     bits: int | None = None,
     mode: QuantizationMode = "affine",
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
-    """Quantize `w` into packed uint32 codes plus per-group scales/biases.
+    """Quantize a weight tensor into packed uint32 codes with per-group scales and biases.
 
-    Modes:
-      - affine: group_size in {32, 64, 128}, bits in {2, 3, 4, 5, 6, 7, 8}.
-      - mxfp4: group_size=32, bits=4, E2M1 codes with shared E8M0 scale (uint8).
-      - mxfp8: group_size=32, bits=8, E4M3 codes with shared E8M0 scale (uint8).
-      - nvfp4: group_size=16, bits=4, E2M1 codes with shared E4M3 scale (uint8).
-      - nvfp8: group_size=16, bits=8, E4M3 codes with shared E4M3 scale (uint8).
-      - nf4: bits=4, NF4 codebook with per-group absmax scale (float).
+    Splits the last dimension of `w` into groups, computes per-group quantization
+    parameters, maps values to integer codes, and packs the codes into uint32 words
+    using LSB-first ordering (MLX-compatible).
+
+    Args:
+        w: Weight tensor to quantize, with at least 2 dimensions. The last
+            dimension must be divisible by `group_size`.
+        group_size: Number of elements per quantization group. If None, a
+            mode-specific default is used (affine: 64, mxfp4/mxfp8: 32,
+            nvfp4/nvfp8: 16, nf4: 64). Allowed values depend on mode:
+
+            - affine: {8, 16, 32, 64, 128, 256, 512}
+            - mxfp4/mxfp8: 32 (fixed)
+            - nvfp4/nvfp8: 16 (fixed)
+            - nf4: any divisor of the last dimension
+        bits: Bit-width per quantized element. If None, a mode-specific default
+            is used. Allowed values depend on mode:
+
+            - affine: {2, 3, 4, 5, 6, 7, 8} (default 4)
+            - mxfp4/nvfp4/nf4: 4 (fixed)
+            - mxfp8/nvfp8: 8 (fixed)
+        mode: Quantization mode to use. One of:
+
+            - ``"affine"``: Linear scale+bias quantization. Computes per-group
+              min/max and maps values to [0, 2^bits - 1].
+            - ``"mxfp4"``: Microscaling FP4 (E2M1) with shared E8M0 exponent.
+            - ``"mxfp8"``: Microscaling FP8 (E4M3) with shared E8M0 exponent.
+            - ``"nvfp4"``: NVIDIA FP4 (E2M1) with E4M3 per-group scale.
+            - ``"nvfp8"``: NVIDIA FP8 (E4M3) with E4M3 per-group scale.
+            - ``"nf4"``: 4-bit NormalFloat codebook (QLoRA-style).
 
     Returns:
-      - affine: (w_q, scales, biases)
-      - other modes: (w_q, scales)
-      where w_q is packed uint32 with elements stored LSB-first.
+        A tuple whose contents depend on the mode:
 
-    Estimated reconstruction error (quantize -> dequantize) on a float32 linear
-    ramp input, shape (512, 1024) unless noted:
-      - mxfp4:  MAE ~0.0417, RMSE ~0.0546, max ~0.125
-      - mxfp8:  MAE ~0.0104, RMSE ~0.0136, max ~0.03125
-      - nvfp4:  MAE ~0.0121, RMSE ~0.0166, max ~0.0469 (shape (512, 512))
-      - nvfp8:  MAE ~0.0105, RMSE ~0.0137, max ~0.03125 (shape (512, 512))
-      - affine: MAE ~3.9e-06, RMSE ~4.6e-06, max ~7.7e-06
-      - nf4:    MAE ~1.2e-04, RMSE ~1.4e-04, max ~2.4e-04
+        - **affine**: ``(w_q, scales, biases)`` where scales and biases have
+          the same dtype as `w`.
+        - **all other modes**: ``(w_q, scales)`` where scales is uint8.
 
-    Errors depend on input distribution, dtype, and group_size; treat these as
-    rough sanity checks, not guarantees.
+        In all cases, ``w_q`` is a packed uint32 array with elements stored
+        LSB-first.
+
+    Raises:
+        ValueError: If `group_size` is not valid for the selected mode.
+        ValueError: If `bits` is not valid for the selected mode.
+        ValueError: If the last dimension of `w` is not divisible by `group_size`.
+        ValueError: If `mode` is not a recognized quantization mode.
+
+    Note:
+        Estimated reconstruction error (quantize then dequantize) on a float32
+        linear ramp input, shape (512, 1024) unless noted:
+
+        - mxfp4:  MAE ~0.0417, RMSE ~0.0546, max ~0.125
+        - mxfp8:  MAE ~0.0104, RMSE ~0.0136, max ~0.03125
+        - nvfp4:  MAE ~0.0121, RMSE ~0.0166, max ~0.0469 (shape (512, 512))
+        - nvfp8:  MAE ~0.0105, RMSE ~0.0137, max ~0.03125 (shape (512, 512))
+        - affine: MAE ~3.9e-06, RMSE ~4.6e-06, max ~7.7e-06
+        - nf4:    MAE ~1.2e-04, RMSE ~1.4e-04, max ~2.4e-04
+
+        Errors depend on input distribution, dtype, and group_size; treat these
+        as rough sanity checks, not guarantees.
     """
     mode = mode.lower()
     if mode == "affine":
         group_size = 64 if group_size is None else int(group_size)
         bits = 4 if bits is None else _require_bits(bits, {2, 3, 4, 5, 6, 7, 8})
-        if group_size not in {32, 64, 128}:
-            raise ValueError("affine mode supports group_size in {32, 64, 128}.")
+        if group_size not in {8, 16, 32, 64, 128, 256, 512}:
+            raise ValueError("affine mode supports group_size in {8,16,32,64,128,256,512}.")
 
         w_groups, _ = _reshape_groups(w, group_size)
         alpha = jnp.max(w_groups, axis=-1)

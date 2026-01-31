@@ -77,7 +77,16 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 
 class MultiPageAsyncCopyDescriptor:
-    """Descriptor for async copy of multiple K/V pages from HBM."""
+    """Descriptor for asynchronous DMA copy of multiple KV cache pages from HBM to VMEM.
+
+    Manages the async transfer of multiple pages from the paged KV cache stored
+    in HBM into a VMEM buffer on TPU. Handles boundary conditions where requested
+    pages may exceed the valid range by mapping out-of-bounds indices to page 0.
+
+    Attributes:
+        _vmem_buf: VMEM buffer reference for storing the loaded pages.
+        _async_copies: List of individual async copy operations, one per page slot.
+    """
 
     def __init__(
         self,
@@ -107,6 +116,11 @@ class MultiPageAsyncCopyDescriptor:
             async_copy.start()
 
     def wait(self):
+        """Wait for all async copies to complete and return the VMEM buffer.
+
+        Returns:
+            The VMEM buffer reference containing the loaded page data.
+        """
         for async_copy in self._async_copies:
             async_copy.wait()
         return self._vmem_buf
@@ -126,6 +140,33 @@ def ref_ragged_page_attention(
     mask_value: float | None = DEFAULT_MASK_VALUE,
     softmax_aux: jax.Array | None = None,
 ):
+    """Reference implementation of ragged paged attention for correctness testing.
+
+    Processes each sequence sequentially using standard einsum-based attention.
+    This is not optimized for performance but serves as a ground truth for
+    validating the Pallas kernel implementation.
+
+    The function iterates over sequences, gathers KV from pages, applies
+    causal masking (with optional sliding window and soft capping), computes
+    softmax attention, and concatenates outputs.
+
+    Args:
+        queries: Concatenated query tokens [total_tokens, num_q_heads, head_dim].
+        kv_pages: Paged KV cache [num_pages, page_size, num_combined_kv_heads, head_dim].
+            Keys at even indices, values at odd indices in dim 2.
+        context_lens: KV context lengths per sequence [max_num_seqs].
+        block_tables: Page table mapping [max_num_seqs, pages_per_seq].
+        query_start_loc: Cumulative query positions [max_num_seqs+1].
+        num_seqs: Array of shape [1] with the dynamic number of sequences.
+        softmax_scale: Scaling factor for QK^T. Defaults to 1.0.
+        sliding_window: Optional window size for local attention.
+        logits_soft_cap: Optional soft cap for attention logits.
+        mask_value: Value for masked positions. Defaults to DEFAULT_MASK_VALUE.
+        softmax_aux: Optional attention sink logits [num_q_heads].
+
+    Returns:
+        Attention output [total_tokens, num_q_heads, head_dim] matching queries layout.
+    """
     static_validate_inputs(
         queries,
         kv_pages,
@@ -200,6 +241,31 @@ def dynamic_validate_inputs(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ):
+    """Validate inputs with both static shape checks and dynamic value checks.
+
+    Extends static_validate_inputs with runtime checks on actual tensor values.
+    This includes verifying that num_seqs does not exceed the maximum, that
+    pages_per_seq is sufficient for the maximum KV length, that total query
+    tokens fit within the buffer, and that query lengths do not exceed KV lengths.
+
+    Args:
+        q: Query tensor [max_num_batched_tokens, num_q_heads, head_dim].
+        kv_pages: Paged KV cache tensor.
+        context_lens: KV context lengths per sequence.
+        block_tables: Page table mapping.
+        query_start_loc: Cumulative query positions.
+        num_seqs: Dynamic number of sequences [1].
+        softmax_scale: Attention scaling factor.
+        sliding_window: Optional sliding window size.
+        logits_soft_cap: Optional logit soft cap value.
+        mask_value: Mask value for causal masking.
+        num_kv_pages_per_block: KV pages per compute block.
+        num_queries_per_block: Queries per compute block.
+        vmem_limit_bytes: VMEM budget limit.
+
+    Raises:
+        ValueError: If any dynamic constraint is violated.
+    """
     static_validate_inputs(
         q,
         kv_pages,
@@ -253,6 +319,30 @@ def static_validate_inputs(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ):
+    """Validate input tensor shapes, dtypes, and static parameter constraints.
+
+    Performs compile-time checks on tensor shapes and dtypes to catch
+    configuration errors early. Validates head dimension consistency,
+    GQA head ratio divisibility, and parameter value ranges.
+
+    Args:
+        q: Query tensor [max_num_batched_tokens, num_q_heads, head_dim].
+        kv_pages: Paged KV cache [num_pages, page_size, num_combined_kv_heads, head_dim].
+        context_lens: KV lengths [max_num_seqs].
+        block_tables: Page indices [max_num_seqs, pages_per_seq].
+        query_start_loc: Cumulative query positions [max_num_seqs+1].
+        num_seqs: Number of sequences [1].
+        softmax_scale: Attention scaling factor (not validated).
+        sliding_window: Must be positive if provided.
+        logits_soft_cap: Must be non-zero if provided.
+        mask_value: Mask value (not validated).
+        num_kv_pages_per_block: Must be in (0, pages_per_seq] if provided.
+        num_queries_per_block: Must be positive if provided.
+        vmem_limit_bytes: Must be positive if provided.
+
+    Raises:
+        ValueError: If any static constraint is violated.
+    """
     _, num_q_heads, head_dim = q.shape
     _, _, num_combined_kv_heads, head_dim_k = kv_pages.shape
     assert num_combined_kv_heads % 2 == 0
@@ -314,6 +404,37 @@ def ragged_page_attention_kernel(
     logits_soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
 ):
+    """Pallas kernel for ragged paged attention with async DMA and online softmax.
+
+    This is the main TPU kernel that processes ragged batches of queries against
+    paged KV caches. It uses a two-level loop structure: the outer loop iterates
+    over sequences that overlap with the current query block, and the inner loop
+    iterates over KV blocks within each sequence.
+
+    The kernel uses double-buffered async DMA to prefetch KV pages from HBM
+    while computing attention on the current block. For each KV block, it
+    performs flash attention with online softmax updates.
+
+    Args:
+        context_lens_ref: Scalar prefetch ref for KV context lengths [max_num_seqs].
+        page_indices_ref: Scalar prefetch ref for page tables [max_num_seqs, pages_per_seq].
+        cu_q_lens_ref: Scalar prefetch ref for cumulative query lengths [max_num_seqs+1].
+        seq_buf_idx_ref: Scalar prefetch ref for (current_seq_idx, current_buffer_idx).
+        num_seqs_ref: Scalar prefetch ref for dynamic number of sequences [1].
+        q_ref: Query block ref [num_q_per_blk, num_q_heads_per_blk, head_dim].
+        kv_pages_hbm_ref: KV cache HBM ref [num_pages, page_size, num_combined_kv_heads, head_dim].
+        softmax_aux_ref: Attention sink logits ref in VMEM.
+        o_ref: Output ref [num_q_per_blk, num_q_heads_per_blk, head_dim].
+        kv_bufs: Double-buffered VMEM scratch for KV page loading.
+        sems: DMA semaphores for async copy synchronization [2].
+        l_ref: Softmax denominator accumulator scratch in VMEM.
+        m_ref: Softmax max accumulator scratch in VMEM.
+        acc_ref: Output accumulator scratch in VMEM.
+        softmax_scale: Scaling factor for attention logits.
+        sliding_window: Optional sliding window size for local attention.
+        logits_soft_cap: Optional soft cap value for attention logits.
+        mask_value: Value for masked positions in the attention matrix.
+    """
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     num_q_per_blk, num_q_heads_per_blk, head_dim = q_ref.shape
@@ -619,16 +740,53 @@ def ragged_page_attention_kernel(
 
 
 def cdiv(a, b):
+    """Compute ceiling division of a by b.
+
+    Args:
+        a: Dividend (numerator).
+        b: Divisor (denominator). Must be non-zero.
+
+    Returns:
+        The smallest integer >= a/b.
+    """
     assert b != 0
     return (a + b - 1) // b
 
 
 def get_dtype_packing(dtype):
+    """Compute how many elements of the given dtype fit in a 32-bit word.
+
+    Args:
+        dtype: JAX/NumPy dtype to compute packing for.
+
+    Returns:
+        Number of elements that fit in 32 bits (e.g., 2 for bfloat16, 1 for float32).
+    """
     bits = jnp.dtype(dtype).itemsize * 8
     return 32 // bits
 
 
 def get_min_heads_per_blk(num_q_heads, num_combined_kv_heads, q_dtype, kv_dtype):
+    """Determine the minimum number of heads per processing block for XLA tiling.
+
+    Computes the smallest number of query and combined KV heads per block that
+    satisfies XLA's tiling constraints. XLA requires certain dimensions to be
+    fully tileable (i.e., divisible by the dtype packing factor and resulting
+    in a valid tile size like 1, 2, 4, 8, or a multiple of 8).
+
+    Args:
+        num_q_heads: Total number of query heads.
+        num_combined_kv_heads: Total number of combined KV heads (K and V interleaved).
+        q_dtype: Query tensor dtype for packing calculation.
+        kv_dtype: KV cache dtype for packing calculation.
+
+    Returns:
+        Tuple of (num_q_heads_per_blk, num_combined_kv_heads_per_blk) that satisfies
+        XLA tiling constraints.
+
+    Raises:
+        ValueError: If num_combined_kv_heads cannot be XLA fully tiled.
+    """
     q_packing = get_dtype_packing(q_dtype)
     kv_packing = get_dtype_packing(kv_dtype)
 

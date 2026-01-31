@@ -8,4 +8,4 @@ sys.path.append(os.path.dirname(__file__))
 from _op_benchmark_registry import run_benchmark
 
 if __name__ == "__main__":
-    raise SystemExit(run_benchmark("quantized_matmul"))
+    raise SystemExit(run_benchmark("quantized_matmul", ignore_platforms=["triton"]))

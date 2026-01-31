@@ -34,35 +34,19 @@ import triton
 import triton.language as tl
 
 from ejkernel.callib import cdiv, strides_from_shape, triton_call
+from ejkernel.quantization._utils.fp_tables import _get_nf4_table
 from ejkernel.quantization._utils.grouping import _require_bits
 
 #: Supported quantization modes for Triton kernels.
 QuantizationMode = Literal["affine", "nf4"]
 
+_NF4_TABLE = _get_nf4_table()
+
 
 @triton.jit
-def _nf4_to_f32(x: tl.tensor) -> tl.tensor:
-    """Convert 4-bit NF4 codes to float32 using polynomial approximation.
-
-    This function approximates the NF4 dequantization lookup table using a
-    5th-degree polynomial, which is more efficient than table lookups in
-    Triton kernels.
-
-    Args:
-        x: Tensor of NF4 codes (0-15) as integers.
-
-    Returns:
-        Tensor of dequantized float32 values in range [-1, 1].
-    """
-    x = x.to(tl.float32)
-    return (
-        x
-        * (
-            x * (x * (x * (1.82943132356953e-5 * x - 0.00068587779130373) + 0.0100420261313669) - 0.0722703570217226)
-            + 0.346075459755188
-        )
-        - 0.994166218659335
-    )
+def _nf4_to_f32(x: tl.tensor, table_ptr) -> tl.tensor:
+    """Convert 4-bit NF4 codes to float32 via table lookup."""
+    return tl.load(table_ptr + x)
 
 
 def _zeroed_outputs_for_splitk(meta: dict) -> tuple[int, ...]:
@@ -81,6 +65,15 @@ def _zeroed_outputs_for_splitk(meta: dict) -> tuple[int, ...]:
 
 
 def _qmm_autotune_configs() -> list[triton.Config]:
+    """Generate autotune configurations for quantized matmul kernels.
+
+    Produces a set of Triton configurations covering various block sizes,
+    warp counts, pipeline stages, and split-K values. Configurations that
+    exceed the shared memory limit (96 KB) are filtered out.
+
+    Returns:
+        List of triton.Config instances for autotuning.
+    """
     configs: list[triton.Config] = []
     bm_choices = (64, 128, 256)
     bn_choices = (64, 128, 256)
@@ -133,6 +126,7 @@ def qmm_nf4_kernel(
     X,
     Wq,
     Wscale,
+    NF4_TABLE,
     M,
     N,
     K,
@@ -154,6 +148,30 @@ def qmm_nf4_kernel(
     USE_BF16: tl.constexpr = True,
     TRANSPOSE: tl.constexpr = True,
 ):
+    """Fused NF4 dequantization and matrix multiplication Triton kernel.
+
+    Performs x @ dequant(w) where w is packed in NF4 (4-bit NormalFloat) format.
+    Each 32-bit word contains 8 NF4 codes that are decoded via table lookup,
+    scaled by per-group scale factors, and multiplied with the activation tile.
+
+    Supports both transposed (NxK) and non-transposed (KxN) weight layouts.
+    Uses split-K parallelism with atomic accumulation when SPLIT_K > 1.
+
+    Args:
+        X: Input activation matrix pointer, shape (M, K).
+        Wq: Packed NF4 weights pointer (uint32, 8 values per word).
+        Wscale: Per-group scale factors pointer.
+        NF4_TABLE: NF4 codebook lookup table pointer (16 float32 entries).
+        M, N, K: Matrix dimensions.
+        O: Output matrix pointer, shape (M, N).
+        stride_*: Tensor stride parameters.
+        GROUP_SIZE: Number of elements per quantization group.
+        VALUES_PER_WORD: Number of quantized values per uint32 word (8 for NF4).
+        BM, BK, BN: Block tile sizes for M, K, N dimensions.
+        SPLIT_K: Split-K parallelism factor.
+        USE_BF16: If True, use BF16 for dot product tiles; otherwise FP16.
+        TRANSPOSE: If True, weights are in NxK layout; otherwise KxN.
+    """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     pid_k = tl.program_id(2)
@@ -216,7 +234,7 @@ def qmm_nf4_kernel(
                 other=0.0,
             )
 
-        w = _nf4_to_f32(q).to(dot_ty) * ws.to(dot_ty)
+        w = _nf4_to_f32(q.to(tl.int32), NF4_TABLE).to(dot_ty) * ws.to(dot_ty)
         acc = tl.dot(x, w, acc)
 
     if SPLIT_K == 1:
@@ -265,6 +283,34 @@ def qmm_affine_kernel(
     TRANSPOSE: tl.constexpr = True,
     HAS_BIAS: tl.constexpr = True,
 ):
+    """Fused affine dequantization and matrix multiplication Triton kernel.
+
+    Performs x @ dequant(w) where w is packed in affine quantization format.
+    Dequantization applies: w_float = w_int * scale + bias (when HAS_BIAS)
+    or w_float = w_int * scale (when not HAS_BIAS).
+
+    Supports 4-bit and 8-bit quantization with per-group scale and bias
+    factors. Multiple quantized values are packed into uint32 words.
+
+    Uses split-K parallelism with atomic accumulation when SPLIT_K > 1.
+
+    Args:
+        X: Input activation matrix pointer, shape (M, K).
+        Wq: Packed quantized weights pointer (uint32).
+        Wscale: Per-group scale factors pointer.
+        Wbias: Per-group bias factors pointer (ignored if HAS_BIAS=False).
+        M, N, K: Matrix dimensions.
+        O: Output matrix pointer, shape (M, N).
+        stride_*: Tensor stride parameters.
+        GROUP_SIZE: Number of elements per quantization group.
+        BITS: Bit-width per quantized element (4 or 8).
+        VALUES_PER_WORD: Number of quantized values per uint32 (32 // BITS).
+        BM, BK, BN: Block tile sizes for M, K, N dimensions.
+        SPLIT_K: Split-K parallelism factor.
+        USE_BF16: If True, use BF16 for dot product tiles; otherwise FP16.
+        TRANSPOSE: If True, weights are in NxK layout; otherwise KxN.
+        HAS_BIAS: If True, apply per-group bias during dequantization.
+    """
     tl.static_assert((BITS == 4) | (BITS == 8))
 
     pid_m = tl.program_id(0)
@@ -466,6 +512,20 @@ def _validate_shapes(
 
 
 def _select_split_k(k: int, block_k: int, max_split: int = 8) -> int:
+    """Select the split-K factor based on the K dimension size.
+
+    Heuristically determines how many splits to use along the K dimension
+    for parallel reduction. Larger K dimensions benefit from more splits
+    to increase parallelism on the GPU.
+
+    Args:
+        k: Total K dimension size.
+        block_k: Block size for the K dimension.
+        max_split: Maximum allowed split-K value.
+
+    Returns:
+        Split-K factor (1, 2, 4, or 8).
+    """
     if block_k <= 0:
         return 1
     tiles = math.ceil(k / block_k)
@@ -535,6 +595,9 @@ def quantized_matmul_triton(
     mode = mode.lower()
     group_size, bits = _resolve_qparams(mode, group_size, bits)
 
+    if use_bf16 and getattr(x, "dtype", None) == jnp.float16:
+        use_bf16 = False
+
     if mode == "affine" and biases is None:
         raise ValueError("affine quantized_matmul requires biases.")
     if mode != "affine" and biases is not None:
@@ -566,6 +629,7 @@ def quantized_matmul_triton(
             x,
             w,
             scales,
+            _NF4_TABLE,
             M,
             N,
             K,

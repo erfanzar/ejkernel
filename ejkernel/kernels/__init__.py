@@ -58,6 +58,14 @@ try:
 except Exception:  # pragma: no cover
 
     def build_cuda_libs():
+        """No-op fallback for building CUDA libraries when the CUDA backend is unavailable.
+
+        This stub is used when the native CUDA module fails to load,
+        allowing imports to succeed without a CUDA toolkit installation.
+
+        Returns:
+            None: Always returns None since no build can be performed.
+        """
         return None  # type: ignore[assignment]
 
 

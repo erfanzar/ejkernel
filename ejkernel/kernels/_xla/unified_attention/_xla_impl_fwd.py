@@ -72,6 +72,36 @@ def _unified_attention_fwd(
     qq_bias: jax.Array | None,
     softmax_aux: jax.Array | None,
 ) -> jax.Array:
+    """Compute unified attention forward pass for ragged batches with paged KV cache.
+
+    Handles variable-length sequences packed together using block-tabled
+    KV caches. Processes sequences one at a time, dividing each sequence's
+    queries into blocks and iterating over KV cache blocks with online
+    softmax for memory-efficient computation.
+
+    Supports ALiBi position encoding, query-query attention bias,
+    attention sinks (softmax_aux), sliding window, and logit soft capping.
+
+    Args:
+        queries: Packed query tokens [total_tokens, num_q_heads, head_dim].
+        key_cache: Paged key cache [num_blocks, block_size, num_kv_heads, head_dim].
+        value_cache: Paged value cache [num_blocks, block_size, num_kv_heads, head_dim].
+        kv_lens: Context length per sequence [num_seqs].
+        block_tables: Block table mapping [num_seqs, max_blocks_per_seq].
+        query_start_loc: Cumulative query counts [num_seqs + 1].
+        softmax_scale: Scaling factor for QK^T.
+        sliding_window: Optional sliding window size (None or 0 disables).
+        logits_soft_cap: Optional soft cap value (None or 0 disables).
+        alibi_slopes: Optional ALiBi slopes [num_q_heads] (None disables).
+        qq_bias: Optional query-query bias [dim, dim] (None disables).
+        softmax_aux: Optional attention sink logits [num_q_heads] (None disables).
+
+    Returns:
+        Attention output [total_tokens, num_q_heads, head_dim].
+
+    Raises:
+        ValueError: If input shapes, dtypes, or configurations are invalid.
+    """
     if queries.ndim != 3:
         raise ValueError("queries must be rank-3: [total_tokens, num_q_heads, head_dim]")
     if key_cache.ndim != 4 or value_cache.ndim != 4:
@@ -149,6 +179,18 @@ def _unified_attention_fwd(
     mask_value = jnp.array(DEFAULT_MASK_VALUE, dtype=jnp.float32)
 
     def _seq_body(seq_idx, o_acc):
+        """Process attention for a single sequence in the ragged batch.
+
+        Determines the query range and KV context for this sequence,
+        then dispatches block-level query processing with online softmax.
+
+        Args:
+            seq_idx: Index of the current sequence.
+            o_acc: Output accumulator being updated.
+
+        Returns:
+            Updated output accumulator with this sequence's results.
+        """
         q_start = query_start_loc[seq_idx]
         q_end = query_start_loc[seq_idx + 1]
         q_len = q_end - q_start
@@ -159,6 +201,19 @@ def _unified_attention_fwd(
         num_kv_blocks = (kv_len + jnp.int32(block_size) - 1) // jnp.int32(block_size)
 
         def _process_query_block(qb, o_inner):
+            """Compute attention for one query block against all KV blocks.
+
+            Loads a block of queries, initializes online softmax state,
+            iterates over all KV cache blocks, normalizes, and writes
+            the result to the output buffer.
+
+            Args:
+                qb: Query block index within this sequence.
+                o_inner: Output buffer being updated.
+
+            Returns:
+                Updated output buffer with this query block's results.
+            """
             q_off = qb * jnp.int32(qblocks)
             q_global_start = q_start + q_off
             q_block = jax.lax.dynamic_slice(
@@ -182,6 +237,19 @@ def _unified_attention_fwd(
                 init_m = jnp.full((qblocks, num_kv_heads, num_q_heads // num_kv_heads), -jnp.inf, dtype=jnp.float32)
 
             def _process_kv_block(kb, carry):
+                """Process one KV cache block and update the online softmax state.
+
+                Loads a physical KV block, computes attention scores with
+                causal masking, optional ALiBi bias, qq_bias, sliding window,
+                and soft capping. Updates the running online softmax accumulator.
+
+                Args:
+                    kb: KV block index within this sequence's block table.
+                    carry: Tuple of (acc, l, m) online softmax state.
+
+                Returns:
+                    Updated (acc, l, m) state.
+                """
                 acc, l, m = carry
                 physical_block = block_tables[seq_idx, kb]
                 k_block = key_cache[physical_block].astype(jnp.float32)  # [B, HKV, D]

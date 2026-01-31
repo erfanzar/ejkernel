@@ -69,6 +69,8 @@ Reference:
     https://arxiv.org/abs/2205.14135
 """
 
+from __future__ import annotations
+
 import functools
 
 import jax
@@ -78,7 +80,12 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
+PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
+DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
+BlockTables = Int[Array, "batch max_blocks"]
+
 from ejkernel.callib import ejit
+from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -336,8 +343,8 @@ flash_attention_call.defvjp(_jax_fwd_attention_call, _jax_bwd_attention_call)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
+    key: DenseKV | PagedKV,
+    value: DenseKV | PagedKV,
     attention_mask: (
         Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
         | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
@@ -361,7 +368,7 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
-    block_tables: Int[Array, "batch max_blocks"] | None = None,
+    block_tables: BlockTables | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention for efficient scaled dot-product attention.
 
@@ -401,9 +408,21 @@ def flash_attention(
         >>>
         >>> out = flash_attention(query, key, value, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
     """
-    del precision, logits_dtype, normalize_output
+    reasons: list[str] = []
     if block_tables is not None:
-        raise ValueError("paged_kv is only supported by the CUDA flash attention backend.")
+        reasons.append("block_tables (paged_kv) is not supported")
+    if not normalize_output:
+        reasons.append("normalize_output must be True")
+    if isinstance(precision, int):
+        if int(precision) != 0:
+            reasons.append("precision must be DEFAULT")
+    elif precision != lax.Precision.DEFAULT:
+        reasons.append("precision must be DEFAULT")
+    if jnp.dtype(logits_dtype) != jnp.float32:
+        reasons.append("logits_dtype must be float32")
+    if reasons:
+        raise EjkernelRuntimeError("flash_attention (platform=triton): " + "; ".join(reasons))
+    del precision, logits_dtype, normalize_output
 
     return flash_attention_call(
         query=query,

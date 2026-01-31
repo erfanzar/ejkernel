@@ -168,13 +168,21 @@ class LazyLogger:
         self._logger: logging.Logger | None = None
 
     @property
-    def level(self):
-        """Get the current logging level."""
+    def level(self) -> int:
+        """Return the current logging level as an integer.
+
+        Returns:
+            Logging level integer (e.g., 10 for DEBUG, 20 for INFO).
+        """
         return self._level
 
     @property
-    def name(self):
-        """Get the logger name."""
+    def name(self) -> str:
+        """Return the logger name.
+
+        Returns:
+            The name string provided at construction time.
+        """
         return self._name
 
     def _ensure_initialized(self) -> None:
@@ -388,17 +396,38 @@ class ProgressLogger:
         else:
             self._logger.info(full_message)
 
-    def __enter__(self):
-        """Context manager entry."""
+    def __enter__(self) -> "ProgressLogger":
+        """Enter the context manager, returning this instance.
+
+        Returns:
+            This ProgressLogger instance for use in ``with`` blocks.
+
+        Example:
+            >>> with ProgressLogger("Processing") as progress:
+            ...     progress.update(0, 10, "Starting")
+        """
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - complete the progress."""
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        """Exit the context manager and finalize progress display.
+
+        Calls ``complete()`` if no exception occurred during the block.
+        Does not suppress exceptions.
+
+        Args:
+            exc_type: Exception type, if any was raised.
+            exc_val: Exception value, if any was raised.
+            exc_tb: Exception traceback, if any was raised.
+
+        Returns:
+            False, indicating exceptions are never suppressed.
+        """
         if exc_type is None:
             self.complete()
         return False
 
 
+#: Module-level logger instance used internally by profiler utilities.
 logger = get_logger("ejKernelLoggings")
 
 
@@ -541,7 +570,11 @@ def _pulse_output_during_wait(completion_signal: threading.Event) -> None:
     """
 
     def pulse_output() -> None:
-        """Periodically flush output streams until completion signal is set."""
+        """Periodically flush stdout and stderr until the completion signal is set.
+
+        Runs in a daemon thread, printing keep-alive messages every 5 seconds
+        to prevent connection timeouts during long profiler finalization.
+        """
         sys.stdout.flush()
         sys.stderr.flush()
         time.sleep(5)

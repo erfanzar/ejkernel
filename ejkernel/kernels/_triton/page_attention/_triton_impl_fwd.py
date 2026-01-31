@@ -121,6 +121,35 @@ def _paged_attn_kernel(
     KV_BLOCK_SIZE: tl.constexpr,
     PARTITION_SIZE: tl.constexpr,
 ):
+    """Paged attention Triton kernel with optional context partitioning.
+
+    Computes attention over block-tabled KV caches using log2-based softmax
+    for numerical stability. Supports both single-pass and partitioned modes
+    for handling long context windows efficiently.
+
+    Each program instance handles one (sequence, kv_head, partition) tuple.
+    In single-pass mode (PARTITION_SIZE=0), each instance processes the full
+    context. In partitioned mode, each instance processes a partition and
+    stores partial (max, sum) statistics for later reduction.
+
+    Args:
+        q_ptr: Query tensor pointer, shape (num_seqs, num_heads, head_dim).
+        k_cache_ptr: Key cache pointer, shape (num_blocks, num_kv_heads, block_size, head_dim).
+        v_cache_ptr: Value cache pointer, same shape as key cache.
+        context_lens_ptr: Per-sequence context lengths pointer, shape (num_seqs,).
+        block_tables_ptr: Block table pointer mapping logical to physical blocks.
+        m_i_ptr: Output pointer for per-partition max logits (partitioned mode).
+        l_i_ptr: Output pointer for per-partition sum of exp (partitioned mode).
+        out_ptr: Output attention tensor pointer.
+        attn_scale: Attention scaling factor (typically 1/sqrt(head_dim)).
+        stride_bt0..stride_o4: Tensor stride parameters for indexing.
+        HEAD_SIZE: Head dimension size (compile-time constant).
+        QUERY_GROUP_SIZE: Number of query heads per KV head for GQA.
+        PADDED_QUERY_GROUP_SIZE: Power-of-2 padded group size for alignment.
+        NUM_KV_HEADS: Number of key-value heads.
+        KV_BLOCK_SIZE: Number of tokens per KV cache block.
+        PARTITION_SIZE: Context partition size (0 for single-pass mode).
+    """
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     part_idx = tl.program_id(2)
@@ -246,6 +275,31 @@ def _paged_attn_v2_reduce_kernel(
     PARTITION_SIZE: tl.constexpr,
     NUM_PARTITIONS: tl.constexpr,
 ):
+    """Reduction kernel for partitioned paged attention.
+
+    Combines partial attention outputs from multiple context partitions using
+    numerically stable log-sum-exp weighted averaging. Each partition stores
+    its local (max_logit, sum_exp, output) which are combined here.
+
+    For single-partition cases (num_partitions == 1), the kernel simply copies
+    the temporary output to the final output buffer. For multi-partition cases,
+    it reweights each partition's output by its relative contribution to the
+    global softmax normalization.
+
+    Args:
+        m_i_ptr: Per-partition max logits, shape (num_seqs, num_kv_heads, num_splits, group_size).
+        l_i_ptr: Per-partition sum of exp, same shape as m_i_ptr.
+        tmp_out_ptr: Per-partition attention outputs.
+        context_lens_ptr: Per-sequence context lengths, shape (num_seqs,).
+        out_ptr: Final output attention tensor pointer.
+        max_num_partitions: Maximum number of partitions across all sequences.
+        stride_o0..stride_o2: Output tensor strides.
+        HEAD_SIZE: Head dimension size (compile-time constant).
+        QUERY_GROUP_SIZE: Number of query heads per KV head.
+        NUM_KV_HEADS: Number of key-value heads.
+        PARTITION_SIZE: Size of each context partition.
+        NUM_PARTITIONS: Power-of-2 padded number of partitions.
+    """
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 

@@ -684,12 +684,50 @@ def triton_kernel_call_lowering(
     )
 
     def unwrap_triton_kernel(kernel, configs):
-        """Return (jit_fn, configs) for any supported Triton wrapper stack."""
+        """Recursively unwrap Triton kernel wrappers to the underlying JIT function.
+
+        Handles the Triton decorator stack (``Autotuner``, ``Heuristics``, and
+        ``JITFunction``), extracting the base JIT function and accumulating
+        the resolved configuration list. Supports both ``@autotune @heuristics @jit``
+        and ``@heuristics @autotune @jit`` decorator orderings.
+
+        Args:
+            kernel: A Triton kernel which may be an ``Autotuner``, ``Heuristics``
+                wrapper, or a base ``JITFunction``.
+            configs: List of ``triton.Config`` objects accumulated so far.
+
+        Returns:
+            Tuple of (jit_function, resolved_configs) where ``jit_function`` is
+            the underlying ``triton.JITFunction`` and ``resolved_configs`` is the
+            list of configurations after pruning and heuristic evaluation.
+
+        Raises:
+            NotImplementedError: If any config uses a ``pre_hook``, which is
+                not supported in the JAX-Triton bridge.
+        """
 
         if isinstance(kernel, autotuner.Autotuner):
             prev_early_config_prune_fn = kernel.early_config_prune
 
             def prune_configs(configs, named_args, **kwargs):
+                """Filter autotuner configs to those compatible with the current metaparams.
+
+                Removes configs whose ``pre_hook`` is set (unsupported) and
+                retains only those whose keyword arguments are consistent with
+                the caller-supplied ``metaparams``. Delegates to any previously
+                registered ``early_config_prune`` function afterwards.
+
+                Args:
+                    configs: List of ``triton.Config`` candidates.
+                    named_args: Dictionary of named arguments for the kernel.
+                    **kwargs: Additional keyword arguments (unused).
+
+                Returns:
+                    Pruned list of ``triton.Config`` objects.
+
+                Raises:
+                    NotImplementedError: If any config has a ``pre_hook``.
+                """
                 pruned_configs = []
                 for config in configs:
                     if config.pre_hook is not None:
