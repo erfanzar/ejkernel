@@ -269,6 +269,9 @@ def _unified_attention_2d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+    if q.dtype != key_cache_ptr.dtype.element_ty:
+        # tl.dot requires q/k dtypes to match; align to KV cache dtype.
+        q = q.to(key_cache_ptr.dtype.element_ty)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -512,6 +515,9 @@ def _unified_attention_3d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+    if q.dtype != key_cache_ptr.dtype.element_ty:
+        # tl.dot requires q/k dtypes to match; align to KV cache dtype.
+        q = q.to(key_cache_ptr.dtype.element_ty)
 
     block_table_offset = seq_idx * block_table_stride
 

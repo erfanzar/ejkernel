@@ -29,6 +29,8 @@ Supported Quantization Modes:
       accuracy/memory tradeoff.
     - **nvfp4**: NVIDIA FP4 (E2M1) with E4M3 per-group scale. Hardware-friendly.
     - **nvfp8**: NVIDIA FP8 (E4M3) with E4M3 per-group scale. Hardware-friendly.
+    - **w4a16**: 4-bit affine quantization with per-channel scale (weights only).
+    - **w8a16**: 8-bit affine quantization with per-channel scale (weights only).
 
 Basic Usage:
     >>> from ejkernel.quantization import quantize, dequantize, prepack_quantized_weights

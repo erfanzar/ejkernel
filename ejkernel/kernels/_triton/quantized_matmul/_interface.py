@@ -36,7 +36,7 @@ from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl import quantized_matmul_triton
 
 #: Supported quantization modes for quantized matrix multiplication.
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
+QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "w4a16", "w8a16"]
 
 
 @kernel_registry.register("quantized_matmul", Platform.TRITON, Backend.GPU)

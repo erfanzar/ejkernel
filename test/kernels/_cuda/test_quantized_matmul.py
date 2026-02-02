@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import shutil
 
 import jax
@@ -36,21 +37,64 @@ except RuntimeError as exc:
     pytest.skip(f"CUDA quantized_matmul build failed: {exc}", allow_module_level=True)
 
 
+@pytest.fixture(autouse=True)
+def _force_cuda_compute_type():
+    prev = os.environ.get("EJKERNEL_QMM_CUDA_COMPUTE")
+    os.environ["EJKERNEL_QMM_CUDA_COMPUTE"] = "f"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("EJKERNEL_QMM_CUDA_COMPUTE", None)
+        else:
+            os.environ["EJKERNEL_QMM_CUDA_COMPUTE"] = prev
+
+
 def _device_put_all(dev, *arrays):
     return [jax.device_put(arr, dev) for arr in arrays]
 
 
-@pytest.mark.parametrize("mode", ["affine", "nf4", "mxfp4"])
-def test_quantized_matmul_cuda_matches_xla(mode: str):
+def _group_sizes_for_mode(mode: str) -> list[int]:
+    mode = mode.lower()
+    if mode == "affine":
+        return [32, 64, 128]
+    if mode == "nf4":
+        return [32, 64]
+    if mode in ("mxfp4", "mxfp8"):
+        return [32]
+    if mode in ("nvfp4", "nvfp8"):
+        return [16]
+    if mode in ("w4a16", "w8a16"):
+        return [-1]
+    raise ValueError(f"Unsupported quantization mode: {mode}")
+
+
+@pytest.mark.parametrize(
+    "mode,group_size",
+    [
+        (mode, gs)
+        for mode in ["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "w4a16", "w8a16"]
+        for gs in _group_sizes_for_mode(mode)
+    ],
+)
+@pytest.mark.parametrize("x_dtype", [jnp.float16, jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("m", [512, 4096, 8192])
+@pytest.mark.parametrize("k", [512, 4096, 8192])
+@pytest.mark.parametrize("n", [512, 4096, 8192])
+def test_quantized_matmul_cuda_matches_xla(mode: str, group_size: int, x_dtype: jnp.dtype, m, k, n):
     key = jax.random.PRNGKey(0 if mode == "affine" else 1)
     kx, kw = jax.random.split(key, 2)
-    m, k, n = 16, 64, 64
 
-    x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
-    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+    x = jax.random.normal(kx, (m, k), dtype=x_dtype)
+    w = jax.random.normal(kw, (n, k), dtype=x_dtype)
 
-    packed = prepack_quantized_weights(w, mode=mode)
+    if group_size < 0:
+        group_size = k
+    prepack_transpose = False if mode in ("w4a16", "w8a16") else True
+    packed = prepack_quantized_weights(w, mode=mode, group_size=group_size, transpose=prepack_transpose)
     if mode == "affine":
+        w_q, scales, biases = packed
+    elif mode in ("w4a16", "w8a16"):
         w_q, scales, biases = packed
     else:
         w_q, scales = packed
@@ -61,29 +105,43 @@ def test_quantized_matmul_cuda_matches_xla(mode: str):
     if biases is not None:
         biases = jax.device_put(biases, dev)
 
+    transpose = mode in ("w4a16", "w8a16")
     out_cuda = cuda_quantized_matmul(
         x,
         w_q,
         scales,
         biases,
-        transpose=False,
+        transpose=transpose,
         mode=mode,
+        group_size=group_size,
     )
+    use_bf16 = x_dtype == jnp.bfloat16
     out_xla = xla_quantized_matmul(
         x,
         w_q,
         scales,
         biases,
-        transpose=False,
+        transpose=transpose,
         mode=mode,
+        group_size=group_size,
+        use_bf16=use_bf16,
     )
 
     out_cuda = jax.block_until_ready(out_cuda)
-    out_xla = jax.block_until_ready(out_xla)
+    out_xla = jax.block_until_ready(out_xla.astype(x.dtype))
 
+    assert out_cuda.dtype == x.dtype
+    rtol = 6e-2
+    atol = 6e-2
+    if x_dtype == jnp.bfloat16:
+        rtol = max(rtol, 1.2e-1)
+        atol = max(atol, 1.2e-1)
+    if mode in ("mxfp8", "nvfp8"):
+        rtol = 1.5e-1
+        atol = 1.5e-1
     np.testing.assert_allclose(
         np.asarray(out_cuda, dtype=np.float32),
         np.asarray(out_xla, dtype=np.float32),
-        rtol=6e-2,
-        atol=6e-2,
+        rtol=rtol,
+        atol=atol,
     )

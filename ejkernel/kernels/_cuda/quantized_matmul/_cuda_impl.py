@@ -83,6 +83,8 @@ def _mode_to_id(mode: str) -> int:
         mxfp8      3
         nvfp4      4
         nvfp8      5
+        w4a16      6
+        w8a16      7
         ========  ==
 
     Args:
@@ -107,7 +109,13 @@ def _mode_to_id(mode: str) -> int:
         return 4
     if mode == "nvfp8":
         return 5
-    raise ValueError("CUDA quantized_matmul supports affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8 modes.")
+    if mode == "w4a16":
+        return 6
+    if mode == "w8a16":
+        return 7
+    raise ValueError(
+        "CUDA quantized_matmul supports affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8, w4a16, w8a16 modes."
+    )
 
 
 def _expected_words(n: int, bits: int) -> int:
@@ -168,10 +176,11 @@ def quantized_matmul_cuda(
             ``mxfp8``/``nvfp8`` and 4 for all other modes. Affine mode
             accepts values in {2, 3, 4, 5, 6, 7, 8}.
         mode: Quantization scheme. One of ``"affine"``, ``"nf4"``,
-            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, or ``"nvfp8"``.
+            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``,
+            ``"w4a16"``, or ``"w8a16"``.
 
     Returns:
-        Result matrix of shape ``(M, N)`` with ``float32`` dtype.
+        Result matrix of shape ``(M, N)`` with the same dtype as ``x``.
 
     Raises:
         ValueError: If *bits* is outside the range [2, 8] or incompatible
@@ -188,13 +197,18 @@ def quantized_matmul_cuda(
     mode_id = _mode_to_id(mode)
     mode = mode.lower()
     if bits is None:
-        bits = 8 if mode in ("mxfp8", "nvfp8") else 4
+        if mode in ("mxfp8", "nvfp8", "w8a16"):
+            bits = 8
+        else:
+            bits = 4
     bits = int(bits)
     if group_size is None:
         if mode in ("mxfp4", "mxfp8"):
             group_size = 32
         elif mode in ("nvfp4", "nvfp8"):
             group_size = 16
+        elif mode in ("w4a16", "w8a16"):
+            group_size = int(x.shape[1])
         else:
             group_size = 64
     group_size = int(group_size)
@@ -213,34 +227,52 @@ def quantized_matmul_cuda(
         raise ValueError("CUDA quantized_matmul nvfp4 requires bits=4.")
     if mode == "nvfp8" and bits != 8:
         raise ValueError("CUDA quantized_matmul nvfp8 requires bits=8.")
-    if transpose:
-        raise ValueError("CUDA quantized_matmul currently requires transpose=False.")
+    if mode == "w4a16" and bits != 4:
+        raise ValueError("CUDA quantized_matmul w4a16 requires bits=4.")
+    if mode == "w8a16" and bits != 8:
+        raise ValueError("CUDA quantized_matmul w8a16 requires bits=8.")
+    if mode in ("w4a16", "w8a16"):
+        if not transpose:
+            raise ValueError("CUDA quantized_matmul w4a16/w8a16 requires transpose=True.")
+        if group_size != int(x.shape[1]):
+            raise ValueError("CUDA quantized_matmul w4a16/w8a16 requires group_size=K.")
+    if transpose and mode not in ("w4a16", "w8a16"):
+        raise ValueError("CUDA quantized_matmul transpose=True only supports w4a16/w8a16.")
 
     m, k = int(x.shape[0]), int(x.shape[1])
     if scales.ndim != 2:
         raise ValueError("CUDA quantized_matmul scales must be rank-2.")
-    n_groups = int(scales.shape[1])
-    n = n_groups * group_size
-    if scales.shape[0] != k:
-        raise ValueError("CUDA quantized_matmul scales shape must be (K, N/group_size).")
-    expected_words = _expected_words(n, bits)
     if transpose:
-        k_w = int(w.shape[1])  # transpose is unsupported; kept for completeness
+        if scales.shape[0] != int(w.shape[0]):
+            raise ValueError("CUDA quantized_matmul scales shape must be (N, K/group_size) for transpose=True.")
+        if k % group_size != 0:
+            raise ValueError("CUDA quantized_matmul K must be divisible by group_size for transpose=True.")
+        n_groups = int(scales.shape[1])
+        if n_groups != k // group_size:
+            raise ValueError("CUDA quantized_matmul scales second dimension must be K/group_size.")
+        n = int(w.shape[0])
+        expected_words = _expected_words(k, bits)
+        if int(w.shape[1]) != expected_words:
+            raise ValueError("CUDA quantized_matmul packed weight shape does not match K and bits.")
     else:
+        n_groups = int(scales.shape[1])
+        n = n_groups * group_size
+        if scales.shape[0] != k:
+            raise ValueError("CUDA quantized_matmul scales shape must be (K, N/group_size).")
+        expected_words = _expected_words(n, bits)
         k_w = int(w.shape[0])
         if int(w.shape[1]) != expected_words:
             raise ValueError("CUDA quantized_matmul packed weight shape does not match N and bits.")
-    if k != k_w:
-        raise ValueError("Input K dimension does not match packed weight K.")
+        if k != k_w:
+            raise ValueError("Input K dimension does not match packed weight K.")
 
-    out_shape = jax.ShapeDtypeStruct((m, n), jnp.float32)
+    out_dtype = jnp.dtype(x.dtype)
+    if out_dtype not in (jnp.float16, jnp.bfloat16, jnp.float32):
+        raise ValueError("CUDA quantized_matmul supports float16/float32/bfloat16 outputs.")
+    out_shape = jax.ShapeDtypeStruct((m, n), out_dtype)
     _register_cuda_qmm()
 
-    call = ffi.ffi_call(
-        "ejk_qmm_cuda",
-        out_shape,
-        vmap_method="sequential",
-    )
+    call = ffi.ffi_call("ejk_qmm_cuda", out_shape, vmap_method="sequential")
 
     attrs = {
         "group_size": group_size,

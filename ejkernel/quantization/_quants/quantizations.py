@@ -23,6 +23,8 @@ multiplication with quantized weights. It supports multiple quantization modes:
 - **mxfp8**: Microscaling FP8 (E4M3) with E8M0 shared exponent
 - **nvfp4**: NVIDIA FP4 (E2M1) with E4M3 per-group scale
 - **nvfp8**: NVIDIA FP8 (E4M3) with E4M3 per-group scale
+- **w4a16**: 4-bit affine quantization with per-channel scale
+- **w8a16**: 8-bit affine quantization with per-channel scale
 
 All modes pack quantized values into uint32 arrays using LSB-first ordering,
 compatible with the MLX quantization format.
@@ -49,7 +51,7 @@ from .._utils.fp_tables import (
 from .._utils.grouping import _quantize_to_codebook, _require_bits, _reshape_groups
 
 #: Supported quantization modes.
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
+QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "w4a16", "w8a16"]
 
 
 def quantize(
@@ -123,6 +125,23 @@ def quantize(
         as rough sanity checks, not guarantees.
     """
     mode = mode.lower()
+    if mode == "w4a16" or mode == "w8a16":
+        bits = 4 if mode == "w4a16" else 8
+        group_size = w.shape[-1] if group_size is None else int(group_size)
+        if group_size != w.shape[-1]:
+            raise ValueError(f"{mode} requires group_size equal to the last dimension (per-channel scale).")
+
+        w_groups, _ = _reshape_groups(w, group_size)
+        alpha = jnp.max(w_groups, axis=-1)
+        beta = jnp.min(w_groups, axis=-1)
+        scale = (alpha - beta) / (2**bits - 1)
+        scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
+
+        q = jnp.round((w_groups - beta[..., None]) / scale[..., None])
+        q = jnp.clip(q, 0, 2**bits - 1).astype(jnp.uint32)
+        packed = _pack_bits(q.reshape(*w.shape[:-1], -1), bits)
+        return packed, scale.astype(w.dtype), beta.astype(w.dtype)
+
     if mode == "affine":
         group_size = 64 if group_size is None else int(group_size)
         bits = 4 if bits is None else _require_bits(bits, {2, 3, 4, 5, 6, 7, 8})
@@ -285,6 +304,20 @@ def dequantize(
         ValueError: If parameters are invalid for the selected mode.
     """
     mode = mode.lower()
+    if mode == "w4a16" or mode == "w8a16":
+        if biases is None:
+            raise ValueError(f"{mode} dequantize requires biases.")
+        bits = 4 if mode == "w4a16" else 8
+        if group_size is None:
+            group_size = (w_q.shape[-1] * 32) // bits
+        group_size = int(group_size)
+        n_groups = scales.shape[-1]
+        n = n_groups * group_size
+        q = _unpack_bits(w_q, n, bits).astype(jnp.float32)
+        q = q.reshape(*scales.shape[:-1], n_groups, group_size)
+        out = q * scales[..., None] + biases[..., None]
+        return out.reshape(*scales.shape[:-1], n)
+
     if mode == "affine":
         if biases is None:
             raise ValueError("affine dequantize requires biases.")
@@ -455,5 +488,7 @@ def prepack_quantized_weights(
         >>> # Then call quantized_matmul with transpose=False
         >>> output = quantized_matmul(x, w_q, scales, biases, transpose=False)
     """
+    if mode in ("w4a16", "w8a16"):
+        transpose = False
     w_in = w.T if transpose else w
     return quantize(w_in, group_size=group_size, bits=bits, mode=mode)

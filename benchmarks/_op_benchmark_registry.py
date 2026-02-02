@@ -325,7 +325,8 @@ def _cfgs_quantized_matmul():
         m=[6144, 8192],
         k=[4096, 8192],
         n=[4096, 8192],
-        mode=["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"],
+        mode=["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "w4a16", "w8a16"],
+        dtype=["fp16", "bf16", "fp32"],
     )
     return _limit_configs(configs)
 

@@ -27,12 +27,15 @@ It supports the following quantization modes via the underlying CUDA kernel:
 * **nf4** -- 4-bit NormalFloat quantization.
 * **mxfp4** / **mxfp8** -- Microscaling FP4/FP8 formats.
 * **nvfp4** / **nvfp8** -- NVIDIA FP4/FP8 formats.
+* **w4a16** / **w8a16** -- 4/8-bit affine quantization with per-channel scale.
+* **w4a16** / **w8a16** -- 4/8-bit affine quantization with per-channel scale
+  (weights in NxK layout, transpose=True).
 
 For modes not natively supported by the CUDA kernel, the function
 transparently falls back to the XLA-based implementation.
 
-Weights are expected as packed ``uint32`` arrays; the output is always
-``float32``.
+Weights are expected as packed ``uint32`` arrays; the output dtype matches
+the input ``x`` dtype.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ from ejkernel.callib._ejit import ejit
 from ..._registry import Backend, Platform, kernel_registry
 from ._cuda_impl import quantized_matmul_cuda
 
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
+QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "w4a16", "w8a16"]
 """Type alias for the supported quantization mode strings."""
 
 
@@ -96,7 +99,7 @@ def quantized_matmul(
         biases: Per-group bias values with the same shape as *scales*.
             Required for ``"affine"`` mode. Defaults to ``None``.
         transpose: Whether the weight matrix uses ``(N, K)`` layout.
-            Currently unsupported for CUDA; must be ``False``.
+            ``w4a16``/``w8a16`` require ``True`` (weights packed along K).
         group_size: Number of output features per quantization group.
             Inferred from *mode* when ``None``: 32 for ``mxfp4``/``mxfp8``,
             16 for ``nvfp4``/``nvfp8``, 64 otherwise.
@@ -104,7 +107,8 @@ def quantized_matmul(
             ``None``: 8 for 8-bit modes, 4 for all others. Affine mode
             accepts 2--8.
         mode: Quantization scheme. One of ``"affine"``, ``"nf4"``,
-            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``. Other
+            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``,
+            ``"w4a16"``, ``"w8a16"``. Other
             values trigger an XLA fallback.
         block_m: Ignored (Triton API compatibility). Defaults to 128.
         block_n: Ignored (Triton API compatibility). Defaults to 128.
@@ -115,29 +119,16 @@ def quantized_matmul(
         split_k: Ignored (Triton API compatibility). Defaults to ``None``.
 
     Returns:
-        Result matrix of shape ``(M, N)`` with ``float32`` dtype.
+        Result matrix of shape ``(M, N)`` with the same dtype as ``x``.
 
     Raises:
         ValueError: Propagated from the CUDA implementation when inputs
             are invalid (e.g., unsupported *bits*, shape mismatches, or
-            ``transpose=True``).
+            unsupported ``transpose``).
     """
     del block_m, block_n, block_k, use_bf16, num_warps, num_stages, split_k
-    if mode not in ("affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"):
-        from ejkernel.kernels._xla.quantized_matmul import quantized_matmul as quantized_matmul_xla
 
-        return quantized_matmul_xla(
-            x,
-            w,
-            scales,
-            biases,
-            transpose=transpose,
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-        )
-    callable_ = ejit(func=quantized_matmul_cuda, static_argnames=["transpose", "group_size", "bits", "mode"])
-    return callable_(
+    return ejit(func=quantized_matmul_cuda, static_argnames=["transpose", "group_size", "bits", "mode"])(
         x,
         w,
         scales,

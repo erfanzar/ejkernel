@@ -41,7 +41,7 @@ from ..base import detect_platform
 from .configs import QuantizedMatmulConfig
 
 #: Supported quantization modes for quantized matrix multiplication.
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
+QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "w4a16", "w8a16"]
 
 
 def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tuple[int, int]:
@@ -62,6 +62,10 @@ def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tup
         return 16 if group_size is None else int(group_size), 4
     if mode == "nvfp8":
         return 16 if group_size is None else int(group_size), 8
+    if mode == "w4a16":
+        return (64 if group_size is None else int(group_size), 4)
+    if mode == "w8a16":
+        return (64 if group_size is None else int(group_size), 8)
     return (64 if group_size is None else int(group_size), 4 if bits is None else int(bits))
 
 
@@ -323,7 +327,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         Returns:
             The registered kernel implementation function.
         """
-        platform = detect_platform(self.op_id, cfg.platform)
+        platform = detect_platform(self.op_id, cfg.platform, prefer_cuda=True)
         return kernel_registry.get(self.op_id, platform=platform, backend=cfg.backend)
 
     def run(
@@ -369,7 +373,8 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
             cfg: Kernel configuration with block sizes and settings.
 
         Returns:
-            Matrix multiplication result of shape (M, N) in float32.
+        Matrix multiplication result of shape (M, N). CUDA returns the same
+        dtype as ``x``; other backends return float32.
 
         Notes:
             For best Triton performance, prepack weights in KxN layout using
@@ -551,8 +556,8 @@ def _quantized_matmul_impl(
             Shape depends on transpose setting and bit-width.
         scales: Per-group scales array for dequantization. Shape is (N, K//group_size)
             for transpose=True or (K, N//group_size) for transpose=False.
-        biases: Per-group biases for affine quantization mode. Must have the same
-            shape as scales. Required when mode="affine", must be None otherwise.
+        biases: Per-group biases for affine quantization modes. Must have the same
+            shape as scales. Required when mode in {"affine", "w4a16", "w8a16"}, must be None otherwise.
         transpose: Weight layout indicator. If True, weights are stored in NxK
             layout (transposed). If False, weights are stored in KxN layout.
             Default is False.
@@ -567,7 +572,8 @@ def _quantized_matmul_impl(
             - "mxfp8": Microscaling FP8 (E4M3) with E8M0 shared exponent
             - "nvfp4": NVIDIA FP4 (E2M1) with E4M3 per-group scale
             - "nvfp8": NVIDIA FP8 (E4M3) with E4M3 per-group scale
-            - "nvfp8": NVIDIA FP8 (E4M3) with E4M3 per-group scale
+            - "w4a16": 4-bit affine quantization with per-channel scale
+            - "w8a16": 8-bit affine quantization with per-channel scale
         platform: Target execution platform override. One of:
             - "triton": Use Triton GPU kernels (requires NVIDIA/AMD GPU)
             - "pallas": Use Pallas kernels (TPU/GPU)
@@ -579,7 +585,8 @@ def _quantized_matmul_impl(
             kernel parameters. If None, uses autotuned or heuristic configuration.
 
     Returns:
-        Matrix multiplication result of shape (M, N) in float32 dtype.
+        Matrix multiplication result of shape (M, N). CUDA returns the same
+        dtype as ``x``; other backends return float32.
 
     Raises:
         ValueError: If mode is "affine" but biases is None.
@@ -604,11 +611,18 @@ def _quantized_matmul_impl(
         - The XLA implementation supports all modes and serves as a fallback when
           Triton kernels are not available or not optimal.
     """
+    mode = mode.lower()
     transpose = _static_bool(transpose, "transpose")
+    if mode in ("w4a16", "w8a16") and group_size is None:
+        group_size = int(x.shape[1])
     if group_size is not None:
         group_size = _static_int(group_size, "group_size")
     if bits is not None:
         bits = _static_int(bits, "bits")
+    if mode in ("affine", "w4a16", "w8a16") and biases is None:
+        raise ValueError("affine quantized_matmul requires biases.")
+    if mode not in ("affine", "w4a16", "w8a16") and biases is not None:
+        raise ValueError("biases must be None for non-affine modes.")
 
     resolved = detect_platform(
         "quantized_matmul",

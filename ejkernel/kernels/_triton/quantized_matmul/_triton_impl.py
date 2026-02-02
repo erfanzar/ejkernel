@@ -428,6 +428,8 @@ def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tup
         ValueError: If bits != 4 for nf4 mode.
     """
     mode = mode.lower()
+    if mode in ("w4a16", "w8a16"):
+        raise ValueError("w4a16/w8a16 are not supported by the Triton backend.")
     if mode == "affine":
         group_size = 64 if group_size is None else int(group_size)
         bits = 4 if bits is None else _require_bits(bits, {2, 3, 4, 5, 6, 7, 8})
