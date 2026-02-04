@@ -122,7 +122,26 @@ def _ssm2_fwd_rule(
     tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim ssm_state_size"]],
     tuple,
 ]:
-    """Forward rule with residuals for backward."""
+    """Compute forward pass and save residuals for backward differentiation.
+
+    Runs the SSM2 forward computation (full sequence or single step),
+    then packages the inputs and intermediate hidden states as residuals
+    for the backward pass.
+
+    Args:
+        x: Input tensor [batch, seq_len, num_heads, head_dim].
+        A: A vector (real form, typically negative) [num_heads].
+        B: B parameter [batch, seq_len, num_heads, ssm_state_size].
+        C: C parameter [batch, seq_len, num_heads, ssm_state_size].
+        D: Skip connection [num_heads].
+        dt: Time step (after softplus) [batch, seq_len, num_heads].
+        initial_state: Initial hidden state or None.
+        n_groups: Number of groups for B, C (nondiff).
+        use_single_step: Whether to use single-step optimization (nondiff).
+
+    Returns:
+        Tuple of ((output, final_state), residuals) for VJP.
+    """
     batch_size, seq_len, num_heads, head_dim = x.shape
     ssm_state_size = B.shape[-1]
 
@@ -167,7 +186,21 @@ def _ssm2_bwd_rule(
     residuals: tuple,
     grads: tuple,
 ) -> tuple:
-    """Backward rule with custom implementation."""
+    """Compute backward pass using stored residuals from the forward rule.
+
+    Unpacks the residuals saved during the forward pass and delegates
+    to the SSM2 backward implementation for gradient computation.
+
+    Args:
+        n_groups: Number of groups for B, C (nondiff).
+        use_single_step: Whether single-step mode was used (nondiff).
+        residuals: Saved tensors from forward: (x, A, B, C, D, dt,
+            all_hidden_states, initial_state).
+        grads: Gradient of the loss w.r.t. (output, final_state).
+
+    Returns:
+        Tuple of gradients (dx, dA, dB, dC, dD, ddt, d_initial_state).
+    """
     x, A, B, C, D, dt, all_hidden_states, initial_state = residuals
     do, dfinal_state = grads
 

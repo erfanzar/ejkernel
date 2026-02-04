@@ -112,6 +112,34 @@ def ref_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
 ):
+    """Reference implementation of V3 ragged paged attention with KV cache write.
+
+    Processes each sequence sequentially, updating the KV cache with new tokens
+    and computing attention. Serves as ground truth for validating the Pallas
+    kernel implementation. Supports sliding window, soft capping, quantization
+    scales, and attention sinks.
+
+    Args:
+        queries: Query tokens [total_tokens, num_q_heads, head_dim].
+        keys: Key tokens [total_tokens, num_kv_heads, head_dim].
+        values: Value tokens [total_tokens, num_kv_heads, head_dim].
+        kv_cache: Paged KV cache [num_pages, page_size, kv_heads_x2/packing, packing, head_dim].
+        kv_lens: KV context lengths per sequence [max_num_seqs].
+        block_tables: Flattened page table [max_num_seqs * pages_per_seq].
+        query_start_loc: Cumulative query positions [max_num_seqs+1].
+        distribution: Batch composition [3] (decode_end, prefill_end, total).
+        softmax_aux: Optional attention sink logits [num_q_heads].
+        softmax_scale: Scaling factor for QK^T.
+        sliding_window: Optional window size for local attention.
+        logits_soft_cap: Optional soft cap for logits.
+        mask_value: Value for masked positions.
+        q_scale: Optional quantization scale for queries.
+        k_scale: Optional quantization scale for keys.
+        v_scale: Optional quantization scale for values.
+
+    Returns:
+        Tuple of (attention_output, updated_kv_cache).
+    """
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
 
@@ -246,6 +274,19 @@ def ref_ragged_paged_attention(
 
 
 def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
+    """Estimate scalar memory (SMEM) usage for the kernel's prefetched data.
+
+    Computes the total SMEM needed for scalar prefetch arrays including
+    kv_lens, block_tables, query_start_loc, distribution, and scratch
+    index buffers. Each array is aligned to 128 elements with 32-bit words.
+
+    Args:
+        max_num_seqs: Maximum number of sequences in the batch.
+        pages_per_seq: Maximum number of pages per sequence.
+
+    Returns:
+        Estimated SMEM usage in bytes.
+    """
     total_bits = (
         align_to(max_num_seqs, 128) * 32
         + align_to(max_num_seqs * pages_per_seq, 128) * 32
@@ -267,6 +308,25 @@ def get_vmem_estimate_bytes(
     q_dtype,
     kv_dtype,
 ):
+    """Estimate vector memory (VMEM) usage for the kernel's scratch buffers.
+
+    Computes the total VMEM needed for double-buffered KV blocks,
+    double-buffered query blocks, softmax accumulators (l, m), and
+    the output accumulator. Used to verify the kernel fits within
+    the TPU's VMEM budget.
+
+    Args:
+        actual_num_kv_heads: Number of KV attention heads.
+        actual_num_q_heads_per_kv_head: Query heads per KV head (GQA ratio).
+        actual_head_dim: Unpadded head dimension.
+        bq_sz: Number of query tokens per block.
+        bkv_sz: Number of KV tokens per block.
+        q_dtype: Query dtype for packing factor calculation.
+        kv_dtype: KV cache dtype for packing factor calculation.
+
+    Returns:
+        Estimated VMEM usage in bytes.
+    """
     q_packing = get_dtype_packing(q_dtype)
     kv_packing = get_dtype_packing(kv_dtype)
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
@@ -289,6 +349,23 @@ def get_kv_cache_shape(
     actual_head_dim,
     kv_dtype,
 ):
+    """Compute the TPU-optimized KV cache tensor shape.
+
+    Determines the full shape of the paged KV cache with proper padding
+    and packing for TPU memory layout. Keys and values are interleaved
+    (num_kv_heads * 2) and packed according to dtype bit width.
+
+    Args:
+        total_num_pages: Total number of pages in the cache pool.
+        page_size: Number of tokens per page.
+        actual_num_kv_heads: Number of KV attention heads (before padding).
+        actual_head_dim: Head dimension (before padding to 128 alignment).
+        kv_dtype: KV cache dtype for packing factor calculation.
+
+    Returns:
+        Tuple of (total_num_pages, page_size, num_kv_heads_x2 // packing,
+        packing, head_dim_padded).
+    """
     kv_packing = get_dtype_packing(kv_dtype)
     return (
         total_num_pages,
@@ -300,6 +377,7 @@ def get_kv_cache_shape(
 
 
 def _ragged_paged_attention_kernel(
+    # --- Scalar prefetch refs (SMEM) ---
     kv_lens_ref,
     page_indices_ref,
     cu_q_lens_ref,
@@ -307,12 +385,14 @@ def _ragged_paged_attention_kernel(
     sem_ids_ref,
     bo_ids_ref,
     bkv_update_ids_ref,
+    # --- HBM input/output refs ---
     q_hbm_ref,
     kv_hbm_ref,
     kv_cache_hbm_ref,
     attention_sink_ref,
     o_hbm_ref,
     updated_kv_cache_hbm_ref,
+    # --- VMEM scratch refs ---
     bkv_x2_ref,
     bq_x2_ref,
     bo_x2_ref,
@@ -332,6 +412,53 @@ def _ragged_paged_attention_kernel(
     bkv_p,
     bq_sz,
 ):
+    """Pallas TPU kernel for ragged paged attention V3 with KV cache write.
+
+    This is the core kernel function that runs on each TPU core. Each program
+    instance processes one complete sequence from the batch, performing:
+
+    1. Double-buffered async DMA to fetch KV cache pages and query blocks
+    2. Flash attention with online softmax across KV blocks
+    3. In-place KV cache updates by writing new K/V tokens back to pages
+    4. Double-buffered output writeback
+
+    The kernel handles three sequence types based on the distribution array:
+    - Decode sequences (seq_idx < decode_end): Single token, static q_len=1
+    - Prefill sequences (decode_end <= seq_idx < prefill_end): Chunked prefill
+    - Mixed sequences (prefill_end <= seq_idx < mixed_end): Variable length
+
+    Args:
+        kv_lens_ref: SMEM ref to KV context lengths [max_num_seqs].
+        page_indices_ref: SMEM ref to flattened page table [max_seqs * pages_per_seq].
+        cu_q_lens_ref: SMEM ref to cumulative query lengths [max_num_seqs+1].
+        distribution_ref: SMEM ref to batch composition [3].
+        sem_ids_ref: SMEM ref to current semaphore indices [3].
+        bo_ids_ref: SMEM ref to output block tracking indices [4].
+        bkv_update_ids_ref: SMEM ref to KV cache update tracking indices [6].
+        q_hbm_ref: HBM ref to query tensor.
+        kv_hbm_ref: HBM ref to new KV tokens tensor.
+        kv_cache_hbm_ref: HBM ref to existing KV cache (input).
+        attention_sink_ref: VMEM ref to attention sink logits or None.
+        o_hbm_ref: HBM ref to output tensor.
+        updated_kv_cache_hbm_ref: HBM ref to updated KV cache (output).
+        bkv_x2_ref: VMEM double-buffer for KV cache blocks.
+        bq_x2_ref: VMEM double-buffer for query blocks.
+        bo_x2_ref: VMEM double-buffer for output blocks.
+        sems: DMA semaphores [4, 2] for (bkv, bq, bo, bkv_update) x 2 buffers.
+        l_ref: VMEM scratch for softmax normalizer (denominator).
+        m_ref: VMEM scratch for softmax running maximum.
+        acc_ref: VMEM scratch for attention output accumulator.
+        softmax_scale: Scaling factor for QK^T dot products.
+        sliding_window: Optional sliding window size for local attention.
+        logits_soft_cap: Optional soft cap for attention logits.
+        mask_value: Value used for masked (future) positions.
+        q_scale: Optional quantization scale for queries.
+        k_scale: Optional quantization scale for keys.
+        v_scale: Optional quantization scale for values.
+        chunk_prefill_size: Chunk size for prefill sequences.
+        bkv_p: Number of KV pages per attention block.
+        bq_sz: Number of query tokens per attention block.
+    """
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
     (
@@ -844,6 +971,21 @@ def _ragged_paged_attention_kernel(
 
 
 def merge_kv(k: jax.Array, v: jax.Array):
+    """Interleave key and value tensors into TPU-packed KV format.
+
+    Concatenates keys and values along the head dimension, reshapes to
+    interleaved KV head layout, pads to TPU alignment requirements, and
+    applies dtype-specific packing.
+
+    Args:
+        k: Key tensor [max_num_tokens, actual_num_kv_heads, actual_head_dim].
+        v: Value tensor [max_num_tokens, actual_num_kv_heads, actual_head_dim].
+            Must have same shape and dtype as k.
+
+    Returns:
+        Merged KV tensor [max_num_tokens, num_kv_heads_x2 // packing,
+        packing, head_dim_padded] ready for cache storage.
+    """
     assert k.shape == v.shape
     assert k.dtype == v.dtype
     max_num_tokens, actual_num_kv_heads, actual_head_dim = k.shape
@@ -874,6 +1016,25 @@ def prepare_inputs(
     v: jax.Array,
     softmax_aux: jax.Array | None = None,
 ):
+    """Transform query and KV tensors into TPU-optimized packed layouts.
+
+    Reshapes and pads queries into the kernel's expected layout:
+    [num_kv_heads, max_tokens, num_q_per_kv // packing, packing, head_dim].
+    Merges keys and values into interleaved KV format. Optionally
+    reshapes attention sink logits for the kernel.
+
+    Args:
+        q: Query tensor [max_num_tokens, actual_num_q_heads, actual_head_dim].
+        k: Key tensor [max_num_tokens, actual_num_kv_heads, actual_head_dim].
+        v: Value tensor [max_num_tokens, actual_num_kv_heads, actual_head_dim].
+        softmax_aux: Optional attention sink logits [num_q_heads].
+
+    Returns:
+        Tuple of (q_packed, kv_merged, softmax_aux_reshaped) where
+        q_packed is the TPU-layout query, kv_merged is the interleaved
+        KV tensor, and softmax_aux_reshaped is the reshaped sink logits
+        or None.
+    """
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     actual_num_kv_heads = k.shape[1]
     assert actual_num_q_heads % actual_num_kv_heads == 0
@@ -921,6 +1082,21 @@ def prepare_outputs(
     actual_num_q_heads_per_kv_head: int,
     actual_head_dim: int,
 ):
+    """Transform kernel output from TPU-packed layout back to standard shape.
+
+    Reverses the layout transformation performed by prepare_inputs,
+    converting from [num_kv_heads, max_tokens, q_per_kv // packing,
+    packing, head_dim] back to [max_tokens, num_q_heads, head_dim],
+    stripping padding in the process.
+
+    Args:
+        out: Kernel output in TPU-packed layout.
+        actual_num_q_heads_per_kv_head: Unpadded query heads per KV head.
+        actual_head_dim: Unpadded head dimension.
+
+    Returns:
+        Output tensor [max_num_tokens, actual_num_q_heads, actual_head_dim].
+    """
     (
         actual_num_kv_heads,
         max_num_tokens,
@@ -964,6 +1140,39 @@ def dynamic_validate_inputs(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ):
+    """Validate inputs with both static shape checks and dynamic value checks.
+
+    Performs all static validation via static_validate_inputs, then
+    additionally checks data-dependent constraints such as distribution
+    ordering, sequence count limits, token count validity, and per-sequence
+    q_len <= kv_len invariants. Used in the reference implementation for
+    thorough correctness checking.
+
+    Args:
+        queries: Query tensor [total_tokens, num_q_heads, head_dim].
+        keys: Key tensor [total_tokens, num_kv_heads, head_dim].
+        values: Value tensor [total_tokens, num_kv_heads, head_dim].
+        kv_cache: Paged KV cache tensor.
+        kv_lens: KV context lengths [max_num_seqs].
+        block_tables: Flattened page table.
+        query_start_loc: Cumulative query positions [max_num_seqs+1].
+        distribution: Batch composition [3].
+        softmax_aux: Optional attention sink logits.
+        softmax_scale: QK^T scaling factor.
+        sliding_window: Optional sliding window size.
+        logits_soft_cap: Optional logit soft cap.
+        mask_value: Causal mask fill value.
+        q_scale: Optional query quantization scale.
+        k_scale: Optional key quantization scale.
+        v_scale: Optional value quantization scale.
+        chunk_prefill_size: Prefill chunk size.
+        num_kv_pages_per_block: KV pages per kernel block.
+        num_queries_per_block: Queries per kernel block.
+        vmem_limit_bytes: VMEM budget limit.
+
+    Raises:
+        ValueError: If any input constraint is violated.
+    """
     q, k, v = queries, keys, values
     static_validate_inputs(
         q,
@@ -1045,7 +1254,37 @@ def static_validate_inputs(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ):
-    """Validate inputs to the RPA kernel statically."""
+    """Validate static shape and dtype constraints for the ragged paged attention kernel.
+
+    Checks tensor shapes, dtypes, alignment requirements, and parameter
+    validity without inspecting data values. Called both during kernel
+    compilation and at the start of dynamic validation.
+
+    Args:
+        queries: Query tensor [total_tokens, num_q_heads, head_dim].
+        keys: Key tensor [total_tokens, num_kv_heads, head_dim].
+        values: Value tensor [total_tokens, num_kv_heads, head_dim].
+        kv_cache: Paged KV cache tensor [pages, page_size, kv_heads_x2/pack, pack, hdim].
+        kv_lens: KV context lengths [max_num_seqs].
+        block_tables: Flattened page table [max_num_seqs * pages_per_seq].
+        query_start_loc: Cumulative query positions [max_num_seqs+1].
+        distribution: Batch composition [3].
+        softmax_aux: Optional attention sink logits [num_q_heads].
+        softmax_scale: QK^T scaling factor.
+        sliding_window: Optional sliding window size (must be positive if set).
+        logits_soft_cap: Optional logit soft cap (must be non-zero if set).
+        mask_value: Causal mask fill value.
+        q_scale: Optional query quantization scale.
+        k_scale: Optional key quantization scale.
+        v_scale: Optional value quantization scale.
+        chunk_prefill_size: Prefill chunk size (must be positive if set).
+        num_kv_pages_per_block: KV pages per kernel block (must be positive if set).
+        num_queries_per_block: Queries per kernel block (must be positive if set).
+        vmem_limit_bytes: VMEM budget limit (must be positive if set).
+
+    Raises:
+        ValueError: If any shape, dtype, or parameter constraint is violated.
+    """
     q, k, v = queries, keys, values
     if not (len(q.shape) == len(k.shape) == len(v.shape) == 3):
         raise ValueError(f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}")

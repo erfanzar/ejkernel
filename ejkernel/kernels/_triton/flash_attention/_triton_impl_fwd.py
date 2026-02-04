@@ -13,6 +13,29 @@
 # limitations under the License.
 
 
+"""Flash Attention forward pass Triton kernel implementation.
+
+This module contains the Triton GPU kernels for the forward pass of Flash Attention.
+It implements tiled, memory-efficient exact attention computation using the online
+softmax algorithm to avoid materializing the full N x N attention matrix.
+
+The main entry point is ``_fwd_attention_kernel_call``, which handles input
+validation, stride computation, and dispatches the ``_attn_fwd`` Triton kernel.
+The inner loop ``_attn_fwd_inner`` processes individual key-value blocks against
+a query block, accumulating weighted values with numerically stable softmax.
+
+Features handled by these kernels:
+    - Causal and non-causal attention patterns
+    - Sliding window (local) attention
+    - Attention bias (additive or boolean mask)
+    - Dropout with reproducible seeded masks
+    - Variable-length sequences via cumulative sequence lengths
+    - Grouped-query attention (GQA) / multi-query attention (MQA)
+    - Logit soft capping (e.g. Gemma-2 style)
+    - Attention sinks for streaming inference
+    - Segment-based masking for packed sequences
+"""
+
 import math
 from typing import Any
 

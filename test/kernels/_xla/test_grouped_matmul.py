@@ -14,6 +14,8 @@
 
 """Tests for XLA grouped matrix multiplication (ragged_dot)."""
 
+import inspect
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -75,4 +77,4 @@ def test_matches_naive(transpose_rhs, use_jit):
 
 def test_registry_alias_for_grouped_matmulv2():
     impl = kernel_registry.get("grouped_matmulv2", platform=Platform.XLA)
-    assert impl is grouped_matmul
+    assert inspect.unwrap(impl) is inspect.unwrap(grouped_matmul)

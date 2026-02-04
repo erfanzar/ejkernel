@@ -231,6 +231,28 @@ def _attention_reference_default(
     custom_type: str,
     logits_soft_cap: float | None,
 ):
+    """Compute reference attention output using standard softmax formulation.
+
+    Implements the default attention reference computation with support for
+    segment masking, logits soft capping, and attention sinks. Used as a
+    correctness baseline for the optimized Splash Attention kernel.
+
+    Args:
+        mask: Boolean attention mask of shape [q_seq_len, kv_seq_len].
+        q: Query tensor of shape [q_seq_len, head_dim].
+        k: Key tensor of shape [kv_seq_len, head_dim].
+        v: Value tensor of shape [kv_seq_len, head_dim].
+        segment_ids: Optional segment IDs for cross-segment masking.
+        sinks: Optional attention sink values for StreamingLLM-style decoding.
+        mask_value: Value to fill masked positions (typically large negative).
+        save_residuals: If True, return log-sum-exp residuals for backward pass.
+        custom_type: Type identifier for custom VJP dispatch (unused here).
+        logits_soft_cap: Optional soft cap value for attention logits.
+
+    Returns:
+        If save_residuals is False, returns output tensor of shape [q_seq_len, head_dim].
+        If save_residuals is True, returns (output, (log_sum_exp,)) tuple.
+    """
     del custom_type
     logits = jnp.einsum("sd,td->st", q.astype(jnp.float32), k.astype(jnp.float32))
 
@@ -270,6 +292,26 @@ def attention_reference(
     custom_type: str = "flash",
     logits_soft_cap: float | None = None,
 ) -> SplashCustomReturnType:
+    """Compute reference attention with default (non-custom-VJP) backward pass.
+
+    Public entry point for computing attention using the standard JAX autodiff
+    backward pass. For custom VJP backward, use ``attention_reference_custom``.
+
+    Args:
+        mask: Boolean attention mask of shape [q_seq_len, kv_seq_len].
+        q: Query tensor of shape [q_seq_len, head_dim].
+        k: Key tensor of shape [kv_seq_len, head_dim].
+        v: Value tensor of shape [kv_seq_len, head_dim].
+        segment_ids: Optional segment IDs for packed sequence masking.
+        sinks: Optional attention sink values.
+        mask_value: Fill value for masked positions. Defaults to DEFAULT_MASK_VALUE.
+        save_residuals: Whether to return log-sum-exp for backward pass.
+        custom_type: VJP computation type ("flash" or "vanilla").
+        logits_soft_cap: Optional soft cap for attention logits.
+
+    Returns:
+        Attention output, or (output, (log_sum_exp,)) if save_residuals is True.
+    """
     return _attention_reference(
         mask,
         q,
@@ -296,6 +338,30 @@ def _attention_reference_custom_fwd(
     custom_type: str,
     logits_soft_cap: float | None,
 ):
+    """Forward pass for custom VJP attention reference.
+
+    Computes attention output and saves residuals needed for the custom
+    backward pass. Higher-order autodiff is not supported.
+
+    Args:
+        mask: Boolean attention mask of shape [q_seq_len, kv_seq_len].
+        q: Query tensor of shape [q_seq_len, head_dim].
+        k: Key tensor of shape [kv_seq_len, head_dim].
+        v: Value tensor of shape [kv_seq_len, head_dim].
+        segment_ids: Optional segment IDs for packed sequence masking.
+        sinks: Optional attention sink values.
+        mask_value: Fill value for masked positions.
+        save_residuals: Must be False (higher-order AD not supported).
+        custom_type: VJP computation type ("flash" or "vanilla").
+        logits_soft_cap: Optional soft cap for attention logits.
+
+    Returns:
+        Tuple of (output, residuals) where residuals contains all tensors
+        needed for the backward pass.
+
+    Raises:
+        NotImplementedError: If save_residuals is True.
+    """
     if save_residuals:
         raise NotImplementedError("Higher-order AD not supported.")
 
@@ -322,6 +388,26 @@ def _attention_reference_custom_bwd(
     res,
     do: jax.Array,
 ) -> tuple[None, jax.Array, jax.Array, jax.Array, None, jax.Array | None]:
+    """Backward pass for custom VJP attention reference.
+
+    Computes gradients for query, key, value, and optional sinks using
+    saved residuals from the forward pass. Supports both "flash" and
+    "vanilla" gradient computation styles, as well as logits soft capping.
+
+    Args:
+        mask_value: Fill value for masked positions (non-differentiable).
+        save_residuals: Whether residuals were saved (non-differentiable).
+        custom_type: VJP type - "flash" uses output-based correction,
+            "vanilla" uses direct softmax Jacobian (non-differentiable).
+        logits_soft_cap: Optional soft cap value (non-differentiable).
+        res: Residuals tuple from forward pass containing
+            (mask, q, k, v, segment_ids, sinks, output, log_sum_exp).
+        do: Gradient of the output tensor.
+
+    Returns:
+        Tuple of gradients (None, dq, dk, dv, None, dsinks) corresponding
+        to (mask, q, k, v, segment_ids, sinks) inputs.
+    """
     del save_residuals
     mask, q, k, v, segment_ids, sinks, o, lse = res
 
@@ -380,6 +466,27 @@ def attention_reference_custom(
     custom_type: str = "flash",
     logits_soft_cap: float | None = None,
 ):
+    """Compute reference attention with custom VJP backward pass.
+
+    Uses a custom VJP rule for more efficient gradient computation compared
+    to standard JAX autodiff. The "flash" type uses output-based gradient
+    correction (FlashAttention-style), while "vanilla" uses direct computation.
+
+    Args:
+        mask: Boolean attention mask of shape [q_seq_len, kv_seq_len].
+        q: Query tensor of shape [q_seq_len, head_dim].
+        k: Key tensor of shape [kv_seq_len, head_dim].
+        v: Value tensor of shape [kv_seq_len, head_dim].
+        segment_ids: Optional segment IDs for packed sequence masking.
+        sinks: Optional attention sink values.
+        mask_value: Fill value for masked positions. Defaults to DEFAULT_MASK_VALUE.
+        save_residuals: Whether to return log-sum-exp residuals.
+        custom_type: Backward computation type ("flash" or "vanilla").
+        logits_soft_cap: Optional soft cap for attention logits.
+
+    Returns:
+        Attention output, or (output, (log_sum_exp,)) if save_residuals is True.
+    """
     return _attention_reference_custom(
         mask,
         q,
@@ -400,6 +507,26 @@ def make_attention_reference(
     backward_impl: str = "vanilla",
     **params: Any,
 ) -> Callable:
+    """Create a JIT-compiled reference attention function with the given mask.
+
+    Factory function that constructs a batched attention computation function
+    with the mask baked in. Supports MHA, MQA, and GQA configurations with
+    optional custom backward passes.
+
+    Args:
+        mask: Attention mask as a Mask object or numpy array of shape
+            [num_heads, q_seq_len, kv_seq_len].
+        is_mqa: If True, use multi-query attention (single KV head shared
+            across all query heads). If False, use multi-head attention.
+        backward_impl: Backward pass implementation to use. Options:
+            "vanilla" - standard JAX autodiff,
+            "custom" - custom VJP with flash-style correction,
+            "custom_vanilla" - custom VJP with vanilla correction.
+        **params: Additional keyword arguments passed to the attention function.
+
+    Returns:
+        A JIT-compiled callable that computes attention given (q, k, v, ...).
+    """
     @partial(
         jax.jit,
         static_argnames=[
@@ -495,11 +622,34 @@ make_masked_mqa_reference = partial(make_attention_reference, is_mqa=True)
 
 
 class QKVLayout(enum.IntEnum):
+    """Physical memory layout for Q, K, V tensors in Splash Attention.
+
+    Controls how the head and sequence dimensions are arranged in memory.
+    HEAD_DIM_MINOR places head_dim as the innermost (fastest-varying) dimension,
+    while SEQ_MINOR places the sequence dimension as innermost.
+
+    Attributes:
+        HEAD_DIM_MINOR: Layout with shape (..., seq_len, head_dim).
+        SEQ_MINOR: Layout with shape (..., head_dim, seq_len).
+    """
+
     HEAD_DIM_MINOR = enum.auto()
     SEQ_MINOR = enum.auto()
 
 
 def from_head_minor(vals: tuple[Any, ...], layout: QKVLayout):
+    """Convert index tuple from HEAD_DIM_MINOR layout to the target layout.
+
+    For HEAD_DIM_MINOR, indices are returned as-is. For SEQ_MINOR, the
+    last two indices are swapped to match the transposed memory layout.
+
+    Args:
+        vals: Tuple of indices in HEAD_DIM_MINOR order.
+        layout: Target QKVLayout to convert to.
+
+    Returns:
+        Index tuple reordered for the target layout.
+    """
     if layout == QKVLayout.HEAD_DIM_MINOR:
         return vals
     return (*vals[:-2], vals[-1], vals[-2])
@@ -577,6 +727,28 @@ def _next_nonzero(
     m_next_ref,
     next_i=False,
 ):
+    """Look up the next nonzero block index from the sparse mask metadata.
+
+    Reads block_mask, data_next, and mask_next arrays stored in TPU scalar
+    memory to determine the next KV block to process and whether masking
+    is needed for the current block.
+
+    Args:
+        h: Head index in the computation grid.
+        i: Query block index in the computation grid.
+        j: KV block index in the computation grid.
+        data_next_ref: Reference to data_next array for block prefetch indices.
+        block_mask_ref: Reference to block_mask array (0=empty, 1=partial, 2=full).
+        m_next_ref: Reference to mask_next array for partial mask block indices.
+        next_i: If True, return query index instead of KV index for dKV kernels.
+
+    Returns:
+        Tuple of (next_data_index, next_mask_index, is_nonzero, should_not_mask):
+            - next_data_index: Index of the next KV (or Q) block to process.
+            - next_mask_index: Index into partial_mask_blocks, or None.
+            - is_nonzero: Whether the current block has any nonzero entries.
+            - should_not_mask: Whether the block is fully unmasked (all ones).
+    """
     assert (data_next_ref is None) == (block_mask_ref is None)
 
     if data_next_ref is None and block_mask_ref is None:
@@ -625,6 +797,30 @@ def _apply_mask_and_soft_cap(
     k_in_lanes=True,
     mask_function=None,
 ) -> jax.Array | tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Apply attention masking and optional logits soft capping to QK scores.
+
+    Combines multiple masking sources (block mask, computed mask function,
+    segment IDs) and applies them to the raw attention logits. Optionally
+    applies tanh-based soft capping to prevent extreme logit values.
+
+    Args:
+        qk: Raw attention logits of shape [bq, bkv] or [bkv, bq].
+        mask_value: Value to fill masked positions (large negative float).
+        should_not_mask: Boolean indicating the block is fully unmasked.
+        mask_ref: Reference to partial mask block, or None if not needed.
+        q_sequence_ref: Reference to query sequence indices for computed masks.
+        q_segment_ids_ref: Reference to query segment IDs, or None.
+        kv_segment_ids_ref: Reference to KV segment IDs, or None.
+        logits_soft_cap: Soft cap value for logits, or None to disable.
+        k_slice: Pallas slice selecting the current KV block.
+        k_offset: Global offset of the current KV block.
+        bq: Query block size.
+        k_in_lanes: If True, KV dimension is in lanes (minor axis).
+        mask_function: Optional callable for computing mask on-the-fly.
+
+    Returns:
+        Masked (and optionally soft-capped) attention logits.
+    """
     assert mask_ref is None or q_sequence_ref is None
     assert (q_sequence_ref is None) == (mask_function is None)
 
@@ -2271,12 +2467,36 @@ class SplashAttentionKernel:
         dkv_mask_info: mask_info_lib.MaskInfo | None,
         **kwargs,
     ):
+        """Initialize the SplashAttentionKernel with mask metadata.
+
+        Args:
+            fwd_mask_info: Sparse mask information for the forward pass.
+            dq_mask_info: Sparse mask information for the dQ backward pass,
+                or None if backward is not needed.
+            dkv_mask_info: Sparse mask information for the dKV backward pass,
+                or None if backward is not needed.
+            **kwargs: Additional kernel configuration (block_sizes, is_mqa,
+                save_residuals, mask_value, logits_soft_cap, etc.).
+        """
         self.kwargs = kwargs
         self.fwd_mask_info = fwd_mask_info
         self.dq_mask_info = dq_mask_info
         self.dkv_mask_info = dkv_mask_info
 
     def __call__(self, *args, **kwargs) -> SplashCustomReturnType:
+        """Execute the Splash Attention kernel.
+
+        Dispatches to the internal ``_splash_attention`` function with the
+        stored mask metadata and kernel configuration.
+
+        Args:
+            *args: Positional arguments (q, k, v, segment_ids, sinks).
+            **kwargs: Keyword arguments overriding stored configuration.
+
+        Returns:
+            Attention output tensor, or (output, (log_sum_exp,)) if
+            save_residuals was set to True during construction.
+        """
         return _splash_attention(
             self.fwd_mask_info,
             self.dq_mask_info,
@@ -2350,6 +2570,32 @@ def _make_splash_attention(
     residual_checkpoint_name: str | None = None,
     interpret: bool = False,
 ):
+    """Create a SplashAttentionKernel from a dense or lazy mask.
+
+    Processes the input mask into sparse MaskInfo representations for forward
+    and backward passes, then constructs a callable kernel object. Supports
+    both static (compile-time) and dynamic (traced) masks.
+
+    Args:
+        mask: Attention mask as a 3D array [num_heads, q_seq_len, kv_seq_len]
+            or a MultiHeadMask object.
+        block_sizes: Tile sizes for the kernel. Uses defaults if None.
+        is_mqa: If True, build for multi-query attention.
+        save_residuals: If True, kernel returns log-sum-exp for backward pass.
+        mask_value: Value for masked positions.
+        logits_soft_cap: Optional soft capping value for attention logits.
+        downcast_smem_data: If True, minimize scalar memory by downcasting.
+        head_shards: Number of shards along the head dimension.
+        q_seq_shards: Number of shards along the query sequence dimension.
+        residual_checkpoint_name: Optional name for activation checkpointing.
+        interpret: If True, run kernel in interpret mode for debugging.
+
+    Returns:
+        A SplashAttentionKernel instance ready for execution.
+
+    Raises:
+        ValueError: If mask shape is not 3-dimensional.
+    """
     if len(mask.shape) != 3:
         raise ValueError(f"Unexpected mask shape: {mask.shape}")
 

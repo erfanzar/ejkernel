@@ -209,9 +209,21 @@ class Tuner(Generic[Cfg]):
         """
 
         def _is_arrayish(x) -> bool:
+            """Check if a value is an array-like object (JAX Array, NumPy array, or JAX Tracer)."""
             return isinstance(x, jax.Array | np.ndarray) or isinstance(x, jcore.Tracer)
 
         def _to_concrete(x):
+            """Convert a tracer or abstract value to a concrete JAX array.
+
+            Handles JAX tracers by extracting shape/dtype from their abstract
+            value and creating zero-filled arrays. Passes through concrete arrays unchanged.
+
+            Args:
+                x: Value to convert (array, tracer, or scalar).
+
+            Returns:
+                Concrete JAX array with the same shape and dtype as the input.
+            """
             if isinstance(x, jax.Array | np.ndarray):
                 return x
             shape = getattr(x, "shape", None)
@@ -225,6 +237,7 @@ class Tuner(Generic[Cfg]):
             return jnp.asarray(x)
 
         def _block_all(x):
+            """Block until all arrays in the pytree are ready for synchronous timing."""
             return jtu.tree_map(lambda t: t.block_until_ready() if hasattr(t, "block_until_ready") else t, x)
 
         leaves, treedef = jtu.tree_flatten((args, kwargs))
@@ -234,6 +247,7 @@ class Tuner(Generic[Cfg]):
         arr0 = tuple(_to_concrete(x) for x in arr_leaves)
 
         def _restore_args_kwargs(array_leaves):
+            """Rebuild (args, kwargs) by merging dynamic array leaves with closed-over constants."""
             it = iter(array_leaves)
             merged = [next(it) if m else v for m, v in zip(is_arr, const_leaves, strict=False)]
             return jtu.tree_unflatten(treedef, merged)
@@ -245,7 +259,17 @@ class Tuner(Generic[Cfg]):
             validate_bwd = False
 
         def _time_forward(jitted: bool = True) -> float:
+            """Time forward-only execution with optional JIT compilation.
+
+            Args:
+                jitted: If True, JIT-compile the function before timing.
+                    Falls back to non-jitted execution if False.
+
+            Returns:
+                Average execution time per iteration in seconds.
+            """
             def core(*arrs):
+                """Reconstruct args/kwargs from array leaves and call the target function."""
                 (aa, kk) = _restore_args_kwargs(arrs)
                 return fn(*aa, **kk)
 
@@ -268,6 +292,7 @@ class Tuner(Generic[Cfg]):
         if validate_bwd:
 
             def _is_diff(x):
+                """Check if a value is differentiable (floating-point or complex type)."""
                 try:
                     dt = np.dtype(getattr(x, "dtype", None))
                     return np.issubdtype(dt, np.inexact)
@@ -283,16 +308,19 @@ class Tuner(Generic[Cfg]):
                     return _time_forward(jitted=False)
 
             def _split(arrs):
+                """Split array leaves into differentiable and non-differentiable groups."""
                 theta, nondiff = [], []
                 for m, v in zip(diff_mask, arrs, strict=False):
                     (theta if m else nondiff).append(v)
                 return tuple(theta), tuple(nondiff)
 
             def _merge(theta, nondiff):
+                """Merge differentiable and non-differentiable arrays back into original order."""
                 it_t, it_n = iter(theta), iter(nondiff)
                 return tuple(next(it_t) if m else next(it_n) for m in diff_mask)
 
             def loss(theta, nondiff):
+                """Compute scalar loss for backward pass validation timing."""
                 arrs = _merge(theta, nondiff)
                 (aa, kk) = _restore_args_kwargs(arrs)
                 y = fn(*aa, **kk)
@@ -507,6 +535,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
             kw = dict(inv.kwargs)
 
             def _is_arrayish(x) -> bool:
+                """Check if a value is an array-like object for argument partitioning."""
                 return isinstance(x, jax.Array | np.ndarray) or isinstance(x, jcore.Tracer)
 
             static_fun_kwargs = {k: v for k, v in kw.items() if callable(v)}
@@ -519,7 +548,9 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                     )
 
                 def mk(c, _static=static_fun_kwargs):
+                    """Create a shard_map-wrapped function for benchmarking a specific configuration."""
                     def f(*a, **k):
+                        """Execute the shard_map wrapper with the bound config and process callback."""
                         callback = None
                         eagers = kernel.create_shard_map_wrapper(
                             *a,
@@ -548,7 +579,9 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                 run_method = _get_platform_method(kernel, "run", platform, context) or kernel.run
 
                 def mk(c, _run=run_method, _static=static_fun_kwargs):
+                    """Create a function that executes the kernel run method with a specific config."""
                     def f(*a, **k):
+                        """Execute the run method with the bound configuration and static kwargs."""
                         return _run(*a, cfg=c, **(k | _static))
 
                     f._ejk_method = "regular"

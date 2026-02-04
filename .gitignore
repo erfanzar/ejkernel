@@ -8,12 +8,12 @@ __pycache__/
 exp.py
 env.py
 run_test.py
+benchmark_plots/*
 # Distribution / packaging
 .Python
 build/
 develop-eggs/
 dist/
-attention_plots/*
 tmp-files/
 downloads/
 eggs/
@@ -184,3 +184,11 @@ cython_debug/
 .auto-claude/
 .worktrees/*
 .claude_settings.json
+
+# CMake build artifacts
+csrc/**/_build/
+csrc/**/CMakeFiles/
+csrc/**/CMakeCache.txt
+csrc/**/cmake_install.cmake
+csrc/**/Makefile
+ejkernel/**/_build/

@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![JAX](https://img.shields.io/badge/JAX-0.8.0+-orange.svg)](https://github.com/google/jax)
+[![JAX](https://img.shields.io/badge/JAX-0.9.0+-orange.svg)](https://github.com/google/jax)
 [![Documentation](https://img.shields.io/badge/docs-readthedocs-green.svg)](https://ejkernel.readthedocs.io/en/latest/)
 
 ejKernel is a production-grade kernel library for JAX that provides highly optimized implementations of deep learning operations with automatic multi-backend support. The library features a sophisticated configuration management system with autotuning, comprehensive type safety, and seamless execution across GPUs, TPUs, and CPUs.
@@ -27,7 +27,6 @@ ejKernel is a production-grade kernel library for JAX that provides highly optim
 - [Citation](#citation)
 - [License](#license)
 
-
 ## Key Features
 
 ### Intelligent Kernel Management
@@ -39,7 +38,7 @@ ejKernel is a production-grade kernel library for JAX that provides highly optim
 
 ### State-of-the-Art Operations
 
-- **25+ Deep Learning Operations**: Flash Attention v2, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, State Space Models (Mamba), RWKV (v4/v6/v7), and more
+- **30+ Deep Learning Operations**: Flash Attention v2, Flash MLA, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, Quantized MatMul, State Space Models (Mamba), RWKV (v4/v6/v7), and more
 - **Memory Efficiency**: Custom VJP implementations with O(N) memory complexity for attention
 - **Distributed Support**: Full shard_map integration for model and data parallelism
 - **Mixed Precision**: Comprehensive dtype support with automatic gradient conversion
@@ -77,7 +76,7 @@ pip install -e ".[dev]"
 ### Dependencies
 
 - Python 3.11-3.13
-- JAX >= 0.8.0
+- JAX >= 0.9.0
 - Triton == 3.4.0 (for GPU)
 - jaxtyping >= 0.3.2
 - beartype >= 0.22.2
@@ -269,6 +268,9 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 | **Kernel Delta Attention**       | Delta-rule linear attention      | O(N)   | Linear complexity, delta updates, decay control        |
 | **Unified Attention**            | vLLM-style paged attention       | O(N)   | Segmented 3D decode kernel                             |
 | **Prefill Page Attention**       | Page attention prefill phase     | O(N)   | Separate prefill handling                              |
+| **Decode Attention**             | Single-token decode attention    | O(N)   | Optimized single-step decoding                         |
+| **Chunked Prefill Paged Decode** | Combined prefill + decode        | O(N)   | Chunked prefill with paged KV cache decode             |
+| **Flash MLA**                    | Multi-head Latent Attention      | O(N)   | Low-rank KV compression, memory-efficient inference    |
 | **Scaled Dot-Product Attention** | Standard attention               | O(N²)  | Basic reference implementation                         |
 
 ### Recurrent Linear Attention (RWKV)
@@ -289,6 +291,7 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 | **Mean Pooling**      | Variable-length sequence aggregation | Sentence embeddings       |
 | **Recurrent**         | Optimized RNN/LSTM/GRU operations    | Sequential modeling       |
 | **Native Sparse**     | Block-sparse matrix computations     | Sparse attention patterns |
+| **Quantized MatMul**  | Packed uint32 quantized matmul       | Low-bit inference         |
 
 ### State Space Models
 
@@ -299,34 +302,38 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 
 ### Platform Support Matrix
 
-| Operation                | Triton (GPU) | Pallas (TPU) | XLA (Universal) |
-| ------------------------ | ------------ | ------------ | --------------- |
-| Flash Attention v2       | ✅           | ✅           | ✅              |
-| Ring Attention           | ✅           | ✅           | ✅              |
-| Page Attention           | ✅           | ✅           | ✅              |
-| Block Sparse Attention   | ✅           | ✅           | ✅              |
-| Ragged Page Attention v2 | ✅           | ✅           | ✅              |
-| Ragged Page Attention v3 | ✅           | ✅           | ✅              |
-| Ragged Decode Attention  | ✅           | ✅           | ✅              |
-| GLA                      | ✅           | -            | ✅              |
-| Lightning Attention      | ✅           | -            | ✅              |
-| MLA                      | ✅           | 🚧           | -               |
-| Recurrent                | ✅           | -            | ✅              |
-| Mean Pooling             | ✅           | -            | ✅              |
-| Grouped MatMul           | -            | ✅           | ✅              |
-| Grouped MatMul v2        | -            | ✅           | -               |
-| Native Sparse Attention  | ✅           | -            | ✅              |
-| Kernel Delta Attention   | -            | -            | ✅              |
-| Unified Attention        | ✅           | -            | ✅              |
-| Prefill Page Attention   | -            | ✅           | ✅              |
-| State Space v1           | -            | -            | ✅              |
-| State Space v2           | -            | -            | ✅              |
-| RWKV-4                   | ✅           | -            | ✅              |
-| RWKV-6                   | ✅           | -            | ✅              |
-| RWKV-7                   | ✅           | -            | ✅              |
-| RWKV-7 Mul               | ✅           | -            | ✅              |
+| Operation                        | Triton (GPU) | CUDA (GPU) | Pallas (TPU) | XLA (Universal) |
+| -------------------------------- | ------------ | ---------- | ------------ | --------------- |
+| Flash Attention v2               | ✅           | ✅         | ✅           | ✅              |
+| Flash MLA                        | ✅           | -          | -            | ✅              |
+| Ring Attention                   | ✅           | -          | ✅           | ✅              |
+| Page Attention                   | ✅           | -          | ✅           | ✅              |
+| Block Sparse Attention           | ✅           | ✅         | ✅           | ✅              |
+| Decode Attention                 | ✅           | -          | -            | ✅              |
+| Chunked Prefill Paged Decode     | ✅           | -          | -            | ✅              |
+| Ragged Page Attention v2         | ✅           | -          | ✅           | ✅              |
+| Ragged Page Attention v3         | ✅           | ✅         | ✅           | ✅              |
+| Ragged Decode Attention          | ✅           | -          | ✅           | ✅              |
+| GLA                              | ✅           | -          | -            | ✅              |
+| Lightning Attention              | ✅           | -          | -            | ✅              |
+| Recurrent                        | ✅           | -          | -            | ✅              |
+| Mean Pooling                     | ✅           | -          | -            | ✅              |
+| Grouped MatMul                   | -            | -          | ✅           | ✅              |
+| Grouped MatMul v2                | -            | -          | ✅           | -               |
+| Native Sparse Attention          | ✅           | -          | -            | ✅              |
+| Quantized MatMul                 | ✅           | ✅         | -            | ✅              |
+| Kernel Delta Attention           | -            | -          | -            | ✅              |
+| Unified Attention                | ✅           | ✅         | -            | ✅              |
+| Prefill Page Attention           | -            | -          | ✅           | ✅              |
+| Scaled Dot-Product Attention     | -            | -          | -            | ✅              |
+| State Space v1                   | -            | -          | -            | ✅              |
+| State Space v2                   | -            | -          | -            | ✅              |
+| RWKV-4                           | ✅           | -          | -            | ✅              |
+| RWKV-6                           | ✅           | -          | -            | ✅              |
+| RWKV-7                           | ✅           | -          | -            | ✅              |
+| RWKV-7 Mul                       | ✅           | -          | -            | ✅              |
 
-✅ = Production ready | 🚧 = Under development | - = Not available
+✅ = Production ready | - = Not available
 
 ## Advanced Usage
 
@@ -543,13 +550,16 @@ Run benchmarks to compare performance across backends:
 # General attention benchmarks
 python benchmarks/benchmark_attention.py
 
+# Flash attention benchmarks
+python benchmarks/benchmark_flash_attention.py
+
 # Ragged page attention benchmarks
-python benchmarks/benchmark_ragged_page_attn.py
+python benchmarks/benchmark_ragged_page_attention_v3.py
 ```
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+We welcome contributions!
 
 ### Priority Areas
 
@@ -581,10 +591,10 @@ Comprehensive documentation available at [ejkernel.readthedocs.io](https://ejker
 If you use ejKernel in your research, please cite:
 
 ```bibtex
-@software{ejkernel2024,
+@software{ejkernel2025,
   author = {Erfan Zare Chavoshi},
   title = {ejKernel: High-Performance JAX Kernels for Deep Learning},
-  year = {2024},
+  year = {2025},
   url = {https://github.com/erfanzar/ejkernel},
   note = {Production-grade kernel library with multi-backend support}
 }

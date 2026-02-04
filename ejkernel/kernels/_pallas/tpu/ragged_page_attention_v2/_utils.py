@@ -412,7 +412,22 @@ def next_power_of_2(x: int):
 
 
 def simplify_key(key):
-    """Simplify the key to reduce the number of combinations."""
+    """Normalize workload parameters to reduce the tuning space.
+
+    Rounds parameters to the nearest power of 2 and aligns head dimensions
+    to 128-byte boundaries. This allows a smaller set of tuned block sizes
+    to cover a wider range of workload configurations with similar performance
+    characteristics.
+
+    Args:
+        key: Tuple of (q_dtype, kv_dtype, num_q_heads_per_blk,
+            num_kv_heads_per_blk, head_dim, page_size,
+            max_num_batched_tokens, pages_per_seq).
+
+    Returns:
+        Simplified tuple with rounded/normalized values suitable for
+        lookup in the TUNED_BLOCK_SIZES dictionary.
+    """
     (
         q_dtype,
         kv_dtype,
@@ -436,7 +451,14 @@ def simplify_key(key):
 
 
 def get_tpu_version() -> int:
-    """Returns the numeric version of the TPU, or -1 if not on TPU."""
+    """Detect and return the numeric TPU generation version.
+
+    Inspects the first JAX device's kind string to determine the TPU version.
+    Handles both standard TPU and TPU lite variants.
+
+    Returns:
+        Integer TPU version (e.g., 4, 5, 6), or -1 if not running on TPU.
+    """
     kind = jax.devices()[0].device_kind
     if "TPU" not in kind:
         return -1
@@ -447,6 +469,17 @@ def get_tpu_version() -> int:
 
 
 def get_device_name(num_devices: int | None = None):
+    """Get a standardized device name string for block size lookup.
+
+    Extracts the first two words of the device kind (e.g., "TPU v6") and
+    optionally appends the device count for multi-device configurations.
+
+    Args:
+        num_devices: Optional number of devices to append to the name.
+
+    Returns:
+        Device name string like "TPU v6" or "TPU v6-8".
+    """
     name = " ".join(jax.devices()[0].device_kind.split()[:2])
     if num_devices is not None:
         name += f"-{num_devices}"
@@ -463,7 +496,29 @@ def get_tuned_block_sizes(
     max_num_batched_tokens,
     pages_per_seq,
 ) -> tuple[int, int]:
-    """Look up for the best (num_kv_pages_per_blk, num_queries_per_blk) from auto-tuned table."""
+    """Look up optimal block sizes from the auto-tuned configuration table.
+
+    Searches the TUNED_BLOCK_SIZES dictionary for the best (bkv, bq) pair
+    matching the given workload parameters and TPU version. Falls back to
+    conservative defaults if no tuned configuration is found.
+
+    Args:
+        q_dtype: Query tensor dtype (e.g., jnp.bfloat16).
+        kv_dtype: KV cache dtype (e.g., jnp.bfloat16).
+        num_q_heads_per_blk: Number of query heads per processing block.
+        num_kv_heads_per_blk: Number of KV heads per processing block.
+        head_dim: Attention head dimension.
+        page_size: Number of tokens per KV cache page.
+        max_num_batched_tokens: Maximum tokens in a batch.
+        pages_per_seq: Maximum number of pages per sequence.
+
+    Returns:
+        Tuple of (num_kv_pages_per_blk, num_queries_per_blk), clamped to
+        not exceed pages_per_seq and max_num_batched_tokens respectively.
+
+    Raises:
+        NotImplementedError: If TPU version is less than 4.
+    """
     tpu_version = get_tpu_version()
     if tpu_version < 4:
         raise NotImplementedError("TPU version must be 4 or higher.")
@@ -490,5 +545,17 @@ def get_tuned_block_sizes(
 
 
 def get_min_page_size(max_model_len, min_page_size=16):
-    """Recommended min page size for high-performance kernel."""
+    """Compute the recommended minimum page size for the attention kernel.
+
+    Determines the smallest page size that keeps the total number of pages
+    per sequence at or below MAX_PAGES_PER_SEQ, ensuring efficient page
+    table lookups.
+
+    Args:
+        max_model_len: Maximum model sequence length to support.
+        min_page_size: Minimum allowed page size. Defaults to 16.
+
+    Returns:
+        Recommended page size (power of 2, at least min_page_size).
+    """
     return max(next_power_of_2(max_model_len) // MAX_PAGES_PER_SEQ, min_page_size)

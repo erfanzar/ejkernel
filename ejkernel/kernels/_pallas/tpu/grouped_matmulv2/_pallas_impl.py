@@ -13,7 +13,31 @@
 # limitations under the License.
 
 
-"""Grouped matrix multiplication kernels for TPU written in Pallas."""
+"""Pallas TPU kernel implementations for grouped matrix multiplication V2.
+
+This module contains the low-level Pallas kernel implementations for both
+grouped_matmul and transposed_grouped_matmul operations on TPU. These are
+the V2 implementations featuring input buffer count configuration for
+improved memory management on TPU.
+
+The module provides:
+    - ``_validate_args``: Input validation for grouped matmul operations
+    - ``make_group_metadata``: Group-to-tile mapping metadata generation
+    - ``_get_store_mask``: Per-tile store mask for group boundary handling
+    - ``grouped_matmul``: Forward grouped matrix multiplication kernel
+    - ``transposed_grouped_matmul``: Transposed grouped matmul for gradient computation
+
+Key differences from V1:
+    - Configurable ``input_buffer_count`` for memory/compute tradeoff
+    - Uses ``buffered_pallas_call`` for improved buffer management
+    - Simplified API without ``existing_out`` parameter
+
+TPU Kernel Design:
+    Both kernels use Pallas ``PrefetchScalarGridSpec`` with scalar prefetch
+    for group metadata. The grid is organized as (tiles_n, tiles_m, tiles_k)
+    for the forward pass and (tiles_n, tiles_k, tiles_m) for the transposed
+    variant. VMEM scratch space is used for float32 accumulation.
+"""
 
 import functools
 import json
@@ -35,7 +59,27 @@ def _validate_args(
     *,
     expected_rhs_dims: int = 3,
 ) -> jax.Array:
-    """Validates the arguments for the grouped_matmul function."""
+    """Validate input arguments for grouped matrix multiplication.
+
+    Checks that lhs and rhs have the expected number of dimensions and that
+    group_sizes has a 32-bit integer dtype. Converts group_sizes to int32
+    if it is uint32.
+
+    Args:
+        lhs: Left-hand side matrix, expected to be 2D with shape [m, k].
+        rhs: Right-hand side tensor, expected to be ``expected_rhs_dims``-dimensional.
+            Typically 3D [num_groups, k, n] for forward or 2D [m, n] for transposed.
+        group_sizes: 1D array of group sizes. Must have int32 or uint32 dtype.
+        expected_rhs_dims: Expected number of dimensions for rhs. Defaults to 3
+            for the forward pass, should be 2 for the transposed variant.
+
+    Returns:
+        The group_sizes array cast to int32 dtype.
+
+    Raises:
+        ValueError: If lhs is not 2D, rhs does not match expected_rhs_dims,
+            or group_sizes is not a 32-bit integer type.
+    """
     if lhs.ndim != 2:
         raise ValueError(f"Expected 2-tensor for 'lhs' but got {lhs.ndim}-tensor.")
 
@@ -200,22 +244,43 @@ def grouped_matmul(
     transpose_rhs: bool = False,
     interpret: bool = False,
 ) -> jax.Array:
-    """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
+    """Compute grouped matrix multiplication: lhs[start_i:end_i, :] @ rhs[i] for each group i.
+
+    Performs N separate matrix multiplications where each group's rows from lhs
+    are multiplied with the corresponding group-specific weight matrix from rhs.
+    The results are concatenated into a single output matrix.
+
+    This V2 implementation features configurable input buffer counts for
+    improved memory management on TPU via ``buffered_pallas_call``.
 
     Args:
-      lhs: A 2d, jax.Array with shape [m, k].
-      rhs: A 3d, jax.Array with shape [num_groups, k, n].
-      group_sizes: A 1d, jax.Array with shape [num_groups] and jnp.int32 dtype.
-      preferred_element_type: jnp.dtype, the element type for the output matrix.
-      tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
-      group_offset: The group in group sizes to start computing from. This is
-        particularly useful for when rhs num_groups is sharded.
-      transpose_rhs: True if the rhs needs to be transposed.
-      interpret: Whether or not to run the kernel in interpret mode, helpful for
-        testing and debugging.
+        lhs: Left-hand side matrix of shape [m, k] where m is the total number
+            of rows across all groups and k is the inner dimension.
+        rhs: Right-hand side tensor of shape [num_groups, k, n] containing a
+            separate matrix for each group. If transpose_rhs is True, expected
+            shape is [num_groups, n, k].
+        group_sizes: 1D array of shape [num_groups] with int32 dtype. Each element
+            specifies the number of rows in lhs belonging to that group.
+            Must sum to m (first dimension of lhs).
+        preferred_element_type: Output dtype for the result matrix.
+        tiling: Tile sizes as (tm, tk, tn) tuple, or a callable returning tile
+            sizes given (m, k, n). None raises ValueError.
+        input_buffer_count: Number of input buffers for the Pallas call. Higher
+            values use more memory but can improve throughput. Defaults to 2.
+        group_offset: Starting group index for sharded execution. Useful when
+            distributing groups across multiple devices. Defaults to 0.
+        transpose_rhs: If True, transposes the last two dimensions of rhs
+            during multiplication. Defaults to False.
+        interpret: Run kernel in interpret mode for debugging. Slower but provides
+            better error messages. Defaults to False.
 
     Returns:
-      A 2d, jax.Array with shape [m, n].
+        Output matrix of shape [m, n] containing the concatenated results of all
+        group matrix multiplications, with dtype matching preferred_element_type.
+
+    Raises:
+        ValueError: If lhs is not 2D, rhs is not 3D, group_sizes is not int32,
+            group_offset is not scalar, or no tiling is available.
     """
     group_sizes = _validate_args(lhs, rhs, group_sizes)
 
@@ -395,23 +460,40 @@ def transposed_grouped_matmul(
     num_actual_groups: int | None = None,
     interpret: bool = False,
 ) -> jax.Array:
-    """Compute lhs[:, sizes[i-1]:sizes[i]] @ rhs[sizes[i-1]:sizes[i], :].
+    """Compute transposed grouped matrix multiplication for gradient computation.
+
+    For each group i, computes lhs[:, start_i:end_i] @ rhs[start_i:end_i, :]
+    where start_i and end_i are determined by group_sizes. This is the transposed
+    variant used primarily for computing gradients with respect to the right-hand
+    side weight matrix in the backward pass of grouped_matmul.
+
+    The kernel visits empty groups (setting their output to zero) and accumulates
+    results across the m-dimension tiles for each group.
 
     Args:
-      lhs: A 2d, jax.Array with shape [k, m].
-      rhs: A 2d, jax.Array with shape [m, n].
-      group_sizes: A 1d, jax.Array with shape [num_groups] and jnp.int32 dtype.
-      preferred_element_type: jnp.dtype, the element type for the output matrix.
-      tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
-      group_offset: The group in group sizes to start computing from. This is
-        particularly useful for when rhs num_groups is sharded.
-      num_actual_groups: For when num_groups is sharded and we should only compute
-        the groups that are local, starting from group_offset.
-      interpret: Whether or not to run the kernel in interpret mode, helpful for
-        testing and debugging.
+        lhs: Left-hand side matrix of shape [k, m] (transposed from the forward
+            pass lhs). Internally transposed to [m, k] for kernel execution.
+        rhs: Right-hand side matrix of shape [m, n] (the gradient from the
+            forward pass output).
+        group_sizes: 1D array of shape [num_groups] with int32 dtype. Each element
+            specifies the number of rows belonging to that group.
+        preferred_element_type: Output dtype for the result tensor.
+        tiling: Tile sizes as (tm, tk, tn) tuple, or a callable returning tile
+            sizes given (m, k, n). None raises ValueError.
+        input_buffer_count: Number of input buffers for the Pallas call. Defaults to 2.
+        group_offset: Starting group index for sharded execution. Defaults to 0.
+        num_actual_groups: Number of groups to actually compute, starting from
+            group_offset. Defaults to num_groups if None. Used when groups are
+            distributed across multiple devices.
+        interpret: Run kernel in interpret mode for debugging. Defaults to False.
 
     Returns:
-      A  3d, jax.Array with shape [num_groups, k, n].
+        3D tensor of shape [num_actual_groups, k, n] where each slice [i, :, :]
+        contains the result of the transposed matmul for group i.
+
+    Raises:
+        ValueError: If lhs is not 2D, rhs is not 2D, group_sizes is not int32,
+            or no tiling is available.
     """
     group_sizes = _validate_args(lhs, rhs, group_sizes, expected_rhs_dims=2)
 

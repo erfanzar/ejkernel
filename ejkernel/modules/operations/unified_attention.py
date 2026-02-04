@@ -289,7 +289,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         Returns:
             Callable implementation function from the kernel registry.
         """
-        platform = detect_platform("unified_attention", cfg.platform)
+        platform = detect_platform("unified_attention", cfg.platform, prefer_triton=True)
         return kernel_registry.get("unified_attention", platform=platform, backend=cfg.backend)
 
     def run(

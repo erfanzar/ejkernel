@@ -333,6 +333,7 @@ def autotune_recorded(hyperparameter_selector, *, show_progress=False, repetitio
             candidates = tuple(kernel.candidate_cfgs(tmp_inv))
 
             def mk(c, _run=kernel.run, _static=static_fun_kwargs):
+                """Create a partial function binding a specific configuration to the kernel run method."""
                 return partial(_run, cfg=c, **_static)
 
             best_cfg, best_t = None, float("inf")
@@ -385,6 +386,7 @@ def benchmark(fn, *args, warmup=1, iters=5, **kwargs) -> float:
     if static:
 
         def fn_wrapped(*a, _fn=fn, _static=static, **k):
+            """Wrap function to merge static callable kwargs with dynamic kwargs at call time."""
             return _fn(*a, **(k | _static))
 
         c = jax.jit(fn_wrapped).lower(*args, **dyn).compile()
@@ -753,6 +755,7 @@ class FNAutotuner:
         jax_compiler = partial(jax.jit, out_shardings=output_shardings)
 
         def parameterized_function(*function_args, **function_kwargs):
+            """Execute the target function with embedded hyperparameter values merged into kwargs."""
             combined_kwargs = dict(function_kwargs, **hyperparameter_values)
             return target_function(*function_args, **combined_kwargs)
 
@@ -799,6 +802,7 @@ class FNAutotuner:
                 if compute_layouts:
 
                     def to_shape(x):
+                        """Convert a JAX array to its ShapeDtypeStruct representation for layout optimization."""
                         return (
                             jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding)
                             if isinstance(x, jax.Array)
@@ -821,6 +825,7 @@ class FNAutotuner:
                 if optimal_formats is not None:
 
                     def place_array_on_optimal_device(array_data, target_format):
+                        """Place an array on its optimal device layout, passing non-arrays through."""
                         return (
                             jax.device_put(array_data, target_format)
                             if isinstance(array_data, jax.Array)
@@ -865,6 +870,7 @@ class FNAutotuner:
         """
 
         def _execute_and_block():
+            """Execute the target function and block until all outputs are ready."""
             return jax.block_until_ready(target_function())
 
         for _ in range(self.timing_warmup_iterations):
@@ -957,6 +963,7 @@ class FNAutotuner:
             self.profiler._pattern = re.compile(event_filter_regex)
 
         def _extract_array_type(x):
+            """Extract the abstract type of a JAX array, or pass through non-array values."""
             return x if not isinstance(x, jax.Array) else jax.typeof(x)
 
         if len(args) == 0 or all(x is None or jax.core.is_concrete(x) for x in jax.tree.leaves(args)):
@@ -1070,6 +1077,7 @@ class FNAutotuner:
             platform = args_with_device[0].platform if len(args_with_device) > 0 else _get_default_device().platform
 
             def _timing_closure():
+                """Execute all hyperparameter configurations in random order for profiler timing."""
                 settings = list(hyperparam_settings.items())
                 pyrandom.shuffle(settings)
                 for i, _ in settings:

@@ -43,6 +43,31 @@ def _rwkv4_fwd_kernel(
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
+    """RWKV-4 forward pass Triton kernel with numerically stable recurrence.
+
+    Processes the WKV recurrence for a block of channels using the (alpha,
+    beta, eps) formulation for numerical stability. Each program instance
+    handles one (batch, channel_block) pair and iterates through all timesteps.
+
+    The computation uses a log-space max trick:
+        tau = max(u+k_t, eps)
+        wkv_t = (exp(eps-tau)*alpha + exp(u+k_t-tau)*v_t) /
+                (exp(eps-tau)*beta + exp(u+k_t-tau))
+        alpha_{t+1} = exp(w+eps-eps_next)*alpha + exp(k_t-eps_next)*v_t
+        beta_{t+1}  = exp(w+eps-eps_next)*beta  + exp(k_t-eps_next)
+
+    Args:
+        w_ptr: Negated exponentiated time decay [-exp(w)], shape (C,).
+        u_ptr: Time-mix bias, shape (C,).
+        k_ptr: Key tensor pointer, shape (B, T, C).
+        v_ptr: Value tensor pointer, shape (B, T, C).
+        state_ptr: Initial state (alpha, beta, eps), shape (B, 3, C).
+        o_ptr: Output tensor pointer, shape (B, T, C).
+        state_out_ptr: Final state output pointer, shape (B, 3, C).
+        T: Sequence length (compile-time constant).
+        C: Number of channels (compile-time constant).
+        BLOCK_C: Channel block size (compile-time constant).
+    """
     b = tl.program_id(0)
     c_blk = tl.program_id(1)
 

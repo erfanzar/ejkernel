@@ -32,4 +32,3 @@ Algorithm:
 from ._interface import decode_attention
 
 __all__ = ("decode_attention",)
-

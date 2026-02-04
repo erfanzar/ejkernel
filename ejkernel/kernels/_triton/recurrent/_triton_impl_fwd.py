@@ -13,6 +13,39 @@
 # limitations under the License.
 
 
+"""Forward pass Triton kernels for recurrent linear attention.
+
+This module provides the GPU-accelerated forward pass for recurrent linear
+attention mechanisms. The kernel processes sequences step-by-step with O(N)
+complexity, maintaining a hidden state matrix that accumulates key-value
+outer products with optional gating.
+
+Algorithm Overview:
+------------------
+For each timestep t:
+    1. Apply gating: h *= exp(gate)  (if gating is enabled)
+    2. Update state: h += k_t * v_t^T  (outer product)
+    3. Compute output: o_t = sum(h * q_t, axis=key_dim)
+
+The hidden state h has shape [key_dim, value_dim] and represents the
+compressed history of the sequence up to the current timestep.
+
+Gating Modes:
+- g (scalar gate per head): h *= exp(g_t), uniform decay across dimensions
+- g_gamma (fixed decay per head): h *= exp(gamma), constant decay rate
+- gk (per-key-dim gate): h *= exp(gk_t)[:, None], key-selective decay
+- gv (per-value-dim gate): h *= exp(gv_t)[None, :], value-selective decay
+
+Memory Layout:
+- Inputs: [batch, sequence, heads, dim] format
+- Hidden state: [batch*heads, key_dim, value_dim]
+- Output is tiled across key and value dimensions for parallelism
+
+Functions:
+- fwd_kernel: Triton JIT kernel for recurrent forward computation
+- fwd_triton_impl: Python wrapper that launches the kernel
+"""
+
 import jax
 import triton
 import triton.language as tl

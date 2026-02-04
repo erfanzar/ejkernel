@@ -45,7 +45,9 @@ from ..kernels._registry import Backend, Platform, kernel_registry
 def detect_platform(
     algorithm: str,
     platform: Platform | Literal["triton", "pallas", "cuda", "xla", "auto"] | None = "auto",
-    maybe_pallas: bool = False,
+    prefer_pallas: bool = False,
+    prefer_cuda: bool = False,
+    prefer_triton: bool = False,
 ) -> Platform:
     """Detect the best platform for a given algorithm.
 
@@ -55,10 +57,14 @@ def detect_platform(
         3. Current JAX backend (GPU/TPU/CPU)
         4. Platform-specific optimizations
 
-    The selection priority:
-        - GPU backend + Triton available -> Triton (best GPU performance)
+    The selection priority (when platform="auto"):
+        - If prefer_pallas is set and a matching Pallas backend exists -> Pallas
+        - If prefer_cuda is set and CUDA is available on NVIDIA -> CUDA
+        - If prefer_triton is set and Triton is available -> Triton
+        - TPU backend + Pallas available -> Pallas
+        - NVIDIA GPU + CUDA implementation available -> CUDA
+        - GPU backend + Triton available -> Triton
         - GPU backend + no Triton -> XLA
-        - TPU backend -> Pallas (TPU-optimized) or XLA fallback
         - CPU backend -> XLA
 
     Args:
@@ -69,6 +75,9 @@ def detect_platform(
             - "cuda": CUDA-specific implementations
             - "xla": XLA compiler-based implementations
             - "auto" or None: Automatic selection (default)
+        prefer_pallas: Prefer Pallas when available (GPU or TPU).
+        prefer_cuda: Prefer CUDA on NVIDIA GPUs when available.
+        prefer_triton: Prefer Triton on GPU when available.
 
     Returns:
         The selected Platform enum value
@@ -87,8 +96,9 @@ def detect_platform(
         >>> print(f"Selected: {detect_platform('ring_attention')}")
 
     Note:
-        Triton is preferred on NVIDIA GPUs for best performance, but XLA provides
-        broader compatibility across hardware backends.
+        CUDA implementations are preferred on NVIDIA GPUs when available. Triton
+        remains the next choice for GPU backends, while XLA provides broader
+        compatibility across hardware backends.
     """
     if platform not in ("auto", None):
         return Platform(platform) if isinstance(platform, str) else platform
@@ -99,6 +109,7 @@ def detect_platform(
         jax_backend = "cpu"
 
     specs = kernel_registry.list_implementations(algorithm)
+    has_cuda = any(spec.platform == Platform.CUDA and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
     has_triton = any(spec.platform == Platform.TRITON and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
     has_pallas_tpu = any(
         spec.platform == Platform.PALLAS and spec.backend in (Backend.TPU, Backend.ANY) for spec in specs
@@ -107,11 +118,33 @@ def detect_platform(
         spec.platform == Platform.PALLAS and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs
     )
 
-    if has_pallas_gpu and jax_backend in ("gpu") and maybe_pallas:
-        return Platform.PALLAS
+    is_nvidia = False
+    try:
+        for dev in jax.local_devices():
+            kind = getattr(dev, "device_kind", "") or ""
+            if isinstance(kind, str) and "NVIDIA" in kind.upper():
+                is_nvidia = True
+                break
+    except Exception:
+        is_nvidia = False
+
+    if prefer_pallas:
+        if has_pallas_tpu and jax_backend in ("tpu"):
+            return Platform.PALLAS
+        if has_pallas_gpu and jax_backend in ("gpu"):
+            return Platform.PALLAS
 
     if has_pallas_tpu and jax_backend in ("tpu"):
         return Platform.PALLAS
+
+    if prefer_cuda and is_nvidia and has_cuda and jax_backend in ("gpu", "cuda"):
+        return Platform.CUDA
+
+    if prefer_triton and has_triton and jax_backend in ("gpu", "cuda"):
+        return Platform.TRITON
+
+    if is_nvidia and has_cuda and jax_backend in ("gpu", "cuda"):
+        return Platform.CUDA
 
     if has_triton and jax_backend in ("gpu", "cuda"):
         return Platform.TRITON

@@ -13,6 +13,23 @@
 # limitations under the License.
 
 
+"""Block-sparse attention backward pass Triton kernel implementation.
+
+This module contains the Triton GPU kernels for the backward pass of block-sparse
+attention. It computes gradients for queries (dQ), keys (dK), and values (dV) using
+pre-computed sparse mask boundaries to skip irrelevant blocks.
+
+The backward pass is organized into three phases:
+    1. **Preprocessing** (``blocksparse_attn_bwd_preprocess``): Computes per-token delta
+       values (element-wise product sum of output and output gradient).
+    2. **dQ computation** (``blocksparse_attn_bwd_dq``): Iterates over sparse KV blocks
+       to accumulate query gradients.
+    3. **dK/dV computation** (``blocksparse_attn_bwd_dkdv``): Iterates over sparse query
+       blocks to accumulate key and value gradients using atomic additions.
+
+The entry point ``_bwd_blocksparse_attn_call`` orchestrates the full backward pass.
+"""
+
 import chex
 import jax
 import jax.numpy as jnp

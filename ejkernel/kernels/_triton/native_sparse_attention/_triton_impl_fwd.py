@@ -72,6 +72,7 @@ def _compare_and_swap(
     i: tl.constexpr,
     n_dims: tl.constexpr,
 ):
+    """Bitonic sort compare-and-swap primitive for GPU-friendly sorting."""
     n_outer: tl.constexpr = x.numel >> n_dims
     shape: tl.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
     y = tl.reshape(x, shape)
@@ -104,6 +105,7 @@ def _bitonic_merge(
     order: tl.constexpr,
     n_dims: tl.constexpr,
 ):
+    """Merge step of bitonic sort, combining sorted subsequences."""
     n_outer: tl.constexpr = x.numel >> n_dims
     tl.static_assert(stage <= n_dims)
     if order == 2:
@@ -123,6 +125,7 @@ def argsort(
     dim: tl.constexpr = None,
     descending: tl.constexpr = tl.core.CONSTEXPR_0,
 ):
+    """GPU-friendly argsort using bitonic sort, returning sorted values and indices."""
     _dim: tl.constexpr = len(x.shape) - 1 if dim is None else dim
     tl.static_assert(_dim == len(x.shape) - 1, "only minor dimension is currently supported")
     n_dims: tl.constexpr = tl.log2(x.shape[_dim])

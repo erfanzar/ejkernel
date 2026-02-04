@@ -13,6 +13,25 @@
 # limitations under the License.
 
 
+"""Block-sparse attention forward pass Triton kernel implementation.
+
+This module contains the Triton GPU kernels for the forward pass of block-sparse
+attention. The main kernel ``blocksparse_attn_fwd`` processes queries in blocks
+and iterates over sparse key-value blocks determined by pre-computed mask boundaries,
+skipping computation for entirely masked-out blocks.
+
+The entry point ``_fwd_blocksparse_attn_call`` handles input validation, padding,
+sparse mask extraction, and dispatches the Triton kernel with appropriate parameters.
+
+Features:
+    - Sparse block patterns (causal, sliding window, custom)
+    - Grouped-query attention (GQA) / multi-query attention (MQA)
+    - Segment-based masking for packed variable-length sequences
+    - Context parallelism with load balancing
+    - Logit soft capping (Gemma-2 style)
+    - Attention sinks for streaming inference
+"""
+
 from collections.abc import Sequence
 
 import chex

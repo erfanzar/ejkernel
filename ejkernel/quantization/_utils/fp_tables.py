@@ -1,0 +1,178 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Floating-point lookup tables for microscaling quantization formats.
+
+This module provides lookup tables for various low-precision floating-point
+formats used in quantization:
+
+- E2M1 (FP4): 2 exponent bits, 1 mantissa bit (used in MXFP4, NVFP4)
+- E4M3 (FP8): 4 exponent bits, 3 mantissa bits (used in MXFP8, NVFP4 scales)
+- NF4: 4-bit NormalFloat codebook optimized for normal distributions
+
+The tables map integer codes to their float32 values, enabling efficient
+vectorized dequantization via table lookup.
+"""
+
+from __future__ import annotations
+
+from jax import numpy as jnp
+
+
+def _make_fp_table(exp_bits: int, mant_bits: int, *, nan_all_ones: bool) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Generate a lookup table for a minifloat format.
+
+    Builds a complete lookup table mapping all possible bit patterns to their
+    float32 values for a custom floating-point format with the specified
+    exponent and mantissa bit widths.
+
+    The format is: [sign (1 bit)] [exponent (exp_bits)] [mantissa (mant_bits)]
+
+    Args:
+        exp_bits: Number of exponent bits.
+        mant_bits: Number of mantissa bits.
+        nan_all_ones: If True, the all-ones bit pattern (sign=1, exp=max, mant=max)
+            is treated as NaN. This matches E4M3 semantics.
+
+    Returns:
+        Tuple of (value_table, nan_mask) where:
+            - value_table: Float32 array of shape (2^(1+exp_bits+mant_bits),)
+              mapping each code to its float value.
+            - nan_mask: Boolean array indicating which codes are NaN.
+    """
+    bits = 1 + exp_bits + mant_bits
+    codes = jnp.arange(2**bits, dtype=jnp.uint32)
+    sign = (codes >> (exp_bits + mant_bits)) & 0x1
+    exp = (codes >> mant_bits) & ((1 << exp_bits) - 1)
+    mant = codes & ((1 << mant_bits) - 1)
+
+    bias = (1 << (exp_bits - 1)) - 1
+    mant_f = mant.astype(jnp.float32) / (2**mant_bits)
+
+    exp_is_zero = exp == 0
+    exp_is_max = exp == ((1 << exp_bits) - 1)
+
+    sub = mant_f * jnp.exp2(1.0 - bias)
+    norm = (1.0 + mant_f) * jnp.exp2(exp.astype(jnp.float32) - bias)
+    val = jnp.where(exp_is_zero, sub, norm)
+    val = jnp.where(sign == 1, -val, val)
+
+    if nan_all_ones:
+        nan_mask = exp_is_max & (mant == ((1 << mant_bits) - 1))
+        val = jnp.where(nan_mask, jnp.nan, val)
+    else:
+        nan_mask = jnp.zeros_like(exp_is_max, dtype=bool)
+
+    return val, nan_mask
+
+
+def _get_e2m1_table() -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Get the E2M1 (FP4) lookup table.
+
+    E2M1 format: 1 sign bit, 2 exponent bits, 1 mantissa bit (4 bits total).
+    Range: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6} (16 values).
+    Used in MXFP4 and NVFP4 quantization modes.
+
+    Returns:
+        Tuple of (value_table, nan_mask). The table has 16 entries.
+    """
+    return _make_fp_table(2, 1, nan_all_ones=False)
+
+
+def _get_e4m3_table() -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Get the E4M3 (FP8) lookup table.
+
+    E4M3 format: 1 sign bit, 4 exponent bits, 3 mantissa bits (8 bits total).
+    Range: ±{0, ..., 448} with NaN at 0xFF. Used in MXFP8 and NVFP4 scales.
+
+    Returns:
+        Tuple of (value_table, nan_mask). The table has 256 entries.
+    """
+    return _make_fp_table(4, 3, nan_all_ones=True)
+
+
+def _get_e4m3_table_q() -> jnp.ndarray:
+    """Get E4M3 table with NaN replaced by infinity for quantization.
+
+    When quantizing to E4M3, we want to avoid selecting the NaN code.
+    By replacing NaN with inf in the lookup table, argmin-based quantization
+    will never select it.
+
+    Returns:
+        E4M3 value table with NaN entries replaced by infinity.
+    """
+    table, nan_mask = _get_e4m3_table()
+    return jnp.where(nan_mask, jnp.inf, table)
+
+
+def _get_e2m1_max() -> jnp.ndarray:
+    """Get the maximum representable absolute value in E2M1 format.
+
+    Returns:
+        Scalar float32 containing max(abs(E2M1 values)) = 6.0.
+    """
+    table, _ = _get_e2m1_table()
+    return jnp.max(jnp.abs(table))
+
+
+def _get_e4m3_max() -> jnp.ndarray:
+    """Get the maximum representable absolute value in E4M3 format.
+
+    Excludes NaN entries when computing the maximum.
+
+    Returns:
+        Scalar float32 containing max(abs(E4M3 values)) = 448.0.
+    """
+    table, nan_mask = _get_e4m3_table()
+    return jnp.max(jnp.abs(jnp.where(nan_mask, 0.0, table)))
+
+
+def _get_nf4_table() -> jnp.ndarray:
+    """Get the NF4 (NormalFloat 4-bit) codebook.
+
+    NF4 is a 4-bit quantization format optimized for normally distributed
+    weights. The 16 codebook values are chosen to minimize quantization
+    error for N(0, 1) distributed data.
+
+    The values are asymmetric around zero to better match the typical
+    distribution of neural network weights.
+
+    Returns:
+        Float32 array of shape (16,) containing the NF4 codebook values
+        in range [-1, 1].
+
+    References:
+        QLoRA: Efficient Finetuning of Quantized LLMs (Dettmers et al., 2023)
+    """
+    return jnp.asarray(
+        [
+            -1.0,
+            -0.6961928009986877,
+            -0.5250730514526367,
+            -0.39491748809814453,
+            -0.28444138169288635,
+            -0.18477343022823334,
+            -0.09105003625154495,
+            0.0,
+            0.07958029955625534,
+            0.16093020141124725,
+            0.24611230194568634,
+            0.33791524171829224,
+            0.44070982933044434,
+            0.5626170039176941,
+            0.7229568362236023,
+            1.0,
+        ],
+        dtype=jnp.float32,
+    )

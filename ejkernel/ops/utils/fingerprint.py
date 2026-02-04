@@ -243,6 +243,7 @@ def stable_json(obj: Any) -> str:
     """
 
     def default(o):
+        """JSON serialization fallback for non-standard types including JAX arrays and callables."""
         if inspect.isfunction(o) or inspect.ismethod(o):
             mod = getattr(o, "__module__", None)
             qn = getattr(o, "__qualname__", getattr(o, "__name__", "anon"))
@@ -335,6 +336,7 @@ def abstractify(pytree: Any) -> Any:
     """
 
     def leaf(x):
+        """Convert a single array to ShapeDtypeStruct or pass through non-array values."""
         if isinstance(x, jax.Array | np.ndarray):
             return jax.ShapeDtypeStruct(np.shape(x), getattr(x, "dtype", None))
         return x

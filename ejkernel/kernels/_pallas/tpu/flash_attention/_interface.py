@@ -72,6 +72,8 @@ Reference:
     https://arxiv.org/abs/2205.14135
 """
 
+from __future__ import annotations
+
 import functools
 
 import jax
@@ -82,12 +84,17 @@ from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
 from ejkernel.callib import ejit
+from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.ops import BwdParams, FwdParams
 
 from ...._registry import Backend, Platform, kernel_registry
 from ._pallas_impl_bwd import _flash_attention_bwd
 from ._pallas_impl_fwd import _flash_attention_fwd, _flash_attention_impl
 from ._utils import BlockSizes, SegmentIds
+
+PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
+DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
+BlockTables = Int[Array, "batch max_blocks"]
 
 
 @kernel_registry.register("flash_attention", Platform.PALLAS, Backend.TPU)
@@ -108,11 +115,13 @@ from ._utils import BlockSizes, SegmentIds
 @jaxtyping.jaxtyped(typechecker=beartype)
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | None = None,
+    key: DenseKV | PagedKV,
+    value: DenseKV | PagedKV,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None
+    ) = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -131,6 +140,7 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    block_tables: BlockTables | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention on TPU using Pallas kernels.
 
@@ -160,6 +170,8 @@ def flash_attention(
         normalize_output: Whether to normalize output (ignored on TPU).
         precision: Matrix multiplication precision (ignored on TPU).
         logits_dtype: Dtype for logits computation (ignored on TPU).
+        block_tables: Optional paged-KV block table of shape
+            ``(batch, max_blocks)``. Unsupported on the TPU backend.
         q_segment_ids: Segment IDs for queries [batch, seq_len_q] for cross-segment masking.
         kv_segment_ids: Segment IDs for keys/values [batch, seq_len_k] for cross-segment masking.
 
@@ -180,14 +192,32 @@ def flash_attention(
         >>> # With logits soft capping (e.g., Gemma models)
         >>> out = flash_attention(query, key, value, logits_soft_cap=20.0)
     """
-    del normalize_output, precision, logits_dtype, dropout_prob, dropout_seed
-
+    reasons: list[str] = []
+    if block_tables is not None:
+        reasons.append("block_tables (paged_kv) is not supported")
     if cum_seqlens_q is not None:
-        raise NotImplementedError("Variable-length sequences (cum_seqlens_q) are not supported on TPU")
+        reasons.append("cum_seqlens_q is not supported")
     if cum_seqlens_k is not None:
-        raise NotImplementedError("Variable-length sequences (cum_seqlens_k) are not supported on TPU")
+        reasons.append("cum_seqlens_k is not supported")
     if softmax_aux is not None:
-        raise NotImplementedError("Attention sinks (softmax_aux) are not supported on TPU")
+        reasons.append("softmax_aux is not supported")
+    if dropout_prob != 0.0:
+        reasons.append("dropout_prob is not supported")
+    if dropout_seed is not None:
+        reasons.append("dropout_seed is not supported")
+    if not normalize_output:
+        reasons.append("normalize_output must be True")
+    if isinstance(precision, int):
+        if int(precision) != 0:
+            reasons.append("precision must be DEFAULT")
+    elif precision != lax.Precision.DEFAULT:
+        reasons.append("precision must be DEFAULT")
+    if jnp.dtype(logits_dtype) != jnp.float32:
+        reasons.append("logits_dtype must be float32")
+    if reasons:
+        raise EjkernelRuntimeError("flash_attention (platform=pallas/tpu): " + "; ".join(reasons))
+
+    del normalize_output, precision, logits_dtype, dropout_prob, dropout_seed
 
     window_tuple: tuple[int, int] | None
     if sliding_window is None:

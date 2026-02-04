@@ -126,7 +126,9 @@ def autotune_lowered(selector: ConfigSelectorChain, lowered) -> AutotuningResult
         run_method = _get_platform_method(kernel, "run", platform, None) or kernel.run
 
         def mk(c, _run=run_method, _static=static_fun_kwargs):
+            """Create a function that executes the kernel run method with a specific configuration."""
             def f(*a, **k):
+                """Execute the kernel with the bound configuration and static kwargs."""
                 return _run(*a, cfg=c, **(k | _static))  # noqa: B023
 
             return f

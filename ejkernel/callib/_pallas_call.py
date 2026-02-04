@@ -128,12 +128,36 @@ def buffered_pallas_call(
     num_scalar_prefetch = grid_spec.num_scalar_prefetch
 
     def len_(x):
+        """Return the length of a sequence, or 1 for a single element.
+
+        Args:
+            x: A list, tuple, or single value.
+
+        Returns:
+            Length of the sequence, or 1 if the input is not a list or tuple.
+        """
         return len(x) if isinstance(x, (list, tuple)) else 1
 
     args_len = len_(grid_spec.in_specs) + len_(grid_spec.out_specs)
 
     def _augment_blockspec(bs, smem_refs):
+        """Augment a BlockSpec by binding SMEM references into its index map.
+
+        Creates a new ``BlockSpec`` whose ``index_map`` passes both the
+        original grid indices and the scalar-memory references to the
+        original index map function.
+
+        Args:
+            bs: Original ``BlockSpec`` with an index map that expects
+                grid indices followed by SMEM references.
+            smem_refs: Scalar-memory references to bind into the index map.
+
+        Returns:
+            New ``pl.BlockSpec`` with the augmented index map.
+        """
+
         def index_map_(*idxs):
+            """Invoke the original index map with grid indices and SMEM refs."""
             return bs.index_map(*idxs, *smem_refs)
 
         return pl.BlockSpec(bs.block_shape, index_map_)
@@ -142,14 +166,54 @@ def buffered_pallas_call(
     grid_dynamic = tuple(None if isinstance(dim, int) else jnp.atleast_1d(dim) for dim in grid_spec.grid)
 
     def _bind_pipeline(spec, count):
+        """Configure multi-buffering on a BlockSpec if needed.
+
+        When ``count`` exceeds 2 (double buffering), replaces the spec's
+        pipeline mode with a ``pl.Buffered`` mode using the given buffer
+        count and lookahead enabled.
+
+        Args:
+            spec: The ``BlockSpec`` to configure.
+            count: Number of buffers to use. A value of 2 keeps the default
+                double-buffering behavior.
+
+        Returns:
+            The original spec (if count == 2) or a copy with updated
+            ``pipeline_mode``.
+        """
         if count == 2:
             return spec
         return dataclasses.replace(spec, pipeline_mode=pl.Buffered(buffer_count=count, use_lookahead=True))
 
     def pallas_call(*args):
+        """Execute the buffered Pallas kernel with the given arguments.
+
+        Constructs the pipeline function, sets up SMEM and HBM memory-space
+        specifications, and invokes ``pl.pallas_call`` with the configured
+        buffering and pipeline emission.
+
+        Args:
+            *args: Arguments to the kernel call. The first
+                ``num_scalar_prefetch`` arguments are scalar prefetch values
+                stored in SMEM; the remaining arguments are input tensors.
+
+        Returns:
+            Output tensor(s) produced by the Pallas kernel execution.
+        """
         smem_args = args[:num_scalar_prefetch]
 
         def pipeline(*args_refs):
+            """Orchestrate the pipelined kernel execution within Pallas.
+
+            Resolves dynamic grid dimensions, binds SMEM references to
+            block specs, applies input buffer counts, and emits the
+            pipeline via ``pltpu.emit_pipeline``.
+
+            Args:
+                *args_refs: Flattened reference arguments in the order:
+                    [grid_dynamic_refs, smem_refs..., input_output_refs...,
+                    scratch_refs...].
+            """
             grid = tuple(d[0] if d is not None else s for d, s in zip(args_refs[0], grid_static, strict=False))
 
             smem_refs = args_refs[1 : num_scalar_prefetch + 1]
@@ -169,6 +233,15 @@ def buffered_pallas_call(
             scratch_refs = args_refs[num_scalar_prefetch + args_len + 1 :]
 
             def _pipeline(*args):
+                """Invoke the user kernel with SMEM refs, data refs, and scratch refs.
+
+                Args:
+                    *args: Input and output reference arguments provided by
+                        ``emit_pipeline``.
+
+                Returns:
+                    Result of the user-provided kernel function.
+                """
                 return kernel(*smem_refs, *args, *scratch_refs)
 
             dim_sem = compiler_params.dimension_semantics

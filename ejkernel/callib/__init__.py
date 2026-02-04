@@ -79,9 +79,32 @@ try:
 except (ImportError, ModuleNotFoundError) as _triton_import_error:  # pragma: no cover
 
     def get_triton_type(obj: Any) -> str:  # type: ignore[override]
+        """Get Triton type string for an object (unavailable fallback).
+
+        This stub is active when Triton is not installed. It always raises
+        an error directing the user to install GPU support.
+
+        Args:
+            obj: Object to get the Triton type for.
+
+        Raises:
+            ValueError: Always, with installation instructions.
+        """
         _raise_triton_unavailable(_triton_import_error)
 
     def triton_call(*args: Any, **kwargs: Any):  # type: ignore[override]
+        """Call a Triton kernel from JAX (unavailable fallback).
+
+        This stub is active when Triton is not installed. It always raises
+        an error directing the user to install GPU support.
+
+        Args:
+            *args: Ignored positional arguments.
+            **kwargs: Ignored keyword arguments.
+
+        Raises:
+            ValueError: Always, with installation instructions.
+        """
         _raise_triton_unavailable(_triton_import_error)
 
 

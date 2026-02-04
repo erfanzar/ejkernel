@@ -54,6 +54,22 @@ from . import _xla as xla
 from ._registry import Backend, Platform, kernel_registry
 
 try:
+    build_cuda_libs = cuda.build_cuda_libs
+except Exception:  # pragma: no cover
+
+    def build_cuda_libs():
+        """No-op fallback for building CUDA libraries when the CUDA backend is unavailable.
+
+        This stub is used when the native CUDA module fails to load,
+        allowing imports to succeed without a CUDA toolkit installation.
+
+        Returns:
+            None: Always returns None since no build can be performed.
+        """
+        return None  # type: ignore[assignment]
+
+
+try:
     from . import _triton as triton
 except ModuleNotFoundError as err:  # pragma: no cover
     if err.name != "triton":
@@ -63,6 +79,7 @@ except ModuleNotFoundError as err:  # pragma: no cover
 __all__ = (
     "Backend",
     "Platform",
+    "build_cuda_libs",
     "cuda",
     "kernel_registry",
     "pallas",

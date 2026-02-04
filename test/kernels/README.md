@@ -6,6 +6,8 @@ Comprehensive test suite for ejkernels XLA, Pallas, and Triton implementations.
 
 ```md
 test/kernels/
+├── _cuda/                  # CUDA implementation tests
+│   └── test_flash_attention.py # Flash attention (CUDA)
 ├── _pallas/                # Pallas implementation tests (TPU/GPU)
 │   ├── tpu/                # TPU Pallas tests (Mosaic)
 │   └── gpu/                # GPU Pallas tests (cuDNN / Pallas+Triton)
@@ -114,6 +116,14 @@ python test/run_tests.py --failfast
 - ✅ Forward and backward passes
 - ✅ Causal masking
 - ✅ Custom scales
+
+### CUDA Kernel Tests
+
+#### Flash Attention (`test_flash_attention.py`) CUDA
+
+- ✅ Forward pass correctness vs XLA
+- ✅ Bias/mask/sinks support
+- ✅ Segment ID masking
 
 ### Comparison Tests (`test_xla_vs_triton.py`)
 

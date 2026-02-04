@@ -230,9 +230,19 @@ class Benchmark:
         self.console = Console()
 
     def _make_scalar_loss(self, output: Any) -> Any:
-        """Convert function output to scalar for gradient computation.
+        """Convert function output to a scalar loss value for gradient computation.
 
-        Handles tuple/list outputs by taking first element and applying mean if needed.
+        Handles various output formats from algorithm functions by extracting
+        the first element from tuple/list outputs and reducing non-scalar
+        tensors via mean. This is necessary for ``jax.grad`` which requires
+        a scalar-valued function.
+
+        Args:
+            output: Raw output from an algorithm function. Can be a scalar,
+                array, tuple, or list.
+
+        Returns:
+            A scalar JAX value suitable for gradient computation.
         """
 
         if isinstance(output, tuple | list):
@@ -552,7 +562,7 @@ class Benchmark:
             }
 
         if len(by_algo) > 1:
-            baseline_algo = next(iter(by_algo.keys()))
+            baseline_algo = "xla" if "xla" in by_algo else next(iter(by_algo.keys()))
             baseline_results = {str(sorted(r.config.items())): r.mean_ms for r in by_algo[baseline_algo]}
 
             for algo in by_algo:
@@ -583,6 +593,9 @@ class Benchmark:
                 "results": {
                     r.algorithm: {
                         "mean_ms": r.mean_ms,
+                        "min_ms": r.min_ms,
+                        "median_ms": r.median_ms,
+                        "max_ms": r.max_ms,
                         "throughput_gflops": r.throughput_estimate,
                     }
                     for r in results
@@ -704,6 +717,58 @@ class Benchmark:
 
             self.console.print(speedup_table)
 
+        algo_order = [a for a in self.algorithms.keys() if a in analysis["summary"]]
+        if algo_order:
+            mean_table = Table(
+                title="Per-Configuration Mean Times (ms)",
+                box=box.ROUNDED,
+                title_style="bold cyan",
+                show_header=True,
+                header_style="bold",
+            )
+            mean_table.add_column("Configuration", style="yellow")
+            for algo in algo_order:
+                mean_table.add_column(f"{algo} mean", justify="right")
+
+            for config_data in analysis["by_config"].values():
+                config_items = [f"{k}={v}" for k, v in config_data["config"].items()]
+                config_str = " • ".join(config_items)
+                row = [config_str]
+                for algo in algo_order:
+                    result = config_data["results"].get(algo)
+                    if result is None:
+                        row.append("-")
+                    else:
+                        row.append(f"{result['mean_ms']:.3f}ms")
+                mean_table.add_row(*row)
+
+            self.console.print(mean_table)
+
+            mmm_table = Table(
+                title="Per-Configuration Min/Median/Max (ms)",
+                box=box.ROUNDED,
+                title_style="bold cyan",
+                show_header=True,
+                header_style="bold",
+            )
+            mmm_table.add_column("Configuration", style="yellow")
+            for algo in algo_order:
+                mmm_table.add_column(f"{algo} min/med/max", justify="right")
+
+            for config_data in analysis["by_config"].values():
+                config_items = [f"{k}={v}" for k, v in config_data["config"].items()]
+                config_str = " • ".join(config_items)
+                row = [config_str]
+                for algo in algo_order:
+                    result = config_data["results"].get(algo)
+                    if result is None:
+                        row.append("-")
+                    else:
+                        row.append(f"{result['min_ms']:.3f}/{result['median_ms']:.3f}/{result['max_ms']:.3f}ms")
+                mmm_table.add_row(*row)
+
+            self.console.print(mmm_table)
+
         config_table = Table(
             title="Fastest Algorithm by Configuration",
             box=box.ROUNDED,
@@ -794,11 +859,35 @@ class Benchmark:
 
         by_config = defaultdict(dict)
         config_keys = []
+        config_items_by_key: dict[tuple[tuple[str, Any], ...], list[tuple[str, Any]]] = {}
+
+        def _freeze_config_value(value: Any) -> Any:
+            """Recursively convert mutable config values to hashable types.
+
+            Converts dicts, lists, tuples, and sets into nested tuples
+            so that configuration values can be used as dictionary keys.
+
+            Args:
+                value: Configuration value to freeze. Supports nested
+                    dicts, lists, tuples, sets, and scalar values.
+
+            Returns:
+                A hashable representation of the value.
+            """
+            if isinstance(value, dict):
+                return tuple((k, _freeze_config_value(v)) for k, v in sorted(value.items()))
+            if isinstance(value, (list, tuple)):
+                return tuple(_freeze_config_value(v) for v in value)
+            if isinstance(value, set):
+                return tuple(sorted(_freeze_config_value(v) for v in value))
+            return value
         for result in self.results:
             if result.mean_ms != float("inf"):
-                config_key = tuple(sorted(result.config.items()))
+                config_items = sorted(result.config.items())
+                config_key = tuple((k, _freeze_config_value(v)) for k, v in config_items)
                 if config_key not in config_keys:
                     config_keys.append(config_key)
+                    config_items_by_key[config_key] = config_items
                 by_config[config_key][result.algorithm] = result
 
         colors = plt.cm.Set3(np.linspace(0, 1, len(algorithms_list)))
@@ -806,8 +895,9 @@ class Benchmark:
         saved_files = []
         for config_key in config_keys:
             results_dict = by_config[config_key]
+            config_items = config_items_by_key[config_key]
 
-            filename_parts = [f"{k}_{v}" for k, v in config_key]
+            filename_parts = [f"{k}_{v}" for k, v in config_items]
             filename = "_".join(filename_parts) + ".png"
             filepath = output_path / filename
 
@@ -893,7 +983,7 @@ class Benchmark:
                     bars_bwd[fastest_bwd_idx].set_edgecolor("gold")
                     bars_bwd[fastest_bwd_idx].set_linewidth(3)
 
-            config_title = " • ".join([f"{k}={v}" for k, v in config_key])
+            config_title = " • ".join([f"{k}={v}" for k, v in config_items])
             fig.suptitle(config_title, fontsize=14, fontweight="bold")
 
             gold_patch = mpatches.Patch(edgecolor="gold", facecolor="lightgray", linewidth=3, label="Fastest")

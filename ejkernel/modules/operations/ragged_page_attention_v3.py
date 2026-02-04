@@ -512,7 +512,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         Raises:
             ValueError: If no matching implementation is found for the configuration
         """
-        platform = detect_platform("ragged_page_attention_v3", cfg.platform)
+        platform = detect_platform("ragged_page_attention_v3", cfg.platform, prefer_cuda=True)
         return kernel_registry.get("ragged_page_attention_v3", platform=platform, backend=cfg.backend)
 
     def run(

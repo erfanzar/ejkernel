@@ -69,6 +69,40 @@ def _rwkv7_fwd_kernel(
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """RWKV-7 forward pass Triton kernel with DPLR state transitions.
+
+    Processes the RWKV-7 recurrence with Diagonal Plus Low-Rank state updates.
+    Each program instance handles one (value_block, batch*head) tuple and
+    iterates through all timesteps sequentially.
+
+    The DPLR recurrence computes:
+        hb = sum(b_t[:, None] * h, axis=0)  (project state via b)
+        h = exp(w_t)[:, None] * h + a_t[:, None] * hb[None, :]  (DPLR update)
+        h += k_t[:, None] * v_t[None, :]  (rank-1 KV update)
+        o_t = sum(h * r_t[:, None], axis=0)  (read from state via receptance)
+
+    Unlike RWKV-6, the full key dimension is processed in a single block (BK),
+    while the value dimension is autotuned, since the low-rank (a, b) updates
+    require the full key dimension to be available simultaneously.
+
+    Args:
+        r: Receptance tensor pointer, shape (B, T, H, K).
+        w: Log-decay tensor pointer, shape (B, T, H, K).
+        k: Key tensor pointer, shape (B, T, H, K).
+        v: Value tensor pointer, shape (B, T, H, V).
+        a: Low-rank update vector pointer, shape (B, T, H, K).
+        b: Low-rank projection vector pointer, shape (B, T, H, K).
+        h0: Initial hidden state pointer, shape (N, H, K, V).
+        cu_seqlens: Cumulative sequence lengths pointer.
+        scale: Receptance scaling factor.
+        o: Output tensor pointer, shape (B, T, H, V).
+        ht: Final state output pointer, shape (N, H, K, V).
+        T, B, H, K, V: Tensor dimensions.
+        BK, BV: Block sizes for key and value dimensions.
+        REVERSE: Whether to process sequence in reverse.
+        USE_INITIAL_STATE: Whether to load initial hidden state.
+        IS_VARLEN: Whether using variable-length sequences.
+    """
     i_v, i_nh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
 

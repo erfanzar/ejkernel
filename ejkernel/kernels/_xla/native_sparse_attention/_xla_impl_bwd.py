@@ -65,6 +65,37 @@ def _sparse_attention_bwd(
     Float[Array, "batch seq_len num_kv_heads head_dim"],
     Float[Array, "batch seq_len num_kv_heads head_dim"],
 ]:
+    """Compute backward pass for block-sparse attention.
+
+    Computes gradients dQ, dK, dV for the sparse attention forward pass.
+    For each query token, recomputes the forward attention over selected
+    blocks, then computes and scatters gradients back to the original
+    K/V positions.
+
+    The gradient flow follows standard attention backward:
+        - dQ: Accumulated from softmax-weighted dScores times K
+        - dK: Scattered from Q times dScores to selected block positions
+        - dV: Scattered from attention weights times dO to selected positions
+
+    Args:
+        q: Query tensor [batch, seq_len, num_q_heads, head_dim].
+        k: Key tensor [batch, seq_len, num_kv_heads, head_dim].
+        v: Value tensor [batch, seq_len, num_kv_heads, head_dim].
+        block_indices: Per-token block selection indices
+            [batch, seq_len, num_kv_heads, num_selected_blocks].
+        block_counts: Number of valid blocks per token
+            [batch, seq_len, num_kv_heads].
+        block_size: Size of each K/V block (static argument).
+        softmax_scale: Scaling factor applied to QK^T dot products.
+        do: Gradient of the loss w.r.t. the attention output
+            [batch, seq_len, num_q_heads, head_dim].
+
+    Returns:
+        Tuple of (dq, dk, dv) where:
+            - dq: Gradient w.r.t. queries [batch, seq_len, num_q_heads, head_dim]
+            - dk: Gradient w.r.t. keys [batch, seq_len, num_kv_heads, head_dim]
+            - dv: Gradient w.r.t. values [batch, seq_len, num_kv_heads, head_dim]
+    """
     B, T, HQ, D = q.shape
     HKV = k.shape[2]
     G = HQ // HKV
@@ -82,6 +113,18 @@ def _sparse_attention_bwd(
     bs = jnp.arange(block_size)
 
     def bkvh_backward(b, kvh):
+        """Compute backward pass for one (batch, kv_head) pair.
+
+        Processes all query head groups within this KV head, computing
+        gradients for Q, K, V by iterating over all token positions.
+
+        Args:
+            b: Batch index.
+            kvh: KV head index.
+
+        Returns:
+            Tuple of (dq_b, dk_b, dv_b) gradients for this batch/head pair.
+        """
         hq_start = kvh * G
 
         q_b = q[b]
@@ -93,6 +136,20 @@ def _sparse_attention_bwd(
         cnt_bt = block_counts[b, :, kvh]
 
         def token_bwd(t):
+            """Compute backward gradients for a single token position.
+
+            Recomputes forward attention weights, then derives dQ for
+            each query head group and scatters dK, dV to the selected
+            block positions.
+
+            Args:
+                t: Token position index within the sequence.
+
+            Returns:
+                Tuple of (dQ_g, dk_upd, dv_upd) where dQ_g has shape
+                [G, head_dim] and dk_upd/dv_upd have shape
+                [num_blocks, block_size, head_dim] for scatter accumulation.
+            """
             inds = inds_bt[t]
             cnt = cnt_bt[t]
 
@@ -110,6 +167,18 @@ def _sparse_attention_bwd(
             v_flat = v_sel.reshape(-1, D)
 
             def head_bwd(g):
+                """Compute backward gradients for a single query head within the group.
+
+                Recomputes softmax weights from Q and K, then applies the
+                standard attention backward formula to get dQ, dK, dV
+                contributions for this head.
+
+                Args:
+                    g: Query head index within the KV head group (0 to G-1).
+
+                Returns:
+                    Tuple of (dQ, dK_flat, dV_flat) gradients for this head.
+                """
                 q_vec = q_grp[t, g]
                 do_vec = do_grp[t, g]
 

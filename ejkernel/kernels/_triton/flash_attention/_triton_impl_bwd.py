@@ -13,6 +13,25 @@
 # limitations under the License.
 
 
+"""Flash Attention backward pass Triton kernel implementation.
+
+This module contains the Triton GPU kernels for the backward pass of Flash Attention.
+It computes gradients for queries (dQ), keys (dK), and values (dV) by recomputing
+attention weights from the saved log-sum-exp values, avoiding the need to store the
+full attention matrix.
+
+The backward pass is organized into two main phases:
+    1. **Preprocessing** (``_attn_bwd_preprocess``): Computes per-token delta values
+       (element-wise dot product of output and output gradient).
+    2. **Gradient computation** (``_attn_bwd``): Distributes work across thread blocks
+       to compute dK/dV (iterating over query blocks for each KV block) and dQ
+       (iterating over KV blocks for each query block).
+
+The gradient kernels mirror the forward pass's support for causal masking, sliding
+windows, attention bias, dropout, variable-length sequences, GQA/MQA, logit soft
+capping, attention sinks, and segment-based masking.
+"""
+
 import math
 from typing import Any
 
@@ -806,6 +825,15 @@ def _attn_bwd_block_dq(
     USE_SINKS: tl.constexpr,
     USE_SEGMENTS: tl.constexpr,
 ):
+    """Process a block of query positions for dQ gradient computation.
+
+    Iterates through key-value blocks to accumulate gradients for a specific
+    block of query positions. Handles causal masking, sliding window constraints,
+    and variable-length sequence boundaries.
+
+    This is the main workhorse for query gradient computation, called for
+    each query block position in the sequence.
+    """
     if IS_CAUSAL:
         index_end_n = min(
             actual_seqlen_k - actual_seqlen_q + index_start_m + BLOCK_M,

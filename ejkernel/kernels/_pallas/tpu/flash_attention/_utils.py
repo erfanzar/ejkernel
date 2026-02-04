@@ -348,6 +348,25 @@ def _mha_reference(
     softmax_scale: float,
     save_residuals: bool,
 ):
+    """Internal reference MHA with custom VJP for efficient gradient computation.
+
+    Wraps ``mha_reference_no_custom_vjp`` with a custom VJP rule that avoids
+    recomputing the full attention matrix during the backward pass.
+
+    Args:
+        q: Query tensor [batch, num_heads, q_seq_len, head_dim].
+        k: Key tensor [batch, num_heads, kv_seq_len, head_dim].
+        v: Value tensor [batch, num_heads, kv_seq_len, head_dim].
+        ab: Optional attention bias tensor.
+        segment_ids: Optional SegmentIds for segment masking.
+        causal: Whether to apply causal masking.
+        mask_value: Value for masked positions.
+        softmax_scale: Scaling factor for attention scores.
+        save_residuals: If True, return residuals for gradient computation.
+
+    Returns:
+        Attention output, or (output, l, m) tuple if save_residuals is True.
+    """
     return mha_reference_no_custom_vjp(
         q,
         k,
@@ -372,6 +391,29 @@ def _mha_reference_fwd(
     softmax_scale: float,
     save_residuals: bool,
 ):
+    """Forward pass for custom VJP reference MHA.
+
+    Computes attention and saves residuals (output, softmax normalizer,
+    softmax max) needed for the backward pass.
+
+    Args:
+        q: Query tensor [batch, num_heads, q_seq_len, head_dim].
+        k: Key tensor [batch, num_heads, kv_seq_len, head_dim].
+        v: Value tensor [batch, num_heads, kv_seq_len, head_dim].
+        ab: Optional attention bias tensor.
+        segment_ids: Optional SegmentIds for segment masking.
+        causal: Whether to apply causal masking.
+        mask_value: Value for masked positions.
+        softmax_scale: Scaling factor for attention scores.
+        save_residuals: Must be False (higher-order AD not supported).
+
+    Returns:
+        Tuple of (output, residuals) where residuals contains all tensors
+        needed for the backward pass.
+
+    Raises:
+        NotImplementedError: If save_residuals is True.
+    """
     if save_residuals:
         raise NotImplementedError
     res = _mha_reference(
@@ -412,6 +454,31 @@ def mha_reference_bwd(
     mask_value: float = DEFAULT_MASK_VALUE,
     softmax_scale: float = 1.0,
 ):
+    """Compute gradients for reference MHA implementation.
+
+    Recomputes attention probabilities from saved residuals and computes
+    gradients for query, key, value, and optional bias tensors.
+
+    Args:
+        q: Query tensor [batch, num_heads, q_seq_len, head_dim].
+        k: Key tensor [batch, num_heads, kv_seq_len, head_dim].
+        v: Value tensor [batch, num_heads, kv_seq_len, head_dim].
+        ab: Optional attention bias tensor.
+        segment_ids: Optional SegmentIds for segment masking.
+        o: Forward pass output tensor.
+        l: Softmax normalizer (sum of exponentials) from forward pass.
+        m: Softmax max values from forward pass.
+        do: Gradient of the output tensor.
+        causal: Whether causal masking was applied.
+        mask_value: Value used for masked positions.
+        softmax_scale: Scaling factor used for attention scores.
+
+    Returns:
+        Tuple of (dq, dk, dv, dab) gradients.
+
+    Raises:
+        NotImplementedError: If softmax_scale != 1.0.
+    """
     if softmax_scale != 1.0:
         raise NotImplementedError
 
@@ -463,6 +530,23 @@ def _mha_reference_bwd(
     residuals,
     do,
 ):
+    """Custom VJP backward pass for reference MHA.
+
+    Unpacks saved residuals and delegates to ``mha_reference_bwd`` for
+    the actual gradient computation.
+
+    Args:
+        causal: Whether causal masking was applied (non-differentiable).
+        mask_value: Value for masked positions (non-differentiable).
+        softmax_scale: Scaling factor (non-differentiable).
+        save_residuals: Whether residuals were saved (non-differentiable).
+        residuals: Saved tensors from the forward pass.
+        do: Gradient of the output tensor.
+
+    Returns:
+        Tuple of gradients (dq, dk, dv, dab, None) corresponding to
+        (q, k, v, ab, segment_ids) inputs.
+    """
     del save_residuals
     q, k, v, ab, segment_ids, o, l, m = residuals
     dq, dk, dv, dab = mha_reference_bwd(

@@ -48,6 +48,7 @@ State Space Models:
 Additional Operations:
     - GroupedMatmul: Efficient grouped matrix multiplication (for MoE)
     - MeanPooling: Sequence mean pooling operation
+    - QuantizedMatmul: Packed uint32 quantized matmul
 
 Features:
     - Automatic kernel selection based on hardware and input shapes
@@ -102,6 +103,7 @@ from .configs import (
     NativeSparseAttentionConfig,
     PageAttentionConfig,
     PrefillPageAttentionConfig,
+    QuantizedMatmulConfig,
     RaggedDecodeAttentionConfig,
     RaggedPageAttentionv2Config,
     RaggedPageAttentionv3Config,
@@ -127,6 +129,7 @@ from .native_sparse_attention import NativeSparseAttention, native_sparse_attent
 from .page_attention import PageAttention, page_attention
 from .pooling import MeanPooling, mean_pooling
 from .prefill_page_attention import PrefillPageAttention, prefill_page_attention
+from .quantized_matmul import QuantizedMatmul, quantized_matmul
 from .ragged_decode_attention import RaggedDecodeAttention, ragged_decode_attention
 from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attention_v2
 from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attention_v3
@@ -173,6 +176,8 @@ __all__ = (
     "PrefillPageAttention",
     "PrefillPageAttention",
     "PrefillPageAttentionConfig",
+    "QuantizedMatmul",
+    "QuantizedMatmulConfig",
     "RWKV4Config",
     "RWKV6Config",
     "RWKV7Config",
@@ -212,6 +217,7 @@ __all__ = (
     "page_attention",
     "prefill_page_attention",
     "prefill_page_attention",
+    "quantized_matmul",
     "ragged_decode_attention",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",

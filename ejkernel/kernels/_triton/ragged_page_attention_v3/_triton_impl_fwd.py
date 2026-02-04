@@ -70,10 +70,26 @@ DEFAULT_MASK_VALUE = -2.381976426469702e38
 
 
 def _align_to(x: int, multiple: int) -> int:
+    """Round up x to the nearest multiple of the given alignment value."""
     return ((int(x) + int(multiple) - 1) // int(multiple)) * int(multiple)
 
 
 def _dtype_packing(dtype: jnp.dtype) -> int:
+    """Determine the packing factor for a given dtype.
+
+    Returns how many values of the given dtype fit into a 32-bit word.
+    This is used for the packed KV cache format where multiple values
+    are stored per 32-bit element.
+
+    Args:
+        dtype: JAX dtype to compute packing for.
+
+    Returns:
+        Packing factor (1 for float32, 2 for float16/bfloat16).
+
+    Raises:
+        ValueError: If dtype is not 16-bit or 32-bit.
+    """
     bw = jnp.dtype(dtype).itemsize * 8
     if bw not in (16, 32):
         raise ValueError(f"Only 16/32-bit floats supported for packing, got {dtype} ({bw} bits).")
@@ -81,6 +97,22 @@ def _dtype_packing(dtype: jnp.dtype) -> int:
 
 
 def _merge_kv(keys: jax.Array, values: jax.Array, *, head_dim_padded: int) -> jax.Array:
+    """Interleave and pack keys and values into the 4D cache format.
+
+    Concatenates keys and values along the head dimension, pads to alignment,
+    and reshapes into the packed format expected by the KV cache.
+
+    Args:
+        keys: Key tensor of shape (total_tokens, num_kv_heads, head_dim).
+        values: Value tensor of shape (total_tokens, num_kv_heads, head_dim).
+        head_dim_padded: Padded head dimension (aligned to 128).
+
+    Returns:
+        Merged KV tensor of shape (total_tokens, heads_per_pack, pack_factor, head_dim_padded).
+
+    Raises:
+        ValueError: If keys and values have mismatched shapes or dtypes.
+    """
     if keys.shape != values.shape or keys.dtype != values.dtype:
         raise ValueError("keys/values mismatch")
     total_tokens, num_kv_heads, head_dim = map(int, keys.shape)
@@ -142,6 +174,44 @@ def _rpa_v3_attn_fwd(
     HAS_K_SCALE: tl.constexpr,
     HAS_V_SCALE: tl.constexpr,
 ):
+    """Ragged paged attention v3 forward Triton kernel.
+
+    Computes attention over a 5D packed KV cache with inline support for
+    FP8 scaling, sliding window, attention sinks, and logit soft capping.
+    Each program instance processes one (query_block, head, sequence) tuple.
+
+    The kernel reads from an already-updated KV cache (scatter performed
+    in Python before launch) and produces the attention output. It uses
+    streaming softmax for numerically stable computation.
+
+    Args:
+        q_ptr: Query tensor pointer, shape (total_tokens, num_q_heads, head_dim).
+        kv_ptr: Packed KV pages pointer (4D reshaped from 5D cache).
+        block_tables_ptr: Flattened block table pointer.
+        kv_lens_ptr: Per-sequence KV lengths.
+        cu_q_lens_ptr: Cumulative query start positions.
+        distribution_ptr: Workload distribution [num_decode, num_prefill, num_seqs].
+        sink_ptr: Attention sink values pointer.
+        softmax_scale: Attention scaling factor.
+        logits_soft_cap: Soft capping value (0 if disabled).
+        sliding_window: Sliding window size (0 if disabled).
+        q_scale, k_scale, v_scale: Optional FP8 quantization scales.
+        head_dim: Head dimension size.
+        *_stride_*: Tensor stride parameters.
+        o_ptr: Output attention tensor pointer.
+        NUM_REPEATS: GQA repeat factor.
+        MAX_NUM_SEQS: Maximum sequences (grid dimension).
+        PAGES_PER_SEQ: Maximum pages per sequence.
+        PAGE_SIZE: Tokens per page.
+        BLOCK_M: Query block size.
+        BLOCK_NPAGES: KV pages per inner iteration.
+        BLOCK_DMODEL: Padded head dimension (power of 2).
+        MASK_VALUE: Value for masked positions.
+        HAS_SINK: Whether attention sinks are active.
+        HAS_SLIDING: Whether sliding window is active.
+        HAS_SOFTCAP: Whether logit soft capping is active.
+        HAS_Q_SCALE, HAS_K_SCALE, HAS_V_SCALE: Whether FP8 scales are active.
+    """
     pid_qb = tl.program_id(0)
     pid_h = tl.program_id(1)
     pid_s = tl.program_id(2)
@@ -251,11 +321,13 @@ def _rpa_v3_attn_fwd(
 
 
 def _contig_strides_3(shape: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Compute contiguous strides for a 3D tensor shape (M, H, D)."""
     _m, h, d = map(int, shape)
     return (h * d, d, 1)
 
 
 def _contig_strides_4(shape: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Compute contiguous strides for a 4D tensor shape (P, S, C, D)."""
     _p, s, c, d = map(int, shape)
     return (s * c * d, c * d, d, 1)
 
@@ -270,6 +342,29 @@ def _kv_update_scatter(
     query_start_loc: jax.Array,
     distribution: jax.Array,
 ) -> jax.Array:
+    """Scatter new key-value pairs into the paged KV cache.
+
+    Inserts new keys and values into their correct positions in the paged
+    cache using the block table mapping. For each new token, determines
+    its target page and offset based on the sequence's KV length and
+    query position, then performs an in-place scatter update.
+
+    The function uses JAX's lax.scatter with CLIP mode for safe indexing,
+    and jnp.searchsorted for efficient sequence-to-token mapping without
+    Python loops.
+
+    Args:
+        keys: New key tensor of shape (total_tokens, num_kv_heads, head_dim).
+        values: New value tensor of shape (total_tokens, num_kv_heads, head_dim).
+        kv_cache: Existing paged KV cache (5D packed format).
+        kv_lens: Per-sequence KV lengths, shape (max_num_seqs,).
+        block_tables: Flattened block table, shape (max_num_seqs * pages_per_seq,).
+        query_start_loc: Cumulative query offsets, shape (max_num_seqs + 1,).
+        distribution: Workload distribution [num_decode, num_prefill, num_seqs].
+
+    Returns:
+        Updated KV cache with new keys and values inserted.
+    """
     total_tokens, _num_kv_heads, _head_dim = map(int, keys.shape)
     num_pages, page_size, _hx2_per_pack, _pack, head_dim_padded = map(int, kv_cache.shape)
     del num_pages
@@ -353,6 +448,42 @@ def ragged_paged_attention_triton(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
+    """Execute ragged paged attention v3 with inline KV cache update.
+
+    Performs two operations in sequence:
+    1. Scatters new keys and values into the paged KV cache
+    2. Computes attention over the updated cache using a Triton kernel
+
+    The function validates all inputs, resolves configuration parameters,
+    and launches the Triton kernel with appropriate grid dimensions.
+
+    Args:
+        queries: Query tensor of shape (total_tokens, num_q_heads, head_dim).
+        keys: New key tensor of shape (total_tokens, num_kv_heads, head_dim).
+        values: New value tensor of shape (total_tokens, num_kv_heads, head_dim).
+        kv_cache: Paged KV cache in 5D packed format.
+        kv_lens: Per-sequence KV lengths, shape (max_num_seqs,).
+        block_tables: Flattened block table, shape (max_num_seqs * pages_per_seq,).
+        query_start_loc: Cumulative query offsets, shape (max_num_seqs + 1,).
+        distribution: Workload distribution [num_decode, num_prefill, num_seqs].
+        softmax_aux: Optional attention sink values, shape (num_q_heads,).
+        softmax_scale: Attention scaling factor.
+        sliding_window: Optional sliding window size.
+        logits_soft_cap: Optional logit soft capping value.
+        q_scale: Optional FP8 scale for queries.
+        k_scale: Optional FP8 scale for keys.
+        v_scale: Optional FP8 scale for values.
+        chunk_prefill_size: Ignored (TPU-specific).
+        num_kv_pages_per_block: KV pages per compute block. Defaults to 16.
+        num_queries_per_block: Queries per compute block. Defaults to 128.
+        vmem_limit_bytes: Ignored (TPU-specific).
+
+    Returns:
+        Tuple of (attention_output, updated_kv_cache).
+
+    Raises:
+        ValueError: If input shapes, dtypes, or dimensions are invalid.
+    """
     del chunk_prefill_size, vmem_limit_bytes
 
     if softmax_scale is None:
@@ -427,6 +558,13 @@ def ragged_paged_attention_triton(
     block_npages = min(block_npages, 32)
 
     block_dmodel = max(triton.next_power_of_2(head_dim), 16)
+    kv_block_tokens = block_npages * page_size
+    if block_m < 16 or kv_block_tokens < 16 or head_dim < 16:
+        raise ValueError(
+            "ragged_page_attention_v3 (triton) requires block_m>=16, "
+            f"kv_block_tokens>=16, head_dim>=16; got block_m={block_m}, "
+            f"kv_block_tokens={kv_block_tokens}, head_dim={head_dim}."
+        )
 
     q_sm, q_sh, q_sd = _contig_strides_3(queries.shape)
     kv_sp, kv_ss, kv_sc, kv_sd = _contig_strides_4(kv_pages.shape)

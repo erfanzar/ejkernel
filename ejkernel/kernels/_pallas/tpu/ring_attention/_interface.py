@@ -128,6 +128,7 @@ class _AttentionSinkMask(mask_lib._ComputableMask):
         super().__init__(shape=shape, mask_function=sink_mask_function, shard_count=shard_count)
 
     def __eq__(self, other: object):
+        """Check equality based on shape, sink size, and query sequence."""
         if not isinstance(other, type(self)):
             return NotImplemented
         return (
@@ -137,6 +138,7 @@ class _AttentionSinkMask(mask_lib._ComputableMask):
         )
 
     def __hash__(self):
+        """Compute hash from shape, sink size, and query sequence bytes."""
         return hash(
             (
                 type(self),
@@ -155,17 +157,26 @@ def _build_mask(
     attention_sink_size: int = 0,
     chunk_size: int | None = None,
 ) -> mask_lib.Mask:
-    """Build a mask from attention parameters.
+    """Build a composite attention mask from attention parameters.
+
+    Constructs a mask by combining causal/full base masks with optional
+    sliding window and attention sink constraints. Supports chunked
+    causal attention (Llama4-style) and sliding window with sink positions.
 
     Args:
         q_seq_len: Query sequence length.
         kv_seq_len: Key/value sequence length.
-        causal: Whether to use causal masking.
-        sliding_window: Sliding window size (int or (left, right) tuple).
-        chunk_size: Chunk size for chunked causal attention.
+        causal: Whether to use causal (autoregressive) masking.
+        sliding_window: Sliding window size as int (symmetric) or
+            (left, right) tuple. Limits attention to nearby positions.
+        attention_sink_size: Number of initial KV positions that are
+            always visible regardless of other masking. Used for
+            streaming/infinite context patterns.
+        chunk_size: Chunk size for chunked causal attention where
+            causality is applied within chunks.
 
     Returns:
-        Constructed Mask object.
+        Constructed Mask object combining all specified masking patterns.
     """
     shape = (q_seq_len, kv_seq_len)
 

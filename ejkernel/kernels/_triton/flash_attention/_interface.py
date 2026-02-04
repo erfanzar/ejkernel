@@ -69,6 +69,8 @@ Reference:
     https://arxiv.org/abs/2205.14135
 """
 
+from __future__ import annotations
+
 import functools
 
 import jax
@@ -78,7 +80,12 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
+PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
+DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
+BlockTables = Int[Array, "batch max_blocks"]
+
 from ejkernel.callib import ejit
+from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
@@ -90,9 +97,11 @@ def _jax_fwd_attention_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | None = None,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None
+    ) = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -256,9 +265,11 @@ def flash_attention_call(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | None = None,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None
+    ) = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -332,11 +343,13 @@ flash_attention_call.defvjp(_jax_fwd_attention_call, _jax_bwd_attention_call)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
-    key: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    value: Float[Array, "batch seq_len_k num_kv_heads head_dim"],
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | None = None,
+    key: DenseKV | PagedKV,
+    value: DenseKV | PagedKV,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None
+    ) = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
@@ -355,6 +368,7 @@ def flash_attention(
     *,
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    block_tables: BlockTables | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Compute flash attention for efficient scaled dot-product attention.
 
@@ -378,6 +392,8 @@ def flash_attention(
         logits_soft_cap: Optional soft cap value for logits (e.g., 20.0 for Gemma)
         softmax_aux: Optional attention sink logits of shape [num_sinks]
         q_segment_ids/kv_segment_ids: Optional packed-sequence segment IDs (mask cross-segment attention)
+        block_tables: Optional paged-KV block table of shape
+            ``(batch, max_blocks)``. Unsupported by the Triton backend.
 
     Returns:
         chex.Array: Attention output with shape [batch, seq_len, num_heads, head_dim]
@@ -392,6 +408,20 @@ def flash_attention(
         >>>
         >>> out = flash_attention(query, key, value, cum_seqlens_q=cum_lens, cum_seqlens_k=cum_lens)
     """
+    reasons: list[str] = []
+    if block_tables is not None:
+        reasons.append("block_tables (paged_kv) is not supported")
+    if not normalize_output:
+        reasons.append("normalize_output must be True")
+    if isinstance(precision, int):
+        if int(precision) != 0:
+            reasons.append("precision must be DEFAULT")
+    elif precision != lax.Precision.DEFAULT:
+        reasons.append("precision must be DEFAULT")
+    if jnp.dtype(logits_dtype) != jnp.float32:
+        reasons.append("logits_dtype must be float32")
+    if reasons:
+        raise EjkernelRuntimeError("flash_attention (platform=triton): " + "; ".join(reasons))
     del precision, logits_dtype, normalize_output
 
     return flash_attention_call(

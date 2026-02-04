@@ -13,6 +13,41 @@
 # limitations under the License.
 
 
+"""Ragged Paged Attention V3 XLA kernel implementation.
+
+This module provides the XLA/JAX reference kernel for ragged paged attention
+V3, which extends V2 with in-place KV cache updates and merged K/V storage.
+
+Key Features:
+    - In-place KV cache writes: New query tokens are written into the
+      paged cache before attention, enabling self-attention within prefill.
+    - Merged K/V storage: Keys and values are interleaved in memory for
+      improved cache locality ([num_pages, page_size, num_kv_heads*2, head_dim]).
+    - Distribution-based dispatch: Uses a 3-element distribution array
+      to determine the number of sequences to process.
+    - Optional attention sinks via softmax_aux for probability absorption.
+    - Sliding window support for long-context efficiency.
+
+Algorithm:
+    For each sequence in the ragged batch:
+    1. Write new query-phase K/V tokens into the paged cache
+    2. Iterate over query blocks with online softmax:
+       a. For each KV block, gather pages, unpack interleaved K/V
+       b. Compute QK^T scores with masking and optional soft cap
+       c. Update running max, sum-of-exp, and weighted value accumulator
+    3. Normalize and write output
+
+Memory Layout:
+    - kv_cache: [num_pages, page_size, (num_kv_heads*2)//pack, pack, head_dim_padded]
+      where K and V are interleaved and packed for alignment.
+    - block_tables: [num_seqs * max_pages_per_seq] flattened page mapping.
+    - distribution: [3] int32 array with [num_prefill, num_decode, num_seqs].
+
+Note:
+    This is a correctness-focused XLA fallback. For production TPU workloads
+    with async DMA and high-bandwidth memory transfers, use the Pallas version.
+"""
+
 from __future__ import annotations
 
 import jax
@@ -25,23 +60,74 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 
 def cdiv(a, b):
+    """Compute ceiling division of a by b.
+
+    Args:
+        a: Numerator.
+        b: Denominator (must be non-zero).
+
+    Returns:
+        Ceiling of a / b.
+    """
     assert b != 0
     return (a + b - 1) // b
 
 
 def get_dtype_bitwidth(dtype):
+    """Return the number of bits per element for a given dtype.
+
+    Args:
+        dtype: A JAX/NumPy dtype.
+
+    Returns:
+        Bit-width of one element (e.g., 16 for float16).
+    """
     return jnp.dtype(dtype).itemsize * 8
 
 
 def get_dtype_packing(dtype):
+    """Return how many elements of the given dtype fit in a 32-bit word.
+
+    Args:
+        dtype: A JAX/NumPy dtype.
+
+    Returns:
+        Number of elements packed per 32-bit word.
+    """
     return 32 // get_dtype_bitwidth(dtype)
 
 
 def align_to(x, a):
+    """Round x up to the nearest multiple of a.
+
+    Args:
+        x: Value to align.
+        a: Alignment boundary.
+
+    Returns:
+        Smallest multiple of a that is >= x.
+    """
     return cdiv(x, a) * a
 
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
+    """Interleave and pack key and value tensors into the merged KV format.
+
+    Concatenates K and V along the head dimension, pads to alignment
+    boundaries, and reshapes into the packed layout expected by the
+    paged KV cache.
+
+    Args:
+        k: Key tensor [max_num_tokens, num_kv_heads, head_dim].
+        v: Value tensor [max_num_tokens, num_kv_heads, head_dim].
+            Must have the same shape and dtype as k.
+
+    Returns:
+        Merged KV tensor of shape
+        [max_num_tokens, num_kv_heads_x2 // packing, packing, head_dim_padded]
+        where packing is determined by the dtype bit-width and head_dim_padded
+        is aligned to 128.
+    """
     with jax.named_scope("rpa_v3_xla.merge_kv"):
         assert k.shape == v.shape
         assert k.dtype == v.dtype
@@ -89,6 +175,36 @@ def static_validate_inputs(
     num_queries_per_block=None,
     vmem_limit_bytes=None,
 ):
+    """Validate input shapes, dtypes, and parameter compatibility.
+
+    Performs comprehensive static checks to catch shape mismatches,
+    dtype errors, and invalid parameter combinations before launching
+    the attention kernel.
+
+    Args:
+        q: Query tensor [total_tokens, num_q_heads, head_dim].
+        k: Key tensor [total_tokens, num_kv_heads, head_dim].
+        v: Value tensor [total_tokens, num_kv_heads, head_dim].
+        kv_cache: Paged KV cache in packed format.
+        kv_lens: Context lengths [num_seqs].
+        block_tables: Page table mapping (flattened or 2D).
+        query_start_loc: Cumulative query counts [num_seqs + 1].
+        distribution: Workload distribution [3] int32.
+        softmax_scale: Scaling factor for QK^T.
+        sliding_window: Optional sliding window size.
+        logits_soft_cap: Optional soft capping value.
+        mask_value: Value for masked positions.
+        q_scale: Optional query scale for FP8 modes.
+        k_scale: Optional key scale for FP8 modes.
+        v_scale: Optional value scale for FP8 modes.
+        chunk_prefill_size: Unused, reserved for Pallas backend.
+        num_kv_pages_per_block: Optional KV pages per processing block.
+        num_queries_per_block: Optional queries per processing block.
+        vmem_limit_bytes: Unused, reserved for Pallas backend.
+
+    Raises:
+        ValueError: If any input fails validation.
+    """
     del chunk_prefill_size, vmem_limit_bytes
     if not (q.ndim == k.ndim == v.ndim == 3):
         raise ValueError("q,k,v must be 3D")
@@ -169,6 +285,42 @@ def ragged_paged_attention(
     num_queries_per_block: int | None = None,
     vmem_limit_bytes: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
+    """Compute ragged paged attention V3 with in-place KV cache updates.
+
+    This function handles the complete attention workflow: writing new
+    query-phase tokens into the paged KV cache, then computing attention
+    with online softmax over the updated cache. It supports mixed prefill
+    and decode workloads in a single batch.
+
+    Args:
+        queries: Packed query tokens [total_tokens, num_q_heads, head_dim].
+        keys: New key tokens to write into cache [total_tokens, num_kv_heads, head_dim].
+        values: New value tokens to write into cache [total_tokens, num_kv_heads, head_dim].
+        kv_cache: Paged KV cache in packed merged format. Updated in-place
+            (donated) with the new K/V tokens.
+        kv_lens: Context length per sequence [num_seqs].
+        block_tables: Flattened page table [num_seqs * max_pages_per_seq].
+        query_start_loc: Cumulative query counts [num_seqs + 1].
+        distribution: Workload distribution [3] int32 array containing
+            [num_prefill_seqs, num_decode_seqs, num_total_seqs].
+        softmax_aux: Optional per-head attention sink logits [num_q_heads].
+        softmax_scale: Scaling factor for QK^T. Default 1.0.
+        sliding_window: Optional sliding window size for local attention.
+        logits_soft_cap: Optional soft capping for logits via tanh.
+        mask_value: Value for masked positions. Default large negative.
+        q_scale: Optional query scale factor (FP8 quantization modes).
+        k_scale: Optional key scale factor (FP8 quantization modes).
+        v_scale: Optional value scale factor (FP8 quantization modes).
+        chunk_prefill_size: Unused (reserved for Pallas backend).
+        num_kv_pages_per_block: Optional number of KV pages per processing block.
+        num_queries_per_block: Optional number of queries per processing block.
+        vmem_limit_bytes: Unused (reserved for Pallas backend).
+
+    Returns:
+        Tuple of (output, updated_kv_cache) where output has shape
+        [total_tokens, num_q_heads, head_dim] and updated_kv_cache
+        has the same shape as the input kv_cache with new tokens written.
+    """
     del chunk_prefill_size, vmem_limit_bytes
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -268,6 +420,15 @@ def ragged_paged_attention(
             sinks_h = softmax_aux.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head).astype(jnp.float32)
 
     def _seq_body(seq_idx, carry):
+        """Process one sequence: update its KV cache pages and compute attention.
+
+        Args:
+            seq_idx: Index of the current sequence in the ragged batch.
+            carry: Tuple of (output_accumulator, kv_cache) being updated.
+
+        Returns:
+            Updated (output_accumulator, kv_cache) carry.
+        """
         o_acc, kv_cache_acc = carry
 
         with jax.named_scope("rpa_v3_xla.seq_setup"):
@@ -297,6 +458,15 @@ def ragged_paged_attention(
             )
 
         def _update_kv_block(qb, kv_flat_pad):
+            """Write one block of new K/V tokens into the flattened page cache.
+
+            Args:
+                qb: Query block index within this sequence.
+                kv_flat_pad: Padded flattened KV pages being updated.
+
+            Returns:
+                Updated kv_flat_pad with this block's tokens written.
+            """
             with jax.named_scope("rpa_v3_xla.kv_update_block"):
                 q_off = qb * qblocks
                 dst = write_start + q_off
@@ -351,6 +521,18 @@ def ragged_paged_attention(
             kv_block_start = kv_start // jnp.int32(kv_tokens_per_block)
 
         def _process_query_block(qb, o_inner):
+            """Compute attention for one query block against the full KV cache.
+
+            Loads a block of queries, iterates over all KV page blocks with
+            online softmax, normalizes, and writes the result to the output.
+
+            Args:
+                qb: Query block index within this sequence.
+                o_inner: Output buffer being updated.
+
+            Returns:
+                Updated output buffer with this query block's results.
+            """
             with jax.named_scope("rpa_v3_xla.q_block"):
                 q_off = qb * qblocks
                 q_global_start = q_start + q_off
@@ -390,6 +572,21 @@ def ragged_paged_attention(
                     init_l = jnp.zeros_like(init_m)
 
             def _process_kv_block(kb, state):
+                """Process one KV page block and update the online softmax state.
+
+                Gathers KV pages, unpacks interleaved K/V, computes masked
+                attention scores, and updates the running accumulator with
+                the online softmax algorithm.
+
+                Args:
+                    kb: KV block index.
+                    state: Tuple of (acc, l, m) online softmax state where
+                        acc is the weighted value sum, l is the sum of
+                        exponentials, and m is the running maximum.
+
+                Returns:
+                    Updated (acc, l, m) state.
+                """
                 with jax.named_scope("rpa_v3_xla.kv_block"):
                     acc, l, m = state
                     page_map_start = kb * kvblocks

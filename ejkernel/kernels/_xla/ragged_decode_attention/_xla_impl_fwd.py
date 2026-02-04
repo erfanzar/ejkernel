@@ -301,6 +301,18 @@ def ragged_flash_attention_xla(
     mask_blocks = jnp.transpose(mask_blocks, (0, 3, 1, 2, 4))
 
     def scan_fn(carry, inputs):
+        """Process one KV block in the flash attention scan.
+
+        Loads the key, value, and mask blocks for the current index
+        and delegates to the flash attention block computation.
+
+        Args:
+            carry: Online softmax state (output, max_logits, normalizer).
+            inputs: Tuple containing the block index.
+
+        Returns:
+            Updated carry and None (no per-step output).
+        """
         (block_idx,) = inputs
         k_block = key_blocks[:, block_idx]
         v_block = value_blocks[:, block_idx]
@@ -380,6 +392,20 @@ def ragged_decode_mqa_xla(
             )
 
     def process_kv_head(q_group, k_head, v_head, aux_i):
+        """Compute attention for one KV head group against its query heads.
+
+        Reshapes the single KV head into a broadcastable form and runs
+        flash attention with the query group for this KV head.
+
+        Args:
+            q_group: Query group for this KV head [batch, group_size, head_dim].
+            k_head: Key for this KV head [batch, kv_len, head_dim].
+            v_head: Value for this KV head [batch, kv_len, head_dim].
+            aux_i: Attention sink auxiliary logits for this head or None.
+
+        Returns:
+            Attention output for this head group [batch, group_size, head_dim].
+        """
         k_head = k_head[:, :, None, :]
         v_head = v_head[:, :, None, :]
         q_group = q_group[:, None, :, :]

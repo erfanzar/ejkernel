@@ -94,4 +94,3 @@ def decode_attention(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-

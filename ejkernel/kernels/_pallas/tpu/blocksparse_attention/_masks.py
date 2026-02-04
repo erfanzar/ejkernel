@@ -55,13 +55,24 @@ from beartype.typing import Callable
 
 
 class Mask:
-    """A base class for blocksparse_attention attention masks."""
+    """Base class for block-sparse attention masks.
+
+    Provides the interface for all mask types used in Splash Attention.
+    Masks define which query-key pairs can attend to each other. Subclasses
+    implement specific masking patterns (causal, local, etc.).
+
+    Masks support composition via bitwise operators:
+        - ``mask1 & mask2``: Logical AND (both masks must allow attention)
+        - ``mask1 | mask2``: Logical OR (either mask allows attention)
+    """
 
     @property
     def shape(self) -> tuple[int, ...]:
+        """Return the shape of the mask (q_seq_len, kv_seq_len)."""
         raise NotImplementedError
 
     def __getitem__(self, idx) -> np.ndarray:
+        """Return mask values for the given slice indices."""
         raise NotImplementedError
 
     def __bool__(self) -> bool:
@@ -70,11 +81,13 @@ class Mask:
         )
 
     def __or__(self, other: Mask) -> Mask:
+        """Combine masks with logical OR (either mask allows attention)."""
         if self.shape != other.shape:
             raise ValueError(f"Invalid shape for other: {other.shape}, expected: {self.shape}")
         return LogicalOr(self, other)
 
     def __and__(self, other: Mask) -> Mask:
+        """Combine masks with logical AND (both masks must allow attention)."""
         if self.shape != other.shape:
             raise ValueError(f"Invalid shape for other: {other.shape}, expected: {self.shape}")
         return LogicalAnd(self, other)
@@ -178,6 +191,16 @@ def make_random_mask(shape: tuple[int, int], sparsity: float, seed: int) -> np.n
 
 @dataclasses.dataclass
 class LogicalOr(Mask):
+    """Composite mask that combines two masks with logical OR.
+
+    A position is unmasked if either the left or right mask allows it.
+    Created automatically when using the ``|`` operator on two Mask instances.
+
+    Attributes:
+        left: First mask operand.
+        right: Second mask operand.
+    """
+
     left: Mask
     right: Mask
 
@@ -189,9 +212,11 @@ class LogicalOr(Mask):
 
     @property
     def shape(self) -> tuple[int, ...]:
+        """Return the shape of the combined mask."""
         return self.left.shape
 
     def __getitem__(self, idx) -> np.ndarray:
+        """Return element-wise OR of both masks at the given indices."""
         return self.left[idx] | self.right[idx]
 
     def __hash__(self):
@@ -200,6 +225,16 @@ class LogicalOr(Mask):
 
 @dataclasses.dataclass
 class LogicalAnd(Mask):
+    """Composite mask that combines two masks with logical AND.
+
+    A position is unmasked only if both the left and right masks allow it.
+    Created automatically when using the ``&`` operator on two Mask instances.
+
+    Attributes:
+        left: First mask operand.
+        right: Second mask operand.
+    """
+
     left: Mask
     right: Mask
 
@@ -211,9 +246,11 @@ class LogicalAnd(Mask):
 
     @property
     def shape(self) -> tuple[int, ...]:
+        """Return the shape of the combined mask."""
         return self.left.shape
 
     def __getitem__(self, idx) -> np.ndarray:
+        """Return element-wise AND of both masks at the given indices."""
         return self.left[idx] & self.right[idx]
 
     def __hash__(self):

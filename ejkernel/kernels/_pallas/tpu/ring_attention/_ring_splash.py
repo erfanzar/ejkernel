@@ -76,7 +76,18 @@ DEFAULT_MASK_VALUE = splash_kernel.DEFAULT_MASK_VALUE
 
 
 class SegmentIds(NamedTuple):
-    """SegmentIds for Q and KV sequences."""
+    """Segment IDs for query and KV sequences in packed-sequence attention.
+
+    Enables document/sequence boundary masking where tokens with different
+    segment IDs are masked from attending to each other. This is essential
+    for packed training where multiple documents share the same batch slot.
+
+    Attributes:
+        q: Query segment IDs [q_seq_len]. Each value identifies which
+            document/sequence the query token belongs to.
+        kv: KV segment IDs [kv_seq_len]. Each value identifies which
+            document/sequence the key/value token belongs to.
+    """
 
     q: jax.Array  # [q_seq_len]
     kv: jax.Array  # [kv_seq_len]
@@ -258,6 +269,27 @@ def _ring_attention_backward(
     logits_soft_cap: float | None,
     ring_axis: str,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
+    """Backward pass for ring attention with distributed gradient accumulation.
+
+    Computes gradients for Q, K, V by running the ring communication pattern
+    in reverse. Each device accumulates local dQ and rotates dK, dV gradients
+    around the ring. Uses Splash Attention's backward kernel for local
+    gradient computation.
+
+    Args:
+        res: Residuals from forward pass containing (q, k, v, segment_ids,
+            sinks, out, logsumexp, fwd_mask_info, dq_mask_info, dkv_mask_info).
+        do: Gradient of loss w.r.t. attention output.
+        mask_value: Value for masked positions.
+        is_mqa: Whether using multi-query attention.
+        block_sizes: Tile sizes for kernel execution.
+        mask_function: Optional custom mask function.
+        logits_soft_cap: Optional soft cap for logits.
+        ring_axis: Axis name for ring communication.
+
+    Returns:
+        Tuple of (dq, dk, dv, dsinks) gradients.
+    """
     (q, k, v, segment_ids, sinks, out, logsumexp, _fwd_mask_info, dq_mask_info, dkv_mask_info) = res
     do_main = do.astype(jnp.float32)
 
@@ -363,6 +395,31 @@ def _ring_attention_fwd_rule(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
 ) -> tuple[jax.Array, tuple]:
+    """Custom VJP forward rule for ring attention.
+
+    Runs the ring attention forward pass and saves all tensors needed
+    for the backward pass as residuals.
+
+    Args:
+        fwd_mask_info: Mask information for forward Splash Attention.
+        dq_mask_info: Optional mask info for dQ backward pass.
+        dkv_mask_info: Optional mask info for dKV backward pass.
+        q: Query tensor (local shard).
+        k: Key tensor (local shard).
+        v: Value tensor (local shard).
+        segment_ids: Optional segment IDs for packed sequences.
+        sinks: Optional attention sink logits.
+        mask_value: Value for masked positions.
+        is_mqa: Whether using multi-query attention.
+        block_sizes: Tile sizes for kernel execution.
+        mask_function: Optional custom mask function.
+        logits_soft_cap: Optional soft cap for logits.
+        ring_axis: Axis name for ring communication.
+        causal: Whether to apply causal masking.
+
+    Returns:
+        Tuple of (output, residuals_for_backward).
+    """
     out, (logsumexp, _) = _ring_attention_forward(
         fwd_mask_info,
         q,
@@ -403,6 +460,25 @@ def _ring_attention_bwd_rule(
     res: tuple,
     do: jax.Array,
 ):
+    """Custom VJP backward rule for ring attention.
+
+    Dispatches to _ring_attention_backward and formats the gradient
+    outputs to match the custom_vjp signature. Returns None for
+    non-differentiable inputs (mask infos, segment_ids).
+
+    Args:
+        mask_value: Value for masked positions.
+        is_mqa: Whether using multi-query attention.
+        block_sizes: Tile sizes for kernel execution.
+        mask_function: Optional custom mask function.
+        logits_soft_cap: Optional soft cap for logits.
+        ring_axis: Axis name for ring communication.
+        res: Residuals saved from forward pass.
+        do: Gradient of loss w.r.t. output.
+
+    Returns:
+        Tuple of gradients matching the forward signature.
+    """
     dq, dk, dv, dsinks = _ring_attention_backward(
         res,
         do,
@@ -437,6 +513,32 @@ def _ring_attention_custom(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
 ) -> jax.Array:
+    """Ring attention with custom VJP for efficient gradient computation.
+
+    Wraps the ring attention forward pass with a JAX custom_vjp to enable
+    explicit control over backward pass gradient computation, ensuring
+    proper ring communication during backpropagation.
+
+    Args:
+        fwd_mask_info: Mask information for forward pass.
+        dq_mask_info: Optional mask info for dQ backward.
+        dkv_mask_info: Optional mask info for dKV backward.
+        q: Query tensor (local shard).
+        k: Key tensor (local shard).
+        v: Value tensor (local shard).
+        segment_ids: Optional segment IDs.
+        sinks: Optional attention sink logits.
+        mask_value: Value for masked positions.
+        is_mqa: Whether using multi-query attention.
+        block_sizes: Tile sizes for kernel.
+        mask_function: Optional custom mask function.
+        logits_soft_cap: Optional soft cap for logits.
+        ring_axis: Ring communication axis name.
+        causal: Whether to apply causal masking.
+
+    Returns:
+        Attention output tensor.
+    """
     out, _ = _ring_attention_forward(
         fwd_mask_info,
         q,
@@ -472,6 +574,11 @@ def _ring_attention_custom_fwd(
     ring_axis: str = RING_AXIS,
     causal: bool = False,
 ):
+    """VJP forward implementation for _ring_attention_custom.
+
+    Delegates to _ring_attention_fwd_rule to compute the forward pass
+    and save residuals needed for the backward pass.
+    """
     return _ring_attention_fwd_rule(
         fwd_mask_info,
         dq_mask_info,
@@ -502,6 +609,11 @@ def _ring_attention_custom_bwd(
     res: tuple,
     do: jax.Array,
 ):
+    """VJP backward implementation for _ring_attention_custom.
+
+    Delegates to _ring_attention_bwd_rule to compute gradients using
+    the ring communication pattern.
+    """
     return _ring_attention_bwd_rule(
         mask_value=mask_value,
         is_mqa=is_mqa,
@@ -518,6 +630,18 @@ _ring_attention_custom.defvjp(_ring_attention_custom_fwd, _ring_attention_custom
 
 
 def _has_axis(axis_name: str) -> bool:
+    """Check whether a named axis exists in the current JAX context.
+
+    Attempts a collective operation to determine if the axis name is
+    defined (e.g., inside shard_map or pmap). Used to decide between
+    ring communication and single-device fallback.
+
+    Args:
+        axis_name: Name of the axis to check.
+
+    Returns:
+        True if the axis exists, False otherwise.
+    """
     try:
         lax.psum(1, axis_name)
         return True
@@ -628,6 +752,20 @@ def ring_splash_attention(
 
 @jax.tree_util.register_pytree_node_class
 class RingSplashAttentionKernel:
+    """Callable ring attention kernel with pre-computed mask information.
+
+    A JAX-pytree-compatible wrapper around ring_splash_attention that
+    stores pre-processed mask information and kernel configuration.
+    Created by make_ring_attention() and can be used directly as a
+    callable or passed through JAX transformations.
+
+    Attributes:
+        fwd_mask_info: Pre-computed mask info for forward pass.
+        dkv_mask_info: Optional pre-computed mask info for dKV backward.
+        ring_axis: Axis name for ring communication.
+        kwargs: Additional keyword arguments passed to ring_splash_attention.
+    """
+
     def __init__(
         self,
         fwd_mask_info: MaskInfo,
@@ -635,6 +773,15 @@ class RingSplashAttentionKernel:
         ring_axis: str = RING_AXIS,
         **kwargs,
     ):
+        """Initialize the ring splash attention kernel.
+
+        Args:
+            fwd_mask_info: Pre-computed mask information for forward pass.
+            dkv_mask_info: Optional mask info for dKV backward pass.
+            ring_axis: Axis name for ring communication (default: "sp").
+            **kwargs: Additional arguments forwarded to ring_splash_attention
+                (e.g., is_mqa, block_sizes, mask_value, logits_soft_cap).
+        """
         self.fwd_mask_info = fwd_mask_info
         self.dkv_mask_info = dkv_mask_info
         self.ring_axis = ring_axis
@@ -648,6 +795,18 @@ class RingSplashAttentionKernel:
         segment_ids: SegmentIds | None = None,
         sinks: jax.Array | None = None,
     ) -> jax.Array:
+        """Compute ring attention with the pre-configured mask and parameters.
+
+        Args:
+            q: Query tensor [num_heads, q_seq_len, head_dim].
+            k: Key tensor [kv_seq_len, head_dim] (MQA) or [num_heads, kv_seq_len, head_dim].
+            v: Value tensor with same shape as k.
+            segment_ids: Optional segment IDs for packed-sequence masking.
+            sinks: Optional attention sink logits.
+
+        Returns:
+            Attention output with same shape as q.
+        """
         return ring_splash_attention(
             self.fwd_mask_info,
             self.dkv_mask_info,
@@ -661,12 +820,27 @@ class RingSplashAttentionKernel:
         )
 
     def tree_flatten(self):
+        """Flatten for JAX pytree serialization.
+
+        Returns:
+            Tuple of (children, aux_data) where children contains the
+            mask info arrays and aux_data contains configuration.
+        """
         children = (self.fwd_mask_info, self.dkv_mask_info)
         aux_data = {"ring_axis": self.ring_axis, **self.kwargs}
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
+        """Reconstruct from JAX pytree serialization.
+
+        Args:
+            aux_data: Configuration dict with ring_axis and kwargs.
+            children: Tuple of (fwd_mask_info, dkv_mask_info).
+
+        Returns:
+            Reconstructed RingSplashAttentionKernel instance.
+        """
         fwd_mask_info, dkv_mask_info = children
         if isinstance(fwd_mask_info, tuple):
             fwd_mask_info = MaskInfo(*fwd_mask_info)

@@ -80,14 +80,47 @@ def _ssm2_bwd(
         do_b,
         dh_final,
     ):
-        """Process backward for a single batch element."""
+        """Process backward pass for a single batch element.
+
+        Runs the reverse-time scan to compute gradients for all SSM2
+        parameters. Uses lax.scan in reverse order and accumulates
+        per-step contributions for dA and dD.
+
+        Args:
+            x_b: Input for this batch [seq_len, num_heads, head_dim].
+            A_val: A vector (shared across batch) [num_heads].
+            B_b: B parameter [seq_len, num_heads, ssm_state_size].
+            C_b: C parameter [seq_len, num_heads, ssm_state_size].
+            D_val: Skip connection (shared) [num_heads].
+            dt_b: Time step [seq_len, num_heads].
+            h_all_b: All hidden states from forward [seq_len, h, d, n].
+            h0_b: Initial hidden state [num_heads, head_dim, ssm_state_size].
+            do_b: Output gradient [seq_len, num_heads, head_dim].
+            dh_final: Gradient of final hidden state [h, d, n].
+
+        Returns:
+            Tuple of (dx_b, dA_b, dB_b, dC_b, dD_b, ddt_b, d_initial_state).
+        """
 
         # Get previous hidden states (shifted by 1)
         # h_prev[t] = h_all[t-1] for t > 0, h_prev[0] = h0
         h_prev = jnp.concatenate([h0_b[None, :, :, :], h_all_b[:-1]], axis=0)
 
         def backward_step(carry, inputs):
-            """Single backward step through time."""
+            """Compute one reverse-time backward step for SSM2.
+
+            Computes gradients dh, dx, dB, dC, ddt, and dA contribution
+            for a single timestep using the SSM2 recurrence equations,
+            then propagates dh to the previous step.
+
+            Args:
+                carry: Gradient w.r.t. hidden state from future steps [h, d, n].
+                inputs: Tuple of (t_idx, x_t, B_t, C_t, dt_t, h_t, h_prev_t, do_t)
+                    for the current (reversed) timestep.
+
+            Returns:
+                Tuple of (dh_prev, (dx_t, dB_t, dC_t, ddt_t, dA_contrib)).
+            """
             dh_next = carry
             _t_idx, x_t, B_t, C_t, dt_t, h_t, h_prev_t, do_t = inputs
             # x_t: [num_heads, head_dim]

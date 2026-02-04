@@ -227,6 +227,27 @@ def ragged_decode_mqa_triton(
     logits_soft_cap: float,
     aux: Array | None,
 ) -> Array:
+    """Launch the ragged decode MQA Triton kernel.
+
+    Prepares kernel parameters and launches the Triton kernel for
+    multi-query ragged decode attention. Handles a single KV head
+    with G query groups attending to the same KV context.
+
+    Args:
+        q: Query tensor of shape (B, G, D) where G is the query group size.
+        k: Key tensor of shape (B, S, D) for one KV head.
+        v: Value tensor of shape (B, S, D) for one KV head.
+        starts: Per-sequence start indices, shape (B,).
+        ends: Per-sequence end indices, shape (B,).
+        softmax_scale: Attention scaling factor.
+        block_size: KV block size for tiled processing.
+        sliding_window: Optional (left, right) sliding window bounds.
+        logits_soft_cap: Soft capping value for attention logits (0.0 to disable).
+        aux: Optional attention sink logits of shape (G, num_sinks).
+
+    Returns:
+        Attention output of shape (B, G, D).
+    """
     B, G, D = q.shape
     S = k.shape[1]
     BLOCK_SIZE = int(block_size)
@@ -286,12 +307,37 @@ def inner_decode_triton(
     logits_soft_cap: float | None = None,
     softmax_aux: Array | None = None,
 ) -> Array:
-    """
-    GPU/Triton inner decode. Mirrors your inner_decode_tpu:
-      - group Q into [B, HKV, G, D]
-      - K/V -> [B, HKV, S, D]
-      - run MQA ragged decode per kv head to get [B, G, D]
-      - reshape back to [B, HQ, D]
+    """High-level GPU/Triton ragged decode attention with GQA support.
+
+    Reshapes queries for grouped-query attention, dispatches per-KV-head
+    MQA decode kernels, and reassembles the output. This mirrors the
+    TPU inner_decode_tpu implementation for cross-platform consistency.
+
+    The processing pipeline:
+        1. Group queries into (B, HKV, G, D) where G = HQ // HKV
+        2. Transpose K/V to (B, HKV, S, D) for per-head processing
+        3. Run MQA ragged decode kernel for each KV head
+        4. Stack and reshape results back to (B, HQ, D)
+
+    Args:
+        query_tensor: Query tensor of shape (B, HQ, D).
+        key_tensor: Key tensor of shape (B, S, HKV, D).
+        value_tensor: Value tensor of shape (B, S, HKV, D).
+        sequence_start: Per-sequence start indices, shape (B,).
+        sequence_end: Per-sequence end indices, shape (B,).
+        softmax_scale: Attention scaling factor. Defaults to 1/sqrt(D).
+        fwd_params: Forward pass parameters controlling block sizes.
+            Defaults to FwdParams(kv_blocksize=256).
+        sliding_window: Optional (left, right) sliding window bounds.
+        logits_soft_cap: Optional soft capping value for logits.
+        softmax_aux: Optional attention sink logits of shape
+            (HKV, num_sinks) or (num_sinks,).
+
+    Returns:
+        Attention output of shape (B, HQ, D).
+
+    Raises:
+        AssertionError: If HQ is not divisible by HKV.
     """
     B, HQ, D = query_tensor.shape
 
