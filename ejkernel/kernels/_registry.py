@@ -21,7 +21,7 @@ lookup of kernel implementations across different platforms (Triton,
 Pallas, CUDA, XLA) and backends (GPU, TPU, CPU).
 
 Key Components:
-    - Platform: Enum for implementation platforms (TRITON, PALLAS, CUDA, XLA)
+    - Platform: Enum for implementation platforms (TRITON, PALLAS, CUDA, CUTE, XLA)
     - Backend: Enum for hardware backends (GPU, TPU, CPU, ANY)
     - KernelSpec: Dataclass describing a registered kernel implementation
     - KernelRegistry: Registry class for managing kernel implementations
@@ -319,12 +319,14 @@ class Platform(str, Enum):
         TRITON: OpenAI Triton GPU kernels.
         PALLAS: JAX Pallas kernels (supports both GPU and TPU).
         CUDA: Native CUDA C/C++ kernels compiled ahead-of-time.
+        CUTE: CUTLASS CuTe DSL kernels.
         XLA: XLA HLO-based implementations using JAX primitives.
     """
 
     TRITON = "triton"
     PALLAS = "pallas"
     CUDA = "cuda"
+    CUTE = "cute"
     XLA = "xla"
 
 
@@ -409,7 +411,7 @@ class KernelRegistry:
     def register(
         self,
         algorithm: str,
-        platform: Platform | Literal["triton", "pallas", "cuda", "xla"],
+        platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla"],
         backend: Backend | Literal["gpu", "tpu", "cpu", "any"],
         priority: int = 0,
     ) -> Callable[[F], F]: ...
@@ -417,7 +419,7 @@ class KernelRegistry:
     def register(
         self,
         algorithm: str,
-        platform: Platform | Literal["triton", "pallas", "cuda", "xla"],
+        platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla"],
         backend: Backend | Literal["gpu", "tpu", "cpu", "any"],
         priority: int = 0,
     ) -> Callable[[F], F]:
@@ -501,7 +503,7 @@ class KernelRegistry:
     def get(
         self,
         algorithm: str,
-        platform: Platform | Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
         backend: Backend | Literal["gpu", "tpu", "cpu", "any"] | None = None,
     ) -> Callable:
         """Retrieve the best matching kernel implementation.

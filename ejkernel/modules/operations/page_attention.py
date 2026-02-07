@@ -135,7 +135,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
         attn_scale: float | None = None,
         max_context_len: int | None = None,
         num_splits: int = 0,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: PageAttentionConfig,
         mask_value: float = -2.381976426469702e38,
@@ -258,7 +258,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
         attn_scale: float | None = None,
         max_context_len: int | None = None,
         num_splits: int = 0,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: PageAttentionConfig | None = None,
         mask_value: float = -2.381976426469702e38,
@@ -382,7 +382,7 @@ def page_attention(
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
     sliding_window: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: PageAttentionConfig | None = None,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
     """Execute page attention with automatic optimization.

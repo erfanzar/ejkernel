@@ -78,7 +78,7 @@ ejkernel/modules/
 @dataclass
 class BaseOperationConfig:
     """Base configuration for all operations"""
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] = "auto"
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] = "auto"
     backend: str = "any"
 
     def to_dict(self) -> dict:

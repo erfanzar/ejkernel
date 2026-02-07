@@ -41,7 +41,7 @@ from ..base import detect_platform
 from .configs import QuantizedMatmulConfig
 
 #: Supported quantization modes for quantized matrix multiplication.
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "w4a16", "w8a16"]
+QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 
 
 def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tuple[int, int]:
@@ -62,10 +62,6 @@ def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tup
         return 16 if group_size is None else int(group_size), 4
     if mode == "nvfp8":
         return 16 if group_size is None else int(group_size), 8
-    if mode == "w4a16":
-        return (64 if group_size is None else int(group_size), 4)
-    if mode == "w8a16":
-        return (64 if group_size is None else int(group_size), 8)
     return (64 if group_size is None else int(group_size), 4 if bits is None else int(bits))
 
 
@@ -278,6 +274,21 @@ def _cuda_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> Quanti
     )
 
 
+def _cute_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
+    """Heuristic config for CuTe DSL path."""
+    return QuantizedMatmulConfig(
+        block_m=128,
+        block_n=128,
+        block_k=64,
+        num_warps=4,
+        num_stages=2,
+        use_bf16=_prefer_bf16(_inv_arg(inv, "x", 0)),
+        split_k=None,
+        platform="cute",
+        backend="gpu",
+    )
+
+
 class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
     """Quantized matrix multiplication kernel with configurable tiling and backend selection.
 
@@ -341,7 +352,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         bits: int | None = None,
         mode: QuantizationMode = "affine",
         _resolved_platform: str | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
         *,
         cfg: QuantizedMatmulConfig,
     ) -> Float[Array, "m n"]:
@@ -369,7 +380,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
                 - "mxfp8": Microscaling FP8 (E4M3) quantization
                 - "nvfp4": NVIDIA FP4 quantization
                 - "nvfp8": NVIDIA FP8 quantization
-            platform: Platform override (triton/pallas/cuda/xla/auto).
+            platform: Platform override (triton/pallas/cuda/cute/xla/auto).
             cfg: Kernel configuration with block sizes and settings.
 
         Returns:
@@ -449,6 +460,8 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
             return _triton_heuristic_cfg(inv)
         if resolved == Platform.CUDA:
             return _cuda_heuristic_cfg(inv)
+        if resolved == Platform.CUTE:
+            return _cute_heuristic_cfg(inv)
         return _xla_heuristic_cfg(inv, "gpu")
 
     def heuristic_cfg_cpu(self, inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
@@ -483,7 +496,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
             List of QuantizedMatmulConfig candidates optimized for GPU.
         """
         resolved = self._resolve_inv_platform(inv)
-        if resolved in (Platform.TRITON, Platform.CUDA):
+        if resolved in (Platform.TRITON, Platform.CUDA, Platform.CUTE):
             return []
         return _xla_candidate_cfgs(inv, "gpu")
 
@@ -537,7 +550,7 @@ def _quantized_matmul_impl(
     group_size: int | None = None,
     bits: int | None = None,
     mode: QuantizationMode = "affine",
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
     """Execute quantized matrix multiplication with automatic optimization.
@@ -557,7 +570,7 @@ def _quantized_matmul_impl(
         scales: Per-group scales array for dequantization. Shape is (N, K//group_size)
             for transpose=True or (K, N//group_size) for transpose=False.
         biases: Per-group biases for affine quantization modes. Must have the same
-            shape as scales. Required when mode in {"affine", "w4a16", "w8a16"}, must be None otherwise.
+            shape as scales. Required when mode is "affine", must be None otherwise.
         transpose: Weight layout indicator. If True, weights are stored in NxK
             layout (transposed). If False, weights are stored in KxN layout.
             Default is False.
@@ -572,12 +585,11 @@ def _quantized_matmul_impl(
             - "mxfp8": Microscaling FP8 (E4M3) with E8M0 shared exponent
             - "nvfp4": NVIDIA FP4 (E2M1) with E4M3 per-group scale
             - "nvfp8": NVIDIA FP8 (E4M3) with E4M3 per-group scale
-            - "w4a16": 4-bit affine quantization with per-channel scale
-            - "w8a16": 8-bit affine quantization with per-channel scale
         platform: Target execution platform override. One of:
             - "triton": Use Triton GPU kernels (requires NVIDIA/AMD GPU)
             - "pallas": Use Pallas kernels (TPU/GPU)
             - "cuda": Use CUDA-specific implementations
+            - "cute": Use CUTLASS CuTe DSL kernels (NVIDIA GPU only)
             - "xla": Use XLA compiler (most portable)
             - "auto": Automatic selection based on available hardware (default)
             - None: Same as "auto"
@@ -608,20 +620,19 @@ def _quantized_matmul_impl(
           store weights in KxN layout and call with transpose=False.
         - The Triton backend currently supports "affine" and "nf4" modes. Other
           modes fall back to the XLA implementation.
+        - The CUTE backend supports all modes but is correctness-first.
         - The XLA implementation supports all modes and serves as a fallback when
-          Triton kernels are not available or not optimal.
+          specialized kernels are not available or not optimal.
     """
     mode = mode.lower()
     transpose = _static_bool(transpose, "transpose")
-    if mode in ("w4a16", "w8a16") and group_size is None:
-        group_size = int(x.shape[1])
     if group_size is not None:
         group_size = _static_int(group_size, "group_size")
     if bits is not None:
         bits = _static_int(bits, "bits")
-    if mode in ("affine", "w4a16", "w8a16") and biases is None:
+    if mode == "affine" and biases is None:
         raise ValueError("affine quantized_matmul requires biases.")
-    if mode not in ("affine", "w4a16", "w8a16") and biases is not None:
+    if mode != "affine" and biases is not None:
         raise ValueError("biases must be None for non-affine modes.")
 
     resolved = detect_platform(
@@ -629,7 +640,7 @@ def _quantized_matmul_impl(
         platform if platform is not None else (cfg.platform if cfg is not None else "auto"),
     )
 
-    if resolved in (Platform.TRITON, Platform.CUDA):
+    if resolved in (Platform.TRITON, Platform.CUDA, Platform.CUTE):
         with policy_override(
             _quantized_matmul_executor.chooser,
             allow_autotune=False,
@@ -677,7 +688,7 @@ def quantized_matmul(
     group_size: int | None = None,
     bits: int | None = None,
     mode: QuantizationMode = "affine",
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
     """Quantized matrix multiplication with fused dequantization.

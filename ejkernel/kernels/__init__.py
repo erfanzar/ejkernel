@@ -17,7 +17,7 @@
 
 This module provides a unified interface to kernel implementations across
 different hardware platforms (GPU, TPU) and implementation frameworks
-(Triton, Pallas, XLA, CUDA).
+(Triton, CuTe, Pallas, XLA, CUDA).
 
 The kernel system supports:
 - Multi-platform implementations with automatic selection
@@ -27,6 +27,7 @@ The kernel system supports:
 
 Submodules:
     cuda: CUDA-specific kernel implementations
+    cute: CUTLASS CuTe DSL kernel implementations
     pallas: Pallas kernel implementations for TPU/GPU
     triton: Triton kernel implementations for GPU
     xla: XLA-based kernel implementations
@@ -47,6 +48,8 @@ Example:
     >>>
     >>> output = kernel(query, key, value)
 """
+
+import importlib.util as _importlib_util
 
 from . import _cuda as cuda
 from . import _pallas as pallas
@@ -76,13 +79,28 @@ except ModuleNotFoundError as err:  # pragma: no cover
         raise
     triton = None  # type: ignore[assignment]
 
-__all__ = (
+_has_cutlass = _importlib_util.find_spec("cutlass") is not None
+if _has_cutlass:
+    try:
+        from . import _cute as cute
+    except ModuleNotFoundError as err:  # pragma: no cover
+        if not str(err.name).startswith("cutlass"):
+            raise
+        cute = None  # type: ignore[assignment]
+else:  # pragma: no cover
+    cute = None  # type: ignore[assignment]
+
+__all__ = [
     "Backend",
     "Platform",
     "build_cuda_libs",
     "cuda",
     "kernel_registry",
     "pallas",
-    "triton",
     "xla",
-)
+]
+if triton is not None:
+    __all__.append("triton")
+if cute is not None:
+    __all__.append("cute")
+__all__ = tuple(__all__)

@@ -20,7 +20,7 @@ that uses gating to control information flow. GLA combines linear attention
 properties with learned gates to achieve both efficiency and expressiveness.
 
 Key features of Gated Linear Attention:
-    - Linear complexity: O(T) time and O(K×V) memory per head
+    - Linear complexity: O(T) time and O(KxV) memory per head
     - Dual gating mechanism: Token-level (g) and layer-level (g_gamma) gates
     - Recurrent formulation with explicit state management
     - Support for variable-length sequences and bidirectional processing
@@ -93,7 +93,7 @@ class GLAttention(Kernel[GLAttentionConfig, Array]):
     Implements gated linear attention combining the efficiency of linear attention
     with learnable gating mechanisms for better expressiveness. The gating controls
     information flow at both the query-key interaction and the state update levels,
-    achieving O(N) complexity with O(K×V) memory per head.
+    achieving O(N) complexity with O(KxV) memory per head.
 
     Features:
         - Gated attention computation with g (query gates) and g_gamma (layer-wise gates)
@@ -162,7 +162,7 @@ class GLAttention(Kernel[GLAttentionConfig, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: GLAttentionConfig,
     ) -> (
@@ -308,7 +308,7 @@ def gla_attention(
     softmax_scale: float | None = None,
     reverse: bool = False,
     return_state: bool = False,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: GLAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

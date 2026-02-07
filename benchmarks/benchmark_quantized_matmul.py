@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 
 sys.path.append(os.path.dirname(__file__))
-from _op_benchmark_registry import SPECS, _build_algorithms, _default_dtype, _ignored_platforms
+from _op_benchmark_registry import SPECS, _build_algorithms, _default_dtype
 
 from ejkernel.benchmarks import Benchmark
 from ejkernel.quantization import prepack_quantized_weights
@@ -61,13 +61,17 @@ if __name__ == "__main__":
         print("No benchmark spec registered for quantized_matmul")
         raise SystemExit(1)
 
-    algorithms = _build_algorithms(spec, ignore_platforms=_ignored_platforms(["triton"]))
+    algorithms = _build_algorithms(spec)
     if not algorithms:
         print(f"No implementations found for {spec.algorithm} on this backend.")
         raise SystemExit(1)
 
     algorithms = {name: _attach_fp_weight(fn) for name, fn in algorithms.items()}
-    algorithms["matmul_fp"] = _fp_matmul
+
+    if os.getenv("EJKERNEL_QMM_BENCH_COMPARE_CUDA_ONLY", "0") == "1":
+        algorithms = {k: v for k, v in algorithms.items() if k in {"cuda", "triton"}}
+    else:
+        algorithms["matmul_fp"] = _fp_matmul
 
     bench = Benchmark(
         algorithms=algorithms,

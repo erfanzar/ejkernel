@@ -147,7 +147,7 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
         initial_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
         conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
         act_fn: Callable[[jax.Array], jax.Array] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: StateSpaceV1Config,
     ) -> tuple[
@@ -265,7 +265,7 @@ def state_space_v1(
     conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
     *,
     act_fn: Callable[[jax.Array], jax.Array] | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: StateSpaceV1Config | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],

@@ -47,7 +47,7 @@ from ejkernel.quantization._utils.grouping import _require_bits
 from ..._registry import Backend, Platform, kernel_registry
 
 #: Supported quantization modes for the XLA implementation.
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "w4a16", "w8a16"]
+QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 
 
 def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tuple[int, int]:
@@ -68,22 +68,6 @@ def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tup
         ValueError: If mode is unsupported or parameters are invalid for the mode.
     """
     mode = mode.lower()
-    if mode == "w4a16":
-        bits = 4 if bits is None else bits
-        group_size = 0 if group_size is None else int(group_size)
-        if bits != 4:
-            raise ValueError("w4a16 requires bits=4.")
-        if group_size <= 0:
-            raise ValueError("w4a16 requires group_size to be set (use K).")
-        return group_size, bits
-    if mode == "w8a16":
-        bits = 8 if bits is None else bits
-        group_size = 0 if group_size is None else int(group_size)
-        if bits != 8:
-            raise ValueError("w8a16 requires bits=8.")
-        if group_size <= 0:
-            raise ValueError("w8a16 requires group_size to be set (use K).")
-        return group_size, bits
     if mode == "affine":
         group_size = 64 if group_size is None else int(group_size)
         bits = 4 if bits is None else _require_bits(bits, {2, 3, 4, 5, 6, 7, 8})
@@ -451,6 +435,9 @@ def _blocked_quantized_matmul(
             w = _decode_tile_nvfp8(q, scale_tile)
         else:
             raise ValueError(f"Unsupported quantization mode: {mode}")
+        if use_bf16:
+            # Match CUDA's fp16 dequantization followed by bf16 GEMM casting.
+            return w.astype(jnp.float16).astype(compute_dtype)
         return w.astype(compute_dtype)
 
     def k_loop(k_idx: int, acc: jax.Array, *, off_m: int, off_n: int) -> jax.Array:
@@ -489,6 +476,15 @@ def _blocked_quantized_matmul(
         """
         off_n = n_idx * block_n
 
+        # Decode all K tiles once per N block (shared across M tiles).
+        k_ids = jnp.arange(num_k, dtype=jnp.int32)
+
+        def _decode_k(k_idx: jax.Array) -> jax.Array:
+            off_k = k_idx * block_k
+            return decode_tile(off_k, off_n)
+
+        w_tiles = jax.lax.map(_decode_k, k_ids)
+
         def m_loop(m_idx: int, out_local: jax.Array) -> jax.Array:
             """Process one M-dimension block row for a fixed N column.
 
@@ -515,7 +511,10 @@ def _blocked_quantized_matmul(
                 Returns:
                     Updated accumulator.
                 """
-                return k_loop(idx, carry, off_m=off_m, off_n=off_n)
+                off_k = idx * block_k
+                x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k)).astype(compute_dtype)
+                w_tile = w_tiles[idx]
+                return carry + _dot_general(x_tile, w_tile)
 
             acc = jax.lax.fori_loop(0, num_k, k_body, acc)
             out_local = jax.lax.dynamic_update_slice(out_local, acc, (off_m, off_n))
@@ -633,7 +632,7 @@ def quantized_matmul(
     """Quantized matrix multiplication using XLA.
 
     This function provides a portable XLA implementation of quantized matmul
-    that supports all quantization modes (affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8, w4a16, w8a16).
+    that supports all quantization modes (affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8).
     When possible, it uses a blocked algorithm with fused dequantization for
     better performance. For incompatible shapes or bit-widths, it falls back
     to a simple dequantize+matmul approach.
@@ -654,7 +653,6 @@ def quantized_matmul(
             the computation is x @ w. Default is False.
         group_size: Number of elements per quantization group. If None, uses
             mode default (64 for affine/nf4, 32 for mxfp4/mxfp8, 16 for nvfp4/nvfp8).
-            w4a16/w8a16 require group_size=K (per-channel).
         bits: Bit-width per quantized element. If None, uses mode default
             (4 for affine/nf4/mxfp4/nvfp4, 8 for mxfp8/nvfp8).
         mode: Quantization mode determining the dequantization formula:
@@ -664,8 +662,6 @@ def quantized_matmul(
             - "mxfp8": Microscaling FP8 (E4M3) with E8M0 exponent
             - "nvfp4": NVIDIA FP4 (E2M1) with E4M3 per-group scale
             - "nvfp8": NVIDIA FP8 (E4M3) with E4M3 per-group scale
-            - "w4a16": 4-bit affine quantization with per-channel scale
-            - "w8a16": 8-bit affine quantization with per-channel scale
         block_m: Tile size for M dimension in blocked algorithm. Default 128.
         block_n: Tile size for N dimension in blocked algorithm. Default 128.
         block_k: Tile size for K dimension in blocked algorithm. Default 64.
@@ -691,13 +687,11 @@ def quantized_matmul(
           when shapes or modes are unsupported.
     """
     mode = mode.lower()
-    if mode in ("w4a16", "w8a16") and group_size is None:
-        group_size = int(x.shape[1])
     group_size, bits = _resolve_qparams(mode, group_size, bits)
 
-    if mode in ("affine", "w4a16", "w8a16") and biases is None:
+    if mode == "affine" and biases is None:
         raise ValueError("affine quantized_matmul requires biases.")
-    if mode not in ("affine", "w4a16", "w8a16") and biases is not None:
+    if mode != "affine" and biases is not None:
         raise ValueError("biases must be None for non-affine modes.")
 
     return _operate(

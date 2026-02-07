@@ -44,10 +44,11 @@ from ..kernels._registry import Backend, Platform, kernel_registry
 
 def detect_platform(
     algorithm: str,
-    platform: Platform | Literal["triton", "pallas", "cuda", "xla", "auto"] | None = "auto",
+    platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = "auto",
     prefer_pallas: bool = False,
     prefer_cuda: bool = False,
     prefer_triton: bool = False,
+    prefer_cute: bool = False,
 ) -> Platform:
     """Detect the best platform for a given algorithm.
 
@@ -59,9 +60,11 @@ def detect_platform(
 
     The selection priority (when platform="auto"):
         - If prefer_pallas is set and a matching Pallas backend exists -> Pallas
+        - If prefer_cute is set and CUTE is available on NVIDIA -> CUTE
         - If prefer_cuda is set and CUDA is available on NVIDIA -> CUDA
         - If prefer_triton is set and Triton is available -> Triton
         - TPU backend + Pallas available -> Pallas
+        - NVIDIA GPU + CUTE implementation available -> CUTE
         - NVIDIA GPU + CUDA implementation available -> CUDA
         - GPU backend + Triton available -> Triton
         - GPU backend + no Triton -> XLA
@@ -73,9 +76,11 @@ def detect_platform(
             - "triton": Triton GPU kernels (CUDA/ROCm)
             - "pallas": Pallas kernels (TPU/GPU)
             - "cuda": CUDA-specific implementations
+            - "cute": CUTLASS CuTe DSL implementations
             - "xla": XLA compiler-based implementations
             - "auto" or None: Automatic selection (default)
         prefer_pallas: Prefer Pallas when available (GPU or TPU).
+        prefer_cute: Prefer CUTE on NVIDIA GPUs when available.
         prefer_cuda: Prefer CUDA on NVIDIA GPUs when available.
         prefer_triton: Prefer Triton on GPU when available.
 
@@ -96,9 +101,9 @@ def detect_platform(
         >>> print(f"Selected: {detect_platform('ring_attention')}")
 
     Note:
-        CUDA implementations are preferred on NVIDIA GPUs when available. Triton
-        remains the next choice for GPU backends, while XLA provides broader
-        compatibility across hardware backends.
+        CUTE implementations are preferred on NVIDIA GPUs when available, then
+        CUDA, then Triton. XLA provides broader compatibility across hardware
+        backends.
     """
     if platform not in ("auto", None):
         return Platform(platform) if isinstance(platform, str) else platform
@@ -111,6 +116,7 @@ def detect_platform(
     specs = kernel_registry.list_implementations(algorithm)
     has_cuda = any(spec.platform == Platform.CUDA and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
     has_triton = any(spec.platform == Platform.TRITON and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
+    has_cute = any(spec.platform == Platform.CUTE and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
     has_pallas_tpu = any(
         spec.platform == Platform.PALLAS and spec.backend in (Backend.TPU, Backend.ANY) for spec in specs
     )
@@ -137,11 +143,17 @@ def detect_platform(
     if has_pallas_tpu and jax_backend in ("tpu"):
         return Platform.PALLAS
 
+    if prefer_cute and is_nvidia and has_cute and jax_backend in ("gpu", "cuda"):
+        return Platform.CUTE
+
     if prefer_cuda and is_nvidia and has_cuda and jax_backend in ("gpu", "cuda"):
         return Platform.CUDA
 
     if prefer_triton and has_triton and jax_backend in ("gpu", "cuda"):
         return Platform.TRITON
+
+    if is_nvidia and has_cute and jax_backend in ("gpu", "cuda"):
+        return Platform.CUTE
 
     if is_nvidia and has_cuda and jax_backend in ("gpu", "cuda"):
         return Platform.CUDA
@@ -165,7 +177,7 @@ class KernelConfig:
         block_d: Head dimension block size (if applicable)
         num_warps: Number of warps for GPU kernels
         num_stages: Number of pipeline stages for overlapping compute/memory
-        platform: Implementation platform (triton, pallas, cuda, xla, auto)
+        platform: Implementation platform (triton, pallas, cuda, cute, xla, auto)
         backend: Target hardware backend (gpu, tpu, cpu, any)
         algorithm: Specific algorithm variant if multiple exist
         priority: Selection priority when multiple configs match
@@ -176,7 +188,7 @@ class KernelConfig:
     block_d: int = 64
     num_warps: int = 4
     num_stages: int = 2
-    platform: Platform | Literal["triton", "pallas", "cuda", "xla", "auto"] = "auto"
+    platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] = "auto"
     backend: Backend | Literal["gpu", "tpu", "cpu", "any"] = Backend.ANY
     algorithm: str | None = None
     priority: int = 0

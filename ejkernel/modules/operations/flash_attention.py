@@ -151,7 +151,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         normalize_output: bool = True,
         precision: lax.PrecisionLike = lax.Precision.DEFAULT,
         logits_dtype: DTypeLike = jnp.float32,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         cfg: FlashAttentionConfig | None = None,
@@ -284,7 +284,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         normalize_output: bool = True,
         precision: lax.PrecisionLike = lax.Precision.DEFAULT,
         logits_dtype: DTypeLike = jnp.float32,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
@@ -819,7 +819,7 @@ def flash_attention(
     normalize_output: bool = True,
     precision: lax.PrecisionLike = lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: FlashAttentionConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
@@ -881,13 +881,8 @@ def flash_attention(
         elif attention_mask is None:
             attention_mask = mask_info.get_or_compute_attention_mask()
 
-    if block_tables is not None:
-        if platform not in (None, "auto", "cuda"):
-            raise EjkernelRuntimeError(
-                f"flash_attention (platform={platform}): block_tables (paged_kv) is only supported on CUDA"
-            )
-        if platform in (None, "auto"):
-            platform = "cuda"
+    if block_tables is not None and platform in (None, "auto"):
+        platform = "cute"
 
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:

@@ -148,7 +148,7 @@ class RWKV4(Kernel[RWKV4Config, Array]):
         state: Float[Array, "batch three chans"] | None = None,
         *,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         cfg: RWKV4Config,
     ) -> (
         Float[Array, "batch seq_len chans"]
@@ -248,7 +248,7 @@ def rwkv4(
     /,
     *,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: RWKV4Config | None = None,
 ) -> Float[Array, "batch seq_len chans"] | tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]:
     """RWKV-4 time-mix recurrence with automatic backend selection.

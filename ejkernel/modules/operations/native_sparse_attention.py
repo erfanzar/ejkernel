@@ -145,7 +145,7 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
         softmax_scale: float | None = None,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: NativeSparseAttentionConfig,
     ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
@@ -395,7 +395,7 @@ def native_sparse_attention(
     /,
     *,
     softmax_scale: float | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: NativeSparseAttentionConfig | None = None,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """Execute native sparse attention with automatic optimization.

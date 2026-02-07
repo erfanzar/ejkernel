@@ -194,7 +194,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
         seq_threshold_3d: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         cfg: UnifiedAttentionConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -309,7 +309,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
         seq_threshold_3d: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         cfg: UnifiedAttentionConfig,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
         """Execute unified paged attention.
@@ -448,7 +448,7 @@ def unified_attention(
     sliding_window: int | None = None,
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: PartitionSpec | None = None,

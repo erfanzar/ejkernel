@@ -144,7 +144,7 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
         softmax_scale: float | None = None,
         causal: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: FlashMLAConfig,
     ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
@@ -273,7 +273,7 @@ def flash_mla(
     *,
     softmax_scale: float | None = None,
     causal: bool = False,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: FlashMLAConfig | None = None,
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
     """Execute flash multi-head latent attention with automatic optimization.

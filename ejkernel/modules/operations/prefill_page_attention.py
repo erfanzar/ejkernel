@@ -106,7 +106,7 @@ class PrefillPageAttention(Kernel[PrefillPageAttentionConfig, Array]):
         value_cache: Float[Array, "num_kv_heads total_num_pages page_size head_dim"],
         context_len: Int[Array, "1"],
         page_indices: Int[Array, "num_pages"],
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: PrefillPageAttentionConfig,
         softmax_scale: float | None = None,
@@ -198,7 +198,7 @@ class PrefillPageAttention(Kernel[PrefillPageAttentionConfig, Array]):
         value_cache: Float[Array, "num_kv_heads total_num_pages page_size head_dim"],
         context_len: Int[Array, "1"],
         page_indices: Int[Array, "num_pages"],
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: PrefillPageAttentionConfig | None = None,
         softmax_scale: float | None = None,
@@ -302,7 +302,7 @@ def prefill_page_attention(
     mask_value: float = -2.381976426469702e38,
     attn_logits_soft_cap: float | None = None,
     sliding_window: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: PrefillPageAttentionConfig | None = None,
 ) -> Float[Array, "chunk_size num_heads head_dim"]:
     """Execute prefill page attention with automatic optimization.

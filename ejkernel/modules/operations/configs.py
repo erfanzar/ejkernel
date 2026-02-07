@@ -36,7 +36,7 @@ Configuration Hierarchy:
 
 Common Parameters:
     All configs inherit from BaseOperationConfig which provides:
-        - platform: Target execution platform (triton/pallas/cuda/xla/auto)
+        - platform: Target execution platform (triton/pallas/cuda/cute/xla/auto)
         - backend: Hardware backend (gpu/tpu/cpu/any)
 
 Block Size Guidelines:
@@ -119,6 +119,7 @@ class BaseOperationConfig:
             - "triton": Triton GPU kernels (NVIDIA/AMD GPUs)
             - "pallas": Pallas kernels (TPU/GPU)
             - "cuda": CUDA-specific implementations
+            - "cute": CUTLASS CuTe DSL implementations
             - "xla": XLA compiler-based implementations (most portable)
             - "auto": Automatic platform selection based on hardware (default)
         backend: Target hardware backend specification.
@@ -132,7 +133,7 @@ class BaseOperationConfig:
         since XLA handles backend selection internally.
     """
 
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] = "auto"
+    platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] = "auto"
     backend: str = "any"
 
     __hash__ = hash_fn
@@ -145,7 +146,7 @@ class FlashAttentionConfig(BaseOperationConfig):
     Args:
         fwd_params: Forward kernel parameters (uses `q_blocksize`/`kv_blocksize` for tiling).
         bwd_params: Backward kernel parameters (optional).
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -166,7 +167,7 @@ class BlockSparseAttentionConfig(BaseOperationConfig):
     """Configuration for Block Sparse Attention operation.
 
     Args:
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -193,7 +194,7 @@ class NativeSparseAttentionConfig(BaseOperationConfig):
         block_size: Size of attention blocks for sparsity (default: 64)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -217,7 +218,7 @@ class RecurrentAttentionConfig(BaseOperationConfig):
         block_d: Head dimension block size (default: 64)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -237,7 +238,7 @@ class RingAttentionConfig(BaseOperationConfig):
     Args:
         fwd_params: Forward pass block size parameters
         bwd_params: Backward pass block size parameters
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -262,7 +263,7 @@ class PageAttentionConfig(BaseOperationConfig):
         pages_per_compute_block: Pages per compute block (default: None)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -285,7 +286,7 @@ class UnifiedAttentionConfig(BaseOperationConfig):
             the segmented 3D decode kernel (Triton only).
         num_warps: Optional Triton kernel override.
         num_stages: Optional Triton kernel override.
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -305,7 +306,7 @@ class DecodeAttentionConfig(BaseOperationConfig):
         num_kv_splits: Number of KV splits used by the Triton kernel (default: 16).
         num_warps: Optional Triton kernel override.
         num_stages: Optional Triton kernel override.
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -329,7 +330,7 @@ class ChunkedPrefillPagedDecodeConfig(BaseOperationConfig):
         num_par_softmax_segments: Parallel softmax segments for 3D kernel (Triton only).
         num_warps: Optional Triton kernel override.
         num_stages: Optional Triton kernel override.
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -350,7 +351,7 @@ class AttentionConfig(BaseOperationConfig):
         block_k: Key block size (default: 128)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 2)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -372,7 +373,7 @@ class GroupedMatmulConfig(BaseOperationConfig):
         block_k: K dimension block size (default: 64)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 2)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -398,7 +399,7 @@ class QuantizedMatmulConfig(BaseOperationConfig):
         num_stages: Number of pipeline stages (default: 3)
         use_bf16: Use BF16 for the dot input tiles (default: True)
         split_k: Optional split-K factor for Triton kernels (default: None)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -421,7 +422,7 @@ class MeanPoolingConfig(BaseOperationConfig):
         block_size: Block size for pooling (default: 64)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -440,7 +441,7 @@ class RaggedDecodeAttentionConfig(BaseOperationConfig):
         block_size: Block size for computation tiling (default: 256)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -462,7 +463,7 @@ class RaggedPageAttentionv2Config(BaseOperationConfig):
         num_queries_per_block: Number of queries to process per compute block (default: None for auto)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -483,7 +484,7 @@ class RaggedPageAttentionv3Config(BaseOperationConfig):
         num_queries_per_block: Number of queries to process per compute block (default: None for auto)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -506,7 +507,7 @@ class GLAttentionConfig(BaseOperationConfig):
         block_d: Head dimension block size (default: 64)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -529,7 +530,7 @@ class LightningAttentionConfig(BaseOperationConfig):
         block_d: Head dimension block size (default: 64)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -550,7 +551,7 @@ class KernelDeltaAttentionConfig(BaseOperationConfig):
     block sizes. The config exists primarily for platform/backend selection.
 
     Args:
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -570,7 +571,7 @@ class RWKV4Config(BaseOperationConfig):
         wkv_t = sum_{i<t} exp(-w*(t-i)) * k_i * v_i + u * k_t * v_t
 
     Args:
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
 
     Note:
@@ -595,7 +596,7 @@ class RWKV6Config(BaseOperationConfig):
         - Improved receptance gating mechanism
 
     Args:
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
 
     Note:
@@ -616,7 +617,7 @@ class RWKV7Config(BaseOperationConfig):
     with enhanced state update mechanisms and gating operations.
 
     Args:
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
 
     Note:
@@ -638,7 +639,7 @@ class RWKV7MulConfig(BaseOperationConfig):
     for sequence modeling tasks.
 
     Args:
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
 
     Note:
@@ -660,7 +661,7 @@ class FlashMLAConfig(BaseOperationConfig):
         block_k: Key block size (default: 128)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 2)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -680,7 +681,7 @@ class ScaledDotProductAttentionConfig(BaseOperationConfig):
     The config exists primarily for platform/backend selection.
 
     Args:
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -696,7 +697,7 @@ class PrefillPageAttentionConfig(BaseOperationConfig):
     Args:
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -714,7 +715,7 @@ class StateSpaceV1Config(BaseOperationConfig):
     block sizes. The config exists primarily for platform/backend selection.
 
     Args:
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
@@ -729,7 +730,7 @@ class StateSpaceV2Config(BaseOperationConfig):
         n_groups: Number of groups for B, C parameters (default: 1)
         use_gated_rmsnorm: Whether to use gated RMSNorm for output (default: False)
         rmsnorm_eps: Epsilon for RMSNorm stability (default: 1e-5)
-        platform: Target platform (triton/pallas/cuda/xla/auto)
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 

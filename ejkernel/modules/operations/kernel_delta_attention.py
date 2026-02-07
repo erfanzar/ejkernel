@@ -139,7 +139,7 @@ class KernelDeltaAttention(Kernel[KernelDeltaAttentionConfig, Array]):
         use_qk_l2norm: bool = True,
         use_chunked: bool = True,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         cfg: KernelDeltaAttentionConfig,
     ) -> (
         Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -255,7 +255,7 @@ def kernel_delta_attention(
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: KernelDeltaAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

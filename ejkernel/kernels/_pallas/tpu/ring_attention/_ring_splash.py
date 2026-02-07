@@ -38,7 +38,7 @@ Key features:
 - Numerically stable: Uses log-sum-exp trick for softmax accumulation
 - Supports causal attention across device boundaries
 - Compatible with Splash Attention's block-sparse optimizations
-- Automatic fallback to single-device Splash when not in ring context
+- Enforces ring context for distributed execution
 
 Example:
     >>> from ejkernel.kernels._pallas.tpu.ring_attention import make_ring_attention
@@ -633,8 +633,8 @@ def _has_axis(axis_name: str) -> bool:
     """Check whether a named axis exists in the current JAX context.
 
     Attempts a collective operation to determine if the axis name is
-    defined (e.g., inside shard_map or pmap). Used to decide between
-    ring communication and single-device fallback.
+    defined (e.g., inside shard_map or pmap). Used to enforce that ring
+    execution runs under the requested distributed axis.
 
     Args:
         axis_name: Name of the axis to check.
@@ -680,9 +680,8 @@ def ring_splash_attention(
 ) -> jax.Array:
     """Compute ring attention using Splash Attention kernels.
 
-    Main entry point for ring attention computation. Automatically detects
-    whether running in a distributed context (shard_map/pmap) and falls back
-    to single-device Splash Attention if not.
+    Main entry point for ring attention computation. Requires a distributed
+    context (``shard_map``/``pmap``) with the requested ring axis.
 
     Args:
         fwd_mask_info: Pre-computed mask info for forward pass.
@@ -705,30 +704,10 @@ def ring_splash_attention(
     """
     dq_mask_info = fwd_mask_info if block_sizes.has_backward_blocks else None
 
-    # Single-device fallback: if we're not inside a `shard_map`/`pmap` context that
-    # defines the ring axis, just run regular Splash attention on the local device.
     if not _has_axis(ring_axis):
-        splash_segment_ids = None
-        if segment_ids is not None:
-            splash_segment_ids = splash_kernel.SegmentIds(q=segment_ids.q, kv=segment_ids.kv)
-
-        return splash_kernel._splash_attention(
-            fwd_mask_info,
-            dq_mask_info,
-            dkv_mask_info,
-            q,
-            k,
-            v,
-            splash_segment_ids,
-            sinks,
-            is_mqa=is_mqa,
-            block_sizes=block_sizes,
-            save_residuals=False,
-            mask_value=mask_value,
-            logits_soft_cap=logits_soft_cap,
-            residual_checkpoint_name=None,
-            mask_function=mask_function,
-            interpret=False,
+        raise NotImplementedError(
+            "ring_splash_attention requires execution under shard_map/pmap with "
+            f"axis '{ring_axis}'. Fallback paths are disabled."
         )
 
     return _ring_attention_custom(

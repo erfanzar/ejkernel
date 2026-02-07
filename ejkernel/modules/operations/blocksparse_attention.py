@@ -162,7 +162,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         chunk_size: int | None = None,
         causal: bool = True,
         fused_backward: bool = False,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         cfg: BlockSparseAttentionConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -283,7 +283,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         chunk_size: int | None = None,
         causal: bool = True,
         fused_backward: bool = False,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
         | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
@@ -831,7 +831,7 @@ def blocksparse_attention(
     causal: bool = True,
     fused_backward: bool = False,
     purify: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: BlockSparseAttentionConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,

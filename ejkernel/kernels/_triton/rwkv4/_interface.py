@@ -72,7 +72,6 @@ from beartype import beartype
 from jaxtyping import Array, Float
 
 from ..._registry import Backend, Platform, kernel_registry
-from ..._xla.rwkv4 import rwkv4 as xla_rwkv4
 from ._triton_impl_fwd import fwd_triton_impl
 
 
@@ -118,28 +117,12 @@ def _bwd_call(
 ):
     """Backward pass for RWKV-4 time-mix in a custom VJP.
 
-    Computes gradients with respect to all inputs using JAX autodiff
-    through the XLA reference implementation.
-
     Args:
         residual: Tensors saved from the forward pass (w, u, k, v, state).
         grads: A tuple containing gradients (do, dstate) of output and final state.
-
-    Returns:
-        A tuple of gradients (dw, du, dk, dv, dstate_in) for all inputs.
     """
-    (w, u, k, v, state, state_was_none) = residual
-    do, dstate = grads
-
-    def f(w_, u_, k_, v_, state_):
-        return xla_rwkv4(w_, u_, k_, v_, state_)
-
-    (o_ref, state_ref), vjp = jax.vjp(f, w, u, k, v, state)
-    del o_ref, state_ref
-    dw, du, dk, dv, dstate_in = vjp((do, dstate))
-    if state_was_none:
-        dstate_in = None
-    return dw, du, dk, dv, dstate_in
+    del residual, grads
+    raise NotImplementedError("rwkv4 Triton backward is not implemented. Fallback gradients are disabled.")
 
 
 @partial(jax.custom_vjp)

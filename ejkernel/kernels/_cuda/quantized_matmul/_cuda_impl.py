@@ -83,8 +83,6 @@ def _mode_to_id(mode: str) -> int:
         mxfp8      3
         nvfp4      4
         nvfp8      5
-        w4a16      6
-        w8a16      7
         ========  ==
 
     Args:
@@ -109,12 +107,8 @@ def _mode_to_id(mode: str) -> int:
         return 4
     if mode == "nvfp8":
         return 5
-    if mode == "w4a16":
-        return 6
-    if mode == "w8a16":
-        return 7
     raise ValueError(
-        "CUDA quantized_matmul supports affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8, w4a16, w8a16 modes."
+        "CUDA quantized_matmul supports affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8 modes."
     )
 
 
@@ -176,8 +170,7 @@ def quantized_matmul_cuda(
             ``mxfp8``/``nvfp8`` and 4 for all other modes. Affine mode
             accepts values in {2, 3, 4, 5, 6, 7, 8}.
         mode: Quantization scheme. One of ``"affine"``, ``"nf4"``,
-            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``,
-            ``"w4a16"``, or ``"w8a16"``.
+            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, or ``"nvfp8"``.
 
     Returns:
         Result matrix of shape ``(M, N)`` with the same dtype as ``x``.
@@ -197,7 +190,7 @@ def quantized_matmul_cuda(
     mode_id = _mode_to_id(mode)
     mode = mode.lower()
     if bits is None:
-        if mode in ("mxfp8", "nvfp8", "w8a16"):
+        if mode in ("mxfp8", "nvfp8"):
             bits = 8
         else:
             bits = 4
@@ -207,8 +200,6 @@ def quantized_matmul_cuda(
             group_size = 32
         elif mode in ("nvfp4", "nvfp8"):
             group_size = 16
-        elif mode in ("w4a16", "w8a16"):
-            group_size = int(x.shape[1])
         else:
             group_size = 64
     group_size = int(group_size)
@@ -227,17 +218,8 @@ def quantized_matmul_cuda(
         raise ValueError("CUDA quantized_matmul nvfp4 requires bits=4.")
     if mode == "nvfp8" and bits != 8:
         raise ValueError("CUDA quantized_matmul nvfp8 requires bits=8.")
-    if mode == "w4a16" and bits != 4:
-        raise ValueError("CUDA quantized_matmul w4a16 requires bits=4.")
-    if mode == "w8a16" and bits != 8:
-        raise ValueError("CUDA quantized_matmul w8a16 requires bits=8.")
-    if mode in ("w4a16", "w8a16"):
-        if not transpose:
-            raise ValueError("CUDA quantized_matmul w4a16/w8a16 requires transpose=True.")
-        if group_size != int(x.shape[1]):
-            raise ValueError("CUDA quantized_matmul w4a16/w8a16 requires group_size=K.")
-    if transpose and mode not in ("w4a16", "w8a16"):
-        raise ValueError("CUDA quantized_matmul transpose=True only supports w4a16/w8a16.")
+    if transpose:
+        raise ValueError("CUDA quantized_matmul does not support transpose=True.")
 
     m, k = int(x.shape[0]), int(x.shape[1])
     if scales.ndim != 2:

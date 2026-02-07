@@ -95,7 +95,7 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
 
     Implements a layer-aware linear attention mechanism optimized for deep transformer
     architectures. The attention computation combines intra-block causal attention
-    with inter-block linear attention, achieving O(N) complexity with O(K×V) memory
+    with inter-block linear attention, achieving O(N) complexity with O(KxV) memory
     per head.
 
     Features:
@@ -173,7 +173,7 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: LightningAttentionConfig,
     ) -> (
@@ -322,7 +322,7 @@ def lightning_attention(
     softmax_scale: float | None = None,
     reverse: bool = False,
     return_state: bool = False,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: LightningAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

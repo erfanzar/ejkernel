@@ -1,0 +1,418 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CuTe Flash Attention public interface."""
+
+from __future__ import annotations
+
+import functools
+
+import jax
+import jaxtyping
+from beartype import beartype
+from jax import lax
+from jax import numpy as jnp
+from jaxtyping import Array, Bool, DTypeLike, Float, Int
+
+from ejkernel.errors import EjkernelRuntimeError
+from ejkernel.ops import BwdParams, FwdParams
+
+from ..._registry import Backend, Platform, kernel_registry
+from ._cute_impl import flash_attention_cute_backward, flash_attention_cute_forward
+
+PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
+DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
+BlockTables = Int[Array, "batch max_blocks"]
+
+_SUPPORTED_DTYPES = {jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)}
+
+
+def _precision_is_default(precision: lax.PrecisionLike) -> bool:
+    """Return whether precision corresponds to ``lax.Precision.DEFAULT``."""
+    if isinstance(precision, int):
+        return int(precision) == 0
+    return precision == lax.Precision.DEFAULT
+
+
+def _validate_qkv_shapes(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    *,
+    block_tables: jax.Array | None,
+) -> None:
+    """Validate dense or paged Q/K/V shapes for the CuTe implementation."""
+    if query.ndim != 4:
+        raise ValueError("query must be rank-4 [batch, seq_len_q, num_heads, head_dim].")
+
+    batch, _, q_heads, q_dim = query.shape
+    if block_tables is None:
+        if key.ndim != 4 or value.ndim != 4:
+            raise ValueError("Dense key/value must be rank-4 [batch, seq_len_k, num_kv_heads, head_dim].")
+
+        bk, sk, hk, dk = key.shape
+        bv, sv, hv, dv = value.shape
+        if bk != batch or bv != batch:
+            raise ValueError(f"Batch mismatch: query={query.shape}, key={key.shape}, value={value.shape}")
+        if sk != sv:
+            raise ValueError(f"Key/value sequence mismatch: key={key.shape}, value={value.shape}")
+    else:
+        if block_tables.ndim != 2:
+            raise ValueError(f"block_tables must be rank-2 [batch, max_blocks], got {block_tables.shape}.")
+        if int(block_tables.shape[0]) != int(batch):
+            raise ValueError(
+                "block_tables batch dimension mismatch: "
+                f"query batch={batch}, block_tables batch={block_tables.shape[0]}."
+            )
+        if key.ndim != 4 or value.ndim != 4:
+            raise ValueError(
+                "Paged key/value caches must be rank-4 "
+                "[num_blocks, block_size, num_kv_heads, head_dim]."
+            )
+        hk, dk = key.shape[2], key.shape[3]
+        hv, dv = value.shape[2], value.shape[3]
+
+    if hk != hv:
+        raise ValueError(f"KV head mismatch between key and value: key={key.shape}, value={value.shape}")
+    if dk != q_dim or dv != q_dim:
+        raise ValueError(
+            f"Head dimension mismatch: query={q_dim}, key={dk}, value={dv}. "
+            "CUTE flash attention requires matching head dimensions."
+        )
+    if q_heads % hk != 0:
+        raise ValueError(f"query_heads ({q_heads}) must be divisible by kv_heads ({hk}) for GQA/MQA.")
+
+
+def _unsupported_reason(
+    *,
+    dropout_prob: float,
+    normalize_output: bool,
+    precision: lax.PrecisionLike,
+    logits_dtype: DTypeLike,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None,
+) -> str | None:
+    """Return a reason string when requested CuTe configuration is unsupported."""
+    reasons: list[str] = []
+    if float(dropout_prob) != 0.0:
+        reasons.append("dropout_prob must be 0.0")
+    if q_segment_ids is not None or kv_segment_ids is not None:
+        reasons.append("segment IDs are not supported")
+    if not normalize_output:
+        reasons.append("normalize_output must be True")
+    if not _precision_is_default(precision):
+        reasons.append("precision must be lax.Precision.DEFAULT")
+    if jnp.dtype(logits_dtype) != jnp.float32:
+        reasons.append("logits_dtype must be float32")
+    if not reasons:
+        return None
+    return "; ".join(reasons)
+
+
+def _lengths_from_cum_seqlens(
+    cum_seqlens: jax.Array,
+    *,
+    batch: int,
+    max_len: int,
+    name: str,
+) -> jax.Array:
+    """Validate cumulative lengths and return per-example lengths."""
+    cum = jnp.asarray(cum_seqlens)
+    if cum.ndim != 1:
+        raise ValueError(f"{name} must be rank-1 [batch + 1], got shape {cum.shape}.")
+    if int(cum.shape[0]) != int(batch + 1):
+        raise ValueError(f"{name} must have shape ({batch + 1},), got {cum.shape}.")
+    if not jnp.issubdtype(cum.dtype, jnp.integer):
+        raise ValueError(f"{name} must have an integer dtype, got {cum.dtype}.")
+
+    cum_i32 = cum.astype(jnp.int32)
+    try:
+        first = int(cum_i32[0])
+    except Exception:
+        first = None
+    if first is not None and first != 0:
+        raise ValueError(f"{name}[0] must be 0.")
+
+    lengths = cum_i32[1:] - cum_i32[:-1]
+    try:
+        min_len = int(jnp.min(lengths))
+    except Exception:
+        min_len = None
+    if min_len is not None and min_len < 0:
+        raise ValueError(f"{name} must be non-decreasing.")
+
+    try:
+        max_observed = int(jnp.max(lengths))
+    except Exception:
+        max_observed = None
+    if max_observed is not None and max_observed > max_len:
+        raise ValueError(f"{name} contains a sequence length greater than max_len={max_len}.")
+    return lengths
+
+
+def _merge_varlen_with_attention_mask(
+    attention_mask: jax.Array | None,
+    *,
+    cum_seqlens_q: jax.Array,
+    cum_seqlens_k: jax.Array,
+    batch: int,
+    q_len: int,
+    k_len: int,
+    causal: bool,
+) -> jax.Array:
+    """Merge explicit mask with a var-len mask derived from cumulative lengths."""
+    q_lengths = _lengths_from_cum_seqlens(
+        cum_seqlens_q,
+        batch=batch,
+        max_len=q_len,
+        name="cum_seqlens_q",
+    )
+    k_lengths = _lengths_from_cum_seqlens(
+        cum_seqlens_k,
+        batch=batch,
+        max_len=k_len,
+        name="cum_seqlens_k",
+    )
+
+    q_idx = jnp.arange(q_len, dtype=jnp.int32)[None, :]
+    k_idx = jnp.arange(k_len, dtype=jnp.int32)[None, :]
+    q_valid = q_idx < q_lengths[:, None]
+    k_valid = k_idx < k_lengths[:, None]
+    varlen_mask = q_valid[:, :, None] & k_valid[:, None, :]
+    if causal:
+        shift = (k_lengths - q_lengths)[:, None, None]
+        q_pos = jnp.arange(q_len, dtype=jnp.int32)[None, :, None]
+        k_pos = jnp.arange(k_len, dtype=jnp.int32)[None, None, :]
+        varlen_mask = varlen_mask & (k_pos <= (q_pos + shift))
+    varlen_mask = varlen_mask[:, None, :, :]
+
+    if attention_mask is None:
+        return varlen_mask
+
+    attn = jnp.asarray(attention_mask)
+    if attn.ndim != 4:
+        raise ValueError(
+            "attention_mask must have rank 4 with shape (batch, num_heads_or_1, seq_len_q, seq_len_k); "
+            f"got rank {attn.ndim} and shape {attn.shape}."
+        )
+    return (attn != 0) & varlen_mask
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9))
+def _flash_attention_call(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    attention_mask: jax.Array | None,
+    bias: jax.Array | None,
+    softmax_scale: float | None,
+    causal: bool,
+    sliding_window: int | tuple[int, int] | None,
+    fwd_params: FwdParams | None,
+    logits_soft_cap: float | None,
+    block_tables: jax.Array | None,
+    softmax_aux: jax.Array | None,
+) -> jax.Array:
+    """Differentiable CuTe Flash Attention call with custom backward behavior."""
+    return flash_attention_cute_forward(
+        query=query,
+        key=key,
+        value=value,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_aux=softmax_aux,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+        fwd_params=fwd_params,
+        block_tables=block_tables,
+    )
+
+
+def _flash_attention_call_fwd(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    attention_mask: jax.Array | None,
+    bias: jax.Array | None,
+    softmax_scale: float | None,
+    causal: bool,
+    sliding_window: int | tuple[int, int] | None,
+    fwd_params: FwdParams | None,
+    logits_soft_cap: float | None,
+    block_tables: jax.Array | None,
+    softmax_aux: jax.Array | None,
+) -> tuple[jax.Array, tuple]:
+    """Custom-VJP forward rule for CuTe Flash Attention."""
+    out = flash_attention_cute_forward(
+        query=query,
+        key=key,
+        value=value,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_aux=softmax_aux,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+        fwd_params=fwd_params,
+        block_tables=block_tables,
+    )
+    residual = (query, key, value, attention_mask, bias, block_tables, softmax_aux)
+    return out, residual
+
+
+def _flash_attention_call_bwd(
+    softmax_scale: float | None,
+    causal: bool,
+    sliding_window: int | tuple[int, int] | None,
+    fwd_params: FwdParams | None,
+    logits_soft_cap: float | None,
+    residual: tuple,
+    d_out: jax.Array,
+) -> tuple[jax.Array | None, jax.Array | None, jax.Array | None, None, None, None, None]:
+    """Custom-VJP backward rule for CuTe Flash Attention."""
+    del fwd_params
+    query, key, value, attention_mask, bias, block_tables, softmax_aux = residual
+    if block_tables is not None:
+        raise EjkernelRuntimeError(
+            "flash_attention (platform=cute): paged_kv backward is not supported in this implementation."
+        )
+    dq, dk, dv = flash_attention_cute_backward(
+        query=query,
+        key=key,
+        value=value,
+        d_out=d_out,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_aux=softmax_aux,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        sliding_window=sliding_window,
+        logits_soft_cap=logits_soft_cap,
+    )
+    return dq, dk, dv, None, None, None, None
+
+
+_flash_attention_call.defvjp(_flash_attention_call_fwd, _flash_attention_call_bwd)
+
+
+@kernel_registry.register("flash_attention", Platform.CUTE, Backend.GPU)
+@jaxtyping.jaxtyped(typechecker=beartype)
+def flash_attention(
+    query: Float[Array, "batch seq_len_q num_heads head_dim"],
+    key: DenseKV | PagedKV,
+    value: DenseKV | PagedKV,
+    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+    | None = None,
+    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    softmax_scale: float | None = None,
+    dropout_prob: float = 0.0,
+    causal: bool = False,
+    dropout_seed: int | None = None,
+    cum_seqlens_q: Int[Array, "batch_plus_one"] | None = None,
+    cum_seqlens_k: Int[Array, "batch_plus_one"] | None = None,
+    sliding_window: int | tuple[int, int] | None = None,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
+    logits_soft_cap: float | None = None,
+    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    normalize_output: bool = True,
+    precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
+    logits_dtype: DTypeLike = jnp.float32,
+    *,
+    q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
+    kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
+    block_tables: BlockTables | None = None,
+) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+    """Compute flash attention on the CuTe backend.
+
+    Dense mode supports custom backward. Paged-KV mode is forward-only and
+    raises an explicit runtime error if differentiated.
+    """
+    del dropout_seed, bwd_params
+    _validate_qkv_shapes(query, key, value, block_tables=block_tables)
+
+    if (
+        jnp.dtype(query.dtype) not in _SUPPORTED_DTYPES
+        or jnp.dtype(key.dtype) not in _SUPPORTED_DTYPES
+        or jnp.dtype(value.dtype) not in _SUPPORTED_DTYPES
+    ):
+        raise EjkernelRuntimeError(
+            "flash_attention (platform=cute) supports only float16, bfloat16, and float32 dtypes."
+        )
+
+    reason = _unsupported_reason(
+        dropout_prob=dropout_prob,
+        normalize_output=normalize_output,
+        precision=precision,
+        logits_dtype=logits_dtype,
+        q_segment_ids=q_segment_ids,
+        kv_segment_ids=kv_segment_ids,
+    )
+    if reason is not None:
+        raise EjkernelRuntimeError(
+            "flash_attention (platform=cute) does not support requested configuration: "
+            f"{reason}."
+        )
+
+    if (cum_seqlens_q is None) != (cum_seqlens_k is None):
+        raise EjkernelRuntimeError(
+            "flash_attention (platform=cute): cum_seqlens_q and cum_seqlens_k must be provided together."
+        )
+    if block_tables is not None and (cum_seqlens_q is not None or cum_seqlens_k is not None):
+        raise EjkernelRuntimeError(
+            "flash_attention (platform=cute): block_tables cannot be combined with cum_seqlens_*."
+        )
+    if softmax_aux is not None and jnp.asarray(softmax_aux).ndim != 1:
+        raise EjkernelRuntimeError(
+            "flash_attention (platform=cute): softmax_aux must be rank-1 [num_sinks]."
+        )
+
+    merged_attention_mask = attention_mask
+    effective_causal = causal
+    if cum_seqlens_q is not None and cum_seqlens_k is not None:
+        merged_attention_mask = _merge_varlen_with_attention_mask(
+            attention_mask,
+            cum_seqlens_q=cum_seqlens_q,
+            cum_seqlens_k=cum_seqlens_k,
+            batch=int(query.shape[0]),
+            q_len=int(query.shape[1]),
+            k_len=int(key.shape[1]),
+            causal=causal,
+        )
+        if causal:
+            # For var-len mode, causal masking depends on per-example q/k length shift.
+            # The shifted causal relation is encoded in `merged_attention_mask`.
+            effective_causal = False
+
+    return _flash_attention_call(
+        query,
+        key,
+        value,
+        merged_attention_mask,
+        bias,
+        softmax_scale,
+        effective_causal,
+        sliding_window,
+        fwd_params,
+        logits_soft_cap,
+        block_tables,
+        softmax_aux,
+    )
+
+
+__all__ = ["flash_attention"]

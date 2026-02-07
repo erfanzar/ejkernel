@@ -169,7 +169,7 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
         sliding_window: int | tuple[int, int] | None = None,
         cum_seqlens_q: Int[Array, "batch"] | None = None,
         cum_seqlens_k: Int[Array, "batch"] | None = None,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: ScaledDotProductAttentionConfig,
     ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
@@ -239,7 +239,7 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
         softmax_scale: float | None = None,
         causal: bool = False,
         sliding_window: int | tuple[int, int] | None = None,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     ):
         """Create a shard_map wrapper for distributed ScaledDotProductAttention execution.
 
@@ -379,7 +379,7 @@ def scaled_dot_product_attention(
     softmax_scale: float | None = None,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     mesh: jax.sharding.Mesh | None = None,
     in_specs: tuple[jax.sharding.PartitionSpec, ...] | None = None,
     out_specs: jax.sharding.PartitionSpec | None = None,

@@ -28,8 +28,19 @@ def _device_put_all(dev, *arrays):
     return [jax.device_put(arr, dev) for arr in arrays]
 
 
-@pytest.mark.parametrize("mode", ["affine", "nf4"])
-def test_quantized_matmul_triton_matches_xla(mode: str):
+@pytest.mark.parametrize(
+    "mode,bits",
+    [
+        ("affine", 4),
+        ("affine", 8),
+        ("nf4", 4),
+        ("mxfp4", 4),
+        ("mxfp8", 8),
+        ("nvfp4", 4),
+        ("nvfp8", 8),
+    ],
+)
+def test_quantized_matmul_triton_matches_xla(mode: str, bits: int):
     key = jax.random.PRNGKey(0 if mode == "affine" else 1)
     kx, kw = jax.random.split(key, 2)
     m, k, n = 16, 64, 64
@@ -37,7 +48,7 @@ def test_quantized_matmul_triton_matches_xla(mode: str):
     x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
     w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
 
-    packed = prepack_quantized_weights(w, mode=mode)
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
         w_q, scales, biases = packed
     else:
@@ -56,6 +67,7 @@ def test_quantized_matmul_triton_matches_xla(mode: str):
         biases,
         transpose=False,
         mode=mode,
+        bits=bits,
     )
     out_xla = xla_quantized_matmul(
         x,
@@ -64,6 +76,7 @@ def test_quantized_matmul_triton_matches_xla(mode: str):
         biases,
         transpose=False,
         mode=mode,
+        bits=bits,
     )
 
     out_triton = jax.block_until_ready(out_triton)

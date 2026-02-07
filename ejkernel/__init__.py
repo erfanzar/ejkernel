@@ -41,6 +41,7 @@ Example:
 import os as _os
 
 _os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+_os.environ.setdefault("CUTE_DSL_ENABLE_TVM_FFI", "1")
 
 __version__ = "0.0.55"
 
@@ -52,8 +53,8 @@ kernel_registry.validate_signatures(None)
 
 __all__ = (
     "Backend",
-    "Platform",
     "EjkernelRuntimeError",
+    "Platform",
     "kernel_registry",
     "kernels",
     "modules",

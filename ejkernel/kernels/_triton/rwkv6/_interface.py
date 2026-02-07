@@ -66,13 +66,11 @@ from __future__ import annotations
 from functools import partial
 
 import jax
-import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
-from ..._xla.rwkv6 import rwkv6 as xla_rwkv6
 from ._triton_impl_fwd import fwd_triton_impl
 
 
@@ -132,60 +130,15 @@ def _bwd_call(
 ):
     """Backward pass for RWKV-6 recurrence in a custom VJP.
 
-    Computes gradients with respect to all inputs using JAX autodiff
-    through the XLA reference implementation.
-
     Args:
         softmax_scale: Non-differentiable scaling factor.
         reverse: Non-differentiable reverse flag.
         cu_seqlens: Non-differentiable cumulative sequence lengths.
         residual: Tensors saved from the forward pass.
         grads: A tuple containing gradients (do, dht) of output and final state.
-
-    Returns:
-        A tuple of gradients (dr, dk, dv, dw, du, dh0) for all inputs.
     """
-    (r, k, v, w, u, softmax_scale_saved, initial_state, reverse_saved, cu_seqlens_saved) = residual
-    do, dht = grads
-    del reverse_saved, cu_seqlens_saved
-
-    if softmax_scale is None:
-        softmax_scale = softmax_scale_saved
-
-    def f(r_, k_, v_, w_, u_, h0_):
-        return xla_rwkv6(
-            r=r_,
-            k=k_,
-            v=v_,
-            w=w_,
-            u=u_,
-            softmax_scale=softmax_scale,
-            initial_state=h0_,
-            reverse=reverse,
-            cu_seqlens=cu_seqlens,
-        )
-
-    if initial_state is None:
-        if cu_seqlens is None:
-            B, _, H, K = r.shape
-            V = v.shape[-1]
-            h0 = jnp.zeros((B, H, K, V), dtype=jnp.float32)
-        else:
-            N = cu_seqlens.shape[0] - 1
-            H, K = r.shape[2], r.shape[3]
-            V = v.shape[-1]
-            h0 = jnp.zeros((N, H, K, V), dtype=jnp.float32)
-        h0_in = None
-    else:
-        h0 = initial_state
-        h0_in = initial_state
-
-    (o_ref, ht_ref), vjp = jax.vjp(f, r, k, v, w, u, h0)
-    del o_ref, ht_ref
-    dr, dk, dv, dw, du, dh0 = vjp((do, dht))
-    if h0_in is None:
-        dh0 = None
-    return dr, dk, dv, dw, du, dh0
+    del softmax_scale, reverse, cu_seqlens, residual, grads
+    raise NotImplementedError("rwkv6 Triton backward is not implemented. Fallback gradients are disabled.")
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(5, 7, 8))

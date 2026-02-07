@@ -87,7 +87,7 @@ class RWKV7(Kernel[RWKV7Config, Array]):
     """RWKV-7 (a,b) DPLR recurrence wrapper.
 
     Implements the RWKV-7 Diagonal + Low-Rank (DPLR) state update, achieving
-    O(T) complexity with O(K×V) memory per head. The DPLR mechanism provides
+    O(T) complexity with O(KxV) memory per head. The DPLR mechanism provides
     richer state dynamics than purely diagonal decay.
 
     State update equation:
@@ -168,7 +168,7 @@ class RWKV7(Kernel[RWKV7Config, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         cfg: RWKV7Config,
     ) -> (
         Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -269,7 +269,7 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
     """RWKV-7 multiplicative (kk, a) parameterization wrapper.
 
     A reparameterization of RWKV-7 using (kk, a) inputs instead of (a, b),
-    achieving O(T) complexity with O(K×V) memory per head. Internally converts
+    achieving O(T) complexity with O(KxV) memory per head. Internally converts
     to the standard DPLR form via:
 
         a' = kk * a
@@ -344,7 +344,7 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         cfg: RWKV7MulConfig,
     ) -> (
         Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -483,7 +483,7 @@ def rwkv7(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: RWKV7Config | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -549,7 +549,7 @@ def rwkv7_mul(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: RWKV7MulConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

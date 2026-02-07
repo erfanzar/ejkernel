@@ -15,6 +15,10 @@ def has_triton() -> bool:
     return importlib.util.find_spec("triton") is not None
 
 
+def has_cutlass() -> bool:
+    return importlib.util.find_spec("cutlass") is not None
+
+
 def rand_qkv(
     key: jax.Array,
     *,

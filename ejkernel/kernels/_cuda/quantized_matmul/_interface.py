@@ -27,9 +27,6 @@ It supports the following quantization modes via the underlying CUDA kernel:
 * **nf4** -- 4-bit NormalFloat quantization.
 * **mxfp4** / **mxfp8** -- Microscaling FP4/FP8 formats.
 * **nvfp4** / **nvfp8** -- NVIDIA FP4/FP8 formats.
-* **w4a16** / **w8a16** -- 4/8-bit affine quantization with per-channel scale.
-* **w4a16** / **w8a16** -- 4/8-bit affine quantization with per-channel scale
-  (weights in NxK layout, transpose=True).
 
 For modes not natively supported by the CUDA kernel, the function
 transparently falls back to the XLA-based implementation.
@@ -51,7 +48,7 @@ from ejkernel.callib._ejit import ejit
 from ..._registry import Backend, Platform, kernel_registry
 from ._cuda_impl import quantized_matmul_cuda
 
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8", "w4a16", "w8a16"]
+QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 """Type alias for the supported quantization mode strings."""
 
 
@@ -99,7 +96,7 @@ def quantized_matmul(
         biases: Per-group bias values with the same shape as *scales*.
             Required for ``"affine"`` mode. Defaults to ``None``.
         transpose: Whether the weight matrix uses ``(N, K)`` layout.
-            ``w4a16``/``w8a16`` require ``True`` (weights packed along K).
+            The CUDA backend currently requires ``transpose=False``.
         group_size: Number of output features per quantization group.
             Inferred from *mode* when ``None``: 32 for ``mxfp4``/``mxfp8``,
             16 for ``nvfp4``/``nvfp8``, 64 otherwise.
@@ -107,8 +104,7 @@ def quantized_matmul(
             ``None``: 8 for 8-bit modes, 4 for all others. Affine mode
             accepts 2--8.
         mode: Quantization scheme. One of ``"affine"``, ``"nf4"``,
-            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``,
-            ``"w4a16"``, ``"w8a16"``. Other
+            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``. Other
             values trigger an XLA fallback.
         block_m: Ignored (Triton API compatibility). Defaults to 128.
         block_n: Ignored (Triton API compatibility). Defaults to 128.

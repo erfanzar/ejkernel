@@ -74,12 +74,17 @@ from __future__ import annotations
 import copy
 import dataclasses
 import functools
+import hashlib
 import inspect
 import os
+import pickle
+import shutil
 import tempfile
 import types
 import zlib
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -92,7 +97,7 @@ from jax._src import core, state, util
 from jax._src.lib import gpu_triton as triton_kernel_call_lib
 from jax.interpreters import ad, batching, mlir, xla
 
-from ._utils import ShapeDtype
+from ._utils import ShapeDtype, check_bool_flag, get_cache_dir
 
 CAN_USE_TRITON = False
 try:
@@ -143,6 +148,35 @@ Grid = int | tuple[int] | tuple[int, int] | tuple[int, int, int]
 GridOrLambda = Grid | Callable[[dict[str, Any]], Grid]
 
 
+def _parse_int_env(name: str, default: int) -> int:
+    """Parse an integer environment variable with a fallback default."""
+    value = os.getenv(name, str(default))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+TRITON_CACHE_ENABLED = check_bool_flag(
+    "EJKERNEL_TRITON_CACHE_COMPILES",
+    check_bool_flag("EASYDEL_TRITON_CACHE_COMPILES", False),
+)
+TRITON_CACHE_VERBOSE = check_bool_flag(
+    "EJKERNEL_TRITON_CACHE_VERBOSE",
+    check_bool_flag("EASYDEL_TRITON_CACHE_VERBOSE", False),
+)
+TRITON_CACHE_MAX_ITEMS = _parse_int_env(
+    "EJKERNEL_TRITON_CACHE_MAX_ITEMS",
+    _parse_int_env("EASYDEL_TRITON_CACHE_MAX_ITEMS", 256),
+)
+TRITON_CACHE_DIR = Path(
+    os.getenv(
+        "EJKERNEL_TRITON_CACHE_DIR",
+        os.getenv("EASYDEL_TRITON_CACHE_DIR", str(get_cache_dir() / "triton_kernels")),
+    )
+)
+
+
 def normalize_grid(grid: GridOrLambda, metaparams) -> tuple[int, int, int]:
     """Normalize grid specification to a 3D tuple.
 
@@ -175,6 +209,180 @@ def avals_to_layouts(avals):
         List of layout specifications as reversed dimension ranges.
     """
     return [list(reversed(range(aval.ndim))) for aval in avals]
+
+
+def _device_set_from_sharding(sharding) -> set | None:
+    """Extract the participating devices from a sharding object.
+
+    Args:
+        sharding: JAX sharding object.
+
+    Returns:
+        Set of devices referenced by the sharding, or ``None`` if unavailable.
+    """
+    for attr_name in ("device_set", "devices"):
+        # Some sharding objects (e.g. AbstractMesh-backed shardings during jit
+        # tracing) raise on attribute access; treat those as "unknown".
+        try:
+            attr = getattr(sharding, attr_name, None)
+        except Exception:
+            continue
+        if attr is None:
+            continue
+        try:
+            devices = attr() if callable(attr) else attr
+        except Exception:
+            continue
+        if devices is not None:
+            return set(devices)
+    return None
+
+
+def _array_device_set(arg: Any) -> set | None:
+    """Return the device set for a JAX array or tracer.
+
+    Args:
+        arg: Potential array-like argument.
+
+    Returns:
+        Set of devices touched by ``arg``. Returns ``None`` for non-array
+        values or when device placement cannot be inferred.
+    """
+    if isinstance(arg, jax.Array):
+        device_attr = getattr(arg, "device", None)
+        if device_attr is not None:
+            try:
+                device = device_attr() if callable(device_attr) else device_attr
+            except Exception:
+                device = None
+            if device is not None:
+                return {device}
+
+        devices_attr = getattr(arg, "devices", None)
+        if devices_attr is not None:
+            try:
+                devices = devices_attr() if callable(devices_attr) else devices_attr
+            except Exception:
+                devices = None
+            if devices is not None:
+                return set(devices)
+
+        sharding = getattr(arg, "sharding", None)
+        if sharding is not None:
+            device_set = _device_set_from_sharding(sharding)
+            if device_set is not None:
+                return device_set
+
+    if isinstance(arg, core.Tracer):
+        aval = getattr(arg, "aval", None)
+        sharding = getattr(aval, "sharding", None)
+        if sharding is not None:
+            device_set = _device_set_from_sharding(sharding)
+            if device_set is not None:
+                return device_set
+
+    return None
+
+
+def _assert_single_device_args(
+    array_args: Sequence[Any],
+    device_index: int | None,
+    *,
+    allow_sharded_tracers: bool,
+) -> None:
+    """Validate that all array arguments are on one logical device.
+
+    Args:
+        array_args: Array or tracer arguments to validate.
+        device_index: Optional requested device index.
+        allow_sharded_tracers: Whether traced sharded values are allowed.
+
+    Raises:
+        AssertionError: If arguments span multiple devices, if arrays are on
+            different devices, or if placement conflicts with ``device_index``.
+    """
+    device_sets: list[tuple[int, set, bool]] = []
+    for idx, arg in enumerate(array_args):
+        devs = _array_device_set(arg)
+        if devs is not None:
+            device_sets.append((idx, devs, isinstance(arg, core.Tracer)))
+
+    if not device_sets:
+        return
+
+    for idx, devs, is_tracer in device_sets:
+        if len(devs) != 1:
+            if allow_sharded_tracers and is_tracer:
+                continue
+            raise AssertionError(
+                "triton_call requires all array arguments to be on a single device. "
+                f"Argument {idx} is sharded across {len(devs)} devices. "
+                "Use `jax.shard_map` for multi-device execution."
+            )
+
+    single_device_sets = [(idx, devs) for idx, devs, _ in device_sets if len(devs) == 1]
+    if not single_device_sets:
+        return
+
+    first_device = next(iter(single_device_sets[0][1]))
+    for idx, devs in single_device_sets[1:]:
+        if next(iter(devs)) != first_device:
+            raise AssertionError(
+                "triton_call requires all array arguments to be on the same device. "
+                f"Argument {idx} is on a different device than argument {single_device_sets[0][0]}."
+            )
+
+    if device_index is None:
+        return
+
+    try:
+        platform = getattr(first_device, "platform", None)
+        devices = jax.devices(platform) if platform else jax.devices()
+        if 0 <= device_index < len(devices) and devices[device_index] != first_device:
+            raise AssertionError(
+                "triton_call received inputs on a different device than the requested "
+                f"`device={device_index}`. Place inputs on the target device or adjust "
+                "the `device` argument."
+            )
+    except Exception:
+        return
+
+
+def _has_multi_accelerators() -> bool:
+    """Check whether more than one non-CPU accelerator is available."""
+    try:
+        devices = jax.devices()
+    except Exception:
+        return False
+    accelerator_devices = [
+        device for device in devices if getattr(device, "platform", None) not in (None, "cpu")
+    ]
+    return len(accelerator_devices) > 1
+
+
+def _in_shard_map_context() -> bool:
+    """Check whether execution is currently inside a shard_map context."""
+    try:
+        from jax._src import mesh as mesh_lib
+
+        env = getattr(mesh_lib, "thread_resources", None)
+        env = getattr(env, "env", None)
+        physical_mesh = getattr(env, "physical_mesh", None)
+        axis_names = getattr(physical_mesh, "axis_names", None)
+        if axis_names:
+            return True
+    except Exception:
+        pass
+
+    try:
+        axis_env = core.thread_local_state.trace_state.axis_env
+        axis_names = getattr(axis_env, "names", None)
+        if axis_names:
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def get_triton_type(obj: Any) -> str:
@@ -398,7 +606,7 @@ def compile_ttir_to_ptx_inplace(
     if cuda_options.debug:
         print(ptx)
     name = metadata["name"]
-    cluster_dims = metadata["cluster_dims"]
+    cluster_dims = metadata.get("cluster_dims", (0, 0, 0))
     return CompilationResult(
         binary=ptx,
         name=name,
@@ -467,7 +675,149 @@ def compile_ttir_to_hsaco_inplace(
     )
 
 
-_COMPILED_KERNEL_CACHE = {}
+def _log_triton_cache(msg: str) -> None:
+    if TRITON_CACHE_VERBOSE:
+        print(msg)
+
+
+def _get_triton_cache_dir() -> Path:
+    TRITON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return TRITON_CACHE_DIR
+
+
+def _triton_kernel_source_hash(fn: triton.JITFunction) -> str:
+    try:
+        source = inspect.getsource(fn.fn)
+    except (OSError, TypeError):
+        code = fn.fn.__code__
+        source = repr((code.co_code, code.co_consts, code.co_names))
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _make_triton_cache_key(
+    *,
+    fn: triton.JITFunction,
+    platform: str,
+    compute_capability: int,
+    signature: tuple[tuple[str, str], ...],
+    specialization: tuple[str, ...],
+    constants: tuple[tuple[str, Any], ...],
+    num_warps: int,
+    num_stages: int,
+    num_ctas: int,
+    enable_fp_fusion: bool,
+) -> str:
+    source_hash = _triton_kernel_source_hash(fn)
+    payload = (
+        triton.__version__,
+        jax.__version__,
+        platform,
+        compute_capability,
+        fn.__module__,
+        fn.fn.__name__,
+        source_hash,
+        signature,
+        specialization,
+        constants,
+        num_warps,
+        num_stages,
+        num_ctas,
+        enable_fp_fusion,
+    )
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _invalidate_triton_cache_entry(cache_key: str, reason: str) -> None:
+    cache_dir = _get_triton_cache_dir() / cache_key
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    _log_triton_cache(f"[triton-cache] invalidated {cache_key}: {reason}")
+
+
+def _load_triton_kernel_cache(
+    cache_key: str,
+    *,
+    platform: str,
+    compute_capability: int,
+) -> CompilationResult | None:
+    cache_path = _get_triton_cache_dir() / cache_key / "kernel.pkl"
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("rb") as f:
+            data = pickle.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("invalid cache payload")
+        if data.get("platform") != platform:
+            raise ValueError("platform mismatch")
+        if data.get("compute_capability") != compute_capability:
+            raise ValueError("compute capability mismatch")
+        binary = data.get("binary")
+        if not isinstance(binary, (bytes, bytearray)):
+            raise ValueError("invalid binary payload")
+        if platform == "cuda":
+            binary = binary.decode("utf-8")
+        return CompilationResult(
+            binary=binary,  # str for cuda, bytes for rocm
+            name=data["name"],
+            shared_mem_bytes=data["shared_mem_bytes"],
+            cluster_dims=tuple(data.get("cluster_dims", (0, 0, 0))),
+            ttgir=None,
+            llir=None,
+        )
+    except Exception as exc:
+        _invalidate_triton_cache_entry(cache_key, f"load failed: {exc}")
+        return None
+
+
+def _save_triton_kernel_cache(
+    cache_key: str,
+    compilation_result: CompilationResult,
+    *,
+    platform: str,
+    compute_capability: int,
+    ttir: str | None,
+) -> None:
+    cache_dir = _get_triton_cache_dir() / cache_key
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "kernel.pkl"
+    tmp_path = cache_dir / "kernel.pkl.tmp"
+
+    if platform == "rocm":
+        with open(compilation_result.binary, "rb") as f:
+            binary = f.read()
+    else:
+        binary = compilation_result.binary.encode("utf-8")
+
+    payload = {
+        "platform": platform,
+        "compute_capability": compute_capability,
+        "binary": binary,
+        "name": compilation_result.name,
+        "shared_mem_bytes": compilation_result.shared_mem_bytes,
+        "cluster_dims": compilation_result.cluster_dims,
+        "ttir": ttir,
+    }
+    with tmp_path.open("wb") as f:
+        pickle.dump(payload, f)
+    os.replace(tmp_path, cache_path)
+
+
+_COMPILED_KERNEL_CACHE: OrderedDict[str, triton_kernel_call_lib.TritonKernel] = OrderedDict()  # type:ignore
+
+
+def _lru_get(cache: OrderedDict, key: str):
+    kernel = cache.get(key)
+    if kernel is not None:
+        cache.move_to_end(key)
+    return kernel
+
+
+def _lru_set(cache: OrderedDict, key: str, value) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    if len(cache) > TRITON_CACHE_MAX_ITEMS:
+        cache.popitem(last=False)
 
 
 def get_or_create_triton_kernel(
@@ -524,40 +874,104 @@ def get_or_create_triton_kernel(
     alignments = [16] * len(arg_dtypes)
     for i, _, value in scalar_args:
         alignments[i] = value
-    specialize_extra = backend.get_arg_specialization
-    if specialize_impl := getattr(triton.runtime.jit, "specialize_impl", None):
-        specialize_impl = functools.partial(specialize_impl, specialize_extra=specialize_extra)
-    else:
-        create_specialize_impl = triton.runtime.jit.create_specialize_impl
-        if len(inspect.signature(create_specialize_impl).parameters) == 0:
-            specialize_impl = functools.partial(create_specialize_impl(), specialize_extra=specialize_extra)
+    scalar_values = {i: value for i, _, value in scalar_args}
+    if hasattr(backend, "get_arg_specialization"):
+        specialize_extra = backend.get_arg_specialization
+        if specialize_impl := getattr(triton.runtime.jit, "specialize_impl", None):
+            specialize_impl = functools.partial(specialize_impl, specialize_extra=specialize_extra)
         else:
-            specialize_impl = create_specialize_impl(specialize_extra)
-    specialization = [
-        specialize_impl(
-            types.SimpleNamespace(data_ptr=lambda alignment=alignment: alignment, dtype=arg_dtype.removeprefix("*")),
-        )
-        for arg_dtype, alignment in safe_zip(arg_dtypes, alignments)
-    ]
-    attrs = {(i,): backend.parse_attr(attr) for i, (_, attr) in enumerate(specialization)}
+            create_specialize_impl = triton.runtime.jit.create_specialize_impl
+            if len(inspect.signature(create_specialize_impl).parameters) == 0:
+                specialize_impl = functools.partial(create_specialize_impl(), specialize_extra=specialize_extra)
+            else:
+                specialize_impl = create_specialize_impl(specialize_extra)
+        specialization = [
+            specialize_impl(
+                types.SimpleNamespace(data_ptr=lambda alignment=alignment: alignment, dtype=arg_dtype.removeprefix("*")),
+            )
+            for arg_dtype, alignment in safe_zip(arg_dtypes, alignments)
+        ]
+    else:
+        specialize_impl = triton.runtime.jit.native_specialize_impl
+        specialization = []
+        for i, (arg_dtype, alignment) in enumerate(safe_zip(arg_dtypes, alignments)):
+            if i in scalar_values:
+                specialization.append(specialize_impl(backend, scalar_values[i], False, True, True))
+            else:
+                arg = types.SimpleNamespace(
+                    data_ptr=lambda alignment=alignment: alignment,
+                    dtype=arg_dtype.removeprefix("*"),
+                )
+                specialization.append(specialize_impl(backend, arg, False, True, True))
+    attrs = {}
+    for i, (_, attr) in enumerate(specialization):
+        if not isinstance(attr, str):
+            attr = ""
+        attrs[(i,)] = backend.parse_attr(attr)
     constants = dict(metaparams)
     constants.update({k: None for _, k, v in scalar_args if v is None})
     constants.update({fn.arg_names[i]: 1 for i, _, v in scalar_args if v == 1})
     for constant in constants:
         signature[constant] = "constexpr"
 
-    cache_key = (
-        fn,
-        tuple(signature.items()),
-        tuple(specialization),
-        tuple(constants.items()),
-        num_warps,
-        num_stages,
-        num_ctas,
-        compute_capability,
-        enable_fp_fusion,
+    signature_key = tuple(signature.items())
+    specialization_key = tuple(repr(item) for item in specialization)
+    constants_key = tuple(sorted(constants.items()))
+
+    cache_key = _make_triton_cache_key(
+        fn=fn,
+        platform=platform,
+        compute_capability=compute_capability,
+        signature=signature_key,
+        specialization=specialization_key,
+        constants=constants_key,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        num_ctas=num_ctas,
+        enable_fp_fusion=enable_fp_fusion,
     )
-    kernel = _COMPILED_KERNEL_CACHE.get(cache_key)
+    kernel = _lru_get(_COMPILED_KERNEL_CACHE, cache_key)
+    if kernel is not None:
+        _log_triton_cache(f"[triton-cache] hit (memory) key={cache_key}")
+
+    if kernel is None and TRITON_CACHE_ENABLED:
+        cached = _load_triton_kernel_cache(
+            cache_key,
+            platform=platform,
+            compute_capability=compute_capability,
+        )
+        if cached is not None:
+            _log_triton_cache(f"[triton-cache] hit (disk) key={cache_key}")
+            if platform == "rocm":
+                fd, hsaco_path = tempfile.mkstemp()
+                with os.fdopen(fd, "wb") as f:
+                    f.write(cached.binary)
+                cached_binary = hsaco_path
+            else:
+                cached_binary = cached.binary
+            try:
+                kernel = triton_kernel_call_lib.TritonKernel(
+                    cached.name,
+                    num_warps,
+                    num_ctas,
+                    cached.shared_mem_bytes,
+                    cached_binary,
+                    "",
+                    compute_capability,
+                )
+            except TypeError:
+                kernel = triton_kernel_call_lib.TritonKernel(
+                    cached.name,
+                    num_warps,
+                    cached.shared_mem_bytes,
+                    cached_binary,
+                    "",
+                    compute_capability,
+                    *cached.cluster_dims,
+                )
+            _lru_set(_COMPILED_KERNEL_CACHE, cache_key, kernel)
+        else:
+            _log_triton_cache(f"[triton-cache] miss (disk) key={cache_key}")
 
     if kernel is None:
         opts = {
@@ -609,7 +1023,19 @@ def get_or_create_triton_kernel(
                 *compilation_result.cluster_dims,
             )
 
-        _COMPILED_KERNEL_CACHE[cache_key] = kernel
+        _lru_set(_COMPILED_KERNEL_CACHE, cache_key, kernel)
+        if TRITON_CACHE_ENABLED:
+            try:
+                _save_triton_kernel_cache(
+                    cache_key,
+                    compilation_result,
+                    platform=platform,
+                    compute_capability=compute_capability,
+                    ttir=ttir if dump else None,
+                )
+                _log_triton_cache(f"[triton-cache] saved key={cache_key}")
+            except Exception as exc:
+                _log_triton_cache(f"[triton-cache] save failed key={cache_key}: {exc}")
 
     return kernel, attrs
 
@@ -925,7 +1351,7 @@ def triton_call(
     compute_capability: int | None = None,
     enable_fp_fusion: bool = True,
     input_output_aliases: dict[int, int] | None = None,
-    zeroed_outputs: (Sequence[int] | Callable[[dict[str, Any]], Sequence[int]]) = (),
+    zeroed_outputs: Sequence[int] | Callable[[dict[str, Any]], Sequence[int]] = (),
     debug: bool = False,
     serialized_metadata: bytes = b"",
     **metaparams: Any,
@@ -960,6 +1386,9 @@ def triton_call(
 
     Raises:
         ValueError: If Triton is not installed or for invalid configurations.
+        AssertionError: If array arguments are not on a single device, or if
+            multiple accelerators are available and the call is not under
+            ``jax.shard_map``.
     """
     if not CAN_USE_TRITON:
         raise ValueError("`triton_call` is only available when `triton` is installed.")
@@ -976,6 +1405,14 @@ def triton_call(
             scalar_args.append((i, get_triton_type(arg), float(arg)))
         else:
             array_args.append(arg)
+
+    in_shard_map_context = _in_shard_map_context()
+    _assert_single_device_args(array_args, device, allow_sharded_tracers=in_shard_map_context)
+    if _has_multi_accelerators() and not in_shard_map_context:
+        raise AssertionError(
+            "Multiple accelerator devices detected. "
+            "triton_call must be invoked under `jax.shard_map` in multi-accelerator setups."
+        )
 
     if input_output_aliases is None:
         input_output_aliases = {}

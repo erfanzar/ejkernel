@@ -171,7 +171,7 @@ class RecurrentAttention(Kernel[RecurrentAttentionConfig, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: RecurrentAttentionConfig,
     ) -> (
@@ -326,7 +326,7 @@ def recurrent_attention(
     softmax_scale: float | None = None,
     reverse: bool = False,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: RecurrentAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

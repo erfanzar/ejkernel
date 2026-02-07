@@ -23,6 +23,7 @@ model and JAX's functional array programming paradigm.
 Key Components:
     - ejit: Enhanced JIT decorator for JAX functions with persistent caching
     - triton_call: Interface for calling Triton kernels from JAX
+    - cute_call: Interface for calling CuTe DSL kernels from JAX
     - buffered_pallas_call: TPU-optimized Pallas kernel execution
     - Type conversion utilities for Triton/JAX compatibility
     - Mathematical helper functions for kernel development
@@ -30,6 +31,7 @@ Key Components:
 Functions:
     ejit: Enhanced JIT compilation with disk caching
     triton_call: Execute Triton kernels from JAX
+    cute_call: Execute CuTe DSL kernels from JAX
     buffered_pallas_call: Create buffered Pallas calls for TPU
     get_triton_type: Get Triton type string for objects
     cdiv: Ceiling division operation
@@ -37,7 +39,7 @@ Functions:
     strides_from_shape: Calculate array strides
 
 Example:
-    >>> from ejkernel.callib import ejit, triton_call, cdiv
+    >>> from ejkernel.callib import ejit, triton_call, cute_call, cdiv
     >>>
     >>> @ejit
     ... def fast_matmul(a, b):
@@ -71,6 +73,24 @@ def _raise_triton_unavailable(err: Exception) -> None:
     raise ValueError(
         "`triton_call` is only available when GPU Triton support is installed "
         "(install `ejkernel[gpu]` and use a CUDA/ROCm-enabled `jaxlib`)."
+    ) from err
+
+
+def _raise_cute_unavailable(err: Exception) -> None:
+    """Raise an error indicating CuTe is not available.
+
+    This helper function provides a consistent error message when attempting
+    to use CuTe functionality without proper GPU support installed.
+
+    Args:
+        err: The original import error that caused CuTe to be unavailable.
+
+    Raises:
+        ValueError: Always raised with installation instructions.
+    """
+    raise ValueError(
+        "`cute_call` is only available when CUTLASS CuTe is installed "
+        "(install `ejkernel[gpu]` and use a CUDA-enabled `jaxlib`)."
     ) from err
 
 
@@ -108,9 +128,30 @@ except (ImportError, ModuleNotFoundError) as _triton_import_error:  # pragma: no
         _raise_triton_unavailable(_triton_import_error)
 
 
+try:
+    from ._cute_call import cute_call
+except (ImportError, ModuleNotFoundError) as _cute_import_error:  # pragma: no cover
+
+    def cute_call(*args: Any, **kwargs: Any):  # type: ignore[override]
+        """Call a CuTe kernel from JAX (unavailable fallback).
+
+        This stub is active when CuTe is not installed. It always raises
+        an error directing the user to install GPU support.
+
+        Args:
+            *args: Ignored positional arguments.
+            **kwargs: Ignored keyword arguments.
+
+        Raises:
+            ValueError: Always, with installation instructions.
+        """
+        _raise_cute_unavailable(_cute_import_error)
+
+
 __all__ = (
     "buffered_pallas_call",
     "cdiv",
+    "cute_call",
     "ejit",
     "get_triton_type",
     "next_power_of_2",

@@ -218,19 +218,28 @@ class Executor(Generic[Cfg, Out]):
             return False
         return any(spec.platform == Platform.CUDA and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
 
+    @staticmethod
+    def _has_cute_impl(algorithm: str) -> bool:
+        """Check if a CuTe DSL implementation exists for the given algorithm."""
+        try:
+            specs = kernel_registry.list_implementations(algorithm)
+        except Exception:
+            return False
+        return any(spec.platform == Platform.CUTE and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
+
     def _prefer_cuda_cfg(self, cfg: Cfg, kernel: Kernel[Cfg, Out], inv: Invocation[Cfg, Out]) -> Cfg:
-        """Upgrade configuration to prefer native CUDA when conditions are met.
+        """Upgrade configuration to prefer CUTE/CUDA when conditions are met.
 
         Automatically switches the platform field in a configuration from 'auto'
-        or 'triton' to 'cuda' when all of the following conditions are satisfied:
+        or 'triton' to 'cute'/'cuda' when all of the following conditions are satisfied:
         - The current configuration platform is 'auto' or 'triton'
         - No explicit override configuration was provided
         - No explicit platform was specified in invocation kwargs
         - The current device is a GPU
         - The GPU is an NVIDIA GPU (not AMD ROCm)
-        - A native CUDA implementation exists in the kernel registry
+        - A CuTe or CUDA implementation exists in the kernel registry
 
-        This enables transparent use of optimized native CUDA kernels when
+        This enables transparent use of optimized CUTE/CUDA kernels when
         available, while gracefully falling back to Triton implementations
         on unsupported platforms.
 
@@ -246,7 +255,7 @@ class Executor(Generic[Cfg, Out]):
             original configuration unchanged.
         """
         platform_val = self._platform_value(getattr(cfg, "platform", None))
-        if platform_val is None or platform_val == "cuda":
+        if platform_val is None or platform_val in ("cuda", "cute"):
             return cfg
         if platform_val not in ("auto", "triton"):
             return cfg
@@ -261,14 +270,16 @@ class Executor(Generic[Cfg, Out]):
             return cfg
         if not self._is_nvidia_gpu():
             return cfg
-        if not self._has_cuda_impl(kernel.op_id):
+        has_cute = self._has_cute_impl(kernel.op_id)
+        has_cuda = self._has_cuda_impl(kernel.op_id)
+        if not has_cute and not has_cuda:
             return cfg
 
         if dataclasses.is_dataclass(cfg):
             fields = {field.name for field in dataclasses.fields(cfg)}
             updates = {}
             if "platform" in fields:
-                updates["platform"] = "cuda"
+                updates["platform"] = "cute" if has_cute else "cuda"
             if "backend" in fields:
                 updates["backend"] = "gpu"
             if updates:
@@ -278,7 +289,7 @@ class Executor(Generic[Cfg, Out]):
                     pass
         try:
             if hasattr(cfg, "platform"):
-                setattr(cfg, "platform", "cuda")
+                setattr(cfg, "platform", "cute" if has_cute else "cuda")
             if hasattr(cfg, "backend"):
                 setattr(cfg, "backend", "gpu")
         except Exception:

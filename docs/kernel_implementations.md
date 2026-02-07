@@ -9,6 +9,7 @@ The kernel implementations in ejKernel are organized by backend technology, with
 ```md
 ejkernel/kernels/
 ├── _triton/          # Triton GPU kernels (NVIDIA/AMD)
+├── _cute/            # CUTLASS CuTe DSL kernels (NVIDIA)
 ├── _pallas/          # Pallas kernels (TPU/GPU)
 │   ├── tpu/         # TPU-specific implementations
 │   └── gpu/         # GPU Pallas implementations
@@ -18,12 +19,13 @@ ejkernel/kernels/
 
 ## Implementation Comparison
 
-| Backend | Target Hardware | Programming Model | Performance | Features |
-|---------|----------------|------------------|-------------|-----------|
-| Triton | NVIDIA/AMD GPU | Block-based SIMD | Best on GPU | Full feature set |
-| Pallas | TPU/GPU | Block-based | Best on TPU | Limited features |
-| XLA | All devices | Functional | Good everywhere | Basic features |
-| CUDA | NVIDIA GPU | Direct CUDA | Maximum control | Under development |
+| Backend | Target Hardware | Programming Model | Performance       | Features                           |
+| ------- | --------------- | ----------------- | ----------------- | ---------------------------------- |
+| Triton  | NVIDIA/AMD GPU  | Block-based SIMD  | Best on GPU       | Full feature set                   |
+| CUTE    | NVIDIA GPU      | CUTLASS CuTe DSL  | Correctness-first | Quantized matmul + flash attention |
+| Pallas  | TPU/GPU         | Block-based       | Best on TPU       | Limited features                   |
+| XLA     | All devices     | Functional        | Good everywhere   | Basic features                     |
+| CUDA    | NVIDIA GPU      | Direct CUDA       | Maximum control   | Under development                  |
 
 ## Flash Attention Implementations
 

@@ -20,9 +20,8 @@ also implements the JAX custom-VJP rule so that:
 
 * The **forward pass** is dispatched to the compiled CUDA kernel via
   :func:`._cuda_impl.blocksparse_attention_cuda`.
-* The **backward pass** falls back to the XLA-based block-sparse attention
-  implementation to compute gradients for query, key, and value, because
-  the CUDA kernel currently provides a forward-only implementation.
+* The **backward pass** is not implemented by the CUDA path and raises
+  ``NotImplementedError`` when gradients are requested.
 
 Helper utilities for converting sparsity layouts to dense boolean masks and
 for creating empty placeholder layouts are also defined here.
@@ -43,83 +42,12 @@ from jaxtyping import Array, ArrayLike, Bool, Float, Int
 from ejkernel.callib import ejit
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask, create_sparsity_mask
-from ejkernel.kernels._xla.blocksparse_attention import blocksparse_attention as xla_blocksparse_attention
 from ejkernel.ops import BwdParams, FwdParams
 
 from ._cuda_impl import blocksparse_attention_cuda
 
 if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
-
-
-def _layouts_to_attention_mask(
-    layouts: tuple[SparseMask] | None,
-    *,
-    q_len: int,
-    kv_len: int,
-    q_blocksize: int,
-    kv_blocksize: int,
-) -> Bool[Array, "batch 1 q_len kv_len"] | None:
-    """Convert block-level sparsity layouts into a dense boolean attention mask.
-
-    For every query position the function determines the range of valid KV
-    block indices from the sparsity bounds and materializes a dense boolean
-    mask of shape ``(batch, 1, q_len, kv_len)``.  This is used by the
-    backward pass which delegates to the XLA reference kernel that expects a
-    dense mask.
-
-    Args:
-        layouts: A tuple of :class:`SparseMask` objects containing
-            ``lower_bounds`` and ``upper_bounds``. Only the first element
-            is used.  ``None`` means no sparsity constraint.
-        q_len: Length of the query sequence.
-        kv_len: Length of the key/value sequence.
-        q_blocksize: Block size for the query dimension.
-        kv_blocksize: Block size for the key/value dimension.
-
-    Returns:
-        A boolean JAX array of shape ``(batch, 1, q_len, kv_len)`` where
-        ``True`` indicates that the query position may attend to the
-        corresponding KV position, or ``None`` when *layouts* is ``None``
-        or bounds are unavailable.
-    """
-    if layouts is None:
-        return None
-    layout = layouts[0]
-    if layout.lower_bounds is None or layout.upper_bounds is None:
-        return None
-    lower = jnp.asarray(layout.lower_bounds, dtype=jnp.int32)
-    upper = jnp.asarray(layout.upper_bounds, dtype=jnp.int32)
-    q_block_ids = jnp.arange(q_len, dtype=jnp.int32) // q_blocksize
-    kv_block_ids = jnp.arange(kv_len, dtype=jnp.int32) // kv_blocksize
-    lower_per_q = jnp.take(lower[:, 0, :], q_block_ids, axis=1)
-    upper_per_q = jnp.take(upper[:, 0, :], q_block_ids, axis=1)
-    kv_blocks = kv_block_ids[None, None, :]
-    mask = (kv_blocks >= lower_per_q[:, :, None]) & (kv_blocks < upper_per_q[:, :, None])
-    return mask[:, None, :, :]
-
-
-def _empty_layouts_like(layouts: tuple[SparseMask] | None):
-    """Create placeholder sparsity layouts with all bounds set to ``None``.
-
-    This is used by the backward pass to return gradient-compatible layout
-    objects that carry no concrete sparsity information (since sparsity
-    bounds are non-differentiable).
-
-    Args:
-        layouts: The original tuple of :class:`SparseMask` objects, or
-            ``None``.
-
-    Returns:
-        A tuple of :class:`SparseMask` instances with all bounds set to
-        ``None``, matching the length of *layouts*, or ``None`` if
-        *layouts* is ``None``.
-    """
-    if layouts is None:
-        return None
-    return tuple(
-        SparseMask(lower_bounds=None, upper_bounds=None, lower_full_bounds=None, upper_full_bounds=None) for _ in layouts
-    )
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=[8, 11, 12, 13, 14, 15, 16, 17, 18])
@@ -340,13 +268,6 @@ def _blocksparse_attention_bhtd_bwd(
 ):
     """Backward pass for the custom VJP of block-sparse attention.
 
-    Because the CUDA kernel only implements the forward pass, gradients are
-    computed by re-evaluating the attention through the XLA-based reference
-    implementation (:func:`xla_blocksparse_attention`) inside a
-    :func:`jax.vjp` call.  The block-level sparsity layouts are converted
-    to a dense boolean mask via :func:`_layouts_to_attention_mask` so that
-    the XLA kernel can consume them.
-
     Args:
         softmax_scale: Logit scaling factor (non-differentiable).
         apply_load_balance: Unused; reserved for API compatibility.
@@ -363,79 +284,23 @@ def _blocksparse_attention_bhtd_bwd(
             :func:`_blocksparse_attention_bhtd_fwd`.
         dout: Upstream gradient tensor of the same shape as the forward
             output.
-
-    Returns:
-        A tuple of gradients corresponding to the differentiable arguments
-        of :func:`_blocksparse_attention_bhtd`:
-        ``(dq, dk, dv, None, None, None, None, empty_layouts, None, None)``.
-        Non-differentiable positions carry ``None``.
     """
-    del apply_load_balance, sequence_parallelism_mesh_axis_name, bwd_params
-
-    (
-        query,
-        key,
-        value,
-        q_positions,
-        q_segment_ids,
-        kv_positions,
-        kv_segment_ids,
-        qkv_layouts,
-        _softmax_scale,
-        softmax_aux,
-        _window_left,
-        _window_right,
-        _causal,
-        _logits_soft_cap,
-        _fwd_params,
-    ) = res
-
-    def ref_fn(q, k, v):
-        attention_mask = _layouts_to_attention_mask(
-            qkv_layouts,
-            q_len=q.shape[2],
-            kv_len=k.shape[2],
-            q_blocksize=fwd_params.q_blocksize,
-            kv_blocksize=fwd_params.kv_blocksize,
-        )
-        if window_left < 0 and window_right < 0:
-            sliding_window = None
-        else:
-            max_i32 = int(jnp.iinfo(jnp.int32).max)
-            wl = window_left if window_left >= 0 else max_i32
-            wr = window_right if window_right >= 0 else max_i32
-            sliding_window = (wl, wr)
-        return xla_blocksparse_attention(
-            q,
-            k,
-            v,
-            q_segment_ids=q_segment_ids,
-            kv_segment_ids=kv_segment_ids,
-            q_positions=q_positions,
-            kv_positions=kv_positions,
-            softmax_aux=softmax_aux,
-            attention_mask=attention_mask,
-            causal=causal,
-            sliding_window=sliding_window,
-            softmax_scale=softmax_scale,
-            logits_soft_cap=logits_soft_cap,
-        )
-
-    dq, dk, dv = jax.vjp(ref_fn, query, key, value)[1](dout)
-
-    empty_layouts = _empty_layouts_like(qkv_layouts)
-
-    return (
-        dq,
-        dk,
-        dv,
-        None,
-        None,
-        None,
-        None,
-        empty_layouts,
-        None,
-        None,
+    del (
+        softmax_scale,
+        apply_load_balance,
+        sequence_parallelism_mesh_axis_name,
+        window_left,
+        window_right,
+        causal,
+        fwd_params,
+        bwd_params,
+        logits_soft_cap,
+        res,
+        dout,
+    )
+    raise NotImplementedError(
+        "CUDA blocksparse_attention does not implement backward. "
+        "Fallback gradients are disabled."
     )
 
 
@@ -487,8 +352,7 @@ def blocksparse_attention(
     This is the high-level entry point registered in the ejkernel kernel
     registry for the ``CUDA`` platform / ``GPU`` backend.  It validates and
     defaults all parameters, constructs sparsity layouts if they are not
-    supplied, and delegates to the CUDA forward kernel (with an XLA-based
-    backward fallback for gradient computation).
+    supplied, and delegates to the CUDA forward kernel.
 
     Grouped-query attention (GQA) is supported: *key* and *value* may have
     fewer heads than *query*, and the kernel will broadcast internally.

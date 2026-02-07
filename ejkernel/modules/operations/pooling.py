@@ -126,7 +126,7 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
         x: Float[Array, "... hidden_dim"],
         chunk_size: int = 32,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: MeanPoolingConfig,
     ) -> Float[Array, "batch hidden_dim"]:
@@ -252,7 +252,7 @@ def mean_pooling(
     /,
     *,
     chunk_size: int = 32,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: MeanPoolingConfig | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
     """Execute mean pooling with automatic optimization.

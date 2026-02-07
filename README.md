@@ -78,6 +78,7 @@ pip install -e ".[dev]"
 - Python 3.11-3.13
 - JAX >= 0.9.0
 - Triton == 3.4.0 (for GPU)
+- nvidia-cutlass-dsl >= 4.3.5 (optional, for CuTe DSL kernels)
 - jaxtyping >= 0.3.2
 - beartype >= 0.22.2
 
@@ -187,7 +188,7 @@ ejKernel employs a sophisticated layered architecture that separates concerns wh
 │ Platform routing, signature validation              │
 ├─────────────────────────────────────────────────────┤
 │ Backend Implementations (kernels/\_\*)              │
-│ Triton, Pallas, XLA, CUDA kernels                   │
+│ Triton, CuTe, Pallas, XLA, CUDA kernels             │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -302,38 +303,39 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 
 ### Platform Support Matrix
 
-| Operation                        | Triton (GPU) | CUDA (GPU) | Pallas (TPU) | XLA (Universal) |
-| -------------------------------- | ------------ | ---------- | ------------ | --------------- |
-| Flash Attention v2               | ✅           | ✅         | ✅           | ✅              |
-| Flash MLA                        | ✅           | -          | -            | ✅              |
-| Ring Attention                   | ✅           | -          | ✅           | ✅              |
-| Page Attention                   | ✅           | -          | ✅           | ✅              |
-| Block Sparse Attention           | ✅           | ✅         | ✅           | ✅              |
-| Decode Attention                 | ✅           | -          | -            | ✅              |
-| Chunked Prefill Paged Decode     | ✅           | -          | -            | ✅              |
-| Ragged Page Attention v2         | ✅           | -          | ✅           | ✅              |
-| Ragged Page Attention v3         | ✅           | ✅         | ✅           | ✅              |
-| Ragged Decode Attention          | ✅           | -          | ✅           | ✅              |
-| GLA                              | ✅           | -          | -            | ✅              |
-| Lightning Attention              | ✅           | -          | -            | ✅              |
-| Recurrent                        | ✅           | -          | -            | ✅              |
-| Mean Pooling                     | ✅           | -          | -            | ✅              |
-| Grouped MatMul                   | -            | -          | ✅           | ✅              |
-| Grouped MatMul v2                | -            | -          | ✅           | -               |
-| Native Sparse Attention          | ✅           | -          | -            | ✅              |
-| Quantized MatMul                 | ✅           | ✅         | -            | ✅              |
-| Kernel Delta Attention           | -            | -          | -            | ✅              |
-| Unified Attention                | ✅           | ✅         | -            | ✅              |
-| Prefill Page Attention           | -            | -          | ✅           | ✅              |
-| Scaled Dot-Product Attention     | -            | -          | -            | ✅              |
-| State Space v1                   | -            | -          | -            | ✅              |
-| State Space v2                   | -            | -          | -            | ✅              |
-| RWKV-4                           | ✅           | -          | -            | ✅              |
-| RWKV-6                           | ✅           | -          | -            | ✅              |
-| RWKV-7                           | ✅           | -          | -            | ✅              |
-| RWKV-7 Mul                       | ✅           | -          | -            | ✅              |
+| Operation                        | Triton (GPU) | CUTE (GPU) | CUDA (GPU) | Pallas (TPU) | XLA (Universal) |
+| -------------------------------- | ------------ | ---------- | ---------- | ------------ | --------------- |
+| Flash Attention v2               | ✅           | ✅         | ✅         | ✅           | ✅              |
+| Flash MLA                        | ✅           | -          | -          | -            | ✅              |
+| Ring Attention                   | ✅           | -          | -          | ✅           | ✅              |
+| Page Attention                   | ✅           | -          | -          | ✅           | ✅              |
+| Block Sparse Attention           | ✅           | -          | ✅         | ✅           | ✅              |
+| Decode Attention                 | ✅           | -          | -          | -            | ✅              |
+| Chunked Prefill Paged Decode     | ✅           | -          | -          | -            | ✅              |
+| Ragged Page Attention v2         | ✅           | -          | -          | ✅           | ✅              |
+| Ragged Page Attention v3         | ✅           | -          | ✅         | ✅           | ✅              |
+| Ragged Decode Attention          | ✅           | -          | -          | ✅           | ✅              |
+| GLA                              | ✅           | -          | -          | -            | ✅              |
+| Lightning Attention              | ✅           | -          | -          | -            | ✅              |
+| Recurrent                        | ✅           | -          | -          | -            | ✅              |
+| Mean Pooling                     | ✅           | -          | -          | -            | ✅              |
+| Grouped MatMul                   | -            | -          | -          | ✅           | ✅              |
+| Grouped MatMul v2                | -            | -          | -          | ✅           | -               |
+| Native Sparse Attention          | ✅           | -          | -          | -            | ✅              |
+| Quantized MatMul                 | ✅           | ✅         | ✅         | -            | ✅              |
+| Kernel Delta Attention           | -            | -          | -          | -            | ✅              |
+| Unified Attention                | ✅           | -          | ✅         | -            | ✅              |
+| Prefill Page Attention           | -            | -          | -          | ✅           | ✅              |
+| Scaled Dot-Product Attention     | -            | -          | -          | -            | ✅              |
+| State Space v1                   | -            | -          | -          | -            | ✅              |
+| State Space v2                   | -            | -          | -          | -            | ✅              |
+| RWKV-4                           | ✅           | -          | -          | -            | ✅              |
+| RWKV-6                           | ✅           | -          | -          | -            | ✅              |
+| RWKV-7                           | ✅           | -          | -          | -            | ✅              |
+| RWKV-7 Mul                       | ✅           | -          | -          | -            | ✅              |
 
 ✅ = Production ready | - = Not available
+* CUTE backend is correctness-first and not tuned yet.
 
 ## Advanced Usage
 

@@ -42,7 +42,7 @@ Mathematical formulation:
         o_t = Σ_{i≤t} exp(Σ_{j=i+1}^{t} w_j) · (k_i^T · v_i) · r_t + u · (k_t^T · v_t) · r_t
 
     This is equivalent to softmax attention in the limit but computed in O(T)
-    time and O(K×V) memory per head.
+    time and O(KxV) memory per head.
 
 Supports:
     - Variable sequence lengths via cu_seqlens (cumulative sequence lengths)
@@ -84,7 +84,7 @@ class RWKV6(Kernel[RWKV6Config, Array]):
 
     Implements the RWKV-6 linear attention recurrence with multi-head support
     and optional variable-length sequence packing, achieving O(T) complexity
-    with O(K×V) memory per head.
+    with O(KxV) memory per head.
 
     Features:
         - Multi-head attention with per-head state matrices
@@ -159,7 +159,7 @@ class RWKV6(Kernel[RWKV6Config, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         cfg: RWKV6Config,
     ) -> (
         Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -278,7 +278,7 @@ def rwkv6(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: RWKV6Config | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

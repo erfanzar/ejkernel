@@ -11,7 +11,7 @@ ejKernel is a sophisticated, high-performance kernel library for JAX that provid
 - **Author**: Erfan Zare Chavoshi
 - **License**: Apache License 2.0
 - **Python Support**: 3.11 - 3.13
-- **Primary Dependencies**: JAX, Triton, Pallas, jaxtyping, beartype
+- **Primary Dependencies**: JAX, Triton, Pallas, CUTLASS CuTe DSL (optional), jaxtyping, beartype
 
 ## Core Objectives
 
@@ -27,6 +27,7 @@ ejKernel is a sophisticated, high-performance kernel library for JAX that provid
 ejkernel/
 ├── kernels/           # Core kernel implementations
 │   ├── _triton/      # Triton GPU kernels
+│   ├── _cute/        # CUTLASS CuTe DSL kernels
 │   ├── _pallas/      # Pallas TPU kernels
 │   ├── _xla/         # XLA CPU/fallback kernels
 │   └── _cuda/        # Native CUDA kernels
@@ -83,23 +84,25 @@ ejkernel/
 
 ## Platform Support Matrix
 
-| Algorithm | Triton GPU | Pallas TPU | XLA (CPU/Fallback) | CUDA |
-|-----------|------------|------------|--------------------|------|
-| Flash Attention v2 | ✅ | ✅ | ✅ | 🚧 |
-| Page Attention | ✅ | ✅ | ✅ | 🚧 |
-| Ring Attention | ✅ | ✅ | ✅ | 🚧 |
-| Native Sparse | ✅ | ❌ | ✅ | 🚧 |
-| GLA | ✅ | 🚧 | ✅ | ❌ |
-| Lightning Attention | ✅ | ❌ | ✅ | 🚧 |
-| MLA | ✅ | 🚧 | ❌ | ❌ |
-| Ragged Page Attention | ✅ | ✅ | ✅ | 🚧 |
-| Recurrent | ✅ | 🚧 | ✅ | 🚧 |
-| Mean Pooling | ✅ | 🚧 | ✅ | 🚧 |
-| Grouped MatMul | 🚧 | ✅ | ✅ | 🚧 |
+| Algorithm | Triton GPU | CUTE GPU | CUDA | Pallas TPU | XLA (CPU/Fallback) |
+|-----------|------------|----------|------|------------|--------------------|
+| Flash Attention v2 | ✅ | ✅ | 🚧 | ✅ | ✅ |
+| Page Attention | ✅ | ❌ | 🚧 | ✅ | ✅ |
+| Ring Attention | ✅ | ❌ | 🚧 | ✅ | ✅ |
+| Native Sparse | ✅ | ❌ | 🚧 | ❌ | ✅ |
+| GLA | ✅ | ❌ | ❌ | 🚧 | ✅ |
+| Lightning Attention | ✅ | ❌ | 🚧 | ❌ | ✅ |
+| MLA | ✅ | ❌ | ❌ | 🚧 | ❌ |
+| Ragged Page Attention | ✅ | ❌ | 🚧 | ✅ | ✅ |
+| Recurrent | ✅ | ❌ | 🚧 | 🚧 | ✅ |
+| Mean Pooling | ✅ | ❌ | 🚧 | 🚧 | ✅ |
+| Grouped MatMul | 🚧 | ❌ | 🚧 | ✅ | ✅ |
+| Quantized MatMul | ✅ | ✅ | ✅ | ❌ | ✅ |
 
 ✅ = Implemented and optimized
 🚧 = Under development
 ❌ = Not yet implemented
+* CUTE backend is correctness-first and currently includes quantized matmul and flash attention.
 
 ## Design Principles
 

@@ -157,7 +157,7 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
         use_gated_rmsnorm: bool = False,
         rmsnorm_eps: float = 1e-5,
         precision: lax.Precision | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: StateSpaceV2Config,
     ) -> tuple[
@@ -293,7 +293,7 @@ def state_space_v2(
     use_gated_rmsnorm: bool = False,
     rmsnorm_eps: float = 1e-5,
     precision: lax.Precision | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: StateSpaceV2Config | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],
