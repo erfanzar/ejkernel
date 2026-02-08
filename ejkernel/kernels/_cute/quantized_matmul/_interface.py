@@ -16,18 +16,115 @@
 
 from __future__ import annotations
 
+import functools
 from typing import Literal
 
+import jax
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Float
 
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
-from ejkernel.kernels._xla.quantized_matmul._interface import _resolve_qparams
 
-from ._cute_impl import get_cute_qmm_call
+from ._cute_impl_bwd import quantized_matmul_input_grad
+from ._cute_impl_fwd import quantized_matmul_forward
 
 QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 12))
+def _operate(
+    x,
+    w,
+    scales,
+    biases,
+    transpose: bool,
+    group_size: int | None,
+    bits: int | None,
+    mode: QuantizationMode,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    use_bf16: bool,
+):
+    return quantized_matmul_forward(
+        x,
+        w,
+        scales,
+        biases,
+        transpose=transpose,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        use_bf16=use_bf16,
+    )
+
+
+def _operate_fwd(
+    x,
+    w,
+    scales,
+    biases,
+    transpose: bool,
+    group_size: int | None,
+    bits: int | None,
+    mode: QuantizationMode,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    use_bf16: bool,
+):
+    out = quantized_matmul_forward(
+        x,
+        w,
+        scales,
+        biases,
+        transpose=transpose,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        use_bf16=use_bf16,
+    )
+    return out, (w, scales, biases)
+
+
+def _operate_bwd(
+    transpose: bool,
+    group_size: int | None,
+    bits: int | None,
+    mode: QuantizationMode,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    use_bf16: bool,
+    residual,
+    grad_out,
+):
+    w, scales, biases = residual
+    grad_x = quantized_matmul_input_grad(
+        grad_out,
+        w,
+        scales,
+        biases,
+        transpose=transpose,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        use_bf16=use_bf16,
+    )
+    return grad_x, None, None, None
+
+
+_operate.defvjp(_operate_fwd, _operate_bwd)
 
 
 @kernel_registry.register("quantized_matmul", Platform.CUTE, Backend.GPU)
@@ -50,46 +147,19 @@ def quantized_matmul(
     num_stages: int | None = None,
     split_k: int | None = None,
 ) -> Float[Array, "m n"]:
-    """Quantized matrix multiplication using CuTe DSL.
-
-    This implementation fuses bit-unpacking, dequantization, and GEMM in a
-    correctness-first kernel. It supports all quantization modes.
-
-    Notes:
-        - This backend targets NVIDIA GPUs only.
-    """
-    mode_lower = mode.lower()
-    group_size_resolved, bits_resolved = _resolve_qparams(mode_lower, group_size, bits)
-
-    if mode_lower == "affine" and biases is None:
-        raise ValueError("affine quantized_matmul requires biases.")
-    if mode_lower != "affine" and biases is not None:
-        raise ValueError("biases must be None for non-affine modes.")
-
+    """Quantized matrix multiplication using CuTe DSL."""
     del num_warps, num_stages, split_k
-
-    dev = None
-    try:
-        dev = x.device()
-    except Exception:
-        dev = None
-    if dev is not None and getattr(dev, "platform", None) != "gpu":
-        raise ValueError("CUTE quantized_matmul requires GPU backend.")
-
-    call = get_cute_qmm_call(
-        x=x,
-        w_q=w,
-        scales=scales,
-        biases=biases,
-        mode=mode_lower,
-        bits=bits_resolved,
-        group_size=group_size_resolved,
-        transpose=transpose,
-        use_bf16=use_bf16,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
+    return _operate(
+        x,
+        w,
+        scales,
+        biases,
+        transpose,
+        group_size,
+        bits,
+        mode,
+        block_m,
+        block_n,
+        block_k,
+        use_bf16,
     )
-    if biases is not None:
-        return call(x, w, scales, biases)
-    return call(x, w, scales)

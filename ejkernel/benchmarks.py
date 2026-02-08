@@ -54,6 +54,7 @@ Example:
 """
 
 import gc
+import inspect
 import json
 import time
 import traceback
@@ -271,6 +272,13 @@ class Benchmark:
         """
 
         inputs = self.input_generator(config)
+        static_argnums: tuple[int, ...] = ()
+        if self.static_kwargs:
+            try:
+                param_names = list(inspect.signature(algo_fn).parameters.keys())
+                static_argnums = tuple(i for i, name in enumerate(param_names) if name in self.static_kwargs)
+            except Exception:
+                static_argnums = ()
 
         if self.static_kwargs:
             compiled_fn = jax.jit(algo_fn, static_argnames=self.static_kwargs)
@@ -314,8 +322,8 @@ class Benchmark:
                     out = algo_fn(inp)
                     return self._make_scalar_loss(out)
 
-            if self.static_kwargs:
-                grad_fn = jax.jit(jax.grad(loss_fn), static_argnames=self.static_kwargs)
+            if self.static_kwargs and static_argnums:
+                grad_fn = jax.jit(jax.grad(loss_fn), static_argnums=static_argnums)
             else:
                 grad_fn = jax.jit(jax.grad(loss_fn))
 
