@@ -469,9 +469,7 @@ class KernelRegistry:
                 """
                 reasons = _collect_unsupported_reasons(func, args, kwargs)
                 if reasons:
-                    raise EjkernelRuntimeError(
-                        f"{algorithm} (platform={plat.value}): " + "; ".join(reasons)
-                    )
+                    raise EjkernelRuntimeError(f"{algorithm} (platform={plat.value}): " + "; ".join(reasons))
                 try:
                     return func(*args, **kwargs)
                 except EjkernelRuntimeError:
@@ -479,9 +477,7 @@ class KernelRegistry:
                 except (NotImplementedError, ValueError) as exc:
                     msg = str(exc)
                     if "not supported" in msg.lower() or "unsupported" in msg.lower():
-                        raise EjkernelRuntimeError(
-                            f"{algorithm} (platform={plat.value}): {msg}"
-                        ) from exc
+                        raise EjkernelRuntimeError(f"{algorithm} (platform={plat.value}): {msg}") from exc
                     raise
 
             _wrapped.__signature__ = inspect.signature(func)

@@ -32,7 +32,10 @@ def _has_tpu() -> bool:
 pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
 
 
-@pytest.mark.parametrize("mode,bits", [("affine", 4), ("nf4", 4), ("mxfp8", 8)])
+@pytest.mark.parametrize(
+    "mode,bits",
+    [("affine", 4), ("nf4", 4), ("mxfp8", 8), ("nvfp4", 4)],
+)
 def test_quantized_matmul_operation_pallas_matches_xla(mode: str, bits: int):
     key = jax.random.PRNGKey(7 if mode == "affine" else 9)
     kx, kw = jax.random.split(key, 2)
@@ -43,16 +46,16 @@ def test_quantized_matmul_operation_pallas_matches_xla(mode: str, bits: int):
 
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     out_pallas = quantized_matmul(
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         bits=bits,
@@ -62,7 +65,7 @@ def test_quantized_matmul_operation_pallas_matches_xla(mode: str, bits: int):
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         bits=bits,
@@ -82,13 +85,13 @@ def test_quantized_matmul_operation_pallas_large_n_matches_xla(monkeypatch: pyte
 
     x = jax.random.normal(kx, (m, k), dtype=jnp.bfloat16)
     w = jax.random.normal(kw, (n, k), dtype=jnp.bfloat16)
-    w_q, scales, biases = prepack_quantized_weights(w, mode="affine", bits=4, group_size=64)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4, group_size=64)
 
     out_pallas = quantized_matmul(
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode="affine",
         bits=4,
@@ -99,7 +102,7 @@ def test_quantized_matmul_operation_pallas_large_n_matches_xla(monkeypatch: pyte
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode="affine",
         bits=4,

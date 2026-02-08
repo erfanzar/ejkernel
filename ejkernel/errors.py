@@ -43,4 +43,3 @@ class EjkernelRuntimeError(RuntimeError):
         ...     "Triton flash attention requires GPU platform"
         ... )
     """
-

@@ -24,6 +24,7 @@ set(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
 set(CUTLASS_ROOT "${REPO_ROOT}/csrc/cutlass")
 set(CUTLASS_INCLUDE "${CUTLASS_ROOT}/include")
 file(GLOB QMM_DEQUANT_SOURCES "${QMM_SRC_DIR}/qmm_dequant_*.cu")
+list(FILTER QMM_DEQUANT_SOURCES EXCLUDE REGEX "qmm_dequant_affine_bits(2|3|5|6|7)_.*\\.cu$")
 set(QMM_SOURCES
   "${QMM_SRC_DIR}/qmm_cuda.cu"
   ${QMM_DEQUANT_SOURCES}

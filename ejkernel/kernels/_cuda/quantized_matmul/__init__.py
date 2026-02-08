@@ -20,11 +20,10 @@ entry point, which performs matrix multiplication between a float input tensor a
 packed quantized weights using a custom CUDA kernel invoked via JAX FFI.
 
 Supported quantization modes:
-    - **affine**: Uniform affine quantization with per-group scales and biases
-      (2--8 bit).
-    - **nf4**: 4-bit NormalFloat quantization.
-    - **mxfp4** / **mxfp8**: Microscaling FP4/FP8 formats (group size 32).
-    - **nvfp4** / **nvfp8**: NVIDIA FP4/FP8 formats (group size 16).
+    - **affine**: Grouped affine quantization with bits in {4, 8}.
+    - **nf4**: 4-bit NormalFloat codebook quantization.
+    - **mxfp4/mxfp8**: Microscaling FP4/FP8 modes (group size 32).
+    - **nvfp4/nvfp8**: NVIDIA FP4/FP8 modes (group size 16).
 
 The CUDA kernel is built on first use from C++/CUDA sources located in the
 repository's ``csrc/quantized_matmul/`` directory using CMake. Build artifacts
@@ -32,7 +31,7 @@ are cached and automatically invalidated when source files change.
 
 Example:
     >>> from ejkernel.kernels._cuda.quantized_matmul import quantized_matmul
-    >>> result = quantized_matmul(x, packed_w, scales, biases, mode="affine")
+    >>> result = quantized_matmul(x, packed_w, scales, zeros, mode="affine")
 """
 
 from ._interface import quantized_matmul

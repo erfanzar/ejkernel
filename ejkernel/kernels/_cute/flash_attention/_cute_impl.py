@@ -1066,12 +1066,12 @@ def _paged_kv_to_dense(
         raise ValueError(f"block_tables must be rank-2 [batch, max_blocks], got {block_tables.shape}.")
     if block_tables.shape[0] != batch:
         raise ValueError(
-            "block_tables batch dimension mismatch: " f"query batch={batch}, block_tables batch={block_tables.shape[0]}."
+            f"block_tables batch dimension mismatch: query batch={batch}, block_tables batch={block_tables.shape[0]}."
         )
 
     if key_cache.ndim != 4 or value_cache.ndim != 4:
         raise ValueError(
-            "Paged key/value caches must be rank-4 tensors " "[num_blocks, block_size, num_kv_heads, head_dim]."
+            "Paged key/value caches must be rank-4 tensors [num_blocks, block_size, num_kv_heads, head_dim]."
         )
     if key_cache.shape != value_cache.shape:
         raise ValueError(f"key/value cache shape mismatch: {key_cache.shape} vs {value_cache.shape}.")

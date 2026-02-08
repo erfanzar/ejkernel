@@ -34,6 +34,9 @@ def quantized_matmul_input_grad(
     group_size: int | None,
     bits: int | None,
     mode: str,
+    gemv_mode: str,
+    revsplit_k: str,
+    revsplit_k_parts: int | None,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -54,6 +57,9 @@ def quantized_matmul_input_grad(
             group_size=group_size,
             bits=bits,
             mode=mode,
+            gemv_mode=gemv_mode,
+            revsplit_k=revsplit_k,
+            revsplit_k_parts=revsplit_k_parts,
             block_m=block_m,
             block_n=block_n,
             block_k=block_k,
@@ -62,7 +68,14 @@ def quantized_matmul_input_grad(
     except ValueError:
         pass
 
-    w_f = dequantize(w, scales, biases, group_size=group_size, bits=bits, mode=mode)
+    del gemv_mode, revsplit_k, revsplit_k_parts
+    zeros = None
+    if mode == "affine":
+        if biases is None:
+            raise ValueError("affine input grad requires affine metadata.")
+        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+        zeros = -biases / safe_scale
+    w_f = dequantize(w, scales, zeros, group_size=group_size, bits=bits, mode=mode)
     if transpose:
         dims = (((1,), (0,)), ((), ()))
     else:

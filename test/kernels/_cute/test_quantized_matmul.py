@@ -61,23 +61,23 @@ def test_quantized_matmul_cute_matches_xla(mode: str, bits: int):
 
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     dev = jax.devices("gpu")[0]
     x = jax.device_put(x, dev)
     w_q = jax.device_put(w_q, dev)
     scales = jax.device_put(scales, dev)
-    if biases is not None:
-        biases = jax.device_put(biases, dev)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
 
     out_cute = cute_quantized_matmul(
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         bits=bits,
@@ -86,7 +86,7 @@ def test_quantized_matmul_cute_matches_xla(mode: str, bits: int):
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         bits=bits,
@@ -111,19 +111,19 @@ def test_quantized_matmul_cute_transpose_matches_xla():
     x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
     w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
 
-    w_q, scales, biases = prepack_quantized_weights(w, mode="affine", bits=4, transpose=False, group_size=32)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4, transpose=False, group_size=32)
 
     dev = jax.devices("gpu")[0]
     x = jax.device_put(x, dev)
     w_q = jax.device_put(w_q, dev)
     scales = jax.device_put(scales, dev)
-    biases = jax.device_put(biases, dev)
+    zeros = jax.device_put(zeros, dev)
 
     out_cute = cute_quantized_matmul(
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=True,
         mode="affine",
         bits=4,
@@ -133,7 +133,7 @@ def test_quantized_matmul_cute_transpose_matches_xla():
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=True,
         mode="affine",
         bits=4,
@@ -265,24 +265,24 @@ def test_quantized_matmul_cute_grad_input_matches_xla(mode: str, bits: int):
 
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     dev = jax.devices("gpu")[0]
     x = jax.device_put(x, dev)
     w_q = jax.device_put(w_q, dev)
     scales = jax.device_put(scales, dev)
-    if biases is not None:
-        biases = jax.device_put(biases, dev)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
 
     def _loss_cute(x_in):
         y = cute_quantized_matmul(
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,
@@ -294,7 +294,7 @@ def test_quantized_matmul_cute_grad_input_matches_xla(mode: str, bits: int):
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,
@@ -334,17 +334,17 @@ def test_quantized_matmul_cute_grad_input_same_kernel_path(monkeypatch: pytest.M
 
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     dev = jax.devices("gpu")[0]
     x = jax.device_put(x, dev)
     w_q = jax.device_put(w_q, dev)
     scales = jax.device_put(scales, dev)
-    if biases is not None:
-        biases = jax.device_put(biases, dev)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
 
     def _forbidden_dequant(*args, **kwargs):
         raise AssertionError(f"Unexpected dequant fallback in CuTe grad path for mode={mode}.")
@@ -356,7 +356,7 @@ def test_quantized_matmul_cute_grad_input_same_kernel_path(monkeypatch: pytest.M
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,

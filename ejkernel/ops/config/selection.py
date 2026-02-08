@@ -268,6 +268,7 @@ class Tuner(Generic[Cfg]):
             Returns:
                 Average execution time per iteration in seconds.
             """
+
             def core(*arrs):
                 """Reconstruct args/kwargs from array leaves and call the target function."""
                 (aa, kk) = _restore_args_kwargs(arrs)
@@ -549,6 +550,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
 
                 def mk(c, _static=static_fun_kwargs):
                     """Create a shard_map-wrapped function for benchmarking a specific configuration."""
+
                     def f(*a, **k):
                         """Execute the shard_map wrapper with the bound config and process callback."""
                         callback = None
@@ -580,6 +582,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
 
                 def mk(c, _run=run_method, _static=static_fun_kwargs):
                     """Create a function that executes the kernel run method with a specific config."""
+
                     def f(*a, **k):
                         """Execute the run method with the bound configuration and static kwargs."""
                         return _run(*a, cfg=c, **(k | _static))

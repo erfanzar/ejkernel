@@ -161,9 +161,7 @@ def _has_multi_accelerators() -> bool:
         devices = jax.devices()
     except Exception:
         return False
-    accelerator_devices = [
-        device for device in devices if getattr(device, "platform", None) not in (None, "cpu")
-    ]
+    accelerator_devices = [device for device in devices if getattr(device, "platform", None) not in (None, "cpu")]
     return len(accelerator_devices) > 1
 
 
@@ -218,16 +216,10 @@ def _validate_out_leaves(
 
     for i, leaf in enumerate(flat_out):
         if not isinstance(leaf, (jax.Array, core.Tracer)):
-            raise TypeError(
-                "`out` leaves must be JAX arrays/tracers. "
-                f"Got type {type(leaf)!r} at output index {i}."
-            )
+            raise TypeError(f"`out` leaves must be JAX arrays/tracers. Got type {type(leaf)!r} at output index {i}.")
         shape, dtype = _leaf_shape_dtype(leaf)
         if shape is None or dtype is None:
-            raise TypeError(
-                "Could not infer shape/dtype from an `out` leaf. "
-                f"Output index: {i}."
-            )
+            raise TypeError(f"Could not infer shape/dtype from an `out` leaf. Output index: {i}.")
 
     if flat_out_shapes is None:
         return
@@ -242,13 +234,11 @@ def _validate_out_leaves(
         leaf_shape, leaf_dtype = _leaf_shape_dtype(leaf)
         if leaf_shape != tuple(spec.shape):
             raise ValueError(
-                "Output shape mismatch at index "
-                f"{i}: out has shape {leaf_shape}, expected {tuple(spec.shape)}."
+                f"Output shape mismatch at index {i}: out has shape {leaf_shape}, expected {tuple(spec.shape)}."
             )
         if leaf_dtype != jnp.dtype(spec.dtype):
             raise ValueError(
-                "Output dtype mismatch at index "
-                f"{i}: out has dtype {leaf_dtype}, expected {jnp.dtype(spec.dtype)}."
+                f"Output dtype mismatch at index {i}: out has dtype {leaf_dtype}, expected {jnp.dtype(spec.dtype)}."
             )
 
 
@@ -258,10 +248,7 @@ def _shape_specs_from_out_leaves(flat_out: Sequence[Any]) -> list[jax.ShapeDtype
     for i, leaf in enumerate(flat_out):
         shape, dtype = _leaf_shape_dtype(leaf)
         if shape is None or dtype is None:
-            raise TypeError(
-                "Could not infer shape/dtype from an `out` leaf. "
-                f"Output index: {i}."
-            )
+            raise TypeError(f"Could not infer shape/dtype from an `out` leaf. Output index: {i}.")
         specs.append(jax.ShapeDtypeStruct(shape, dtype))
     return specs
 

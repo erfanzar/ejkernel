@@ -276,7 +276,7 @@ def _raise_on_jvp(*args, **kwargs):
     """Raise for unsupported automatic differentiation."""
     del args, kwargs
     raise NotImplementedError(
-        "CuTe TVM-FFI primitive does not support automatic differentiation. " "Use `jax.custom_jvp` or `jax.custom_vjp`."
+        "CuTe TVM-FFI primitive does not support automatic differentiation. Use `jax.custom_jvp` or `jax.custom_vjp`."
     )
 
 
@@ -284,7 +284,7 @@ def _raise_on_vmap(*args, **kwargs):
     """Raise for unsupported batching."""
     del args, kwargs
     raise NotImplementedError(
-        "CuTe TVM-FFI primitive does not support batching via `jax.vmap`. " "Use `jax.custom_batching.custom_vmap`."
+        "CuTe TVM-FFI primitive does not support batching via `jax.vmap`. Use `jax.custom_batching.custom_vmap`."
     )
 
 

@@ -309,8 +309,7 @@ def _run_unified_attention(
         num_stages,
     )
     raise EjkernelRuntimeError(
-        "chunked_prefill_paged_decode (platform=cute) requires Triton unified_attention; "
-        "fallback paths are disabled."
+        "chunked_prefill_paged_decode (platform=cute) requires Triton unified_attention; fallback paths are disabled."
     )
 
 

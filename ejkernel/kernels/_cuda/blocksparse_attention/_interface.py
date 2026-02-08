@@ -298,10 +298,7 @@ def _blocksparse_attention_bhtd_bwd(
         res,
         dout,
     )
-    raise NotImplementedError(
-        "CUDA blocksparse_attention does not implement backward. "
-        "Fallback gradients are disabled."
-    )
+    raise NotImplementedError("CUDA blocksparse_attention does not implement backward. Fallback gradients are disabled.")
 
 
 _blocksparse_attention_bhtd.defvjp(_blocksparse_attention_bhtd_fwd, _blocksparse_attention_bhtd_bwd)

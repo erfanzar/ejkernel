@@ -372,7 +372,13 @@ def quantized_matmul_input_grad(
         except Exception:
             pass
 
-    w_f = dequantize(w_q, scales, biases, group_size=group_size, bits=bits, mode=mode)
+    zeros = None
+    if mode == "affine":
+        if biases is None:
+            raise ValueError("affine input grad requires affine metadata.")
+        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+        zeros = -biases / safe_scale
+    w_f = dequantize(w_q, scales, zeros, group_size=group_size, bits=bits, mode=mode)
     return jax.lax.dot_general(dy, w_f, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
 
 

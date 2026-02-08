@@ -17,21 +17,31 @@
 from __future__ import annotations
 
 import functools
-from typing import Literal
 
 import jax
+import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Float
+
+from ejkernel.quantization._utils.qparams import (
+    GemvMode,
+    QuantizationAxis,
+    RevSplitKMode,
+    normalize_gemv_mode,
+    normalize_revsplitk_mode,
+    normalize_revsplitk_parts,
+    resolve_qparams,
+    resolve_runtime_axis_and_transpose,
+    to_backend_mode,
+)
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._cuda_impl_bwd import quantized_matmul_input_grad
 from ._cuda_impl_fwd import quantized_matmul_forward
 
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8, 9, 10))
 def _operate(
     x,
     w,
@@ -40,7 +50,10 @@ def _operate(
     transpose: bool,
     group_size: int | None,
     bits: int | None,
-    mode: QuantizationMode,
+    mode: str,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
 ):
     return quantized_matmul_forward(
         x,
@@ -51,6 +64,9 @@ def _operate(
         group_size=group_size,
         bits=bits,
         mode=mode,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
     )
 
 
@@ -62,7 +78,10 @@ def _operate_fwd(
     transpose: bool,
     group_size: int | None,
     bits: int | None,
-    mode: QuantizationMode,
+    mode: str,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
 ):
     out = quantized_matmul_forward(
         x,
@@ -73,6 +92,9 @@ def _operate_fwd(
         group_size=group_size,
         bits=bits,
         mode=mode,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
     )
     return out, (w, scales, biases)
 
@@ -81,7 +103,10 @@ def _operate_bwd(
     transpose: bool,
     group_size: int | None,
     bits: int | None,
-    mode: QuantizationMode,
+    mode: str,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
     residual,
     grad_out,
 ):
@@ -95,6 +120,9 @@ def _operate_bwd(
         group_size=group_size,
         bits=bits,
         mode=mode,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
     )
     return grad_x, None, None, None
 
@@ -108,11 +136,15 @@ def quantized_matmul(
     x: Float[Array, "m k"],
     w: Array,
     scales: Array,
-    biases: Array | None = None,
+    zeros: Array | None = None,
     transpose: bool = False,
     group_size: int | None = None,
     bits: int | None = None,
-    mode: QuantizationMode = "affine",
+    mode: str = "affine",
+    axis: QuantizationAxis | None = None,
+    gemv_mode: GemvMode = "auto",
+    revsplit_k: RevSplitKMode = "auto",
+    revsplit_k_parts: int | None = None,
     *,
     block_m: int = 128,
     block_n: int = 128,
@@ -122,6 +154,39 @@ def quantized_matmul(
     num_stages: int | None = None,
     split_k: int | None = None,
 ) -> Float[Array, "m n"]:
-    """Perform quantized matrix multiplication using CUDA custom call."""
+    """Perform quantized matrix multiplication using CUDA custom call.
+
+    ``zeros`` is used only for affine mode and is converted to per-group
+    additive offsets before dispatching the CUDA custom call.
+    """
     del block_m, block_n, block_k, use_bf16, num_warps, num_stages, split_k
-    return _operate(x, w, scales, biases, transpose, group_size, bits, mode)
+    mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
+    _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    gemv_mode = normalize_gemv_mode(gemv_mode)
+    revsplit_k = normalize_revsplitk_mode(revsplit_k)
+    revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
+
+    if mode == "affine":
+        if zeros is None:
+            raise ValueError("affine quantized_matmul requires `zeros`.")
+        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+        affine_biases = -zeros * safe_scale
+    else:
+        if zeros is not None:
+            raise ValueError("zeros must be None for non-affine modes.")
+        affine_biases = None
+
+    backend_mode = to_backend_mode(mode, bits)
+    return _operate(
+        x,
+        w,
+        scales,
+        affine_biases,
+        transpose,
+        group_size,
+        bits,
+        backend_mode,
+        gemv_mode,
+        revsplit_k,
+        revsplit_k_parts,
+    )

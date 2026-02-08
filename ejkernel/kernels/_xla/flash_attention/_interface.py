@@ -90,10 +90,6 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int, PRNGKeyArray
 
-PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
-DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
-BlockTables = Int[Array, "batch max_blocks"]
-
 from ejkernel.callib._ejit import ejit
 from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.ops import BwdParams, FwdParams
@@ -101,6 +97,10 @@ from ejkernel.ops import BwdParams, FwdParams
 from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_bwd import _flash_attention_bwd
 from ._xla_impl_fwd import _flash_attention_fwd
+
+PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
+DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
+BlockTables = Int[Array, "batch max_blocks"]
 
 _PREC_TO_CODE = {
     jax.lax.Precision.DEFAULT: 0,

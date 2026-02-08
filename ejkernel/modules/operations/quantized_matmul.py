@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from typing import Literal
 
 import jax
@@ -36,33 +37,52 @@ from ejkernel.ops import (
     policy_override,
 )
 from ejkernel.ops.config.persistent import PersistentCache
+from ejkernel.quantization._utils.qparams import (
+    GemvMode,
+    QuantizationAxis,
+    QuantizationMode,
+    RevSplitKMode,
+    normalize_gemv_mode,
+    normalize_revsplitk_mode,
+    normalize_revsplitk_parts,
+    resolve_qparams,
+    resolve_runtime_axis_and_transpose,
+    select_qmm_kernel_family,
+)
 
 from ..base import detect_platform
 from .configs import QuantizedMatmulConfig
 
-#: Supported quantization modes for quantized matrix multiplication.
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
-
 
 def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tuple[int, int]:
-    mode = mode.lower()
-    if mode == "affine":
-        group_size = 64 if group_size is None else int(group_size)
-        bits = 4 if bits is None else int(bits)
-        return group_size, bits
-    if mode == "nf4":
-        group_size = 64 if group_size is None else int(group_size)
-        bits = 4 if bits is None else int(bits)
-        return group_size, bits
-    if mode == "mxfp4":
-        return 32 if group_size is None else int(group_size), 4
-    if mode == "mxfp8":
-        return 32 if group_size is None else int(group_size), 8
-    if mode == "nvfp4":
-        return 16 if group_size is None else int(group_size), 4
-    if mode == "nvfp8":
-        return 16 if group_size is None else int(group_size), 8
-    return (64 if group_size is None else int(group_size), 4 if bits is None else int(bits))
+    _, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
+    return group_size, bits
+
+
+def _fallback_platform_for_cuda_transpose() -> Platform:
+    def _has_impl(cand: Platform, backend: str) -> bool:
+        try:
+            kernel_registry.get("quantized_matmul", platform=cand, backend=backend)
+            return True
+        except ValueError:
+            return False
+
+    try:
+        backend = jax.default_backend()
+    except Exception:
+        backend = "cpu"
+
+    if backend in ("gpu", "cuda"):
+        for cand in (Platform.TRITON, Platform.CUTE):
+            if _has_impl(cand, "gpu"):
+                return cand
+    if _has_impl(Platform.XLA, "any"):
+        return Platform.XLA
+
+    for cand, back in ((Platform.TRITON, "gpu"), (Platform.CUTE, "gpu"), (Platform.XLA, "any")):
+        if _has_impl(cand, back):
+            return cand
+    return Platform.XLA
 
 
 def _static_bool(value, name: str) -> bool:
@@ -218,7 +238,7 @@ def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> 
 def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) -> list[QuantizedMatmulConfig]:
     mode = str(inv.kwargs.get("mode", "affine"))
     group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
-    m, k, n, _ = _infer_mkn(inv, group_size)
+    _m, k, n, _ = _infer_mkn(inv, group_size)
 
     values_per_word = 32 // bits if bits in (4, 8) else 1
     align_n = _lcm(128, _lcm(group_size, values_per_word))
@@ -414,8 +434,8 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
     """Quantized matrix multiplication kernel with configurable tiling and backend selection.
 
     This kernel performs matrix multiplication between a dense input matrix and a
-    quantized weight matrix, supporting multiple quantization modes including affine,
-    NF4, MXFP4, MXFP8, and NVFP4.
+    quantized weight matrix, supporting explicit quantization modes:
+    affine, nf4, mxfp4, mxfp8, nvfp4, and nvfp8.
 
     The kernel automatically selects the optimal backend (Triton or XLA) based on
     the target platform and input characteristics. It supports autotuning for
@@ -427,7 +447,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
     Example:
         >>> kernel = QuantizedMatmul()
         >>> cfg = QuantizedMatmulConfig(block_m=128, block_n=128, block_k=64)
-        >>> output = kernel.run(x, w_q, scales, biases, cfg=cfg)
+        >>> output = kernel.run(x, w_q, scales, zeros, cfg=cfg)
     """
 
     version = "1"
@@ -467,11 +487,15 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         x: Float[Array, "m k"],
         w: Array,
         scales: Array,
-        biases: Array | None = None,
+        zeros: Array | None = None,
         transpose: bool = False,
         group_size: int | None = None,
         bits: int | None = None,
         mode: QuantizationMode = "affine",
+        axis: QuantizationAxis | None = None,
+        gemv_mode: GemvMode = "auto",
+        revsplit_k: RevSplitKMode = "auto",
+        revsplit_k_parts: int | None = None,
         _resolved_platform: str | None = None,
         platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
         *,
@@ -479,8 +503,9 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
     ) -> Float[Array, "m n"]:
         """Execute quantized matmul with the selected backend.
 
-        Performs the computation: output = x @ dequantize(w, scales, biases)
-        or output = x @ dequantize(w, scales, biases).T if transpose=True.
+        Performs the computation:
+            - ``output = x @ dequantize(w, scales, zeros)``
+            - ``output = x @ dequantize(w, scales, zeros).T`` when ``transpose=True``
 
         Args:
             x: Input matrix of shape (M, K) in float dtype.
@@ -488,29 +513,29 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
                 transpose and bits settings.
             scales: Per-group scales array. Shape is (N, K//group_size) for
                 transpose=True or (K, N//group_size) for transpose=False.
-            biases: Per-group biases (required for affine mode only). Must have
-                the same shape as scales when provided.
+            zeros: Per-group affine zero-points (canonical affine metadata).
+                Required for affine mode and must be ``None`` for non-affine modes.
             transpose: If True, compute x @ w.T (weights stored in KxN layout).
                 If False, compute x @ w (weights stored in KxN transposed layout).
             group_size: Group size used in quantization. If None, uses mode default.
-            bits: Bit-width used in quantization. If None, uses mode default.
-            mode: Quantization mode. One of:
-                - "affine": Linear affine quantization (requires biases)
-                - "nf4": 4-bit NormalFloat quantization
-                - "mxfp4": Microscaling FP4 (E2M1) quantization
-                - "mxfp8": Microscaling FP8 (E4M3) quantization
-                - "nvfp4": NVIDIA FP4 quantization
-                - "nvfp8": NVIDIA FP8 quantization
+            bits: Bit-width used in quantization. Honored for affine ({4,8});
+                ignored for nf4/mxfp4/mxfp8/nvfp4/nvfp8.
+            mode: Quantization mode. One of
+                {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}.
+            axis: Optional quantization axis convenience alias. "row" maps to
+                transpose=False and "col" maps to transpose=True.
             platform: Platform override (triton/pallas/cuda/cute/xla/auto).
             cfg: Kernel configuration with block sizes and settings.
 
         Returns:
-        Matrix multiplication result of shape (M, N). CUDA returns the same
-        dtype as ``x``; other backends return float32.
+            Matrix multiplication result of shape (M, N). CUDA returns the same
+            dtype as ``x``; other backends return float32.
 
         Notes:
             For best Triton performance, prepack weights in KxN layout using
             prepack_quantized_weights() and call with transpose=False.
+            For affine mode, backend wrappers convert ``zeros`` to internal
+            additive offsets right before kernel launch.
         """
         _ = _resolved_platform
         if platform is not None:
@@ -531,11 +556,15 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
             x,
             w,
             scales,
-            biases,
+            zeros,
             transpose=transpose,
             group_size=group_size,
             bits=bits,
             mode=mode,
+            axis=axis,
+            gemv_mode=gemv_mode,
+            revsplit_k=revsplit_k,
+            revsplit_k_parts=revsplit_k_parts,
             block_m=cfg.block_m,
             block_n=cfg.block_n,
             block_k=cfg.block_k,
@@ -670,102 +699,75 @@ def _quantized_matmul_impl(
     x: Float[Array, "m k"],
     w: Array,
     scales: Array,
-    biases: Array | None = None,
+    zeros: Array | None = None,
     /,
     *,
     transpose: bool = False,
     group_size: int | None = None,
     bits: int | None = None,
     mode: QuantizationMode = "affine",
+    axis: QuantizationAxis | None = None,
+    gemv_mode: GemvMode = "auto",
+    revsplit_k: RevSplitKMode = "auto",
+    revsplit_k_parts: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
-    """Execute quantized matrix multiplication with automatic optimization.
-
-    This is the primary API for performing matrix multiplication with quantized
-    weights. It automatically selects the optimal backend (Triton or XLA) and
-    configuration based on the target platform and input characteristics.
-
-    The computation performed is:
-        - If transpose=True: output = x @ dequantize(w, scales, biases).T
-        - If transpose=False: output = x @ dequantize(w, scales, biases)
-
-    Args:
-        x: Input activation matrix of shape (M, K) in float dtype.
-        w: Packed uint32 weights produced by quantize() or prepack_quantized_weights().
-            Shape depends on transpose setting and bit-width.
-        scales: Per-group scales array for dequantization. Shape is (N, K//group_size)
-            for transpose=True or (K, N//group_size) for transpose=False.
-        biases: Per-group biases for affine quantization modes. Must have the same
-            shape as scales. Required when mode is "affine", must be None otherwise.
-        transpose: Weight layout indicator. If True, weights are stored in NxK
-            layout (transposed). If False, weights are stored in KxN layout.
-            Default is False.
-        group_size: Number of elements per quantization group. If None, uses the
-            mode-specific default (e.g., 64 for affine, 32 for mxfp4).
-        bits: Bit-width for quantization. If None, uses the mode-specific default
-            (e.g., 4 for affine/nf4/mxfp4, 8 for mxfp8).
-        mode: Quantization mode determining the dequantization formula:
-            - "affine": Linear scale+bias quantization (q * scale + bias)
-            - "nf4": 4-bit NormalFloat codebook quantization
-            - "mxfp4": Microscaling FP4 (E2M1) with E8M0 shared exponent
-            - "mxfp8": Microscaling FP8 (E4M3) with E8M0 shared exponent
-            - "nvfp4": NVIDIA FP4 (E2M1) with E4M3 per-group scale
-            - "nvfp8": NVIDIA FP8 (E4M3) with E4M3 per-group scale
-        platform: Target execution platform override. One of:
-            - "triton": Use Triton GPU kernels (requires NVIDIA/AMD GPU)
-            - "pallas": Use Pallas kernels (TPU/GPU)
-            - "cuda": Use CUDA-specific implementations
-            - "cute": Use CUTLASS CuTe DSL kernels (NVIDIA GPU only)
-            - "xla": Use XLA compiler (most portable)
-            - "auto": Automatic selection based on available hardware (default)
-            - None: Same as "auto"
-        cfg: Optional QuantizedMatmulConfig to override default block sizes and
-            kernel parameters. If None, uses autotuned or heuristic configuration.
-
-    Returns:
-        Matrix multiplication result of shape (M, N). CUDA returns the same
-        dtype as ``x``; other backends return float32.
-
-    Raises:
-        ValueError: If mode is "affine" but biases is None.
-        ValueError: If mode is not "affine" but biases is provided.
-        ValueError: If group_size or bits are incompatible with the selected mode.
-
-    Example:
-        >>> from ejkernel.quantization import quantize, prepack_quantized_weights
-        >>> from ejkernel.modules.operations import quantized_matmul
-        >>>
-        >>> # Quantize weights (NxK layout, transpose for optimal kernel layout)
-        >>> w_q, scales, biases = prepack_quantized_weights(weights, mode="affine")
-        >>>
-        >>> # Perform quantized matmul
-        >>> output = quantized_matmul(x, w_q, scales, biases, mode="affine")
-
-    Notes:
-        - For best Triton performance on GPU, use prepack_quantized_weights() to
-          store weights in KxN layout and call with transpose=False.
-        - The Triton backend currently supports "affine" and "nf4" modes. Other
-          modes fall back to the XLA implementation.
-        - The CUTE backend supports all modes but is correctness-first.
-        - The XLA implementation supports all modes and serves as a fallback when
-          specialized kernels are not available or not optimal.
-    """
-    mode = mode.lower()
+    """Execute quantized matrix multiplication with normalized qparams."""
     transpose = _static_bool(transpose, "transpose")
     if group_size is not None:
         group_size = _static_int(group_size, "group_size")
     if bits is not None:
         bits = _static_int(bits, "bits")
-    if mode == "affine" and biases is None:
-        raise ValueError("affine quantized_matmul requires biases.")
-    if mode != "affine" and biases is not None:
-        raise ValueError("biases must be None for non-affine modes.")
+    mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
+    axis, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    gemv_mode = normalize_gemv_mode(gemv_mode)
+    revsplit_k = normalize_revsplitk_mode(revsplit_k)
+    revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
+
+    if int(x.shape[0]) == 1 and mode in {"mxfp4", "mxfp8"} and gemv_mode == "on":
+        warnings.warn(
+            "gemv_mode='on' with MX modes at M==1 is mapped to GEMM-SplitK for GemLite parity.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    family, family_revsplit_parts = select_qmm_kernel_family(
+        m=int(x.shape[0]),
+        mode=mode,
+        bits=bits,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
+    )
+    if family == "gemv_revsplitk":
+        revsplit_k_parts = family_revsplit_parts
+
+    if mode == "affine" and zeros is None:
+        raise ValueError("affine quantized_matmul requires `zeros`.")
+    if mode != "affine" and zeros is not None:
+        raise ValueError("zeros must be None for non-affine modes.")
+
+    try:
+        backend_name = jax.default_backend()
+    except Exception:
+        backend_name = "cpu"
 
     resolved = detect_platform(
         "quantized_matmul",
         platform if platform is not None else (cfg.platform if cfg is not None else "auto"),
+        prefer_pallas=backend_name == "tpu",
+        prefer_cuda=backend_name in ("gpu", "cuda"),
     )
+    if resolved == Platform.CUDA and axis == "col":
+        fallback = _fallback_platform_for_cuda_transpose()
+        warnings.warn(
+            (f"CUDA quantized_matmul does not support axis='col' (transpose=True); falling back to {fallback.value}."),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        resolved = fallback
+    dispatch_platform = resolved.value
 
     if resolved in (Platform.TRITON, Platform.CUDA, Platform.CUTE):
         with policy_override(
@@ -778,13 +780,17 @@ def _quantized_matmul_impl(
                 x=x,
                 w=w,
                 scales=scales,
-                biases=biases,
+                zeros=zeros,
                 transpose=transpose,
                 group_size=group_size,
                 bits=bits,
                 mode=mode,
+                axis=axis,
+                gemv_mode=gemv_mode,
+                revsplit_k=revsplit_k,
+                revsplit_k_parts=revsplit_k_parts,
                 _resolved_platform=resolved.value,
-                platform=platform,
+                platform=dispatch_platform,
                 _cfg=cfg,
             )
 
@@ -793,13 +799,17 @@ def _quantized_matmul_impl(
         x=x,
         w=w,
         scales=scales,
-        biases=biases,
+        zeros=zeros,
         transpose=transpose,
         group_size=group_size,
         bits=bits,
         mode=mode,
+        axis=axis,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
         _resolved_platform=resolved.value,
-        platform=platform,
+        platform=dispatch_platform,
         _cfg=cfg,
     )
 
@@ -808,13 +818,17 @@ def quantized_matmul(
     x: Float[Array, "m k"],
     w: Array,
     scales: Array,
-    biases: Array | None = None,
+    zeros: Array | None = None,
     /,
     *,
     transpose: bool = False,
     group_size: int | None = None,
     bits: int | None = None,
     mode: QuantizationMode = "affine",
+    axis: QuantizationAxis | None = None,
+    gemv_mode: GemvMode = "auto",
+    revsplit_k: RevSplitKMode = "auto",
+    revsplit_k_parts: int | None = None,
     platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
@@ -822,44 +836,58 @@ def quantized_matmul(
 
     See `_quantized_matmul_impl` for full documentation.
     """
+    runtime_axis, runtime_transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
 
-    def _inner(xi, wi, si, bi):
+    def _inner(xi, wi, si, zi):
         return _quantized_matmul_impl(
             xi,
             wi,
             si,
-            bi,
-            transpose=transpose,
+            zi,
+            transpose=runtime_transpose,
             group_size=group_size,
             bits=bits,
             mode=mode,
+            axis=runtime_axis,
+            gemv_mode=gemv_mode,
+            revsplit_k=revsplit_k,
+            revsplit_k_parts=revsplit_k_parts,
             platform=platform,
             cfg=cfg,
         )
 
     @jax.custom_vjp
-    def _inner_vjp(xi, wi, si, bi):
-        return _inner(xi, wi, si, bi)
+    def _inner_vjp(xi, wi, si, zi):
+        return _inner(xi, wi, si, zi)
 
-    def _inner_fwd(xi, wi, si, bi):
-        y = _inner(xi, wi, si, bi)
-        return y, (wi, si, bi)
+    def _inner_fwd(xi, wi, si, zi):
+        y = _inner(xi, wi, si, zi)
+        return y, (wi, si, zi)
 
     def _inner_bwd(res, g):
-        wi, si, bi = res
+        wi, si, zi = res
         from ejkernel.quantization._quants.quantizations import dequantize
 
-        w_f = dequantize(wi, si, bi, group_size=group_size, bits=bits, mode=mode)
-        if transpose:
+        dequant_axis: QuantizationAxis = "col" if runtime_transpose else "row"
+        w_f = dequantize(
+            wi,
+            si,
+            zi,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            axis=dequant_axis,
+        )
+        if runtime_transpose:
             grad_x = g @ w_f
         else:
             grad_x = g @ w_f.T
 
         grad_w = jnp.zeros_like(wi)
         grad_scales = jnp.zeros_like(si)
-        grad_biases = jnp.zeros_like(bi) if bi is not None else None
-        return grad_x, grad_w, grad_scales, grad_biases
+        grad_zeros = jnp.zeros_like(zi) if zi is not None else None
+        return grad_x, grad_w, grad_scales, grad_zeros
 
     _inner_vjp.defvjp(_inner_fwd, _inner_bwd)
 
-    return _inner_vjp(x, w, scales, biases)
+    return _inner_vjp(x, w, scales, zeros)

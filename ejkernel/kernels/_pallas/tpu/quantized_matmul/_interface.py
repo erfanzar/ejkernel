@@ -17,15 +17,25 @@
 from __future__ import annotations
 
 import functools
-from typing import Literal
 
 import jax
+import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Float
 
 from ejkernel.callib._ejit import ejit
-from ejkernel.quantization._utils.grouping import _require_bits
+from ejkernel.quantization._utils.qparams import (
+    GemvMode,
+    QuantizationAxis,
+    RevSplitKMode,
+    normalize_gemv_mode,
+    normalize_revsplitk_mode,
+    normalize_revsplitk_parts,
+    resolve_qparams,
+    resolve_runtime_axis_and_transpose,
+    to_backend_mode,
+)
 
 from ...._registry import Backend, Platform, kernel_registry
 from ...._xla.quantized_matmul import quantized_matmul as _xla_quantized_matmul
@@ -36,49 +46,6 @@ from ._pallas_impl_core import (
     is_packed_tpu_legal_input_grad,
 )
 from ._pallas_impl_fwd import _pallas_qmm_transpose_false
-
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
-
-
-def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tuple[int, int]:
-    mode = mode.lower()
-    if mode == "affine":
-        group_size = 64 if group_size is None else int(group_size)
-        bits = 4 if bits is None else _require_bits(bits, {2, 3, 4, 5, 6, 7, 8})
-        if group_size not in {32, 64, 128}:
-            raise ValueError("affine mode supports group_size in {32, 64, 128}.")
-        return group_size, bits
-    if mode == "mxfp4":
-        group_size = 32 if group_size is None else int(group_size)
-        bits = 4 if bits is None else int(bits)
-        if group_size != 32 or bits != 4:
-            raise ValueError("mxfp4 requires group_size=32 and bits=4.")
-        return group_size, bits
-    if mode == "mxfp8":
-        group_size = 32 if group_size is None else int(group_size)
-        bits = 8 if bits is None else int(bits)
-        if group_size != 32 or bits != 8:
-            raise ValueError("mxfp8 requires group_size=32 and bits=8.")
-        return group_size, bits
-    if mode == "nvfp4":
-        group_size = 16 if group_size is None else int(group_size)
-        bits = 4 if bits is None else int(bits)
-        if group_size != 16 or bits != 4:
-            raise ValueError("nvfp4 requires group_size=16 and bits=4.")
-        return group_size, bits
-    if mode == "nvfp8":
-        group_size = 16 if group_size is None else int(group_size)
-        bits = 8 if bits is None else int(bits)
-        if group_size != 16 or bits != 8:
-            raise ValueError("nvfp8 requires group_size=16 and bits=8.")
-        return group_size, bits
-    if mode == "nf4":
-        group_size = 64 if group_size is None else int(group_size)
-        bits = 4 if bits is None else int(bits)
-        if bits != 4:
-            raise ValueError("nf4 requires bits=4.")
-        return group_size, bits
-    raise ValueError(f"Unsupported quantization mode: {mode}")
 
 
 def _is_packed_tpu_legal(
@@ -127,6 +94,9 @@ def _is_packed_tpu_legal(
         "block_n",
         "block_k",
         "use_bf16",
+        "gemv_mode",
+        "revsplit_k",
+        "revsplit_k_parts",
     ],
 )
 def _operate_impl(
@@ -143,7 +113,11 @@ def _operate_impl(
     block_n: int,
     block_k: int,
     use_bf16: bool,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
 ) -> jax.Array:
+    del gemv_mode, revsplit_k, revsplit_k_parts
     del use_bf16
     compute_in_bf16 = True
 
@@ -153,11 +127,12 @@ def _operate_impl(
             x,
             w,
             scales,
-            biases,
+            None,
             transpose=transpose,
             group_size=group_size,
             bits=bits,
             mode=mode,
+            biases=biases,
             block_m=block_m,
             block_n=block_n,
             block_k=block_k,
@@ -201,11 +176,12 @@ def _operate_impl(
         x,
         w,
         scales,
-        biases,
+        None,
         transpose=transpose,
         group_size=group_size,
         bits=bits,
         mode=mode,
+        biases=biases,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -213,7 +189,7 @@ def _operate_impl(
     )
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 12))
+@functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 15))
 def _operate(
     x: jax.Array,
     w: jax.Array,
@@ -227,6 +203,9 @@ def _operate(
     block_n: int,
     block_k: int,
     use_bf16: bool,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
 ) -> jax.Array:
     return _operate_impl(
         x,
@@ -241,6 +220,9 @@ def _operate(
         block_n=block_n,
         block_k=block_k,
         use_bf16=use_bf16,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
     )
 
 
@@ -257,6 +239,9 @@ def _operate_fwd(
     block_n: int,
     block_k: int,
     use_bf16: bool,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array | None]]:
     out = _operate_impl(
         x,
@@ -271,6 +256,9 @@ def _operate_fwd(
         block_n=block_n,
         block_k=block_k,
         use_bf16=use_bf16,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
     )
     return out, (w, scales, biases)
 
@@ -284,9 +272,13 @@ def _operate_bwd(
     block_n: int,
     block_k: int,
     use_bf16: bool,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
     residual: tuple[jax.Array, jax.Array, jax.Array | None],
     grad_out: jax.Array,
 ) -> tuple[jax.Array, None, None, None]:
+    del gemv_mode, revsplit_k, revsplit_k_parts
     w, scales, biases = residual
     path = get_qmm_tpu_path()
     packed_legal = False
@@ -330,11 +322,15 @@ def quantized_matmul(
     x: Float[Array, "m k"],
     w: Array,
     scales: Array,
-    biases: Array | None = None,
+    zeros: Array | None = None,
     transpose: bool = False,
     group_size: int | None = None,
     bits: int | None = None,
-    mode: QuantizationMode = "affine",
+    mode: str = "affine",
+    axis: QuantizationAxis | None = None,
+    gemv_mode: GemvMode = "auto",
+    revsplit_k: RevSplitKMode = "auto",
+    revsplit_k_parts: int | None = None,
     *,
     block_m: int = 128,
     block_n: int = 128,
@@ -344,30 +340,48 @@ def quantized_matmul(
     num_stages: int | None = None,
     split_k: int | None = None,
 ) -> Float[Array, "m n"]:
-    """Quantized matmul on TPU via Pallas with custom backward support."""
+    """Quantized matmul on TPU via Pallas with custom backward support.
+
+    ``zeros`` is used only for affine mode and is converted to per-group
+    additive offsets before entering Pallas/XLA kernels.
+    """
     del num_warps, num_stages, split_k
     del use_bf16
 
-    mode = mode.lower()
-    group_size, bits = _resolve_qparams(mode, group_size, bits)
-    if mode == "affine" and biases is None:
-        raise ValueError("affine quantized_matmul requires biases.")
-    if mode != "affine" and biases is not None:
-        raise ValueError("biases must be None for non-affine modes.")
+    mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
+    _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    gemv_mode = normalize_gemv_mode(gemv_mode)
+    revsplit_k = normalize_revsplitk_mode(revsplit_k)
+    revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
+
+    if mode == "affine":
+        if zeros is None:
+            raise ValueError("affine quantized_matmul requires `zeros`.")
+        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+        affine_biases = -zeros * safe_scale
+    else:
+        if zeros is not None:
+            raise ValueError("zeros must be None for non-affine modes.")
+        affine_biases = None
+
+    backend_mode = to_backend_mode(mode, bits)
 
     return _operate(
         x,
         w,
         scales,
-        biases,
+        affine_biases,
         transpose,
         group_size,
         bits,
-        mode,
+        backend_mode,
         block_m,
         block_n,
         block_k,
         True,
+        gemv_mode,
+        revsplit_k,
+        revsplit_k_parts,
     )
 
 

@@ -19,6 +19,7 @@ functions for various quantization modes.
 """
 
 from .quantizations import (
+    QuantizationAxis,
     QuantizationMode,
     dequantize,
     prepack_quantized_weights,
@@ -27,6 +28,7 @@ from .quantizations import (
 )
 
 __all__ = [
+    "QuantizationAxis",
     "QuantizationMode",
     "dequantize",
     "prepack_quantized_weights",

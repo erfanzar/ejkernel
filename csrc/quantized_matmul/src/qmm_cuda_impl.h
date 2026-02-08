@@ -307,6 +307,119 @@ inline bool UseFusedQmm() {
   return false;
 }
 
+inline bool UseExperimentalGemvQmm() {
+  static int cached = -1;
+  if (cached != -1) {
+    return cached == 1;
+  }
+  const char *env = std::getenv("EJKERNEL_QMM_CUDA_GEMV_EXPERIMENTAL");
+  if (!env) {
+    cached = 0;
+    return false;
+  }
+  if (env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' ||
+      env[0] == 'Y') {
+    cached = 1;
+    return true;
+  }
+  cached = 0;
+  return false;
+}
+
+enum class QmmKernelFamily : int64_t {
+  kGemm = 0,
+  kGemmSplitK = 1,
+  kGemvSplitK = 2,
+  kGemvRevSplitK = 3,
+};
+
+inline bool IsEffective4BitMode(int64_t mode, int64_t bits) {
+  if (mode == 0) {
+    return bits == kBits4;
+  }
+  return mode == 1 || mode == 2 || mode == 4;
+}
+
+inline Error ResolveQmmKernelFamily(int64_t M, int64_t mode, int64_t bits,
+                                    int64_t gemv_mode, int64_t revsplit_k,
+                                    int64_t revsplit_k_parts,
+                                    QmmKernelFamily *family_out,
+                                    int64_t *revsplit_parts_out) {
+  if (gemv_mode < 0 || gemv_mode > 2) {
+    return MakeInvalid("gemv_mode must be one of {0(auto),1(on),2(off)}.");
+  }
+  if (revsplit_k < 0 || revsplit_k > 2) {
+    return MakeInvalid("revsplit_k must be one of {0(auto),1(on),2(off)}.");
+  }
+  if (!(revsplit_k_parts == 0 || revsplit_k_parts == 1 || revsplit_k_parts == 2 ||
+        revsplit_k_parts == 4 || revsplit_k_parts == 8 || revsplit_k_parts == 16)) {
+    return MakeInvalid("revsplit_k_parts must be one of {0,1,2,4,8,16}.");
+  }
+  if (M <= 0) {
+    return MakeInvalid("Input activation leading dimension M must be >= 1.");
+  }
+
+  // GemLite parity: keep MXFP M==1 on GEMM-SplitK path.
+  if (M == 1 && (mode == 2 || mode == 3)) {
+    *family_out = QmmKernelFamily::kGemmSplitK;
+    *revsplit_parts_out = 0;
+    return Error::Success();
+  }
+
+  bool effective_4bit = IsEffective4BitMode(mode, bits);
+  bool use_gemv = false;
+  if (gemv_mode == 0) {
+    use_gemv = (M == 1);
+  } else if (gemv_mode == 1) {
+    if (M != 1) {
+      return MakeInvalid("gemv_mode=on requires M == 1.");
+    }
+    use_gemv = true;
+  } else {
+    use_gemv = false;
+  }
+
+  int64_t revsplit_parts = 0;
+  if (!use_gemv) {
+    *family_out = (M > 64) ? QmmKernelFamily::kGemm : QmmKernelFamily::kGemmSplitK;
+    *revsplit_parts_out = 0;
+    return Error::Success();
+  }
+
+  if (revsplit_k == 1) {
+    if (!effective_4bit) {
+      return MakeInvalid("revsplit_k=on requires an effective 4-bit mode.");
+    }
+    revsplit_parts = revsplit_k_parts == 0 ? 2 : revsplit_k_parts;
+    if (revsplit_parts < 2) {
+      return MakeInvalid("revsplit_k=on requires revsplit_k_parts >= 2.");
+    }
+    *family_out = QmmKernelFamily::kGemvRevSplitK;
+    *revsplit_parts_out = revsplit_parts;
+    return Error::Success();
+  }
+
+  if (revsplit_k == 2) {
+    *family_out = QmmKernelFamily::kGemvSplitK;
+    *revsplit_parts_out = 0;
+    return Error::Success();
+  }
+
+  // auto
+  if (effective_4bit) {
+    revsplit_parts = revsplit_k_parts == 0 ? 2 : revsplit_k_parts;
+    if (revsplit_parts < 2) {
+      revsplit_parts = 2;
+    }
+    *family_out = QmmKernelFamily::kGemvRevSplitK;
+    *revsplit_parts_out = revsplit_parts;
+    return Error::Success();
+  }
+  *family_out = QmmKernelFamily::kGemvSplitK;
+  *revsplit_parts_out = 0;
+  return Error::Success();
+}
+
 __device__ __forceinline__ uint32_t LoadPackedQ(const uint32_t *row, int64_t n,
                                                 int bits) {
   if (bits == 4) {
@@ -400,6 +513,37 @@ __device__ __forceinline__ float DequantValue(uint32_t q, const ScaleT *scales,
   uint8_t code = static_cast<uint8_t>(scales[idx]);
   float scale = kE4M3Table[code];
   return kE4M3Table[q] * scale;
+}
+
+template <typename ScaleT, typename BiasT>
+__global__ void DequantToBf16Kernel(const uint32_t *wq, const ScaleT *scales,
+                                    const BiasT *biases, __nv_bfloat16 *out,
+                                    int64_t K, int64_t N, int64_t n_words,
+                                    int64_t n_groups, int64_t group_size,
+                                    int bits, int64_t mode,
+                                    int64_t transpose) {
+  int64_t total = K * N;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+  bool transposed = transpose != 0;
+
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    const uint32_t *wq_row =
+        transposed ? (wq + n * n_words) : (wq + k * n_words);
+    uint32_t q = LoadPackedQ(wq_row, transposed ? k : n, bits);
+    int64_t g = transposed ? (k / group_size) : (n / group_size);
+    float val =
+        DequantValue(q, scales, biases, n, k, g, n_groups, transposed, mode);
+    out[idx] = __float2bfloat16(val);
+  }
 }
 
 template <typename XType, typename ScaleT, typename BiasT, typename OutT>
@@ -537,6 +681,117 @@ Error LaunchQmmFusedKernel(const XType *x, const uint32_t *wq,
       x, wq, scales, biases, out, M, N, K, n_words, n_groups, group_size,
       bits, mode, transpose);
   return CheckCuda(cudaPeekAtLastError(), "fused qmm kernel launch");
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT>
+__global__ void QmmFusedGemvKernel(const XType *x, const uint32_t *wq,
+                                   const ScaleT *scales, const BiasT *biases,
+                                   OutT *out, int64_t N, int64_t K,
+                                   int64_t n_words, int64_t n_groups,
+                                   int64_t group_size, int bits, int64_t mode,
+                                   int64_t transpose) {
+  int64_t n = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (n >= N) {
+    return;
+  }
+
+  bool transposed = transpose != 0;
+  float acc = 0.0f;
+  for (int64_t k = 0; k < K; ++k) {
+    float x_val = ToFloatLocal(x[k]);
+    const uint32_t *wq_row =
+        transposed ? (wq + n * n_words) : (wq + k * n_words);
+    uint32_t q = LoadPackedQ(wq_row, transposed ? k : n, bits);
+    int64_t g = transposed ? (k / group_size) : (n / group_size);
+    float w_val =
+        DequantValue(q, scales, biases, n, k, g, n_groups, transposed, mode);
+    acc += x_val * w_val;
+  }
+  out[n] = CastOut<OutT>(acc);
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT>
+__global__ void QmmFusedGemvRevSplitKKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_words,
+    int64_t n_groups, int64_t group_size, int bits, int64_t mode,
+    int64_t transpose, int64_t revsplit_k_parts) {
+  int64_t n = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (n >= N) {
+    return;
+  }
+
+  bool transposed = transpose != 0;
+  int64_t parts = revsplit_k_parts <= 1 ? 2 : revsplit_k_parts;
+  float acc = 0.0f;
+  for (int64_t p = 0; p < parts; ++p) {
+    int64_t k_start = (K * p) / parts;
+    int64_t k_end = (K * (p + 1)) / parts;
+    for (int64_t k = k_start; k < k_end; ++k) {
+      float x_val = ToFloatLocal(x[k]);
+      const uint32_t *wq_row =
+          transposed ? (wq + n * n_words) : (wq + k * n_words);
+      uint32_t q = LoadPackedQ(wq_row, transposed ? k : n, bits);
+      int64_t g = transposed ? (k / group_size) : (n / group_size);
+      float w_val =
+          DequantValue(q, scales, biases, n, k, g, n_groups, transposed, mode);
+      acc += x_val * w_val;
+    }
+  }
+  out[n] = CastOut<OutT>(acc);
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT>
+Error LaunchQmmFusedGemvKernel(const XType *x, const uint32_t *wq,
+                               const ScaleT *scales, const BiasT *biases,
+                               OutT *out, int64_t N, int64_t K,
+                               int64_t n_words, int64_t n_groups,
+                               int64_t group_size, int bits, int64_t mode,
+                               int64_t transpose, cudaStream_t stream) {
+  dim3 block(256);
+  dim3 grid(static_cast<uint32_t>((N + block.x - 1) / block.x));
+  QmmFusedGemvKernel<XType, ScaleT, BiasT, OutT><<<grid, block, 0, stream>>>(
+      x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+      mode, transpose);
+  return CheckCuda(cudaPeekAtLastError(), "fused qmm gemv kernel launch");
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT>
+Error LaunchQmmFusedGemvRevSplitKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_words,
+    int64_t n_groups, int64_t group_size, int bits, int64_t mode,
+    int64_t transpose, int64_t revsplit_k_parts, cudaStream_t stream) {
+  dim3 block(256);
+  dim3 grid(static_cast<uint32_t>((N + block.x - 1) / block.x));
+  QmmFusedGemvRevSplitKKernel<XType, ScaleT, BiasT, OutT>
+      <<<grid, block, 0, stream>>>(
+          x, wq, scales, biases, out, N, K, n_words, n_groups, group_size,
+          bits, mode, transpose, revsplit_k_parts);
+  return CheckCuda(cudaPeekAtLastError(),
+                   "fused qmm gemv revsplit-k kernel launch");
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT>
+Error LaunchQmmFusedByFamily(
+    QmmKernelFamily family, int64_t revsplit_k_parts, const XType *x,
+    const uint32_t *wq, const ScaleT *scales, const BiasT *biases, OutT *out,
+    int64_t M, int64_t N, int64_t K, int64_t n_words, int64_t n_groups,
+    int64_t group_size, int bits, int64_t mode, int64_t transpose,
+    cudaStream_t stream) {
+  if (family == QmmKernelFamily::kGemvSplitK) {
+    return LaunchQmmFusedGemvKernel<XType, ScaleT, BiasT, OutT>(
+        x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+        mode, transpose, stream);
+  }
+  if (family == QmmKernelFamily::kGemvRevSplitK) {
+    return LaunchQmmFusedGemvRevSplitKernel<XType, ScaleT, BiasT, OutT>(
+        x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+        mode, transpose, revsplit_k_parts, stream);
+  }
+  return LaunchQmmFusedKernel<XType, ScaleT, BiasT, OutT>(
+      x, wq, scales, biases, out, M, N, K, n_words, n_groups, group_size, bits,
+      mode, transpose, stream);
 }
 
 struct CublasHandleCache {
@@ -1002,18 +1257,18 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                           std::optional<AnyBuffer> biases,
                           Result<AnyBuffer> out, int64_t group_size,
                           int64_t bits, int64_t mode, int64_t transpose,
-                          cudaStream_t stream, ScratchAllocator scratch) {
-  if (bits < 2 || bits > 8) {
-    return MakeInvalid("CUDA quantized_matmul supports bits in [2, 8].");
+                          int64_t gemv_mode, int64_t revsplit_k,
+                          int64_t revsplit_k_parts, cudaStream_t stream,
+                          ScratchAllocator scratch) {
+  if (bits != kBits4 && bits != kBits8) {
+    return MakeInvalid("CUDA quantized_matmul supports bits in {4, 8}.");
   }
   if (transpose != 0) {
     return MakeInvalid(
         "CUDA quantized_matmul does not support transpose=True.");
   }
-  if (mode == 0 && !(bits == 2 || bits == 3 || bits == 4 || bits == 5 ||
-                     bits == 6 || bits == 7 || bits == 8)) {
-    return MakeInvalid(
-        "affine mode supports bits in {2,3,4,5,6,7,8} on CUDA.");
+  if (mode == 0 && !(bits == kBits4 || bits == kBits8)) {
+    return MakeInvalid("affine mode supports bits in {4,8} on CUDA.");
   }
   if (mode == 1 && bits != kBits4) {
     return MakeInvalid("nf4 mode requires bits=4 on CUDA.");
@@ -1046,6 +1301,15 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
   int64_t K_w = w_dims[0];
   int64_t N_words = w_dims[1];
   bool use_bf16_gemm = x.element_type() == xla::ffi::DataType::BF16;
+
+  QmmKernelFamily kernel_family = QmmKernelFamily::kGemm;
+  int64_t revsplit_parts_effective = 0;
+  if (Error err = ResolveQmmKernelFamily(M, mode, bits, gemv_mode, revsplit_k,
+                                         revsplit_k_parts, &kernel_family,
+                                         &revsplit_parts_effective);
+      err.failure()) {
+    return err;
+  }
 
   if (group_size <= 0) {
     return MakeInvalid("group_size must be positive.");
@@ -1110,7 +1374,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     }
   } else if (mode == 2 || mode == 3 || mode == 4 || mode == 5) {
     if (biases.has_value()) {
-      return MakeInvalid("mxfp/nvfp modes do not accept biases.");
+      return MakeInvalid("mxfp4/mxfp8/nvfp4/nvfp8 modes do not accept biases.");
     }
   } else {
     return MakeInvalid("Unsupported mode for CUDA quantized_matmul.");
@@ -1120,7 +1384,17 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     return MakeInvalid("M/N/K are too large for CUDA GEMM.");
   }
 
-  if (UseFusedQmm()) {
+  bool is_gemv_family = kernel_family == QmmKernelFamily::kGemvSplitK ||
+                        kernel_family == QmmKernelFamily::kGemvRevSplitK;
+  bool use_fused_path = false;
+  if (is_gemv_family) {
+    // Default to cuBLAS/dequant for M==1; enable fused GEMV only for experiments.
+    use_fused_path = UseExperimentalGemvQmm();
+  } else {
+    use_fused_path = UseFusedQmm();
+  }
+
+  if (use_fused_path) {
     const uint32_t *wq_ptr =
         static_cast<const uint32_t *>(wq.untyped_data());
     auto scales_dtype = scales.element_type();
@@ -1136,19 +1410,22 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
             bias_ptr = static_cast<const float *>(biases->untyped_data());
           }
           if (x_dtype == xla::ffi::DataType::F16) {
-            return LaunchQmmFusedKernel<half, float, float, OutT>(
+            return LaunchQmmFusedByFamily<half, float, float, OutT>(
+                kernel_family, revsplit_parts_effective,
                 static_cast<const half *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
                 mode, transpose, stream);
           }
           if (x_dtype == xla::ffi::DataType::F32) {
-            return LaunchQmmFusedKernel<float, float, float, OutT>(
+            return LaunchQmmFusedByFamily<float, float, float, OutT>(
+                kernel_family, revsplit_parts_effective,
                 static_cast<const float *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
                 mode, transpose, stream);
           }
           if (x_dtype == xla::ffi::DataType::BF16) {
-            return LaunchQmmFusedKernel<__nv_bfloat16, float, float, OutT>(
+            return LaunchQmmFusedByFamily<__nv_bfloat16, float, float, OutT>(
+                kernel_family, revsplit_parts_effective,
                 static_cast<const __nv_bfloat16 *>(x.untyped_data()), wq_ptr,
                 scales_ptr, bias_ptr, out_ptr, M, N, K, N_words, n_groups,
                 group_size, bits, mode, transpose, stream);
@@ -1163,19 +1440,22 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
             bias_ptr = static_cast<const half *>(biases->untyped_data());
           }
           if (x_dtype == xla::ffi::DataType::F16) {
-            return LaunchQmmFusedKernel<half, half, half, OutT>(
+            return LaunchQmmFusedByFamily<half, half, half, OutT>(
+                kernel_family, revsplit_parts_effective,
                 static_cast<const half *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
                 mode, transpose, stream);
           }
           if (x_dtype == xla::ffi::DataType::F32) {
-            return LaunchQmmFusedKernel<float, half, half, OutT>(
+            return LaunchQmmFusedByFamily<float, half, half, OutT>(
+                kernel_family, revsplit_parts_effective,
                 static_cast<const float *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
                 mode, transpose, stream);
           }
           if (x_dtype == xla::ffi::DataType::BF16) {
-            return LaunchQmmFusedKernel<__nv_bfloat16, half, half, OutT>(
+            return LaunchQmmFusedByFamily<__nv_bfloat16, half, half, OutT>(
+                kernel_family, revsplit_parts_effective,
                 static_cast<const __nv_bfloat16 *>(x.untyped_data()), wq_ptr,
                 scales_ptr, bias_ptr, out_ptr, M, N, K, N_words, n_groups,
                 group_size, bits, mode, transpose, stream);
@@ -1191,22 +1471,25 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                 static_cast<const __nv_bfloat16 *>(biases->untyped_data());
           }
           if (x_dtype == xla::ffi::DataType::F16) {
-            return LaunchQmmFusedKernel<half, __nv_bfloat16, __nv_bfloat16,
-                                        OutT>(
+            return LaunchQmmFusedByFamily<half, __nv_bfloat16, __nv_bfloat16,
+                                          OutT>(
+                kernel_family, revsplit_parts_effective,
                 static_cast<const half *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
                 mode, transpose, stream);
           }
           if (x_dtype == xla::ffi::DataType::F32) {
-            return LaunchQmmFusedKernel<float, __nv_bfloat16, __nv_bfloat16,
-                                        OutT>(
+            return LaunchQmmFusedByFamily<float, __nv_bfloat16, __nv_bfloat16,
+                                          OutT>(
+                kernel_family, revsplit_parts_effective,
                 static_cast<const float *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
                 mode, transpose, stream);
           }
           if (x_dtype == xla::ffi::DataType::BF16) {
-            return LaunchQmmFusedKernel<__nv_bfloat16, __nv_bfloat16,
-                                        __nv_bfloat16, OutT>(
+            return LaunchQmmFusedByFamily<__nv_bfloat16, __nv_bfloat16,
+                                          __nv_bfloat16, OutT>(
+                kernel_family, revsplit_parts_effective,
                 static_cast<const __nv_bfloat16 *>(x.untyped_data()), wq_ptr,
                 scales_ptr, bias_ptr, out_ptr, M, N, K, N_words, n_groups,
                 group_size, bits, mode, transpose, stream);
@@ -1221,19 +1504,22 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
         const uint8_t *scales_ptr =
             static_cast<const uint8_t *>(scales.untyped_data());
         if (x_dtype == xla::ffi::DataType::F16) {
-          return LaunchQmmFusedKernel<half, uint8_t, uint8_t, OutT>(
+          return LaunchQmmFusedByFamily<half, uint8_t, uint8_t, OutT>(
+              kernel_family, revsplit_parts_effective,
               static_cast<const half *>(x.untyped_data()), wq_ptr, scales_ptr,
               nullptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
               mode, transpose, stream);
         }
         if (x_dtype == xla::ffi::DataType::F32) {
-          return LaunchQmmFusedKernel<float, uint8_t, uint8_t, OutT>(
+          return LaunchQmmFusedByFamily<float, uint8_t, uint8_t, OutT>(
+              kernel_family, revsplit_parts_effective,
               static_cast<const float *>(x.untyped_data()), wq_ptr, scales_ptr,
               nullptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
               mode, transpose, stream);
         }
         if (x_dtype == xla::ffi::DataType::BF16) {
-          return LaunchQmmFusedKernel<__nv_bfloat16, uint8_t, uint8_t, OutT>(
+          return LaunchQmmFusedByFamily<__nv_bfloat16, uint8_t, uint8_t, OutT>(
+              kernel_family, revsplit_parts_effective,
               static_cast<const __nv_bfloat16 *>(x.untyped_data()), wq_ptr,
               scales_ptr, nullptr, out_ptr, M, N, K, N_words, n_groups,
               group_size, bits, mode, transpose, stream);
@@ -1241,7 +1527,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
         return MakeInvalid("x dtype must be float16/float32/bfloat16.");
       }
 
-      return MakeInvalid("scales dtype must be uint8 for mxfp/nvfp modes.");
+      return MakeInvalid("scales dtype must be uint8 for mxfp4/mxfp8/nvfp4/nvfp8 modes.");
     };
 
     if (out_dtype == xla::ffi::DataType::F32) {
@@ -1266,7 +1552,11 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     if (cudaGetDevice(&current_device) != cudaSuccess) {
       return MakeInternal("Failed to query current CUDA device.");
     }
-    bool match = g_dequant_cache.buffer != nullptr &&
+    bool have_cached_weights =
+        use_bf16_gemm ? (g_dequant_cache.buffer_bf16 != nullptr &&
+                         g_dequant_cache.bf16_valid)
+                      : (g_dequant_cache.buffer != nullptr);
+    bool match = have_cached_weights &&
                  g_dequant_cache.device == current_device &&
                  g_dequant_cache.wq == wq_ptr &&
                  g_dequant_cache.scales == scales.untyped_data() &&
@@ -1278,26 +1568,30 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                  g_dequant_cache.group_size == group_size &&
                  g_dequant_cache.bits == bits && g_dequant_cache.mode == mode;
     if (match) {
-      w_deq = g_dequant_cache.buffer;
+      if (!use_bf16_gemm) {
+        w_deq = g_dequant_cache.buffer;
+      }
       need_dequantize = false;
     } else {
-      size_t w_deq_bytes =
-          static_cast<size_t>(K) * static_cast<size_t>(N) * sizeof(half);
-      if (g_dequant_cache.buffer == nullptr ||
-          g_dequant_cache.bytes < w_deq_bytes ||
-          g_dequant_cache.device != current_device) {
-        if (g_dequant_cache.buffer) {
-          cudaFree(g_dequant_cache.buffer);
-          g_dequant_cache.buffer = nullptr;
-          g_dequant_cache.bytes = 0;
+      if (!use_bf16_gemm) {
+        size_t w_deq_bytes =
+            static_cast<size_t>(K) * static_cast<size_t>(N) * sizeof(half);
+        if (g_dequant_cache.buffer == nullptr ||
+            g_dequant_cache.bytes < w_deq_bytes ||
+            g_dequant_cache.device != current_device) {
+          if (g_dequant_cache.buffer) {
+            cudaFree(g_dequant_cache.buffer);
+            g_dequant_cache.buffer = nullptr;
+            g_dequant_cache.bytes = 0;
+          }
+          cudaError_t alloc_err =
+              cudaMalloc(&g_dequant_cache.buffer, w_deq_bytes);
+          if (alloc_err != cudaSuccess) {
+            return MakeInternal("Failed to allocate cached dequant buffer.");
+          }
+          g_dequant_cache.bytes = w_deq_bytes;
+          g_dequant_cache.device = current_device;
         }
-        cudaError_t alloc_err =
-            cudaMalloc(&g_dequant_cache.buffer, w_deq_bytes);
-        if (alloc_err != cudaSuccess) {
-          return MakeInternal("Failed to allocate cached dequant buffer.");
-        }
-        g_dequant_cache.bytes = w_deq_bytes;
-        g_dequant_cache.device = current_device;
       }
       g_dequant_cache.wq = wq_ptr;
       g_dequant_cache.scales = scales.untyped_data();
@@ -1310,20 +1604,25 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
       g_dequant_cache.group_size = group_size;
       g_dequant_cache.bits = bits;
       g_dequant_cache.mode = mode;
+      g_dequant_cache.device = current_device;
       g_dequant_cache.bf16_valid = false;
-      w_deq = g_dequant_cache.buffer;
+      if (!use_bf16_gemm) {
+        w_deq = g_dequant_cache.buffer;
+      }
       need_dequantize = true;
     }
   } else {
-    size_t w_deq_bytes =
-        static_cast<size_t>(K) * static_cast<size_t>(N) * sizeof(half);
-    auto w_deq_opt = scratch.Allocate(w_deq_bytes, alignof(half));
-    if (!w_deq_opt.has_value()) {
-      return MakeInternal(
-          "Failed to allocate scratch buffer for dequantized weights.");
+    if (!use_bf16_gemm) {
+      size_t w_deq_bytes =
+          static_cast<size_t>(K) * static_cast<size_t>(N) * sizeof(half);
+      auto w_deq_opt = scratch.Allocate(w_deq_bytes, alignof(half));
+      if (!w_deq_opt.has_value()) {
+        return MakeInternal(
+            "Failed to allocate scratch buffer for dequantized weights.");
+      }
+      void *w_deq_ptr = *w_deq_opt;
+      w_deq = reinterpret_cast<half *>(w_deq_ptr);
     }
-    void *w_deq_ptr = *w_deq_opt;
-    w_deq = reinterpret_cast<half *>(w_deq_ptr);
     need_dequantize = true;
   }
 
@@ -1335,7 +1634,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                                   elems_per_block));
 
   auto scales_dtype = scales.element_type();
-  if (need_dequantize) {
+  if (need_dequantize && !use_bf16_gemm) {
     if (mode == 0) {
       auto biases_buf = *biases;
       auto bias_dtype = biases_buf.element_type();
@@ -1344,38 +1643,8 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
       }
       if (scales_dtype == xla::ffi::DataType::F32) {
         switch (bits) {
-        case 2:
-          ResolveLaunchDequantAffineBits2F32(group_size)(
-              wq_ptr, static_cast<const float *>(scales.untyped_data()),
-              static_cast<const float *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 3:
-          ResolveLaunchDequantAffineBits3F32(group_size)(
-              wq_ptr, static_cast<const float *>(scales.untyped_data()),
-              static_cast<const float *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
         case 4:
           ResolveLaunchDequantAffineBits4F32(group_size)(
-              wq_ptr, static_cast<const float *>(scales.untyped_data()),
-              static_cast<const float *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 5:
-          ResolveLaunchDequantAffineBits5F32(group_size)(
-              wq_ptr, static_cast<const float *>(scales.untyped_data()),
-              static_cast<const float *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 6:
-          ResolveLaunchDequantAffineBits6F32(group_size)(
-              wq_ptr, static_cast<const float *>(scales.untyped_data()),
-              static_cast<const float *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 7:
-          ResolveLaunchDequantAffineBits7F32(group_size)(
               wq_ptr, static_cast<const float *>(scales.untyped_data()),
               static_cast<const float *>(biases_buf.untyped_data()), w_deq, K,
               N, N_words, group_size, n_groups, grid, block, stream);
@@ -1387,43 +1656,12 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
               N, N_words, group_size, n_groups, grid, block, stream);
           break;
         default:
-          return MakeInvalid(
-              "affine mode supports bits in {2,3,4,5,6,7,8} on CUDA.");
+          return MakeInvalid("affine mode supports bits in {4,8} on CUDA.");
         }
       } else if (scales_dtype == xla::ffi::DataType::F16) {
         switch (bits) {
-        case 2:
-          ResolveLaunchDequantAffineBits2F16(group_size)(
-              wq_ptr, static_cast<const half *>(scales.untyped_data()),
-              static_cast<const half *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 3:
-          ResolveLaunchDequantAffineBits3F16(group_size)(
-              wq_ptr, static_cast<const half *>(scales.untyped_data()),
-              static_cast<const half *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
         case 4:
           ResolveLaunchDequantAffineBits4F16(group_size)(
-              wq_ptr, static_cast<const half *>(scales.untyped_data()),
-              static_cast<const half *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 5:
-          ResolveLaunchDequantAffineBits5F16(group_size)(
-              wq_ptr, static_cast<const half *>(scales.untyped_data()),
-              static_cast<const half *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 6:
-          ResolveLaunchDequantAffineBits6F16(group_size)(
-              wq_ptr, static_cast<const half *>(scales.untyped_data()),
-              static_cast<const half *>(biases_buf.untyped_data()), w_deq, K,
-              N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 7:
-          ResolveLaunchDequantAffineBits7F16(group_size)(
               wq_ptr, static_cast<const half *>(scales.untyped_data()),
               static_cast<const half *>(biases_buf.untyped_data()), w_deq, K,
               N, N_words, group_size, n_groups, grid, block, stream);
@@ -1435,48 +1673,12 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
               N, N_words, group_size, n_groups, grid, block, stream);
           break;
         default:
-          return MakeInvalid(
-              "affine mode supports bits in {2,3,4,5,6,7,8} on CUDA.");
+          return MakeInvalid("affine mode supports bits in {4,8} on CUDA.");
         }
       } else if (scales_dtype == xla::ffi::DataType::BF16) {
         switch (bits) {
-        case 2:
-          ResolveLaunchDequantAffineBits2BF16(group_size)(
-              wq_ptr,
-              static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
-              static_cast<const __nv_bfloat16 *>(biases_buf.untyped_data()),
-              w_deq, K, N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 3:
-          ResolveLaunchDequantAffineBits3BF16(group_size)(
-              wq_ptr,
-              static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
-              static_cast<const __nv_bfloat16 *>(biases_buf.untyped_data()),
-              w_deq, K, N, N_words, group_size, n_groups, grid, block, stream);
-          break;
         case 4:
           ResolveLaunchDequantAffineBits4BF16(group_size)(
-              wq_ptr,
-              static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
-              static_cast<const __nv_bfloat16 *>(biases_buf.untyped_data()),
-              w_deq, K, N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 5:
-          ResolveLaunchDequantAffineBits5BF16(group_size)(
-              wq_ptr,
-              static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
-              static_cast<const __nv_bfloat16 *>(biases_buf.untyped_data()),
-              w_deq, K, N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 6:
-          ResolveLaunchDequantAffineBits6BF16(group_size)(
-              wq_ptr,
-              static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
-              static_cast<const __nv_bfloat16 *>(biases_buf.untyped_data()),
-              w_deq, K, N, N_words, group_size, n_groups, grid, block, stream);
-          break;
-        case 7:
-          ResolveLaunchDequantAffineBits7BF16(group_size)(
               wq_ptr,
               static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
               static_cast<const __nv_bfloat16 *>(biases_buf.untyped_data()),
@@ -1490,8 +1692,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
               w_deq, K, N, N_words, group_size, n_groups, grid, block, stream);
           break;
         default:
-          return MakeInvalid(
-              "affine mode supports bits in {2,3,4,5,6,7,8} on CUDA.");
+          return MakeInvalid("affine mode supports bits in {4,8} on CUDA.");
         }
       } else {
         return MakeInvalid(
@@ -1616,6 +1817,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     size_t w_bf16_bytes =
         static_cast<size_t>(K) * static_cast<size_t>(N) *
         sizeof(__nv_bfloat16);
+    bool need_bf16_dequantize = need_dequantize;
     if (use_cache) {
       if (g_dequant_cache.buffer_bf16 == nullptr ||
           g_dequant_cache.bytes_bf16 < w_bf16_bytes ||
@@ -1635,20 +1837,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
         g_dequant_cache.bf16_valid = false;
       }
       w_deq_bf16 = g_dequant_cache.buffer_bf16;
-      if (need_dequantize || !g_dequant_cache.bf16_valid) {
-        dim3 cblock(256);
-        int64_t w_elems = static_cast<int64_t>(K) * static_cast<int64_t>(N);
-        dim3 cgrid(static_cast<uint32_t>((w_elems + cblock.x - 1) / cblock.x));
-        convert_f16_to_bf16<<<cgrid, cblock, 0, stream>>>(
-            w_deq, w_deq_bf16, w_elems);
-        if (Error err =
-                CheckCuda(cudaPeekAtLastError(),
-                          "weight cast kernel launch");
-            err.failure()) {
-          return err;
-        }
-        g_dequant_cache.bf16_valid = true;
-      }
+      need_bf16_dequantize = need_bf16_dequantize || !g_dequant_cache.bf16_valid;
     } else {
       auto w_bf16_opt = scratch.Allocate(w_bf16_bytes, alignof(__nv_bfloat16));
       if (!w_bf16_opt.has_value()) {
@@ -1656,15 +1845,121 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
             "Failed to allocate bf16 buffer for dequantized weights.");
       }
       w_deq_bf16 = reinterpret_cast<__nv_bfloat16 *>(*w_bf16_opt);
-      dim3 cblock(256);
-      int64_t w_elems = static_cast<int64_t>(K) * static_cast<int64_t>(N);
-      dim3 cgrid(static_cast<uint32_t>((w_elems + cblock.x - 1) / cblock.x));
-      convert_f16_to_bf16<<<cgrid, cblock, 0, stream>>>(
-          w_deq, w_deq_bf16, w_elems);
-      if (Error err =
-              CheckCuda(cudaPeekAtLastError(), "weight cast kernel launch");
-          err.failure()) {
-        return err;
+      need_bf16_dequantize = true;
+    }
+
+    auto launch_dequant_bf16 = [&](auto *scales_ptr, auto *biases_ptr) -> Error {
+      using ScaleT = std::remove_pointer_t<decltype(scales_ptr)>;
+      using BiasT = std::remove_pointer_t<decltype(biases_ptr)>;
+      DequantToBf16Kernel<ScaleT, BiasT><<<grid, block, 0, stream>>>(
+          wq_ptr, scales_ptr, biases_ptr, w_deq_bf16, K, N, N_words, n_groups,
+          group_size, bits, mode, transpose);
+      return CheckCuda(cudaPeekAtLastError(), "bf16 dequant kernel launch");
+    };
+
+    if (need_bf16_dequantize) {
+      if (mode == 0) {
+        auto biases_buf = *biases;
+        auto bias_dtype = biases_buf.element_type();
+        if (bias_dtype != scales_dtype) {
+          return MakeInvalid("biases dtype must match scales dtype.");
+        }
+        if (scales_dtype == xla::ffi::DataType::F32) {
+          if (Error err = launch_dequant_bf16(
+                  static_cast<const float *>(scales.untyped_data()),
+                  static_cast<const float *>(biases_buf.untyped_data()));
+              err.failure()) {
+            return err;
+          }
+        } else if (scales_dtype == xla::ffi::DataType::F16) {
+          if (Error err = launch_dequant_bf16(
+                  static_cast<const half *>(scales.untyped_data()),
+                  static_cast<const half *>(biases_buf.untyped_data()));
+              err.failure()) {
+            return err;
+          }
+        } else if (scales_dtype == xla::ffi::DataType::BF16) {
+          if (Error err = launch_dequant_bf16(
+                  static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
+                  static_cast<const __nv_bfloat16 *>(biases_buf.untyped_data()));
+              err.failure()) {
+            return err;
+          }
+        } else {
+          return MakeInvalid(
+              "scales/biases dtype must be float32/float16/bfloat16.");
+        }
+      } else if (mode == 1) {
+        if (scales_dtype == xla::ffi::DataType::F32) {
+          if (Error err = launch_dequant_bf16(
+                  static_cast<const float *>(scales.untyped_data()),
+                  static_cast<const float *>(nullptr));
+              err.failure()) {
+            return err;
+          }
+        } else if (scales_dtype == xla::ffi::DataType::F16) {
+          if (Error err = launch_dequant_bf16(
+                  static_cast<const half *>(scales.untyped_data()),
+                  static_cast<const half *>(nullptr));
+              err.failure()) {
+            return err;
+          }
+        } else if (scales_dtype == xla::ffi::DataType::BF16) {
+          if (Error err = launch_dequant_bf16(
+                  static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
+                  static_cast<const __nv_bfloat16 *>(nullptr));
+              err.failure()) {
+            return err;
+          }
+        } else {
+          return MakeInvalid(
+              "scales dtype must be float32/float16/bfloat16 for nf4.");
+        }
+      } else if (mode == 2) {
+        if (scales_dtype != xla::ffi::DataType::U8 || bits != kBits4) {
+          return MakeInvalid("mxfp4 requires scales dtype uint8 and bits=4.");
+        }
+        if (Error err = launch_dequant_bf16(
+                static_cast<const uint8_t *>(scales.untyped_data()),
+                static_cast<const uint8_t *>(nullptr));
+            err.failure()) {
+          return err;
+        }
+      } else if (mode == 3) {
+        if (scales_dtype != xla::ffi::DataType::U8 || bits != kBits8) {
+          return MakeInvalid("mxfp8 requires scales dtype uint8 and bits=8.");
+        }
+        if (Error err = launch_dequant_bf16(
+                static_cast<const uint8_t *>(scales.untyped_data()),
+                static_cast<const uint8_t *>(nullptr));
+            err.failure()) {
+          return err;
+        }
+      } else if (mode == 4) {
+        if (scales_dtype != xla::ffi::DataType::U8 || bits != kBits4) {
+          return MakeInvalid("nvfp4 requires scales dtype uint8 and bits=4.");
+        }
+        if (Error err = launch_dequant_bf16(
+                static_cast<const uint8_t *>(scales.untyped_data()),
+                static_cast<const uint8_t *>(nullptr));
+            err.failure()) {
+          return err;
+        }
+      } else if (mode == 5) {
+        if (scales_dtype != xla::ffi::DataType::U8 || bits != kBits8) {
+          return MakeInvalid("nvfp8 requires scales dtype uint8 and bits=8.");
+        }
+        if (Error err = launch_dequant_bf16(
+                static_cast<const uint8_t *>(scales.untyped_data()),
+                static_cast<const uint8_t *>(nullptr));
+            err.failure()) {
+          return err;
+        }
+      } else {
+        return MakeInvalid("Unsupported mode for CUDA quantized_matmul.");
+      }
+      if (use_cache) {
+        g_dequant_cache.bf16_valid = true;
       }
     }
   }
@@ -1858,6 +2153,9 @@ extern "C" XLA_FFI_Error *ejk_qmm_cuda(XLA_FFI_CallFrame *call_frame) {
                             .Attr<int64_t>("bits")
                             .Attr<int64_t>("mode")
                             .Attr<int64_t>("transpose")
+                            .Attr<int64_t>("gemv_mode")
+                            .Attr<int64_t>("revsplit_k")
+                            .Attr<int64_t>("revsplit_k_parts")
                             .Ctx<PlatformStream<cudaStream_t>>()
                             .Ctx<ScratchAllocator>()
                             .To(QuantizedMatmulCuda);

@@ -354,9 +354,7 @@ def _has_multi_accelerators() -> bool:
         devices = jax.devices()
     except Exception:
         return False
-    accelerator_devices = [
-        device for device in devices if getattr(device, "platform", None) not in (None, "cpu")
-    ]
+    accelerator_devices = [device for device in devices if getattr(device, "platform", None) not in (None, "cpu")]
     return len(accelerator_devices) > 1
 
 

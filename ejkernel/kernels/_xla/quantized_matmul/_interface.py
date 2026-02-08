@@ -26,8 +26,6 @@ this falls back to dequantize+matmul.
 
 from __future__ import annotations
 
-from typing import Literal
-
 import jax
 import jax.numpy as jnp
 import jaxtyping
@@ -42,69 +40,24 @@ from ejkernel.quantization._utils.fp_tables import (
     _get_e4m3_table,
     _get_nf4_table,
 )
-from ejkernel.quantization._utils.grouping import _require_bits
+from ejkernel.quantization._utils.qparams import (
+    GemvMode,
+    QuantizationAxis,
+    RevSplitKMode,
+    normalize_gemv_mode,
+    normalize_revsplitk_mode,
+    normalize_revsplitk_parts,
+    resolve_qparams,
+    resolve_runtime_axis_and_transpose,
+    to_backend_mode,
+)
 
 from ..._registry import Backend, Platform, kernel_registry
 
-#: Supported quantization modes for the XLA implementation.
-QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 
-
-def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tuple[int, int]:
-    """Resolve and validate quantization parameters.
-
-    Applies mode-specific defaults and validates that the parameters are
-    compatible with the quantization mode.
-
-    Args:
-        mode: Quantization mode (affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8).
-        group_size: Number of elements per quantization group, or None for default.
-        bits: Bit-width per quantized element, or None for default.
-
-    Returns:
-        Tuple of (resolved_group_size, resolved_bits).
-
-    Raises:
-        ValueError: If mode is unsupported or parameters are invalid for the mode.
-    """
-    mode = mode.lower()
-    if mode == "affine":
-        group_size = 64 if group_size is None else int(group_size)
-        bits = 4 if bits is None else _require_bits(bits, {2, 3, 4, 5, 6, 7, 8})
-        if group_size not in {32, 64, 128}:
-            raise ValueError("affine mode supports group_size in {32, 64, 128}.")
-        return group_size, bits
-    if mode == "mxfp4":
-        group_size = 32 if group_size is None else int(group_size)
-        bits = 4 if bits is None else bits
-        if group_size != 32 or bits != 4:
-            raise ValueError("mxfp4 requires group_size=32 and bits=4.")
-        return group_size, bits
-    if mode == "mxfp8":
-        group_size = 32 if group_size is None else int(group_size)
-        bits = 8 if bits is None else bits
-        if group_size != 32 or bits != 8:
-            raise ValueError("mxfp8 requires group_size=32 and bits=8.")
-        return group_size, bits
-    if mode == "nvfp4":
-        group_size = 16 if group_size is None else int(group_size)
-        bits = 4 if bits is None else bits
-        if group_size != 16 or bits != 4:
-            raise ValueError("nvfp4 requires group_size=16 and bits=4.")
-        return group_size, bits
-    if mode == "nvfp8":
-        group_size = 16 if group_size is None else int(group_size)
-        bits = 8 if bits is None else bits
-        if group_size != 16 or bits != 8:
-            raise ValueError("nvfp8 requires group_size=16 and bits=8.")
-        return group_size, bits
-    if mode == "nf4":
-        group_size = 64 if group_size is None else int(group_size)
-        bits = 4 if bits is None else bits
-        if bits != 4:
-            raise ValueError("nf4 requires bits=4.")
-        return group_size, bits
-    raise ValueError(f"Unsupported quantization mode: {mode}")
+def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tuple[str, int, int]:
+    mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
+    return to_backend_mode(mode, bits), group_size, bits
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -140,12 +93,17 @@ def _decode_tile_affine(
     scale_tile: jax.Array,
     bias_tile: jax.Array | None,
 ) -> jax.Array:
-    """Decode affine quantized tile: out = q * scale + bias.
+    """Decode affine quantized tile using additive-bias form.
+
+    Public affine metadata is ``(q - zero) * scale``. This helper operates on
+    the equivalent additive form ``q * scale + bias`` where
+    ``bias = -zero * scale``.
 
     Args:
         q: Quantized codes tile.
         scale_tile: Per-element scales (broadcast from per-group).
-        bias_tile: Per-element biases (broadcast from per-group), or None.
+        bias_tile: Per-element additive bias terms (broadcast from per-group),
+            or None.
 
     Returns:
         Dequantized weight tile.
@@ -284,11 +242,13 @@ def _blocked_quantized_matmul(
         x: Input activation matrix of shape (M, K).
         w_q: Packed uint32 weights.
         scales: Per-group scales array.
-        biases: Per-group biases (affine mode only).
+        biases: Per-group affine additive biases (derived from canonical
+            ``zeros`` metadata), or None.
         transpose: If True, weights are in NxK layout; if False, KxN layout.
         group_size: Number of elements per quantization group.
         bits: Bit-width per quantized element (4 or 8).
-        mode: Quantization mode (affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8).
+        mode: Backend quantization key
+            ("affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8").
         block_m: Block size for M dimension.
         block_n: Block size for N dimension.
         block_k: Block size for K dimension.
@@ -370,9 +330,9 @@ def _blocked_quantized_matmul(
         return q
 
     def load_group_tile(off_k: int, off_n: int) -> tuple[jax.Array, jax.Array | None]:
-        """Load per-group scales and biases for a weight tile.
+        """Load per-group scales and affine additive biases for a weight tile.
 
-        Slices the scales (and optionally biases) arrays and repeats
+        Slices the scales (and optionally affine additive biases) arrays and repeats
         them to match the tile dimensions for element-wise dequantization.
 
         Args:
@@ -409,7 +369,7 @@ def _blocked_quantized_matmul(
         """Dequantize a single weight tile using the configured quantization mode.
 
         Loads packed codes and group parameters, then applies the
-        mode-specific decoding formula (affine, nf4, mxfp4, etc.)
+        mode-specific decoding formula (affine/nf4/mxfp*/nvfp*).
         to produce a float tile.
 
         Args:
@@ -537,6 +497,9 @@ def _blocked_quantized_matmul(
         "block_n",
         "block_k",
         "use_bf16",
+        "gemv_mode",
+        "revsplit_k",
+        "revsplit_k_parts",
     ],
 )
 def _operate(
@@ -552,6 +515,9 @@ def _operate(
     block_n,
     block_k,
     use_bf16,
+    gemv_mode,
+    revsplit_k,
+    revsplit_k_parts,
 ):
     """Execute quantized matmul with automatic path selection.
 
@@ -564,7 +530,8 @@ def _operate(
         x: Input activation matrix of shape (M, K).
         w: Packed uint32 weights.
         scales: Per-group scale parameters.
-        biases: Per-group bias parameters (affine mode) or None.
+        biases: Per-group affine additive bias parameters (derived from
+            canonical ``zeros`` metadata), or None.
         transpose: Whether weights are in NxK (transposed) layout.
         group_size: Elements per quantization group.
         bits: Bit-width per quantized element.
@@ -577,6 +544,7 @@ def _operate(
     Returns:
         Matrix multiplication result of shape (M, N) in float32.
     """
+    del gemv_mode, revsplit_k, revsplit_k_parts
     if mode in ("affine", "nf4") and scales.dtype != jnp.float32 and not use_bf16:
         scales = scales.astype(jnp.float32)
         if biases is not None:
@@ -605,7 +573,13 @@ def _operate(
             # Shape or tiling mismatch, fall back to dequantize+matmul.
             pass
 
-    w_f = dequantize(w, scales, biases, group_size=group_size, bits=bits, mode=mode)
+    zeros = None
+    if mode == "affine":
+        if biases is None:
+            raise ValueError("affine fallback dequantization requires affine metadata.")
+        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+        zeros = -biases / safe_scale
+    w_f = dequantize(w, scales, zeros, group_size=group_size, bits=bits, mode=mode)
     return x @ w_f.T if transpose else x @ w_f
 
 
@@ -615,11 +589,15 @@ def quantized_matmul(
     x: Float[Array, "m k"],
     w: Array,
     scales: Array,
-    biases: Array | None = None,
+    zeros: Array | None = None,
     transpose: bool = False,
     group_size: int | None = None,
     bits: int | None = None,
-    mode: QuantizationMode = "affine",
+    mode: str = "affine",
+    axis: QuantizationAxis | None = None,
+    gemv_mode: GemvMode = "auto",
+    revsplit_k: RevSplitKMode = "auto",
+    revsplit_k_parts: int | None = None,
     *,
     block_m: int = 128,
     block_n: int = 128,
@@ -632,7 +610,8 @@ def quantized_matmul(
     """Quantized matrix multiplication using XLA.
 
     This function provides a portable XLA implementation of quantized matmul
-    that supports all quantization modes (affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8).
+    for explicit modes ``affine``, ``nf4``, ``mxfp4``, ``mxfp8``, ``nvfp4``,
+    and ``nvfp8``.
     When possible, it uses a blocked algorithm with fused dequantization for
     better performance. For incompatible shapes or bit-widths, it falls back
     to a simple dequantize+matmul approach.
@@ -646,22 +625,21 @@ def quantized_matmul(
             - affine/nf4: float scales, shape (N, K//group_size) or (K, N//group_size)
             - mxfp4/mxfp8: uint8 E8M0 exponents
             - nvfp4/nvfp8: uint8 E4M3 scale codes
-        biases: Per-group biases (required for affine mode only). Must have
-            the same shape as scales. Must be None for non-affine modes.
+        zeros: Per-group affine zero-points (canonical affine metadata). Must
+            have the same shape as scales. Must be None for non-affine modes.
+            Internally converted to additive offsets for blocked fused kernels.
         transpose: If True, weights are in NxK layout (transposed) and the
             computation is x @ w.T. If False, weights are in KxN layout and
             the computation is x @ w. Default is False.
         group_size: Number of elements per quantization group. If None, uses
             mode default (64 for affine/nf4, 32 for mxfp4/mxfp8, 16 for nvfp4/nvfp8).
-        bits: Bit-width per quantized element. If None, uses mode default
-            (4 for affine/nf4/mxfp4/nvfp4, 8 for mxfp8/nvfp8).
+        bits: Bit-width per quantized element. Honored for affine only
+            (supported values {4,8}); ignored for explicit non-affine modes.
         mode: Quantization mode determining the dequantization formula:
-            - "affine": Linear scale+bias (q * scale + bias)
+            - "affine": ``(q - zero) * scale``
             - "nf4": 4-bit NormalFloat codebook
-            - "mxfp4": Microscaling FP4 (E2M1) with E8M0 exponent
-            - "mxfp8": Microscaling FP8 (E4M3) with E8M0 exponent
-            - "nvfp4": NVIDIA FP4 (E2M1) with E4M3 per-group scale
-            - "nvfp8": NVIDIA FP8 (E4M3) with E4M3 per-group scale
+            - "mxfp4"/"mxfp8": Microscaling FP4/FP8
+            - "nvfp4"/"nvfp8": NVIDIA microscaling FP4/FP8
         block_m: Tile size for M dimension in blocked algorithm. Default 128.
         block_n: Tile size for N dimension in blocked algorithm. Default 128.
         block_k: Tile size for K dimension in blocked algorithm. Default 64.
@@ -675,30 +653,38 @@ def quantized_matmul(
         Matrix multiplication result of shape (M, N) in float32.
 
     Raises:
-        ValueError: If mode is "affine" but biases is None.
-        ValueError: If mode is not "affine" but biases is provided.
+        ValueError: If mode is "affine" and zeros is not provided.
+        ValueError: If mode is not "affine" but zeros is provided.
         ValueError: If parameters are invalid for the selected mode.
 
     Notes:
         - The blocked algorithm is used when bits is 4 or 8 and block sizes
           are compatible with group_size. Otherwise, falls back to
           dequantize+matmul.
-        - This implementation serves as the fallback for the Triton backend
-          when shapes or modes are unsupported.
+        - This implementation serves as the fallback for other backends
+          when shapes or runtime constraints are unsupported.
     """
-    mode = mode.lower()
-    group_size, bits = _resolve_qparams(mode, group_size, bits)
+    mode, group_size, bits = _resolve_qparams(mode, group_size, bits)
+    _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    gemv_mode = normalize_gemv_mode(gemv_mode)
+    revsplit_k = normalize_revsplitk_mode(revsplit_k)
+    revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
 
-    if mode == "affine" and biases is None:
-        raise ValueError("affine quantized_matmul requires biases.")
-    if mode != "affine" and biases is not None:
-        raise ValueError("biases must be None for non-affine modes.")
+    if mode == "affine":
+        if zeros is None:
+            raise ValueError("affine quantized_matmul requires `zeros`.")
+        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+        affine_biases = -zeros * safe_scale
+    else:
+        if zeros is not None:
+            raise ValueError("zeros must be None for non-affine modes.")
+        affine_biases = None
 
     return _operate(
         x,
         w,
         scales,
-        biases,
+        affine_biases,
         transpose=transpose,
         group_size=group_size,
         bits=bits,
@@ -707,4 +693,7 @@ def quantized_matmul(
         block_n=block_n,
         block_k=block_k,
         use_bf16=use_bf16,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
     )

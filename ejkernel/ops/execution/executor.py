@@ -73,11 +73,11 @@ import jax.numpy as jnp
 import jax.sharding
 import jax.tree_util as jtu
 
+from ...kernels._registry import Backend, Platform, kernel_registry
 from ..config.cache import _cache_overlay
 from ..core import Invocation, Kernel, _get_platform_method, _has_custom_vjp
 from ..core.types import Cfg, Out
 from ..utils.fingerprint import abstractify, device_fingerprint, get_device_platform, stable_json
-from ...kernels._registry import Backend, Platform, kernel_registry
 
 
 class ConfigChooser(Protocol):
@@ -289,9 +289,9 @@ class Executor(Generic[Cfg, Out]):
                     pass
         try:
             if hasattr(cfg, "platform"):
-                setattr(cfg, "platform", "cute" if has_cute else "cuda")
+                cfg.platform = "cute" if has_cute else "cuda"
             if hasattr(cfg, "backend"):
-                setattr(cfg, "backend", "gpu")
+                cfg.backend = "gpu"
         except Exception:
             return cfg
         return cfg

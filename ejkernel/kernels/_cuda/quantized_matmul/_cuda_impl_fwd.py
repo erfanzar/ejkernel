@@ -23,9 +23,21 @@ from ejkernel.callib._ejit import ejit
 from ._cuda_impl import quantized_matmul_cuda
 
 QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
+GemvMode = Literal["auto", "on", "off"]
+RevSplitKMode = Literal["auto", "on", "off"]
 
 
-@ejit(static_argnames=["transpose", "group_size", "bits", "mode"])
+@ejit(
+    static_argnames=[
+        "transpose",
+        "group_size",
+        "bits",
+        "mode",
+        "gemv_mode",
+        "revsplit_k",
+        "revsplit_k_parts",
+    ]
+)
 def quantized_matmul_forward(
     x,
     w,
@@ -36,6 +48,9 @@ def quantized_matmul_forward(
     group_size: int | None,
     bits: int | None,
     mode: QuantizationMode,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
 ):
     """Dispatch to the CUDA custom call implementation."""
     return quantized_matmul_cuda(
@@ -47,6 +62,9 @@ def quantized_matmul_forward(
         group_size=group_size,
         bits=bits,
         mode=mode,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
     )
 
 

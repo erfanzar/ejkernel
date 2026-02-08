@@ -22,7 +22,7 @@ DTYPE_SUFFIX = {
     "bf16": "BF16",
 }
 
-AFFINE_BITS = (2, 3, 4, 5, 6, 7, 8)
+AFFINE_BITS = (4, 8)
 AFFINE_DTYPES = ("f32", "f16", "bf16")
 
 NF4_DTYPES = ("f32", "f16", "bf16")

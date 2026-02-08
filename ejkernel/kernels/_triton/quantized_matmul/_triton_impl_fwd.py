@@ -34,6 +34,8 @@ from ._triton_impl import (
 )
 
 QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
+GemvMode = Literal["auto", "on", "off"]
+RevSplitKMode = Literal["auto", "on", "off"]
 
 _QMM_DEQUANT_CACHE: OrderedDict[tuple, jax.Array] = OrderedDict()
 _QMM_DEQUANT_CACHE_LOCK = threading.Lock()
@@ -141,6 +143,9 @@ def quantized_matmul_forward(
     num_warps: int | None,
     num_stages: int | None,
     split_k: int | None,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
 ):
     """Forward Triton QMM with optional two-stage large-kernel path."""
     mode_lower = mode.lower()
@@ -233,6 +238,9 @@ def quantized_matmul_forward(
             "num_warps",
             "num_stages",
             "split_k",
+            "gemv_mode",
+            "revsplit_k",
+            "revsplit_k_parts",
         ],
     )(
         x,
@@ -250,6 +258,9 @@ def quantized_matmul_forward(
         num_warps=num_warps,
         num_stages=num_stages,
         split_k=split_k,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
     )
     return out.astype(jnp.bfloat16)
 

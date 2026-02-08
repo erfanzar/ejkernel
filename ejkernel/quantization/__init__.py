@@ -19,34 +19,35 @@ memory footprint and enable efficient inference. It supports multiple
 quantization formats optimized for different use cases:
 
 Supported Quantization Modes:
-    - **affine**: Linear scale+bias quantization with configurable bit-width
-      (2-8 bits). Best accuracy, most flexible.
-    - **nf4**: 4-bit NormalFloat codebook optimized for normally-distributed
-      weights. Used in QLoRA.
-    - **mxfp4**: Microscaling FP4 (E2M1) with E8M0 shared exponent. Low memory,
-      moderate accuracy.
-    - **mxfp8**: Microscaling FP8 (E4M3) with E8M0 shared exponent. Good
-      accuracy/memory tradeoff.
-    - **nvfp4**: NVIDIA FP4 (E2M1) with E4M3 per-group scale. Hardware-friendly.
-    - **nvfp8**: NVIDIA FP8 (E4M3) with E4M3 per-group scale. Hardware-friendly.
+    - **affine**: Grouped affine quantization using ``(q - zero) * scale``.
+    - **nf4**: 4-bit NormalFloat codebook quantization.
+    - **mxfp4/mxfp8**: Microscaling FP4/FP8 modes.
+    - **nvfp4/nvfp8**: NVIDIA microscaling FP4/FP8 modes.
 
 Basic Usage:
     >>> from ejkernel.quantization import quantize, dequantize, prepack_quantized_weights
     >>>
     >>> # Quantize weights
-    >>> w_q, scales, biases = quantize(weights, mode="affine", bits=4)
+    >>> w_q, scales, zeros = quantize(weights, mode="affine", bits=4, axis="row")
     >>>
     >>> # Dequantize for verification
-    >>> w_reconstructed = dequantize(w_q, scales, biases, mode="affine", bits=4)
+    >>> w_reconstructed = dequantize(w_q, scales, zeros, mode="affine", bits=4, axis="row")
     >>>
     >>> # For optimized matmul kernels, use prepack_quantized_weights
-    >>> w_q, scales, biases = prepack_quantized_weights(weights, mode="affine")
+    >>> w_q, scales, zeros = prepack_quantized_weights(weights, mode="affine", axis="row")
 
 For fused quantized matmul kernels with better performance, see
 `ejkernel.modules.operations.quantized_matmul`.
+
+Affine ``zeros`` metadata usage:
+    - Required for affine mode.
+    - Must be ``None`` for non-affine modes.
+    - Backend wrappers convert ``zeros`` to additive per-group offsets internally
+      before launching low-level Triton/CUDA/CuTe/Pallas kernels.
 """
 
 from ._quants.quantizations import (
+    QuantizationAxis,
     QuantizationMode,
     dequantize,
     prepack_quantized_weights,
@@ -55,6 +56,7 @@ from ._quants.quantizations import (
 from ._quants.quantizations import quantized_matmul as dense_quantized_matmul
 
 __all__ = [
+    "QuantizationAxis",
     "QuantizationMode",
     "dense_quantized_matmul",
     "dequantize",

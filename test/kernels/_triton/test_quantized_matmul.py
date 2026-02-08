@@ -54,21 +54,21 @@ def test_quantized_matmul_triton_matches_xla(mode: str, bits: int):
 
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     dev = jax.devices("gpu")[0]
     x, w_q, scales = _device_put_all(dev, x, w_q, scales)
-    if biases is not None:
-        biases = jax.device_put(biases, dev)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
 
     out_triton = triton_quantized_matmul(
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         bits=bits,
@@ -77,7 +77,7 @@ def test_quantized_matmul_triton_matches_xla(mode: str, bits: int):
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         bits=bits,
@@ -116,22 +116,22 @@ def test_quantized_matmul_triton_grad_input_matches_xla(mode: str, bits: int):
 
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     dev = jax.devices("gpu")[0]
     x, w_q, scales = _device_put_all(dev, x, w_q, scales)
-    if biases is not None:
-        biases = jax.device_put(biases, dev)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
 
     def _loss_triton(x_in):
         y = triton_quantized_matmul(
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,
@@ -143,7 +143,7 @@ def test_quantized_matmul_triton_grad_input_matches_xla(mode: str, bits: int):
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,
@@ -183,15 +183,15 @@ def test_quantized_matmul_triton_grad_input_same_kernel_path(monkeypatch: pytest
 
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     dev = jax.devices("gpu")[0]
     x, w_q, scales = _device_put_all(dev, x, w_q, scales)
-    if biases is not None:
-        biases = jax.device_put(biases, dev)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
 
     def _forbidden_dequant(*args, **kwargs):
         raise AssertionError(f"Unexpected dequant fallback in Triton grad path for mode={mode}.")
@@ -203,7 +203,7 @@ def test_quantized_matmul_triton_grad_input_same_kernel_path(monkeypatch: pytest
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,
@@ -212,3 +212,64 @@ def test_quantized_matmul_triton_grad_input_same_kernel_path(monkeypatch: pytest
 
     gx = jax.block_until_ready(jax.grad(_loss)(x))
     assert gx.shape == (m, k)
+
+
+@pytest.mark.parametrize(
+    "mode,bits",
+    [
+        ("affine", 4),
+        ("nf4", 4),
+        ("nvfp8", 8),
+    ],
+)
+def test_quantized_matmul_triton_m1_gemv_paths_match_xla(mode: str, bits: int):
+    key = jax.random.PRNGKey(101 if mode == "affine" else 103)
+    kx, kw = jax.random.split(key, 2)
+    m, k, n = 1, 256, 512
+
+    x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, zeros = packed
+    else:
+        w_q, scales = packed
+        zeros = None
+
+    dev = jax.devices("gpu")[0]
+    x, w_q, scales = _device_put_all(dev, x, w_q, scales)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
+
+    out_triton = triton_quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        transpose=False,
+        mode=mode,
+        bits=bits,
+        gemv_mode="auto",
+        revsplit_k="auto",
+    )
+    out_xla = xla_quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        transpose=False,
+        mode=mode,
+        bits=bits,
+        gemv_mode="auto",
+        revsplit_k="auto",
+    )
+
+    out_triton = jax.block_until_ready(out_triton)
+    out_xla = jax.block_until_ready(out_xla)
+
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=7e-2,
+        atol=7e-2,
+    )

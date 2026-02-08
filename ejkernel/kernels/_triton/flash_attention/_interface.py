@@ -80,10 +80,6 @@ from jax import lax
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
-PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
-DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
-BlockTables = Int[Array, "batch max_blocks"]
-
 from ejkernel.callib import ejit
 from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.ops import BwdParams, FwdParams
@@ -91,6 +87,10 @@ from ejkernel.ops import BwdParams, FwdParams
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_bwd import _bwd_attention_kernel_call
 from ._triton_impl_fwd import _fwd_attention_kernel_call
+
+PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
+DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
+BlockTables = Int[Array, "batch max_blocks"]
 
 
 def _jax_fwd_attention_call(

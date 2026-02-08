@@ -23,7 +23,17 @@ from ejkernel.callib._ejit import ejit
 from ejkernel.quantization import dequantize
 
 
-@ejit(static_argnames=["transpose", "group_size", "bits", "mode"])
+@ejit(
+    static_argnames=[
+        "transpose",
+        "group_size",
+        "bits",
+        "mode",
+        "gemv_mode",
+        "revsplit_k",
+        "revsplit_k_parts",
+    ]
+)
 def quantized_matmul_input_grad(
     dy,
     w,
@@ -34,6 +44,9 @@ def quantized_matmul_input_grad(
     group_size: int | None,
     bits: int | None,
     mode: str,
+    gemv_mode: str,
+    revsplit_k: str,
+    revsplit_k_parts: int | None,
 ):
     """Compute gradient with respect to the dense input x.
 
@@ -41,7 +54,14 @@ def quantized_matmul_input_grad(
         CUDA custom-call QMM currently supports only ``transpose=False`` in the
         forward path, so backward uses exact dequantize+dot for dX.
     """
-    w_f = dequantize(w, scales, biases, group_size=group_size, bits=bits, mode=mode)
+    del gemv_mode, revsplit_k, revsplit_k_parts
+    zeros = None
+    if mode == "affine":
+        if biases is None:
+            raise ValueError("affine input grad requires affine metadata.")
+        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+        zeros = -biases / safe_scale
+    w_f = dequantize(w, scales, zeros, group_size=group_size, bits=bits, mode=mode)
     if transpose:
         # y = x @ w_f.T, so dX = dY @ w_f
         dims = (((1,), (0,)), ((), ()))

@@ -41,6 +41,12 @@ from jax._src import core
 
 from ejkernel.callib._cute_call import cute_call
 from ejkernel.callib._cute_ffi import build_cute_ffi_call, has_cute_ffi_support
+from ejkernel.quantization._utils.qparams import (
+    normalize_gemv_mode,
+    normalize_revsplitk_mode,
+    normalize_revsplitk_parts,
+    select_qmm_kernel_family,
+)
 
 os.environ.setdefault("CUTE_DSL_ENABLE_TVM_FFI", "1")
 
@@ -111,7 +117,10 @@ def _fake_tensor(dtype: type[cutlass.Numeric], shape: tuple[int, ...]):
     rank = len(shape)
     stride_order = tuple(range(rank - 1, -1, -1))
     ft = cute.runtime.make_fake_compact_tensor(
-        dtype, shape, stride_order=stride_order, assumed_align=16,
+        dtype,
+        shape,
+        stride_order=stride_order,
+        assumed_align=16,
     )
     if rank == 2:
         # For 2-D row-major tensors, tell the compiler:
@@ -1170,9 +1179,7 @@ def _make_gmem_tiled_copy_x(
     guarantees ≥128-byte alignment for device buffers.
     """
     atom = cute.make_copy_atom(
-        cute.nvgpu.cpasync.CopyG2SOp(
-            cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
-        ),
+        cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL),
         out_dtype,
         num_bits_per_copy=copy_bits,
     )
@@ -1798,10 +1805,10 @@ def _build_mma_pipelined_qmm_host_fns(
 
             # GMEM→SMEM partitions
             thr_g2s = tiled_copy_g2s.get_slice(tidx)
-            tAgA = thr_g2s.partition_S(gA)   # (CPY, CPY_M, CPY_K, k_tiles)
+            tAgA = thr_g2s.partition_S(gA)  # (CPY, CPY_M, CPY_K, k_tiles)
             # Re-annotate 128-bit alignment after partition_S (which drops it)
             tAgA = cute.make_tensor(tAgA.iterator.align(16), tAgA.layout)
-            tAsA = thr_g2s.partition_D(sA)   # (CPY, CPY_M, CPY_K, STAGES)
+            tAsA = thr_g2s.partition_D(sA)  # (CPY, CPY_M, CPY_K, STAGES)
 
             # Identity tensor for M-boundary predication
             mcA = cute.make_identity_tensor(x.layout.shape)
@@ -1822,9 +1829,7 @@ def _build_mma_pipelined_qmm_host_fns(
             )
             for rest_v in range(tApA.shape[0]):
                 for m in range(tApA.shape[1]):
-                    tApA[rest_v, m, 0] = cute.elem_less(
-                        tAcA[(0, rest_v), m, 0, 0][0], x.shape[0]
-                    )
+                    tApA[rest_v, m, 0] = cute.elem_less(tAcA[(0, rest_v), m, 0, 0][0], x.shape[0])
 
             # -- MMA partition & fragment setup (3-D sA, sB) --
             thr_mma = tiled_mma.get_slice(tidx)
@@ -1934,7 +1939,6 @@ def _build_mma_pipelined_qmm_host_fns(
             # ======== Mainloop ========
             for k_tile in range(k_tile_count):
                 for kb in cutlass.range(num_k_block, unroll_full=True):
-
                     # -- Last kb: advance SMEM pipeline --
                     if kb == num_k_block - 1:
                         tCsA_p = tCsA_s2r[None, None, None, smem_pipe_read]
@@ -2055,16 +2059,22 @@ def _build_mma_pipelined_qmm_host_fns(
             )
 
             # Re-wrap x with explicit contiguous stride for cp.async alignment
-            mA = cute.make_tensor(
-                x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1))
-            )
+            mA = cute.make_tensor(x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1)))
             grid_x = (out.shape[0] + tile_m - 1) // tile_m
             grid_y = (out.shape[1] + tile_n - 1) // tile_n
             qmm_pipe_kernel(
-                mA, w_q, scales, biases, out,
-                sA_layout, sB_layout, sC_layout,
-                tiled_copy_g2s, tiled_mma,
-                tiled_copy_s2r_A, tiled_copy_s2r_B,
+                mA,
+                w_q,
+                scales,
+                biases,
+                out,
+                sA_layout,
+                sB_layout,
+                sC_layout,
+                tiled_copy_g2s,
+                tiled_mma,
+                tiled_copy_s2r_A,
+                tiled_copy_s2r_B,
             ).launch(
                 grid=(grid_x, grid_y, 1),
                 block=(num_threads, 1, 1),
@@ -2105,16 +2115,22 @@ def _build_mma_pipelined_qmm_host_fns(
             )
 
             # Re-wrap x with explicit contiguous stride for cp.async alignment
-            mA = cute.make_tensor(
-                x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1))
-            )
+            mA = cute.make_tensor(x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1)))
             grid_x = (out.shape[0] + tile_m - 1) // tile_m
             grid_y = (out.shape[1] + tile_n - 1) // tile_n
             qmm_pipe_kernel(
-                mA, w_q, scales, biases, out,
-                sA_layout, sB_layout, sC_layout,
-                tiled_copy_g2s, tiled_mma,
-                tiled_copy_s2r_A, tiled_copy_s2r_B,
+                mA,
+                w_q,
+                scales,
+                biases,
+                out,
+                sA_layout,
+                sB_layout,
+                sC_layout,
+                tiled_copy_g2s,
+                tiled_mma,
+                tiled_copy_s2r_A,
+                tiled_copy_s2r_B,
             ).launch(
                 grid=(grid_x, grid_y, 1),
                 block=(num_threads, 1, 1),
@@ -2196,9 +2212,7 @@ def _build_mma_pipelined_qmm_host_fns(
         )
         for rest_v in range(tApA.shape[0]):
             for m in range(tApA.shape[1]):
-                tApA[rest_v, m, 0] = cute.elem_less(
-                    tAcA[(0, rest_v), m, 0, 0][0], x.shape[0]
-                )
+                tApA[rest_v, m, 0] = cute.elem_less(tAcA[(0, rest_v), m, 0, 0][0], x.shape[0])
 
         thr_mma = tiled_mma.get_slice(tidx)
         tCsA = thr_mma.partition_A(sA)
@@ -2411,16 +2425,21 @@ def _build_mma_pipelined_qmm_host_fns(
         )
 
         # Re-wrap x with explicit contiguous stride for cp.async alignment
-        mA = cute.make_tensor(
-            x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1))
-        )
+        mA = cute.make_tensor(x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1)))
         grid_x = (out.shape[0] + tile_m - 1) // tile_m
         grid_y = (out.shape[1] + tile_n - 1) // tile_n
         qmm_pipe_kernel(
-            mA, w_q, scales, out,
-            sA_layout, sB_layout, sC_layout,
-            tiled_copy_g2s, tiled_mma,
-            tiled_copy_s2r_A, tiled_copy_s2r_B,
+            mA,
+            w_q,
+            scales,
+            out,
+            sA_layout,
+            sB_layout,
+            sC_layout,
+            tiled_copy_g2s,
+            tiled_mma,
+            tiled_copy_s2r_A,
+            tiled_copy_s2r_B,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(num_threads, 1, 1),
@@ -2460,16 +2479,21 @@ def _build_mma_pipelined_qmm_host_fns(
         )
 
         # Re-wrap x with explicit contiguous stride for cp.async alignment
-        mA = cute.make_tensor(
-            x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1))
-        )
+        mA = cute.make_tensor(x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1)))
         grid_x = (out.shape[0] + tile_m - 1) // tile_m
         grid_y = (out.shape[1] + tile_n - 1) // tile_n
         qmm_pipe_kernel(
-            mA, w_q, scales, out,
-            sA_layout, sB_layout, sC_layout,
-            tiled_copy_g2s, tiled_mma,
-            tiled_copy_s2r_A, tiled_copy_s2r_B,
+            mA,
+            w_q,
+            scales,
+            out,
+            sA_layout,
+            sB_layout,
+            sC_layout,
+            tiled_copy_g2s,
+            tiled_mma,
+            tiled_copy_s2r_A,
+            tiled_copy_s2r_B,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(num_threads, 1, 1),
@@ -2612,6 +2636,8 @@ def _qmm_call_name(
     out_dtype: jnp.dtype,
     transpose: bool,
     with_bias: bool,
+    kernel_family: str,
+    revsplit_k_parts: int,
     tile_m: int,
     tile_n: int,
     tile_k: int,
@@ -2622,6 +2648,7 @@ def _qmm_call_name(
         f"{mode.lower()}_b{int(bits)}_g{int(group_size)}_"
         f"{jnp.dtype(out_dtype).name}_{'t' if transpose else 'nt'}_"
         f"{'bias' if with_bias else 'nobias'}_"
+        f"{kernel_family}_rsk{int(revsplit_k_parts)}_"
         f"bm{int(tile_m)}_bn{int(tile_n)}_bk{int(tile_k)}"
     )
 
@@ -2651,6 +2678,8 @@ def _qmm_primitive_cache_key(
     transpose: bool,
     out_dtype: jnp.dtype,
     with_bias: bool,
+    kernel_family: str,
+    revsplit_k_parts: int,
     tile_m: int,
     tile_n: int,
     tile_k: int,
@@ -2663,6 +2692,8 @@ def _qmm_primitive_cache_key(
         int(group_size),
         bool(transpose),
         bool(with_bias),
+        str(kernel_family),
+        int(revsplit_k_parts),
         str(jnp.dtype(out_dtype)),
         int(tile_m),
         int(tile_n),
@@ -2890,6 +2921,9 @@ def get_cute_qmm_call(
     bits: int,
     group_size: int,
     transpose: bool,
+    gemv_mode: str,
+    revsplit_k: str,
+    revsplit_k_parts: int | None,
     use_bf16: bool,
     block_m: int = _DEFAULT_BLOCK_M,
     block_n: int = _DEFAULT_BLOCK_N,
@@ -2899,6 +2933,21 @@ def get_cute_qmm_call(
     out_dtype = jnp.bfloat16 if use_bf16 else jnp.float16
     out_cute_dtype = cutlass.BFloat16 if use_bf16 else cutlass.Float16
     with_bias = biases is not None
+    gemv_mode = normalize_gemv_mode(gemv_mode)
+    revsplit_k = normalize_revsplitk_mode(revsplit_k)
+    revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
+    kernel_family, family_revsplit_parts = select_qmm_kernel_family(
+        m=int(x.shape[0]),
+        mode=mode.lower(),  # type: ignore[arg-type]
+        bits=int(bits),
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
+    )
+    if kernel_family == "gemv_revsplitk":
+        revsplit_parts_eff = 2 if family_revsplit_parts is None else int(family_revsplit_parts)
+    else:
+        revsplit_parts_eff = 0
     out_shape = _infer_output_shape(
         x=x,
         scales=scales,
@@ -2930,6 +2979,8 @@ def get_cute_qmm_call(
         out_dtype=jnp.dtype(out_dtype),
         transpose=transpose,
         with_bias=with_bias,
+        kernel_family=kernel_family,
+        revsplit_k_parts=revsplit_parts_eff,
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
@@ -2945,6 +2996,8 @@ def get_cute_qmm_call(
         transpose=transpose,
         out_dtype=jnp.dtype(out_dtype),
         with_bias=with_bias,
+        kernel_family=kernel_family,
+        revsplit_k_parts=revsplit_parts_eff,
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,

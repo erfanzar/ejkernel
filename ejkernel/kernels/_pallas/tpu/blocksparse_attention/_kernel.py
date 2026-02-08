@@ -527,6 +527,7 @@ def make_attention_reference(
     Returns:
         A JIT-compiled callable that computes attention given (q, k, v, ...).
     """
+
     @partial(
         jax.jit,
         static_argnames=[

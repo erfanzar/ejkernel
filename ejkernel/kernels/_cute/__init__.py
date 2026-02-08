@@ -24,16 +24,9 @@ from .flash_attention import flash_attention
 from .quantized_matmul import quantized_matmul
 from .unified_attention import unified_attention
 
-try:
-    from .ragged_page_attention_v3 import ragged_page_attention_v3
-except Exception:  # pragma: no cover
-    ragged_page_attention_v3 = None
-
 __all__ = [
     "chunked_prefill_paged_decode",
     "flash_attention",
     "quantized_matmul",
     "unified_attention",
 ]
-if ragged_page_attention_v3 is not None:
-    __all__.append("ragged_page_attention_v3")

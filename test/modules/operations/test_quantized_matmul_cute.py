@@ -36,7 +36,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("mode,bits", [("affine", 4), ("nf4", 4)])
+@pytest.mark.parametrize("mode,bits", [("affine", 4), ("nf4", 4), ("mxfp4", 4)])
 def test_quantized_matmul_cute_matches_xla(mode: str, bits: int):
     key = jax.random.PRNGKey(0 if mode == "affine" else 1)
     kx, kw = jax.random.split(key, 2)
@@ -47,16 +47,16 @@ def test_quantized_matmul_cute_matches_xla(mode: str, bits: int):
 
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     out_cute = quantized_matmul(
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         bits=bits,
@@ -66,7 +66,7 @@ def test_quantized_matmul_cute_matches_xla(mode: str, bits: int):
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         bits=bits,
@@ -86,7 +86,7 @@ def test_quantized_matmul_cute_jit_matches_xla():
 
     x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
     w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
-    w_q, scales = prepack_quantized_weights(w, mode="nf4", bits=4)
+    w_q, scales = prepack_quantized_weights(w, mode="mxfp4", bits=4)
 
     @jax.jit
     def run(xi, wi, si):
@@ -96,7 +96,7 @@ def test_quantized_matmul_cute_jit_matches_xla():
             si,
             None,
             transpose=False,
-            mode="nf4",
+            mode="mxfp4",
             bits=4,
             platform="cute",
         )
@@ -108,7 +108,7 @@ def test_quantized_matmul_cute_jit_matches_xla():
         scales,
         None,
         transpose=False,
-        mode="nf4",
+        mode="mxfp4",
         bits=4,
         platform="xla",
     )
@@ -126,7 +126,7 @@ def test_quantized_matmul_cute_vmap_over_x_matches_xla():
 
     x = jax.random.normal(kx, (b, m, k), dtype=jnp.float16)
     w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
-    w_q, scales = prepack_quantized_weights(w, mode="nf4", bits=4)
+    w_q, scales = prepack_quantized_weights(w, mode="mxfp4", bits=4)
 
     def run(platform: str):
         def _single(xi):
@@ -136,7 +136,7 @@ def test_quantized_matmul_cute_vmap_over_x_matches_xla():
                 scales,
                 None,
                 transpose=False,
-                mode="nf4",
+                mode="mxfp4",
                 bits=4,
                 platform=platform,
             )
@@ -163,7 +163,7 @@ def test_quantized_matmul_cute_jit_vmap_over_all_inputs_matches_xla():
     scales_parts = []
     for pk in pack_keys:
         w = jax.random.normal(pk, (n, k), dtype=jnp.float16)
-        w_q_i, scales_i = prepack_quantized_weights(w, mode="nf4", bits=4)
+        w_q_i, scales_i = prepack_quantized_weights(w, mode="mxfp4", bits=4)
         w_q_parts.append(w_q_i)
         scales_parts.append(scales_i)
 
@@ -178,7 +178,7 @@ def test_quantized_matmul_cute_jit_vmap_over_all_inputs_matches_xla():
                 si,
                 None,
                 transpose=False,
-                mode="nf4",
+                mode="mxfp4",
                 bits=4,
                 platform=platform,
             )
@@ -193,7 +193,10 @@ def test_quantized_matmul_cute_jit_vmap_over_all_inputs_matches_xla():
     assert_allclose(out_cute, out_xla, atol=6e-2, rtol=6e-2)
 
 
-@pytest.mark.parametrize("mode,bits", [("affine", 4), ("nf4", 4), ("mxfp8", 8)])
+@pytest.mark.parametrize(
+    "mode,bits",
+    [("affine", 4), ("nf4", 4), ("mxfp4", 4), ("nvfp8", 8)],
+)
 def test_quantized_matmul_cute_grad_input_matches_xla(mode: str, bits: int):
     key = jax.random.PRNGKey(41 if mode == "affine" else 43)
     kx, kw = jax.random.split(key, 2)
@@ -203,17 +206,17 @@ def test_quantized_matmul_cute_grad_input_matches_xla(mode: str, bits: int):
     w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     def _loss_cute(x_in):
         y = quantized_matmul(
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,
@@ -226,7 +229,7 @@ def test_quantized_matmul_cute_grad_input_matches_xla(mode: str, bits: int):
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,

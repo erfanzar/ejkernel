@@ -253,7 +253,12 @@ def _jax_fwd_attention_call(
         | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
         | None
     ) = None,
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    bias: (
+        Float[Array, "batch num_heads seq_len_q seq_len_k"]
+        | Float[Array, "num_heads"]
+        | Float[Array, "batch num_heads"]
+        | None
+    ) = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,
@@ -520,7 +525,12 @@ def flash_attention_call(
         | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
         | None
     ) = None,
-    bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
+    bias: (
+        Float[Array, "batch num_heads seq_len_q seq_len_k"]
+        | Float[Array, "num_heads"]
+        | Float[Array, "batch num_heads"]
+        | None
+    ) = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,
     causal: bool = False,

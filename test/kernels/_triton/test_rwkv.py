@@ -37,6 +37,7 @@ def test_rwkv4_matches_xla_and_grad():
     u = jax.random.normal(jax.random.PRNGKey(1), (C,), dtype=jnp.float16)
     k = jax.random.normal(jax.random.PRNGKey(2), (B, T, C), dtype=jnp.float16)
     v = jax.random.normal(jax.random.PRNGKey(3), (B, T, C), dtype=jnp.float16)
+    state0 = jax.random.normal(jax.random.PRNGKey(4), (B, 3, C), dtype=jnp.float32)
 
     out_tri, st_tri = triton_rwkv4(w, u, k, v, state=None)
     out_xla, st_xla = xla_rwkv4(w, u, k, v, state=None)
@@ -47,17 +48,23 @@ def test_rwkv4_matches_xla_and_grad():
     np.testing.assert_allclose(np.asarray(out_tri, np.float32), np.asarray(out_xla, np.float32), rtol=2e-2, atol=2e-2)
     np.testing.assert_allclose(np.asarray(st_tri, np.float32), np.asarray(st_xla, np.float32), rtol=2e-2, atol=2e-2)
 
-    def loss_tri(w_):
-        o, st = triton_rwkv4(w_, u, k, v, state=None)
+    def loss_tri(w_, u_, k_, v_, state_):
+        o, st = triton_rwkv4(w_, u_, k_, v_, state=state_)
         return jnp.sum(o) + jnp.sum(st)
 
-    def loss_xla(w_):
-        o, st = xla_rwkv4(w_, u, k, v, state=None)
+    def loss_xla(w_, u_, k_, v_, state_):
+        o, st = xla_rwkv4(w_, u_, k_, v_, state=state_)
         return jnp.sum(o) + jnp.sum(st)
 
-    dw_tri = jax.grad(loss_tri)(w)
-    dw_xla = jax.grad(loss_xla)(w)
-    np.testing.assert_allclose(np.asarray(dw_tri, np.float32), np.asarray(dw_xla, np.float32), rtol=2e-2, atol=2e-2)
+    grads_tri = jax.grad(loss_tri, argnums=(0, 1, 2, 3, 4))(w, u, k, v, state0)
+    grads_xla = jax.grad(loss_xla, argnums=(0, 1, 2, 3, 4))(w, u, k, v, state0)
+    for g_tri, g_xla in zip(grads_tri, grads_xla, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(g_tri, np.float32),
+            np.asarray(g_xla, np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
 
 
 def test_rwkv6_matches_xla_and_varlen():

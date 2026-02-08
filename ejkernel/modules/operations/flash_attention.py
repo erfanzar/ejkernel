@@ -59,7 +59,6 @@ from jax import numpy as jnp
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, DTypeLike, Float, Int
 
-from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,

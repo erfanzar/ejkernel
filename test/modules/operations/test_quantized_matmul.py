@@ -27,7 +27,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("mode", ["affine", "nf4"])
+@pytest.mark.parametrize("mode", ["affine", "nf4", "mxfp4"])
 def test_quantized_matmul_triton_matches_xla(mode: str):
     key = jax.random.PRNGKey(0 if mode == "affine" else 1)
     kx, kw = jax.random.split(key, 2)
@@ -38,16 +38,16 @@ def test_quantized_matmul_triton_matches_xla(mode: str):
 
     packed = prepack_quantized_weights(w, mode=mode)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     out_triton = quantized_matmul(
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         platform="triton",
@@ -56,7 +56,7 @@ def test_quantized_matmul_triton_matches_xla(mode: str):
         x,
         w_q,
         scales,
-        biases,
+        zeros,
         transpose=False,
         mode=mode,
         platform="xla",
@@ -68,7 +68,10 @@ def test_quantized_matmul_triton_matches_xla(mode: str):
     assert_allclose(out_triton, out_xla, atol=6e-2, rtol=6e-2)
 
 
-@pytest.mark.parametrize("mode,bits", [("affine", 4), ("nf4", 4), ("mxfp8", 8)])
+@pytest.mark.parametrize(
+    "mode,bits",
+    [("affine", 4), ("nf4", 4), ("mxfp4", 4), ("nvfp8", 8)],
+)
 def test_quantized_matmul_triton_grad_input_matches_xla(mode: str, bits: int):
     key = jax.random.PRNGKey(23 if mode == "affine" else 29)
     kx, kw = jax.random.split(key, 2)
@@ -79,17 +82,17 @@ def test_quantized_matmul_triton_grad_input_matches_xla(mode: str, bits: int):
 
     packed = prepack_quantized_weights(w, mode=mode, bits=bits)
     if mode == "affine":
-        w_q, scales, biases = packed
+        w_q, scales, zeros = packed
     else:
         w_q, scales = packed
-        biases = None
+        zeros = None
 
     def _loss_triton(x_in):
         y = quantized_matmul(
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,
@@ -102,7 +105,7 @@ def test_quantized_matmul_triton_grad_input_matches_xla(mode: str, bits: int):
             x_in,
             w_q,
             scales,
-            biases,
+            zeros,
             transpose=False,
             mode=mode,
             bits=bits,

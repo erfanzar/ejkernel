@@ -76,10 +76,7 @@ def _validate_qkv_shapes(
                 f"query batch={batch}, block_tables batch={block_tables.shape[0]}."
             )
         if key.ndim != 4 or value.ndim != 4:
-            raise ValueError(
-                "Paged key/value caches must be rank-4 "
-                "[num_blocks, block_size, num_kv_heads, head_dim]."
-            )
+            raise ValueError("Paged key/value caches must be rank-4 [num_blocks, block_size, num_kv_heads, head_dim].")
         hk, dk = key.shape[2], key.shape[3]
         hv, dv = value.shape[2], value.shape[3]
 
@@ -365,8 +362,7 @@ def flash_attention(
     )
     if reason is not None:
         raise EjkernelRuntimeError(
-            "flash_attention (platform=cute) does not support requested configuration: "
-            f"{reason}."
+            f"flash_attention (platform=cute) does not support requested configuration: {reason}."
         )
 
     if (cum_seqlens_q is None) != (cum_seqlens_k is None):
@@ -378,9 +374,7 @@ def flash_attention(
             "flash_attention (platform=cute): block_tables cannot be combined with cum_seqlens_*."
         )
     if softmax_aux is not None and jnp.asarray(softmax_aux).ndim != 1:
-        raise EjkernelRuntimeError(
-            "flash_attention (platform=cute): softmax_aux must be rank-1 [num_sinks]."
-        )
+        raise EjkernelRuntimeError("flash_attention (platform=cute): softmax_aux must be rank-1 [num_sinks].")
 
     merged_attention_mask = attention_mask
     effective_causal = causal

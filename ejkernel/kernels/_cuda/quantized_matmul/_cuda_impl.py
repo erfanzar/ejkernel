@@ -37,10 +37,37 @@ import jax
 import jax.ffi as ffi
 import jax.numpy as jnp
 
+from ejkernel.quantization._utils.qparams import (
+    GemvMode,
+    RevSplitKMode,
+    normalize_gemv_mode,
+    normalize_revsplitk_mode,
+    normalize_revsplitk_parts,
+    resolve_qparams,
+    select_qmm_kernel_family,
+    to_backend_mode,
+)
+
 from ._build import build_cuda_lib
 
 QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 """Type alias for supported quantization mode strings."""
+
+
+def _gemv_mode_to_id(mode: GemvMode) -> int:
+    if mode == "auto":
+        return 0
+    if mode == "on":
+        return 1
+    return 2
+
+
+def _revsplit_mode_to_id(mode: RevSplitKMode) -> int:
+    if mode == "auto":
+        return 0
+    if mode == "on":
+        return 1
+    return 2
 
 
 @lru_cache(maxsize=1)
@@ -107,9 +134,7 @@ def _mode_to_id(mode: str) -> int:
         return 4
     if mode == "nvfp8":
         return 5
-    raise ValueError(
-        "CUDA quantized_matmul supports affine, nf4, mxfp4, mxfp8, nvfp4, nvfp8 modes."
-    )
+    raise ValueError("CUDA quantized_matmul supports {'affine','nf4','mxfp4','mxfp8','nvfp4','nvfp8'}.")
 
 
 def _expected_words(n: int, bits: int) -> int:
@@ -121,7 +146,7 @@ def _expected_words(n: int, bits: int) -> int:
 
     Args:
         n: Number of output features (columns).
-        bits: Bit-width per quantized element (2--8).
+        bits: Bit-width per quantized element (4 or 8).
 
     Returns:
         Number of ``uint32`` words per row of the packed weight matrix.
@@ -139,10 +164,13 @@ def quantized_matmul_cuda(
     group_size: int | None = None,
     bits: int | None = None,
     mode: QuantizationMode = "affine",
+    gemv_mode: GemvMode = "auto",
+    revsplit_k: RevSplitKMode = "auto",
+    revsplit_k_parts: int | None = None,
 ) -> jax.Array:
     """Execute quantized matrix multiplication on CUDA via JAX FFI.
 
-    Performs ``x @ dequantize(w, scales, biases)`` entirely on the GPU
+    Performs ``x @ dequantize(w, scales, zeros)`` entirely on the GPU
     using a custom CUDA kernel registered through JAX's FFI mechanism.
     Weights are stored in a packed ``uint32`` format and dequantized
     on-the-fly during the kernel execution.
@@ -157,18 +185,17 @@ def quantized_matmul_cuda(
             with ``uint32`` dtype, where *N* is the number of output
             features.
         scales: Per-group scale factors of shape ``(K, N / group_size)``.
-        biases: Per-group bias values with the same shape as *scales*.
-            Required for ``"affine"`` mode; optional for other modes.
-            Defaults to ``None``.
+        biases: Internal additive affine offsets with the same shape as
+            *scales* (derived from canonical affine ``zeros`` metadata).
+            Required only when *mode* is ``"affine"``.
         transpose: Whether the weight matrix is stored in ``(N, K)``
             layout. Currently **must** be ``False``; passing ``True``
             raises :class:`ValueError`.
         group_size: Number of output features per quantization group.
-            Defaults depend on *mode*: 32 for ``mxfp4``/``mxfp8``,
-            16 for ``nvfp4``/``nvfp8``, and 64 for ``affine``/``nf4``.
-        bits: Bit-width per quantized element. Defaults to 8 for
-            ``mxfp8``/``nvfp8`` and 4 for all other modes. Affine mode
-            accepts values in {2, 3, 4, 5, 6, 7, 8}.
+            Defaults depend on *mode*: 64 for ``affine``/``nf4``,
+            32 for ``mxfp4``/``mxfp8``, and 16 for ``nvfp4``/``nvfp8``.
+        bits: Bit-width per quantized element. Honored only for ``affine``
+            (supported values {4,8}); ignored for explicit non-affine modes.
         mode: Quantization scheme. One of ``"affine"``, ``"nf4"``,
             ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, or ``"nvfp8"``.
 
@@ -176,7 +203,7 @@ def quantized_matmul_cuda(
         Result matrix of shape ``(M, N)`` with the same dtype as ``x``.
 
     Raises:
-        ValueError: If *bits* is outside the range [2, 8] or incompatible
+        ValueError: If *bits* is not in {4, 8} or incompatible
             with the chosen *mode*.
         ValueError: If *transpose* is ``True`` (currently unsupported).
         ValueError: If *scales* is not rank-2 or its shape is inconsistent
@@ -187,41 +214,30 @@ def quantized_matmul_cuda(
     """
     # Avoid device queries on tracers; runtime will error if no GPU backend.
 
+    mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
+    gemv_mode = normalize_gemv_mode(gemv_mode)
+    revsplit_k = normalize_revsplitk_mode(revsplit_k)
+    revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
+    mode = to_backend_mode(mode, bits)
     mode_id = _mode_to_id(mode)
-    mode = mode.lower()
-    if bits is None:
-        if mode in ("mxfp8", "nvfp8"):
-            bits = 8
-        else:
-            bits = 4
-    bits = int(bits)
-    if group_size is None:
-        if mode in ("mxfp4", "mxfp8"):
-            group_size = 32
-        elif mode in ("nvfp4", "nvfp8"):
-            group_size = 16
-        else:
-            group_size = 64
     group_size = int(group_size)
-
-    if bits < 2 or bits > 8:
-        raise ValueError("CUDA quantized_matmul supports bits in [2, 8].")
-    if mode == "affine" and bits not in (2, 3, 4, 5, 6, 7, 8):
-        raise ValueError("CUDA quantized_matmul affine supports bits in {2, 3, 4, 5, 6, 7, 8}.")
-    if mode == "nf4" and bits != 4:
-        raise ValueError("CUDA quantized_matmul nf4 requires bits=4.")
-    if mode == "mxfp4" and bits != 4:
-        raise ValueError("CUDA quantized_matmul mxfp4 requires bits=4.")
-    if mode == "mxfp8" and bits != 8:
-        raise ValueError("CUDA quantized_matmul mxfp8 requires bits=8.")
-    if mode == "nvfp4" and bits != 4:
-        raise ValueError("CUDA quantized_matmul nvfp4 requires bits=4.")
-    if mode == "nvfp8" and bits != 8:
-        raise ValueError("CUDA quantized_matmul nvfp8 requires bits=8.")
+    bits = int(bits)
     if transpose:
         raise ValueError("CUDA quantized_matmul does not support transpose=True.")
 
     m, k = int(x.shape[0]), int(x.shape[1])
+    kernel_family, family_revsplit_parts = select_qmm_kernel_family(
+        m=m,
+        mode=mode,
+        bits=bits,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
+    )
+    if kernel_family == "gemv_revsplitk":
+        revsplit_k_parts = 2 if family_revsplit_parts is None else int(family_revsplit_parts)
+    else:
+        revsplit_k_parts = 0 if revsplit_k_parts is None else int(revsplit_k_parts)
     if scales.ndim != 2:
         raise ValueError("CUDA quantized_matmul scales must be rank-2.")
     if transpose:
@@ -261,6 +277,9 @@ def quantized_matmul_cuda(
         "bits": bits,
         "mode": mode_id,
         "transpose": int(transpose),
+        "gemv_mode": _gemv_mode_to_id(gemv_mode),
+        "revsplit_k": _revsplit_mode_to_id(revsplit_k),
+        "revsplit_k_parts": int(revsplit_k_parts),
     }
 
     if biases is None:

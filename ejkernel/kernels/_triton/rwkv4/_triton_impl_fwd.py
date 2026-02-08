@@ -109,6 +109,75 @@ def _rwkv4_fwd_kernel(
     tl.store(state_out_ptr + base_state_out + 2 * C + cs, eps.to(tl.float32), mask=cmask)
 
 
+@triton.jit
+def _rwkv4_fwd_kernel_with_hist(
+    w_ptr,  # [-exp(w_raw)], [C]
+    u_ptr,  # [C]
+    k_ptr,  # [B, T, C]
+    v_ptr,  # [B, T, C]
+    state_ptr,  # [B, 3, C]
+    o_ptr,  # [B, T, C]
+    state_out_ptr,  # [B, 3, C]
+    state_hist_ptr,  # [B, T + 1, 3, C]
+    T: tl.constexpr,
+    C: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """RWKV-4 forward pass kernel that additionally stores per-step state history."""
+    b = tl.program_id(0).to(tl.int64)
+    c_blk = tl.program_id(1)
+
+    cs = c_blk * BLOCK_C + tl.arange(0, BLOCK_C)
+    cmask = cs < C
+
+    w = tl.load(w_ptr + cs, mask=cmask, other=0.0).to(tl.float32)
+    u = tl.load(u_ptr + cs, mask=cmask, other=0.0).to(tl.float32)
+
+    base_state = (b * 3) * C
+    alpha = tl.load(state_ptr + base_state + 0 * C + cs, mask=cmask, other=0.0).to(tl.float32)
+    beta = tl.load(state_ptr + base_state + 1 * C + cs, mask=cmask, other=0.0).to(tl.float32)
+    eps = tl.load(state_ptr + base_state + 2 * C + cs, mask=cmask, other=-1e30).to(tl.float32)
+
+    base_seq = b * T * C
+
+    # Store initial state as state_hist[:, 0, :, :].
+    base_hist0 = ((b * (T + 1)) * 3) * C
+    tl.store(state_hist_ptr + base_hist0 + 0 * C + cs, alpha.to(tl.float32), mask=cmask)
+    tl.store(state_hist_ptr + base_hist0 + 1 * C + cs, beta.to(tl.float32), mask=cmask)
+    tl.store(state_hist_ptr + base_hist0 + 2 * C + cs, eps.to(tl.float32), mask=cmask)
+
+    for t in range(0, T):
+        off = base_seq + t * C + cs
+        kt = tl.load(k_ptr + off, mask=cmask, other=0.0).to(tl.float32)
+        vt = tl.load(v_ptr + off, mask=cmask, other=0.0).to(tl.float32)
+
+        ukt = u + kt
+        tau = tl.maximum(ukt, eps)
+        e1a = tl.exp(eps - tau)
+        e2a = tl.exp(ukt - tau)
+        wkv = (e1a * alpha + e2a * vt) / (e1a * beta + e2a)
+        tl.store(o_ptr + off, wkv.to(o_ptr.dtype.element_ty), mask=cmask)
+
+        w_eps = w + eps
+        eps_next = tl.maximum(w_eps, kt)
+        e1b = tl.exp(w_eps - eps_next)
+        e2b = tl.exp(kt - eps_next)
+        alpha = e1b * alpha + e2b * vt
+        beta = e1b * beta + e2b
+        eps = eps_next
+
+        # Store updated state as state_hist[:, t + 1, :, :].
+        base_hist_t = ((b * (T + 1) + (t + 1)) * 3) * C
+        tl.store(state_hist_ptr + base_hist_t + 0 * C + cs, alpha.to(tl.float32), mask=cmask)
+        tl.store(state_hist_ptr + base_hist_t + 1 * C + cs, beta.to(tl.float32), mask=cmask)
+        tl.store(state_hist_ptr + base_hist_t + 2 * C + cs, eps.to(tl.float32), mask=cmask)
+
+    base_state_out = (b * 3) * C
+    tl.store(state_out_ptr + base_state_out + 0 * C + cs, alpha.to(tl.float32), mask=cmask)
+    tl.store(state_out_ptr + base_state_out + 1 * C + cs, beta.to(tl.float32), mask=cmask)
+    tl.store(state_out_ptr + base_state_out + 2 * C + cs, eps.to(tl.float32), mask=cmask)
+
+
 def fwd_triton_impl(
     w: Float[Array, "chans"],
     u: Float[Array, "chans"],
@@ -150,3 +219,40 @@ def fwd_triton_impl(
         BLOCK_C=BLOCK_C,
     )
     return o, state_out
+
+
+def fwd_triton_impl_with_history(
+    w: Float[Array, "chans"],
+    u: Float[Array, "chans"],
+    k: Float[Array, "batch seq_len chans"],
+    v: Float[Array, "batch seq_len chans"],
+    state: Float[Array, "batch three chans"],
+) -> tuple[
+    Float[Array, "batch seq_len chans"],
+    Float[Array, "batch three chans"],
+    Float[Array, "batch seq_plus_one three chans"],
+]:
+    """Execute RWKV-4 forward pass and return per-step state history."""
+    B, T, C = k.shape
+    out_shape = jax.ShapeDtypeStruct(k.shape, v.dtype)
+    state_shape = jax.ShapeDtypeStruct((B, 3, C), jnp.float32)
+    state_hist_shape = jax.ShapeDtypeStruct((B, T + 1, 3, C), jnp.float32)
+
+    BLOCK_C = 128 if C >= 128 else 64 if C >= 64 else 32
+    grid = (B, cdiv(C, BLOCK_C))
+
+    o, state_out, state_hist = triton_call(
+        w,
+        u,
+        k,
+        v,
+        state,
+        kernel=_rwkv4_fwd_kernel_with_hist,
+        out_shape=[out_shape, state_shape, state_hist_shape],
+        name="ejkernel::triton::rwkv4_fwd_with_hist",
+        grid=grid,
+        T=T,
+        C=C,
+        BLOCK_C=BLOCK_C,
+    )
+    return o, state_out, state_hist

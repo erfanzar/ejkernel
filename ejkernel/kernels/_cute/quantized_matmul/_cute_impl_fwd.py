@@ -18,11 +18,13 @@ from __future__ import annotations
 
 from typing import Literal
 
-from ejkernel.kernels._xla.quantized_matmul._interface import _resolve_qparams
+from ejkernel.quantization._utils.qparams import resolve_qparams
 
 from ._cute_impl import get_cute_qmm_call
 
 QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
+GemvMode = Literal["auto", "on", "off"]
+RevSplitKMode = Literal["auto", "on", "off"]
 
 
 def quantized_matmul_forward(
@@ -35,6 +37,9 @@ def quantized_matmul_forward(
     group_size: int | None,
     bits: int | None,
     mode: QuantizationMode,
+    gemv_mode: GemvMode,
+    revsplit_k: RevSplitKMode,
+    revsplit_k_parts: int | None,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -42,12 +47,12 @@ def quantized_matmul_forward(
 ):
     """Forward CuTe QMM."""
     mode_lower = mode.lower()
-    group_size_resolved, bits_resolved = _resolve_qparams(mode_lower, group_size, bits)
+    _, group_size_resolved, bits_resolved, _ = resolve_qparams(mode_lower, group_size, bits)
 
     if mode_lower == "affine" and biases is None:
-        raise ValueError("affine quantized_matmul requires biases.")
+        raise ValueError("affine quantized_matmul requires affine metadata.")
     if mode_lower != "affine" and biases is not None:
-        raise ValueError("biases must be None for non-affine modes.")
+        raise ValueError("affine metadata must be None for non-affine modes.")
 
     dev = None
     try:
@@ -66,6 +71,9 @@ def quantized_matmul_forward(
         bits=bits_resolved,
         group_size=group_size_resolved,
         transpose=transpose,
+        gemv_mode=gemv_mode,
+        revsplit_k=revsplit_k,
+        revsplit_k_parts=revsplit_k_parts,
         use_bf16=use_bf16,
         block_m=block_m,
         block_n=block_n,

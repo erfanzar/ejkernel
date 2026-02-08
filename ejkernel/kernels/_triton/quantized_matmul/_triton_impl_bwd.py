@@ -38,6 +38,9 @@ from ._triton_impl_fwd import quantized_matmul_forward
         "num_warps",
         "num_stages",
         "split_k",
+        "gemv_mode",
+        "revsplit_k",
+        "revsplit_k_parts",
     ]
 )
 def quantized_matmul_input_grad(
@@ -57,6 +60,9 @@ def quantized_matmul_input_grad(
     num_warps: int | None,
     num_stages: int | None,
     split_k: int | None,
+    gemv_mode: str,
+    revsplit_k: str,
+    revsplit_k_parts: int | None,
 ):
     """Compute gradient with respect to x.
 
@@ -81,6 +87,9 @@ def quantized_matmul_input_grad(
             num_warps=num_warps,
             num_stages=num_stages,
             split_k=split_k,
+            gemv_mode=gemv_mode,
+            revsplit_k=revsplit_k,
+            revsplit_k_parts=revsplit_k_parts,
         )
     except ValueError:
         pass

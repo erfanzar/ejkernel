@@ -69,10 +69,12 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
+from jax.interpreters import ad
 from jaxtyping import Array, Float
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._triton_impl_fwd import fwd_triton_impl
+from ._triton_impl_bwd import bwd_triton_impl
+from ._triton_impl_fwd import fwd_triton_impl, fwd_triton_impl_with_history
 
 
 def _fwd_call(
@@ -97,6 +99,7 @@ def _fwd_call(
     Returns:
         A tuple containing (output, final_state) and residuals for backward.
     """
+    state_input = state
     state_was_none = state is None
     if state is None:
         bsz, _, chans = k.shape
@@ -106,8 +109,10 @@ def _fwd_call(
         state = jnp.stack([alpha0, beta0, eps0], axis=1)
 
     w_neg = -jnp.exp(w.astype(jnp.float32))
-    o, final_state = fwd_triton_impl(w_neg, u.astype(jnp.float32), k, v, state.astype(jnp.float32))
-    residual = (w, u, k, v, state, state_was_none)
+    o, final_state, state_hist = fwd_triton_impl_with_history(
+        w_neg, u.astype(jnp.float32), k, v, state.astype(jnp.float32)
+    )
+    residual = (w, u, k, v, w_neg, state_hist, state_was_none, state_input)
     return (o, final_state), residual
 
 
@@ -121,8 +126,35 @@ def _bwd_call(
         residual: Tensors saved from the forward pass (w, u, k, v, state).
         grads: A tuple containing gradients (do, dstate) of output and final state.
     """
-    del residual, grads
-    raise NotImplementedError("rwkv4 Triton backward is not implemented. Fallback gradients are disabled.")
+    w, u, k, v, w_neg, state_hist, state_was_none, state_input = residual
+    do, dstate = grads
+
+    do = ad.instantiate_zeros(do)
+    dstate = ad.instantiate_zeros(dstate)
+    if dstate is None:
+        dstate = jnp.zeros((k.shape[0], 3, k.shape[2]), dtype=jnp.float32)
+    else:
+        dstate = dstate.astype(jnp.float32)
+
+    dw_neg, du, dk, dv, dstate0 = bwd_triton_impl(
+        w_neg=w_neg,
+        u=u.astype(jnp.float32),
+        k=k,
+        v=v,
+        state_hist=state_hist,
+        do=do,
+        dstate=dstate,
+    )
+    dw = (dw_neg * w_neg).astype(w.dtype)
+    du = du.astype(u.dtype)
+    dk = dk.astype(k.dtype)
+    dv = dv.astype(v.dtype)
+
+    if state_was_none:
+        state_cotangent = None
+    else:
+        state_cotangent = dstate0.astype(state_input.dtype)
+    return dw, du, dk, dv, state_cotangent
 
 
 @partial(jax.custom_vjp)

@@ -889,6 +889,7 @@ class Benchmark:
             if isinstance(value, set):
                 return tuple(sorted(_freeze_config_value(v) for v in value))
             return value
+
         for result in self.results:
             if result.mean_ms != float("inf"):
                 config_items = sorted(result.config.items())
