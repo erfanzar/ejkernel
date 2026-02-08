@@ -322,11 +322,11 @@ def _cfgs_grouped_matmul():
 
 def _cfgs_quantized_matmul():
     configs = _grid(
-        m=[8192],
-        k=[8192],
-        n=[8192],
+        m=[128, 512, 2048, 4096],
+        k=[4096, 8192],
+        n=[128, 512, 1024, 4096],
         mode=["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"],
-        dtype=["fp16", "bf16"],
+        dtype=["bf16"],
     )
     return _limit_configs(configs)
 
@@ -1092,6 +1092,7 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         configs=_cfgs_quantized_matmul(),
         wrapper_factory=_quantized_wrapper,
         static_kwargs=["mode"],
+        bench_bwd=True,
     ),
     "mean_pooling": OpBenchmarkSpec(
         op_name="mean_pooling",

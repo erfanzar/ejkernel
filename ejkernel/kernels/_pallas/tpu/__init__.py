@@ -24,6 +24,7 @@ Available Kernels:
     - blocksparse_attention: Block-sparse attention patterns
     - ring_attention: Distributed attention across devices
     - page_attention: Paged KV cache attention
+    - quantized_matmul: Packed-weights quantized matrix multiplication
     - ragged_page_attention_v2/v3: Variable-length paged attention
     - ragged_decode_attention: Decode-phase attention
     - grouped_matmul/v2: Grouped matrix multiplication
@@ -35,6 +36,7 @@ from .grouped_matmul import grouped_matmul
 from .grouped_matmulv2 import grouped_matmulv2
 from .page_attention import page_attention
 from .prefill_page_attention import prefill_page_attention
+from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
@@ -47,6 +49,7 @@ __all__ = (
     "grouped_matmulv2",
     "page_attention",
     "prefill_page_attention",
+    "quantized_matmul",
     "ragged_decode_attention",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",

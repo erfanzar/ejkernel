@@ -3,6 +3,7 @@
 
 import os
 import sys
+from collections import defaultdict
 
 import jax
 import jax.numpy as jnp
@@ -85,5 +86,33 @@ if __name__ == "__main__":
     )
 
     bench.run(verbose=True)
+    # Report Pallas/XLA median ratio over common configs.
+    per_cfg: dict[tuple[tuple[str, object], ...], dict[str, float]] = defaultdict(dict)
+    for result in bench.results:
+        cfg_key = tuple(sorted(result.config.items()))
+        per_cfg[cfg_key][result.algorithm] = result.median_ms
+
+    ratios = []
+    for vals in per_cfg.values():
+        if "pallas" in vals and "xla" in vals and vals["xla"] > 0:
+            ratios.append(vals["pallas"] / vals["xla"])
+
+    if ratios:
+        ratios_sorted = sorted(ratios)
+        median_ratio = ratios_sorted[len(ratios_sorted) // 2]
+        mean_ratio = sum(ratios_sorted) / len(ratios_sorted)
+        print(
+            f"[quantized_matmul] Pallas/XLA ratio: "
+            f"median={median_ratio:.3f}, mean={mean_ratio:.3f}, samples={len(ratios_sorted)}"
+        )
+        target_raw = os.getenv("EJKERNEL_QMM_TPU_ACCEPT_RATIO")
+        if target_raw:
+            target = float(target_raw)
+            if median_ratio > target:
+                print(
+                    f"[quantized_matmul] Acceptance failed: median ratio {median_ratio:.3f} > target {target:.3f}"
+                )
+                raise SystemExit(2)
+
     bench.plot(f"benchmark_plots/{spec.op_name}")
     raise SystemExit(0)

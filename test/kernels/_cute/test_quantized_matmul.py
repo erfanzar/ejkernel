@@ -14,6 +14,7 @@
 
 # ruff: noqa: E402
 
+import importlib
 import importlib.util
 
 import jax
@@ -31,6 +32,8 @@ from ejkernel.callib._cute_ffi import has_cute_ffi_support
 from ejkernel.kernels._cute.quantized_matmul import quantized_matmul as cute_quantized_matmul
 from ejkernel.kernels._xla.quantized_matmul import quantized_matmul as xla_quantized_matmul
 from ejkernel.quantization import prepack_quantized_weights
+
+cute_qmm_bwd = importlib.import_module("ejkernel.kernels._cute.quantized_matmul._cute_impl_bwd")
 
 if not has_cute_ffi_support():
     pytest.skip("CuTe primitive support is required for CuTe kernel tests", allow_module_level=True)
@@ -238,3 +241,127 @@ def test_quantized_matmul_cute_transpose_cache_key_regression():
         rtol=6e-2,
         atol=6e-2,
     )
+
+
+@pytest.mark.parametrize(
+    "mode,bits",
+    [
+        ("affine", 4),
+        ("affine", 8),
+        ("nf4", 4),
+        ("mxfp4", 4),
+        ("mxfp8", 8),
+        ("nvfp4", 4),
+        ("nvfp8", 8),
+    ],
+)
+def test_quantized_matmul_cute_grad_input_matches_xla(mode: str, bits: int):
+    key = jax.random.PRNGKey(202 if mode == "affine" else 303)
+    kx, kw = jax.random.split(key, 2)
+    m, k, n = 16, 64, 64
+
+    x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, biases = packed
+    else:
+        w_q, scales = packed
+        biases = None
+
+    dev = jax.devices("gpu")[0]
+    x = jax.device_put(x, dev)
+    w_q = jax.device_put(w_q, dev)
+    scales = jax.device_put(scales, dev)
+    if biases is not None:
+        biases = jax.device_put(biases, dev)
+
+    def _loss_cute(x_in):
+        y = cute_quantized_matmul(
+            x_in,
+            w_q,
+            scales,
+            biases,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+        )
+        return jnp.mean(y)
+
+    def _loss_xla(x_in):
+        y = xla_quantized_matmul(
+            x_in,
+            w_q,
+            scales,
+            biases,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+        )
+        return jnp.mean(y)
+
+    g_cute = jax.block_until_ready(jax.grad(_loss_cute)(x))
+    g_xla = jax.block_until_ready(jax.grad(_loss_xla)(x))
+
+    np.testing.assert_allclose(
+        np.asarray(g_cute, dtype=np.float32),
+        np.asarray(g_xla, dtype=np.float32),
+        rtol=7e-2,
+        atol=7e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,bits",
+    [
+        ("affine", 4),
+        ("affine", 8),
+        ("nf4", 4),
+        ("mxfp4", 4),
+        ("mxfp8", 8),
+        ("nvfp4", 4),
+        ("nvfp8", 8),
+    ],
+)
+def test_quantized_matmul_cute_grad_input_same_kernel_path(monkeypatch: pytest.MonkeyPatch, mode: str, bits: int):
+    key = jax.random.PRNGKey(404 if mode == "affine" else 505)
+    kx, kw = jax.random.split(key, 2)
+    m, k, n = 16, 64, 64
+
+    x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, biases = packed
+    else:
+        w_q, scales = packed
+        biases = None
+
+    dev = jax.devices("gpu")[0]
+    x = jax.device_put(x, dev)
+    w_q = jax.device_put(w_q, dev)
+    scales = jax.device_put(scales, dev)
+    if biases is not None:
+        biases = jax.device_put(biases, dev)
+
+    def _forbidden_dequant(*args, **kwargs):
+        raise AssertionError(f"Unexpected dequant fallback in CuTe grad path for mode={mode}.")
+
+    monkeypatch.setattr(cute_qmm_bwd, "dequantize", _forbidden_dequant)
+
+    def _loss(x_in):
+        y = cute_quantized_matmul(
+            x_in,
+            w_q,
+            scales,
+            biases,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+        )
+        return jnp.mean(y)
+
+    gx = jax.block_until_ready(jax.grad(_loss)(x))
+    assert gx.shape == (m, k)

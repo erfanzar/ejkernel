@@ -66,3 +66,50 @@ def test_quantized_matmul_triton_matches_xla(mode: str):
     out_xla = jax.block_until_ready(out_xla)
 
     assert_allclose(out_triton, out_xla, atol=6e-2, rtol=6e-2)
+
+
+@pytest.mark.parametrize("mode,bits", [("affine", 4), ("nf4", 4), ("mxfp8", 8)])
+def test_quantized_matmul_triton_grad_input_matches_xla(mode: str, bits: int):
+    key = jax.random.PRNGKey(23 if mode == "affine" else 29)
+    kx, kw = jax.random.split(key, 2)
+    m, k, n = 16, 64, 64
+
+    x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, biases = packed
+    else:
+        w_q, scales = packed
+        biases = None
+
+    def _loss_triton(x_in):
+        y = quantized_matmul(
+            x_in,
+            w_q,
+            scales,
+            biases,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+            platform="triton",
+        )
+        return jnp.mean(y)
+
+    def _loss_xla(x_in):
+        y = quantized_matmul(
+            x_in,
+            w_q,
+            scales,
+            biases,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+            platform="xla",
+        )
+        return jnp.mean(y)
+
+    g_triton = jax.block_until_ready(jax.grad(_loss_triton)(x))
+    g_xla = jax.block_until_ready(jax.grad(_loss_xla)(x))
+    assert_allclose(g_triton, g_xla, atol=7e-2, rtol=7e-2)

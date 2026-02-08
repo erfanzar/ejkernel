@@ -138,3 +138,59 @@ def test_quantized_matmul_cuda_matches_xla(mode: str, group_size: int, x_dtype: 
         rtol=rtol,
         atol=atol,
     )
+
+
+@pytest.mark.parametrize("mode,bits", [("affine", 4), ("nf4", 4), ("mxfp8", 8)])
+def test_quantized_matmul_cuda_grad_input_matches_xla(mode: str, bits: int):
+    key = jax.random.PRNGKey(77 if mode == "affine" else 79)
+    kx, kw = jax.random.split(key, 2)
+    m, k, n = 32, 256, 256
+
+    x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, biases = packed
+    else:
+        w_q, scales = packed
+        biases = None
+
+    dev = jax.devices("gpu")[0]
+    x, w_q, scales = _device_put_all(dev, x, w_q, scales)
+    if biases is not None:
+        biases = jax.device_put(biases, dev)
+
+    def _loss_cuda(x_in):
+        y = cuda_quantized_matmul(
+            x_in,
+            w_q,
+            scales,
+            biases,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+        )
+        return jnp.mean(y)
+
+    def _loss_xla(x_in):
+        y = xla_quantized_matmul(
+            x_in,
+            w_q,
+            scales,
+            biases,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+        )
+        return jnp.mean(y)
+
+    g_cuda = jax.block_until_ready(jax.grad(_loss_cuda)(x))
+    g_xla = jax.block_until_ready(jax.grad(_loss_xla)(x))
+
+    np.testing.assert_allclose(
+        np.asarray(g_cuda, dtype=np.float32),
+        np.asarray(g_xla, dtype=np.float32),
+        rtol=8e-2,
+        atol=8e-2,
+    )

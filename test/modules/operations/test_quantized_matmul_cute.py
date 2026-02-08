@@ -16,12 +16,18 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from ejkernel.callib._cute_ffi import has_cute_ffi_support
-from ejkernel.kernels._cute.quantized_matmul._cute_impl import _wrap_vmap_compatible_jax_call
 from ejkernel.modules.operations import quantized_matmul
 from ejkernel.quantization import prepack_quantized_weights
 
 from ._utils import assert_allclose, device_platform, has_cutlass
+
+try:
+    from ejkernel.callib._cute_ffi import has_cute_ffi_support
+    from ejkernel.kernels._cute.quantized_matmul._cute_impl import _wrap_vmap_compatible_jax_call
+except ModuleNotFoundError as exc:
+    if exc.name == "cuda" or (exc.name is not None and exc.name.startswith("cuda.")):
+        pytest.skip("CUDA Python bindings required for CuTe tests", allow_module_level=True)
+    raise
 
 pytestmark = [
     pytest.mark.skipif(device_platform() != "gpu", reason="GPU-only CUTE validation"),
@@ -185,6 +191,52 @@ def test_quantized_matmul_cute_jit_vmap_over_all_inputs_matches_xla():
     out_cute = jax.block_until_ready(out_cute)
     out_xla = jax.block_until_ready(out_xla)
     assert_allclose(out_cute, out_xla, atol=6e-2, rtol=6e-2)
+
+
+@pytest.mark.parametrize("mode,bits", [("affine", 4), ("nf4", 4), ("mxfp8", 8)])
+def test_quantized_matmul_cute_grad_input_matches_xla(mode: str, bits: int):
+    key = jax.random.PRNGKey(41 if mode == "affine" else 43)
+    kx, kw = jax.random.split(key, 2)
+    m, k, n = 16, 64, 64
+
+    x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, biases = packed
+    else:
+        w_q, scales = packed
+        biases = None
+
+    def _loss_cute(x_in):
+        y = quantized_matmul(
+            x_in,
+            w_q,
+            scales,
+            biases,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+            platform="cute",
+        )
+        return jnp.mean(y)
+
+    def _loss_xla(x_in):
+        y = quantized_matmul(
+            x_in,
+            w_q,
+            scales,
+            biases,
+            transpose=False,
+            mode=mode,
+            bits=bits,
+            platform="xla",
+        )
+        return jnp.mean(y)
+
+    g_cute = jax.block_until_ready(jax.grad(_loss_cute)(x))
+    g_xla = jax.block_until_ready(jax.grad(_loss_xla)(x))
+    assert_allclose(g_cute, g_xla, atol=7e-2, rtol=7e-2)
 
 
 def test_cute_qmm_vmap_wrapper_supports_mixed_batched_inputs():

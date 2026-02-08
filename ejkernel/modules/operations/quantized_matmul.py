@@ -81,6 +81,10 @@ def _lcm(a: int, b: int) -> int:
     return abs(a * b) // math.gcd(a, b)
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
 def _nearest_choices(value: int, choices: tuple[int, ...], count: int = 2) -> list[int]:
     ranked = sorted(set(choices), key=lambda x: abs(x - value))
     return sorted(ranked[:count])
@@ -161,6 +165,123 @@ def _xla_choices(hardware: str) -> tuple[tuple[int, ...], tuple[int, ...], tuple
     if hardware == "tpu":
         return (256, 512, 1024, 2048), (256, 512, 1024, 2048), (128, 256, 512)
     return (256, 512, 1024, 2048), (256, 512, 1024, 2048), (128, 256, 512)
+
+
+def _tpu_predecode_fits_memory_model(k: int, n: int) -> bool:
+    cap_raw = os.getenv("EJKERNEL_QMM_TPU_MAX_PREDECODE_BYTES")
+    if cap_raw is None:
+        cap = 256 * 1024 * 1024
+    else:
+        try:
+            cap = int(cap_raw)
+        except ValueError:
+            cap = 256 * 1024 * 1024
+    if cap <= 0:
+        return True
+    return (k * n * 2) <= cap
+
+
+def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
+    mode = str(inv.kwargs.get("mode", "affine"))
+    group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
+    m, k, n, _ = _infer_mkn(inv, group_size)
+    values_per_word = 32 // bits if bits in (4, 8) else 1
+    align_n = _lcm(128, _lcm(group_size, values_per_word))
+
+    block_m = 256 if m >= 2048 else 128
+    block_n = 256 if n >= 1024 else 128
+    block_k = 256 if k >= 4096 else 128
+
+    block_n = max(align_n, _ceil_div(block_n, align_n) * align_n)
+    block_k = max(128, _ceil_div(block_k, 128) * 128)
+
+    # If predecode would exceed the memory model cap, bias to smaller tiles to
+    # reduce temporary pressure and make XLA fallback more likely.
+    if not _tpu_predecode_fits_memory_model(k, n):
+        block_m = 128
+        block_n = max(128, align_n)
+        block_k = 128
+
+    return QuantizedMatmulConfig(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=4,
+        num_stages=2,
+        use_bf16=True,
+        split_k=None,
+        platform="pallas",
+        backend="tpu",
+    )
+
+
+def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) -> list[QuantizedMatmulConfig]:
+    mode = str(inv.kwargs.get("mode", "affine"))
+    group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
+    m, k, n, _ = _infer_mkn(inv, group_size)
+
+    values_per_word = 32 // bits if bits in (4, 8) else 1
+    align_n = _lcm(128, _lcm(group_size, values_per_word))
+    bm_opts = (128, 256)
+    bn_seed = (128, 256, 512, 1024)
+    bk_opts = (128, 256, 512)
+
+    bn_opts = []
+    for v in bn_seed:
+        aligned = max(align_n, _ceil_div(v, align_n) * align_n)
+        bn_opts.append(aligned)
+    bn_opts = sorted(set(bn_opts))
+
+    # Memory model: for very large KxN with predecode path, keep candidate set small.
+    if not _tpu_predecode_fits_memory_model(k, n):
+        bn_opts = [max(align_n, 128)]
+        bk_opts = (128,)
+
+    x = _inv_arg(inv, "x", 0)
+    w = _inv_arg(inv, "w", 1)
+    scales = _inv_arg(inv, "scales", 2)
+    try:
+        from ejkernel.kernels._pallas.tpu.quantized_matmul._pallas_impl_core import (
+            is_packed_tpu_legal_forward as _packed_legal_forward,
+        )
+    except Exception:
+        _packed_legal_forward = None
+
+    configs: list[QuantizedMatmulConfig] = []
+    for bm in bm_opts:
+        for bn in bn_opts:
+            for bk in bk_opts:
+                cfg = QuantizedMatmulConfig(
+                    block_m=bm,
+                    block_n=bn,
+                    block_k=bk,
+                    num_warps=4,
+                    num_stages=2,
+                    use_bf16=True,
+                    split_k=None,
+                    platform="pallas",
+                    backend="tpu",
+                )
+                if _packed_legal_forward is not None and bits in (4, 8):
+                    # Keep candidates that are legal for packed path, or that can
+                    # still run through predecode memory model.
+                    if _packed_legal_forward(
+                        x,
+                        w,
+                        scales,
+                        group_size=group_size,
+                        bits=bits,
+                        block_m=bm,
+                        block_n=bn,
+                        block_k=bk,
+                    ) or _tpu_predecode_fits_memory_model(k, n):
+                        configs.append(cfg)
+                else:
+                    configs.append(cfg)
+
+    if not configs:
+        configs.append(_pallas_tpu_heuristic_cfg(inv))
+    return configs
 
 
 def _xla_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array], hardware: str) -> list[QuantizedMatmulConfig]:
@@ -484,6 +605,9 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         Returns:
             A QuantizedMatmulConfig optimized for TPU execution.
         """
+        resolved = self._resolve_inv_platform(inv)
+        if resolved == Platform.PALLAS:
+            return _pallas_tpu_heuristic_cfg(inv)
         return _xla_heuristic_cfg(inv, "tpu")
 
     def candidate_cfgs_gpu(self, inv: Invocation[QuantizedMatmulConfig, Array]) -> list[QuantizedMatmulConfig]:
@@ -520,6 +644,9 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         Returns:
             List of QuantizedMatmulConfig candidates optimized for TPU.
         """
+        resolved = self._resolve_inv_platform(inv)
+        if resolved == Platform.PALLAS:
+            return _pallas_tpu_candidate_cfgs(inv)
         return _xla_candidate_cfgs(inv, "tpu")
 
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu

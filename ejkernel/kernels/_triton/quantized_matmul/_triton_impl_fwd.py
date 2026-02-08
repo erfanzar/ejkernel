@@ -1,0 +1,257 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Forward Triton implementation for quantized matrix multiplication."""
+
+from __future__ import annotations
+
+import os
+import threading
+from collections import OrderedDict
+from typing import Literal
+
+import jax
+import jax.numpy as jnp
+
+from ejkernel.callib._ejit import ejit
+
+from ._triton_impl import (
+    _parse_matmul_precision,
+    _resolve_qparams,
+    quantized_matmul_dequant_triton,
+    quantized_matmul_triton,
+)
+
+QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
+
+_QMM_DEQUANT_CACHE: OrderedDict[tuple, jax.Array] = OrderedDict()
+_QMM_DEQUANT_CACHE_LOCK = threading.Lock()
+
+
+def _device_key(arr: jax.Array) -> tuple | None:
+    try:
+        dev = arr.device()
+    except Exception:
+        return None
+    if dev is None:
+        return None
+    return (getattr(dev, "platform", None), getattr(dev, "id", None), str(dev))
+
+
+def _dequant_cache_key(
+    w: jax.Array,
+    scales: jax.Array,
+    biases: jax.Array | None,
+    out_dtype,
+    group_size: int,
+    bits: int,
+    mode: str,
+    transpose: bool,
+) -> tuple:
+    return (
+        _device_key(w),
+        id(w),
+        id(scales),
+        id(biases) if biases is not None else None,
+        w.shape,
+        w.dtype,
+        scales.shape,
+        scales.dtype,
+        biases.shape if biases is not None else None,
+        biases.dtype if biases is not None else None,
+        out_dtype,
+        group_size,
+        bits,
+        mode,
+        transpose,
+    )
+
+
+@ejit(static_argnames=["transpose", "group_size", "bits", "mode", "use_bf16"])
+def _dequant_jit(
+    w,
+    scales,
+    biases,
+    *,
+    transpose: bool,
+    group_size: int | None,
+    bits: int | None,
+    mode: QuantizationMode,
+    use_bf16: bool,
+):
+    return quantized_matmul_dequant_triton(
+        w,
+        scales,
+        biases,
+        transpose=transpose,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        use_bf16=use_bf16,
+    )
+
+
+@ejit(static_argnames=["transpose", "output_dtype", "precision"])
+def _two_stage_matmul(
+    x,
+    w_deq,
+    *,
+    transpose: bool,
+    output_dtype,
+    precision,
+):
+    if transpose:
+        dimension_numbers = (((1,), (1,)), ((), ()))
+    else:
+        dimension_numbers = (((1,), (0,)), ((), ()))
+    return jax.lax.dot_general(
+        x,
+        w_deq,
+        dimension_numbers=dimension_numbers,
+        precision=precision,
+        preferred_element_type=output_dtype,
+    )
+
+
+def quantized_matmul_forward(
+    x,
+    w,
+    scales,
+    biases,
+    *,
+    transpose: bool,
+    group_size: int | None,
+    bits: int | None,
+    mode: QuantizationMode,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    use_bf16: bool,
+    num_warps: int | None,
+    num_stages: int | None,
+    split_k: int | None,
+):
+    """Forward Triton QMM with optional two-stage large-kernel path."""
+    mode_lower = mode.lower()
+    use_two_stage = os.getenv("EJKERNEL_QMM_TWO_STAGE", "1").lower() in {"1", "true", "yes", "y"}
+    use_cache = os.getenv("EJKERNEL_QMM_DEQUANT_CACHE", "1").lower() in {"1", "true", "yes", "y"}
+
+    if use_two_stage and use_cache:
+        group_size_resolved, bits_resolved = _resolve_qparams(mode_lower, group_size, bits)
+        m = x.shape[0]
+        k = x.shape[1]
+        if transpose:
+            n = w.shape[0]
+        else:
+            n = scales.shape[1] * group_size_resolved
+
+        use_large_kernel = m >= 4096 and n >= 4096 and k >= 4096
+        if use_large_kernel:
+            out_dtype = jnp.bfloat16 if use_bf16 else jnp.float16
+            output_dtype = jnp.bfloat16
+            precision_env = os.getenv("EJKERNEL_QMM_MATMUL_PRECISION", "")
+            if precision_env:
+                matmul_precision = _parse_matmul_precision(precision_env)
+            else:
+                max_dim = max(m, n, k)
+                if max_dim <= 2048:
+                    matmul_precision = jax.lax.Precision.FASTEST
+                elif max_dim <= 4096:
+                    matmul_precision = jax.lax.Precision.HIGH
+                else:
+                    matmul_precision = jax.lax.Precision.DEFAULT
+            cache_limit = int(os.getenv("EJKERNEL_QMM_DEQUANT_CACHE_MAX_ITEMS", "2"))
+
+            w_deq = None
+            cache_key = None
+            if cache_limit > 0:
+                cache_key = _dequant_cache_key(
+                    w,
+                    scales,
+                    biases,
+                    out_dtype,
+                    group_size_resolved,
+                    bits_resolved,
+                    mode_lower,
+                    transpose,
+                )
+                with _QMM_DEQUANT_CACHE_LOCK:
+                    w_deq = _QMM_DEQUANT_CACHE.get(cache_key)
+                    if w_deq is not None:
+                        _QMM_DEQUANT_CACHE.move_to_end(cache_key)
+
+            if w_deq is None:
+                w_deq = _dequant_jit(
+                    w,
+                    scales,
+                    biases,
+                    transpose=transpose,
+                    group_size=group_size_resolved,
+                    bits=bits_resolved,
+                    mode=mode_lower,
+                    use_bf16=use_bf16,
+                )
+                if cache_key is not None:
+                    with _QMM_DEQUANT_CACHE_LOCK:
+                        _QMM_DEQUANT_CACHE[cache_key] = w_deq
+                        _QMM_DEQUANT_CACHE.move_to_end(cache_key)
+                        while len(_QMM_DEQUANT_CACHE) > cache_limit:
+                            _QMM_DEQUANT_CACHE.popitem(last=False)
+
+            x_cast = x.astype(out_dtype)
+            out = _two_stage_matmul(
+                x_cast,
+                w_deq,
+                transpose=transpose,
+                output_dtype=output_dtype,
+                precision=matmul_precision,
+            )
+            return out.astype(jnp.bfloat16)
+
+    out = ejit(
+        func=quantized_matmul_triton,
+        static_argnames=[
+            "transpose",
+            "group_size",
+            "bits",
+            "mode",
+            "block_m",
+            "block_n",
+            "block_k",
+            "use_bf16",
+            "num_warps",
+            "num_stages",
+            "split_k",
+        ],
+    )(
+        x,
+        w,
+        scales,
+        biases,
+        transpose=transpose,
+        group_size=group_size,
+        bits=bits,
+        mode=mode_lower,
+        use_bf16=use_bf16,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        split_k=split_k,
+    )
+    return out.astype(jnp.bfloat16)
+
+
+__all__ = ("quantized_matmul_forward",)
