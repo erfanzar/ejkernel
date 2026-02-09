@@ -206,8 +206,7 @@ def _normalize_rwkv7_varlen_state(
     if state.ndim == 5:
         if state.shape[0] != 1:
             raise ValueError(
-                "Packed varlen RWKV7 initial_state with rank-5 must have leading batch size 1, "
-                f"got shape {state.shape}."
+                f"Packed varlen RWKV7 initial_state with rank-5 must have leading batch size 1, got shape {state.shape}."
             )
         state = state[0]
     if state.ndim != 4:

@@ -37,9 +37,9 @@ __all__ = (
     "AutotunePolicy",
     "ConfigCache",
     "ConfigSelectorChain",
-    "forward_autotune_only",
     "PersistentCache",
     "Tuner",
+    "forward_autotune_only",
     "overlay_cache",
     "policy_override",
 )

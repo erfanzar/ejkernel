@@ -6,4 +6,6 @@ ejkernel.kernels._cuda.quantized_matmul package
 
    _build
    _cuda_impl
+   _cuda_impl_bwd
+   _cuda_impl_fwd
    _interface

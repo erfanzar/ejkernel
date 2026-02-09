@@ -47,9 +47,7 @@ def _pack_varlen_inputs(
     core expects `[total_tokens, H, D]`.
     """
     if query.ndim != key.ndim or query.ndim != value.ndim:
-        raise ValueError(
-            f"query/key/value must share rank in varlen mode, got {query.ndim}, {key.ndim}, {value.ndim}."
-        )
+        raise ValueError(f"query/key/value must share rank in varlen mode, got {query.ndim}, {key.ndim}, {value.ndim}.")
 
     if query.ndim == 4:
         if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
@@ -95,8 +93,7 @@ def _normalize_varlen_initial_state(
     if state.ndim == 5:
         if state.shape[0] != 1:
             raise ValueError(
-                "Varlen recurrent initial_state rank-5 form must have leading batch size 1, "
-                f"got {state.shape[0]}."
+                f"Varlen recurrent initial_state rank-5 form must have leading batch size 1, got {state.shape[0]}."
             )
         state = state[0]
     if state.ndim != 4:

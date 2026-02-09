@@ -5,4 +5,5 @@ ejkernel.kernels._triton.ring_attention package
    :maxdepth: 2
 
    _interface
-   _ring_kernel
+   _triton_impl_bwd
+   _triton_impl_fwd

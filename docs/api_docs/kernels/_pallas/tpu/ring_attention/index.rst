@@ -5,4 +5,5 @@ ejkernel.kernels._pallas.tpu.ring_attention package
    :maxdepth: 2
 
    _interface
-   _ring_splash
+   _pallas_impl_bwd
+   _pallas_impl_fwd

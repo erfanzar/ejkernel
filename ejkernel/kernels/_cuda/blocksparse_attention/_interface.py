@@ -92,8 +92,7 @@ def _normalize_softmax_aux(
         if aux.shape[0] == num_kv_heads:
             return jnp.repeat(aux, repeats=(num_heads // num_kv_heads), axis=0)
         raise ValueError(
-            f"softmax_aux first dim must be num_kv_heads ({num_kv_heads}) or num_heads ({num_heads}); "
-            f"got {aux.shape[0]}"
+            f"softmax_aux first dim must be num_kv_heads ({num_kv_heads}) or num_heads ({num_heads}); got {aux.shape[0]}"
         )
     raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}")
 
@@ -127,7 +126,11 @@ def _build_token_mask(
         kv_block_idx = (jnp.arange(kv_len, dtype=jnp.int32) // int(kv_blocksize)).astype(jnp.int32)
         lb_tok = lower[:, 0, q_block_idx]
         ub_tok = upper[:, 0, q_block_idx]
-        valid = valid & (kv_block_idx[None, None, :] >= lb_tok[:, :, None]) & (kv_block_idx[None, None, :] < ub_tok[:, :, None])
+        valid = (
+            valid
+            & (kv_block_idx[None, None, :] >= lb_tok[:, :, None])
+            & (kv_block_idx[None, None, :] < ub_tok[:, :, None])
+        )
 
     valid = valid & (q_segment_ids[:, :, None] == kv_segment_ids[:, None, :])
 

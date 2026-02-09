@@ -7,3 +7,4 @@ ejkernel.quantization._utils package
    bitpack
    fp_tables
    grouping
+   qparams

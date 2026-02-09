@@ -12,5 +12,7 @@ ejkernel API Reference
    types/index
    xla_utils/index
    benchmarks
+   build_cudalib
+   errors
    loggings
    utils

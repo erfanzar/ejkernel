@@ -5,3 +5,5 @@ ejkernel.kernels._triton.gla package
    :maxdepth: 2
 
    _interface
+   _triton_impl_bwd
+   _triton_impl_fwd

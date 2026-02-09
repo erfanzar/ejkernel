@@ -5,6 +5,7 @@ ejkernel.kernels package
    :maxdepth: 2
 
    _cuda/index
+   _cute/index
    _pallas/index
    _triton/index
    _xla/index
