@@ -26,16 +26,18 @@ Classes:
     Tuner: Performance benchmarking and autotuning
     overlay_cache: Context manager for temporary cache overrides
     policy_override: Context manager for temporary policy changes
+    forward_autotune_only: Context manager to force forward-only autotuning
 """
 
 from .cache import ConfigCache, overlay_cache
 from .persistent import PersistentCache
-from .selection import AutotunePolicy, ConfigSelectorChain, Tuner, policy_override
+from .selection import AutotunePolicy, ConfigSelectorChain, Tuner, forward_autotune_only, policy_override
 
 __all__ = (
     "AutotunePolicy",
     "ConfigCache",
     "ConfigSelectorChain",
+    "forward_autotune_only",
     "PersistentCache",
     "Tuner",
     "overlay_cache",

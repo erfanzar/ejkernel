@@ -318,7 +318,7 @@ def _recurrent_attention_varlen_fwd(
         gv_batch = gv_seq[None, ...] if gv_seq is not None else None
         h0_batch = h0[None, ...] if h0 is not None else None
 
-        o_batch, h_final_batch = _recurrent_attention_fwd(
+        o_batch, _, h_final_batch = _recurrent_attention_fwd(
             q_batch,
             k_batch,
             v_batch,

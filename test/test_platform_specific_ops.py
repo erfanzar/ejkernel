@@ -21,7 +21,17 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from ejkernel.ops import ConfigCache, ConfigSelectorChain, Executor, Kernel, get_device_platform
+from ejkernel.ops import (
+    AutotunePolicy,
+    ConfigCache,
+    ConfigSelectorChain,
+    Executor,
+    Invocation,
+    Kernel,
+    Tuner,
+    forward_autotune_only,
+    get_device_platform,
+)
 
 
 @dataclass
@@ -138,6 +148,21 @@ class PlatformSpecificVJPKernel(Kernel[TestConfig, jax.Array]):
         return dx, dy_val
 
 
+class CaptureValidateBackwardTuner(Tuner[TestConfig]):
+    """Tuner stub that records whether backward validation was requested."""
+
+    def __init__(self):
+        super().__init__(warmup=0, iters=1)
+        self.last_validate_backward: bool | None = None
+
+    def autotune(self, make_fn, args, kwargs, candidates):
+        candidates = tuple(candidates)
+        assert candidates
+        fn = make_fn(candidates[0])
+        self.last_validate_backward = bool(getattr(fn, "_ejk_validate_backward", False))
+        return candidates[0]
+
+
 class TestPlatformSpecificKernels:
     """Test platform-specific kernel functionality."""
 
@@ -238,6 +263,43 @@ class TestPlatformSpecificKernels:
 
         assert jnp.all(jnp.isfinite(dx))
         assert jnp.all(jnp.isfinite(dy))
+
+    def test_forward_autotune_only_disables_backward_autotune_validation(self):
+        """forward_autotune_only() should force forward-only autotune timing."""
+        kernel = PlatformSpecificKernel()
+        inv = Invocation(
+            op_id=kernel.op_id,
+            args=(jnp.array([1.0]), jnp.array([2.0])),
+            kwargs={},
+        )
+
+        tuner_default = CaptureValidateBackwardTuner()
+        selector_default = ConfigSelectorChain(
+            cache=ConfigCache(),
+            policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+            tuner=tuner_default,
+        )
+        selector_default.choose(inv, kernel)
+        assert tuner_default.last_validate_backward is True
+
+        tuner_context = CaptureValidateBackwardTuner()
+        selector_context = ConfigSelectorChain(
+            cache=ConfigCache(),
+            policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+            tuner=tuner_context,
+        )
+        with forward_autotune_only():
+            selector_context.choose(inv, kernel)
+        assert tuner_context.last_validate_backward is False
+
+        tuner_after = CaptureValidateBackwardTuner()
+        selector_after = ConfigSelectorChain(
+            cache=ConfigCache(),
+            policy=AutotunePolicy(allow_autotune=True, cache_miss_fallback="autotune", validate_backward=True),
+            tuner=tuner_after,
+        )
+        selector_after.choose(inv, kernel)
+        assert tuner_after.last_validate_backward is True
 
 
 if __name__ == "__main__":

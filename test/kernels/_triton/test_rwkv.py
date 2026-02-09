@@ -129,3 +129,133 @@ def test_rwkv7_matches_xla_and_mul_wrapper():
     np.testing.assert_allclose(
         np.asarray(st_mul_tri, np.float32), np.asarray(st_mul_xla, np.float32), rtol=2e-2, atol=2e-2
     )
+
+
+def test_rwkv6_grad_matches_xla_and_vjp():
+    B, T, H, K, V = 1, 8, 2, 16, 16
+    key = jax.random.PRNGKey(11)
+    kr, kk, kv, kw, ku, kh = jax.random.split(key, 6)
+
+    r = jax.random.normal(kr, (B, T, H, K), dtype=jnp.float16)
+    k = jax.random.normal(kk, (B, T, H, K), dtype=jnp.float16)
+    v = jax.random.normal(kv, (B, T, H, V), dtype=jnp.float16)
+    w = jax.random.normal(kw, (B, T, H, K), dtype=jnp.float16) * -0.01
+    u = jax.random.normal(ku, (H, K), dtype=jnp.float16)
+    h0 = jax.random.normal(kh, (B, H, K, V), dtype=jnp.float32)
+
+    def loss_tri(r_, k_, v_, w_, u_, h0_):
+        o, st = triton_rwkv6(r_, k_, v_, w_, u_, initial_state=h0_)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    def loss_xla(r_, k_, v_, w_, u_, h0_):
+        o, st = xla_rwkv6(r_, k_, v_, w_, u_, initial_state=h0_)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    grads_tri = jax.jit(jax.grad(loss_tri, argnums=(0, 1, 2, 3, 4, 5)))(r, k, v, w, u, h0)
+    grads_xla = jax.jit(jax.grad(loss_xla, argnums=(0, 1, 2, 3, 4, 5)))(r, k, v, w, u, h0)
+    grads_tri = jax.tree_util.tree_map(jax.block_until_ready, grads_tri)
+    grads_xla = jax.tree_util.tree_map(jax.block_until_ready, grads_xla)
+
+    for g_tri, g_xla in zip(grads_tri, grads_xla, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(g_tri, np.float32),
+            np.asarray(g_xla, np.float32),
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+    def fwd_tri(r_, k_, v_, w_, u_, h0_):
+        return triton_rwkv6(r_, k_, v_, w_, u_, initial_state=h0_)
+
+    @jax.jit
+    def vjp_eval(r_, k_, v_, w_, u_, h0_):
+        (out, st), vjp_fn = jax.vjp(fwd_tri, r_, k_, v_, w_, u_, h0_)
+        cot = (jnp.ones_like(out), jnp.ones_like(st))
+        return vjp_fn(cot)
+
+    vjp_grads = vjp_eval(r, k, v, w, u, h0)
+    for grad in vjp_grads:
+        assert jnp.all(jnp.isfinite(grad))
+
+
+def test_rwkv7_and_rwkv7_mul_grad_match_xla_and_vjp():
+    B, T, H, K, V = 1, 8, 2, 16, 16
+    key = jax.random.PRNGKey(17)
+    kr, kw, kk, kv, ka, kb, kkk, kh = jax.random.split(key, 8)
+
+    r = jax.random.normal(kr, (B, T, H, K), dtype=jnp.float16)
+    w = jax.random.normal(kw, (B, T, H, K), dtype=jnp.float16) * -0.01
+    k = jax.random.normal(kk, (B, T, H, K), dtype=jnp.float16)
+    v = jax.random.normal(kv, (B, T, H, V), dtype=jnp.float16)
+    a = jax.random.normal(ka, (B, T, H, K), dtype=jnp.float16) * 0.01
+    b = jax.random.normal(kb, (B, T, H, K), dtype=jnp.float16) * 0.01
+    kk_mul = jax.random.normal(kkk, (B, T, H, K), dtype=jnp.float16) * 0.01
+    h0 = jax.random.normal(kh, (B, H, K, V), dtype=jnp.float32)
+
+    def loss_tri_ab(r_, w_, k_, v_, a_, b_, h0_):
+        o, st = triton_rwkv7(r_, w_, k_, v_, a_, b_, initial_state=h0_)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    def loss_xla_ab(r_, w_, k_, v_, a_, b_, h0_):
+        o, st = xla_rwkv7(r_, w_, k_, v_, a_, b_, initial_state=h0_)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    grads_tri_ab = jax.jit(jax.grad(loss_tri_ab, argnums=(0, 1, 2, 3, 4, 5, 6)))(r, w, k, v, a, b, h0)
+    grads_xla_ab = jax.jit(jax.grad(loss_xla_ab, argnums=(0, 1, 2, 3, 4, 5, 6)))(r, w, k, v, a, b, h0)
+    grads_tri_ab = jax.tree_util.tree_map(jax.block_until_ready, grads_tri_ab)
+    grads_xla_ab = jax.tree_util.tree_map(jax.block_until_ready, grads_xla_ab)
+
+    for g_tri, g_xla in zip(grads_tri_ab, grads_xla_ab, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(g_tri, np.float32),
+            np.asarray(g_xla, np.float32),
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+    def loss_tri_mul(r_, w_, k_, v_, kk_, a_, h0_):
+        o, st = triton_rwkv7_mul(r_, w_, k_, v_, kk_, a_, initial_state=h0_)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    def loss_xla_mul(r_, w_, k_, v_, kk_, a_, h0_):
+        o, st = xla_rwkv7_mul(r_, w_, k_, v_, kk_, a_, initial_state=h0_)
+        return jnp.mean(o) + 0.1 * jnp.mean(st)
+
+    grads_tri_mul = jax.jit(jax.grad(loss_tri_mul, argnums=(0, 1, 2, 3, 4, 5, 6)))(r, w, k, v, kk_mul, a, h0)
+    grads_xla_mul = jax.jit(jax.grad(loss_xla_mul, argnums=(0, 1, 2, 3, 4, 5, 6)))(r, w, k, v, kk_mul, a, h0)
+    grads_tri_mul = jax.tree_util.tree_map(jax.block_until_ready, grads_tri_mul)
+    grads_xla_mul = jax.tree_util.tree_map(jax.block_until_ready, grads_xla_mul)
+
+    for g_tri, g_xla in zip(grads_tri_mul, grads_xla_mul, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(g_tri, np.float32),
+            np.asarray(g_xla, np.float32),
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+    def fwd_tri_ab(r_, w_, k_, v_, a_, b_, h0_):
+        return triton_rwkv7(r_, w_, k_, v_, a_, b_, initial_state=h0_)
+
+    @jax.jit
+    def vjp_eval_ab(r_, w_, k_, v_, a_, b_, h0_):
+        (out_ab, st_ab), vjp_fn_ab = jax.vjp(fwd_tri_ab, r_, w_, k_, v_, a_, b_, h0_)
+        cot_ab = (jnp.ones_like(out_ab), jnp.ones_like(st_ab))
+        return vjp_fn_ab(cot_ab)
+
+    vjp_grads_ab = vjp_eval_ab(r, w, k, v, a, b, h0)
+    for grad in vjp_grads_ab:
+        assert jnp.all(jnp.isfinite(grad))
+
+    def fwd_tri_mul(r_, w_, k_, v_, kk_, a_, h0_):
+        return triton_rwkv7_mul(r_, w_, k_, v_, kk_, a_, initial_state=h0_)
+
+    @jax.jit
+    def vjp_eval_mul(r_, w_, k_, v_, kk_, a_, h0_):
+        (out_mul, st_mul), vjp_fn_mul = jax.vjp(fwd_tri_mul, r_, w_, k_, v_, kk_, a_, h0_)
+        cot_mul = (jnp.ones_like(out_mul), jnp.ones_like(st_mul))
+        return vjp_fn_mul(cot_mul)
+
+    vjp_grads_mul = vjp_eval_mul(r, w, k, v, kk_mul, a, h0)
+    for grad in vjp_grads_mul:
+        assert jnp.all(jnp.isfinite(grad))

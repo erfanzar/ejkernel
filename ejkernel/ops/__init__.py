@@ -65,6 +65,7 @@ from .config import (
     ConfigSelectorChain,
     PersistentCache,
     Tuner,
+    forward_autotune_only,
     overlay_cache,
     policy_override,
 )
@@ -133,6 +134,7 @@ __all__ = (
     "device_kind",
     "extract_labels_from_hlo_text",
     "find_labels_in_lowered",
+    "forward_autotune_only",
     "from_json",
     "get_device_platform",
     "get_invocations",

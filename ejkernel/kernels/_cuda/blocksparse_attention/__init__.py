@@ -21,8 +21,8 @@ sequences with structured sparsity (e.g., causal, sliding-window, or custom
 sparse patterns).
 
 The forward pass is computed by a compiled CUDA kernel loaded via JAX FFI,
-while the backward pass falls back to an XLA-based reference implementation
-to compute gradients for query, key, and value tensors.
+while the backward pass uses a CUDA-side dense analytical fallback that
+preserves block-sparse semantics for query/key/value gradients.
 
 Public API:
     blocksparse_attention: High-level entry point registered in the kernel

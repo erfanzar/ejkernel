@@ -17,9 +17,11 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from ejkernel.kernels._xla import lightning_attn, recurrent, recurrent_gla
+from ejkernel.kernels._xla.recurrent._xla_impl_fwd import _recurrent_attention_fwd
 
 
 class TestRecurrentAttention:
@@ -95,6 +97,105 @@ class TestRecurrentAttention:
         assert output_fwd.shape == output_rev.shape
 
         assert not jnp.allclose(output_fwd, output_rev)
+
+    def test_varlen_backward_matches_batched_and_vjp(self):
+        """Test packed varlen backward under jit + finite-diff + VJP."""
+        batch, seq_len, num_heads, head_dim = 2, 6, 2, 8
+        key = jax.random.PRNGKey(0)
+        kq, kk, kv, ks = jax.random.split(key, 4)
+
+        q = jax.random.normal(kq, (batch, seq_len, num_heads, head_dim), dtype=jnp.float32)
+        k = jax.random.normal(kk, (batch, seq_len, num_heads, head_dim), dtype=jnp.float32)
+        v = jax.random.normal(kv, (batch, seq_len, num_heads, head_dim), dtype=jnp.float32)
+        h0 = jax.random.normal(ks, (batch, num_heads, head_dim, head_dim), dtype=jnp.float32)
+
+        q_p = q.reshape(1, batch * seq_len, num_heads, head_dim)
+        k_p = k.reshape(1, batch * seq_len, num_heads, head_dim)
+        v_p = v.reshape(1, batch * seq_len, num_heads, head_dim)
+        cu = jnp.arange(0, (batch + 1) * seq_len, seq_len, dtype=jnp.int32)
+
+        def loss_varlen(q_, k_, v_, h0_):
+            out, st = recurrent(q_, k_, v_, initial_state=h0_, cu_seqlens=cu)
+            return jnp.mean(out) + 0.1 * jnp.mean(st)
+
+        def loss_batched_reference(q_, k_, v_, h0_):
+            g_ = jnp.zeros_like(q_)
+            gk_ = jnp.zeros_like(q_)
+            gv_ = jnp.zeros_like(v_)
+            g_gamma_ = jnp.zeros((q_.shape[-2],), dtype=q_.dtype)
+            out, _, st = _recurrent_attention_fwd(
+                q_,
+                k_,
+                v_,
+                g_,
+                g_gamma_,
+                gk_,
+                gv_,
+                None,
+                h0_,
+                False,
+            )
+            return jnp.mean(out) + 0.1 * jnp.mean(st)
+
+        grads_varlen = jax.jit(jax.grad(loss_varlen, argnums=(0, 1, 2, 3)))(q_p, k_p, v_p, h0)
+        grads_batched = jax.jit(jax.grad(loss_batched_reference, argnums=(0, 1, 2, 3)))(q, k, v, h0)
+        grads_varlen = jax.tree_util.tree_map(jax.block_until_ready, grads_varlen)
+        grads_batched = jax.tree_util.tree_map(jax.block_until_ready, grads_batched)
+
+        dq_varlen = grads_varlen[0].reshape(batch, seq_len, num_heads, head_dim)
+        dk_varlen = grads_varlen[1].reshape(batch, seq_len, num_heads, head_dim)
+        dv_varlen = grads_varlen[2].reshape(batch, seq_len, num_heads, head_dim)
+        dh0_varlen = grads_varlen[3]
+
+        np.testing.assert_allclose(
+            np.asarray(dq_varlen, dtype=np.float32),
+            np.asarray(grads_batched[0], dtype=np.float32),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        np.testing.assert_allclose(
+            np.asarray(dk_varlen, dtype=np.float32),
+            np.asarray(grads_batched[1], dtype=np.float32),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        np.testing.assert_allclose(
+            np.asarray(dv_varlen, dtype=np.float32),
+            np.asarray(grads_batched[2], dtype=np.float32),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        np.testing.assert_allclose(
+            np.asarray(dh0_varlen, dtype=np.float32),
+            np.asarray(grads_batched[3], dtype=np.float32),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+
+        # Spot-check one element against finite differences for numerical sanity.
+        idx = (0, seq_len // 2, 0, 0)
+        eps = 1e-3
+        delta = jnp.zeros_like(k_p).at[idx].set(eps)
+        loss_jit = jax.jit(loss_varlen)
+        fd = (loss_jit(q_p, k_p + delta, v_p, h0) - loss_jit(q_p, k_p - delta, v_p, h0)) / (2.0 * eps)
+        np.testing.assert_allclose(
+            np.asarray(grads_varlen[1][idx], dtype=np.float32),
+            np.asarray(fd, dtype=np.float32),
+            rtol=5e-2,
+            atol=5e-3,
+        )
+
+        def fwd_varlen(q_, k_, v_, h0_):
+            return recurrent(q_, k_, v_, initial_state=h0_, cu_seqlens=cu)
+
+        @jax.jit
+        def vjp_eval(q_, k_, v_, h0_):
+            (out, st), vjp_fn = jax.vjp(fwd_varlen, q_, k_, v_, h0_)
+            return vjp_fn((jnp.ones_like(out), jnp.ones_like(st)))
+
+        vjp_grads = vjp_eval(q_p, k_p, v_p, h0)
+        for grad in vjp_grads:
+            assert jnp.all(jnp.isfinite(grad))
 
 
 class TestGLA:

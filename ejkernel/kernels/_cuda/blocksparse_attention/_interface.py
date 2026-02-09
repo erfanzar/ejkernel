@@ -20,8 +20,8 @@ also implements the JAX custom-VJP rule so that:
 
 * The **forward pass** is dispatched to the compiled CUDA kernel via
   :func:`._cuda_impl.blocksparse_attention_cuda`.
-* The **backward pass** is not implemented by the CUDA path and raises
-  ``NotImplementedError`` when gradients are requested.
+* The **backward pass** uses a CUDA-side dense analytical fallback that
+  preserves block-sparse masking semantics.
 
 Helper utilities for converting sparsity layouts to dense boolean masks and
 for creating empty placeholder layouts are also defined here.
@@ -37,6 +37,7 @@ import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
 from beartype.typing import Callable
+from jax.interpreters import ad
 from jaxtyping import Array, ArrayLike, Bool, Float, Int
 
 from ejkernel.callib import ejit
@@ -50,7 +51,195 @@ if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=[8, 11, 12, 13, 14, 15, 16, 17, 18])
+def _build_fwd_params(q_blocksize: int, kv_blocksize: int, num_stages: int | None, num_warps: int | None) -> FwdParams:
+    return FwdParams(
+        q_blocksize=int(q_blocksize),
+        kv_blocksize=int(kv_blocksize),
+        num_stages=None if num_stages is None else int(num_stages),
+        num_warps=None if num_warps is None else int(num_warps),
+    )
+
+
+def _build_bwd_params(q_blocksize: int, kv_blocksize: int, num_stages: int | None, num_warps: int | None) -> BwdParams:
+    return BwdParams(
+        q_blocksize=int(q_blocksize),
+        kv_blocksize=int(kv_blocksize),
+        num_stages=None if num_stages is None else int(num_stages),
+        num_warps=None if num_warps is None else int(num_warps),
+    )
+
+
+def _normalize_softmax_aux(
+    softmax_aux: ArrayLike | None,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+) -> Float[Array, "num_heads num_sinks"] | None:
+    if softmax_aux is None:
+        return None
+
+    aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
+    if aux.ndim == 1:
+        if aux.shape[0] == num_heads:
+            return aux[:, None]
+        if aux.shape[0] == num_kv_heads:
+            return jnp.repeat(aux, repeats=(num_heads // num_kv_heads), axis=0)[:, None]
+        return jnp.broadcast_to(aux[None, :], (num_heads, aux.shape[0]))
+
+    if aux.ndim == 2:
+        if aux.shape[0] == num_heads:
+            return aux
+        if aux.shape[0] == num_kv_heads:
+            return jnp.repeat(aux, repeats=(num_heads // num_kv_heads), axis=0)
+        raise ValueError(
+            f"softmax_aux first dim must be num_kv_heads ({num_kv_heads}) or num_heads ({num_heads}); "
+            f"got {aux.shape[0]}"
+        )
+    raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}")
+
+
+def _build_token_mask(
+    *,
+    q_positions: Int[Array, "batch q_len"],
+    q_segment_ids: Int[Array, "batch q_len"],
+    kv_positions: Int[Array, "batch kv_len"],
+    kv_segment_ids: Int[Array, "batch kv_len"],
+    qkv_layouts: tuple[SparseMask] | None,
+    q_blocksize: int,
+    kv_blocksize: int,
+    causal: bool,
+    window_left: int,
+    window_right: int,
+) -> Bool[Array, "batch q_len kv_len"]:
+    batch_size, q_len = q_positions.shape
+    _, kv_len = kv_positions.shape
+
+    valid = jnp.ones((batch_size, q_len, kv_len), dtype=bool)
+
+    if qkv_layouts is not None and len(qkv_layouts) > 0 and qkv_layouts[0].lower_bounds is not None:
+        layout = qkv_layouts[0]
+        lower = jnp.asarray(layout.lower_bounds, dtype=jnp.int32)
+        upper = jnp.asarray(layout.upper_bounds, dtype=jnp.int32)
+        if lower.ndim == 2:
+            lower = lower[:, None, :]
+            upper = upper[:, None, :]
+        q_block_idx = (jnp.arange(q_len, dtype=jnp.int32) // int(q_blocksize)).astype(jnp.int32)
+        kv_block_idx = (jnp.arange(kv_len, dtype=jnp.int32) // int(kv_blocksize)).astype(jnp.int32)
+        lb_tok = lower[:, 0, q_block_idx]
+        ub_tok = upper[:, 0, q_block_idx]
+        valid = valid & (kv_block_idx[None, None, :] >= lb_tok[:, :, None]) & (kv_block_idx[None, None, :] < ub_tok[:, :, None])
+
+    valid = valid & (q_segment_ids[:, :, None] == kv_segment_ids[:, None, :])
+
+    if causal:
+        valid = valid & (q_positions[:, :, None] >= kv_positions[:, None, :])
+
+    if window_left >= 0 or window_right >= 0:
+        dist = q_positions[:, :, None] - kv_positions[:, None, :]
+        if window_left >= 0:
+            valid = valid & (dist <= int(window_left))
+        if window_right >= 0:
+            valid = valid & (dist >= -int(window_right))
+
+    return valid
+
+
+def _blocksparse_dense_backward(
+    *,
+    query: ArrayLike,
+    key: ArrayLike,
+    value: ArrayLike,
+    q_positions: Int[Array, "batch q_len"],
+    q_segment_ids: Int[Array, "batch q_len"],
+    kv_positions: Int[Array, "batch kv_len"],
+    kv_segment_ids: Int[Array, "batch kv_len"],
+    qkv_layouts: tuple[SparseMask] | None,
+    softmax_scale: float,
+    softmax_aux: ArrayLike | None,
+    window_left: int,
+    window_right: int,
+    causal: bool,
+    logits_soft_cap: float | None,
+    q_blocksize: int,
+    kv_blocksize: int,
+    dout: ArrayLike,
+) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
+    q_f = jnp.asarray(query, dtype=jnp.float32)
+    k_f = jnp.asarray(key, dtype=jnp.float32)
+    v_f = jnp.asarray(value, dtype=jnp.float32)
+    do_f = jnp.asarray(dout, dtype=jnp.float32)
+
+    batch_size, num_heads, q_len, _ = q_f.shape
+    _, num_kv_heads, kv_len, _ = k_f.shape
+    repeats = num_heads // num_kv_heads
+    if repeats * num_kv_heads != num_heads:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads}) in CUDA blocksparse backward."
+        )
+
+    k_full = jnp.repeat(k_f, repeats=repeats, axis=1)
+    v_full = jnp.repeat(v_f, repeats=repeats, axis=1)
+
+    raw_logits = jnp.einsum("bhqd,bhkd->bhqk", q_f, k_full)
+    if logits_soft_cap is not None and logits_soft_cap > 0:
+        cap = float(logits_soft_cap)
+        scaled = raw_logits * softmax_scale / cap
+        logits = cap * jnp.tanh(scaled)
+        dlogits_draw = softmax_scale * (1.0 - jnp.tanh(scaled) ** 2)
+    else:
+        logits = raw_logits * softmax_scale
+        dlogits_draw = softmax_scale
+
+    token_mask = _build_token_mask(
+        q_positions=jnp.asarray(q_positions, dtype=jnp.int32),
+        q_segment_ids=jnp.asarray(q_segment_ids, dtype=jnp.int32),
+        kv_positions=jnp.asarray(kv_positions, dtype=jnp.int32),
+        kv_segment_ids=jnp.asarray(kv_segment_ids, dtype=jnp.int32),
+        qkv_layouts=qkv_layouts,
+        q_blocksize=q_blocksize,
+        kv_blocksize=kv_blocksize,
+        causal=causal,
+        window_left=window_left,
+        window_right=window_right,
+    )
+    logits = jnp.where(token_mask[:, None, :, :], logits, -jnp.inf)
+
+    aux = _normalize_softmax_aux(softmax_aux, num_heads=num_heads, num_kv_heads=num_kv_heads)
+    if aux is None:
+        probs_ext = jax.nn.softmax(logits, axis=-1)
+        probs_ext = jnp.where(jnp.isfinite(probs_ext), probs_ext, 0.0)
+        probs = probs_ext
+        dprobs_ext = jnp.einsum("bhqv,bhkv->bhqk", do_f, v_full)
+    else:
+        aux_logits = jnp.broadcast_to(aux[None, :, None, :], (batch_size, num_heads, q_len, aux.shape[-1]))
+        logits_ext = jnp.concatenate([logits, aux_logits], axis=-1)
+        probs_ext = jax.nn.softmax(logits_ext, axis=-1)
+        probs_ext = jnp.where(jnp.isfinite(probs_ext), probs_ext, 0.0)
+        probs = probs_ext[..., :kv_len]
+        dprobs = jnp.einsum("bhqv,bhkv->bhqk", do_f, v_full)
+        dprobs_ext = jnp.concatenate([dprobs, jnp.zeros_like(aux_logits)], axis=-1)
+
+    dv_full = jnp.einsum("bhqk,bhqv->bhkv", probs, do_f)
+
+    softmax_dot = jnp.sum(dprobs_ext * probs_ext, axis=-1, keepdims=True)
+    dlogits_ext = probs_ext * (dprobs_ext - softmax_dot)
+    dlogits = dlogits_ext[..., :kv_len]
+    dlogits = jnp.where(token_mask[:, None, :, :], dlogits, 0.0)
+
+    draw = dlogits * dlogits_draw
+    dq = jnp.einsum("bhqk,bhkd->bhqd", draw, k_full)
+    dk_full = jnp.einsum("bhqk,bhqd->bhkd", draw, q_f)
+
+    dk = jnp.sum(dk_full.reshape(batch_size, num_kv_heads, repeats, kv_len, key.shape[-1]), axis=2)
+    dv = jnp.sum(dv_full.reshape(batch_size, num_kv_heads, repeats, kv_len, value.shape[-1]), axis=2)
+
+    return dq.astype(query.dtype), dk.astype(key.dtype), dv.astype(value.dtype)
+
+
+@functools.partial(
+    jax.custom_vjp,
+    nondiff_argnums=[8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+)
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -60,8 +249,14 @@ if typing.TYPE_CHECKING:
         "window_left",
         "window_right",
         "causal",
-        "fwd_params",
-        "bwd_params",
+        "fwd_q_blocksize",
+        "fwd_kv_blocksize",
+        "fwd_num_stages",
+        "fwd_num_warps",
+        "bwd_q_blocksize",
+        "bwd_kv_blocksize",
+        "bwd_num_stages",
+        "bwd_num_warps",
         "logits_soft_cap",
     ],
 )
@@ -82,8 +277,14 @@ def _blocksparse_attention_bhtd(
     window_left: int = -1,
     window_right: int = -1,
     causal: bool = True,
-    fwd_params: FwdParams | None = None,
-    bwd_params: BwdParams | None = None,
+    fwd_q_blocksize: int = 64,
+    fwd_kv_blocksize: int = 64,
+    fwd_num_stages: int | None = 2,
+    fwd_num_warps: int | None = 4,
+    bwd_q_blocksize: int = 32,
+    bwd_kv_blocksize: int = 32,
+    bwd_num_stages: int | None = 2,
+    bwd_num_warps: int | None = 4,
     logits_soft_cap: float | None = None,
 ) -> ArrayLike:
     """Compute block-sparse attention in BHTD layout with a custom VJP rule.
@@ -113,9 +314,14 @@ def _blocksparse_attention_bhtd(
         window_left: Left sliding-window size (``-1`` to disable).
         window_right: Right sliding-window size (``-1`` to disable).
         causal: Whether to apply causal masking.
-        fwd_params: Forward-pass kernel configuration.
-        bwd_params: Backward-pass kernel configuration (unused in the
-            forward path).
+        fwd_q_blocksize: Forward query block size.
+        fwd_kv_blocksize: Forward key/value block size.
+        fwd_num_stages: Forward kernel stages.
+        fwd_num_warps: Forward kernel warps.
+        bwd_q_blocksize: Backward query block size (unused in forward).
+        bwd_kv_blocksize: Backward key/value block size (unused in forward).
+        bwd_num_stages: Backward kernel stages (unused in forward).
+        bwd_num_warps: Backward kernel warps (unused in forward).
         logits_soft_cap: Optional soft-cap for attention logits.
 
     Returns:
@@ -124,14 +330,19 @@ def _blocksparse_attention_bhtd(
 
     Raises:
         NotImplementedError: If *bias* is not ``None``.
-        AssertionError: If *fwd_params* is ``None``.
     """
-    del apply_load_balance, sequence_parallelism_mesh_axis_name, bwd_params
+    del (
+        apply_load_balance,
+        sequence_parallelism_mesh_axis_name,
+        bwd_q_blocksize,
+        bwd_kv_blocksize,
+        bwd_num_stages,
+        bwd_num_warps,
+    )
 
     if bias is not None:
         raise NotImplementedError("Bias is not supported in CUDA block-sparse attention.")
-
-    assert fwd_params is not None, "fwd_params must be provided"
+    fwd_params = _build_fwd_params(fwd_q_blocksize, fwd_kv_blocksize, fwd_num_stages, fwd_num_warps)
 
     return blocksparse_attention_cuda(
         query=query,
@@ -169,8 +380,14 @@ def _blocksparse_attention_bhtd_fwd(
     window_left: int,
     window_right: int,
     causal: bool,
-    fwd_params: FwdParams,
-    bwd_params: BwdParams,
+    fwd_q_blocksize: int,
+    fwd_kv_blocksize: int,
+    fwd_num_stages: int | None,
+    fwd_num_warps: int | None,
+    bwd_q_blocksize: int,
+    bwd_kv_blocksize: int,
+    bwd_num_stages: int | None,
+    bwd_num_warps: int | None,
     logits_soft_cap: float | None,
 ):
     """Forward pass for the custom VJP of block-sparse attention.
@@ -198,9 +415,14 @@ def _blocksparse_attention_bhtd_fwd(
         window_left: Left sliding-window size.
         window_right: Right sliding-window size.
         causal: Whether to apply causal masking.
-        fwd_params: Forward-pass kernel configuration.
-        bwd_params: Backward-pass kernel configuration (unused here but
-            accepted for signature consistency).
+        fwd_q_blocksize: Forward query block size.
+        fwd_kv_blocksize: Forward key/value block size.
+        fwd_num_stages: Forward kernel stages.
+        fwd_num_warps: Forward kernel warps.
+        bwd_q_blocksize: Backward query block size.
+        bwd_kv_blocksize: Backward key/value block size.
+        bwd_num_stages: Backward kernel stages.
+        bwd_num_warps: Backward kernel warps.
         logits_soft_cap: Optional soft-cap for attention logits.
 
     Returns:
@@ -210,10 +432,11 @@ def _blocksparse_attention_bhtd_fwd(
     Raises:
         NotImplementedError: If *bias* is not ``None``.
     """
-    del apply_load_balance, sequence_parallelism_mesh_axis_name, bwd_params
+    del apply_load_balance, sequence_parallelism_mesh_axis_name
 
     if bias is not None:
         raise NotImplementedError("Bias is not supported in CUDA block-sparse attention.")
+    fwd_params = _build_fwd_params(fwd_q_blocksize, fwd_kv_blocksize, fwd_num_stages, fwd_num_warps)
 
     out = blocksparse_attention_cuda(
         query=query,
@@ -248,7 +471,14 @@ def _blocksparse_attention_bhtd_fwd(
         window_right,
         causal,
         logits_soft_cap,
-        fwd_params,
+        fwd_q_blocksize,
+        fwd_kv_blocksize,
+        fwd_num_stages,
+        fwd_num_warps,
+        bwd_q_blocksize,
+        bwd_kv_blocksize,
+        bwd_num_stages,
+        bwd_num_warps,
     )
     return out, res
 
@@ -260,8 +490,14 @@ def _blocksparse_attention_bhtd_bwd(
     window_left: int,
     window_right: int,
     causal: bool,
-    fwd_params: FwdParams,
-    bwd_params: BwdParams,
+    fwd_q_blocksize: int,
+    fwd_kv_blocksize: int,
+    fwd_num_stages: int | None,
+    fwd_num_warps: int | None,
+    bwd_q_blocksize: int,
+    bwd_kv_blocksize: int,
+    bwd_num_stages: int | None,
+    bwd_num_warps: int | None,
     logits_soft_cap: float | None,
     res,
     dout: ArrayLike,
@@ -276,8 +512,14 @@ def _blocksparse_attention_bhtd_bwd(
         window_left: Left sliding-window size (non-differentiable).
         window_right: Right sliding-window size (non-differentiable).
         causal: Whether causal masking is applied (non-differentiable).
-        fwd_params: Forward-pass kernel configuration (non-differentiable).
-        bwd_params: Backward-pass kernel configuration (unused).
+        fwd_q_blocksize: Forward query block size.
+        fwd_kv_blocksize: Forward key/value block size.
+        fwd_num_stages: Forward kernel stages.
+        fwd_num_warps: Forward kernel warps.
+        bwd_q_blocksize: Backward query block size.
+        bwd_kv_blocksize: Backward key/value block size.
+        bwd_num_stages: Backward kernel stages.
+        bwd_num_warps: Backward kernel warps.
         logits_soft_cap: Optional soft-cap for attention logits
             (non-differentiable).
         res: Residuals tuple saved by
@@ -286,19 +528,63 @@ def _blocksparse_attention_bhtd_bwd(
             output.
     """
     del (
-        softmax_scale,
         apply_load_balance,
         sequence_parallelism_mesh_axis_name,
-        window_left,
-        window_right,
-        causal,
-        fwd_params,
-        bwd_params,
-        logits_soft_cap,
-        res,
-        dout,
+        fwd_num_stages,
+        fwd_num_warps,
+        bwd_q_blocksize,
+        bwd_kv_blocksize,
+        bwd_num_stages,
+        bwd_num_warps,
     )
-    raise NotImplementedError("CUDA blocksparse_attention does not implement backward. Fallback gradients are disabled.")
+
+    query = res[0]
+    key = res[1]
+    value = res[2]
+    q_positions = res[3]
+    q_segment_ids = res[4]
+    kv_positions = res[5]
+    kv_segment_ids = res[6]
+    qkv_layouts = res[7]
+    out = res[8]
+    softmax_aux = res[9]
+
+    dout = ad.instantiate_zeros(dout)
+    if dout is None:
+        dout = jnp.zeros_like(out)
+
+    dq, dk, dv = _blocksparse_dense_backward(
+        query=query,
+        key=key,
+        value=value,
+        q_positions=q_positions,
+        q_segment_ids=q_segment_ids,
+        kv_positions=kv_positions,
+        kv_segment_ids=kv_segment_ids,
+        qkv_layouts=qkv_layouts,
+        softmax_scale=softmax_scale,
+        softmax_aux=softmax_aux,
+        window_left=window_left,
+        window_right=window_right,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        q_blocksize=fwd_q_blocksize,
+        kv_blocksize=fwd_kv_blocksize,
+        dout=dout,
+    )
+
+    return (
+        dq,
+        dk,
+        dv,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 _blocksparse_attention_bhtd.defvjp(_blocksparse_attention_bhtd_fwd, _blocksparse_attention_bhtd_bwd)
@@ -494,7 +780,13 @@ def blocksparse_attention(
         window_left=window_left,
         window_right=window_right,
         causal=causal,
-        fwd_params=fwd_params,
-        bwd_params=bwd_params,
+        fwd_q_blocksize=int(fwd_params.q_blocksize),
+        fwd_kv_blocksize=int(fwd_params.kv_blocksize),
+        fwd_num_stages=None if fwd_params.num_stages is None else int(fwd_params.num_stages),
+        fwd_num_warps=None if fwd_params.num_warps is None else int(fwd_params.num_warps),
+        bwd_q_blocksize=int(bwd_params.q_blocksize),
+        bwd_kv_blocksize=int(bwd_params.kv_blocksize),
+        bwd_num_stages=None if bwd_params.num_stages is None else int(bwd_params.num_stages),
+        bwd_num_warps=None if bwd_params.num_warps is None else int(bwd_params.num_warps),
         logits_soft_cap=logits_soft_cap,
     )

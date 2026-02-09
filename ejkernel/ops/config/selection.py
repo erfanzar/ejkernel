@@ -61,6 +61,7 @@ import pprint
 import time
 import traceback
 from collections.abc import Iterable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Generic, Literal, TypeVar
 
@@ -81,6 +82,7 @@ Cfg = TypeVar("Cfg")
 Out = TypeVar("Out")
 
 autotune_logger = get_logger("ejKernel-Selection")
+_backward_autotune_enabled: ContextVar[bool] = ContextVar("ejkernel_backward_autotune_enabled", default=True)
 
 
 @dataclass
@@ -164,6 +166,35 @@ class policy_override:
         """
         for k, v in self._prev.items():
             setattr(self.selector.policy, k, v)
+
+
+class forward_autotune_only:
+    """Context manager that disables backward validation during autotuning.
+
+    While active, autotune measurements run forward-only even when
+    ``AutotunePolicy.validate_backward`` is True. This keeps autotuning focused
+    on forward latency and avoids gradient-timing overhead.
+
+    Example:
+        >>> with forward_autotune_only():
+        ...     cfg = selector.choose(inv, kernel)
+    """
+
+    def __init__(self):
+        self._token = None
+
+    def __enter__(self):
+        self._token = _backward_autotune_enabled.set(False)
+        return self
+
+    def __exit__(self, *exc):
+        if self._token is not None:
+            _backward_autotune_enabled.reset(self._token)
+
+
+def _is_backward_autotune_enabled() -> bool:
+    """Return whether backward validation is currently enabled for autotune."""
+    return bool(_backward_autotune_enabled.get())
 
 
 class Tuner(Generic[Cfg]):
@@ -542,6 +573,8 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
             static_fun_kwargs = {k: v for k, v in kw.items() if callable(v)}
             dyn_kwargs = kw
 
+            validate_backward = self.policy.validate_backward and _is_backward_autotune_enabled()
+
             if inv.method == "shard_map":
                 if not hasattr(kernel, "create_shard_map_wrapper"):
                     raise RuntimeError(
@@ -574,7 +607,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                         return outs
 
                     f._ejk_method = "shard_map"
-                    if self.policy.validate_backward and getattr(kernel, "supports_grad_validation", False):
+                    if validate_backward and getattr(kernel, "supports_grad_validation", False):
                         f._ejk_validate_backward = True
                     return f
             else:
@@ -588,7 +621,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                         return _run(*a, cfg=c, **(k | _static))
 
                     f._ejk_method = "regular"
-                    if self.policy.validate_backward:
+                    if validate_backward:
                         f._ejk_validate_backward = True
                     return f
 

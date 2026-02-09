@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from ejkernel.kernels._cuda.blocksparse_attention import blocksparse_attention as cuda_blocksparse_attention
+from ejkernel.kernels._triton.blocksparse_attention import blocksparse_attention as triton_blocksparse_attention
 from ejkernel.kernels._xla.blocksparse_attention import blocksparse_attention as xla_blocksparse_attention
 from ejkernel.ops import BwdParams, FwdParams
 
@@ -164,3 +165,81 @@ def test_blocksparse_attention_cuda_noncausal_matches_xla():
     out_xla = jax.block_until_ready(out_xla)
 
     np.testing.assert_allclose(out_cuda, out_xla, rtol=2e-2, atol=2e-2)
+
+
+def test_blocksparse_attention_cuda_grad_matches_triton_and_vjp():
+    key = jax.random.PRNGKey(123)
+    kq, kk, kv = jax.random.split(key, 3)
+
+    batch, num_heads, q_len, head_dim = 1, 4, 64, 32
+    num_kv_heads, kv_len = 2, 64
+
+    q = jax.random.normal(kq, (batch, num_heads, q_len, head_dim), dtype=jnp.float16)
+    k = jax.random.normal(kk, (batch, num_kv_heads, kv_len, head_dim), dtype=jnp.float16)
+    v = jax.random.normal(kv, (batch, num_kv_heads, kv_len, head_dim), dtype=jnp.float16)
+
+    fwd_params = FwdParams(q_blocksize=32, kv_blocksize=32, num_warps=4, num_stages=2)
+    bwd_params = BwdParams(q_blocksize=32, kv_blocksize=32, num_warps=4, num_stages=2)
+
+    dev = jax.devices("gpu")[0]
+    q, k, v = _device_put_all(dev, q, k, v)
+
+    def loss_cuda(q_, k_, v_):
+        out = cuda_blocksparse_attention(
+            q_,
+            k_,
+            v_,
+            causal=True,
+            sliding_window=(32, 32),
+            softmax_scale=head_dim**-0.5,
+            fwd_params=fwd_params,
+            bwd_params=bwd_params,
+        )
+        return jnp.mean(out)
+
+    def loss_triton(q_, k_, v_):
+        out = triton_blocksparse_attention(
+            q_,
+            k_,
+            v_,
+            causal=True,
+            sliding_window=(32, 32),
+            softmax_scale=head_dim**-0.5,
+            fwd_params=fwd_params,
+            bwd_params=bwd_params,
+        )
+        return jnp.mean(out)
+
+    grads_cuda = jax.jit(jax.grad(loss_cuda, argnums=(0, 1, 2)))(q, k, v)
+    grads_triton = jax.jit(jax.grad(loss_triton, argnums=(0, 1, 2)))(q, k, v)
+    grads_cuda = jax.tree_util.tree_map(jax.block_until_ready, grads_cuda)
+    grads_triton = jax.tree_util.tree_map(jax.block_until_ready, grads_triton)
+
+    for g_cuda, g_triton in zip(grads_cuda, grads_triton, strict=True):
+        np.testing.assert_allclose(
+            np.asarray(g_cuda, dtype=np.float32),
+            np.asarray(g_triton, dtype=np.float32),
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+    def fwd_cuda(q_, k_, v_):
+        return cuda_blocksparse_attention(
+            q_,
+            k_,
+            v_,
+            causal=True,
+            sliding_window=(32, 32),
+            softmax_scale=head_dim**-0.5,
+            fwd_params=fwd_params,
+            bwd_params=bwd_params,
+        )
+
+    @jax.jit
+    def vjp_eval(q_, k_, v_):
+        out, vjp_fn = jax.vjp(fwd_cuda, q_, k_, v_)
+        return vjp_fn(jnp.ones_like(out))
+
+    vjp_grads = vjp_eval(q, k, v)
+    for grad in vjp_grads:
+        assert jnp.all(jnp.isfinite(grad))
