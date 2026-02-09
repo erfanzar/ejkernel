@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Benchmark quantized_matmul across all available implementations."""
+"""Benchmark quantized_matmul across all available implementations.
+
+Compares quantized matmul kernels against full-precision ``jnp.matmul`` and
+optionally reports Pallas/XLA median speed ratios.  The benchmark sweeps over
+matrix shapes, quantization modes (affine, nf4, mxfp4/8, nvfp4/8), and
+data types.  Results are plotted to ``benchmark_plots/quantized_matmul``.
+
+Environment variables:
+    EJKERNEL_QMM_CUDA_CACHE: Enable CUDA compilation caching (default ``"1"``).
+    EJKERNEL_QMM_BENCH_COMPARE_CUDA_ONLY: When ``"1"``, only benchmark cuda
+        and triton platforms without the fp baseline.
+    EJKERNEL_QMM_TPU_ACCEPT_RATIO: If set, the script exits with code 2 when
+        the Pallas/XLA median ratio exceeds this threshold.
+"""
 
 import os
 import sys
@@ -18,6 +31,12 @@ os.environ.setdefault("EJKERNEL_QMM_CUDA_CACHE", "1")
 
 
 def _gen_quantized_inputs_with_fp(config):
+    """Generate quantized matmul inputs plus the full-precision weight for comparison.
+
+    Returns:
+        Tuple of ``(x, w_q, scales, biases, mode, w_full)`` where ``w_full``
+        is the original unquantized weight matrix.
+    """
     m = config.get("m", 64)
     k = config.get("k", 64)
     n = config.get("n", 64)
@@ -46,6 +65,13 @@ def _gen_quantized_inputs_with_fp(config):
 
 
 def _attach_fp_weight(fn):
+    """Wrap *fn* to accept and discard the trailing ``w_full`` argument.
+
+    This adapter allows quantized kernels (which do not need the
+    full-precision weight) to share the same input signature as the
+    full-precision baseline.
+    """
+
     def _fn(x, w_q, scales, biases, mode, w_full):
         return fn(x, w_q, scales, biases, mode)
 
@@ -53,6 +79,7 @@ def _attach_fp_weight(fn):
 
 
 def _fp_matmul(x, w_q, scales, biases, mode, w_full):
+    """Full-precision matmul baseline using the unquantized weight."""
     return jnp.matmul(x, w_full.T)
 
 

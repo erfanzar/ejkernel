@@ -55,6 +55,14 @@ QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 
 
 def _gemv_mode_to_id(mode: GemvMode) -> int:
+    """Convert a GEMV mode string to the integer ID expected by the CUDA kernel.
+
+    Args:
+        mode: One of ``"auto"``, ``"on"``, or ``"off"``.
+
+    Returns:
+        Integer identifier: 0 for auto, 1 for on, 2 for off.
+    """
     if mode == "auto":
         return 0
     if mode == "on":
@@ -63,6 +71,14 @@ def _gemv_mode_to_id(mode: GemvMode) -> int:
 
 
 def _revsplit_mode_to_id(mode: RevSplitKMode) -> int:
+    """Convert a reverse split-K mode string to the integer ID expected by the CUDA kernel.
+
+    Args:
+        mode: One of ``"auto"``, ``"on"``, or ``"off"``.
+
+    Returns:
+        Integer identifier: 0 for auto, 1 for on, 2 for off.
+    """
     if mode == "auto":
         return 0
     if mode == "on":

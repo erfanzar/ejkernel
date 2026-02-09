@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Utility functions for the XLA ring attention backend.
+
+Provides chunk-level attention bias computation with support for causal
+masking, segment IDs, sliding windows, and attention sinks.
+"""
 
 import chex
 import jax

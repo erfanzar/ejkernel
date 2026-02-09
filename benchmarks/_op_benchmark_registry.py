@@ -22,6 +22,25 @@ from ejkernel.utils import make_dummy_rpa_inputs
 
 @dataclass
 class OpBenchmarkSpec:
+    """Specification for a single operation benchmark.
+
+    Encapsulates everything needed to benchmark a kernel operation: the
+    operation callable, how to generate inputs, which configurations to
+    sweep, and how to wrap the operation for each platform.
+
+    Attributes:
+        op_name: Human-readable name used for logging and plot filenames.
+        algorithm: Registry key used to look up kernel implementations.
+        op_fn: The operation callable to benchmark.
+        input_generator: Factory that produces input tensors from a config dict.
+        configs: List of configuration dicts defining the parameter sweep.
+        static_kwargs: Argument names treated as compile-time constants.
+        bench_bwd: Whether to also benchmark the backward pass.
+        needs_platform: Whether the operation requires a ``platform`` argument.
+        wrapper_factory: Optional factory to build a platform-specific wrapper
+            around ``op_fn``.  When ``None``, the default wrapper is used.
+    """
+
     op_name: str
     algorithm: str
     op_fn: Callable[..., Any]
@@ -34,6 +53,11 @@ class OpBenchmarkSpec:
 
 
 def _default_dtype() -> jnp.dtype:
+    """Return a sensible default dtype for the current JAX backend.
+
+    Returns:
+        ``bfloat16`` on TPU, ``float32`` on CPU, ``float16`` on GPU.
+    """
     backend = jax.default_backend()
     if backend == "tpu":
         return jnp.bfloat16
@@ -43,6 +67,17 @@ def _default_dtype() -> jnp.dtype:
 
 
 def _available_platforms(algorithm: str) -> list[str]:
+    """List kernel platforms available for *algorithm* on the current backend.
+
+    Filters out the ``triton`` platform when the triton package is not
+    installed.
+
+    Args:
+        algorithm: Registry algorithm name (e.g. ``"flash_attention"``).
+
+    Returns:
+        Sorted, deduplicated list of platform name strings.
+    """
     backend = Backend(jax.default_backend())
     platforms: list[str] = []
     for spec in kernel_registry.list_implementations(algorithm):
@@ -55,12 +90,32 @@ def _available_platforms(algorithm: str) -> list[str]:
 
 
 def _parse_platform_list(value: str | None) -> list[str]:
+    """Parse a comma-or-space-separated platform string into a list.
+
+    Args:
+        value: Raw string such as ``"triton, cuda"`` or ``None``.
+
+    Returns:
+        List of non-empty platform name strings, or empty list if *value*
+        is falsy.
+    """
     if not value:
         return []
     return [item for item in value.replace(",", " ").split() if item]
 
 
 def _ignored_platforms(extra: list[str] | None = None) -> set[str]:
+    """Collect the set of platforms to skip during benchmarking.
+
+    Reads ``EJKERNEL_BENCH_IGNORE_PLATFORMS`` from the environment and
+    merges in any *extra* names supplied by the caller.
+
+    Args:
+        extra: Additional platform names to ignore.
+
+    Returns:
+        Lower-cased set of platform names to exclude.
+    """
     env_value = os.getenv("EJKERNEL_BENCH_IGNORE_PLATFORMS")
     items = _parse_platform_list(env_value)
     if extra:
@@ -69,6 +124,17 @@ def _ignored_platforms(extra: list[str] | None = None) -> set[str]:
 
 
 def _wrap_op(op_fn: Callable[..., Any], platform: str) -> Callable[..., Any]:
+    """Wrap *op_fn* to inject ``platform`` and unwrap tuple outputs.
+
+    Args:
+        op_fn: The operation callable.
+        platform: Platform name passed as a keyword argument.
+
+    Returns:
+        A wrapper that calls *op_fn* with ``platform=platform`` and returns
+        the first element if the result is a tuple.
+    """
+
     def _fn(*args):
         out = op_fn(*args, platform=platform)
         return out[0] if isinstance(out, tuple) else out
@@ -77,6 +143,18 @@ def _wrap_op(op_fn: Callable[..., Any], platform: str) -> Callable[..., Any]:
 
 
 def _wrap_op_with_kwargs(op_fn: Callable[..., Any], platform: str, **fixed_kwargs) -> Callable[..., Any]:
+    """Wrap *op_fn* with ``platform`` and additional fixed keyword arguments.
+
+    Args:
+        op_fn: The operation callable.
+        platform: Platform name passed as a keyword argument.
+        **fixed_kwargs: Extra keyword arguments forwarded on every call.
+
+    Returns:
+        A wrapper that calls *op_fn* with the given kwargs and unwraps
+        tuple outputs.
+    """
+
     def _fn(*args):
         out = op_fn(*args, platform=platform, **fixed_kwargs)
         return out[0] if isinstance(out, tuple) else out
@@ -85,6 +163,15 @@ def _wrap_op_with_kwargs(op_fn: Callable[..., Any], platform: str, **fixed_kwarg
 
 
 def _wrap_op_no_platform(op_fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap *op_fn* without injecting a platform, unwrapping tuple outputs.
+
+    Args:
+        op_fn: The operation callable.
+
+    Returns:
+        A wrapper that returns the first element when *op_fn* produces a tuple.
+    """
+
     def _fn(*args):
         out = op_fn(*args)
         return out[0] if isinstance(out, tuple) else out
@@ -93,6 +180,17 @@ def _wrap_op_no_platform(op_fn: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _wrap_attention_like(op_fn: Callable[..., Any], platform: str) -> Callable[..., Any]:
+    """Wrap an attention-like op to accept positional (q, k, v, causal, sliding_window).
+
+    Args:
+        op_fn: An attention operation that takes keyword args for ``causal``,
+            ``sliding_window``, and ``platform``.
+        platform: Platform name injected on every call.
+
+    Returns:
+        A wrapper accepting ``(q, k, v, causal, sliding_window)`` positionally.
+    """
+
     def _fn(q, k, v, causal, sliding_window):
         out = op_fn(q, k, v, causal=causal, sliding_window=sliding_window, platform=platform)
         return out[0] if isinstance(out, tuple) else out
@@ -101,12 +199,32 @@ def _wrap_attention_like(op_fn: Callable[..., Any], platform: str) -> Callable[.
 
 
 def _apply_native_sparse_op(*args, platform: str):
+    """Dispatch apply_native_sparse_attention through the kernel registry.
+
+    Args:
+        *args: Positional arguments forwarded to the kernel implementation.
+        platform: Platform name used to resolve the implementation.
+
+    Returns:
+        The result of the resolved kernel implementation.
+    """
     backend = Backend(jax.default_backend())
     impl = kernel_registry.get("apply_native_sparse_attention", platform=platform, backend=backend)
     return impl(*args)
 
 
 def _limit_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Truncate *configs* to the limit set by ``EJKERNEL_BENCH_CONFIG_LIMIT``.
+
+    When the environment variable is unset or not a positive integer the
+    full list is returned unchanged.
+
+    Args:
+        configs: Full list of benchmark configuration dicts.
+
+    Returns:
+        Possibly truncated list of configurations.
+    """
     limit = os.getenv("EJKERNEL_BENCH_CONFIG_LIMIT")
     if limit is None:
         return configs
@@ -120,12 +238,21 @@ def _limit_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _grid(**options: list[Any]) -> list[dict[str, Any]]:
+    """Build the Cartesian product of *options* as a list of config dicts.
+
+    Args:
+        **options: Mapping of parameter name to a list of values to sweep.
+
+    Returns:
+        List of dicts, one per combination in the Cartesian product.
+    """
     keys = list(options.keys())
     values = [options[k] for k in keys]
     return [dict(zip(keys, combo, strict=True)) for combo in itertools.product(*values)]
 
 
 def _cfgs_mha():
+    """Generate benchmark configs for multi-head attention operations."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[256, 512, 1024, 2048, 4096],
@@ -139,6 +266,7 @@ def _cfgs_mha():
 
 
 def _cfgs_blocksparse():
+    """Generate benchmark configs for block-sparse attention."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[256, 512, 1024, 2048, 4096],
@@ -152,6 +280,7 @@ def _cfgs_blocksparse():
 
 
 def _cfgs_native_sparse():
+    """Generate benchmark configs for native sparse attention."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[256, 512, 1024],
@@ -164,6 +293,7 @@ def _cfgs_native_sparse():
 
 
 def _cfgs_apply_native_sparse():
+    """Generate benchmark configs for apply-native-sparse attention."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[256, 512, 1024],
@@ -177,6 +307,7 @@ def _cfgs_apply_native_sparse():
 
 
 def _cfgs_decode_attention():
+    """Generate benchmark configs for paged decode attention."""
     configs = _grid(
         batch=[1, 2, 4, 8],
         qheads=[4, 8],
@@ -189,6 +320,7 @@ def _cfgs_decode_attention():
 
 
 def _cfgs_ragged_decode():
+    """Generate benchmark configs for ragged decode attention."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[128, 256, 512, 1024],
@@ -200,6 +332,7 @@ def _cfgs_ragged_decode():
 
 
 def _cfgs_page_attention():
+    """Generate benchmark configs for page attention."""
     configs = _grid(
         batch=[1, 2, 4, 8],
         qheads=[4, 8],
@@ -212,6 +345,7 @@ def _cfgs_page_attention():
 
 
 def _cfgs_prefill_page_attention():
+    """Generate benchmark configs for prefill page attention."""
     configs = _grid(
         qheads=[4, 8],
         kvheads=[4, 8],
@@ -224,6 +358,7 @@ def _cfgs_prefill_page_attention():
 
 
 def _cfgs_chunked_prefill():
+    """Generate benchmark configs for chunked prefill paged decode."""
     configs = _grid(
         qheads=[4, 8],
         kvheads=[4, 8],
@@ -237,6 +372,7 @@ def _cfgs_chunked_prefill():
 
 
 def _cfgs_rpa_v2():
+    """Generate benchmark configs for ragged page attention v2."""
     configs = _grid(
         num_seqs=[2, 4, 8],
         pages_per_seq=[2, 4],
@@ -249,6 +385,7 @@ def _cfgs_rpa_v2():
 
 
 def _cfgs_rpa_v3():
+    """Generate benchmark configs for ragged page attention v3."""
     configs = _grid(
         num_seqs=[8],
         pages_per_seq=[128],
@@ -262,6 +399,7 @@ def _cfgs_rpa_v3():
 
 
 def _cfgs_unified():
+    """Generate hand-picked benchmark configs for unified attention."""
     return [
         {"num_seqs": 2, "qheads": 4, "kvheads": 2, "dim": 64, "block_size": 16, "kv_lens": [16, 12], "q_lens": [16, 12]},
         {
@@ -286,6 +424,7 @@ def _cfgs_unified():
 
 
 def _cfgs_kernel_delta():
+    """Generate benchmark configs for kernel delta attention."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[128, 256, 512],
@@ -296,6 +435,7 @@ def _cfgs_kernel_delta():
 
 
 def _cfgs_lightning():
+    """Generate benchmark configs for lightning attention."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[256, 512, 1024],
@@ -311,6 +451,7 @@ def _cfgs_lightning():
 
 
 def _cfgs_grouped_matmul():
+    """Generate benchmark configs for grouped matrix multiplication."""
     configs = _grid(
         groups=[4, 8, 16],
         m_per_group=[32, 64],
@@ -321,6 +462,7 @@ def _cfgs_grouped_matmul():
 
 
 def _cfgs_quantized_matmul():
+    """Generate benchmark configs for quantized matrix multiplication."""
     configs = _grid(
         m=[128, 512, 2048, 4096],
         k=[4096, 8192],
@@ -332,6 +474,7 @@ def _cfgs_quantized_matmul():
 
 
 def _cfgs_mean_pooling():
+    """Generate benchmark configs for mean pooling."""
     configs = _grid(
         batch=[1, 2, 4, 8],
         seq=[256, 512, 1024, 2048],
@@ -341,6 +484,7 @@ def _cfgs_mean_pooling():
 
 
 def _cfgs_rwkv4():
+    """Generate benchmark configs for RWKV-4 recurrence."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[128, 256, 512],
@@ -350,6 +494,7 @@ def _cfgs_rwkv4():
 
 
 def _cfgs_rwkv6():
+    """Generate benchmark configs for RWKV-6 recurrence."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[128, 256, 512],
@@ -360,6 +505,7 @@ def _cfgs_rwkv6():
 
 
 def _cfgs_rwkv7():
+    """Generate benchmark configs for RWKV-7 recurrence."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[128, 256, 512],
@@ -370,6 +516,7 @@ def _cfgs_rwkv7():
 
 
 def _cfgs_rwkv7_mul():
+    """Generate benchmark configs for RWKV-7 multiplicative recurrence."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[128, 256, 512],
@@ -380,6 +527,7 @@ def _cfgs_rwkv7_mul():
 
 
 def _cfgs_state_space_v1():
+    """Generate benchmark configs for state-space model v1 (Mamba-1)."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[128, 256, 512],
@@ -390,6 +538,7 @@ def _cfgs_state_space_v1():
 
 
 def _cfgs_state_space_v2():
+    """Generate benchmark configs for state-space model v2 (Mamba-2)."""
     configs = _grid(
         batch=[1, 2, 4],
         seq=[128, 256, 512],
@@ -402,6 +551,16 @@ def _cfgs_state_space_v2():
 
 
 def _rand_inputs(config: dict[str, Any], *shapes: tuple[int, ...], dtype: jnp.dtype | None = None):
+    """Generate a list of random normal tensors with the given shapes.
+
+    Args:
+        config: Benchmark config dict; ``seed`` is read if present.
+        *shapes: One shape tuple per desired output tensor.
+        dtype: Element type; falls back to ``_default_dtype()``.
+
+    Returns:
+        List of JAX arrays, one per shape.
+    """
     key = jax.random.PRNGKey(config.get("seed", 0))
     dtype = _default_dtype() if dtype is None else dtype
     keys = jax.random.split(key, len(shapes))
@@ -409,6 +568,7 @@ def _rand_inputs(config: dict[str, Any], *shapes: tuple[int, ...], dtype: jnp.dt
 
 
 def _gen_mha_inputs(config: dict[str, Any]):
+    """Generate random q, k, v tensors and attention flags for MHA benchmarks."""
     batch = config["batch"]
     seq = config["seq"]
     qh = config["qheads"]
@@ -420,6 +580,7 @@ def _gen_mha_inputs(config: dict[str, Any]):
 
 
 def _gen_blocksparse_inputs(config: dict[str, Any]):
+    """Generate random inputs for block-sparse attention (heads-first layout)."""
     batch = config["batch"]
     seq = config["seq"]
     qh = config["qheads"]
@@ -437,6 +598,7 @@ def _gen_blocksparse_inputs(config: dict[str, Any]):
 
 
 def _gen_native_sparse_inputs(config: dict[str, Any]):
+    """Generate random q, k, v tensors and block_counts for native sparse attention."""
     batch = config["batch"]
     seq = config["seq"]
     qh = config["qheads"]
@@ -448,6 +610,7 @@ def _gen_native_sparse_inputs(config: dict[str, Any]):
 
 
 def _gen_apply_native_sparse_inputs(config: dict[str, Any]):
+    """Generate inputs for apply-native-sparse attention including block indices."""
     batch = config["batch"]
     seq = config["seq"]
     qh = config["qheads"]
@@ -471,6 +634,7 @@ def _gen_apply_native_sparse_inputs(config: dict[str, Any]):
 
 
 def _gen_decode_attention_inputs(config: dict[str, Any]):
+    """Generate query, paged KV buffers, token map, and seq lengths for decode attention."""
     batch = config["batch"]
     heads = config["qheads"]
     kvh = config.get("kvheads", heads)
@@ -492,6 +656,7 @@ def _gen_decode_attention_inputs(config: dict[str, Any]):
 
 
 def _gen_ragged_decode_inputs(config: dict[str, Any]):
+    """Generate query, KV tensors, and sequence start/end for ragged decode attention."""
     batch = config["batch"]
     seq = config["seq"]
     heads = config["qheads"]
@@ -505,6 +670,7 @@ def _gen_ragged_decode_inputs(config: dict[str, Any]):
 
 
 def _gen_page_attention_inputs(config: dict[str, Any]):
+    """Generate query, paged KV caches, context lengths, and block tables for page attention."""
     num_seqs = config["batch"]
     heads = config["qheads"]
     kvh = config.get("kvheads", heads)
@@ -526,6 +692,7 @@ def _gen_page_attention_inputs(config: dict[str, Any]):
 
 
 def _gen_prefill_page_attention_inputs(config: dict[str, Any]):
+    """Generate query chunk, paged KV caches, context length, and page indices for prefill page attention."""
     chunk_size = config.get("chunk_size", 128)
     heads = config["qheads"]
     kvh = config.get("kvheads", heads)
@@ -546,6 +713,7 @@ def _gen_prefill_page_attention_inputs(config: dict[str, Any]):
 
 
 def _gen_chunked_prefill_inputs(config: dict[str, Any]):
+    """Generate q/k/v, paged KV caches, KV lengths, block tables, and query offsets for chunked prefill."""
     num_seqs = config.get("num_seqs", 2)
     q_len = config.get("q_len", 8)
     heads = config["qheads"]
@@ -576,6 +744,7 @@ def _gen_chunked_prefill_inputs(config: dict[str, Any]):
 
 
 def _make_kv_pages(num_pages: int, page_size: int, kv_heads: int, head_dim: int, seed: int, dtype: jnp.dtype):
+    """Create interleaved KV page tensor of shape ``(num_pages, page_size, kv_heads*2, head_dim)``."""
     k = jax.random.normal(
         jax.random.PRNGKey(seed), (num_pages, page_size, kv_heads, head_dim), dtype=jnp.float32
     ).astype(dtype)
@@ -587,6 +756,7 @@ def _make_kv_pages(num_pages: int, page_size: int, kv_heads: int, head_dim: int,
 
 
 def _gen_rpa_v2_inputs(config: dict[str, Any]):
+    """Generate inputs for ragged page attention v2 including KV pages and query offsets."""
     num_seqs = config.get("num_seqs", 2)
     pages_per_seq = config.get("pages_per_seq", 2)
     page_size = config.get("page_size", 8)
@@ -611,6 +781,7 @@ def _gen_rpa_v2_inputs(config: dict[str, Any]):
 
 
 def _gen_rpa_v3_inputs(config: dict[str, Any]):
+    """Generate inputs for ragged page attention v3 using the ``make_dummy_rpa_inputs`` helper."""
     inputs = make_dummy_rpa_inputs(
         rng_seed=config.get("seed", 0),
         num_seqs=config.get("num_seqs", 2),
@@ -637,6 +808,7 @@ def _gen_rpa_v3_inputs(config: dict[str, Any]):
 
 
 def _make_unified_inputs(config: dict[str, Any]):
+    """Generate queries, paged KV caches, lengths, block tables, and query offsets for unified attention."""
     num_seqs = config.get("num_seqs", 2)
     q_heads = config.get("qheads", 4)
     kv_heads = config.get("kvheads", 2)
@@ -668,6 +840,7 @@ def _make_unified_inputs(config: dict[str, Any]):
 
 
 def _gen_grouped_matmul_inputs(config: dict[str, Any]):
+    """Generate LHS, RHS, and group_sizes tensors for grouped matmul."""
     groups = config.get("groups", 4)
     m_per = config.get("m_per_group", 32)
     k = config.get("k", 64)
@@ -683,6 +856,7 @@ def _gen_grouped_matmul_inputs(config: dict[str, Any]):
 
 
 def _gen_quantized_matmul_inputs(config: dict[str, Any]):
+    """Generate activation, quantized weight, scales, biases, and mode for quantized matmul."""
     m = config.get("m", 64)
     k = config.get("k", 64)
     n = config.get("n", 64)
@@ -702,6 +876,7 @@ def _gen_quantized_matmul_inputs(config: dict[str, Any]):
 
 
 def _gen_rwkv4_inputs(config: dict[str, Any]):
+    """Generate w, u, k, v tensors for RWKV-4 WKV recurrence."""
     batch = config.get("batch", 2)
     seq = config.get("seq", 128)
     chans = config.get("chans", 256)
@@ -716,6 +891,7 @@ def _gen_rwkv4_inputs(config: dict[str, Any]):
 
 
 def _gen_rwkv6_inputs(config: dict[str, Any]):
+    """Generate r, k, v, w, u tensors for RWKV-6 recurrence."""
     batch = config.get("batch", 2)
     seq = config.get("seq", 128)
     heads = config.get("heads", 4)
@@ -733,6 +909,7 @@ def _gen_rwkv6_inputs(config: dict[str, Any]):
 
 
 def _gen_rwkv7_inputs(config: dict[str, Any]):
+    """Generate r, w, k, v, a, b tensors for RWKV-7 recurrence."""
     batch = config.get("batch", 2)
     seq = config.get("seq", 128)
     heads = config.get("heads", 4)
@@ -751,6 +928,7 @@ def _gen_rwkv7_inputs(config: dict[str, Any]):
 
 
 def _gen_rwkv7_mul_inputs(config: dict[str, Any]):
+    """Generate r, w, k, v, kk, a tensors for RWKV-7 multiplicative recurrence."""
     batch = config.get("batch", 2)
     seq = config.get("seq", 128)
     heads = config.get("heads", 4)
@@ -769,6 +947,7 @@ def _gen_rwkv7_mul_inputs(config: dict[str, Any]):
 
 
 def _gen_state_space_v1_inputs(config: dict[str, Any]):
+    """Generate hidden, A, B, C, D, dt tensors for state-space model v1."""
     batch = config.get("batch", 2)
     seq = config.get("seq", 128)
     inter = config.get("intermediate_size", 64)
@@ -786,6 +965,7 @@ def _gen_state_space_v1_inputs(config: dict[str, Any]):
 
 
 def _gen_state_space_v2_inputs(config: dict[str, Any]):
+    """Generate x, A, B, C, D, dt tensors for state-space model v2."""
     batch = config.get("batch", 2)
     seq = config.get("seq", 128)
     heads = config.get("heads", 4)
@@ -805,6 +985,7 @@ def _gen_state_space_v2_inputs(config: dict[str, Any]):
 
 
 def _gen_simple_seq_inputs(config: dict[str, Any]):
+    """Generate a single random ``(batch, seq, dim)`` tensor for simple sequence ops."""
     batch = config.get("batch", 2)
     seq = config.get("seq", 128)
     dim = config.get("dim", 256)
@@ -814,6 +995,7 @@ def _gen_simple_seq_inputs(config: dict[str, Any]):
 
 
 def _gen_kernel_delta_inputs(config: dict[str, Any]):
+    """Generate q, k, v, beta tensors for kernel delta attention."""
     batch = config.get("batch", 2)
     seq = config.get("seq", 128)
     heads = config.get("heads", 4)
@@ -830,6 +1012,7 @@ def _gen_kernel_delta_inputs(config: dict[str, Any]):
 
 
 def _gen_lightning_inputs(config: dict[str, Any]):
+    """Generate q, k, v, layer_idx, num_layers for lightning attention."""
     q, k, v, _, _ = _gen_mha_inputs(config)
     layer_idx = config.get("layer_idx", 0)
     num_layers = config.get("num_layers", 24)
@@ -837,16 +1020,19 @@ def _gen_lightning_inputs(config: dict[str, Any]):
 
 
 def _gen_gla_inputs(config: dict[str, Any]):
+    """Generate q, k, v tensors for gated linear attention."""
     q, k, v, _, _ = _gen_mha_inputs(config)
     return q, k, v
 
 
 def _gen_recurrent_inputs(config: dict[str, Any]):
+    """Generate q, k, v tensors for recurrent attention."""
     q, k, v, _, _ = _gen_mha_inputs(config)
     return q, k, v
 
 
 def _gen_unified_inputs(config: dict[str, Any]):
+    """Generate inputs for unified attention (delegates to ``_make_unified_inputs``)."""
     return _make_unified_inputs(config)
 
 
@@ -855,6 +1041,15 @@ def _build_algorithms(
     *,
     ignore_platforms: set[str] | None = None,
 ) -> dict[str, Callable[..., Any]]:
+    """Build a mapping of platform name to wrapped callable for benchmarking.
+
+    Args:
+        spec: The benchmark specification to derive algorithms from.
+        ignore_platforms: Set of platform names (lower-cased) to exclude.
+
+    Returns:
+        Dict mapping each available platform name to its wrapped operation callable.
+    """
     platforms = _available_platforms(spec.algorithm)
     if ignore_platforms:
         platforms = [platform for platform in platforms if platform.lower() not in ignore_platforms]
@@ -873,6 +1068,20 @@ def _build_algorithms(
 
 
 def run_benchmark(op_name: str, *, ignore_platforms: list[str] | None = None) -> int:
+    """Run the full benchmark suite for the given operation.
+
+    Looks up the ``OpBenchmarkSpec`` from the ``SPECS`` registry, builds
+    platform-specific callables, and executes the benchmark with warmup
+    and timing iterations.  Results are printed and a plot is saved to
+    ``benchmark_plots/<op_name>``.
+
+    Args:
+        op_name: Name of the operation as registered in ``SPECS``.
+        ignore_platforms: Additional platforms to skip.
+
+    Returns:
+        0 on success, 1 if the spec is missing or no implementations are found.
+    """
     spec = SPECS.get(op_name)
     if spec is None:
         print(f"No benchmark spec registered for {op_name}")
@@ -900,6 +1109,8 @@ def run_benchmark(op_name: str, *, ignore_platforms: list[str] | None = None) ->
 
 
 def _quantized_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap a quantized matmul op to accept ``mode`` positionally and inject ``platform``."""
+
     def _fn(x, w, scales, biases, mode):
         out = op_fn(x, w, scales, biases, mode=mode, platform=platform)
         return out[0] if isinstance(out, tuple) else out
@@ -908,6 +1119,8 @@ def _quantized_wrapper(op_fn: Callable[..., Any], platform: str):
 
 
 def _lightning_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap a lightning attention op to pass ``layer_idx``, ``num_layers``, and ``platform`` as kwargs."""
+
     def _fn(q, k, v, layer_idx, num_layers):
         out = op_fn(q, k, v, layer_idx=layer_idx, num_layers=num_layers, platform=platform)
         return out[0] if isinstance(out, tuple) else out
@@ -916,6 +1129,8 @@ def _lightning_wrapper(op_fn: Callable[..., Any], platform: str):
 
 
 def _grouped_matmul_v2_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap a grouped matmul op to enable v2 mode and inject ``platform``."""
+
     def _fn(lhs, rhs, group_sizes):
         out = op_fn(lhs, rhs, group_sizes, use_v2=True, platform=platform)
         return out[0] if isinstance(out, tuple) else out

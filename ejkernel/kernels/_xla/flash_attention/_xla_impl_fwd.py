@@ -53,7 +53,25 @@ from jaxtyping import DTypeLike, PRNGKeyArray
 
 
 def _maybe_broadcast_kv_to_q_heads(k: chex.Array, v: chex.Array, hq: int) -> tuple[chex.Array, chex.Array]:
-    """Broadcast KV heads to match Q heads for GQA/MQA support."""
+    """Broadcast KV heads to match query heads for GQA/MQA support.
+
+    When using Grouped-Query Attention (GQA) or Multi-Query Attention (MQA),
+    the number of KV heads is fewer than the number of query heads. This
+    function replicates KV heads along the head axis so that each query
+    head has a corresponding KV head to attend to.
+
+    Args:
+        k: Key tensor with shape [..., num_kv_heads, head_dim].
+        v: Value tensor with shape [..., num_kv_heads, head_dim].
+        hq: Number of query heads. Must be divisible by num_kv_heads.
+
+    Returns:
+        Tuple of (k_expanded, v_expanded) where each tensor has
+        num_kv_heads replaced with hq along the head axis.
+
+    Raises:
+        ValueError: If hq is not divisible by the number of KV heads.
+    """
     if k.shape[-2] == hq:
         return k, v
     hk = k.shape[-2]
@@ -74,7 +92,26 @@ def _apply_logits_transforms(
     mask: chex.Array | None,
     logits_dtype: DTypeLike,
 ) -> chex.Array:
-    """Apply transformations to attention logits: scaling, bias, soft cap, masking."""
+    """Apply transformations to attention logits: scaling, bias, soft cap, and masking.
+
+    Processes raw QK^T dot products through the standard attention logits
+    pipeline. The transformations are applied in order: dtype cast, scaling,
+    bias addition, soft capping, and masking.
+
+    Args:
+        logits: Raw attention logits from QK^T dot product.
+        softmax_scale: Multiplicative scaling factor for logits.
+        bias: Optional additive attention bias (e.g., ALiBi, relative position).
+            If provided, added after scaling.
+        logits_soft_cap: Optional soft cap value. When set, applies
+            ``cap * tanh(logits / cap)`` to prevent extreme values.
+        mask: Optional boolean mask where True indicates valid (attendable)
+            positions and False indicates positions to mask out.
+        logits_dtype: Target dtype for logits computation (e.g., float32).
+
+    Returns:
+        Transformed logits tensor promoted to at least float32 precision.
+    """
     logits = logits.astype(logits_dtype)
     logits = logits * softmax_scale
 
@@ -99,11 +136,21 @@ def _causal_mask_for_chunk(
     k_start: int,
     k_len: int,
 ) -> chex.Array:
-    """
-    Create causal attention mask for a chunk.
+    """Create a causal attention mask for a specific Q/K chunk pair.
+
+    Generates a boolean mask enforcing the causal constraint: each query
+    position can only attend to key positions at the same or earlier
+    absolute position. Positions are computed from chunk offsets.
+
+    Args:
+        q_start: Starting absolute position of the query chunk.
+        q_len: Number of query tokens in the chunk.
+        k_start: Starting absolute position of the key chunk.
+        k_len: Number of key tokens in the chunk.
 
     Returns:
-        [1, 1, q_len, k_len] where True means attend
+        Boolean mask of shape [1, 1, q_len, k_len] where True indicates
+        the query position can attend to the key position.
     """
     q_pos = q_start + jnp.arange(q_len)
     k_pos = k_start + jnp.arange(k_len)
@@ -118,11 +165,24 @@ def _window_mask_for_chunk(
     k_len: int,
     window: tuple[int, int] | None,
 ) -> chex.Array | None:
-    """
-    Create sliding window attention mask for a chunk.
+    """Create a sliding window attention mask for a specific Q/K chunk pair.
+
+    Generates a boolean mask enforcing the sliding window constraint: each
+    query position can only attend to key positions within the specified
+    left and right window distances.
+
+    Args:
+        q_start: Starting absolute position of the query chunk.
+        q_len: Number of query tokens in the chunk.
+        k_start: Starting absolute position of the key chunk.
+        k_len: Number of key tokens in the chunk.
+        window: Optional tuple of (left_window, right_window) distances.
+            If None, no sliding window constraint is applied.
 
     Returns:
-        [1, 1, q_len, k_len] where True means attend, or None
+        Boolean mask of shape [1, 1, q_len, k_len] where True indicates
+        the key position is within the window of the query position,
+        or None if no window constraint is specified.
     """
     if window is None:
         return None
@@ -139,7 +199,27 @@ def _window_mask_for_chunk(
 
 
 def _slice_broadcast_qk(x: chex.Array | None, q_start: int, q_len: int, k_start: int, k_len: int) -> chex.Array | None:
-    """Slice x along query/key axes with broadcasting-aware semantics to [*,*,q_len,k_len]."""
+    """Slice a 4D tensor along query and key axes with broadcasting-aware semantics.
+
+    Extracts a sub-tensor corresponding to a specific Q/K chunk pair from
+    a bias or mask tensor. Handles broadcasting dimensions (size 1) by
+    skipping the slice and relying on JAX broadcasting.
+
+    Args:
+        x: Input tensor to slice, broadcastable to [batch, heads, seq_q, seq_k].
+            Can have fewer than 4 dimensions (will be padded with leading 1s).
+        q_start: Starting position along the query axis.
+        q_len: Number of elements to take along the query axis.
+        k_start: Starting position along the key axis.
+        k_len: Number of elements to take along the key axis.
+
+    Returns:
+        Sliced and broadcast tensor of shape [batch, heads, q_len, k_len],
+        or None if the input is None.
+
+    Raises:
+        ValueError: If the input has more than 4 dimensions.
+    """
     if x is None:
         return None
     if x.ndim > 4:
@@ -182,8 +262,41 @@ def _attend_chunk(
     dropout_key: PRNGKeyArray | None = None,
     softmax_aux: chex.Array | None = None,
 ) -> tuple[chex.Array, chex.Array, chex.Array, PRNGKeyArray | None]:
-    """
-    Process a single KV chunk with online softmax and optional attention sinks.
+    """Process a single KV chunk against a query chunk using online softmax.
+
+    Computes attention scores between a query chunk and a KV chunk,
+    applies all logits transforms (scaling, bias, soft cap, masking),
+    and updates the running online softmax accumulators (output, max,
+    denominator). Optionally incorporates attention sinks and dropout.
+
+    The online softmax maintains running statistics across KV chunks
+    to avoid materializing the full attention matrix:
+        - x_max tracks the running maximum for numerical stability
+        - denom tracks the running sum of exponentials
+        - accum tracks the running weighted sum of values
+
+    Args:
+        q_chunk: Query chunk [batch, q_len, num_heads, head_dim].
+        k_chunk: Key chunk [batch, k_len, num_heads, head_dim].
+        v_chunk: Value chunk [batch, k_len, num_heads, head_dim].
+        accum: Running output accumulator [batch, q_len, num_heads, head_dim].
+        x_max: Running maximum of logits [batch, num_heads, q_len].
+        denom: Running sum of exponentials [batch, num_heads, q_len].
+        softmax_scale: Scaling factor for attention scores.
+        bias_chunk: Optional bias chunk [batch, heads, q_len, k_len].
+        mask_chunk: Optional boolean mask chunk [batch, heads, q_len, k_len].
+        window_mask: Optional sliding window mask [1, 1, q_len, k_len].
+        causal_mask: Optional causal mask [1, 1, q_len, k_len].
+        logits_soft_cap: Optional soft cap value for logits.
+        logits_dtype: Dtype for logits computation.
+        precision: JAX precision for matrix multiplications.
+        dropout_prob: Dropout probability for attention weights.
+        dropout_key: Optional PRNG key for dropout.
+        softmax_aux: Optional attention sink logits.
+
+    Returns:
+        Tuple of (accum, x_max, denom, next_dropout_key) with updated
+        running statistics after processing this KV chunk.
     """
 
     logits = jnp.einsum(
@@ -275,8 +388,42 @@ def _flash_attention_fwd(
     dropout_prob: float = 0.0,
     dropout_key: PRNGKeyArray | None = None,
 ) -> chex.Array:
-    """
-    Forward pass for chunked flash attention with online softmax and optional attention sinks.
+    """Forward pass for chunked flash attention with online softmax.
+
+    Implements the Flash Attention algorithm by processing the attention
+    computation in tiles/chunks. The query sequence is split into chunks
+    of size chunk_size_q, and for each query chunk, the key/value sequence
+    is iterated in chunks of size chunk_size_k. Online softmax maintains
+    running statistics across KV chunks for numerically stable computation
+    without materializing the full N x N attention matrix.
+
+    Args:
+        q: Query tensor [batch, seq_len_q, num_q_heads, head_dim].
+        k: Key tensor [batch, seq_len_k, num_kv_heads, head_dim].
+        v: Value tensor [batch, seq_len_k, num_kv_heads, v_head_dim].
+        softmax_scale: Scaling factor for attention scores.
+        logits_soft_cap: Optional soft cap for attention logits via tanh.
+        bias: Optional attention bias [batch, heads, seq_len_q, seq_len_k].
+        mask: Optional boolean attention mask [batch, heads, seq_len_q, seq_len_k].
+        q_segment_ids: Optional query segment IDs for packed sequences.
+        kv_segment_ids: Optional key/value segment IDs for packed sequences.
+        window: Optional (left, right) sliding window bounds.
+        chunk_size_q: Number of query tokens per chunk.
+        chunk_size_k: Number of key/value tokens per chunk.
+        normalize_output: Whether to divide output by the sum of attention weights.
+        precision: JAX precision for matrix multiplications.
+        logits_dtype: Dtype for logits computation (e.g., float32).
+        softmax_aux: Optional attention sink logits.
+        causal: Whether to apply causal masking.
+        dropout_prob: Dropout probability for attention weights.
+        dropout_key: Optional PRNG key for dropout.
+
+    Returns:
+        Attention output tensor [batch, seq_len_q, num_q_heads, v_head_dim].
+
+    Raises:
+        ValueError: If query and key head dimensions don't match, or if
+            key and value sequence lengths differ.
     """
     B, Tq, Hq, D = q.shape
     _, Tk, Hk, Dk = k.shape
@@ -299,6 +446,20 @@ def _flash_attention_fwd(
     q_rem = Tq % chunk_size_q
 
     def q_step(carry, i):
+        """Process a single query chunk through all KV chunks via lax.scan.
+
+        For a given query chunk, iterates over all KV chunks using online
+        softmax to accumulate the attention output without materializing
+        the full attention matrix.
+
+        Args:
+            carry: Dropout PRNG key state.
+            i: Query chunk index.
+
+        Returns:
+            Tuple of (updated_dropout_key, chunk_output) where chunk_output
+            has shape [batch, chunk_size_q, num_heads, d_out].
+        """
         dropout_key_i = carry
         q_chunk_start = i * chunk_size_q
         q_chunk_len = S_Q
@@ -313,6 +474,18 @@ def _flash_attention_fwd(
             dropout_key_i, chunk_dropout_key = jax.random.split(dropout_key_i)
 
         def kv_step(carry, j):
+            """Process a single KV chunk for the current query chunk.
+
+            Slices the j-th KV chunk, applies all masks and transforms,
+            and updates the online softmax accumulators.
+
+            Args:
+                carry: Tuple of (accum, x_max, denom, dropout_key).
+                j: KV chunk index.
+
+            Returns:
+                Tuple of (updated_carry, None) for lax.scan.
+            """
             acc_, x_max_, denom_, dk_ = carry
             kv_chunk_start = j * chunk_size_k
             kv_chunk_len = S_K
@@ -363,6 +536,16 @@ def _flash_attention_fwd(
         k_rem = Tk % chunk_size_k
 
         def handle_k_rem():
+            """Handle the remainder KV chunk when seq_len_k is not divisible by chunk_size_k.
+
+            Processes the final partial KV chunk (k_rem tokens) that doesn't
+            fit into a full chunk_size_k block. Uses lax.cond to skip if
+            there is no remainder.
+
+            Returns:
+                Tuple of (accum, x_max, denom, dropout_key) with updated
+                online softmax accumulators.
+            """
             if k_rem == 0:
                 return acc, x_max, denom, chunk_dropout_key
 
@@ -422,6 +605,16 @@ def _flash_attention_fwd(
     if q_rem > 0:
 
         def process_remainder():
+            """Process the remainder query chunk when seq_len_q is not divisible by chunk_size_q.
+
+            Handles the final partial query chunk (q_rem tokens) by
+            iterating through all KV chunks and computing attention
+            with the same online softmax approach.
+
+            Returns:
+                Attention output for the remainder query tokens with shape
+                [batch, q_rem, num_heads, d_out], cast to the input dtype.
+            """
             q_chunk_start = n_q_full * chunk_size_q
             q_chunk_len = q_rem
             q_chunk = lax.dynamic_slice_in_dim(q, q_chunk_start, q_chunk_len, axis=1)
@@ -439,6 +632,18 @@ def _flash_attention_fwd(
                 chunk_dropout_key = dropout_key
 
             def kv_step_rem(carry, j):
+                """Process a single KV chunk for the remainder query chunk.
+
+                Same logic as kv_step but operates on the remainder query
+                tokens that don't fill a complete query chunk.
+
+                Args:
+                    carry: Tuple of (accum, x_max, denom, dropout_key).
+                    j: KV chunk index.
+
+                Returns:
+                    Tuple of (updated_carry, None) for lax.scan.
+                """
                 acc_, x_max_, denom_, dk_ = carry
                 kv_chunk_start = j * chunk_size_k
                 kv_chunk_len = S_K

@@ -127,12 +127,45 @@ def _recurrent_attention_bwd(
         hidden_states = jnp.flip(hidden_states, axis=1)
 
     def process_batch(q_b, k_b, v_b, g_b, g_gamma_b, gk_b, gv_b, hidden_b, do_b, dfinal_h):
-        """Process backward for a single batch element."""
+        """Process backward pass for a single batch element.
+
+        Runs the reverse-time scan to compute gradients for all recurrent
+        attention parameters. Uses lax.scan in reverse order and accumulates
+        per-step contributions for gates and initial state.
+
+        Args:
+            q_b: Query for this batch [seq_len, num_heads, head_dim].
+            k_b: Key for this batch [seq_len, num_heads, head_dim].
+            v_b: Value for this batch [seq_len, num_heads, head_dim].
+            g_b: GLA gate for this batch [seq_len, num_heads, head_dim].
+            g_gamma_b: Per-head decay for this batch [num_heads].
+            gk_b: Key gate for this batch [seq_len, num_heads, head_dim].
+            gv_b: Value gate for this batch [seq_len, num_heads, head_dim].
+            hidden_b: Saved hidden states [seq_len, num_heads, head_dim, head_dim].
+            do_b: Output gradient [seq_len, num_heads, head_dim].
+            dfinal_h: Gradient of final hidden state [num_heads, head_dim, head_dim].
+
+        Returns:
+            Tuple of (dq_b, dk_b, dv_b, dg_b, dgk_b, dgv_b, dh_initial).
+        """
 
         dh = dfinal_h
 
         def backward_step(carry, inputs):
-            """Single backward step through time."""
+            """Compute one reverse-time backward step for recurrent attention.
+
+            Computes gradients dq, dk, dv, dg, dgk, dgv for a single timestep
+            and propagates dh to the previous step through the decay chain.
+
+            Args:
+                carry: Gradient w.r.t. hidden state from future steps
+                    [num_heads, head_dim, head_dim].
+                inputs: Tuple of (t_idx, q_t, k_t, v_t, g_t, gk_t, gv_t, h_t, do_t)
+                    for the current (reversed) timestep.
+
+            Returns:
+                Tuple of (dh_prev, (dq_t, dk_t, dv_t, dg_t, dgk_t, dgv_t)).
+            """
             dh_next = carry
             _t_idx, q_t, k_t, v_t, g_t, gk_t, gv_t, h_t, do_t = inputs
 

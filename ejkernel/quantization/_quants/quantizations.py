@@ -55,9 +55,22 @@ from .._utils.qparams import (
 def _to_quant_layout(w: jax.Array, axis: QuantizationAxis) -> jax.Array:
     """Map logical weight layout to quantization/runtime layout.
 
-    ``axis='row'`` maps logical ``(..., out_features, in_features)`` to
-    ``(..., in_features, out_features)`` so grouping along the last dimension
-    groups over output channels.
+    For ``axis='row'``, swaps the last two dimensions so that the grouping
+    dimension (last axis) runs over output channels. For ``axis='col'``,
+    the layout is returned unchanged since grouping already runs over
+    input channels.
+
+    Args:
+        w: Weight tensor with at least 2 dimensions, typically shaped
+            ``(..., out_features, in_features)``.
+        axis: Quantization axis. "row" transposes the last two dims;
+            "col" leaves the layout unchanged.
+
+    Returns:
+        Weight tensor in quantization layout, possibly transposed.
+
+    Raises:
+        ValueError: If w has fewer than 2 dimensions.
     """
     if w.ndim < 2:
         raise ValueError("quantize expects inputs with two or more dimensions.")
@@ -72,11 +85,29 @@ def quantize(
     mode: QuantizationMode = "affine",
     axis: QuantizationAxis = "row",
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
-    """Quantize weights into packed uint32 codes.
+    """Quantize weights into packed uint32 codes with per-group scaling.
+
+    Supports multiple quantization modes, each producing different output
+    tuples. The weight tensor is first transposed to the quantization layout
+    (based on axis), then grouped and quantized per-group.
+
+    Args:
+        w: Weight tensor with at least 2 dimensions. The last dimension
+            must be divisible by the resolved group_size.
+        group_size: Number of elements per quantization group, or None for
+            mode-specific default (e.g., 64 for affine, 32 for mxfp4).
+        bits: Bit-width for quantized values, or None for mode-specific
+            default (e.g., 4 for affine and nf4).
+        mode: Quantization mode. One of "affine", "nf4", "mxfp4", "mxfp8",
+            "nvfp4", "nvfp8".
+        axis: Quantization axis determining how groups are formed:
+            "row" groups over output channels, "col" groups over input channels.
 
     Returns:
-      - affine: ``(w_q, scales, zeros)`` with dequant formula ``(q - zero) * scale``
-      - nf4/mxfp4/mxfp8/nvfp4/nvfp8: ``(w_q, scales)``
+        For affine mode: tuple of (w_q, scales, zeros) where the dequantization
+            formula is ``(q - zero) * scale``.
+        For all other modes: tuple of (w_q, scales) where scales encode either
+            per-group float scales (nf4) or shared exponents (mxfp/nvfp).
     """
     axis = normalize_axis(axis)
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
@@ -159,10 +190,32 @@ def dequantize(
     mode: QuantizationMode = "affine",
     axis: QuantizationAxis = "row",
 ) -> jax.Array:
-    """Dequantize packed weights from ``quantize``.
+    """Dequantize packed uint32 weights back to floating-point values.
 
-    For affine mode, metadata is ``zeros`` and the dequantization formula is
-    ``(q - zero) * scale``.
+    Reverses the quantization performed by ``quantize()``, unpacking the
+    bit-packed codes and applying the appropriate inverse transformation
+    for the specified mode.
+
+    Args:
+        w_q: Packed uint32 array of quantized codes from ``quantize()``.
+        scales: Per-group scale factors (float for affine/nf4, uint8
+            exponents for mxfp/nvfp modes).
+        zeros: Per-group zero-point offsets. Required for affine mode
+            (dequantization formula: ``(q - zero) * scale``). Must be
+            None for all other modes.
+        group_size: Number of elements per quantization group, or None
+            for mode-specific default.
+        bits: Bit-width for quantized values, or None for mode-specific default.
+        mode: Quantization mode matching the one used during quantization.
+        axis: Quantization axis (kept for API symmetry; not used in
+            current implementation).
+
+    Returns:
+        Dequantized float tensor with the same leading dimensions as scales
+        and last dimension equal to ``n_groups * group_size``.
+
+    Raises:
+        ValueError: If zeros is None for affine mode.
     """
     axis = normalize_axis(axis)
     del axis  # kept for API symmetry and future layout-aware validation.
@@ -237,7 +290,34 @@ def quantized_matmul(
     mode: QuantizationMode = "affine",
     axis: QuantizationAxis | None = None,
 ) -> jax.Array:
-    """Dense reference quantized matmul: dequantize then matmul."""
+    """Dense reference quantized matrix multiplication via dequantize-then-matmul.
+
+    First dequantizes the packed weight tensor back to full precision, then
+    performs a standard matrix multiplication with the input activations.
+    This is a reference implementation; for fused high-performance variants,
+    see ``ejkernel.modules.operations.quantized_matmul``.
+
+    Args:
+        x: Input activation tensor of shape ``(..., K)`` where K is the
+            contraction dimension.
+        w: Packed uint32 weight tensor from ``quantize()`` or
+            ``prepack_quantized_weights()``.
+        scales: Per-group scale factors for dequantization.
+        zeros: Per-group zero-point offsets (required for affine mode,
+            must be None for other modes).
+        transpose: If True, transposes the dequantized weight before matmul
+            (``x @ w.T``). If False, uses ``x @ w``.
+        group_size: Number of elements per quantization group, or None
+            for mode-specific default.
+        bits: Bit-width for quantized values, or None for mode-specific default.
+        mode: Quantization mode matching the one used during quantization.
+        axis: Explicit quantization axis. If provided, overrides the transpose
+            flag for consistency.
+
+    Returns:
+        Matrix multiplication result with shape ``(..., N)`` where N is the
+        output dimension of the weight matrix.
+    """
     if axis is not None:
         _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
 
@@ -264,11 +344,32 @@ def prepack_quantized_weights(
     transpose: bool = True,
     axis: QuantizationAxis | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
-    """Prepack logical ``(out_features, in_features)`` weights.
+    """Prepack logical ``(out_features, in_features)`` weights for quantized matmul.
 
-    Backward compatibility:
-      - if ``axis`` is omitted, ``transpose=True`` maps to ``axis='row'``
-      - if ``axis`` is omitted, ``transpose=False`` maps to ``axis='col'``
+    Convenience wrapper around ``quantize()`` that resolves the quantization
+    axis from either the explicit ``axis`` parameter or the legacy
+    ``transpose`` flag. The output is ready for use with
+    ``quantized_matmul()`` or the fused kernel variants.
+
+    Backward compatibility when ``axis`` is omitted:
+        - ``transpose=True`` maps to ``axis='row'`` (group over out features).
+        - ``transpose=False`` maps to ``axis='col'`` (group over in features).
+
+    Args:
+        w: Weight tensor of shape ``(out_features, in_features)`` or with
+            additional leading batch dimensions.
+        group_size: Number of elements per quantization group, or None for
+            mode-specific default.
+        bits: Bit-width for quantized values, or None for mode-specific default.
+        mode: Quantization mode. One of "affine", "nf4", "mxfp4", "mxfp8",
+            "nvfp4", "nvfp8".
+        transpose: Legacy flag for axis inference when ``axis`` is None.
+        axis: Explicit quantization axis ("row" or "col"). Overrides
+            ``transpose`` when provided.
+
+    Returns:
+        For affine mode: tuple of (w_q, scales, zeros).
+        For other modes: tuple of (w_q, scales).
     """
     axis = resolve_prepack_axis(axis=axis, transpose=transpose)
     return quantize(w, group_size=group_size, bits=bits, mode=mode, axis=axis)

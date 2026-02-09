@@ -12,7 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Forward TPU Pallas kernels for quantized matmul."""
+"""Forward TPU Pallas kernels for quantized matrix multiplication.
+
+This module implements the forward-pass TPU Pallas kernels for quantized
+matrix multiplication (Y = X @ dequant(W)). It provides two execution paths
+that are dispatched by a hybrid router:
+
+Execution Paths:
+    - **Packed (fused)**: Unpacks quantized codes, dequantizes, and multiplies
+      in a single Pallas kernel. Best for large-N NF4 workloads where the
+      unpack/dequant overhead is hidden by the matmul.
+    - **Predecode (two-stage)**: First materializes a dense bfloat16 weight
+      via ``get_predecoded_dense_weight``, then calls ``pallas_dense_matmul``.
+      Generally faster for affine mode due to TPU-friendly dense scheduling.
+
+The ``_pallas_qmm_transpose_false`` dispatcher selects between packed and
+predecode based on the ``path`` argument or the hybrid heuristic.
+
+Grid Strategy (Packed Path):
+    3D grid (num_M, num_N, num_K) where M and N tiles are parallel and K
+    is accumulated sequentially with a VMEM scratch buffer. Each K iteration
+    unpacks the weight tile, dequantizes it, and accumulates the matmul
+    result. The final K iteration stores to HBM.
+
+Supported Modes:
+    - affine: ``code * scale + bias``
+    - nf4: NormalFloat4 lookup with scale
+"""
 
 from __future__ import annotations
 
@@ -49,7 +75,32 @@ def _pallas_qmm_transpose_false_packed(
     block_k: int,
     use_bf16: bool,
 ) -> jax.Array:
-    """Packed fused TPU Pallas path for forward transpose=False."""
+    """Packed fused TPU Pallas path for forward Y = X @ dequant(W).
+
+    Runs a single Pallas kernel that, for each (M, N, K) tile, unpacks
+    the quantized weight codes from packed 32-bit words, dequantizes them
+    using per-group scales (and optional biases), and accumulates the
+    matmul result in a VMEM scratch buffer with fp32 precision.
+
+    Args:
+        x: Activation tensor [M, K].
+        w_q: Packed quantized weight [K, N // values_per_word].
+        scales: Per-group scale tensor [K, N // group_size].
+        biases: Optional per-group additive bias [K, N // group_size].
+        group_size: Number of output elements per quantization group.
+        bits: Quantization bit width (4 or 8).
+        mode: Quantization mode ("affine" or "nf4").
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+        use_bf16: Ignored (TPU fused path always uses bfloat16).
+
+    Returns:
+        Float32 result [M, N].
+
+    Raises:
+        ValueError: If bits, mode, or block constraints are invalid.
+    """
     del use_bf16  # TPU fused path always computes in bfloat16.
     if bits not in (4, 8):
         raise ValueError("TPU packed fused path supports bits in {4, 8}.")
@@ -188,7 +239,28 @@ def _pallas_qmm_transpose_false_predecode(
     block_k: int,
     use_bf16: bool,
 ) -> jax.Array:
-    """Predecode-to-dense TPU Pallas path for forward transpose=False."""
+    """Predecode-to-dense TPU Pallas path for forward Y = X @ dequant(W).
+
+    First materializes a full dense bfloat16 weight matrix from the quantized
+    representation (using cached predecoding when possible), then delegates
+    to ``pallas_dense_matmul`` for the actual matmul.
+
+    Args:
+        x: Activation tensor [M, K].
+        w_q: Packed quantized weight [K, N_packed].
+        scales: Per-group scale tensor [K, N // group_size].
+        biases: Optional per-group additive bias.
+        group_size: Elements per quantization group.
+        bits: Quantization bit width (4 or 8).
+        mode: Quantization mode string.
+        block_m: M-dimension tile size for dense matmul.
+        block_n: N-dimension tile size for dense matmul.
+        block_k: K-dimension tile size for dense matmul.
+        use_bf16: Ignored (TPU always uses bfloat16).
+
+    Returns:
+        Float32 result [M, N].
+    """
     del use_bf16
     w_dense = get_predecoded_dense_weight(
         w_q,
@@ -209,8 +281,20 @@ def _pallas_qmm_transpose_false_predecode(
 
 
 def _prefer_packed_path(n: int, block_n: int, mode: str) -> bool:
-    # Packed wins most consistently for large-N NF4; affine is typically on-par
-    # or faster with predecode due TPU-friendly dense matmul scheduling.
+    """Heuristic deciding whether the packed kernel is preferred over predecode.
+
+    Packed wins most consistently for large-N NF4 workloads; affine is
+    typically on-par or faster with predecode due to TPU-friendly dense
+    matmul scheduling.
+
+    Args:
+        n: Output dimension size.
+        block_n: N-dimension tile size.
+        mode: Quantization mode string.
+
+    Returns:
+        True if the packed path is expected to be faster.
+    """
     if mode == "nf4":
         return n >= max(512, 2 * block_n)
     return False
@@ -232,7 +316,36 @@ def _pallas_qmm_transpose_false(
     path: str,
     packed_legal: bool,
 ) -> jax.Array:
-    """Dispatch forward TPU QMM based on hybrid/packed/predecode mode."""
+    """Dispatch forward TPU QMM based on hybrid/packed/predecode path.
+
+    Selects between the packed fused kernel and the predecode-to-dense
+    path for the forward pass (Y = X @ dequant(W)):
+
+    - ``path="packed"``: Forces the packed fused kernel (raises if illegal).
+    - ``path="predecode"``: Forces the predecode-to-dense path.
+    - ``path="hybrid"``: Uses ``_prefer_packed_path`` heuristic to choose.
+
+    Args:
+        x: Activation tensor [M, K].
+        w_q: Packed quantized weight [K, N_packed].
+        scales: Per-group scale tensor [K, N // group_size].
+        biases: Optional per-group additive bias.
+        group_size: Elements per quantization group.
+        bits: Quantization bit width (4 or 8).
+        mode: Quantization mode string.
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+        use_bf16: Whether to use bfloat16 (ignored on TPU).
+        path: Execution path (``"packed"``, ``"predecode"``, or ``"hybrid"``).
+        packed_legal: Whether the packed path satisfies TPU tiling constraints.
+
+    Returns:
+        Float32 result [M, N].
+
+    Raises:
+        ValueError: If ``path="packed"`` but ``packed_legal`` is False.
+    """
     n = scales.shape[-1] * group_size
     if path == "packed":
         if not packed_legal:

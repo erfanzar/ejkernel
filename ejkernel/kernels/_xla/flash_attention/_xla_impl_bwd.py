@@ -62,11 +62,37 @@ def _flash_attention_bwd(
     res: tuple,
     g: chex.Array,
 ) -> tuple[chex.Array, chex.Array, chex.Array]:
-    """
-    Backward pass for flash attention using JAX autodiff.
+    """Backward pass for flash attention using JAX autodiff.
+
+    Reconstructs the forward computation from saved residuals and uses
+    JAX's VJP (vector-Jacobian product) to compute gradients for query,
+    key, and value tensors. All static parameters (precision, chunk sizes,
+    causal mode, etc.) are provided as encoded integers or plain values
+    and decoded internally.
+
+    Args:
+        bias: Optional attention bias tensor used in the forward pass.
+        mask: Optional boolean attention mask used in the forward pass.
+        q_segment_ids: Optional query segment IDs for packed sequences.
+        kv_segment_ids: Optional key/value segment IDs for packed sequences.
+        softmax_aux: Optional attention sink logits used in the forward pass.
+        window: Optional (left, right) sliding window bounds.
+        softmax_scale: Scaling factor applied to attention scores.
+        logits_soft_cap: Optional soft cap value for attention logits.
+        chunk_size_q: Query chunk size used in the forward pass.
+        chunk_size_k: Key/value chunk size used in the forward pass.
+        normalize_output: Whether output was normalized by attention weight sum.
+        precision_code: Integer code encoding the JAX precision setting.
+        logits_dtype_code: Integer code encoding the logits computation dtype.
+        causal: Whether causal masking was applied in the forward pass.
+        dropout_prob: Dropout probability used in the forward pass.
+        dropout_key: Optional PRNG key for dropout reproducibility.
+        res: Tuple of (query, key, value) residuals saved from the forward pass.
+        g: Gradient of the loss with respect to the attention output.
 
     Returns:
-        dq, dk, dv
+        Tuple of (dq, dk, dv) where each gradient has the same shape
+        as its corresponding input tensor.
     """
     from ._xla_impl_fwd import _flash_attention_fwd
 
@@ -87,6 +113,16 @@ def _flash_attention_bwd(
     logits_dtype = _CODE_TO_DTYPE[logits_dtype_code]
 
     def f(q_, k_, v_):
+        """Reconstruct the forward pass for VJP computation.
+
+        Args:
+            q_: Query tensor.
+            k_: Key tensor.
+            v_: Value tensor.
+
+        Returns:
+            Forward pass attention output.
+        """
         return _flash_attention_fwd(
             q_,
             k_,

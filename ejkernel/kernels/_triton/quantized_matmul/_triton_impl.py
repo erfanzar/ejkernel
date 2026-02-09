@@ -51,6 +51,7 @@ QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 GemvMode = Literal["auto", "on", "off"]
 RevSplitKMode = Literal["auto", "on", "off"]
 
+
 def _get_decode_tables() -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Build decode lookup tables as local arrays (no global state)."""
 

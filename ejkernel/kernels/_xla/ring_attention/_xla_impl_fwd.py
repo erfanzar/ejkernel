@@ -168,10 +168,37 @@ def _blockwise_attention_fwd(
     )
 
     def scan_attention(_, scan):
+        """Process one query chunk against all KV chunks.
+
+        Iterates over all KV chunks for a single query chunk,
+        accumulating attention using the online softmax algorithm.
+
+        Args:
+            _: Unused carry (stateless across query chunks).
+            scan: Tuple of (q_chunk, numerator_chunk, denominator_chunk,
+                max_score_chunk, q_chunk_idx).
+
+        Returns:
+            Tuple of (empty carry, (output_chunk, numerator, denominator, max_score)).
+        """
         q_chunk, numerator_chunk, denominator_chunk, max_score_chunk, q_chunk_idx = scan
 
         @partial(jax.checkpoint, prevent_cse=prevent_cse, policy=policy)
         def scan_kv_block(carry, scan):
+            """Process one KV chunk and update the online softmax state.
+
+            Computes attention scores between a query chunk and a KV chunk,
+            applies bias, masking, optional soft capping and attention sinks,
+            and updates the running numerator, denominator, and max score.
+
+            Args:
+                carry: Tuple of (numerator_chunk, denominator_chunk,
+                    prev_max_score_chunk) online softmax state.
+                scan: Tuple of (k_chunk, value_chunk, k_chunk_idx).
+
+            Returns:
+                Updated carry and None (no per-step output).
+            """
             k_chunk, value_chunk, k_chunk_idx = scan
 
             numerator_chunk, denominator_chunk, prev_max_score_chunk = carry
@@ -251,6 +278,19 @@ def _blockwise_attention_fwd(
             ), None
 
         def skip_upper_half(carry, args):
+            """Conditionally skip KV blocks above the causal diagonal.
+
+            For causal attention without explicit position IDs, checks whether
+            the query-KV block pair falls below or on the causal diagonal. If
+            above, skips computation entirely to avoid unnecessary work.
+
+            Args:
+                carry: Online softmax state to pass through.
+                args: Tuple of (key_chunk, value_chunk, k_chunk_idx).
+
+            Returns:
+                Updated carry (unchanged if skipped) and None.
+            """
             _key_chunk, _value_chunk, k_chunk_idx = args
             should_run = jnp.array(True)
             if causal_block_size is not None and not use_positions:
@@ -387,6 +427,21 @@ def _ring_attention_fwd(
     use_positions = q_position_ids is not None and kv_position_ids is not None
 
     def scan_kv_block(carry, idx):
+        """Process one ring step: compute local attention and rotate KV blocks.
+
+        Computes blockwise attention between the local query shard and the
+        current KV shard, then rotates KV blocks to the next device in
+        the ring using collective ppermute.
+
+        Args:
+            carry: Tuple of (prev_max_score, numerator, denominator, key,
+                value, kv_segment_ids, kv_position_ids).
+            idx: Ring step index (0 to axis_size - 1).
+
+        Returns:
+            Updated carry with rotated KV blocks and accumulated attention,
+            and None (no per-step output).
+        """
         prev_max_score, numerator, denominator, key, value, kv_segment_ids, kv_position_ids = carry
         axis_idx = lax.axis_index(axis_name) if axis_name is not None else 0
         q_block_idx = axis_idx
@@ -424,6 +479,15 @@ def _ring_attention_fwd(
         )
 
         def _ppermute_or_none(x):
+            """Rotate a tensor to the next device in the ring, or pass through.
+
+            Args:
+                x: Array to rotate, or None.
+
+            Returns:
+                Rotated array if axis_name is set and x is not None,
+                otherwise x unchanged.
+            """
             if axis_name is None or x is None:
                 return x
             return lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)])

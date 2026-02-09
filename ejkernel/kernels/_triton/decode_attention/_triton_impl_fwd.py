@@ -375,6 +375,7 @@ def decode_attention_triton(
     stride_pl0, stride_pl1, stride_pl2 = strides_from_shape(partial_lse_shape.shape)
 
     def grid_stage1(meta):
+        """Return the 3D grid dimensions for Stage 1: (batch, num_q_heads, num_kv_splits)."""
         return (batch, num_q_heads, num_kv_splits)
 
     partial_out, partial_lse = triton_call(
@@ -423,6 +424,7 @@ def decode_attention_triton(
     stride_lse0, stride_lse1 = strides_from_shape(lse_shape.shape)
 
     def grid_stage2(meta):
+        """Return the 2D grid dimensions for Stage 2: (batch, num_q_heads)."""
         return (batch, num_q_heads)
 
     out, lse = triton_call(

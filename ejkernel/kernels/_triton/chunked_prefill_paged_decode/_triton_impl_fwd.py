@@ -90,6 +90,16 @@ def _update_block_tabled_kv_cache(
     num_seqs = int(block_tables.shape[0])
 
     def _seq_body(seq_idx, carry):
+        """Process all new tokens for a single sequence and insert into the KV cache.
+
+        Args:
+            seq_idx: Index of the sequence being processed.
+            carry: Tuple of (flattened_key_cache, flattened_value_cache).
+
+        Returns:
+            Updated (flattened_key_cache, flattened_value_cache) with all
+            new tokens for this sequence written to their paged positions.
+        """
         k_flat, v_flat = carry
         q_start = query_start_loc[seq_idx]
         q_end = query_start_loc[seq_idx + 1]
@@ -97,6 +107,16 @@ def _update_block_tabled_kv_cache(
         ctx_len = kv_lens[seq_idx] - q_len
 
         def _tok_body(t, carry_tok):
+            """Insert a single token's key and value into the paged KV cache.
+
+            Args:
+                t: Token offset within the current sequence's new tokens.
+                carry_tok: Tuple of (flattened_key_cache, flattened_value_cache).
+
+            Returns:
+                Updated caches with the token at position (ctx_len + t) written
+                to its physical block location determined by the block table.
+            """
             k_flat_tok, v_flat_tok = carry_tok
             pos = ctx_len + t
             block_idx = pos // jnp.int32(block_size)

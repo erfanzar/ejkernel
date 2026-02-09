@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe DSL Flash Attention implementation helpers."""
+"""CuTe DSL Flash Attention forward and backward kernel implementations.
+
+This module builds CuTe DSL kernels for scaled dot-product attention using
+online softmax, supporting causal masking, sliding windows, explicit masks,
+additive bias, attention sinks, GQA/MQA, logit soft-capping, and paged
+KV caches.  Both forward and backward (dq, dk, dv) passes are provided.
+Kernels are compiled via the CuTe TVM-FFI pathway and dispatched through JAX.
+"""
 
 from __future__ import annotations
 
@@ -157,7 +164,30 @@ def _build_flash_host_fns(
     softmax_scale: float,
     logits_soft_cap: float | None,
 ) -> tuple[Callable[..., None], Callable[..., None]]:
-    """Create runtime and JAX host launchers specialized for static settings."""
+    """Create runtime and JAX host launchers specialized for static attention settings.
+
+    Builds a CuTe DSL kernel that computes scaled dot-product attention in a
+    single pass using online softmax (numerically stable streaming update).
+    The kernel is specialized at compilation time for the given combination
+    of causal masking, sliding window, bias, explicit mask, attention sinks,
+    and optional logit soft-capping.
+
+    Parallelization: one CUDA thread per query position, with a 3-D grid
+    ``(batch, q_tiles, q_heads)`` where ``q_tiles = ceil(q_len / q_block)``.
+
+    Args:
+        q_block: Number of query positions per CUDA thread block tile.
+        causal: Whether to apply causal (lower-triangular) masking.
+        use_mask: Whether an explicit int32 attention mask is provided.
+        use_bias: Whether an additive bias tensor is provided.
+        use_sinks: Whether attention-sink auxiliary logits are provided.
+        window: Optional ``(left, right)`` sliding-window bounds.
+        softmax_scale: Multiplicative scale applied to QK^T scores.
+        logits_soft_cap: Optional soft-capping value for logits (tanh clamp).
+
+    Returns:
+        Tuple of ``(runtime_launcher, jax_stream_launcher)`` callables.
+    """
     use_window = window is not None
     window_left = 0 if window is None else int(window[0])
     window_right = 0 if window is None else int(window[1])
@@ -341,7 +371,36 @@ def _get_cute_flash_calls(
     logits_soft_cap: float | None,
     fwd_params: FwdParams | None,
 ) -> Callable[..., jax.Array]:
-    """Build CuTe flash callables backed by CuTe primitive."""
+    """Build a CuTe flash-attention forward callable backed by CuTe FFI primitives.
+
+    Compiles and caches a CuTe DSL forward kernel specialised for the given
+    attention configuration (causal, mask, bias, sinks, window, softmax scale,
+    logit soft-cap, and query tile size).  The returned callable accepts
+    ``(query, key, value, bias, mask, softmax_aux)`` arrays and dispatches to
+    the compiled GPU kernel via the CuTe FFI pathway.
+
+    Args:
+        query: Query tensor, shape ``[batch, seq_len_q, num_heads, head_dim]``.
+        key: Key tensor, shape ``[batch, seq_len_k, num_kv_heads, head_dim]``.
+        value: Value tensor, same shape as *key*.
+        bias: Optional additive attention bias, shape
+            ``[batch, num_heads, seq_len_q, seq_len_k]``.
+        attention_mask: Optional int32 attention mask, shape
+            ``[batch, 1|num_heads, seq_len_q, seq_len_k]``.
+        softmax_aux: Optional attention-sink auxiliary logits, rank-1.
+        causal: Whether causal masking is applied.
+        window: Optional ``(left, right)`` sliding-window bounds.
+        softmax_scale: Multiplicative scale for QK^T dot products.
+        logits_soft_cap: Optional soft-capping value for logits.
+        fwd_params: Optional forward parameters controlling query tile size.
+
+    Returns:
+        A callable ``(query, key, value, bias, mask, softmax_aux) -> output``
+        that runs the compiled forward kernel.
+
+    Raises:
+        RuntimeError: If CuTe TVM-FFI support is not available.
+    """
     has_bias = bias is not None
     has_mask = attention_mask is not None
     has_sinks = softmax_aux is not None
@@ -423,7 +482,32 @@ def _build_flash_bwd_host_fns(
     softmax_scale: float,
     logits_soft_cap: float | None,
 ) -> tuple[Callable[..., None], Callable[..., None]]:
-    """Create runtime and JAX host launchers for CuTe dense backward kernels."""
+    """Create runtime and JAX host launchers for CuTe dense backward kernels.
+
+    Builds three CuTe DSL kernels (``dq``, ``dk``, ``dv``) that together
+    compute the full backward pass of scaled dot-product attention.  Each
+    gradient kernel recomputes the softmax distribution from the saved
+    forward inputs (no auxiliary lse tensor is stored), applying the same
+    causal/window/mask/bias/sink/soft-cap logic used during the forward pass.
+
+    Parallelization:
+        - ``dq``: grid ``(batch, seq_len_q, q_heads)``, 1 thread per element.
+        - ``dk``: grid ``(batch, seq_len_k, kv_heads)``, 1 thread per element.
+        - ``dv``: grid ``(batch, seq_len_k, kv_heads)``, 1 thread per element.
+
+    Args:
+        causal: Whether causal masking is applied.
+        use_mask: Whether an explicit int32 attention mask is provided.
+        use_bias: Whether an additive bias tensor is provided.
+        use_sinks: Whether attention-sink auxiliary logits are provided.
+        window: Optional ``(left, right)`` sliding-window bounds.
+        softmax_scale: Multiplicative scale applied to QK^T scores.
+        logits_soft_cap: Optional soft-capping value for logits.
+
+    Returns:
+        Tuple of ``(runtime_launcher, jax_stream_launcher)`` callables that
+        accept ``(query, key, value, bias, mask, softmax_aux, d_out, dq, dk, dv)``.
+    """
     use_window = window is not None
     window_left = 0 if window is None else int(window[0])
     window_right = 0 if window is None else int(window[1])
@@ -981,7 +1065,33 @@ def _get_cute_flash_bwd_calls(
     softmax_scale: float,
     logits_soft_cap: float | None,
 ) -> Callable[..., tuple[jax.Array, jax.Array, jax.Array]]:
-    """Build CuTe backward callables backed by CuTe primitive."""
+    """Build a CuTe flash-attention backward callable backed by CuTe FFI primitives.
+
+    Compiles and caches CuTe DSL backward kernels (dq, dk, dv) specialised for
+    the given attention configuration.  The returned callable accepts
+    ``(query, key, value, bias, mask, softmax_aux, d_out)`` arrays and returns
+    ``(dq, dk, dv)`` gradient tensors.
+
+    Args:
+        query: Query tensor, shape ``[batch, seq_len_q, num_heads, head_dim]``.
+        key: Key tensor, shape ``[batch, seq_len_k, num_kv_heads, head_dim]``.
+        value: Value tensor, same shape as *key*.
+        d_out: Upstream gradient tensor, same shape as *query*.
+        bias: Optional additive attention bias.
+        attention_mask: Optional int32 attention mask.
+        softmax_aux: Optional attention-sink auxiliary logits.
+        causal: Whether causal masking is applied.
+        window: Optional ``(left, right)`` sliding-window bounds.
+        softmax_scale: Multiplicative scale for QK^T dot products.
+        logits_soft_cap: Optional soft-capping value for logits.
+
+    Returns:
+        A callable ``(query, key, value, bias, mask, softmax_aux, d_out) -> (dq, dk, dv)``
+        that runs the compiled backward kernels.
+
+    Raises:
+        RuntimeError: If CuTe TVM-FFI support is not available.
+    """
     has_bias = bias is not None
     has_mask = attention_mask is not None
     has_sinks = softmax_aux is not None
@@ -1061,7 +1171,25 @@ def _paged_kv_to_dense(
     *,
     batch: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Convert paged KV cache tensors to dense per-batch KV tensors."""
+    """Convert paged KV cache tensors to dense per-batch KV tensors.
+
+    Gathers physical cache blocks according to *block_tables* and reshapes
+    them into dense ``[batch, max_blocks * block_size, kv_heads, head_dim]``
+    key and value tensors suitable for standard dense attention.
+
+    Args:
+        key_cache: Paged key cache, shape ``[num_blocks, block_size, kv_heads, head_dim]``.
+        value_cache: Paged value cache, same shape as *key_cache*.
+        block_tables: Sequence-to-physical-block mapping, shape ``[batch, max_blocks]``.
+        batch: Expected batch size (must match ``block_tables.shape[0]``).
+
+    Returns:
+        Tuple of ``(dense_key, dense_value)`` tensors, each with shape
+        ``[batch, max_blocks * block_size, kv_heads, head_dim]``.
+
+    Raises:
+        ValueError: If shapes are inconsistent or ranks are incorrect.
+    """
     if block_tables.ndim != 2:
         raise ValueError(f"block_tables must be rank-2 [batch, max_blocks], got {block_tables.shape}.")
     if block_tables.shape[0] != batch:
@@ -1100,7 +1228,42 @@ def flash_attention_cute_forward(
     fwd_params: FwdParams | None,
     block_tables: jax.Array | None = None,
 ) -> jax.Array:
-    """Run CuTe Flash Attention forward for dense or paged-KV inputs."""
+    """Run CuTe Flash Attention forward for dense or paged-KV inputs.
+
+    Validates all input shapes and dtypes, normalises optional parameters
+    (sliding window, softmax scale, attention mask, bias, attention sinks),
+    then dispatches to a compiled CuTe DSL forward kernel.  For paged-KV
+    inputs the cache blocks are first gathered into dense tensors via
+    ``_paged_kv_to_dense``.
+
+    The kernel computes numerically-stable scaled dot-product attention
+    using online softmax with optional causal masking, sliding window,
+    additive bias, explicit mask, attention sinks, and logit soft-capping.
+
+    Args:
+        query: Query tensor, shape ``[batch, seq_len_q, num_heads, head_dim]``.
+        key: Key tensor.  Dense: ``[batch, seq_len_k, num_kv_heads, head_dim]``.
+            Paged: ``[num_blocks, block_size, num_kv_heads, head_dim]``.
+        value: Value tensor, same shape as *key*.
+        attention_mask: Optional boolean/int mask, rank-4
+            ``[batch, 1|num_heads, seq_len_q, seq_len_k]``.
+        bias: Optional additive bias, shape
+            ``[batch, num_heads, seq_len_q, seq_len_k]``.
+        softmax_aux: Optional attention-sink logits, rank-1 ``[num_sinks]``.
+        softmax_scale: Scale factor for QK^T. Defaults to ``1/sqrt(head_dim)``.
+        causal: Whether to apply causal masking.
+        sliding_window: Optional sliding-window size (int or ``(left, right)``).
+        logits_soft_cap: Optional logit soft-capping value.
+        fwd_params: Optional forward parameters (e.g. query tile size).
+        block_tables: Optional paged-KV block table, shape ``[batch, max_blocks]``.
+
+    Returns:
+        Attention output tensor with the same shape and dtype as *query*.
+
+    Raises:
+        ValueError: If input shapes, ranks, or dtypes are invalid.
+        RuntimeError: If CuTe TVM-FFI support is not available.
+    """
     if query.ndim != 4:
         raise ValueError("query must be rank-4 [batch, seq_len_q, num_heads, head_dim].")
 
@@ -1183,7 +1346,35 @@ def flash_attention_cute_backward(
     sliding_window: int | tuple[int, int] | None,
     logits_soft_cap: float | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Run CuTe Flash Attention dense backward and return ``(dq, dk, dv)``."""
+    """Run CuTe Flash Attention dense backward and return ``(dq, dk, dv)``.
+
+    Validates inputs, normalises optional parameters, then dispatches to
+    compiled CuTe DSL backward kernels that compute gradients for query,
+    key, and value.  The backward pass recomputes the softmax distribution
+    from the saved forward inputs rather than storing auxiliary tensors.
+
+    Args:
+        query: Query tensor, shape ``[batch, seq_len_q, num_heads, head_dim]``.
+        key: Key tensor, shape ``[batch, seq_len_k, num_kv_heads, head_dim]``.
+        value: Value tensor, same shape as *key*.
+        d_out: Upstream gradient, same shape as *query*.
+        attention_mask: Optional int32 attention mask, rank-4.
+        bias: Optional additive bias, shape
+            ``[batch, num_heads, seq_len_q, seq_len_k]``.
+        softmax_aux: Optional attention-sink logits, rank-1.
+        softmax_scale: Scale factor for QK^T. Defaults to ``1/sqrt(head_dim)``.
+        causal: Whether causal masking is applied.
+        sliding_window: Optional sliding-window size.
+        logits_soft_cap: Optional logit soft-capping value.
+
+    Returns:
+        Tuple of ``(dq, dk, dv)`` gradient tensors with shapes matching
+        *query*, *key*, and *value* respectively.
+
+    Raises:
+        ValueError: If input shapes, ranks, or dtypes are invalid.
+        RuntimeError: If CuTe TVM-FFI support is not available.
+    """
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("query/key/value must be rank-4 tensors [batch, seq_len, num_heads, head_dim].")
     if d_out.shape != query.shape:

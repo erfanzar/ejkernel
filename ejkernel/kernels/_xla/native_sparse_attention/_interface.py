@@ -128,20 +128,33 @@ def _nsa_compression_xla(
     block_size: int,
     softmax_scale: float,
 ) -> tuple[Float[Array, "batch seq_len num_q_heads head_dim"], Float[Array, "batch seq_len num_q_heads"]]:
-    """
-    Compute compressed attention over mean-pooled key/value blocks with GQA support.
+    """Compute compressed attention over mean-pooled key/value blocks with GQA support.
+
+    This function implements the compressed attention component of Native
+    Sparse Attention (NSA). It computes attention between full-resolution
+    queries and block-compressed (mean-pooled) keys and values. The
+    compressed representations provide a coarse global context summary.
+
+    A causal block mask ensures each query token only attends to blocks
+    that have been fully completed (i.e., all tokens in the block precede
+    the query position).
 
     Args:
-        query: Query tensor [batch, seq_len, num_q_heads, head_dim]
-        k_cmp: Compressed (mean-pooled) keys [batch, num_blocks, num_kv_heads, head_dim]
-        v_cmp: Compressed (mean-pooled) values [batch, num_blocks, num_kv_heads, head_dim]
-        block_size: Size of each block
-        softmax_scale: Attention scaling factor
+        query: Query tensor of shape [batch, seq_len, num_q_heads, head_dim].
+        k_cmp: Compressed (mean-pooled) keys of shape
+            [batch, num_blocks, num_kv_heads, head_dim].
+        v_cmp: Compressed (mean-pooled) values of shape
+            [batch, num_blocks, num_kv_heads, head_dim].
+        block_size: Number of tokens per block used for compression.
+        softmax_scale: Multiplicative scaling factor for attention scores.
 
     Returns:
-        Tuple of (output, log_sum_exp) where:
-            - output: [batch, seq_len, num_q_heads, head_dim]
-            - lse: [batch, seq_len, num_q_heads]
+        Tuple of (output, lse) where:
+            - output: Compressed attention output of shape
+              [batch, seq_len, num_q_heads, head_dim].
+            - lse: Log-sum-exp of attention scores of shape
+              [batch, seq_len, num_q_heads], used for subsequent
+              top-k block selection.
     """
     _batch, seq_len, num_q_heads, _head_dim = query.shape
     num_kv_heads = k_cmp.shape[2]

@@ -108,7 +108,21 @@ def _compute_token_linear_indices(
 
 
 def _build_kv_update_host_fns() -> tuple[Callable[..., None], Callable[..., None]]:
-    """Build runtime and stream-based host functions for KV cache updates."""
+    """Build runtime and stream-based host functions for KV cache updates.
+
+    Creates a CuTe DSL kernel that scatter-writes packed key/value tokens
+    into the correct physical slots of a paged KV cache.  Each CUDA thread
+    block processes one token, with threads cooperatively copying across the
+    ``(num_kv_heads * head_dim)`` feature elements using a strided loop.
+
+    The grid is ``(total_tokens, 1, 1)`` and the block size is controlled
+    by the ``EJKERNEL_CUTE_CPPD_THREADS`` environment variable (default 256).
+
+    Returns:
+        Tuple of ``(runtime_launcher, jax_stream_launcher)`` callables that
+        accept ``(keys, values, linear_indices, key_cache_in, value_cache_in,
+        out_key_cache, out_value_cache)``.
+    """
 
     @cute.kernel
     def _kv_update_kernel(
@@ -207,7 +221,28 @@ def _get_cute_kv_update_call(
     key_cache: jax.Array,
     value_cache: jax.Array,
 ) -> Callable[..., tuple[jax.Array, jax.Array]]:
-    """Build a CuTe KV-update callable."""
+    """Build a CuTe KV-update callable backed by CuTe FFI primitives.
+
+    Compiles the KV-update CuTe kernel via ``build_cute_ffi_call`` with
+    in-place aliasing (``key_cache`` and ``value_cache`` are updated in place)
+    and returns a callable that performs the scatter-write operation.
+
+    Args:
+        keys: Packed key tokens, shape ``[total_tokens, num_kv_heads, head_dim]``.
+        values: Packed value tokens, same shape as *keys*.
+        linear_indices: Linear destination indices into the flattened cache,
+            shape ``[total_tokens]``, int32.
+        key_cache: Existing key cache, shape
+            ``[num_blocks, block_size, num_kv_heads, head_dim]``.
+        value_cache: Existing value cache, same shape as *key_cache*.
+
+    Returns:
+        A callable ``(keys, values, linear_indices, key_cache, value_cache)
+        -> (updated_key_cache, updated_value_cache)``.
+
+    Raises:
+        RuntimeError: If CuTe TVM-FFI support is not available.
+    """
 
     if not has_cute_ffi_support():
         raise RuntimeError(
@@ -266,9 +301,37 @@ def _run_unified_attention(
     num_warps: int | None,
     num_stages: int | None,
 ) -> jax.Array:
-    """Execute attention on top of the updated KV cache.
+    """Execute paged attention on the updated KV cache via Triton unified attention.
 
-    Requires Triton unified attention and raises when unavailable.
+    Delegates to the Triton ``unified_attention`` kernel which supports
+    variable-length sequences with paged KV caches.  This function serves
+    as the attention stage of the two-phase chunked-prefill-paged-decode
+    pipeline (phase 1: KV cache update via CuTe, phase 2: attention via
+    Triton).
+
+    Args:
+        queries: Packed queries, shape ``[total_tokens, num_q_heads, head_dim]``.
+        key_cache: Updated key cache, shape
+            ``[num_blocks, block_size, num_kv_heads, head_dim]``.
+        value_cache: Updated value cache, same shape as *key_cache*.
+        kv_lens: Total KV length per sequence, shape ``[num_seqs]``.
+        block_tables: Block table mapping, shape ``[num_seqs, max_blocks]``.
+        query_start_loc: Cumulative query starts, shape ``[num_seqs + 1]``.
+        alibi_slopes: Optional ALiBi slopes, shape ``[num_q_heads]``.
+        softmax_aux: Optional attention-sink logits, shape ``[num_q_heads]``.
+        softmax_scale: Attention scale factor.
+        sliding_window: Optional sliding-window size.
+        logits_soft_cap: Optional logit soft-capping value.
+        seq_threshold_3d: Optional Triton tuning hint for 3-D grid threshold.
+        num_par_softmax_segments: Optional Triton parallel-softmax segment count.
+        num_warps: Optional Triton warp count.
+        num_stages: Optional Triton pipeline stage count.
+
+    Returns:
+        Attention output tensor, shape ``[total_tokens, num_q_heads, head_dim]``.
+
+    Raises:
+        EjkernelRuntimeError: If Triton unified attention is not available.
     """
     if triton_unified_attention is not None:
         return triton_unified_attention(

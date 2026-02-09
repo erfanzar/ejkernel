@@ -132,6 +132,18 @@ def _recurrent_kda_fwd(
     b_seq = beta.transpose(2, 0, 1)  # (L, B, H)
 
     def step_fn(state, inputs):
+        """Execute a single recurrent KDA step.
+
+        Applies decay, computes delta update, modifies state, and
+        produces output for one timestep.
+
+        Args:
+            state: Current memory state [batch, num_heads, head_dim, value_dim].
+            inputs: Tuple of (q_t, k_t, v_t, g_t, beta_t) for this timestep.
+
+        Returns:
+            Tuple of (new_state, output) for this timestep.
+        """
         q_t, k_t, v_t, g_t, beta_t = inputs
         g_exp = jnp.exp(g_t)[:, :, None, None]
         beta_scaled = beta_t[:, :, None]
@@ -262,6 +274,19 @@ def _chunk_kda_fwd(
     attn = jnp.where(mask_triu, 0.0, attn)
 
     def resolve_intra_chunk_row(attn_chunk, i):
+        """Resolve delta dependencies for a single row of the intra-chunk attention matrix.
+
+        Uses iterative refinement to account for cascading delta updates
+        within the chunk. Row i's dependencies on rows 0..i-1 are resolved
+        by accumulating their contributions.
+
+        Args:
+            attn_chunk: Current attention matrix [chunk_size, chunk_size].
+            i: Row index being resolved.
+
+        Returns:
+            Tuple of (updated_attn_chunk, None) with row i resolved.
+        """
         row = attn_chunk[i, :]
         idx = jnp.arange(chunk_size)
         mask_lt_i = idx < i
@@ -274,6 +299,18 @@ def _chunk_kda_fwd(
         return attn_chunk.at[i].set(new_row), None
 
     def resolve_single_chunk(attn_single):
+        """Resolve all intra-chunk delta dependencies for one attention matrix.
+
+        Iterates through all rows sequentially, resolving cascading
+        dependencies to produce the final effective attention coefficients.
+
+        Args:
+            attn_single: Intra-chunk attention matrix [chunk_size, chunk_size].
+
+        Returns:
+            Resolved attention matrix [chunk_size, chunk_size] with all
+            delta dependencies accounted for.
+        """
         resolved, _ = lax.scan(resolve_intra_chunk_row, attn_single, jnp.arange(chunk_size))
         return resolved
 
@@ -304,6 +341,25 @@ def _chunk_kda_fwd(
     }
 
     def chunk_step(state, inputs):
+        """Process a single chunk in the chunked KDA algorithm.
+
+        Combines intra-chunk parallel computation with inter-chunk
+        state propagation. For each chunk:
+        1. Computes the intra-chunk QK attention with decay weighting
+        2. Subtracts the inter-chunk state contribution from values
+        3. Combines local and cross-chunk attention outputs
+        4. Updates the recurrent state for the next chunk
+
+        Args:
+            state: Current memory state [batch, num_heads, head_dim, value_dim].
+            inputs: Dictionary with keys 'query', 'key', 'value',
+                'k_cumdecay', 'g_cumsum', 'decay_mask' containing the
+                chunk's data tensors.
+
+        Returns:
+            Tuple of (new_state, chunk_output) where chunk_output has
+            shape [batch, num_heads, chunk_size, value_dim].
+        """
         q_i = inputs["query"]  # (B, H, cs, K)
         k_i = inputs["key"]  # (B, H, cs, K)
         v_i = inputs["value"]  # (B, H, cs, V)

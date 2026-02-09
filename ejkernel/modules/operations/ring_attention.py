@@ -204,6 +204,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             q_position_ids: Int[Array, "batch seq_len_q"] | None = None,
             kv_position_ids: Int[Array, "batch seq_len_k"] | None = None,
         ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
+            """Shard-map compatible wrapper that delegates to self.run with captured params."""
             return self.run(
                 query=query,
                 key=key,
@@ -375,6 +376,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
             kv_len = 512
 
         def _largest_pow2_divisor(n: int, *, max_block: int = 512) -> int:
+            """Return the largest power-of-2 divisor of n that is <= max_block."""
             n = max(1, int(n))
             for b in (512, 256, 128, 64, 32, 16, 8, 4, 2, 1):
                 if b <= max_block and b <= n and n % b == 0:

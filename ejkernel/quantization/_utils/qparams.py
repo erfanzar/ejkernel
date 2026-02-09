@@ -33,7 +33,21 @@ KernelFamily = Literal["gemm", "gemm_splitk", "gemv_splitk", "gemv_revsplitk"]
 
 
 def normalize_axis(axis: str | None, *, default: QuantizationAxis = "row") -> QuantizationAxis:
-    """Normalize quantization axis name."""
+    """Normalize and validate the quantization axis name.
+
+    Converts the axis string to lowercase and validates it against the
+    allowed set of axis names.
+
+    Args:
+        axis: Axis name string, or None to use the default.
+        default: Default axis to return when axis is None.
+
+    Returns:
+        Normalized axis name, either "row" or "col".
+
+    Raises:
+        ValueError: If axis is not one of {"row", "col"}.
+    """
     if axis is None:
         return default
     axis = axis.lower()
@@ -46,9 +60,23 @@ def normalize_mode_and_bits(
     mode: str,
     bits: int | None,
 ) -> tuple[QuantizationMode, int | None, bool]:
-    """Normalize explicit quantization mode and optional bits.
+    """Normalize and validate explicit quantization mode and optional bit-width.
 
-    Returns canonical (mode, bits, used_legacy_alias).
+    Converts mode to lowercase and checks it against the set of supported
+    modes. Ambiguous shorthand names ("mxfp", "nvfp") are rejected with
+    a helpful error message.
+
+    Args:
+        mode: Quantization mode string (case-insensitive). Must be one of
+            {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}.
+        bits: Optional bit-width override. Converted to int if provided.
+
+    Returns:
+        Tuple of (canonical_mode, bits, used_legacy_alias) where
+        used_legacy_alias is always False for current modes.
+
+    Raises:
+        ValueError: If mode is ambiguous ("mxfp", "nvfp") or unsupported.
     """
     mode = mode.lower()
     if mode in {"mxfp", "nvfp"}:
@@ -67,13 +95,29 @@ def resolve_qparams(
     group_size: int | None,
     bits: int | None,
 ) -> tuple[QuantizationMode, int, int, bool]:
-    """Resolve explicit mode, bit-width, and group-size.
+    """Resolve and validate the full set of quantization parameters.
 
-    Rules:
-      - affine: bits in {4,8}, group_size in {32,64,128}
-      - nf4: bits fixed to 4, group_size in {32,64,128}
-      - mxfp4/mxfp8: group_size=32
-      - nvfp4/nvfp8: group_size=16
+    Applies mode-specific defaults and constraints for bit-width and
+    group-size, raising clear errors when user-supplied values violate
+    the rules for the chosen quantization mode.
+
+    Mode-specific rules:
+        - affine: bits in {4, 8} (default 4), group_size in {32, 64, 128} (default 64).
+        - nf4: bits fixed to 4, group_size in {32, 64, 128} (default 64).
+        - mxfp4 / mxfp8: bits fixed to 4 or 8 respectively, group_size must be 32.
+        - nvfp4 / nvfp8: bits fixed to 4 or 8 respectively, group_size must be 16.
+
+    Args:
+        mode: Quantization mode string (passed through normalize_mode_and_bits).
+        group_size: Number of elements per quantization group, or None for
+            mode-specific default.
+        bits: Bit-width for quantized values, or None for mode-specific default.
+
+    Returns:
+        Tuple of (mode, group_size, bits, used_legacy_alias).
+
+    Raises:
+        ValueError: If group_size or bits are invalid for the chosen mode.
     """
     mode, bits, used_legacy = normalize_mode_and_bits(mode, bits)
 
@@ -106,16 +150,35 @@ def resolve_qparams(
 
 
 def to_backend_mode(mode: QuantizationMode, bits: int) -> BackendQuantizationMode:
-    """Map explicit mode to backend mode key.
+    """Map a user-facing quantization mode to the backend mode key.
 
-    The ``bits`` parameter is accepted for backward compatibility and ignored.
+    In the current implementation, the backend mode is identical to the
+    user-facing mode. The ``bits`` parameter is accepted for backward
+    compatibility but is ignored.
+
+    Args:
+        mode: User-facing quantization mode.
+        bits: Bit-width (ignored; kept for API compatibility).
+
+    Returns:
+        Backend quantization mode string, identical to the input mode.
     """
     del bits
     return mode
 
 
 def normalize_gemv_mode(mode: str | None) -> GemvMode:
-    """Normalize GEMV dispatch override mode."""
+    """Normalize and validate the GEMV dispatch override mode.
+
+    Args:
+        mode: GEMV mode string ("auto", "on", "off"), or None for "auto".
+
+    Returns:
+        Normalized GEMV mode string.
+
+    Raises:
+        ValueError: If mode is not one of {"auto", "on", "off"}.
+    """
     if mode is None:
         return "auto"
     norm = str(mode).lower()
@@ -125,7 +188,17 @@ def normalize_gemv_mode(mode: str | None) -> GemvMode:
 
 
 def normalize_revsplitk_mode(mode: str | None) -> RevSplitKMode:
-    """Normalize reverse split-K dispatch override mode."""
+    """Normalize and validate the reverse split-K dispatch override mode.
+
+    Args:
+        mode: Reverse split-K mode string ("auto", "on", "off"), or None for "auto".
+
+    Returns:
+        Normalized reverse split-K mode string.
+
+    Raises:
+        ValueError: If mode is not one of {"auto", "on", "off"}.
+    """
     if mode is None:
         return "auto"
     norm = str(mode).lower()
@@ -135,9 +208,19 @@ def normalize_revsplitk_mode(mode: str | None) -> RevSplitKMode:
 
 
 def normalize_revsplitk_parts(parts: int | None) -> int | None:
-    """Normalize optional reverse split-K partition count.
+    """Normalize and validate the optional reverse split-K partition count.
 
-    Only powers of two in {1,2,4,8,16} are supported.
+    Only small powers of two are supported to ensure efficient GPU utilization.
+
+    Args:
+        parts: Number of split-K partitions, or None to leave unset.
+            Must be one of {1, 2, 4, 8, 16} if provided.
+
+    Returns:
+        Validated partition count as int, or None if not provided.
+
+    Raises:
+        ValueError: If parts is not one of {1, 2, 4, 8, 16}.
     """
     if parts is None:
         return None
@@ -148,7 +231,19 @@ def normalize_revsplitk_parts(parts: int | None) -> int | None:
 
 
 def is_effective_4bit_mode(mode: QuantizationMode, bits: int) -> bool:
-    """Return whether the effective runtime quantization is 4-bit."""
+    """Check whether the effective runtime quantization is 4-bit.
+
+    For affine mode, the bit-width is user-configurable and may be 4 or 8.
+    For other modes, the effective bit-width is determined by the mode name
+    (e.g., nf4, mxfp4, nvfp4 are all 4-bit).
+
+    Args:
+        mode: Quantization mode.
+        bits: Bit-width parameter (only used for affine mode).
+
+    Returns:
+        True if the runtime quantization uses 4-bit values, False otherwise.
+    """
     if mode == "affine":
         return int(bits) == 4
     return mode in {"nf4", "mxfp4", "nvfp4"}
@@ -163,14 +258,35 @@ def select_qmm_kernel_family(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ) -> tuple[KernelFamily, int | None]:
-    """Select QMM kernel family using GemLite-style policy.
+    """Select the quantized matmul kernel family using a GemLite-style policy.
 
-    Policy:
-      - M > 64 -> gemm
-      - 1 < M <= 64 -> gemm_splitk
-      - M == 1 -> GEMV family
-        - 4-bit effective mode: gemv_revsplitk (auto)
-        - 8-bit effective mode: gemv_splitk (auto)
+    The selection policy considers the activation batch dimension (M), the
+    effective bit-width, and user overrides (gemv_mode, revsplit_k) to choose
+    the best kernel family for the workload.
+
+    Selection policy:
+        - M > 64: "gemm" (standard batched GEMM).
+        - 1 < M <= 64: "gemm_splitk" (split-K GEMM for moderate batch).
+        - M == 1 with MX modes: "gemm_splitk" (MX paths use GEMM-SplitK for M=1).
+        - M == 1, 4-bit effective: "gemv_revsplitk" (reverse split-K GEMV).
+        - M == 1, 8-bit effective: "gemv_splitk" (split-K GEMV).
+
+    Args:
+        m: Activation leading dimension (batch size for matmul). Must be >= 1.
+        mode: Quantization mode.
+        bits: Bit-width parameter.
+        gemv_mode: GEMV dispatch override ("auto", "on", "off").
+        revsplit_k: Reverse split-K override ("auto", "on", "off").
+        revsplit_k_parts: Number of reverse split-K partitions, or None.
+
+    Returns:
+        Tuple of (kernel_family, revsplitk_parts) where kernel_family is one
+        of {"gemm", "gemm_splitk", "gemv_splitk", "gemv_revsplitk"} and
+        revsplitk_parts is the number of partitions (or None if not applicable).
+
+    Raises:
+        ValueError: If m < 1, gemv_mode="on" with M != 1, or revsplit_k="on"
+            with a non-4-bit mode.
     """
     m = int(m)
     if m <= 0:
@@ -216,13 +332,25 @@ def resolve_runtime_axis_and_transpose(
     axis: str | None,
     transpose: bool,
 ) -> tuple[QuantizationAxis, bool]:
-    """Resolve runtime axis and transpose consistency.
+    """Resolve runtime quantization axis and ensure transpose consistency.
 
-    Runtime mapping:
-      - axis='row' -> transpose=False
-      - axis='col' -> transpose=True
+    Enforces the bidirectional mapping between axis and transpose:
+        - axis="row" requires transpose=False (no transpose needed).
+        - axis="col" requires transpose=True (weight is transposed).
 
-    If axis is omitted, transpose drives axis.
+    When axis is omitted (None), the transpose flag determines the axis.
+
+    Args:
+        axis: Quantization axis string ("row" or "col"), or None to
+            infer from the transpose flag.
+        transpose: Whether the weight matrix is transposed at runtime.
+
+    Returns:
+        Tuple of (resolved_axis, resolved_transpose).
+
+    Raises:
+        ValueError: If axis and transpose are inconsistent (e.g.,
+            axis="row" with transpose=True).
     """
     if axis is None:
         return ("col" if transpose else "row"), transpose
@@ -239,11 +367,22 @@ def resolve_runtime_axis_and_transpose(
 
 
 def resolve_prepack_axis(*, axis: str | None, transpose: bool) -> QuantizationAxis:
-    """Resolve axis for prepack API.
+    """Resolve the quantization axis for the prepack API.
 
-    Backward-compatible mapping (when axis is omitted):
-      - transpose=True  -> axis='row'
-      - transpose=False -> axis='col'
+    When axis is explicitly provided, it is normalized and returned directly.
+    When axis is omitted (None), the transpose flag provides backward-compatible
+    axis inference:
+        - transpose=True maps to axis="row" (legacy default).
+        - transpose=False maps to axis="col".
+
+    Args:
+        axis: Explicit axis string ("row" or "col"), or None to infer
+            from the transpose flag.
+        transpose: Legacy transpose flag used for axis inference when
+            axis is None.
+
+    Returns:
+        Resolved quantization axis, either "row" or "col".
     """
     if axis is not None:
         return normalize_axis(axis)

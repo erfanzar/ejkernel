@@ -171,6 +171,20 @@ def _blockwise_attention_bwd(
     )
 
     def scan_attention(carry, scan):
+        """Process backward for one query chunk against all KV chunks.
+
+        Iterates over all KV chunks to compute gradient contributions dQ
+        for this query chunk, while accumulating dK and dV across all
+        query chunks.
+
+        Args:
+            carry: Tuple of (dk, dv) gradient accumulators for KV.
+            scan: Tuple of (q_chunk, dq_chunk, g_chunk, output_chunk,
+                denominator_chunk, max_score_chunk, q_chunk_idx).
+
+        Returns:
+            Updated (dk, dv) carry and dq_chunk for this query chunk.
+        """
         dk, dv = carry
         (
             q_chunk,
@@ -185,6 +199,18 @@ def _blockwise_attention_bwd(
 
         @partial(jax.checkpoint, prevent_cse=prevent_cse, policy=policy)
         def scan_kv_block(carry, scan):
+            """Compute backward gradients for one query-KV chunk pair.
+
+            Recomputes attention weights from the forward pass, then uses
+            them to compute dQ, dK, and dV contributions for this chunk pair.
+
+            Args:
+                carry: Running dq_chunk accumulator for this query chunk.
+                scan: Tuple of (k_chunk, value_chunk, k_chunk_idx).
+
+            Returns:
+                Updated dq_chunk carry and (dk_chunk, dv_chunk) outputs.
+            """
             k_chunk, value_chunk, k_chunk_idx = scan
             dq_chunk = carry
             attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / softmax_scale
@@ -218,6 +244,19 @@ def _blockwise_attention_bwd(
             )
 
         def skip_upper_half(carry, args):
+            """Conditionally skip KV blocks above the causal diagonal in backward.
+
+            For causal attention without explicit position IDs, checks whether
+            the query-KV block pair falls below or on the causal diagonal.
+            If above, returns zero gradients to avoid unnecessary computation.
+
+            Args:
+                carry: Running dq_chunk accumulator.
+                args: Tuple of (key_chunk, value_chunk, k_chunk_idx).
+
+            Returns:
+                Updated carry and (dk_chunk, dv_chunk) outputs (zeros if skipped).
+            """
             _key_chunk, _value_chunk, k_chunk_idx = args
             should_run = jnp.array(True)
             if causal_block_size is not None and not use_positions:
@@ -349,6 +388,21 @@ def _ring_attention_bwd(
     use_positions = q_position_ids is not None and kv_position_ids is not None
 
     def scan_kv_block(carry, idx):
+        """Process one ring step backward: compute local gradients and rotate.
+
+        Computes blockwise backward attention between the local query shard
+        and the current KV shard, then rotates KV blocks and their gradients
+        to the next device in the ring using collective ppermute.
+
+        Args:
+            carry: Tuple of (dq, dk, dv, key, value, kv_segment_ids,
+                kv_position_ids).
+            idx: Ring step index (0 to axis_size - 1).
+
+        Returns:
+            Updated carry with rotated KV/gradient blocks and accumulated
+            gradients, and None (no per-step output).
+        """
         dq, dk, dv, key, value, kv_segment_ids, kv_position_ids = carry
         axis_idx = lax.axis_index(axis_name) if axis_name is not None else 0
         q_block_idx = axis_idx
@@ -387,6 +441,15 @@ def _ring_attention_bwd(
         )
 
         def _ppermute_or_none(x):
+            """Rotate a tensor to the next device in the ring, or pass through.
+
+            Args:
+                x: Array to rotate, or None.
+
+            Returns:
+                Rotated array if axis_name is set and x is not None,
+                otherwise x unchanged.
+            """
             if axis_name is None or x is None:
                 return x
             return lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)])

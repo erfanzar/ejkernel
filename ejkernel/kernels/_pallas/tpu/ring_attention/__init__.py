@@ -28,7 +28,7 @@ Features:
 """
 
 from ._interface import ring_attention
-from ._ring_splash import (
+from ._pallas_impl_bwd import (
     RING_AXIS,
     BlockSizes,
     RingSplashAttentionKernel,

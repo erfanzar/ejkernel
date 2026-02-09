@@ -154,6 +154,7 @@ class FlashAttentionConfig(BaseOperationConfig):
     bwd_params: BwdParams | None = None
 
     def __post_init__(self):
+        """Convert dict-typed forward/backward params to FwdParams/BwdParams."""
         if isinstance(self.fwd_params, dict):
             self.fwd_params = FwdParams(**self.fwd_params)
         if isinstance(self.bwd_params, dict):
@@ -167,14 +168,17 @@ class BlockSparseAttentionConfig(BaseOperationConfig):
     """Configuration for Block Sparse Attention operation.
 
     Args:
-        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
-        backend: Backend specification (default: "any")
+        fwd_params: Forward kernel parameters (q/kv block sizes, warps, stages).
+        bwd_params: Backward kernel parameters (q/kv block sizes, warps, stages).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
     """
 
     fwd_params: FwdParams | None = None
     bwd_params: BwdParams | None = None
 
     def __post_init__(self):
+        """Convert dict-typed forward/backward params to FwdParams/BwdParams."""
         if isinstance(self.fwd_params, dict):
             self.fwd_params = FwdParams(**self.fwd_params)
         if isinstance(self.bwd_params, dict):
@@ -246,6 +250,7 @@ class RingAttentionConfig(BaseOperationConfig):
     bwd_params: BwdParams | None = None
 
     def __post_init__(self):
+        """Convert dict-typed forward/backward params to FwdParams/BwdParams."""
         if isinstance(self.fwd_params, dict):
             self.fwd_params = FwdParams(**self.fwd_params)
         if isinstance(self.bwd_params, dict):
@@ -448,6 +453,7 @@ class RaggedDecodeAttentionConfig(BaseOperationConfig):
     fwd_params: FwdParams | None = None
 
     def __post_init__(self):
+        """Convert dict-typed forward params to FwdParams."""
         if isinstance(self.fwd_params, dict):
             self.fwd_params = FwdParams(**self.fwd_params)
 

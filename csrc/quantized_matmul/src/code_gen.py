@@ -98,18 +98,30 @@ DISPATCH_HEADER_PREAMBLE = """#pragma once
 
 @dataclass(frozen=True)
 class Kernel:
+    """A single quantized-matmul dequantization kernel variant.
+
+    Attributes:
+        kind: Quantization family (``"affine"``, ``"nf4"``, ``"mxfp4"``,
+            ``"mxfp8"``, ``"nvfp4"``, or ``"nvfp8"``).
+        bits: Bit width of the quantized representation, or ``None``.
+        dtype: Scale/bias data-type key (``"f32"``, ``"f16"``, ``"bf16"``),
+            or ``None`` for format-native types.
+    """
+
     kind: str
     bits: int | None
     dtype: str | None
 
     @property
     def ctype(self) -> str:
+        """Return the CUDA C type string for this kernel's dtype."""
         if self.dtype is None:
             return ""
         return DTYPE_MAP[self.dtype]
 
     @property
     def func_name(self) -> str:
+        """Return the C function name for this dequantization kernel."""
         if self.kind == "affine":
             return f"LaunchDequantAffineBits{self.bits}{DTYPE_SUFFIX[self.dtype]}"
         if self.kind == "nf4":
@@ -126,6 +138,7 @@ class Kernel:
 
     @property
     def filename(self) -> str:
+        """Derive the output ``.cu`` filename from this kernel's parameters."""
         if self.kind == "affine":
             return f"qmm_dequant_affine_bits{self.bits}_{self.dtype}.cu"
         if self.kind == "nf4":
@@ -133,6 +146,7 @@ class Kernel:
         return f"qmm_dequant_{self.kind}.cu"
 
     def signature(self) -> str:
+        """Return the C function signature string for this kernel."""
         if self.kind == "affine":
             return (
                 f"const uint32_t *wq, const {self.ctype} *scales, "
@@ -153,6 +167,7 @@ class Kernel:
         )
 
     def gs_func_name(self, group_size: int) -> str:
+        """Return the group-size-specialized C function name."""
         if self.kind == "affine":
             return (
                 f"LaunchDequantAffineBits{self.bits}"
@@ -163,6 +178,7 @@ class Kernel:
         raise ValueError(f"Group size specialization not supported: {self.kind}")
 
     def render(self) -> str:
+        """Render the full C++ source file content for this kernel."""
         if self.kind == "affine":
             gs_wrappers = []
             for group_size in GROUP_SIZES:
@@ -241,6 +257,7 @@ class Kernel:
 
 
 def iter_kernels() -> list[Kernel]:
+    """Build and return the list of all dequantization kernel variants."""
     kernels: list[Kernel] = []
     for bits in AFFINE_BITS:
         for dtype in AFFINE_DTYPES:
@@ -255,6 +272,11 @@ def iter_kernels() -> list[Kernel]:
 
 
 def _write_if_changed(path: Path, content: str) -> bool:
+    """Write *content* to *path* only if it differs from the existing file.
+
+    Returns:
+        ``True`` if the file was written, ``False`` if it was already up to date.
+    """
     if path.exists() and path.read_text() == content:
         return False
     path.write_text(content)
@@ -262,6 +284,7 @@ def _write_if_changed(path: Path, content: str) -> bool:
 
 
 def _render_dispatch_header(kernels: list[Kernel]) -> str:
+    """Render the ``qmm_dequant_dispatch.h`` header with declarations and resolve functions."""
     lines = [PRELUDE, DISPATCH_HEADER_PREAMBLE]
     for kernel in kernels:
         lines.append(f"void {kernel.func_name}({kernel.signature()});\n")
@@ -336,6 +359,11 @@ def _render_dispatch_header(kernels: list[Kernel]) -> str:
 
 
 def generate(output_dir: Path) -> int:
+    """Write all generated ``.cu`` and dispatch header files into *output_dir*.
+
+    Returns:
+        The number of files that were actually written (changed).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     kernels = iter_kernels()
     count = 0
@@ -350,6 +378,7 @@ def generate(output_dir: Path) -> int:
 
 
 def main() -> None:
+    """Parse CLI arguments and generate quantized matmul dequantization stubs."""
     parser = argparse.ArgumentParser(
         prog="code_gen",
         description="Generate quantized matmul dequantization instantiation stubs.",

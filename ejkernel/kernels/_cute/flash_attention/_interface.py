@@ -12,7 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe Flash Attention public interface."""
+"""CuTe Flash Attention public interface.
+
+This module exposes :func:`flash_attention`, the top-level entry point for
+running Flash Attention on NVIDIA GPUs through a CuTe DSL kernel. The
+implementation supports:
+
+* Forward and backward passes with JAX ``custom_vjp``.
+* Both fixed-length and variable-length (ragged) batches via cumulative
+  sequence lengths.
+* Optional attention mask, additive bias, causal masking, sliding-window
+  attention, logits soft-capping, and attention-sink auxiliary weights.
+* Paged KV cache support (forward-only; backward raises an error).
+
+When the input configuration falls outside the capabilities of the CuTe
+path (e.g., unsupported dtype, dropout, segment IDs, or non-default
+precision), the function raises an ``EjkernelRuntimeError``.
+"""
 
 from __future__ import annotations
 
@@ -221,7 +237,29 @@ def _flash_attention_call(
     block_tables: jax.Array | None,
     softmax_aux: jax.Array | None,
 ) -> jax.Array:
-    """Differentiable CuTe Flash Attention call with custom backward behavior."""
+    """Differentiable CuTe Flash Attention call with custom VJP.
+
+    This function is decorated with :func:`jax.custom_vjp` so that the
+    forward and backward passes use the specialized CuTe DSL kernels
+    defined in :mod:`._cute_impl`.
+
+    Args:
+        query: Query tensor, rank-4 ``(batch, seq_len_q, num_heads, head_dim)``.
+        key: Key tensor (dense or paged).
+        value: Value tensor (dense or paged).
+        attention_mask: Optional boolean/integer attention mask.
+        bias: Optional additive bias.
+        softmax_scale: Softmax scaling factor, or ``None``.
+        causal: Whether to apply causal masking.
+        sliding_window: Sliding-window specification, or ``None``.
+        fwd_params: Optional forward-pass tuning parameters.
+        logits_soft_cap: Logits soft-cap value, or ``None``.
+        block_tables: Optional paged-KV block table.
+        softmax_aux: Optional attention-sink auxiliary weights.
+
+    Returns:
+        Attention output tensor with the same shape as *query*.
+    """
     return flash_attention_cute_forward(
         query=query,
         key=key,
@@ -252,7 +290,16 @@ def _flash_attention_call_fwd(
     block_tables: jax.Array | None,
     softmax_aux: jax.Array | None,
 ) -> tuple[jax.Array, tuple]:
-    """Custom-VJP forward rule for CuTe Flash Attention."""
+    """Custom VJP forward rule for CuTe Flash Attention.
+
+    Runs the CuTe forward kernel and saves the input tensors as
+    residuals for the backward pass.
+
+    Returns:
+        A tuple ``(out, residual)`` where *out* is the attention output
+        and *residual* contains (query, key, value, attention_mask, bias,
+        block_tables, softmax_aux).
+    """
     out = flash_attention_cute_forward(
         query=query,
         key=key,
@@ -280,7 +327,20 @@ def _flash_attention_call_bwd(
     residual: tuple,
     d_out: jax.Array,
 ) -> tuple[jax.Array | None, jax.Array | None, jax.Array | None, None, None, None, None]:
-    """Custom-VJP backward rule for CuTe Flash Attention."""
+    """Custom VJP backward rule for CuTe Flash Attention.
+
+    Unpacks the residual tuple saved by the forward rule and computes
+    gradients with respect to query, key, and value via
+    :func:`flash_attention_cute_backward`. Gradients for attention_mask,
+    bias, block_tables, and softmax_aux are returned as ``None``.
+
+    Returns:
+        A 7-tuple ``(dq, dk, dv, None, None, None, None)``.
+
+    Raises:
+        EjkernelRuntimeError: If *block_tables* is not ``None``, since
+            paged-KV backward is not supported.
+    """
     del fwd_params
     query, key, value, attention_mask, bias, block_tables, softmax_aux = residual
     if block_tables is not None:
@@ -335,10 +395,54 @@ def flash_attention(
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
     block_tables: BlockTables | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    """Compute flash attention on the CuTe backend.
+    """Compute scaled dot-product attention using the CuTe DSL kernel.
 
-    Dense mode supports custom backward. Paged-KV mode is forward-only and
-    raises an explicit runtime error if differentiated.
+    This is the top-level public entry point registered with the ejKernel
+    kernel registry under ``("flash_attention", Platform.CUTE, Backend.GPU)``.
+    Dense mode supports both forward and backward passes via a custom VJP
+    rule. Paged-KV mode is forward-only and raises an explicit runtime
+    error if differentiated.
+
+    The CuTe path requires ``float16``, ``bfloat16``, or ``float32``
+    inputs, no dropout, ``DEFAULT`` precision, and ``float32`` logits
+    dtype. Any deviation raises an ``EjkernelRuntimeError``.
+
+    Args:
+        query: Query tensor of shape
+            ``(batch, seq_len_q, num_heads, head_dim)``.
+        key: Key tensor (dense or paged KV cache).
+        value: Value tensor (dense or paged KV cache).
+        attention_mask: Optional boolean or integer mask of shape
+            ``(batch, [num_heads,] seq_len_q, seq_len_k)``.
+        bias: Optional additive bias of shape
+            ``(batch, num_heads, seq_len_q, seq_len_k)``.
+        softmax_scale: Multiplicative scaling applied to QK^T before
+            softmax. Defaults to ``head_dim ** -0.5`` when ``None``.
+        dropout_prob: Dropout probability. Must be ``0.0`` for CuTe.
+        causal: Whether to apply causal masking.
+        dropout_seed: Unused; accepted for API compatibility.
+        cum_seqlens_q: Cumulative query sequence lengths for
+            variable-length batches, or ``None``.
+        cum_seqlens_k: Cumulative key sequence lengths, or ``None``.
+        sliding_window: Sliding-window size, or ``None``.
+        fwd_params: Optional forward-pass tuning parameters.
+        bwd_params: Unused; accepted for API compatibility.
+        logits_soft_cap: Logits soft-cap value, or ``None``.
+        softmax_aux: Optional attention-sink auxiliary weights.
+        normalize_output: Must be ``True`` for CuTe.
+        precision: JAX precision enum. Must be ``DEFAULT`` for CuTe.
+        logits_dtype: Dtype for logits computation. Must be ``float32``.
+        q_segment_ids: Not supported by CuTe; must be ``None``.
+        kv_segment_ids: Not supported by CuTe; must be ``None``.
+        block_tables: Optional paged-KV block table (keyword-only).
+
+    Returns:
+        Attention output tensor of shape
+        ``(batch, seq_len_q, num_heads, head_dim)``.
+
+    Raises:
+        EjkernelRuntimeError: If inputs have unsupported dtypes or
+            configuration (dropout, segment IDs, non-default precision).
     """
     del dropout_seed, bwd_params
     _validate_qkv_shapes(query, key, value, block_tables=block_tables)

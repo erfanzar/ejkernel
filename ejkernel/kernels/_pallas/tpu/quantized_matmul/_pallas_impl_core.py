@@ -12,7 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared TPU Pallas core for quantized matmul forward and input-grad paths."""
+"""Shared TPU Pallas core utilities for quantized matrix multiplication.
+
+This module contains the low-level building blocks shared between the forward
+and input-gradient TPU Pallas kernels for quantized matrix multiplication. It
+provides bit-unpacking, dequantization, block normalization, legality checks,
+predecoded weight caching, and a generic dense Pallas matmul.
+
+Key Components:
+    - Bit packing/unpacking: ``_unpack_bits_4_8`` extracts 4-bit or 8-bit
+      quantized values from packed 32-bit words
+    - Dequantization: ``_dequantize_tile`` supports affine, NF4, MXFP4,
+      MXFP8, NVFP4, and NVFP8 quantization modes
+    - Predecode caching: ``get_predecoded_dense_weight`` materializes and
+      caches dense bf16 weights from quantized representations with an
+      LRU eviction policy
+    - BlockSpec legality: ``is_packed_tpu_legal_forward`` and
+      ``is_packed_tpu_legal_input_grad`` verify Mosaic TPU tiling constraints
+    - Dense matmul: ``pallas_dense_matmul`` provides a tiled Pallas kernel
+      for bf16 matrix multiplication with fp32 accumulation
+
+Environment Variables:
+    - EJKERNEL_QMM_TPU_PATH: Selects "hybrid", "packed", or "predecode"
+      execution path (default: "hybrid")
+    - EJKERNEL_QMM_TPU_PREDECODE_CACHE: Enable/disable predecode caching
+      (default: True)
+    - EJKERNEL_QMM_TPU_PREDECODE_CACHE_MAX_ITEMS: Max cached dense weights
+      (default: 2)
+    - EJKERNEL_QMM_TPU_MAX_PREDECODE_BYTES: Max bytes per predecode buffer
+      (default: 256 MiB)
+"""
 
 from __future__ import annotations
 
@@ -41,22 +70,69 @@ _PREDECODE_CACHE_LOCK = threading.Lock()
 
 
 def _ceil_div(a: int, b: int) -> int:
+    """Compute ceiling division of a by b.
+
+    Args:
+        a: Dividend.
+        b: Divisor (must be positive).
+
+    Returns:
+        The smallest integer >= a/b.
+    """
     return (a + b - 1) // b
 
 
 def _pad_2d(x: jax.Array, pad0: int, pad1: int) -> jax.Array:
+    """Zero-pad a 2D array along both dimensions.
+
+    Args:
+        x: Input 2D array.
+        pad0: Number of rows to pad at the bottom.
+        pad1: Number of columns to pad on the right.
+
+    Returns:
+        Padded array, or the original if both pads are zero.
+    """
     if pad0 == 0 and pad1 == 0:
         return x
     return jnp.pad(x, ((0, pad0), (0, pad1)))
 
 
 def _pad_2d_optional(x: jax.Array | None, pad0: int, pad1: int) -> jax.Array | None:
+    """Zero-pad a 2D array if it is not None.
+
+    Args:
+        x: Input 2D array or None.
+        pad0: Number of rows to pad at the bottom.
+        pad1: Number of columns to pad on the right.
+
+    Returns:
+        Padded array, or None if x is None.
+    """
     if x is None:
         return None
     return _pad_2d(x, pad0, pad1)
 
 
 def _normalize_tpu_blocks(block_m: int, block_n: int, block_k: int) -> tuple[int, int, int]:
+    """Round block dimensions up to TPU-friendly tile sizes.
+
+    Ensures block_m is a multiple of 8 (>= 8) for the sublane dimension,
+    and block_n/block_k are multiples of 128 (>= 128) for the lane dimension.
+    These constraints are required by the Mosaic TPU compiler for valid
+    BlockSpec tiling.
+
+    Args:
+        block_m: Desired M-dimension block size.
+        block_n: Desired N-dimension block size.
+        block_k: Desired K-dimension block size.
+
+    Returns:
+        Tuple of (block_m, block_n, block_k) rounded up to valid sizes.
+
+    Raises:
+        ValueError: If any block dimension is non-positive.
+    """
     if block_m <= 0 or block_n <= 0 or block_k <= 0:
         raise ValueError("block_m/block_n/block_k must be positive.")
     block_m = max(8, _ceil_div(block_m, 8) * 8)
@@ -66,8 +142,21 @@ def _normalize_tpu_blocks(block_m: int, block_n: int, block_k: int) -> tuple[int
 
 
 def _is_2d_blockspec_legal(block0: int, block1: int, dim0: int, dim1: int) -> bool:
-    # Mosaic TPU lowering requires: trailing dim % 128 == 0 (or equals full dim),
-    # second-to-trailing dim % 8 == 0 (or equals full dim).
+    """Check whether a 2D BlockSpec satisfies Mosaic TPU lowering constraints.
+
+    Mosaic requires the trailing dimension to be either the full dimension
+    or a multiple of 128, and the second-to-trailing dimension to be either
+    the full dimension or a multiple of 8.
+
+    Args:
+        block0: Block size for the first (sublane) dimension.
+        block1: Block size for the second (lane) dimension.
+        dim0: Full size of the first dimension after padding.
+        dim1: Full size of the second dimension after padding.
+
+    Returns:
+        True if the block spec is legal for TPU lowering.
+    """
     return (block1 == dim1 or block1 % 128 == 0) and (block0 == dim0 or block0 % 8 == 0)
 
 
@@ -82,6 +171,25 @@ def is_packed_tpu_legal_forward(
     block_n: int,
     block_k: int,
 ) -> bool:
+    """Check if the packed fused TPU Pallas path is legal for forward matmul.
+
+    Validates that quantization bit width, block dimensions, tensor shapes,
+    and Mosaic tiling constraints are all satisfied for the packed (fused
+    unpack + dequant + matmul) kernel path.
+
+    Args:
+        x: Activation tensor [M, K].
+        w_q: Packed quantized weight tensor [K, N // values_per_word].
+        scales: Per-group scale tensor [K, N // group_size].
+        group_size: Number of output elements per quantization group.
+        bits: Quantization bit width (must be 4 or 8).
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+
+    Returns:
+        True if all constraints are satisfied for the packed TPU path.
+    """
     if bits not in (4, 8):
         return False
     try:
@@ -130,6 +238,25 @@ def is_packed_tpu_legal_input_grad(
     block_n: int,
     block_k: int,
 ) -> bool:
+    """Check if the packed fused TPU Pallas path is legal for the input gradient.
+
+    Validates constraints for the backward pass dX = dY @ W^T using the
+    packed kernel. The contraction axis is N (output dimension of the forward
+    pass), so tiling constraints differ from the forward check.
+
+    Args:
+        dy: Upstream gradient tensor [M, N].
+        w_q: Packed quantized weight tensor [K, N // values_per_word].
+        scales: Per-group scale tensor [K, N // group_size].
+        group_size: Number of output elements per quantization group.
+        bits: Quantization bit width (must be 4 or 8).
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+
+    Returns:
+        True if all constraints are satisfied for the packed TPU dX path.
+    """
     if bits not in (4, 8):
         return False
     try:
@@ -169,6 +296,16 @@ def is_packed_tpu_legal_input_grad(
 
 
 def _parse_bool_env(name: str, default: bool) -> bool:
+    """Parse a boolean from an environment variable.
+
+    Args:
+        name: Environment variable name.
+        default: Value to return when the variable is unset.
+
+    Returns:
+        True if the env var is set to a truthy string (1/true/yes/y/on),
+        False otherwise.
+    """
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -176,6 +313,15 @@ def _parse_bool_env(name: str, default: bool) -> bool:
 
 
 def _parse_int_env(name: str, default: int) -> int:
+    """Parse a non-negative integer from an environment variable.
+
+    Args:
+        name: Environment variable name.
+        default: Value to return when the variable is unset or not parseable.
+
+    Returns:
+        Parsed integer clamped to >= 0, or *default* if unset/invalid.
+    """
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -187,6 +333,11 @@ def _parse_int_env(name: str, default: int) -> int:
 
 
 def get_qmm_tpu_path() -> str:
+    """Read the preferred QMM TPU execution path from the environment.
+
+    Returns:
+        One of "hybrid", "packed", or "predecode" (default: "hybrid").
+    """
     path = os.getenv("EJKERNEL_QMM_TPU_PATH", "hybrid").strip().lower()
     if path not in _QMM_PATHS:
         return "hybrid"
@@ -194,33 +345,89 @@ def get_qmm_tpu_path() -> str:
 
 
 def get_predecode_cache_enabled() -> bool:
+    """Check whether the predecoded dense weight LRU cache is enabled.
+
+    Returns:
+        True if caching is enabled (default: True).
+    """
     return _parse_bool_env("EJKERNEL_QMM_TPU_PREDECODE_CACHE", True)
 
 
 def get_predecode_cache_max_items() -> int:
+    """Return the maximum number of items in the predecode LRU cache.
+
+    Returns:
+        Max cached entries (default: 2).
+    """
     return _parse_int_env("EJKERNEL_QMM_TPU_PREDECODE_CACHE_MAX_ITEMS", _DEFAULT_PREDECODE_CACHE_MAX_ITEMS)
 
 
 def get_predecode_max_bytes() -> int:
+    """Return the maximum byte size allowed for a single predecoded weight buffer.
+
+    Returns:
+        Max bytes per predecoded buffer (default: 256 MiB).
+    """
     return _parse_int_env("EJKERNEL_QMM_TPU_MAX_PREDECODE_BYTES", _DEFAULT_PREDECODE_MAX_BYTES)
 
 
 def _decode_e2m1(code: jax.Array) -> jax.Array:
+    """Decode E2M1 (MXFP4) codes to float32 via lookup table.
+
+    Args:
+        code: Integer code array with values in [0, 7].
+
+    Returns:
+        Float32 array of decoded values.
+    """
     table, _ = _get_e2m1_table()
     return table[code.astype(jnp.int32)]
 
 
 def _decode_e4m3(code: jax.Array) -> jax.Array:
+    """Decode E4M3 (FP8) codes to float32 via lookup table.
+
+    Args:
+        code: Integer code array with values in [0, 255].
+
+    Returns:
+        Float32 array of decoded values.
+    """
     table, _ = _get_e4m3_table()
     return table[code.astype(jnp.int32)]
 
 
 def _decode_nf4(code: jax.Array) -> jax.Array:
+    """Decode NF4 (NormalFloat4) codes to float32 via lookup table.
+
+    Args:
+        code: Integer code array with values in [0, 15].
+
+    Returns:
+        Float32 array of decoded values.
+    """
     table = _get_nf4_table()
     return table[code.astype(jnp.int32)]
 
 
 def _unpack_bits_4_8(words: jax.Array, bits: int) -> jax.Array:
+    """Unpack 4-bit or 8-bit quantized values from packed 32-bit words.
+
+    Each 32-bit word contains ``32 // bits`` quantized values stored in
+    little-endian order. The function extracts each value using bit shifts
+    and masks, then reshapes the result to [K, N] where N is the number of
+    unpacked values.
+
+    Args:
+        words: Packed weight array [K, N_packed] of uint32 words.
+        bits: Quantization bit width (4 or 8).
+
+    Returns:
+        Unpacked uint32 code array [K, N_packed * (32 // bits)].
+
+    Raises:
+        ValueError: If bits is not 4 or 8.
+    """
     words = words.astype(jnp.uint32)
     if bits == 4:
         q = jnp.stack(
@@ -252,6 +459,19 @@ def _unpack_bits_4_8(words: jax.Array, bits: int) -> jax.Array:
 
 
 def _expand_groups(values: jax.Array, group_size: int, width: int) -> jax.Array:
+    """Repeat per-group values to match the full output width.
+
+    Each group value is broadcast to ``group_size`` consecutive elements
+    along the last axis, then truncated to ``width``.
+
+    Args:
+        values: Per-group array [K, num_groups].
+        group_size: Number of output elements per group.
+        width: Target output width (may be < num_groups * group_size).
+
+    Returns:
+        Expanded array [K, width].
+    """
     groups = values.shape[-1]
     expanded = jnp.broadcast_to(values[..., :, None], (*values.shape, group_size))
     return expanded.reshape(values.shape[0], groups * group_size)[:, :width]
@@ -264,6 +484,30 @@ def _dequantize_tile(
     mode: str,
     group_size: int,
 ) -> jax.Array:
+    """Dequantize an unpacked code tile to float32 using per-group scales.
+
+    Supports multiple quantization modes:
+    - "affine": ``code * scale + bias`` (optional additive bias)
+    - "nf4": NormalFloat4 lookup then multiply by scale
+    - "mxfp4": E2M1 lookup with power-of-2 exponent scale
+    - "mxfp8": E4M3 lookup with power-of-2 exponent scale
+    - "nvfp4": E2M1 values with E4M3-decoded scale
+    - "nvfp8": E4M3 values with E4M3-decoded scale
+
+    Args:
+        q: Unpacked code array [K, N] (uint32 codes).
+        scales: Per-group scale array [K, N // group_size].
+        biases: Optional per-group additive bias [K, N // group_size]
+            (used only in "affine" mode).
+        mode: Quantization mode string.
+        group_size: Number of output elements per quantization group.
+
+    Returns:
+        Dequantized float32 weight tile [K, N].
+
+    Raises:
+        ValueError: If *mode* is not recognised.
+    """
     width = q.shape[-1]
     if mode == "affine":
         vals = q.astype(jnp.int32).astype(jnp.float32)
@@ -309,6 +553,25 @@ def _predecode_dense_weight(
     bits: int,
     mode: str,
 ) -> jax.Array:
+    """Materialize a dense bfloat16 weight matrix from quantized representation.
+
+    Unpacks the packed weight, dequantizes to float32 using the specified
+    mode and scales, then casts to bfloat16 for TPU matmul.
+
+    Args:
+        w_q: Packed quantized weight [K, N_packed].
+        scales: Per-group scales [K, N // group_size].
+        biases: Optional per-group biases [K, N // group_size].
+        group_size: Elements per quantization group.
+        bits: Bit width (4 or 8).
+        mode: Quantization mode (e.g. "affine", "nf4").
+
+    Returns:
+        Dense bfloat16 weight [K, N].
+
+    Raises:
+        ValueError: If bits is not 4 or 8 or packed width is too small.
+    """
     if bits not in (4, 8):
         raise ValueError("TPU predecode path supports bits in {4, 8}.")
     n = scales.shape[-1] * group_size
@@ -322,6 +585,14 @@ def _predecode_dense_weight(
 
 
 def _device_key(arr: jax.Array) -> tuple | None:
+    """Extract a hashable device identifier from a JAX array for caching.
+
+    Args:
+        arr: JAX array whose device placement to identify.
+
+    Returns:
+        Tuple of (platform, device_id, device_str), or None if unavailable.
+    """
     try:
         dev = arr.device()
     except Exception:
@@ -336,10 +607,27 @@ def _device_key(arr: jax.Array) -> tuple | None:
 
 
 def _is_tracer(x: object) -> bool:
+    """Check whether *x* is a JAX abstract tracer (i.e. not a concrete value).
+
+    Args:
+        x: Object to check.
+
+    Returns:
+        True if *x* is a ``jax.core.Tracer`` instance.
+    """
     return isinstance(x, jax_core.Tracer)
 
 
 def _estimate_predecode_bytes(k: int, n: int) -> int:
+    """Estimate the memory footprint of a predecoded dense bfloat16 weight.
+
+    Args:
+        k: Number of rows (contraction dimension).
+        n: Number of columns (output dimension).
+
+    Returns:
+        Estimated byte count (k * n * 2 for bfloat16).
+    """
     return int(k) * int(n) * jnp.dtype(jnp.bfloat16).itemsize
 
 
@@ -352,6 +640,26 @@ def get_predecoded_dense_weight(
     bits: int,
     mode: str,
 ) -> jax.Array:
+    """Get or compute a dense bfloat16 weight from quantized tensors.
+
+    Uses a thread-safe LRU cache keyed on array identity, shape, dtype,
+    device, and quantization parameters. When caching is disabled or the
+    inputs are JAX tracers, the weight is computed eagerly without caching.
+
+    Args:
+        w_q: Packed quantized weight [K, N_packed].
+        scales: Per-group scales [K, N // group_size].
+        biases: Optional per-group biases (affine mode only).
+        group_size: Elements per quantization group.
+        bits: Quantization bit width (4 or 8).
+        mode: Quantization mode string.
+
+    Returns:
+        Dense bfloat16 weight [K, N].
+
+    Raises:
+        ValueError: If the predecoded buffer would exceed the byte cap.
+    """
     k = int(w_q.shape[0])
     n = int(scales.shape[-1]) * int(group_size)
     est_bytes = _estimate_predecode_bytes(k, n)
@@ -426,6 +734,32 @@ def pallas_dense_matmul(
     block_n: int,
     block_k: int,
 ) -> jax.Array:
+    """Tiled dense matrix multiplication on TPU via Pallas.
+
+    Computes ``lhs @ rhs`` (or ``lhs @ rhs.T`` when transpose_rhs=True)
+    using a 3D grid of (M, N, K) tiles with bfloat16 inputs and float32
+    accumulation. Both operands are padded to multiples of the block sizes
+    and the result is sliced back to the original dimensions.
+
+    Grid strategy:
+        - M and N dimensions are parallelised across TPU cores
+        - K dimension is accumulated sequentially within each core
+        - A VMEM scratch accumulator avoids repeated HBM round-trips
+
+    Args:
+        lhs: Left-hand-side activation [M, K].
+        rhs: Right-hand-side weight [K, N] or [N, K] if transposed.
+        transpose_rhs: If True, rhs has shape [N, K] and is transposed.
+        block_m: Tile size for M dimension.
+        block_n: Tile size for N dimension.
+        block_k: Tile size for K (contraction) dimension.
+
+    Returns:
+        Float32 result [M, N].
+
+    Raises:
+        ValueError: If contraction dimensions do not match.
+    """
     block_m, block_n, block_k = _normalize_tpu_blocks(block_m, block_n, block_k)
 
     m, k = lhs.shape

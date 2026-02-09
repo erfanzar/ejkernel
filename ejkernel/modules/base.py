@@ -194,6 +194,11 @@ class KernelConfig:
     priority: int = 0
 
     def __post_init__(self):
+        """Normalize backend when platform is XLA.
+
+        XLA handles backend selection internally, so backend is forced
+        to "any" when the platform is set to "xla".
+        """
         if self.platform == "xla":
             self.backend = "any"
 

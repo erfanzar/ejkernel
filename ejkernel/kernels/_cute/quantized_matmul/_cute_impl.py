@@ -249,7 +249,23 @@ def _exp2_from_e8m0(exp_code: cutlass.Uint32, *, loc=None):
 
 
 def _build_dequant_fn(*, mode: str, with_bias: bool):
-    """Build mode-specific dequantization callback used by fused QMM kernels."""
+    """Build a mode-specific dequantization callback used by fused QMM kernels.
+
+    Returns a callable ``(row_idx, group_idx, q_code, scales[, biases]) -> Float32``
+    that decodes a single quantized weight element according to the given
+    quantization mode.  Supported modes: ``affine`` (with bias), ``nf4``,
+    ``mxfp4``, ``mxfp8``, ``nvfp4``, ``nvfp8``.
+
+    Args:
+        mode: Quantization mode string (case-insensitive).
+        with_bias: Whether the dequantization uses per-group bias (affine mode).
+
+    Returns:
+        A dequantization callable suitable for use inside CuTe DSL kernels.
+
+    Raises:
+        ValueError: If *mode* is not recognised.
+    """
     mode = mode.lower()
     if with_bias and mode == "affine":
 
@@ -344,7 +360,7 @@ def _infer_output_shape(
     group_size: int,
     transpose: bool,
 ) -> tuple[int, int]:
-    """Infer fused QMM output shape from inputs."""
+    """Infer the ``(M, N)`` output shape of the fused QMM from input metadata."""
     m = int(x.shape[0])
     if transpose:
         n = int(scales.shape[0])
@@ -365,7 +381,21 @@ def _autotune_enabled() -> bool:
 
 
 def _candidate_tiles(block_m: int, block_n: int, block_k: int) -> list[tuple[int, int, int]]:
-    """Generate candidate tile triplets for fused QMM autotuning."""
+    """Generate candidate tile triplets for fused QMM autotuning.
+
+    Produces a deduplicated list of ``(tile_m, tile_n, tile_k)`` candidates
+    that fit within the shared-memory budget and are compatible with the
+    4x4 register tile used by the tiled SMEM kernel.  The list is capped
+    by ``EJKERNEL_CUTE_QMM_AUTOTUNE_MAX_CANDIDATES`` (default 6).
+
+    Args:
+        block_m: Requested M tile size.
+        block_n: Requested N tile size.
+        block_k: Requested K tile size.
+
+    Returns:
+        List of valid ``(tile_m, tile_n, tile_k)`` tuples.
+    """
     ttm, ttn = _THREAD_TILE_M, _THREAD_TILE_N
     candidates = [
         (block_m, block_n, block_k),
@@ -424,7 +454,31 @@ def _build_naive_qmm_host_fns(
     tile_n: int,
     tile_k: int,
 ):
-    """Build naive scalar fused dequant+matmul CuTe host launchers."""
+    """Build naive scalar fused dequant+matmul CuTe host launchers.
+
+    Creates a CuTe DSL kernel that fuses bit-unpacking, dequantization,
+    and GEMM using a simple scalar accumulation strategy.  Each thread
+    processes one or more ``(M, N)`` output elements in a strided loop,
+    iterating over the K dimension in tiles.  This is the fallback path
+    used when the tiled SMEM and MMA paths are not applicable.
+
+    Parallelization: 2-D grid ``(ceil(M/tile_m), ceil(N/tile_n))`` with
+    threads striding across the ``tile_m * tile_n`` tile area.
+
+    Args:
+        mode: Quantization mode (e.g. ``"affine"``, ``"nf4"``).
+        bits: Bit-width of quantized weights (e.g. 4, 8).
+        group_size: Number of elements per quantization group.
+        out_dtype: CUTLASS output dtype (e.g. ``cutlass.BFloat16``).
+        with_bias: Whether per-group dequantization bias is used.
+        transpose: Whether the quantized weight matrix is transposed.
+        tile_m: Output tile height.
+        tile_n: Output tile width.
+        tile_k: K-dimension tile size for the inner reduction loop.
+
+    Returns:
+        Tuple of ``(runtime_launcher, jax_stream_launcher)`` callables.
+    """
     dequant = _build_dequant_fn(mode=mode, with_bias=with_bias)
     threads = _threads_for_tile(tile_m, tile_n)
     tile_area = tile_m * tile_n
@@ -620,7 +674,35 @@ def _build_tiled_qmm_host_fns(
     tile_n: int,
     tile_k: int,
 ):
-    """Build tiled SMEM-based fused dequant+matmul CuTe host launchers."""
+    """Build tiled SMEM-based fused dequant+matmul CuTe host launchers.
+
+    Creates a CuTe DSL kernel that uses shared-memory staging with explicit
+    4x4 register tiling for the inner product.  Input activations (x) and
+    dequantized weights are cooperatively loaded into shared memory tiles,
+    then each thread computes a 4x4 register-resident accumulator block.
+    For NF4 mode, a shared-memory lookup table is used for fast decoding.
+
+    Parallelization: 2-D grid ``(ceil(M/tile_m), ceil(N/tile_n))`` with
+    ``threads = (tile_n/4, tile_m/4)``.
+
+    Args:
+        mode: Quantization mode (e.g. ``"affine"``, ``"nf4"``).
+        bits: Bit-width of quantized weights.
+        group_size: Number of elements per quantization group.
+        out_dtype: CUTLASS output dtype.
+        with_bias: Whether per-group dequantization bias is used.
+        transpose: Whether the quantized weight matrix is transposed.
+        tile_m: Output tile height (must be divisible by 4).
+        tile_n: Output tile width (must be divisible by 4).
+        tile_k: K-dimension tile size for shared-memory staging.
+
+    Returns:
+        Tuple of ``(runtime_launcher, jax_stream_launcher)`` callables.
+
+    Raises:
+        ValueError: If tile dimensions are not divisible by the 4x4 thread tile
+            or the resulting thread count is outside [32, 1024].
+    """
     dequant = _build_dequant_fn(mode=mode, with_bias=with_bias)
 
     ttm = _THREAD_TILE_M
@@ -1073,7 +1155,7 @@ def _make_mma_smem_layout(
     row_major: bool = True,
     copy_bits: int = 128,
 ):
-    """Create a swizzled SMEM layout for MMA, matching tensorop_gemm.py pattern."""
+    """Create a swizzled SMEM layout for MMA tiles, following the CUTLASS ``tensorop_gemm.py`` pattern."""
     major_size = tile_col if row_major else tile_row
     major_size = 64 if major_size >= 64 else major_size
     swizzle_bits = int(math.log2(major_size * dtype.width // copy_bits))
@@ -1155,7 +1237,7 @@ def _make_staged_smem_layout(
     row_major: bool = True,
     copy_bits: int = 128,
 ):
-    """Extend a 2-D swizzled SMEM layout to 3-D ``(row, col, stages)``."""
+    """Extend a 2-D swizzled SMEM layout to 3-D ``(row, col, stages)`` for pipelining."""
     atom_2d = _make_mma_smem_layout(tile_row, tile_col, dtype, row_major, copy_bits)
     return cute.tile_to_shape(atom_2d, (tile_row, tile_col, num_stages), (0, 1, 2))
 
@@ -1166,7 +1248,7 @@ def _make_gmem_tiled_copy_x(
     num_threads: int,
     copy_bits: int = 128,
 ):
-    """Create a ``CopyG2SOp`` tiled copy for async GMEM→SMEM of *x* activations.
+    """Create a ``CopyG2SOp`` tiled copy for async GMEM-to-SMEM of *x* activations.
 
     Follows the ``_make_gmem_tiled_copy_AB`` pattern from the CUTLASS
     Ampere ``tensorop_gemm.py`` example.  *x* is row-major ``(M, K)``
@@ -1176,7 +1258,16 @@ def _make_gmem_tiled_copy_x(
     verifier requires matching alignment on the GMEM source; this is
     satisfied because ``_fake_tensor_from_shaped`` in the FFI layer
     sets ``assumed_align=16`` (16 bytes = 128 bits), and JAX/XLA
-    guarantees ≥128-byte alignment for device buffers.
+    guarantees at least 128-byte alignment for device buffers.
+
+    Args:
+        out_dtype: Element type for the SMEM tile.
+        tile_k: K-dimension tile size.
+        num_threads: Number of threads per thread block.
+        copy_bits: Number of bits per cp.async copy (default 128).
+
+    Returns:
+        A ``TiledCopy`` object configured for async global-to-shared copies.
     """
     atom = cute.make_copy_atom(
         cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL),
@@ -1205,7 +1296,40 @@ def _build_mma_qmm_host_fns(
     tile_n: int,
     tile_k: int,
 ):
-    """Build MMA tensor-core fused dequant+matmul CuTe host launchers (SM80+)."""
+    """Build MMA tensor-core fused dequant+matmul CuTe host launchers (SM80+).
+
+    Creates a CuTe DSL kernel that leverages Ampere (SM80+) warp-level
+    MMA instructions (``MmaF16BF16Op``) for the inner GEMM.  Input
+    activations are cooperatively loaded into swizzled shared memory via
+    scalar stores, quantized weights are dequantized on-the-fly and stored
+    into shared memory in ``(N, K)`` layout, then SMEM-to-register copies
+    use ``LdMatrix`` operations for bank-conflict-free loads.  The
+    accumulator is written back through a shared-memory epilogue.
+
+    This is a single-stage (non-pipelined) kernel variant; for overlapped
+    data movement use ``_build_mma_pipelined_qmm_host_fns`` instead.
+
+    Parallelization: 2-D grid ``(ceil(M/tile_m), ceil(N/tile_n))`` with
+    128 threads (4 warps) per block.
+
+    Args:
+        mode: Quantization mode.
+        bits: Bit-width of quantized weights.
+        group_size: Quantization group size.
+        out_dtype: CUTLASS output dtype.
+        with_bias: Whether per-group bias is used.
+        transpose: Whether the weight matrix is transposed.
+        tile_m: Tile height (must be a multiple of 32).
+        tile_n: Tile width (must be a multiple of 32).
+        tile_k: K-dimension tile size (must be a multiple of 16).
+
+    Returns:
+        Tuple of ``(runtime_launcher, jax_stream_launcher)`` callables.
+
+    Raises:
+        ValueError: If tile dimensions are incompatible with the MMA atom
+            configuration.
+    """
     if not _validate_mma_tile(tile_m, tile_n, tile_k):
         raise ValueError(
             f"Tile ({tile_m}, {tile_n}, {tile_k}) incompatible with MMA config "
@@ -1737,7 +1861,41 @@ def _build_mma_pipelined_qmm_host_fns(
     tile_k: int,
     num_stages: int = _MMA_PIPELINE_STAGES,
 ):
-    """Build pipelined MMA tensor-core fused dequant+matmul (SM80+ cp.async)."""
+    """Build pipelined MMA tensor-core fused dequant+matmul (SM80+ cp.async).
+
+    Creates a CuTe DSL kernel that extends the single-stage MMA variant with
+    a multi-stage software pipeline.  Input activations are loaded via
+    ``cp.async`` (128-bit asynchronous global-to-shared-memory copies) into
+    a circular buffer of ``num_stages`` shared-memory slots, overlapping
+    data movement with MMA computation.  Quantized weights are dequantized
+    cooperatively and stored into the corresponding SMEM stage.
+
+    The pipeline structure follows the CUTLASS Ampere ``tensorop_gemm.py``
+    pattern: prologue prefetches ``num_stages - 1`` tiles, then the mainloop
+    issues future cp.async copies alongside MMA on already-loaded tiles.
+
+    Parallelization: 2-D grid ``(ceil(M/tile_m), ceil(N/tile_n))`` with
+    128 threads (4 warps) per block.
+
+    Args:
+        mode: Quantization mode.
+        bits: Bit-width of quantized weights.
+        group_size: Quantization group size.
+        out_dtype: CUTLASS output dtype.
+        with_bias: Whether per-group bias is used.
+        transpose: Whether the weight matrix is transposed.
+        tile_m: Tile height (must be a multiple of 32).
+        tile_n: Tile width (must be a multiple of 32).
+        tile_k: K-dimension tile size (must be a multiple of 16).
+        num_stages: Number of pipeline stages for the SMEM circular buffer.
+
+    Returns:
+        Tuple of ``(runtime_launcher, jax_stream_launcher)`` callables.
+
+    Raises:
+        ValueError: If tile dimensions are incompatible with the MMA atom
+            configuration.
+    """
     if not _validate_mma_tile(tile_m, tile_n, tile_k):
         raise ValueError(
             f"Tile ({tile_m}, {tile_n}, {tile_k}) incompatible with MMA config "
@@ -2521,7 +2679,30 @@ def _build_fused_qmm_host_fns(
     tile_n: int,
     tile_k: int,
 ):
-    """Build fused dequant+matmul CuTe host launchers (pipelined MMA → MMA → tiled → naive)."""
+    """Build fused dequant+matmul CuTe host launchers with automatic fallback.
+
+    Tries kernel variants in decreasing performance order:
+    pipelined MMA (cp.async) -> single-stage MMA -> tiled SMEM scalar -> naive
+    scalar.  Environment variables can force a specific path:
+
+    - ``EJKERNEL_CUTE_QMM_USE_NAIVE=1``: naive scalar only.
+    - ``EJKERNEL_CUTE_QMM_USE_TILED=1``: tiled SMEM scalar.
+    - ``EJKERNEL_CUTE_QMM_USE_MMA_SINGLE=1``: single-stage MMA (no pipeline).
+
+    Args:
+        mode: Quantization mode.
+        bits: Bit-width of quantized weights.
+        group_size: Quantization group size.
+        out_dtype: CUTLASS output dtype.
+        with_bias: Whether per-group bias is used.
+        transpose: Whether the weight matrix is transposed.
+        tile_m: Output tile height.
+        tile_n: Output tile width.
+        tile_k: K-dimension tile size.
+
+    Returns:
+        Tuple of ``(runtime_launcher, jax_stream_launcher)`` callables.
+    """
     kw = dict(
         mode=mode,
         bits=bits,
@@ -2608,7 +2789,25 @@ def _build_primitive_qmm_call(
     out_shape: jax.ShapeDtypeStruct,
     use_vmap_wrapper: bool = True,
 ) -> Callable[..., jax.Array]:
-    """Build a CuTe primitive fused-QMM call wrapper."""
+    """Build a CuTe primitive fused-QMM call wrapper.
+
+    Compiles the given CuTe host function into a JAX-callable primitive via
+    ``build_cute_ffi_call`` and optionally wraps it with a ``custom_vmap``
+    batching rule so that ``jax.vmap`` works out of the box.
+
+    Args:
+        jax_host_fn: A ``@cute.jit`` host launcher that accepts a CUDA stream
+            and CuTe tensors.
+        out_shape: Shape and dtype descriptor for the output array.
+        use_vmap_wrapper: Whether to wrap the call with an explicit batching
+            rule for ``jax.vmap`` compatibility.
+
+    Returns:
+        A callable that accepts JAX arrays and returns the QMM result.
+
+    Raises:
+        RuntimeError: If CuTe TVM-FFI support is not available or compilation fails.
+    """
     if not has_cute_ffi_support():
         raise RuntimeError(
             "CUTE quantized_matmul requires CuTe primitive support. "
@@ -2753,7 +2952,32 @@ def _benchmark_tile(
     tile: tuple[int, int, int],
     out_struct: jax.ShapeDtypeStruct,
 ) -> float:
-    """Benchmark one fused-QMM tile candidate and return mean runtime (ms)."""
+    """Benchmark one fused-QMM tile candidate and return mean wall-clock runtime.
+
+    Compiles and runs the kernel for the given tile configuration, performs
+    warmup iterations, then measures average execution time over multiple
+    iterations.  Tuning parameters are controlled via environment variables:
+    ``EJKERNEL_CUTE_QMM_AUTOTUNE_WARMUP`` (default 1) and
+    ``EJKERNEL_CUTE_QMM_AUTOTUNE_ITERS`` (default 3).
+
+    Args:
+        x: Input activation tensor.
+        w_q: Packed quantized weight tensor.
+        scales: Quantization scale tensor.
+        biases: Optional quantization bias tensor.
+        mode: Quantization mode.
+        bits: Bit-width of quantized weights.
+        group_size: Quantization group size.
+        transpose: Whether weights are transposed.
+        out_dtype: CUTLASS output dtype.
+        out_jax_dtype: JAX output dtype.
+        with_bias: Whether bias is present.
+        tile: ``(tile_m, tile_n, tile_k)`` candidate.
+        out_struct: Output shape/dtype descriptor.
+
+    Returns:
+        Mean execution time in milliseconds.
+    """
     bm, bn, bk = tile
     _, host_jax_fn = _build_fused_qmm_host_fns(
         mode=mode,
@@ -2847,7 +3071,34 @@ def _select_tile_config(
     block_k: int,
     out_struct: jax.ShapeDtypeStruct,
 ) -> tuple[int, int, int]:
-    """Choose the fused-QMM tile config, optionally via runtime autotune."""
+    """Choose the best fused-QMM tile configuration, optionally via runtime autotuning.
+
+    If autotuning is enabled (``EJKERNEL_CUTE_QMM_AUTOTUNE != 0``, the default)
+    and the inputs are concrete JAX arrays (not tracers), benchmarks several
+    candidate tile sizes and caches the fastest.  Otherwise returns the
+    requested tile configuration directly.  Results are cached per unique
+    combination of mode, shapes, dtypes, and requested tile.
+
+    Args:
+        x: Input activation tensor (used for shape/dtype and benchmarking).
+        w_q: Packed quantized weight tensor.
+        scales: Quantization scale tensor.
+        biases: Optional quantization bias tensor.
+        mode: Quantization mode.
+        bits: Bit-width of quantized weights.
+        group_size: Quantization group size.
+        transpose: Whether weights are transposed.
+        out_dtype: CUTLASS output dtype.
+        out_jax_dtype: JAX output dtype.
+        with_bias: Whether bias is present.
+        block_m: Requested M tile size.
+        block_n: Requested N tile size.
+        block_k: Requested K tile size.
+        out_struct: Output shape/dtype descriptor.
+
+    Returns:
+        Best ``(tile_m, tile_n, tile_k)`` configuration.
+    """
     requested = (
         _normalize_block(block_m, _DEFAULT_BLOCK_M),
         _normalize_block(block_n, _DEFAULT_BLOCK_N),
@@ -2929,7 +3180,40 @@ def get_cute_qmm_call(
     block_n: int = _DEFAULT_BLOCK_N,
     block_k: int = _DEFAULT_BLOCK_K,
 ) -> Callable[..., jax.Array]:
-    """Build a fused dequant+matmul CuTe primitive wrapper."""
+    """Build a fused dequant+matmul CuTe primitive wrapper.
+
+    This is the main entry point for CuTe-backed quantized matrix
+    multiplication.  It selects the kernel family (fused GEMM or
+    GEMV with reverse split-K), chooses tile dimensions via autotuning,
+    compiles the appropriate CuTe DSL kernel, and returns a callable
+    that performs ``out = x @ dequant(w_q, scales[, biases])``.
+
+    The compiled kernel and its CuTe FFI primitive are cached so that
+    repeated calls with the same configuration reuse the compiled artefact.
+
+    Args:
+        x: Input activation tensor, shape ``[M, K]``.
+        w_q: Packed quantized weights, shape depends on *transpose* and *bits*.
+        scales: Per-group quantization scales.
+        biases: Optional per-group quantization biases (affine mode).
+        mode: Quantization mode (``"affine"``, ``"nf4"``, ``"mxfp4"``,
+            ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``).
+        bits: Bit-width of quantized weights.
+        group_size: Number of weight elements per quantization group.
+        transpose: Whether the weight matrix is stored transposed.
+        gemv_mode: GEMV dispatch mode hint (``"auto"``, ``"never"``, etc.).
+        revsplit_k: Reverse split-K mode hint (``"auto"``, ``"never"``, etc.).
+        revsplit_k_parts: Number of split-K partitions (if applicable).
+        use_bf16: If True, use bfloat16 output; otherwise float16.
+        block_m: Requested M tile size for the kernel grid.
+        block_n: Requested N tile size for the kernel grid.
+        block_k: Requested K tile size for the kernel grid.
+
+    Returns:
+        A callable ``(x, w_q, scales[, biases], *, out=None) -> jax.Array``
+        that computes the fused dequantize + matmul operation.  If *out* is
+        provided, the result is written into it.
+    """
     out_dtype = jnp.bfloat16 if use_bf16 else jnp.float16
     out_cute_dtype = cutlass.BFloat16 if use_bf16 else cutlass.Float16
     with_bias = biases is not None

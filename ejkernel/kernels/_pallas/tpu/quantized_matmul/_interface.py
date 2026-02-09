@@ -12,7 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TPU Pallas quantized matrix multiplication interface."""
+"""TPU Pallas quantized matrix multiplication interface.
+
+Public entry point and ``custom_vjp`` wiring for the TPU Pallas
+quantized matmul kernel. This module registers the ``quantized_matmul``
+operation under ``(Platform.PALLAS, Backend.TPU)`` in the kernel
+registry and provides:
+
+- **Parameter normalization**: Resolves quantization parameters
+  (``mode``, ``group_size``, ``bits``), axis/transpose semantics, and
+  GEMV/RevSplitK settings before entering the kernel.
+- **Affine zeros conversion**: Converts the user-facing ``zeros``
+  tensor to internal additive ``biases = -zeros * scales``.
+- **Custom VJP**: ``_operate`` / ``_operate_fwd`` / ``_operate_bwd``
+  implement a ``jax.custom_vjp`` so that the backward pass uses the
+  Pallas input-gradient kernel instead of JAX's default AD.
+- **Hybrid dispatch**: Both forward and backward paths select between
+  the packed fused kernel and predecode-to-dense path according to
+  the ``EJKERNEL_QMM_TPU_PATH`` environment variable or a heuristic.
+- **XLA fallback**: transpose=True, unsupported bit widths, or tiling
+  failures silently fall back to the XLA quantized matmul backend.
+"""
 
 from __future__ import annotations
 
@@ -49,7 +69,20 @@ from ._pallas_impl_fwd import _pallas_qmm_transpose_false
 
 
 def _biases_to_zeros(scales: jax.Array, biases: jax.Array | None) -> jax.Array | None:
-    """Convert internal affine additive biases back to canonical affine zeros."""
+    """Convert internal affine additive biases back to canonical affine zeros.
+
+    The internal representation stores ``biases = -zeros * scales`` for
+    numerical convenience. This helper recovers the original ``zeros``
+    tensor as ``zeros = -biases / scales``, guarding against division by
+    zero by replacing zero scales with ones.
+
+    Args:
+        scales: Per-group scale tensor.
+        biases: Per-group additive bias, or None for non-affine modes.
+
+    Returns:
+        Per-group zeros tensor, or None if biases is None.
+    """
     if biases is None:
         return None
     safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
@@ -68,7 +101,29 @@ def _is_packed_tpu_legal(
     block_n: int,
     block_k: int,
 ) -> bool:
-    """Strict legality gate for packed TPU Pallas QMM BlockSpecs."""
+    """Strict legality gate for packed TPU Pallas QMM BlockSpecs.
+
+    Validates that the given tensor shapes and tiling parameters satisfy
+    all TPU Mosaic constraints required by the packed fused Pallas kernel.
+    Delegates to ``is_packed_tpu_legal_forward`` or
+    ``is_packed_tpu_legal_input_grad`` depending on the ``is_input_grad``
+    flag.
+
+    Args:
+        is_input_grad: If True, checks legality for the backward (dX) kernel;
+            otherwise for the forward kernel.
+        x_or_dy: Activation tensor (forward) or upstream gradient (backward).
+        w_q: Packed quantized weight tensor.
+        scales: Per-group scale tensor.
+        group_size: Elements per quantization group.
+        bits: Quantization bit width (4 or 8).
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+
+    Returns:
+        True if the packed Pallas kernel can legally run with the given config.
+    """
     if is_input_grad:
         return is_packed_tpu_legal_input_grad(
             x_or_dy,
@@ -125,6 +180,33 @@ def _operate_impl(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ) -> jax.Array:
+    """Core forward implementation for TPU Pallas quantized matmul.
+
+    Attempts the Pallas hybrid packed/predecode path for 4/8-bit
+    transpose=False workloads. Falls back to the XLA quantized matmul
+    backend when transpose=True, when bit widths are unsupported, or
+    when the Pallas path raises an exception.
+
+    Args:
+        x: Activation tensor [M, K].
+        w: Packed quantized weight tensor.
+        scales: Per-group scale tensor.
+        biases: Optional per-group additive bias (affine mode).
+        transpose: Whether to multiply by W^T instead of W.
+        group_size: Elements per quantization group.
+        bits: Quantization bit width.
+        mode: Backend quantization mode string.
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+        use_bf16: Ignored (TPU always uses bfloat16).
+        gemv_mode: GEMV dispatch mode (ignored on TPU).
+        revsplit_k: Reverse split-K mode (ignored on TPU).
+        revsplit_k_parts: Reverse split-K partition count (ignored on TPU).
+
+    Returns:
+        Float32 result of the quantized matrix multiplication.
+    """
     del gemv_mode, revsplit_k, revsplit_k_parts
     del use_bf16
     compute_in_bf16 = True
@@ -214,6 +296,34 @@ def _operate(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ) -> jax.Array:
+    """Forward pass of the custom-VJP quantized matmul primitive.
+
+    This function is decorated with ``jax.custom_vjp`` so that the
+    backward pass uses the dedicated Pallas input-gradient kernel
+    (``_operate_bwd``) instead of JAX's default automatic differentiation.
+    Arguments at positions 4-14 are marked as non-differentiable
+    static configuration.
+
+    Args:
+        x: Activation tensor [M, K].
+        w: Packed quantized weight tensor.
+        scales: Per-group scale tensor.
+        biases: Optional per-group additive bias (affine mode).
+        transpose: Whether the forward uses W^T.
+        group_size: Elements per quantization group.
+        bits: Quantization bit width.
+        mode: Backend quantization mode string.
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+        use_bf16: Whether to use bfloat16.
+        gemv_mode: GEMV dispatch mode.
+        revsplit_k: Reverse split-K mode.
+        revsplit_k_parts: Reverse split-K partition count.
+
+    Returns:
+        Float32 result [M, N].
+    """
     return _operate_impl(
         x,
         w,
@@ -250,6 +360,17 @@ def _operate_fwd(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array | None]]:
+    """Forward rule for the custom VJP.
+
+    Computes the forward result and saves residuals needed by the
+    backward pass. Only the quantized weight, scales, and biases are
+    saved -- the activation ``x`` is not retained since the backward
+    pass only computes dX (not dW).
+
+    Returns:
+        A tuple of (forward_output, residuals) where residuals is
+        ``(w, scales, biases)``.
+    """
     out = _operate_impl(
         x,
         w,
@@ -285,6 +406,18 @@ def _operate_bwd(
     residual: tuple[jax.Array, jax.Array, jax.Array | None],
     grad_out: jax.Array,
 ) -> tuple[jax.Array, None, None, None]:
+    """Backward rule for the custom VJP.
+
+    Computes only the gradient w.r.t. the activation tensor (dX).
+    Gradients w.r.t. the quantized weight, scales, and biases are
+    returned as None because these are typically frozen quantization
+    parameters. Delegates to ``quantized_matmul_input_grad`` which
+    selects the appropriate Pallas or XLA backward kernel.
+
+    Returns:
+        Tuple ``(grad_x, None, None, None)`` matching the four
+        differentiable arguments ``(x, w, scales, biases)``.
+    """
     del gemv_mode, revsplit_k, revsplit_k_parts
     w, scales, biases = residual
     path = get_qmm_tpu_path()
@@ -349,8 +482,46 @@ def quantized_matmul(
 ) -> Float[Array, "m n"]:
     """Quantized matmul on TPU via Pallas with custom backward support.
 
-    ``zeros`` is used only for affine mode and is converted to per-group
-    additive offsets before entering Pallas/XLA kernels.
+    Computes Y = X @ dequant(W) (or Y = X @ dequant(W)^T when
+    ``transpose=True``). Registered as the ``(Platform.PALLAS, Backend.TPU)``
+    implementation of the ``"quantized_matmul"`` kernel.
+
+    For affine mode, ``zeros`` is converted to internal additive biases
+    (``biases = -zeros * scales``) before entering the Pallas/XLA kernels.
+    Non-affine modes must pass ``zeros=None``.
+
+    The forward and backward passes each select between a packed fused
+    Pallas kernel and a predecode-to-dense path, controlled by the
+    ``EJKERNEL_QMM_TPU_PATH`` environment variable or a built-in heuristic.
+    transpose=True and unsupported bit widths fall back to XLA.
+
+    Args:
+        x: Activation tensor [M, K].
+        w: Packed quantized weight tensor.
+        scales: Per-group scale tensor.
+        zeros: Per-group zero-point tensor (affine mode only).
+        transpose: If True, multiply by dequant(W)^T.
+        group_size: Elements per quantization group (inferred if None).
+        bits: Quantization bit width (inferred if None).
+        mode: Quantization mode (``"affine"``, ``"nf4"``, etc.).
+        axis: Quantization axis override.
+        gemv_mode: GEMV dispatch mode (ignored on TPU).
+        revsplit_k: Reverse split-K mode (ignored on TPU).
+        revsplit_k_parts: Reverse split-K partition count (ignored on TPU).
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+        use_bf16: Ignored (TPU always uses bfloat16).
+        num_warps: Ignored (GPU-only parameter).
+        num_stages: Ignored (GPU-only parameter).
+        split_k: Ignored (GPU-only parameter).
+
+    Returns:
+        Float32 result [M, N].
+
+    Raises:
+        ValueError: If affine mode is used without ``zeros``, or if
+            ``zeros`` is provided for a non-affine mode.
     """
     del num_warps, num_stages, split_k
     del use_bf16

@@ -11,48 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Kernel public interface and registration wrappers."""
 
-
-"""Gated Linear Attention (GLA) implementation using Triton kernels.
-
-This module provides a specialized implementation of Gated Linear Attention,
-a variant of linear attention that incorporates learnable gating mechanisms
-to improve model expressiveness while maintaining O(N) time complexity.
-
-GLA extends standard linear attention by applying element-wise gates to the
-attention computation, allowing the model to dynamically control information
-flow. This is particularly useful for capturing long-range dependencies while
-maintaining computational efficiency.
-
-The implementation is built on top of the general recurrent linear attention
-kernel, configured specifically for GLA's gating patterns.
-
-Key features:
-- O(N) time complexity via recurrent formulation
-- Learnable gates (g) for enhanced expressiveness
-- Optional decay factors (g_gamma) for temporal dynamics
-- Support for variable-length sequences
-- GPU-optimized Triton kernels
-
-Example:
-    >>> import jax.numpy as jnp
-    >>> from ejkernel.kernels._triton.gla import recurrent_gla
-    >>>
-    >>> batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64
-    >>> q = jnp.ones((batch, seq_len, num_heads, head_dim))
-    >>> k = jnp.ones((batch, seq_len, num_heads, head_dim))
-    >>> v = jnp.ones((batch, seq_len, num_heads, head_dim))
-    >>> g = jnp.ones((batch, seq_len, num_heads, head_dim))
-    >>>
-    >>> output, final_state = recurrent_gla(q, k, v, g=g)
-"""
+from __future__ import annotations
 
 import jaxtyping
 from beartype import beartype
-from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
-from ..recurrent import recurrent
+from ._triton_impl_fwd import Array, Float, Int
+from ._triton_impl_fwd import recurrent_gla as _recurrent_gla_impl
 
 
 @kernel_registry.register("gla", Platform.TRITON, Backend.GPU)
@@ -70,15 +38,12 @@ def recurrent_gla(
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """
     Computes Gated Linear Attention (GLA) in a recurrent, linear-time manner.
-
     This function provides a convenient wrapper around the core `recurrent`
     implementation, tailored for GLA. It processes sequences step-by-step,
     making it highly efficient for very long sequences and suitable for
     autoregressive decoding.
-
     It supports both standard batch processing and variable-length sequence
     processing using cumulative sequence lengths (`cu_seqlens`).
-
     Args:
         query: The query tensor. Expected shape is `(batch, seq_len, num_heads, head_dim)`
             or `(total_tokens, num_heads, head_dim)` if `cu_seqlens` is used.
@@ -96,41 +61,18 @@ def recurrent_gla(
             This is a 1D tensor like `[0, len_seq1, len_seq1+len_seq2, ...]`.
             If provided, the input tensors `query, key, value, g` are expected to be
             "packed" with a shape of `(total_tokens, ...)`.
-
     Returns:
         A tuple containing:
             - o (jax.Array): The output tensor, with the same shape as `q`.
             - final_state (jax.Array): The final hidden state of the recurrence,
               which can be used as `initial_state` for a subsequent segment.
-
     Raises:
         ValueError: If `cu_seqlens` is provided and the batch size of `q` is
             not 1.
         ValueError: If `cu_seqlens` is provided and the number of initial states
             does not match the number of sequences.
     """
-    if cu_seqlens is not None:
-        if query.shape[0] != 1:
-            raise ValueError(
-                f"The batch size is expected to be 1 rather than {query.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing."
-            )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
-            raise ValueError(
-                f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
-            )
-    if softmax_scale is None:
-        softmax_scale = key.shape[-1] ** -0.5
-    o, final_state = recurrent(
-        query=query,
-        key=key,
-        value=value,
-        g=g,
-        g_gamma=g_gamma,
-        softmax_scale=softmax_scale,
-        initial_state=initial_state,
-        reverse=reverse,
-        cu_seqlens=cu_seqlens,
-    )
-    return o, final_state
+    return _recurrent_gla_impl(query, key, value, g, g_gamma, softmax_scale, initial_state, reverse, cu_seqlens)
+
+
+__all__ = ("recurrent_gla",)

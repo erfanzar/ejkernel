@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backward CuTe implementation for quantized matrix multiplication."""
+"""Backward CuTe implementation for quantized matrix multiplication.
+
+This module provides :func:`quantized_matmul_input_grad`, which computes
+the gradient of the loss with respect to the dense input activation *x*.
+It first attempts to use the CuTe QMM forward kernel with flipped transpose
+semantics; if that fails (e.g., due to unsupported layout), it falls back
+to exact dequantization followed by ``jax.lax.dot_general``.
+"""
 
 from __future__ import annotations
 
@@ -42,10 +49,36 @@ def quantized_matmul_input_grad(
     block_k: int,
     use_bf16: bool,
 ):
-    """Compute gradient with respect to x.
+    """Compute gradient of the loss with respect to the dense input *x*.
 
-    Uses the same CuTe QMM kernel by flipping the transpose semantic when
-    possible, and falls back to exact dequantize+dot when needed.
+    First attempts to reuse the CuTe QMM forward kernel by flipping the
+    transpose flag. If that raises a ``ValueError`` (e.g., the transposed
+    layout is unsupported for the given mode), the function falls back to
+    dequantizing the packed weights to full precision and performing the
+    transpose matmul via ``jax.lax.dot_general``.
+
+    Args:
+        dy: Upstream gradient of shape ``(M, N)``.
+        w: Packed quantized weight matrix.
+        scales: Per-group scale factors.
+        biases: Per-group additive offsets (affine mode only).
+        transpose: Whether the weight layout is transposed.
+        group_size: Quantization group size.
+        bits: Bit-width per quantized element.
+        mode: Backend quantization mode string.
+        gemv_mode: GEMV dispatch mode (unused in fallback path).
+        revsplit_k: Reverse split-K dispatch mode (unused in fallback path).
+        revsplit_k_parts: Split-K partitions (unused in fallback path).
+        block_m: Tile size along the M dimension.
+        block_n: Tile size along the N dimension.
+        block_k: Tile size along the K dimension.
+        use_bf16: Whether to use bfloat16 accumulation.
+
+    Returns:
+        Gradient tensor with shape ``(M, K)`` and dtype ``float32``.
+
+    Raises:
+        ValueError: If *biases* is ``None`` when mode is ``"affine"``.
     """
     try:
         return quantized_matmul_forward(

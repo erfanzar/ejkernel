@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Forward CuTe implementation for quantized matrix multiplication."""
+"""Forward CuTe implementation for quantized matrix multiplication.
+
+This module provides :func:`quantized_matmul_forward`, which resolves
+quantization parameters, validates inputs, and dispatches to the CuTe DSL
+fused kernel built by :func:`~._cute_impl.get_cute_qmm_call`. It is used
+by the custom VJP forward rule in :mod:`~._interface`.
+"""
 
 from __future__ import annotations
 
@@ -45,7 +51,35 @@ def quantized_matmul_forward(
     block_k: int,
     use_bf16: bool,
 ):
-    """Forward CuTe QMM."""
+    """Execute quantized matmul forward pass via the CuTe DSL fused kernel.
+
+    Resolves quantization parameters, validates that the mode and biases
+    are consistent, and dispatches to the cached CuTe DSL callable.
+
+    Args:
+        x: Input activation matrix of shape ``(M, K)``.
+        w: Packed quantized weight matrix.
+        scales: Per-group scale factors.
+        biases: Per-group additive offsets (affine mode only).
+        transpose: Whether the weight layout is transposed.
+        group_size: Quantization group size.
+        bits: Bit-width per quantized element.
+        mode: Backend quantization mode string.
+        gemv_mode: GEMV dispatch mode.
+        revsplit_k: Reverse split-K dispatch mode.
+        revsplit_k_parts: Number of split-K partitions.
+        block_m: Tile size along the M dimension.
+        block_n: Tile size along the N dimension.
+        block_k: Tile size along the K dimension.
+        use_bf16: Whether to use bfloat16 accumulation.
+
+    Returns:
+        Result matrix of shape ``(M, N)`` with the same dtype as *x*.
+
+    Raises:
+        ValueError: If biases are missing for affine mode or present for
+            non-affine modes, or if the input is not on GPU.
+    """
     mode_lower = mode.lower()
     _, group_size_resolved, bits_resolved, _ = resolve_qparams(mode_lower, group_size, bits)
 

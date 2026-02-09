@@ -1,3 +1,9 @@
+"""Generate blocksparse attention CUDA kernel instantiation stubs.
+
+Emits per-head-dim, per-dtype, per-SM ``.cu`` files that explicitly
+instantiate the blocksparse forward-pass template.  It is safe to re-run.
+"""
+
 import argparse
 import itertools
 from dataclasses import dataclass
@@ -13,6 +19,7 @@ HEAD_DIMENSIONS = [32, 64, 96, 128, 192, 256]
 
 
 def get_fwd_template() -> str:
+    """Return the C++ forward-pass template string with format placeholders."""
     return """// Copyright (c) 2025, erfanzar.
 //
 // Splitting the different head dimensions to different files to speed up compilation.
@@ -33,6 +40,15 @@ void run_blocksparse_fwd_<{DTYPE}, {QK_HEAD_DIM}, {V_HEAD_DIM}>(Blocksparse_fwd_
 
 @dataclass
 class Kernel:
+    """A single blocksparse attention kernel instantiation variant.
+
+    Attributes:
+        sm: Target SM version.
+        dtype: Data-type key (``"fp16"`` or ``"bf16"``).
+        qk_head_dim: Query/key head dimension.
+        v_head_dim: Value head dimension.
+    """
+
     sm: int
     dtype: str
     qk_head_dim: int
@@ -40,6 +56,7 @@ class Kernel:
 
     @property
     def template(self) -> str:
+        """Render the C++ source for this kernel variant."""
         return get_fwd_template().format(
             DTYPE=DTYPE_MAP[self.dtype],
             QK_HEAD_DIM=self.qk_head_dim,
@@ -48,10 +65,12 @@ class Kernel:
 
     @property
     def filename(self) -> str:
+        """Derive the output ``.cu`` filename from this kernel's parameters."""
         return f"blocksparse_fwd_hdim{self.qk_head_dim}_vhdim{self.v_head_dim}_" f"{self.dtype}_sm{self.sm}.cu"
 
 
 def get_all_kernels() -> list[Kernel]: # type: ignore
+    """Yield all kernel variants across dtypes, head dimensions, and SM versions."""
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM):
         yield Kernel(
             sm=sm,
@@ -62,11 +81,17 @@ def get_all_kernels() -> list[Kernel]: # type: ignore
 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
+    """Write a single kernel's ``.cu`` file into *autogen_dir*."""
     content = kernel.template
     (autogen_dir / kernel.filename).write_text(content)
 
 
 def main(output_dir: str | None) -> None:
+    """Generate all blocksparse kernel instantiation files.
+
+    Args:
+        output_dir: Target directory; defaults to this script's directory.
+    """
     if output_dir is None:
         output_dir = Path(__file__).parent
     else:

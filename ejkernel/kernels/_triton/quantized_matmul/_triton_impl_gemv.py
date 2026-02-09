@@ -36,6 +36,7 @@ from ejkernel.quantization._utils.fp_tables import _get_e2m1_table, _get_e4m3_ta
 
 QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 
+
 def _get_decode_tables() -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Build decode lookup tables as local arrays (no global state)."""
 

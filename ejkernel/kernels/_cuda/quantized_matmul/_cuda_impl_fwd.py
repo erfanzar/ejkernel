@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Forward CUDA implementation for quantized matrix multiplication."""
+"""Forward CUDA implementation for quantized matrix multiplication.
+
+This module provides :func:`quantized_matmul_forward`, a thin JIT-compiled
+wrapper around the low-level :func:`~._cuda_impl.quantized_matmul_cuda` FFI
+call. It is used by the custom VJP forward rule in
+:mod:`~._interface` and is not intended for direct external use.
+"""
 
 from __future__ import annotations
 
@@ -52,7 +58,28 @@ def quantized_matmul_forward(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ):
-    """Dispatch to the CUDA custom call implementation."""
+    """Execute quantized matmul forward pass via the CUDA FFI custom call.
+
+    This function is JIT-compiled with ``@ejit`` and all quantization
+    configuration arguments are marked as static. It simply forwards
+    all arguments to :func:`~._cuda_impl.quantized_matmul_cuda`.
+
+    Args:
+        x: Input activation matrix of shape ``(M, K)``.
+        w: Packed quantized weight matrix.
+        scales: Per-group scale factors.
+        biases: Per-group additive offsets (affine mode only).
+        transpose: Whether the weight layout is transposed.
+        group_size: Quantization group size.
+        bits: Bit-width per quantized element.
+        mode: Backend quantization mode string.
+        gemv_mode: GEMV dispatch mode.
+        revsplit_k: Reverse split-K dispatch mode.
+        revsplit_k_parts: Number of split-K partitions.
+
+    Returns:
+        Result matrix of shape ``(M, N)`` with the same dtype as *x*.
+    """
     return quantized_matmul_cuda(
         x,
         w,

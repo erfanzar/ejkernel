@@ -12,7 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backward TPU Pallas kernels for quantized matmul."""
+"""Backward TPU Pallas kernels for quantized matrix multiplication.
+
+This module implements the input-gradient (dX) TPU Pallas kernels for
+quantized matrix multiplication. Given a forward pass Y = X @ dequant(W),
+the backward pass computes dX = dY @ dequant(W)^T.
+
+Execution Paths:
+    - **Packed (fused)**: Unpacks quantized codes, dequantizes, and performs
+      dX = dY @ W_deq^T in a single Pallas kernel. The N dimension is the
+      contraction axis (``arbitrary`` semantics) while M and K are parallel.
+      Best for large-N NF4 workloads.
+    - **Predecode (two-stage)**: First materializes a dense bfloat16 weight
+      via ``get_predecoded_dense_weight``, then delegates to
+      ``pallas_dense_matmul`` with ``transpose_rhs=True``. Typically faster
+      for affine mode.
+    - **XLA fallback**: For transpose=True or unsupported bit widths, the
+      gradient is computed via the XLA quantized matmul backend or plain
+      ``jax.lax.dot_general`` on fully dequantized weights.
+
+Grid Strategy (Packed Path):
+    3D grid (num_M, num_N, num_K) where M and K tiles are parallel and N
+    is the contraction axis accumulated sequentially with a VMEM scratch
+    buffer. Each N iteration unpacks the weight tile, dequantizes it, and
+    accumulates dY @ W_deq^T. The final N iteration stores to HBM.
+
+Supported Modes:
+    - affine: ``code * scale + bias``
+    - nf4: NormalFloat4 lookup with scale
+"""
 
 from __future__ import annotations
 
@@ -53,7 +81,33 @@ def _pallas_qmm_input_grad_transpose_false_packed(
     block_k: int,
     use_bf16: bool,
 ) -> jax.Array:
-    """Packed fused TPU Pallas path for dX when forward transpose=False."""
+    """Packed fused TPU Pallas path for dX when forward transpose=False.
+
+    Computes dX = dY @ dequant(W)^T in a single Pallas kernel that, for
+    each (M, N, K) tile, unpacks the quantized weight codes from packed
+    32-bit words, dequantizes them using per-group scales (and optional
+    biases), and accumulates the matmul result in a VMEM scratch buffer
+    with fp32 precision. The N dimension serves as the contraction axis.
+
+    Args:
+        dy: Upstream gradient tensor [M, N].
+        w_q: Packed quantized weight [K, N // values_per_word].
+        scales: Per-group scale tensor [K, N // group_size].
+        biases: Optional per-group additive bias [K, N // group_size].
+        group_size: Number of output elements per quantization group.
+        bits: Quantization bit width (4 or 8).
+        mode: Quantization mode (``"affine"`` or ``"nf4"``).
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size (contraction axis).
+        block_k: K-dimension tile size.
+        use_bf16: Ignored (TPU fused path always uses bfloat16).
+
+    Returns:
+        Float32 input gradient [M, K].
+
+    Raises:
+        ValueError: If bits, mode, or block constraints are invalid.
+    """
     del use_bf16  # TPU fused path always computes in bfloat16.
     if bits not in (4, 8):
         raise ValueError("TPU packed fused path supports bits in {4, 8}.")
@@ -198,7 +252,29 @@ def _pallas_qmm_input_grad_transpose_false_predecode(
     block_k: int,
     use_bf16: bool,
 ) -> jax.Array:
-    """Predecode-to-dense TPU Pallas path for dX when forward transpose=False."""
+    """Predecode-to-dense TPU Pallas path for dX when forward transpose=False.
+
+    First materializes a full dense bfloat16 weight matrix from the
+    quantized representation (using cached predecoding when possible),
+    then delegates to ``pallas_dense_matmul`` with ``transpose_rhs=True``
+    to compute dX = dY @ W_dense^T.
+
+    Args:
+        dy: Upstream gradient tensor [M, N].
+        w_q: Packed quantized weight [K, N_packed].
+        scales: Per-group scale tensor [K, N // group_size].
+        biases: Optional per-group additive bias.
+        group_size: Elements per quantization group.
+        bits: Quantization bit width (4 or 8).
+        mode: Quantization mode string.
+        block_m: M-dimension tile size for the dense matmul.
+        block_n: N-dimension tile size for the dense matmul.
+        block_k: K-dimension tile size for the dense matmul.
+        use_bf16: Ignored (TPU always uses bfloat16).
+
+    Returns:
+        Float32 input gradient [M, K].
+    """
     del use_bf16
     w_dense = get_predecoded_dense_weight(
         w_q,
@@ -220,6 +296,20 @@ def _pallas_qmm_input_grad_transpose_false_predecode(
 
 
 def _prefer_packed_path(n: int, block_n: int, mode: str) -> bool:
+    """Heuristic deciding whether the packed kernel is preferred for dX.
+
+    Packed wins most consistently for large-N NF4 workloads; affine is
+    typically on-par or faster with predecode due to TPU-friendly dense
+    matmul scheduling.
+
+    Args:
+        n: Contraction (N) dimension size for the backward pass.
+        block_n: N-dimension tile size.
+        mode: Quantization mode string.
+
+    Returns:
+        True if the packed path is expected to be faster.
+    """
     if mode == "nf4":
         return n >= max(512, 2 * block_n)
     return False
@@ -241,6 +331,33 @@ def _quantized_matmul_input_grad_hybrid(
     path: str,
     packed_legal: bool,
 ) -> jax.Array:
+    """Dispatch dX computation based on hybrid/packed/predecode path.
+
+    Selects between packed and predecode execution paths for the
+    input gradient (dX = dY @ W^T) based on the ``path`` argument
+    or a heuristic when ``path`` is ``"hybrid"``.
+
+    Args:
+        dy: Upstream gradient tensor [M, N].
+        w_q: Packed quantized weight [K, N_packed].
+        scales: Per-group scale tensor [K, N // group_size].
+        biases: Optional per-group additive bias.
+        group_size: Elements per quantization group.
+        bits: Quantization bit width (4 or 8).
+        mode: Quantization mode string.
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+        use_bf16: Whether to use bfloat16 (ignored on TPU).
+        path: Execution path (``"packed"``, ``"predecode"``, or ``"hybrid"``).
+        packed_legal: Whether the packed path satisfies TPU tiling constraints.
+
+    Returns:
+        Float32 input gradient [M, K].
+
+    Raises:
+        ValueError: If ``path="packed"`` but ``packed_legal`` is False.
+    """
     n = dy.shape[-1]
     if path == "packed":
         if not packed_legal:
@@ -333,7 +450,45 @@ def quantized_matmul_input_grad(
     path: str,
     packed_legal: bool,
 ) -> jax.Array:
-    """Gradient w.r.t. input for TPU Pallas quantized matmul."""
+    """Gradient w.r.t. input for TPU Pallas quantized matmul.
+
+    Entry point for computing dX given the upstream gradient dY and the
+    quantized weight. Handles three execution strategies:
+
+    1. **transpose=True**: Delegates to the XLA quantized matmul backend
+       since the transpose-True backward path is not yet implemented in
+       Pallas.
+    2. **4/8-bit Pallas**: Attempts the hybrid packed/predecode Pallas
+       kernel. Falls through to strategy 3 on any failure.
+    3. **Fallback**: Fully dequantizes W to dense float and computes
+       dX = dY @ W_dense^T via ``jax.lax.dot_general``.
+
+    For affine mode, the additive biases are converted to canonical
+    affine zeros (``zeros = -biases / scales``) before forwarding to
+    the XLA or dequantize fallback paths.
+
+    Args:
+        dy: Upstream gradient tensor [M, N].
+        w_q: Packed quantized weight.
+        scales: Per-group scale tensor.
+        biases: Optional per-group additive bias (affine mode only).
+        transpose: Whether the forward pass used transposed weights.
+        group_size: Elements per quantization group.
+        bits: Quantization bit width.
+        mode: Quantization mode string.
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+        use_bf16: Whether to use bfloat16 (ignored, always True on TPU).
+        path: Execution path (``"packed"``, ``"predecode"``, or ``"hybrid"``).
+        packed_legal: Whether the packed path satisfies TPU tiling constraints.
+
+    Returns:
+        Float32 input gradient dX.
+
+    Raises:
+        ValueError: If affine mode is used but biases is None.
+    """
     del use_bf16
     zeros = None
     if mode == "affine":

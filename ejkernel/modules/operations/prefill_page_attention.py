@@ -243,6 +243,7 @@ class PrefillPageAttention(Kernel[PrefillPageAttentionConfig, Array]):
             context_len,
             page_indices,
         ):
+            """Shard-map compatible wrapper that delegates to self.run with captured params."""
             return self.run(
                 query=query,
                 key_cache=key_cache,

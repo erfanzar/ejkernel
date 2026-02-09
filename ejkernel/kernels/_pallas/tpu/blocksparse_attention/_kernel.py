@@ -61,9 +61,7 @@ from typing import Any, Literal, NamedTuple, Union, overload
 
 import jax
 import jax.numpy as jnp
-import jaxtyping
 import numpy as np
-from beartype import beartype
 from beartype.typing import Callable
 from jax import ad_checkpoint, lax, tree_util
 from jax.experimental import pallas as pl
@@ -71,7 +69,6 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Bool, Float, Int
 
 from ejkernel.callib import ejit
-from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import BwdParams, FwdParams
 
 from . import _info as mask_info_lib
@@ -2672,7 +2669,6 @@ make_splash_mha_single_device = partial(make_splash_mha, is_mqa=False, head_shar
 make_splash_mqa_single_device = partial(make_splash_mha, is_mqa=True, head_shards=1, q_seq_shards=1)
 
 
-@kernel_registry.register("blocksparse_attention", Platform.PALLAS, Backend.TPU)
 @ejit(
     static_argnames=(
         "softmax_scale",
@@ -2686,7 +2682,6 @@ make_splash_mqa_single_device = partial(make_splash_mha, is_mqa=True, head_shard
         "logits_soft_cap",
     )
 )
-@jaxtyping.jaxtyped(typechecker=beartype)
 def blocksparse_attention(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch kv_num_heads kv_len head_dim"],

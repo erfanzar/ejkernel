@@ -286,6 +286,7 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
             cum_seqlens_k,
             attention_mask,
         ):
+            """Shard-map compatible wrapper that delegates to impl with captured params."""
             return impl(
                 query=query,
                 key=key,

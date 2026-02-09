@@ -11,21 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Kernel public interface and registration wrappers."""
 
+from __future__ import annotations
 
-"""GPU-optimized implementation of scaled dot-product attention using Pallas/Triton.
-
-This module provides GPU-accelerated scaled dot-product attention using cuDNN
-backend via JAX's Pallas/Triton framework for high-performance computation.
-"""
-
-import jax
 import jaxtyping
 from beartype import beartype
-from beartype.typing import Callable
-from jaxtyping import Array, Bool, Float, Int
 
 from ...._registry import Backend, Platform, kernel_registry
+from ._pallas_impl_fwd import Array, Bool, Callable, Float, Int
+from ._pallas_impl_fwd import scaled_dot_product_attention as _scaled_dot_product_attention_impl
 
 
 @kernel_registry.register("scaled_dot_product_attention", Platform.PALLAS, Backend.GPU)
@@ -45,12 +40,10 @@ def scaled_dot_product_attention(
     cum_seqlens_k: Int[Array, "batch"] | None = None,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """Compute scaled dot-product attention using GPU-optimized cuDNN backend.
-
     This function provides a high-performance GPU implementation of scaled
     dot-product attention using NVIDIA's cuDNN library via JAX's Pallas/Triton
     framework. It's optimized for NVIDIA GPUs and supports various attention
     patterns including causal, local, and variable-length sequences.
-
     Args:
         query: Query tensor of shape [batch, seq_len, num_q_heads, head_dim].
             Contains the query vectors for attention computation.
@@ -81,11 +74,9 @@ def scaled_dot_product_attention(
             the sum of all sequence lengths from 0 to i.
         cum_seqlens_k: Optional cumulative sequence lengths for key/value, shape [batch+1].
             Used for variable-length sequences in packed format.
-
     Returns:
         Attention output tensor of shape [batch, seq_len, num_q_heads, head_dim].
         Contains the weighted aggregation of values based on attention scores.
-
     Note:
         This implementation uses the cuDNN backend which provides highly optimized
         GPU kernels for attention computation. It's significantly faster than the
@@ -94,7 +85,6 @@ def scaled_dot_product_attention(
         - Support for grouped query attention (GQA) and multi-query attention (MQA)
         - Variable-length sequence handling without padding overhead
         - Local attention patterns for long sequences
-
     Example:
         >>> import jax.numpy as jnp
         >>>
@@ -114,18 +104,19 @@ def scaled_dot_product_attention(
         >>> bias = jnp.ones((2, 8, 512, 512)) * -1e9
         >>> output = scaled_dot_product_attention(query, key, value, bias=bias)
     """
-    if bias is None and init_bias is not None:
-        bias = init_bias()
-    return jax.nn.dot_product_attention(
-        query=query,
-        key=key,
-        value=value,
-        mask=attention_mask,
-        bias=bias,
-        is_causal=causal,
-        scale=softmax_scale,
-        local_window_size=sliding_window,
-        key_value_seq_lengths=cum_seqlens_k,
-        query_seq_lengths=cum_seqlens_q,
-        implementation="cudnn",
+    return _scaled_dot_product_attention_impl(
+        query,
+        key,
+        value,
+        attention_mask,
+        bias,
+        init_bias,
+        softmax_scale,
+        causal,
+        sliding_window,
+        cum_seqlens_q,
+        cum_seqlens_k,
     )
+
+
+__all__ = ("scaled_dot_product_attention",)

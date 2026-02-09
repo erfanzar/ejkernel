@@ -203,6 +203,17 @@ def attention_pack_with_static_shape(
     valid_mask_flat = valid_mask.reshape(-1)
 
     def process_token(i, packed_acc):
+        """Copy a single token from the padded input to its packed position.
+
+        Args:
+            i: Flat index into the (batch * seq_len) token grid.
+            packed_acc: Running packed output accumulator
+                [1, max_tokens, num_heads, head_dim].
+
+        Returns:
+            Updated packed accumulator with token i placed at its target
+            position if valid, otherwise unchanged.
+        """
         b = batch_idx_flat[i]
         p = pos_idx_flat[i]
         t = target_idx_flat[i]
@@ -352,11 +363,32 @@ def attention_pack_from_cu_static(
     out = jnp.zeros((1, max_tokens, H, D), dtype=x.dtype)
 
     def body_b(b, out_acc):
+        """Pack tokens for a single batch element into the output buffer.
+
+        Args:
+            b: Batch index being processed.
+            out_acc: Running packed output accumulator
+                [1, max_tokens, num_heads, head_dim].
+
+        Returns:
+            Updated accumulator with batch element b's valid tokens
+            copied to contiguous positions starting at cum_seqlens[b].
+        """
         start = cum_seqlens[b]
         end = cum_seqlens[b + 1]
         L = end - start
 
         def body_p(p, acc):
+            """Copy position p from batch element b if within sequence length.
+
+            Args:
+                p: Position index within the padded sequence.
+                acc: Running packed output accumulator.
+
+            Returns:
+                Updated accumulator with token at position p written to
+                its destination if p < sequence length, otherwise unchanged.
+            """
             valid = p < L
             dst = start + p
             acc = jnp.where(valid, acc.at[0, dst].set(x[b, p]), acc)
@@ -401,11 +433,33 @@ def attention_unpack_with_static_shape(
     out = jnp.zeros((batch_size, seqlen, H, D), dtype=x.dtype)
 
     def body_b(b, out_acc):
+        """Unpack tokens for a single batch element from the packed buffer.
+
+        Args:
+            b: Batch index being processed.
+            out_acc: Running unpacked output accumulator
+                [batch_size, seqlen, num_heads, head_dim].
+
+        Returns:
+            Updated accumulator with batch element b's tokens copied from
+            their contiguous packed positions back to the padded layout.
+        """
         start = cum_seqlens[b]
         end = cum_seqlens[b + 1]
         L = end - start
 
         def body_p(p, acc):
+            """Copy position p from packed buffer to batch element b if valid.
+
+            Args:
+                p: Position index within the padded output sequence.
+                acc: Running unpacked output accumulator.
+
+            Returns:
+                Updated accumulator with the token at packed position
+                (start + p) written to (b, p) if p < sequence length,
+                otherwise unchanged.
+            """
             valid = p < L
             src = start + p
             acc = jnp.where(valid, acc.at[b, p].set(x[0, src]), acc)

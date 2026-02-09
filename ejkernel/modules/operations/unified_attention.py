@@ -239,6 +239,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
             qq_bias: Float[Array, "num_query_tokens num_query_tokens"] | None,
             softmax_aux: Float[Array, "num_q_heads"] | None,
         ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
+            """Shard-map compatible wrapper that delegates to self.run with captured params."""
             return self.run(
                 queries=queries,
                 key_cache=key_cache,

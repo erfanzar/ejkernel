@@ -117,13 +117,17 @@ def _sparse_attention_bwd(
 
         Processes all query head groups within this KV head, computing
         gradients for Q, K, V by iterating over all token positions.
+        Uses JAX vmap over tokens for parallel gradient computation.
 
         Args:
-            b: Batch index.
-            kvh: KV head index.
+            b: Batch index within the batch dimension.
+            kvh: KV head index within the key/value head dimension.
 
         Returns:
-            Tuple of (dq_b, dk_b, dv_b) gradients for this batch/head pair.
+            Tuple of (dq_b, dk_b, dv_b) where:
+                - dq_b: Query gradients [seq_len, num_q_heads, head_dim]
+                - dk_b: Key gradients [num_blocks, block_size, head_dim]
+                - dv_b: Value gradients [num_blocks, block_size, head_dim]
         """
         hq_start = kvh * G
 

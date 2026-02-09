@@ -28,6 +28,6 @@ Features:
 """
 
 from ._interface import ring_attention
-from ._ring_kernel import RingFlashResiduals, ring_flash_attention_call
+from ._triton_impl_bwd import RingFlashResiduals, ring_flash_attention_call
 
 __all__ = ("RingFlashResiduals", "ring_attention", "ring_flash_attention_call")

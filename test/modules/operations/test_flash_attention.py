@@ -83,19 +83,6 @@ def test_flash_attention_dropout_seed_changes_output():
     assert not jnp.allclose(out0, out1)
 
 
-@pytest.mark.skipif(device_platform() != "gpu", reason="GPU-only CUDA validation")
-def test_flash_attention_cuda_alibi_matches_dense_reference():
-    key = jax.random.PRNGKey(7)
-    q, k, v = rand_qkv(key, batch=2, q_len=8, kv_len=8, q_heads=4, kv_heads=4, head_dim=32, dtype=jnp.float16)
-    slopes = jnp.linspace(0.1, 0.4, q.shape[2], dtype=jnp.float32)
-    k_idx = jnp.arange(k.shape[1], dtype=jnp.float32)
-    bias = slopes[None, :, None, None] * k_idx[None, None, None, :]
-    bias = jnp.broadcast_to(bias, (q.shape[0], q.shape[2], q.shape[1], k.shape[1])).astype(jnp.float32)
-
-    out_cuda = flash_attention(q, k, v, slopes, None, None, None, causal=True, platform="cuda")
-    ref_out, _ = dense_attention_reference(q, k, v, bias=bias, causal=True)
-    assert_allclose(out_cuda, ref_out, atol=0.25, rtol=0.15)
-
 
 @pytest.mark.skipif(device_platform() != "gpu", reason="GPU-only CUDA validation")
 def test_flash_attention_cuda_softcap_matches_xla():

@@ -11,21 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Kernel public interface and registration wrappers."""
 
+from __future__ import annotations
 
-"""XLA implementation of scaled dot-product attention.
-
-This module provides a wrapper around JAX's native dot_product_attention
-with XLA backend, suitable for CPU and general-purpose computation.
-"""
-
-import jax
 import jaxtyping
 from beartype import beartype
-from beartype.typing import Callable
-from jaxtyping import Array, Bool, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
+from ._xla_impl_fwd import Array, Bool, Callable, Float, Int
+from ._xla_impl_fwd import scaled_dot_product_attention as _scaled_dot_product_attention_impl
 
 
 @kernel_registry.register("scaled_dot_product_attention", Platform.XLA, Backend.ANY)
@@ -44,10 +39,8 @@ def scaled_dot_product_attention(
     cum_seqlens_k: Int[Array, "batch"] | None = None,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """Compute scaled dot-product attention using XLA backend.
-
     This function wraps JAX's native dot_product_attention with the XLA
     implementation, which is optimized for CPU and general-purpose hardware.
-
     Args:
         query: Query tensor of shape [batch, seq_len, num_q_heads, head_dim].
         key: Key tensor of shape [batch, kv_len, num_kv_heads, head_dim].
@@ -71,15 +64,12 @@ def scaled_dot_product_attention(
             Used for variable-length sequences in packed format.
         cum_seqlens_k: Optional cumulative sequence lengths for key/value, shape [batch+1].
             Used for variable-length sequences in packed format.
-
     Returns:
         Attention output tensor of shape [batch, seq_len, num_q_heads, head_dim].
-
     Note:
         This implementation uses the XLA backend which provides good portability
         but may not be as optimized as specialized implementations (cuDNN, Flash Attention)
         for GPU hardware.
-
     Example:
         >>> import jax.numpy as jnp
         >>> query = jnp.ones((2, 128, 8, 64))
@@ -89,18 +79,19 @@ def scaled_dot_product_attention(
         >>> output.shape
         (2, 128, 8, 64)
     """
-    if bias is None and init_bias is not None:
-        bias = init_bias()
-    return jax.nn.dot_product_attention(
-        query=query,
-        key=key,
-        value=value,
-        mask=attention_mask,
-        bias=bias,
-        scale=softmax_scale,
-        is_causal=causal,
-        local_window_size=sliding_window,
-        key_value_seq_lengths=cum_seqlens_k,
-        query_seq_lengths=cum_seqlens_q,
-        implementation="xla",
+    return _scaled_dot_product_attention_impl(
+        query,
+        key,
+        value,
+        attention_mask,
+        bias,
+        init_bias,
+        softmax_scale,
+        causal,
+        sliding_window,
+        cum_seqlens_q,
+        cum_seqlens_k,
     )
+
+
+__all__ = ("scaled_dot_product_attention",)

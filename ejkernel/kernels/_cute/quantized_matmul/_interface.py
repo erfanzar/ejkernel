@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe DSL quantized matrix multiplication interface."""
+"""CuTe DSL quantized matrix multiplication public interface.
+
+This module exposes :func:`quantized_matmul`, the registry-facing entry point
+for CuTe-backed quantized matrix multiplication. It is registered under the
+``CUTE`` platform and ``GPU`` backend and supports differentiable computation
+through a custom VJP rule.
+
+The forward pass delegates to the CuTe DSL fused kernel via
+:func:`~._cute_impl_fwd.quantized_matmul_forward`, while the backward pass
+computes the input gradient via
+:func:`~._cute_impl_bwd.quantized_matmul_input_grad`.
+"""
 
 from __future__ import annotations
 
@@ -59,6 +70,32 @@ def _operate(
     block_k: int,
     use_bf16: bool,
 ):
+    """Differentiable quantized matmul primitive with custom VJP for CuTe.
+
+    Dispatches the forward computation to the CuTe DSL fused kernel. The
+    non-differentiable arguments (indices 4--14) are passed through to
+    both forward and backward rules.
+
+    Args:
+        x: Input activation matrix.
+        w: Packed quantized weight matrix.
+        scales: Per-group scale factors.
+        biases: Per-group additive offsets (affine mode only).
+        transpose: Whether the weight matrix uses transposed layout.
+        group_size: Quantization group size.
+        bits: Bit-width per quantized element.
+        mode: Backend quantization mode string.
+        gemv_mode: GEMV dispatch mode.
+        revsplit_k: Reverse split-K dispatch mode.
+        revsplit_k_parts: Number of split-K partitions.
+        block_m: Tile size along the M dimension.
+        block_n: Tile size along the N dimension.
+        block_k: Tile size along the K dimension.
+        use_bf16: Whether to use bfloat16 accumulation.
+
+    Returns:
+        Result matrix with shape ``(M, N)`` and the same dtype as *x*.
+    """
     return quantized_matmul_forward(
         x,
         w,
@@ -95,6 +132,15 @@ def _operate_fwd(
     block_k: int,
     use_bf16: bool,
 ):
+    """Custom VJP forward rule for :func:`_operate`.
+
+    Runs the CuTe quantized matmul forward pass and saves the weight,
+    scales, and biases tensors as residuals for the backward pass.
+
+    Returns:
+        A tuple ``(out, (w, scales, biases))`` where *out* is the
+        forward result and the second element is the residual tuple.
+    """
     out = quantized_matmul_forward(
         x,
         w,
@@ -130,6 +176,16 @@ def _operate_bwd(
     residual,
     grad_out,
 ):
+    """Custom VJP backward rule for :func:`_operate`.
+
+    Computes the gradient of the loss with respect to the dense input *x*
+    by calling :func:`quantized_matmul_input_grad`. Gradients with respect
+    to the quantized weights, scales, and biases are returned as ``None``
+    since they are not differentiable in the quantized regime.
+
+    Returns:
+        A 4-tuple ``(grad_x, None, None, None)``.
+    """
     w, scales, biases = residual
     grad_x = quantized_matmul_input_grad(
         grad_out,
@@ -178,10 +234,41 @@ def quantized_matmul(
     num_stages: int | None = None,
     split_k: int | None = None,
 ) -> Float[Array, "m n"]:
-    """Quantized matrix multiplication using CuTe DSL.
+    """Perform quantized matrix multiplication using CuTe DSL kernels.
 
-    ``zeros`` is used only for affine mode and is converted to per-group
-    additive offsets before launching CuTe kernels.
+    This is the registry-facing entry point for the CuTe platform. It
+    resolves quantization parameters, converts affine ``zeros`` metadata
+    into per-group additive biases, and delegates to the differentiable
+    :func:`_operate` primitive backed by CuTe DSL fused kernels.
+
+    Args:
+        x: Input activation matrix of shape ``(m, k)``.
+        w: Packed quantized weight matrix (``uint32``).
+        scales: Per-group scale factors.
+        zeros: Per-group zero-point offsets. Required for ``"affine"``
+            mode; must be ``None`` for all other modes.
+        transpose: Whether the weight matrix is transposed.
+        group_size: Number of output features per quantization group.
+        bits: Bit-width per quantized element.
+        mode: Quantization scheme name.
+        axis: Optional quantization axis hint.
+        gemv_mode: GEMV dispatch mode (``"auto"``, ``"on"``, ``"off"``).
+        revsplit_k: Reverse split-K dispatch mode.
+        revsplit_k_parts: Number of split-K partitions.
+        block_m: Tile size along the M dimension for the CuTe kernel.
+        block_n: Tile size along the N dimension for the CuTe kernel.
+        block_k: Tile size along the K dimension for the CuTe kernel.
+        use_bf16: Whether to use bfloat16 accumulation in the kernel.
+        num_warps: *Unused by this backend.* Accepted for API compatibility.
+        num_stages: *Unused by this backend.* Accepted for API compatibility.
+        split_k: *Unused by this backend.* Accepted for API compatibility.
+
+    Returns:
+        Result matrix of shape ``(m, n)`` with the same dtype as *x*.
+
+    Raises:
+        ValueError: If ``zeros`` is ``None`` when mode is ``"affine"``,
+            or non-``None`` for non-affine modes.
     """
     del num_warps, num_stages, split_k
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)

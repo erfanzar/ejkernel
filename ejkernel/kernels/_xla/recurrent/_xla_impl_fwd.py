@@ -181,10 +181,36 @@ def _recurrent_attention_fwd(
         raise ValueError(f"g_gamma.ndim={g_gamma.ndim} must be 1 or 2")
 
     def process_batch(q_b, k_b, v_b, g_b, g_gamma_b, gk_b, gv_b, h0):
-        """Process a single batch element."""
+        """Process a single batch element through the full recurrent sequence.
+
+        Runs the recurrence h_t = decay * h_{t-1} + k_t^T * v_t using lax.scan
+        and collects all hidden states and outputs.
+
+        Args:
+            q_b: Query for this batch [seq_len, num_heads, head_dim].
+            k_b: Key for this batch [seq_len, num_heads, head_dim].
+            v_b: Value for this batch [seq_len, num_heads, head_dim].
+            g_b: GLA gate for this batch [seq_len, num_heads, head_dim].
+            g_gamma_b: Per-head decay for this batch [num_heads].
+            gk_b: Key gate for this batch [seq_len, num_heads, head_dim].
+            gv_b: Value gate for this batch [seq_len, num_heads, head_dim].
+            h0: Initial hidden state [num_heads, head_dim, head_dim].
+
+        Returns:
+            Tuple of (outputs, hidden_states, h_final).
+        """
         g_gamma_seq = jnp.broadcast_to(g_gamma_b, (seq_len, num_heads))
 
         def scan_fn(carry, inputs):
+            """Single recurrence step within lax.scan.
+
+            Args:
+                carry: Tuple of (hidden_state,).
+                inputs: Tuple of (q_t, k_t, v_t, g_t, g_gamma_t, gk_t, gv_t).
+
+            Returns:
+                Updated carry and outputs (hidden_state, output).
+            """
             (h,) = carry
             (h_new,), o = _recurrent_attention_step((h,), inputs, softmax_scale, use_g, use_g_gamma, use_gk, use_gv)
 
@@ -223,16 +249,29 @@ def _recurrent_attention_varlen_fwd(
     initial_state: Float[Array, "num_seqs num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
 ) -> tuple[Float[Array, "total_tokens num_heads head_dim"], Float[Array, "num_seqs num_heads head_dim head_dim"]]:
-    """
-    Forward pass for recurrent linear attention with variable-length sequences.
+    """Forward pass for recurrent linear attention with variable-length sequences.
+
+    Processes multiple sequences packed into a single tensor by iterating
+    over each sequence individually using cu_seqlens boundaries. Each
+    sequence is processed independently with its own initial state.
 
     Args:
-        q, k, v: Query, key, value tensors [total_tokens, num_heads, head_dim]
-        cu_seqlens: Cumulative sequence lengths [num_seqs + 1]
-        ... (other args same as fixed-length version)
+        q: Query tensor [total_tokens, num_heads, head_dim].
+        k: Key tensor [total_tokens, num_heads, head_dim].
+        v: Value tensor [total_tokens, num_heads, head_dim].
+        cu_seqlens: Cumulative sequence lengths [num_seqs + 1].
+        g: Optional GLA gate [total_tokens, num_heads, head_dim].
+        g_gamma: Optional per-head decay [num_heads] or [num_seqs, num_heads].
+        gk: Optional key gate [total_tokens, num_heads, head_dim].
+        gv: Optional value gate [total_tokens, num_heads, head_dim].
+        softmax_scale: Query scaling factor.
+        initial_state: Optional initial states [num_seqs, num_heads, head_dim, head_dim].
+        reverse: If True, process each sequence in reverse.
 
     Returns:
-        Tuple of (output, final_states)
+        Tuple of (outputs, final_states) where outputs has shape
+        [total_tokens, num_heads, head_dim] and final_states has shape
+        [num_seqs, num_heads, head_dim, head_dim].
     """
     num_seqs = len(cu_seqlens) - 1
     head_dim = q.shape[2]
@@ -241,7 +280,18 @@ def _recurrent_attention_varlen_fwd(
         softmax_scale = 1.0 / jnp.sqrt(head_dim).astype(jnp.float32)
 
     def process_sequence(seq_idx):
-        """Process a single variable-length sequence."""
+        """Process a single variable-length sequence through recurrent attention.
+
+        Extracts the token range for this sequence from the packed tensor,
+        wraps it in a batch dimension, runs the recurrent forward pass,
+        and returns the output and final state.
+
+        Args:
+            seq_idx: Index of the current sequence in cu_seqlens.
+
+        Returns:
+            Tuple of (output_seq, h_final) for this sequence.
+        """
         start = cu_seqlens[seq_idx]
         end = cu_seqlens[seq_idx + 1]
 

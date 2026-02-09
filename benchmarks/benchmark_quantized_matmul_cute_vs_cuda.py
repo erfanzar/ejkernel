@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Benchmark quantized_matmul CuTe vs CUDA across modes/shapes/dtypes."""
+"""Benchmark quantized_matmul CuTe vs CUDA across modes/shapes/dtypes.
+
+Sweeps every combination of quantization mode (affine-4/8, nf4, mxfp4/8,
+nvfp4/8), matrix shape, and data type (fp16, bf16), measuring wall-clock
+latency for both the CuTe and CUDA platforms.  Reports per-config speedups,
+aggregate statistics, and the 5 worst / 5 best cases.
+
+Environment variables:
+    EJKERNEL_QMM_SWEEP_WARMUP: Number of warmup iterations (default 6).
+    EJKERNEL_QMM_SWEEP_ITERS: Number of timed iterations (default 25).
+    EJKERNEL_QMM_SWEEP_SEED: RNG seed for weight generation (default 0).
+"""
 
 from __future__ import annotations
 
@@ -36,6 +47,7 @@ DTYPES: tuple[jnp.dtype, ...] = (jnp.float16, jnp.bfloat16)
 
 
 def _dtype_name(dtype: jnp.dtype) -> str:
+    """Return a short human-readable string for a JAX dtype."""
     return "bf16" if jnp.dtype(dtype) == jnp.bfloat16 else "fp16"
 
 
@@ -51,6 +63,25 @@ def _bench_case(
     warmup: int,
     iters: int,
 ) -> float:
+    """Time a single quantized matmul configuration on a given platform.
+
+    Performs one compilation call, then *warmup* untimed iterations, then
+    *iters* timed iterations with ``block_until_ready``.
+
+    Args:
+        x: Activation matrix.
+        w_q: Quantized weight matrix.
+        scales: Per-group scale factors.
+        biases: Per-group biases (only for affine mode).
+        mode: Quantization mode name.
+        bits: Bit width of the quantization.
+        platform: Kernel platform to use (``"cute"`` or ``"cuda"``).
+        warmup: Number of warmup iterations.
+        iters: Number of timed iterations.
+
+    Returns:
+        Average latency in milliseconds per iteration.
+    """
     y = quantized_matmul(
         x,
         w_q,
@@ -94,6 +125,11 @@ def _bench_case(
 
 
 def main() -> int:
+    """Run the full CuTe-vs-CUDA quantized matmul sweep and print results.
+
+    Returns:
+        0 on success, 1 if the GPU backend is not available.
+    """
     if jax.default_backend() != "gpu":
         print("GPU backend required.")
         return 1

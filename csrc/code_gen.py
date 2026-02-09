@@ -15,6 +15,15 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class CodegenTarget:
+    """Description of a single per-kernel code generator to invoke.
+
+    Attributes:
+        name: Human-readable label printed during execution.
+        path: Absolute path to the ``code_gen.py`` script.
+        supports_sms: Whether this generator accepts a ``--sms`` flag.
+        sms_override: If set, use this SM string instead of the global one.
+    """
+
     name: str
     path: Path
     supports_sms: bool = False
@@ -22,10 +31,12 @@ class CodegenTarget:
 
 
 def _repo_root() -> Path:
+    """Return the repository root directory (two levels above this file)."""
     return Path(__file__).resolve().parent.parent
 
 
 def _default_targets() -> list[CodegenTarget]:
+    """Return the list of all known kernel code-generation targets."""
     root = _repo_root()
     return [
         CodegenTarget(
@@ -59,6 +70,13 @@ def _default_targets() -> list[CodegenTarget]:
 
 
 def _run_target(target: CodegenTarget, sms: str | None) -> None:
+    """Execute a single code-generation target as a subprocess.
+
+    Args:
+        target: The codegen target to run.
+        sms: Comma-separated SM versions to pass via ``--sms``, or ``None``
+            to omit the flag.
+    """
     if not target.path.exists():
         print(f"[skip] {target.name}: missing {target.path}", file=sys.stderr)
         return
@@ -72,6 +90,7 @@ def _run_target(target: CodegenTarget, sms: str | None) -> None:
 
 
 def main() -> None:
+    """Parse CLI arguments and invoke every registered code generator."""
     parser = argparse.ArgumentParser(
         prog="code_gen",
         description="Run all csrc code generators.",

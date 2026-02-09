@@ -18,17 +18,23 @@ DOCS_API_DIR = PROJECT_ROOT / "docs" / "api_docs"
 
 
 def _strip_prefix(module_path: str) -> str:
+    """Remove the leading project-name prefix from a dotted module path."""
     prefix = f"{PROJECT_NAME}."
     return module_path[len(prefix) :] if module_path.startswith(prefix) else module_path
 
 
 def _docname_from_module(module_path: str) -> str:
+    """Convert a dotted module path to a slash-separated doc name."""
     return _strip_prefix(module_path).replace(".", "/")
 
 
 def create_rst_file(name: str, module_path: str, output_dir: Path) -> None:
-    """
-    Create a module page at a nested path (mirrors package structure).
+    """Create a Sphinx ``.rst`` module page at a nested path mirroring package structure.
+
+    Args:
+        name: Title to use at the top of the RST page.
+        module_path: Fully-qualified dotted module name.
+        output_dir: Root directory for the generated RST tree.
     """
     docname = _docname_from_module(module_path)
     rst_path = output_dir / f"{docname}.rst"
@@ -45,10 +51,13 @@ def create_rst_file(name: str, module_path: str, output_dir: Path) -> None:
 
 
 def _write_package_index(pkg_docname: str, children: list[str], packages: set[str]) -> None:
-    """
-    Write index.rst for a package.
-    pkg_docname: '' for top-level, otherwise 'kernels' or 'kernels/triton_flash_attention', etc.
-    children: list of docnames for immediate children (packages or modules)
+    """Write an ``index.rst`` toctree page for a package.
+
+    Args:
+        pkg_docname: Slash-separated package doc name (``""`` for the top-level).
+        children: Doc names for immediate children (packages or modules).
+        packages: Set of doc names that are themselves packages (used to
+            distinguish sub-package entries from leaf modules).
     """
     if pkg_docname:
         index_path = DOCS_API_DIR / pkg_docname / "index.rst"
@@ -81,8 +90,17 @@ def _write_package_index(pkg_docname: str, children: list[str], packages: set[st
 
 
 def generate_api_docs(clean: bool = True) -> bool:
-    """
-    Generate API documentation with a hierarchical layout.
+    """Generate API documentation with a hierarchical RST layout.
+
+    Discovers all modules under the project package, writes per-module RST
+    pages and per-package index pages into ``DOCS_API_DIR``.
+
+    Args:
+        clean: If ``True``, remove the existing docs directory before generating.
+
+    Returns:
+        ``True`` if documentation was generated successfully, ``False`` if no
+        modules were found.
     """
     print("Generating API documentation...")
 
@@ -138,15 +156,14 @@ def generate_api_docs(clean: bool = True) -> bool:
 
 
 def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    """
-    Run a shell command and return the result.
+    """Run a shell command and return the result.
 
     Args:
-        cmd: Command and arguments as list.
-        check: Whether to raise exception on non-zero exit code.
+        cmd: Command and arguments as a list of strings.
+        check: Whether to raise an exception on non-zero exit code.
 
     Returns:
-        CompletedProcess object with command results.
+        ``CompletedProcess`` object with command results.
     """
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=check)
@@ -160,15 +177,14 @@ def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProce
 
 
 def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
-    """
-    Format Python code using ruff.
+    """Format Python code using ruff check and ruff format.
 
     Args:
         directory: Directory to format.
         fix: Whether to apply fixes automatically.
 
     Returns:
-        True if successful, False otherwise.
+        ``True`` if all formatting succeeded, ``False`` otherwise.
     """
     print(f"Formatting code in {directory}/...")
 
@@ -208,6 +224,14 @@ def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
 
 
 def discover_modules(project_name: str) -> list[str]:
+    """Discover all non-init Python modules under the project package.
+
+    Args:
+        project_name: Top-level package directory name.
+
+    Returns:
+        Sorted list of fully-qualified dotted module paths.
+    """
     base_dir = (PROJECT_ROOT / project_name).resolve()
     if not base_dir.is_dir():
         raise FileNotFoundError(f"Package directory not found: {base_dir}")
@@ -223,14 +247,13 @@ def discover_modules(project_name: str) -> list[str]:
 
 
 def run_tests(test_dir: str = "test") -> bool:
-    """
-    Run project tests using pytest.
+    """Run project tests using pytest.
 
     Args:
         test_dir: Directory containing tests.
 
     Returns:
-        True if tests pass, False otherwise.
+        ``True`` if all tests pass, ``False`` otherwise.
     """
     print(f"Running tests in {test_dir}/...")
 
@@ -245,7 +268,7 @@ def run_tests(test_dir: str = "test") -> bool:
 
 
 def main():
-    """Main entry point."""
+    """Parse CLI arguments and run selected tasks (format, docs, test)."""
     parser = argparse.ArgumentParser(description=f"Format code and generate documentation for {PROJECT_NAME}")
 
     # Task selection

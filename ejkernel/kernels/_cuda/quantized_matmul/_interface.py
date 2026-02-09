@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA quantized matrix multiplication interface."""
+"""CUDA quantized matrix multiplication public interface.
+
+This module exposes :func:`quantized_matmul`, the registry-facing entry point
+for CUDA-backed quantized matrix multiplication. It is registered under the
+``CUDA`` platform and ``GPU`` backend and supports differentiable computation
+through a custom VJP rule.
+
+The forward pass delegates to the CUDA FFI custom call via
+:func:`~._cuda_impl_fwd.quantized_matmul_forward`, while the backward pass
+computes the input gradient via
+:func:`~._cuda_impl_bwd.quantized_matmul_input_grad`.
+"""
 
 from __future__ import annotations
 
@@ -55,6 +66,28 @@ def _operate(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ):
+    """Differentiable quantized matmul primitive with custom VJP.
+
+    Dispatches the forward computation to the CUDA custom call. The
+    non-differentiable arguments (indices 4--10) are passed through to both
+    forward and backward rules.
+
+    Args:
+        x: Input activation matrix.
+        w: Packed quantized weight matrix.
+        scales: Per-group scale factors.
+        biases: Per-group additive offsets (affine mode only).
+        transpose: Whether the weight matrix uses transposed layout.
+        group_size: Quantization group size.
+        bits: Bit-width per quantized element.
+        mode: Backend quantization mode string.
+        gemv_mode: GEMV dispatch mode.
+        revsplit_k: Reverse split-K dispatch mode.
+        revsplit_k_parts: Number of split-K partitions.
+
+    Returns:
+        Result matrix with shape ``(M, N)`` and the same dtype as *x*.
+    """
     return quantized_matmul_forward(
         x,
         w,
@@ -83,6 +116,15 @@ def _operate_fwd(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ):
+    """Custom VJP forward rule for :func:`_operate`.
+
+    Runs the CUDA quantized matmul forward pass and saves the weight,
+    scales, and biases tensors as residuals for the backward pass.
+
+    Returns:
+        A tuple ``(out, (w, scales, biases))`` where *out* is the
+        forward result and the second element is the residual tuple.
+    """
     out = quantized_matmul_forward(
         x,
         w,
@@ -110,6 +152,16 @@ def _operate_bwd(
     residual,
     grad_out,
 ):
+    """Custom VJP backward rule for :func:`_operate`.
+
+    Computes the gradient of the loss with respect to the dense input *x*
+    by calling :func:`quantized_matmul_input_grad`. Gradients with respect
+    to the quantized weights, scales, and biases are returned as ``None``
+    since they are not differentiable in the quantized regime.
+
+    Returns:
+        A 4-tuple ``(grad_x, None, None, None)``.
+    """
     w, scales, biases = residual
     grad_x = quantized_matmul_input_grad(
         grad_out,
@@ -156,8 +208,39 @@ def quantized_matmul(
 ) -> Float[Array, "m n"]:
     """Perform quantized matrix multiplication using CUDA custom call.
 
-    ``zeros`` is used only for affine mode and is converted to per-group
-    additive offsets before dispatching the CUDA custom call.
+    This is the registry-facing entry point for the CUDA platform. It
+    resolves quantization parameters, converts affine ``zeros`` metadata
+    into per-group additive biases, and delegates to the differentiable
+    :func:`_operate` primitive backed by the CUDA FFI kernel.
+
+    Args:
+        x: Input activation matrix of shape ``(m, k)``.
+        w: Packed quantized weight matrix (``uint32``).
+        scales: Per-group scale factors.
+        zeros: Per-group zero-point offsets. Required for ``"affine"``
+            mode; must be ``None`` for all other modes.
+        transpose: Whether the weight matrix is transposed.
+        group_size: Number of output features per quantization group.
+        bits: Bit-width per quantized element.
+        mode: Quantization scheme name.
+        axis: Optional quantization axis hint.
+        gemv_mode: GEMV dispatch mode (``"auto"``, ``"on"``, ``"off"``).
+        revsplit_k: Reverse split-K dispatch mode.
+        revsplit_k_parts: Number of split-K partitions.
+        block_m: *Unused by this backend.* Accepted for API compatibility.
+        block_n: *Unused by this backend.* Accepted for API compatibility.
+        block_k: *Unused by this backend.* Accepted for API compatibility.
+        use_bf16: *Unused by this backend.* Accepted for API compatibility.
+        num_warps: *Unused by this backend.* Accepted for API compatibility.
+        num_stages: *Unused by this backend.* Accepted for API compatibility.
+        split_k: *Unused by this backend.* Accepted for API compatibility.
+
+    Returns:
+        Result matrix of shape ``(m, n)`` with the same dtype as *x*.
+
+    Raises:
+        ValueError: If ``zeros`` is ``None`` when mode is ``"affine"``,
+            or non-``None`` for non-affine modes.
     """
     del block_m, block_n, block_k, use_bf16, num_warps, num_stages, split_k
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)

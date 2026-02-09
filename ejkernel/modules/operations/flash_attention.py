@@ -188,6 +188,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
             kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         ) -> Float[Array, "batch num_heads seq_len head_dim"]:
+            """Shard-local flash attention forwarding to self.run."""
             return self.run(
                 query=query,
                 key=key,
@@ -504,6 +505,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         causal = bool(inv.kwargs.get("causal", True))
 
         def window_total(sw):
+            """Compute total window span from a sliding window specification."""
             if sw is None:
                 return None
             if isinstance(sw, int):
@@ -517,12 +519,14 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         smem_limit = int(os.getenv("EJKERNEL_TRITON_SMEM_LIMIT", str(99 * 1024)))
 
         def next_pow2_ge(x: int, min_val: int = 16) -> int:
+            """Return the smallest power of two >= x, with a minimum of min_val."""
             return max(min_val, 1 << math.ceil(math.log2(max(1, x))))
 
         block_headdim = next_pow2_ge(head_dim, 16)
         elem_bytes = 2 if dtype in (jnp.float16, jnp.bfloat16) else 4
 
         def smem_est_bytes(qb: int, kb: int, num_stages: int) -> int:
+            """Estimate shared memory usage in bytes for given block sizes and stages."""
             kv_bytes = 2 * kb * block_headdim * elem_bytes
             q_bytes = int(0.25 * qb * block_headdim * elem_bytes)
             base = kv_bytes + q_bytes
@@ -552,6 +556,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             q_opts = [x for x in q_opts if x <= 128] or [64, 128]
 
         def pick_warps_stages(qb: int, kb: int, dh: int) -> tuple[int, int]:
+            """Select num_warps and num_stages based on block sizes and head dim."""
             if dh <= 64:
                 warps = 2 if max(qb, kb) <= 64 else 4
             elif dh <= 128:
@@ -563,6 +568,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             return warps, stages
 
         def bwd_block(x: int, cap: int = 128) -> int:
+            """Compute backward block size from a forward block size."""
             return max(32, min(cap, x // 2 if x >= 64 else x))
 
         hv_pairs = []
@@ -629,6 +635,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         causal = bool(inv.kwargs.get("causal", True))
 
         def win_span(sw):
+            """Compute total window span from a sliding window specification."""
             if sw is None:
                 return None
             if isinstance(sw, int):
@@ -638,6 +645,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             return wl + wr + 1
 
         def round128(x: int | float) -> int:
+            """Round x up to the nearest multiple of 128."""
             return 128 * max(1, round(float(x) / 128.0))
 
         win = win_span(sliding_window)
@@ -655,6 +663,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             kv_opts = [x for x in kv_opts if x <= 256] or [128, 256]
 
         def bwd_tile(_x: int) -> int:
+            """Return a fixed backward tile size of 128."""
             return 128
 
         hv_pairs: list[tuple[int, int]] = []
@@ -713,6 +722,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         causal = bool(inv.kwargs.get("causal", True))
 
         def win_span(sw):
+            """Compute total window span from a sliding window specification."""
             if sw is None:
                 return None
             if isinstance(sw, int):
@@ -722,6 +732,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             return wl + wr + 1
 
         def round128(x: int | float) -> int:
+            """Round x up to the nearest multiple of 128."""
             return 128 * max(1, round(float(x) / 128.0))
 
         win = win_span(sliding_window)
@@ -739,6 +750,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             kv_opts = [x for x in kv_opts if x <= 256] or [128, 256]
 
         def bwd_tile(_x: int) -> int:
+            """Return a fixed backward tile size of 128."""
             return 128
 
         hv_pairs: list[tuple[int, int]] = []

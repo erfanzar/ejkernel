@@ -72,6 +72,6 @@ Note:
     prefer the Pallas implementation for better performance.
 """
 
-from ._impl import prefill_page_attention
+from ._interface import prefill_page_attention
 
 __all__ = ("prefill_page_attention",)

@@ -118,9 +118,36 @@ def _ssm1_fwd(
     discrete_Bx = dt[:, :, :, None] * B[:, None, :, :].swapaxes(1, 2) * hidden_states[:, :, :, None]
 
     def process_batch(x_b, dA_b, dBx_b, C_b, h0):
-        """Process a single batch element."""
+        """Process a single batch element through the SSM1 recurrence.
+
+        Runs the full sequential scan for one batch element using
+        ``jax.lax.scan``, collecting all intermediate hidden states
+        and per-timestep outputs.
+
+        Args:
+            x_b: Input for this batch [seq_len, intermediate_size].
+            dA_b: Discretized A for this batch [seq_len, intermediate_size, ssm_state_size].
+            dBx_b: Discretized B*x for this batch [seq_len, intermediate_size, ssm_state_size].
+            C_b: C parameter for this batch [seq_len, ssm_state_size].
+            h0: Initial hidden state [intermediate_size, ssm_state_size].
+
+        Returns:
+            Tuple of (outputs, hidden_states_all, h_final) where:
+                - outputs: Per-timestep SSM output [seq_len, intermediate_size].
+                - hidden_states_all: All hidden states [seq_len, intermediate_size, ssm_state_size].
+                - h_final: Final hidden state [intermediate_size, ssm_state_size].
+        """
 
         def scan_fn(carry, inputs):
+            """Single SSM1 recurrence step within lax.scan.
+
+            Args:
+                carry: Tuple of (hidden_state,) with shape [intermediate_size, ssm_state_size].
+                inputs: Tuple of (x_t, dA_t, dBx_t, C_t) for the current timestep.
+
+            Returns:
+                Updated carry and tuple of (new_hidden_state, output_scalar).
+            """
             x_t, dA_t, dBx_t, C_t = inputs
             (h,) = carry
 

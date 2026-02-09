@@ -236,6 +236,7 @@ def _expand_axis_candidates(
     effective_min = min(max(1, min_value), limit)
 
     def _quantize(val: float | int) -> int:
+        """Round and clamp a value to the nearest valid block size within limits."""
         if step is None or step <= 1:
             quantized = round(val)
         else:
@@ -245,6 +246,7 @@ def _expand_axis_candidates(
     candidates: list[int] = []
 
     def _push(val: float | int | None):
+        """Quantize and append a candidate value if not already present."""
         if val is None:
             return
         quantized = _quantize(val)
@@ -457,6 +459,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             Float[Array, "total_tokens num_q_heads head_dim"],
             Float[Array, "num_pages page_size num_kv_heads_x2_per_kv_packing kv_packing head_dim_padded"],
         ]:
+            """Shard-map compatible wrapper that delegates to self.run with captured params."""
             return self.run(
                 queries=queries,
                 keys=keys,
@@ -991,12 +994,14 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             kv_candidates: list[int] = []
 
             def _prev_pow2(x: int) -> int:
+                """Return the largest power of 2 <= x."""
                 x = int(x)
                 if x <= 1:
                     return 1
                 return 1 << (x.bit_length() - 1)
 
             def _push_kv_pages(kv_pages: int):
+                """Clamp and append a KV-pages candidate if not already present."""
                 kv_pages = int(kv_pages)
                 if kv_pages <= 0:
                     return
@@ -1025,6 +1030,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             pairs: list[tuple[int, int]] = []
 
             def _push_pair(kv_pages: int, q_tokens: int):
+                """Validate and append a (kv_pages, q_tokens) pair if within limits and unique."""
                 kv_pages = int(kv_pages)
                 q_tokens = int(q_tokens)
                 if kv_pages <= 0 or q_tokens <= 0:
@@ -1069,6 +1075,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         pairs: list[tuple[int, int]] = []
 
         def _push_pair(kv_pages: int, q_tokens: int):
+            """Validate and append a (kv_pages, q_tokens) pair if within limits and unique."""
             if kv_pages <= 0 or q_tokens <= 0:
                 return
             if kv_pages > kv_limit or q_tokens > q_limit:

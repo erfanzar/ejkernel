@@ -224,6 +224,7 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
             num_seqs: Array | int,
             softmax_aux: Float[Array, "num_sinks"] | None = None,
         ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
+            """Shard-map compatible wrapper that delegates to self.run with captured params."""
             return self.run(
                 queries=queries,
                 kv_pages=kv_pages,
@@ -498,6 +499,7 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
             p_opts = [min(2, pages_per_seq)]
 
         def pick_warps_stages(block_m: int, npages: int) -> tuple[int, int]:
+            """Select warp count and pipeline stages based on block size and head dimension."""
             if head_dim <= 64:
                 warps = 2 if block_m <= 64 else 4
             elif head_dim <= 128:

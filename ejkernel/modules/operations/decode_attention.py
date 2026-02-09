@@ -155,6 +155,7 @@ class DecodeAttention(Kernel[DecodeAttentionConfig, tuple[Array, Array]]):
             Float[Array, "batch num_q_heads head_dim"],
             Float[Array, "batch num_q_heads"],
         ]:
+            """Shard-local decode attention forwarding to self.run."""
             return self.run(
                 query=query,
                 key_buffer=key_buffer,

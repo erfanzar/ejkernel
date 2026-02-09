@@ -196,6 +196,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             q_positions: Int[Array, "batch seq_len"] | None,
             kv_positions: Int[Array, "batch kv_len"] | None,
         ) -> Float[Array, "batch num_heads seq_len vhead_dim"]:
+            """Shard-local blocksparse attention forwarding to self.run."""
             return self.run(
                 query=query,
                 key=key,
@@ -497,6 +498,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         causal = bool(inv.kwargs.get("causal", True))
 
         def window_total(sw):
+            """Compute total window span from a sliding window specification."""
             if sw is None:
                 return None
             if isinstance(sw, int):
@@ -513,6 +515,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         elem_bytes = 2 if dtype in (jnp.float16, jnp.bfloat16) else 4
 
         def smem_est_bytes(qb: int, kb: int, num_stages: int) -> int:
+            """Estimate shared memory usage in bytes for given block sizes and stages."""
             kv_bytes = 2 * kb * block_headdim * elem_bytes
 
             q_bytes = int(0.5 * qb * block_headdim * elem_bytes)
@@ -545,6 +548,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             q_opts = [x for x in q_opts if x <= 128] or [64, 128]
 
         def pick_warps_stages(qb: int, kb: int, dh: int) -> tuple[int, int]:
+            """Select num_warps and num_stages based on block sizes and head dim."""
             if dh <= 64:
                 warps = 2 if max(qb, kb) <= 64 else 4
             elif dh <= 128:
@@ -561,6 +565,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             return warps, stages
 
         def bwd_block(x: int, cap: int = 128) -> int:
+            """Compute backward block size from a forward block size."""
             return max(32, min(cap, x // 2 if x >= 64 else x))
 
         hv_pairs = []
@@ -628,6 +633,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         causal = bool(inv.kwargs.get("causal", True))
 
         def win_span(sw):
+            """Compute total window span from a sliding window specification."""
             if sw is None:
                 return None
             if isinstance(sw, int):
@@ -637,6 +643,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             return wl + wr + 1
 
         def nearest_128_from_set(x: int, allowed=(128, 256, 512, 1024)) -> int:
+            """Return the allowed value nearest to x, breaking ties by smallest."""
             return min(allowed, key=lambda v: (abs(v - x), v))
 
         allowed = (128, 256, 512, 1024)
@@ -653,6 +660,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         kv_opts = sorted(set(kv_opts))
 
         def bwd_tile(x: int) -> int:
+            """Compute backward tile size from a forward tile size."""
             return 128 if x <= 256 else 256
 
         hv_pairs: list[tuple[int, int]] = []
@@ -707,6 +715,18 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         return configs
 
     def candidate_cfgs_xla(self, inv: Invocation[BlockSparseAttentionConfig, Array]):
+        """Generate XLA-optimized candidate configurations for autotuning.
+
+        Produces block-size combinations in the range 128-1024 suitable for XLA
+        compilation. Sliding window, sequence lengths, and causal mode are used
+        to narrow the search space.
+
+        Args:
+            inv: Invocation object with arguments and metadata.
+
+        Returns:
+            List of BlockSparseAttentionConfig candidates for autotuning.
+        """
         q = inv.kwargs["query"]
         k = inv.kwargs["key"]
         q_len = int(q.shape[-2])
@@ -716,6 +736,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         causal = bool(inv.kwargs.get("causal", True))
 
         def win_span(sw):
+            """Compute total window span from a sliding window specification."""
             if sw is None:
                 return None
             if isinstance(sw, int):
@@ -725,6 +746,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             return wl + wr + 1
 
         def nearest_128_from_set(x: int, allowed=(128, 256, 512, 1024)) -> int:
+            """Return the allowed value nearest to x, breaking ties by smallest."""
             return min(allowed, key=lambda v: (abs(v - x), v))
 
         allowed = (128, 256, 512, 1024)
@@ -741,6 +763,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         kv_opts = sorted(set(kv_opts))
 
         def bwd_tile(x: int) -> int:
+            """Compute backward tile size from a forward tile size."""
             return 128 if x <= 256 else 256
 
         hv_pairs: list[tuple[int, int]] = []

@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backward CUDA implementation for quantized matrix multiplication."""
+"""Backward CUDA implementation for quantized matrix multiplication.
+
+This module provides :func:`quantized_matmul_input_grad`, which computes
+the gradient of the loss with respect to the dense input activation *x*.
+Because the CUDA custom-call QMM kernel only supports forward evaluation,
+the backward pass dequantizes the weights to full precision and performs
+the transpose matmul via ``jax.lax.dot_general``.
+"""
 
 from __future__ import annotations
 
@@ -48,11 +55,35 @@ def quantized_matmul_input_grad(
     revsplit_k: str,
     revsplit_k_parts: int | None,
 ):
-    """Compute gradient with respect to the dense input x.
+    """Compute gradient of the loss with respect to the dense input *x*.
+
+    Dequantizes the packed weight matrix to full precision and performs the
+    transpose matmul ``dY @ W^T`` (or ``dY @ W`` when transposed) using
+    ``jax.lax.dot_general``.
 
     Note:
-        CUDA custom-call QMM currently supports only ``transpose=False`` in the
-        forward path, so backward uses exact dequantize+dot for dX.
+        The CUDA custom-call QMM currently supports only ``transpose=False``
+        in the forward path, so the backward always uses exact
+        dequantize + dot for dX.
+
+    Args:
+        dy: Upstream gradient of shape ``(M, N)``.
+        w: Packed quantized weight matrix.
+        scales: Per-group scale factors.
+        biases: Per-group additive offsets (affine mode only).
+        transpose: Whether the weight layout is transposed.
+        group_size: Quantization group size.
+        bits: Bit-width per quantized element.
+        mode: Backend quantization mode string.
+        gemv_mode: Unused; accepted for signature compatibility.
+        revsplit_k: Unused; accepted for signature compatibility.
+        revsplit_k_parts: Unused; accepted for signature compatibility.
+
+    Returns:
+        Gradient tensor with shape ``(M, K)`` and dtype ``float32``.
+
+    Raises:
+        ValueError: If *biases* is ``None`` when mode is ``"affine"``.
     """
     del gemv_mode, revsplit_k, revsplit_k_parts
     zeros = None

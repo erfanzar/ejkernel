@@ -12,7 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Quantized matrix multiplication operation with automatic optimization."""
+"""Quantized matrix multiplication operation with automatic optimization.
+
+This module implements fused quantized matrix multiplication, performing
+dequantization and matmul in a single kernel pass for maximum throughput.
+It supports multiple quantization formats and automatically selects the
+optimal backend (Triton, Pallas, CUDA, CuTe, or XLA) based on the target
+hardware and input characteristics.
+
+Supported Quantization Modes:
+    - affine: Standard asymmetric quantization with scales and zero-points
+    - nf4: NormalFloat4 (QLoRA-style 4-bit quantization)
+    - mxfp4: Microscaling FP4
+    - mxfp8: Microscaling FP8
+    - nvfp4: NVIDIA FP4
+    - nvfp8: NVIDIA FP8
+
+Key Features:
+    - Fused dequantize + matmul in a single kernel pass
+    - Automatic platform selection (Triton/Pallas/CUDA/CuTe/XLA)
+    - Configurable block sizes with autotuning support
+    - Split-K for improved parallelism on tall-skinny matrices
+    - GEMV specialization for M=1 workloads
+    - Custom VJP for backward pass compatibility
+    - TPU Pallas support with packed path optimization
+
+Mathematical Formulation:
+    output = x @ dequantize(w, scales, zeros)
+    output = x @ dequantize(w, scales, zeros).T  (when transpose=True)
+
+Performance Characteristics:
+    - Eliminates memory bandwidth overhead of separate dequantization
+    - Automatic split-K selection for small batch sizes
+    - Hardware-specific heuristics for block size selection
+    - Persistent configuration caching across runs
+
+References:
+    - QLoRA: https://arxiv.org/abs/2305.14314
+    - GPTQ: https://arxiv.org/abs/2210.17323
+    - Microscaling: https://arxiv.org/abs/2310.10537
+"""
 
 from __future__ import annotations
 
@@ -55,12 +94,33 @@ from .configs import QuantizedMatmulConfig
 
 
 def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tuple[int, int]:
+    """Resolve quantization parameters from mode, group_size, and bits.
+
+    Args:
+        mode: Quantization mode string (e.g., "affine", "nf4").
+        group_size: Optional group size override.
+        bits: Optional bit-width override.
+
+    Returns:
+        Tuple of (group_size, bits) with defaults applied based on mode.
+    """
     _, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
     return group_size, bits
 
 
 def _fallback_platform_for_cuda_transpose() -> Platform:
+    """Determine the fallback platform when CUDA does not support transpose.
+
+    CUDA quantized_matmul does not support axis='col' (transpose=True).
+    This function probes available implementations and returns the best
+    fallback platform in order of preference: Triton > CuTe > XLA.
+
+    Returns:
+        Platform enum value for the best available fallback.
+    """
+
     def _has_impl(cand: Platform, backend: str) -> bool:
+        """Check whether a kernel implementation exists for the given platform and backend."""
         try:
             kernel_registry.get("quantized_matmul", platform=cand, backend=backend)
             return True
@@ -86,14 +146,41 @@ def _fallback_platform_for_cuda_transpose() -> Platform:
 
 
 def _static_bool(value, name: str) -> bool:
+    """Extract a concrete boolean value, raising if it is a JAX tracer.
+
+    Args:
+        value: The value to concretize.
+        name: Parameter name for the error message.
+
+    Returns:
+        The concrete boolean value.
+    """
     return jax.core.concrete_or_error(bool, value, f"{name} must be static.")
 
 
 def _static_int(value, name: str) -> int:
+    """Extract a concrete integer value, raising if it is a JAX tracer.
+
+    Args:
+        value: The value to concretize.
+        name: Parameter name for the error message.
+
+    Returns:
+        The concrete integer value.
+    """
     return jax.core.concrete_or_error(int, value, f"{name} must be static.")
 
 
 def _lcm(a: int, b: int) -> int:
+    """Compute the least common multiple of two integers.
+
+    Args:
+        a: First integer. If <= 0, returns b.
+        b: Second integer. If <= 0, returns a.
+
+    Returns:
+        The least common multiple of a and b.
+    """
     if a <= 0:
         return int(b)
     if b <= 0:
@@ -102,15 +189,46 @@ def _lcm(a: int, b: int) -> int:
 
 
 def _ceil_div(a: int, b: int) -> int:
+    """Compute ceiling division of a by b.
+
+    Args:
+        a: Numerator.
+        b: Denominator.
+
+    Returns:
+        The smallest integer >= a/b.
+    """
     return (a + b - 1) // b
 
 
 def _nearest_choices(value: int, choices: tuple[int, ...], count: int = 2) -> list[int]:
+    """Select the nearest choices to a target value from a set of options.
+
+    Args:
+        value: Target value to match.
+        choices: Available choices to select from.
+        count: Number of nearest choices to return.
+
+    Returns:
+        Sorted list of the `count` choices closest to `value`.
+    """
     ranked = sorted(set(choices), key=lambda x: abs(x - value))
     return sorted(ranked[:count])
 
 
 def _expand_choices(value: int, choices: tuple[int, ...]) -> list[int]:
+    """Expand a value into a neighborhood of choices.
+
+    Returns the value itself plus its immediate neighbors in the sorted
+    choices list, providing a small search window for autotuning.
+
+    Args:
+        value: The base value to expand around.
+        choices: Sorted tuple of available choices.
+
+    Returns:
+        Sorted list of up to 3 choices: the value and its neighbors.
+    """
     choices = tuple(sorted(set(choices)))
     try:
         idx = choices.index(value)
@@ -125,6 +243,19 @@ def _expand_choices(value: int, choices: tuple[int, ...]) -> list[int]:
 
 
 def _ensure_aligned(choices: list[int], align: int, max_choice: int) -> list[int]:
+    """Filter or round choices to ensure alignment.
+
+    Returns only choices that are multiples of `align`. If none of the
+    original choices are aligned, rounds up and filters by max_choice.
+
+    Args:
+        choices: List of candidate block sizes.
+        align: Required alignment (e.g., group_size * values_per_word).
+        max_choice: Maximum allowed value after rounding.
+
+    Returns:
+        List of aligned choices, or [align] as fallback.
+    """
     if align <= 1:
         return choices
     aligned = [c for c in choices if c % align == 0]
@@ -138,12 +269,37 @@ def _ensure_aligned(choices: list[int], align: int, max_choice: int) -> list[int
 
 
 def _inv_arg(inv: Invocation[QuantizedMatmulConfig, Array], name: str, index: int):
+    """Resolve a positional-or-keyword argument from an Invocation.
+
+    Args:
+        inv: The kernel invocation containing args and kwargs.
+        name: The keyword argument name to look up.
+        index: The positional argument index to try first.
+
+    Returns:
+        The resolved argument value.
+    """
     if len(inv.args) > index:
         return inv.args[index]
     return inv.kwargs[name]
 
 
 def _infer_mkn(inv: Invocation[QuantizedMatmulConfig, Array], group_size: int) -> tuple[int, int, int, bool]:
+    """Infer the M, K, N dimensions and transpose flag from an invocation.
+
+    Extracts shape information from the input tensors (x, w, scales)
+    to determine the effective matmul dimensions.
+
+    Args:
+        inv: The kernel invocation containing the input tensors.
+        group_size: Quantization group size, used to compute N when
+            transpose is False.
+
+    Returns:
+        Tuple of (M, K, N, transpose) where M is the batch dimension,
+        K is the reduction dimension, N is the output dimension, and
+        transpose indicates whether the weight is in transposed layout.
+    """
     x = _inv_arg(inv, "x", 0)
     w = _inv_arg(inv, "w", 1)
     scales = _inv_arg(inv, "scales", 2)
@@ -157,6 +313,17 @@ def _infer_mkn(inv: Invocation[QuantizedMatmulConfig, Array], group_size: int) -
 
 
 def _prefer_bf16(x: Array) -> bool:
+    """Determine whether to prefer bfloat16 accumulation for the given input.
+
+    Returns True unless the input is explicitly float16, in which case
+    float16 accumulation may be preferred for consistency.
+
+    Args:
+        x: Input array to check dtype of.
+
+    Returns:
+        True if bfloat16 is preferred, False if float16 is detected.
+    """
     dt = getattr(x, "dtype", None)
     if dt is None:
         return True
@@ -164,6 +331,19 @@ def _prefer_bf16(x: Array) -> bool:
 
 
 def _pick_split_k(m: int, k: int, block_k: int) -> int:
+    """Select the split-K factor for improved parallelism on small M.
+
+    When the M dimension is small and K is large, splitting the K
+    reduction across multiple thread blocks improves GPU utilization.
+
+    Args:
+        m: M dimension (number of rows in the output).
+        k: K dimension (reduction dimension).
+        block_k: Block size along the K dimension.
+
+    Returns:
+        Split-K factor (1, 2, 4, or 8). Returns 1 for no split.
+    """
     if block_k <= 0:
         return 1
     tiles = math.ceil(k / block_k)
@@ -180,6 +360,15 @@ def _pick_split_k(m: int, k: int, block_k: int) -> int:
 
 
 def _xla_choices(hardware: str) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Return block size choice tuples for XLA backend on the given hardware.
+
+    Args:
+        hardware: Hardware target string ("cpu", "tpu", or "gpu").
+
+    Returns:
+        Tuple of (block_m_choices, block_n_choices, block_k_choices) where
+        each element is a tuple of valid block sizes for that dimension.
+    """
     if hardware == "cpu":
         return (128, 256, 512), (128, 256, 512), (64, 128, 256)
     if hardware == "tpu":
@@ -188,6 +377,19 @@ def _xla_choices(hardware: str) -> tuple[tuple[int, ...], tuple[int, ...], tuple
 
 
 def _tpu_predecode_fits_memory_model(k: int, n: int) -> bool:
+    """Check whether a predecoded weight matrix fits the TPU memory budget.
+
+    The predecode path materializes the full dequantized weight matrix
+    (K x N in bfloat16). This function checks whether that temporary
+    fits within the configurable memory cap.
+
+    Args:
+        k: K dimension of the weight matrix.
+        n: N dimension of the weight matrix.
+
+    Returns:
+        True if the predecoded matrix fits within the memory cap.
+    """
     cap_raw = os.getenv("EJKERNEL_QMM_TPU_MAX_PREDECODE_BYTES")
     if cap_raw is None:
         cap = 256 * 1024 * 1024
@@ -202,6 +404,17 @@ def _tpu_predecode_fits_memory_model(k: int, n: int) -> bool:
 
 
 def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
+    """Generate a heuristic configuration for TPU Pallas quantized matmul.
+
+    Selects block sizes based on matrix dimensions, quantization parameters,
+    and TPU memory model constraints.
+
+    Args:
+        inv: The kernel invocation containing input tensors and kwargs.
+
+    Returns:
+        A QuantizedMatmulConfig tuned for TPU Pallas execution.
+    """
     mode = str(inv.kwargs.get("mode", "affine"))
     group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
     m, k, n, _ = _infer_mkn(inv, group_size)
@@ -236,6 +449,18 @@ def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> 
 
 
 def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) -> list[QuantizedMatmulConfig]:
+    """Generate candidate configurations for autotuning TPU Pallas quantized matmul.
+
+    Creates a grid of block size combinations, filtering by alignment
+    constraints and TPU memory model limits. Configurations that are legal
+    for the packed TPU path are preferred.
+
+    Args:
+        inv: The kernel invocation containing input tensors and kwargs.
+
+    Returns:
+        List of QuantizedMatmulConfig candidates for TPU autotuning.
+    """
     mode = str(inv.kwargs.get("mode", "affine"))
     group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
     _m, k, n, _ = _infer_mkn(inv, group_size)
@@ -305,6 +530,20 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
 
 
 def _xla_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array], hardware: str) -> list[QuantizedMatmulConfig]:
+    """Generate candidate configurations for autotuning XLA quantized matmul.
+
+    Creates block size combinations based on matrix dimensions and hardware
+    target, selecting nearby power-of-2 choices and ensuring alignment with
+    quantization group size. Returns up to 6 candidates sorted by proximity
+    to the actual matrix dimensions.
+
+    Args:
+        inv: The kernel invocation containing input tensors and kwargs.
+        hardware: Hardware target string ("cpu", "tpu", or "gpu").
+
+    Returns:
+        List of up to 6 QuantizedMatmulConfig candidates for XLA autotuning.
+    """
     mode = str(inv.kwargs.get("mode", "affine"))
     group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
     M, K, N, transpose = _infer_mkn(inv, group_size)
@@ -345,6 +584,7 @@ def _xla_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array], hardware:
                 )
 
     def _score(cfg: QuantizedMatmulConfig) -> int:
+        """Score a config by Manhattan distance from actual matrix dimensions."""
         return abs(cfg.block_m - M) + abs(cfg.block_n - N) + abs(cfg.block_k - K)
 
     configs.sort(key=_score)
@@ -352,11 +592,35 @@ def _xla_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array], hardware:
 
 
 def _xla_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array], hardware: str) -> QuantizedMatmulConfig:
+    """Generate a heuristic configuration for XLA quantized matmul.
+
+    Returns the top-ranked candidate from _xla_candidate_cfgs, or a
+    minimal fallback configuration if no candidates are generated.
+
+    Args:
+        inv: The kernel invocation containing input tensors and kwargs.
+        hardware: Hardware target string ("cpu", "tpu", or "gpu").
+
+    Returns:
+        A QuantizedMatmulConfig tuned for XLA execution.
+    """
     candidates = _xla_candidate_cfgs(inv, hardware)
     return candidates[0] if candidates else QuantizedMatmulConfig(platform="xla", backend="any")
 
 
 def _triton_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
+    """Generate a heuristic configuration for Triton GPU quantized matmul.
+
+    Selects block sizes, warp counts, pipeline stages, and split-K factor
+    based on matrix dimensions and quantization parameters. Includes
+    shared memory usage estimation to avoid exceeding GPU limits.
+
+    Args:
+        inv: The kernel invocation containing input tensors and kwargs.
+
+    Returns:
+        A QuantizedMatmulConfig tuned for Triton GPU execution.
+    """
     mode = str(inv.kwargs.get("mode", "affine"))
     group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
     M, K, N, _ = _infer_mkn(inv, group_size)
@@ -401,7 +665,17 @@ def _triton_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> Quan
 
 
 def _cuda_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
-    """Heuristic config for CUDA custom call path."""
+    """Generate a heuristic configuration for CUDA custom-call quantized matmul.
+
+    Uses fixed 128x128x64 block sizes with 4 warps and 2 pipeline stages,
+    which are well-suited for CUDA's custom-call codepath.
+
+    Args:
+        inv: The kernel invocation containing input tensors and kwargs.
+
+    Returns:
+        A QuantizedMatmulConfig tuned for CUDA custom-call execution.
+    """
     return QuantizedMatmulConfig(
         block_m=128,
         block_n=128,
@@ -416,7 +690,17 @@ def _cuda_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> Quanti
 
 
 def _cute_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
-    """Heuristic config for CuTe DSL path."""
+    """Generate a heuristic configuration for CuTe DSL quantized matmul.
+
+    Uses fixed 128x128x64 block sizes with 4 warps and 2 pipeline stages,
+    matching the CuTe DSL kernel's default tile shape.
+
+    Args:
+        inv: The kernel invocation containing input tensors and kwargs.
+
+    Returns:
+        A QuantizedMatmulConfig tuned for CuTe DSL execution.
+    """
     return QuantizedMatmulConfig(
         block_m=128,
         block_n=128,
@@ -722,7 +1006,36 @@ def _quantized_matmul_impl(
     platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
-    """Execute quantized matrix multiplication with normalized qparams."""
+    """Execute quantized matrix multiplication with normalized qparams.
+
+    Internal implementation that normalizes quantization parameters (mode,
+    group_size, bits, axis, transpose), resolves the kernel family (GEMM vs
+    GEMV vs revsplit-K), validates zeros requirements, and dispatches to the
+    appropriate platform executor.
+
+    Args:
+        x: Input matrix of shape (M, K) in float dtype.
+        w: Packed quantized weights.
+        scales: Per-group scale factors.
+        zeros: Per-group zero-points (required for affine mode, None otherwise).
+        transpose: If True, compute x @ dequantize(w).T.
+        group_size: Quantization group size.
+        bits: Quantization bit-width.
+        mode: Quantization mode string.
+        axis: Optional quantization axis convenience alias.
+        gemv_mode: GEMV kernel selection mode ("auto", "on", "off").
+        revsplit_k: Reverse split-K mode ("auto", "on", "off").
+        revsplit_k_parts: Number of parts for reverse split-K.
+        platform: Platform override.
+        cfg: Optional configuration override.
+
+    Returns:
+        Matrix multiplication result of shape (M, N).
+
+    Raises:
+        ValueError: If affine mode is used without zeros, or non-affine mode
+            with zeros.
+    """
     transpose = _static_bool(transpose, "transpose")
     if group_size is not None:
         group_size = _static_int(group_size, "group_size")
@@ -841,13 +1154,40 @@ def quantized_matmul(
     platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
-    """Quantized matrix multiplication with fused dequantization.
+    """Quantized matrix multiplication with fused dequantization and custom VJP.
 
-    See `_quantized_matmul_impl` for full documentation.
+    Performs output = x @ dequantize(w, scales, zeros) with automatic backend
+    selection and a custom backward pass that dequantizes weights for the
+    gradient computation. Supports affine, nf4, mxfp4, mxfp8, nvfp4, and
+    nvfp8 quantization modes.
+
+    Args:
+        x: Input matrix of shape (M, K) in float dtype.
+        w: Packed uint32 weights produced by quantize().
+        scales: Per-group scale factors.
+        zeros: Per-group zero-points. Required for affine mode, must be
+            None for non-affine modes.
+        transpose: If True, compute x @ dequantize(w).T.
+        group_size: Quantization group size. If None, uses mode default.
+        bits: Quantization bit-width. Honored for affine ({4,8});
+            ignored for nf4/mxfp4/mxfp8/nvfp4/nvfp8.
+        mode: Quantization mode. One of
+            {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}.
+        axis: Optional quantization axis convenience alias. "row" maps to
+            transpose=False; "col" maps to transpose=True.
+        gemv_mode: GEMV kernel selection mode ("auto", "on", "off").
+        revsplit_k: Reverse split-K mode ("auto", "on", "off").
+        revsplit_k_parts: Number of parts for reverse split-K.
+        platform: Platform override (triton/pallas/cuda/cute/xla/auto).
+        cfg: Optional configuration override.
+
+    Returns:
+        Matrix multiplication result of shape (M, N).
     """
     runtime_axis, runtime_transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
 
     def _inner(xi, wi, si, zi):
+        """Dispatch to _quantized_matmul_impl with captured quantization parameters."""
         return _quantized_matmul_impl(
             xi,
             wi,
@@ -867,13 +1207,16 @@ def quantized_matmul(
 
     @jax.custom_vjp
     def _inner_vjp(xi, wi, si, zi):
+        """Forward pass wrapper decorated with custom_vjp for backward compatibility."""
         return _inner(xi, wi, si, zi)
 
     def _inner_fwd(xi, wi, si, zi):
+        """Custom VJP forward: compute output and save residuals (w, scales, zeros)."""
         y = _inner(xi, wi, si, zi)
         return y, (wi, si, zi)
 
     def _inner_bwd(res, g):
+        """Custom VJP backward: dequantize weights and compute grad_x (grad_w/scales/zeros are zero)."""
         wi, si, zi = res
         from ejkernel.quantization._quants.quantizations import dequantize
 

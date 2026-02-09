@@ -61,8 +61,8 @@ pip install ejkernel
 ### Platform-Specific Installation
 
 ```bash
-# GPU Support (CUDA/ROCm)
-pip install ejkernel[gpu]
+# GPU Support (CUDA)
+pip install ejkernel[cuda]
 
 # TPU Support
 pip install ejkernel[tpu]
@@ -77,10 +77,12 @@ pip install -e ".[dev]"
 
 - Python 3.11-3.13
 - JAX >= 0.9.0
-- Triton == 3.4.0 (for GPU)
-- nvidia-cutlass-dsl >= 4.3.5 (optional, for CuTe DSL kernels)
+- Triton == 3.6.0 (for GPU)
+- nvidia-cutlass-dsl >= 4.4.0 (optional, for CuTe DSL kernels)
+- jax-tvm-ffi == 0.1.2 (optional, for CuTe TVM-FFI primitive path)
 - jaxtyping >= 0.3.2
 - beartype >= 0.22.2
+- pydantic >= 2.11.10
 
 ## Quick Start
 
@@ -178,17 +180,17 @@ ejKernel employs a sophisticated layered architecture that separates concerns wh
 
 ```md
 ┌─────────────────────────────────────────────────────┐
-│ Public API (modules/)                               │
-│ Simple functions with sensible defaults             │
+│ Public API (modules/) │
+│ Simple functions with sensible defaults │
 ├─────────────────────────────────────────────────────┤
-│ Operations Layer (ops/)                             │
-│ Configuration management, autotuning, caching       │
+│ Operations Layer (ops/) │
+│ Configuration management, autotuning, caching │
 ├─────────────────────────────────────────────────────┤
-│ Kernel Registry (kernels/)                          │
-│ Platform routing, signature validation              │
+│ Kernel Registry (kernels/) │
+│ Platform routing, signature validation │
 ├─────────────────────────────────────────────────────┤
-│ Backend Implementations (kernels/\_\*)              │
-│ Triton, CuTe, Pallas, XLA, CUDA kernels             │
+│ Backend Implementations (kernels/\_\*) │
+│ Triton, CuTe, Pallas, XLA, CUDA kernels │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -254,45 +256,45 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 
 ### Attention Mechanisms
 
-| Algorithm                        | Description                      | Memory | Key Features                                           |
-| -------------------------------- | -------------------------------- | ------ | ------------------------------------------------------ |
-| **Flash Attention v2**           | Memory-efficient exact attention | O(N)   | Causal masking, dropout, sliding windows, soft capping |
-| **Ring Attention**               | Distributed sequence parallelism | O(N/P) | Ultra-long sequences, communication overlap            |
-| **Page Attention**               | KV-cache optimized inference     | O(N)   | Block-wise memory, continuous batching                 |
-| **Block Sparse Attention**       | Configurable sparse patterns     | O(N√N) | Local+global, custom patterns                          |
-| **GLA**                          | Gated Linear Attention           | O(N)   | Linear complexity, gated updates                       |
-| **Lightning Attention**          | Layer-dependent decay            | O(N)   | Exponential moving average                             |
-| **MLA**                          | Multi-head Latent Attention      | O(N)   | Compressed KV representation                           |
-| **Ragged Page Attention v2**     | Variable-length paged attention  | O(N)   | Ragged sequences with page caching                     |
-| **Ragged Page Attention v3**     | Enhanced ragged page attention   | O(N)   | Attention sinks support, improved handling             |
-| **Ragged Decode Attention**      | Variable-length decoding         | O(N)   | Efficient batched inference                            |
-| **Kernel Delta Attention**       | Delta-rule linear attention      | O(N)   | Linear complexity, delta updates, decay control        |
-| **Unified Attention**            | vLLM-style paged attention       | O(N)   | Segmented 3D decode kernel                             |
-| **Prefill Page Attention**       | Page attention prefill phase     | O(N)   | Separate prefill handling                              |
-| **Decode Attention**             | Single-token decode attention    | O(N)   | Optimized single-step decoding                         |
-| **Chunked Prefill Paged Decode** | Combined prefill + decode        | O(N)   | Chunked prefill with paged KV cache decode             |
-| **Flash MLA**                    | Multi-head Latent Attention      | O(N)   | Low-rank KV compression, memory-efficient inference    |
-| **Scaled Dot-Product Attention** | Standard attention               | O(N²)  | Basic reference implementation                         |
+| Algorithm                        | Description                      | Memory | Key Features                                                            |
+| -------------------------------- | -------------------------------- | ------ | ----------------------------------------------------------------------- |
+| **Flash Attention v2**           | Memory-efficient exact attention | O(N)   | Causal masking, dropout, sliding windows, soft capping                  |
+| **Ring Attention**               | Distributed sequence parallelism | O(N/P) | Ultra-long sequences, communication overlap, XLA single-device fallback |
+| **Page Attention**               | KV-cache optimized inference     | O(N)   | Block-wise memory, continuous batching                                  |
+| **Block Sparse Attention**       | Configurable sparse patterns     | O(N√N) | Local+global, custom patterns                                           |
+| **GLA**                          | Gated Linear Attention           | O(N)   | Linear complexity, gated updates                                        |
+| **Lightning Attention**          | Layer-dependent decay            | O(N)   | Exponential moving average                                              |
+| **MLA**                          | Multi-head Latent Attention      | O(N)   | Compressed KV representation                                            |
+| **Ragged Page Attention v2**     | Variable-length paged attention  | O(N)   | Ragged sequences with page caching                                      |
+| **Ragged Page Attention v3**     | Enhanced ragged page attention   | O(N)   | Attention sinks support, improved handling                              |
+| **Ragged Decode Attention**      | Variable-length decoding         | O(N)   | Efficient batched inference                                             |
+| **Kernel Delta Attention**       | Delta-rule linear attention      | O(N)   | Linear complexity, delta updates, decay control                         |
+| **Unified Attention**            | vLLM-style paged attention       | O(N)   | Segmented 3D decode kernel                                              |
+| **Prefill Page Attention**       | Page attention prefill phase     | O(N)   | Separate prefill handling                                               |
+| **Decode Attention**             | Single-token decode attention    | O(N)   | Optimized single-step decoding                                          |
+| **Chunked Prefill Paged Decode** | Combined prefill + decode        | O(N)   | Chunked prefill with paged KV cache decode                              |
+| **Flash MLA**                    | Multi-head Latent Attention      | O(N)   | Low-rank KV compression, memory-efficient inference                     |
+| **Scaled Dot-Product Attention** | Standard attention               | O(N²)  | Basic reference implementation                                          |
 
 ### Recurrent Linear Attention (RWKV)
 
-| Operation     | Description                          | Key Features                                       |
-| ------------- | ------------------------------------ | -------------------------------------------------- |
-| **RWKV-4**    | Time-mix recurrence                  | Numerically stable (α,β,ε) state, O(N) memory      |
-| **RWKV-6**    | Multi-head linear attention          | Variable-length packing, reverse mode, O(N) memory |
-| **RWKV-7**    | DPLR (Diagonal + Low-Rank) recurrence| (a,b) parameterization, state-space inspired       |
-| **RWKV-7 Mul**| Multiplicative RWKV-7 variant        | (kk,a) reparameterization for optimized kernels    |
+| Operation      | Description                           | Key Features                                       |
+| -------------- | ------------------------------------- | -------------------------------------------------- |
+| **RWKV-4**     | Time-mix recurrence                   | Numerically stable (α,β,ε) state, O(N) memory      |
+| **RWKV-6**     | Multi-head linear attention           | Variable-length packing, reverse mode, O(N) memory |
+| **RWKV-7**     | DPLR (Diagonal + Low-Rank) recurrence | (a,b) parameterization, state-space inspired       |
+| **RWKV-7 Mul** | Multiplicative RWKV-7 variant         | (kk,a) reparameterization for optimized kernels    |
 
 ### Other Operations
 
-| Operation             | Description                          | Use Case                  |
-| --------------------- | ------------------------------------ | ------------------------- |
-| **Grouped MatMul**    | Efficient batched matrix operations  | Expert models, MoE        |
-| **Grouped MatMul v2** | Enhanced with shard_map support      | Distributed expert models |
-| **Mean Pooling**      | Variable-length sequence aggregation | Sentence embeddings       |
-| **Recurrent**         | Optimized RNN/LSTM/GRU operations    | Sequential modeling       |
-| **Native Sparse**     | Block-sparse matrix computations     | Sparse attention patterns |
-| **Quantized MatMul**  | Packed uint32 quantized matmul       | Low-bit inference         |
+| Operation             | Description                                                 | Use Case                  |
+| --------------------- | ----------------------------------------------------------- | ------------------------- |
+| **Grouped MatMul**    | Efficient batched matrix operations                         | Expert models, MoE        |
+| **Grouped MatMul v2** | Enhanced with shard_map support                             | Distributed expert models |
+| **Mean Pooling**      | Variable-length sequence aggregation                        | Sentence embeddings       |
+| **Recurrent**         | Optimized RNN/LSTM/GRU operations                           | Sequential modeling       |
+| **Native Sparse**     | Block-sparse matrix computations                            | Sparse attention patterns |
+| **Quantized MatMul**  | Multi-mode quantized matmul (affine, NF4, MXFP4/8, NVFP4/8) | Low-bit inference         |
 
 ### State Space Models
 
@@ -303,39 +305,40 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 
 ### Platform Support Matrix
 
-| Operation                        | Triton (GPU) | CUTE (GPU) | CUDA (GPU) | Pallas (TPU) | XLA (Universal) |
-| -------------------------------- | ------------ | ---------- | ---------- | ------------ | --------------- |
-| Flash Attention v2               | ✅           | ✅         | ✅         | ✅           | ✅              |
-| Flash MLA                        | ✅           | -          | -          | -            | ✅              |
-| Ring Attention                   | ✅           | -          | -          | ✅           | ✅              |
-| Page Attention                   | ✅           | -          | -          | ✅           | ✅              |
-| Block Sparse Attention           | ✅           | -          | ✅         | ✅           | ✅              |
-| Decode Attention                 | ✅           | -          | -          | -            | ✅              |
-| Chunked Prefill Paged Decode     | ✅           | -          | -          | -            | ✅              |
-| Ragged Page Attention v2         | ✅           | -          | -          | ✅           | ✅              |
-| Ragged Page Attention v3         | ✅           | -          | ✅         | ✅           | ✅              |
-| Ragged Decode Attention          | ✅           | -          | -          | ✅           | ✅              |
-| GLA                              | ✅           | -          | -          | -            | ✅              |
-| Lightning Attention              | ✅           | -          | -          | -            | ✅              |
-| Recurrent                        | ✅           | -          | -          | -            | ✅              |
-| Mean Pooling                     | ✅           | -          | -          | -            | ✅              |
-| Grouped MatMul                   | -            | -          | -          | ✅           | ✅              |
-| Grouped MatMul v2                | -            | -          | -          | ✅           | -               |
-| Native Sparse Attention          | ✅           | -          | -          | -            | ✅              |
-| Quantized MatMul                 | ✅           | ✅         | ✅         | -            | ✅              |
-| Kernel Delta Attention           | -            | -          | -          | -            | ✅              |
-| Unified Attention                | ✅           | -          | ✅         | -            | ✅              |
-| Prefill Page Attention           | -            | -          | -          | ✅           | ✅              |
-| Scaled Dot-Product Attention     | -            | -          | -          | -            | ✅              |
-| State Space v1                   | -            | -          | -          | -            | ✅              |
-| State Space v2                   | -            | -          | -          | -            | ✅              |
-| RWKV-4                           | ✅           | -          | -          | -            | ✅              |
-| RWKV-6                           | ✅           | -          | -          | -            | ✅              |
-| RWKV-7                           | ✅           | -          | -          | -            | ✅              |
-| RWKV-7 Mul                       | ✅           | -          | -          | -            | ✅              |
+| Operation                    | Triton (GPU) | CUTE (GPU) | CUDA (GPU) | Pallas (TPU) | XLA (Universal) |
+| ---------------------------- | ------------ | ---------- | ---------- | ------------ | --------------- |
+| Flash Attention v2           | ✅           | ✅         | ✅         | ✅           | ✅              |
+| Flash MLA                    | ✅           | -          | -          | -            | ✅              |
+| Ring Attention               | ✅           | -          | -          | ✅           | ✅              |
+| Page Attention               | ✅           | -          | -          | ✅           | ✅              |
+| Block Sparse Attention       | ✅           | -          | ✅         | ✅           | ✅              |
+| Decode Attention             | ✅           | -          | -          | -            | ✅              |
+| Chunked Prefill Paged Decode | ✅           | ✅         | -          | -            | ✅              |
+| Ragged Page Attention v2     | ✅           | -          | -          | ✅           | ✅              |
+| Ragged Page Attention v3     | ✅           | -          | ✅         | ✅           | ✅              |
+| Ragged Decode Attention      | ✅           | -          | -          | ✅           | ✅              |
+| GLA                          | ✅           | -          | -          | -            | ✅              |
+| Lightning Attention          | ✅           | -          | -          | -            | ✅              |
+| Recurrent                    | ✅           | -          | -          | -            | ✅              |
+| Mean Pooling                 | ✅           | -          | -          | -            | ✅              |
+| Grouped MatMul               | -            | -          | -          | ✅           | ✅              |
+| Grouped MatMul v2            | -            | -          | -          | ✅           | -               |
+| Native Sparse Attention      | ✅           | -          | -          | -            | ✅              |
+| Quantized MatMul             | ✅           | ✅         | ✅         | ✅           | ✅              |
+| Kernel Delta Attention       | -            | -          | -          | -            | ✅              |
+| Unified Attention            | ✅           | ✅         | ✅         | -            | ✅              |
+| Prefill Page Attention       | -            | -          | -          | ✅           | ✅              |
+| Scaled Dot-Product Attention | -            | -          | -          | -            | ✅              |
+| State Space v1               | -            | -          | -          | -            | ✅              |
+| State Space v2               | -            | -          | -          | -            | ✅              |
+| RWKV-4                       | ✅           | -          | -          | -            | ✅              |
+| RWKV-6                       | ✅           | -          | -          | -            | ✅              |
+| RWKV-7                       | ✅           | -          | -          | -            | ✅              |
+| RWKV-7 Mul                   | ✅           | -          | -          | -            | ✅              |
 
 ✅ = Production ready | - = Not available
-* CUTE backend is correctness-first and not tuned yet.
+
+\* CuTe backend uses TVM-FFI primitive path with fused kernels. \* Quantized MatMul on TPU uses hybrid dispatch (packed Pallas / predecode / XLA fallback).
 
 ## Advanced Usage
 

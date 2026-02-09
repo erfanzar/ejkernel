@@ -149,7 +149,16 @@ GridOrLambda = Grid | Callable[[dict[str, Any]], Grid]
 
 
 def _parse_int_env(name: str, default: int) -> int:
-    """Parse an integer environment variable with a fallback default."""
+    """Parse an integer environment variable with a fallback default.
+
+    Args:
+        name: Name of the environment variable.
+        default: Default value returned when the variable is unset or
+            cannot be parsed as an integer.
+
+    Returns:
+        The parsed integer value, or ``default`` on failure.
+    """
     value = os.getenv(name, str(default))
     try:
         return int(value)
@@ -349,7 +358,12 @@ def _assert_single_device_args(
 
 
 def _has_multi_accelerators() -> bool:
-    """Check whether more than one non-CPU accelerator is available."""
+    """Check whether more than one non-CPU accelerator is available.
+
+    Returns:
+        ``True`` if more than one non-CPU device is visible to JAX,
+        ``False`` otherwise (including when device enumeration fails).
+    """
     try:
         devices = jax.devices()
     except Exception:
@@ -359,7 +373,14 @@ def _has_multi_accelerators() -> bool:
 
 
 def _in_shard_map_context() -> bool:
-    """Check whether execution is currently inside a shard_map context."""
+    """Check whether execution is currently inside a shard_map context.
+
+    Probes JAX internal thread-local state for an active mesh environment
+    or axis environment, which indicates that ``jax.shard_map`` is in effect.
+
+    Returns:
+        ``True`` if a shard-map mesh context is detected, ``False`` otherwise.
+    """
     try:
         from jax._src import mesh as mesh_lib
 
@@ -674,16 +695,37 @@ def compile_ttir_to_hsaco_inplace(
 
 
 def _log_triton_cache(msg: str) -> None:
+    """Print a cache diagnostic message when verbose logging is enabled.
+
+    Args:
+        msg: The message string to print.
+    """
     if TRITON_CACHE_VERBOSE:
         print(msg)
 
 
 def _get_triton_cache_dir() -> Path:
+    """Return the Triton kernel cache directory, creating it if needed.
+
+    Returns:
+        Path to the Triton kernel cache directory.
+    """
     TRITON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return TRITON_CACHE_DIR
 
 
 def _triton_kernel_source_hash(fn: triton.JITFunction) -> str:
+    """Compute a SHA-256 hash of a Triton JIT function's source code.
+
+    Falls back to hashing the bytecode, constants, and names if the source
+    text is unavailable (e.g. for dynamically generated functions).
+
+    Args:
+        fn: A Triton ``JITFunction`` whose source will be hashed.
+
+    Returns:
+        Hex-digest string of the SHA-256 hash.
+    """
     try:
         source = inspect.getsource(fn.fn)
     except (OSError, TypeError):
@@ -705,6 +747,27 @@ def _make_triton_cache_key(
     num_ctas: int,
     enable_fp_fusion: bool,
 ) -> str:
+    """Build a deterministic SHA-256 cache key for a Triton kernel compilation.
+
+    Incorporates Triton/JAX versions, platform, compute capability, kernel
+    source hash, type signature, specialization attributes, constants, and
+    launch parameters to produce a unique key.
+
+    Args:
+        fn: The Triton ``JITFunction`` being compiled.
+        platform: Target platform (e.g. ``"cuda"`` or ``"rocm"``).
+        compute_capability: GPU compute capability version.
+        signature: Tuple of ``(param_name, type_string)`` pairs.
+        specialization: Tuple of specialization attribute strings.
+        constants: Tuple of ``(param_name, value)`` pairs for constants.
+        num_warps: Number of warps per thread block.
+        num_stages: Number of pipeline stages.
+        num_ctas: Number of cooperative thread arrays.
+        enable_fp_fusion: Whether floating-point fusion is enabled.
+
+    Returns:
+        A SHA-256 hex-digest string uniquely identifying this compilation.
+    """
     source_hash = _triton_kernel_source_hash(fn)
     payload = (
         triton.__version__,
@@ -726,6 +789,12 @@ def _make_triton_cache_key(
 
 
 def _invalidate_triton_cache_entry(cache_key: str, reason: str) -> None:
+    """Remove a Triton kernel cache entry from disk.
+
+    Args:
+        cache_key: The cache key identifying the entry to remove.
+        reason: Human-readable reason for the invalidation (logged).
+    """
     cache_dir = _get_triton_cache_dir() / cache_key
     if cache_dir.exists():
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -738,6 +807,21 @@ def _load_triton_kernel_cache(
     platform: str,
     compute_capability: int,
 ) -> CompilationResult | None:
+    """Load a compiled Triton kernel from the on-disk cache.
+
+    Validates platform and compute capability against the stored metadata.
+    If the cache entry is corrupt or mismatched it is automatically
+    invalidated.
+
+    Args:
+        cache_key: SHA-256 hex-digest identifying the cached kernel.
+        platform: Expected platform (``"cuda"`` or ``"rocm"``).
+        compute_capability: Expected GPU compute capability.
+
+    Returns:
+        A ``CompilationResult`` on a successful cache hit, or ``None`` if
+        the entry does not exist or failed validation.
+    """
     cache_path = _get_triton_cache_dir() / cache_key / "kernel.pkl"
     if not cache_path.exists():
         return None
@@ -776,6 +860,19 @@ def _save_triton_kernel_cache(
     compute_capability: int,
     ttir: str | None,
 ) -> None:
+    """Persist a compiled Triton kernel to the on-disk cache.
+
+    Writes the binary, metadata, and optional TTIR to a pickle file using
+    an atomic rename to avoid partial writes.
+
+    Args:
+        cache_key: SHA-256 hex-digest identifying this compilation.
+        compilation_result: The compiled kernel binary and metadata.
+        platform: Target platform (``"cuda"`` or ``"rocm"``).
+        compute_capability: GPU compute capability used during compilation.
+        ttir: Optional Triton IR text to store alongside the binary
+            (typically only when debug mode is enabled).
+    """
     cache_dir = _get_triton_cache_dir() / cache_key
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / "kernel.pkl"
@@ -805,6 +902,15 @@ _COMPILED_KERNEL_CACHE: OrderedDict[str, triton_kernel_call_lib.TritonKernel] = 
 
 
 def _lru_get(cache: OrderedDict, key: str):
+    """Retrieve a value from an LRU OrderedDict cache, promoting it on hit.
+
+    Args:
+        cache: The ``OrderedDict`` acting as an LRU cache.
+        key: The cache key to look up.
+
+    Returns:
+        The cached value if found, or ``None`` on a miss.
+    """
     kernel = cache.get(key)
     if kernel is not None:
         cache.move_to_end(key)
@@ -812,6 +918,16 @@ def _lru_get(cache: OrderedDict, key: str):
 
 
 def _lru_set(cache: OrderedDict, key: str, value) -> None:
+    """Insert or update a value in an LRU OrderedDict cache.
+
+    Moves the entry to the end (most recently used) and evicts the oldest
+    entry if the cache exceeds ``TRITON_CACHE_MAX_ITEMS``.
+
+    Args:
+        cache: The ``OrderedDict`` acting as an LRU cache.
+        key: The cache key.
+        value: The value to store.
+    """
     cache[key] = value
     cache.move_to_end(key)
     if len(cache) > TRITON_CACHE_MAX_ITEMS:

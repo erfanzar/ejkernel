@@ -94,6 +94,21 @@ void run_mha_bwd_<86, {DTYPE}, {HEAD_DIM}, {SOFTCAP}>(Flash_bwd_params &params, 
 
 @dataclass(frozen=True)
 class Kernel:
+    """A single FlashAttention kernel instantiation variant for Hopper/SM8x.
+
+    Attributes:
+        sm: Target SM version (e.g. 80, 90).
+        arch: Resolved architecture bucket (80 or 90).
+        dtype: Data-type key (``"fp16"``, ``"bf16"``, or ``"e4m3"``).
+        head_dim: Query/key head dimension.
+        head_dim_v: Value head dimension.
+        split: Whether this is a split-KV variant.
+        paged_kv: Whether paged KV is enabled.
+        softcap: Whether softcap logit clamping is enabled.
+        packgqa: Whether packed GQA layout is enabled.
+        direction: ``"fwd"`` or ``"bwd"``.
+    """
+
     sm: int
     arch: int
     dtype: str
@@ -106,6 +121,7 @@ class Kernel:
     direction: str
 
     def render(self) -> str:
+        """Render the C++ template instantiation source code for this kernel."""
         if self.direction == "fwd":
             if self.arch == 90:
                 packgqa = self.packgqa or self.paged_kv or self.split
@@ -147,6 +163,7 @@ class Kernel:
 
     @property
     def filename(self) -> str:
+        """Derive the output ``.cu`` filename from this kernel's parameters."""
         parts = ["flash", self.direction, f"hdim{self.head_dim}"]
         if self.head_dim_v != self.head_dim:
             parts.append(str(self.head_dim_v))
@@ -163,16 +180,19 @@ class Kernel:
 
 
 def _write_if_changed(path: Path, content: str) -> None:
+    """Write *content* to *path* only if it differs from the existing file."""
     if path.exists() and path.read_text() == content:
         return
     path.write_text(content)
 
 
 def _resolve_arch(sm: int) -> int:
+    """Map an SM version to its architecture bucket (80 or 90)."""
     return 90 if sm >= 90 else 80
 
 
 def _iter_fwd_kernels(sms: Iterable[int]) -> Iterable[Kernel]:
+    """Yield all forward-pass kernel variants for the given SM versions."""
     for sm, dtype, head_dim, paged_kv, split, softcap, packgqa in itertools.product(
         sms, DTYPE_MAP.keys(), HEAD_DIMS, PAGED_KV, SPLIT, SOFTCAP, PACKGQA
     ):
@@ -195,6 +215,7 @@ def _iter_fwd_kernels(sms: Iterable[int]) -> Iterable[Kernel]:
 
 
 def _iter_bwd_kernels(sms: Iterable[int]) -> Iterable[Kernel]:
+    """Yield all backward-pass kernel variants for the given SM versions."""
     for sm, dtype, head_dim, softcap in itertools.product(sms, DTYPE_MAP_BWD.keys(), HEAD_DIMS, SOFTCAP):
         arch = _resolve_arch(sm)
         yield Kernel(
@@ -212,11 +233,17 @@ def _iter_bwd_kernels(sms: Iterable[int]) -> Iterable[Kernel]:
 
 
 def iter_kernels(sms: Iterable[int]) -> Iterable[Kernel]:
+    """Yield all forward and backward kernel variants for the given SM versions."""
     yield from _iter_fwd_kernels(sms)
     yield from _iter_bwd_kernels(sms)
 
 
 def generate(output_dir: Path, sms: Iterable[int]) -> int:
+    """Write all generated ``.cu`` files into *output_dir*.
+
+    Returns:
+        The total number of files written.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for kernel in iter_kernels(sms):
@@ -227,6 +254,7 @@ def generate(output_dir: Path, sms: Iterable[int]) -> int:
 
 
 def main() -> None:
+    """Parse CLI arguments and generate Hopper FlashAttention instantiation stubs."""
     parser = argparse.ArgumentParser(
         prog="code_gen",
         description="Generate Hopper/SM90+ FlashAttention instantiation stubs.",

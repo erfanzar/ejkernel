@@ -81,9 +81,9 @@ Reference:
 """
 
 from ._info import MaskInfo
+from ._interface import blocksparse_attention
 from ._kernel import (
     BlockSizes,
-    blocksparse_attention,
     make_attention_reference,
     make_masked_mha_reference,
     make_masked_mqa_reference,

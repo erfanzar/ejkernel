@@ -253,6 +253,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         preferred_split_lens = (64, 128, 256, 512)
 
         def best_splits(n: int, targets=preferred_split_lens, min_len=32, max_len=8192):
+            """Find divisor-based split candidates ranked by proximity to preferred lengths."""
             divs = set()
             r = int(math.sqrt(n))
             for d in range(1, r + 1):
@@ -266,6 +267,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
                     valid.append((s, sl))
 
             def score(sl):
+                """Score a split length by minimum distance to any preferred target."""
                 return min(abs(sl - t) for t in targets)
 
             valid.sort(key=lambda x: (score(x[1]), -x[1]))
@@ -281,11 +283,13 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         elem_bytes = 2 if dtype in (jnp.float16, jnp.bfloat16) else 4
 
         def next_pow2_ge(x, min_val=16):
+            """Return the smallest power of 2 >= x, clamped to min_val."""
             return max(min_val, 1 << math.ceil(math.log2(max(1, x))))
 
         block_headdim = next_pow2_ge(head_dim, 16)
 
         def smem_est_bytes(block_heads: int, block_k: int, num_stages: int) -> int:
+            """Estimate shared memory usage in bytes for a given tile configuration."""
             kv_bytes = 2 * block_k * block_headdim * elem_bytes
             q_bytes = int(0.25 * block_heads * block_headdim * elem_bytes)
             stage_factor = 1.0 + 0.5 * max(0, num_stages - 2)
@@ -293,12 +297,14 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             return int((kv_bytes + q_bytes) * stage_factor * fudge)
 
         def warp_options(block_heads: int, block_k: int) -> list[int]:
+            """Return valid warp counts based on block sizes and head dimension."""
             opts = [2, 4]
             if head_dim >= 128 or block_k >= 128:
                 opts.append(8)
             return opts
 
         def stage_options(block_k: int) -> list[int]:
+            """Return valid pipeline stage counts based on block_k size."""
             return [1] if block_k <= 64 else [1, 2]
 
         seeds = []
@@ -313,6 +319,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         seen = set()
 
         def try_add(H, K, s, sl):
+            """Try adding configs for the given block_heads, block_k, splits, and split_len."""
             if K > sl or sl % K != 0:
                 return False
             for W in warp_options(H, K):
@@ -463,6 +470,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             sequence_end,
             softmax_aux,
         ):
+            """Shard-map compatible wrapper that delegates to self.run with captured params."""
             return self.run(
                 query=query,
                 key=key,

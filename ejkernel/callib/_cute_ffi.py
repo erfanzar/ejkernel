@@ -77,7 +77,14 @@ else:  # pragma: no cover
 
 @dataclass(frozen=True)
 class _CompiledKernel:
-    """Container for a compiled CuTe callable and its FFI target name."""
+    """Container for a compiled CuTe callable and its FFI target name.
+
+    Attributes:
+        target_name: The unique FFI target name used to register the kernel
+            with JAX via TVM-FFI.
+        compiled: The compiled CuTe callable object produced by
+            ``cute.compile``.
+    """
 
     target_name: str
     compiled: Any
@@ -90,12 +97,27 @@ _REGISTERED_TARGETS_LOCK = threading.Lock()
 
 
 def _to_shape_dtype_struct(out_shape: Any) -> Any:
-    """Normalize output descriptors into ``jax.ShapeDtypeStruct`` leaves."""
+    """Normalize output descriptors into ``jax.ShapeDtypeStruct`` leaves.
+
+    Args:
+        out_shape: A pytree of objects with ``shape`` and ``dtype`` attributes.
+
+    Returns:
+        A pytree with the same structure where each leaf is replaced by a
+        ``jax.ShapeDtypeStruct``.
+    """
     return tree_util.tree_map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape)
 
 
 def _shape_dtype_key(shaped: Any) -> tuple[int, jnp.dtype]:
-    """Build a stable compile-cache key fragment from a shaped value."""
+    """Build a stable compile-cache key fragment from a shaped value.
+
+    Args:
+        shaped: An object with ``shape`` and ``dtype`` attributes.
+
+    Returns:
+        A tuple of ``(rank, dtype)`` suitable for use as a cache key component.
+    """
     return (len(tuple(shaped.shape)), jnp.dtype(shaped.dtype))
 
 
@@ -123,7 +145,18 @@ def _fake_tensor_from_shaped(shaped: Any):
 
 
 def _fn_expects_stream(fn: Any) -> bool:
-    """Return whether the compiled host launcher expects a leading stream arg."""
+    """Return whether the compiled host launcher expects a leading stream arg.
+
+    Inspects the function's signature to determine if the first positional
+    parameter is named ``stream``.
+
+    Args:
+        fn: A callable whose signature will be inspected.
+
+    Returns:
+        ``True`` if the first positional parameter is named ``stream``,
+        ``False`` otherwise or if the signature cannot be inspected.
+    """
     try:
         params = list(inspect.signature(fn).parameters.values())
     except Exception:
@@ -137,7 +170,18 @@ def _fn_expects_stream(fn: Any) -> bool:
 
 
 def _make_fake_stream() -> Any:
-    """Create a compile-time stream placeholder for TVM-FFI CuTe kernels."""
+    """Create a compile-time stream placeholder for TVM-FFI CuTe kernels.
+
+    Tries ``cute.runtime.make_fake_stream`` first, then falls back to a
+    null CUDA stream from the ``cuda.bindings`` package.
+
+    Returns:
+        A fake or null stream object suitable for CuTe compilation.
+
+    Raises:
+        RuntimeError: If neither ``cute.runtime`` nor ``cuda.bindings``
+            can provide a stream object.
+    """
     try:
         return cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     except Exception:
@@ -148,7 +192,14 @@ def _make_fake_stream() -> Any:
 
 
 def _cache_key_hash(cache_key: tuple[Any, ...]) -> str:
-    """Build a deterministic hash string from a compile cache key."""
+    """Build a deterministic hash string from a compile cache key.
+
+    Args:
+        cache_key: A tuple of values representing the compilation parameters.
+
+    Returns:
+        A SHA-256 hex-digest string derived from the cache key's ``repr``.
+    """
     return hashlib.sha256(repr(cache_key).encode("utf-8")).hexdigest()
 
 
@@ -160,7 +211,24 @@ def _compile_or_get_kernel(
     compile_options: str | None,
     static_kwargs: tuple[tuple[str, Any], ...],
 ) -> _CompiledKernel:
-    """Compile (or fetch cached) CuTe callable and FFI target metadata."""
+    """Compile (or fetch cached) CuTe callable and FFI target metadata.
+
+    Looks up the compile cache by a key derived from the function identity,
+    input/output shapes and dtypes, compile options, and static kwargs. On a
+    cache miss, compiles the kernel using fake tensors and stores the result.
+
+    Args:
+        fn: The ``@cute.jit`` launcher callable to compile.
+        in_shaped: Tuple of input shaped objects (with ``shape`` and ``dtype``).
+        out_shaped: Tuple of ``jax.ShapeDtypeStruct`` for expected outputs.
+        compile_options: Optional options string forwarded to ``cute.compile``.
+        static_kwargs: Tuple of ``(name, value)`` pairs for static keyword
+            arguments passed at compile time.
+
+    Returns:
+        A ``_CompiledKernel`` containing the compiled callable and its
+        unique FFI target name.
+    """
     cache_key = (
         fn,
         tuple(_shape_dtype_key(arg) for arg in in_shaped),
@@ -181,6 +249,15 @@ def _compile_or_get_kernel(
         compile_kwargs = dict(static_kwargs)
 
         def _compile(add_stream: bool):
+            """Run ``cute.compile`` with or without a leading stream argument.
+
+            Args:
+                add_stream: If ``True``, prepend a fake stream to the
+                    compile arguments.
+
+            Returns:
+                The compiled CuTe callable.
+            """
             compile_args: list[Any] = []
             if add_stream:
                 compile_args.append(_make_fake_stream())
@@ -205,7 +282,20 @@ def _compile_or_get_kernel(
 
 
 def _register_target_once(kernel: _CompiledKernel) -> None:
-    """Register a compiled CuTe callable as a JAX FFI target exactly once."""
+    """Register a compiled CuTe callable as a JAX FFI target exactly once.
+
+    Uses ``jax_tvm_ffi.register_ffi_target`` to make the compiled kernel
+    available to the JAX FFI lowering path. Tries multiple platform strings
+    (``gpu``, ``cuda``, ``CUDA``, and unspecified) to accommodate different
+    JAX/XLA runtime configurations.
+
+    Args:
+        kernel: The ``_CompiledKernel`` to register.
+
+    Raises:
+        ValueError: If ``jax_tvm_ffi`` is not installed.
+        RuntimeError: If all registration attempts fail.
+    """
     if not _HAS_JAX_TVM_FFI:
         raise ValueError("CuTe primitive path requires `jax_tvm_ffi` (apache-tvm-ffi) to register TVM-FFI targets.")
 
@@ -239,7 +329,26 @@ def _cute_kernel_call_impl(
     compile_options: str | None,
     static_kwargs: tuple[tuple[str, Any], ...],
 ):
-    """Primitive implementation shared by eager and lowering paths."""
+    """Primitive implementation shared by eager and lowering paths.
+
+    Compiles (or retrieves from cache) the CuTe kernel, registers it as a
+    JAX FFI target, and dispatches execution via ``jax.ffi.ffi_call``.
+
+    Args:
+        *args_flat: Flattened input arrays for the kernel.
+        fn: The ``@cute.jit`` launcher callable.
+        out_shape_dtype_flat: Tuple of ``jax.ShapeDtypeStruct`` for outputs.
+        input_output_aliases: Tuple of ``(input_idx, output_idx)`` pairs for
+            in-place aliasing.
+        compile_options: Optional options string for ``cute.compile``.
+        static_kwargs: Tuple of ``(name, value)`` pairs for static kwargs.
+
+    Returns:
+        The output arrays produced by the FFI call.
+
+    Raises:
+        ValueError: If CuTe is not available.
+    """
     if not CAN_USE_CUTE_PRIMITIVE:
         raise ValueError("CuTe primitive path requires CUTLASS CuTe DSL.")
 
@@ -268,12 +377,31 @@ cute_kernel_call_p.def_impl(functools.partial(xla.apply_primitive, cute_kernel_c
 
 @cute_kernel_call_p.def_abstract_eval
 def _cute_kernel_call_abstract_eval(*_, out_shape_dtype_flat, **__):
-    """Primitive abstract evaluation returning output avals."""
+    """Primitive abstract evaluation returning output avals.
+
+    Args:
+        *_: Unused positional arguments (input avals).
+        out_shape_dtype_flat: Tuple of ``jax.ShapeDtypeStruct`` defining
+            the expected output shapes and dtypes.
+        **__: Unused keyword arguments.
+
+    Returns:
+        List of ``jax.core.ShapedArray`` abstract values for each output.
+    """
     return [jax.core.ShapedArray(x.shape, x.dtype) for x in out_shape_dtype_flat]
 
 
 def _raise_on_jvp(*args, **kwargs):
-    """Raise for unsupported automatic differentiation."""
+    """Raise for unsupported automatic differentiation.
+
+    Args:
+        *args: Unused positional arguments.
+        **kwargs: Unused keyword arguments.
+
+    Raises:
+        NotImplementedError: Always, as the CuTe TVM-FFI primitive does
+            not support JVP or transpose rules.
+    """
     del args, kwargs
     raise NotImplementedError(
         "CuTe TVM-FFI primitive does not support automatic differentiation. Use `jax.custom_jvp` or `jax.custom_vjp`."
@@ -281,7 +409,16 @@ def _raise_on_jvp(*args, **kwargs):
 
 
 def _raise_on_vmap(*args, **kwargs):
-    """Raise for unsupported batching."""
+    """Raise for unsupported batching.
+
+    Args:
+        *args: Unused positional arguments.
+        **kwargs: Unused keyword arguments.
+
+    Raises:
+        NotImplementedError: Always, as the CuTe TVM-FFI primitive does
+            not support batching via ``jax.vmap``.
+    """
     del args, kwargs
     raise NotImplementedError(
         "CuTe TVM-FFI primitive does not support batching via `jax.vmap`. Use `jax.custom_batching.custom_vmap`."
@@ -327,6 +464,14 @@ def build_cute_ffi_call(
 
     @partial(jax.jit, inline=True)
     def _call(*args):
+        """Dispatch the CuTe kernel through the JAX primitive.
+
+        Args:
+            *args: Runtime input arrays (pytree-flattened internally).
+
+        Returns:
+            Output pytree matching the ``output_shape_dtype`` structure.
+        """
         args_flat, _ = tree_util.tree_flatten(args)
         out_flat = cute_kernel_call_p.bind(
             *args_flat,

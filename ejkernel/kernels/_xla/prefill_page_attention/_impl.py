@@ -26,17 +26,11 @@ platform-specific implementations.
 
 import jax
 import jax.numpy as jnp
-import jaxtyping
-from beartype import beartype
 from jaxtyping import Array, Float, Int
-
-from ..._registry import Backend, Platform, kernel_registry
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.float32).max)
 
 
-@kernel_registry.register("prefill_page_attention", Platform.XLA, Backend.ANY)
-@jaxtyping.jaxtyped(typechecker=beartype)
 def prefill_page_attention(
     query: Float[Array, "chunk_size num_heads head_dim"],
     key_cache: Float[Array, "num_kv_heads total_num_pages page_size head_dim"],

@@ -322,6 +322,19 @@ def ring_attention(
     kv_len = int(key.shape[1])
 
     def _divisor_or_self(length: int, candidate: int) -> int:
+        """Find the largest divisor of length that is at most candidate.
+
+        If candidate evenly divides length, returns candidate directly.
+        Otherwise searches downward from candidate to find the largest
+        divisor of length.
+
+        Args:
+            length: The sequence length to divide.
+            candidate: The preferred chunk size (upper bound).
+
+        Returns:
+            The largest divisor of length that is <= candidate, or 1.
+        """
         candidate = max(1, min(int(candidate), length))
         if length % candidate == 0:
             return candidate

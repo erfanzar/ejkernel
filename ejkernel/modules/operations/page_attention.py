@@ -313,6 +313,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
             context_lens,
             block_tables,
         ):
+            """Shard-map compatible wrapper that delegates to self.run with captured params."""
             return self.run(
                 query=query,
                 key_cache=key_cache,

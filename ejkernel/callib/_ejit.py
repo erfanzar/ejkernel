@@ -637,6 +637,7 @@ if __name__ == "__main__":
 
     @ejit
     def my_function(x, y):
+        """Example function demonstrating ejit usage."""
         return x * y + x
 
     a = jnp.array([1, 2, 3], dtype=jnp.float32)

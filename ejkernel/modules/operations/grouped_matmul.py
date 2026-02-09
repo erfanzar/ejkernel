@@ -208,6 +208,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
             rhs: Float[Array, "num_groups k n"] | Float[Array, "num_groups n k"],
             group_sizes: Int[Array, "num_groups_or_shards"],
         ) -> Float[Array, "m n"]:
+            """Shard-local grouped matmul forwarding to self.run."""
             out = self.run(
                 lhs=lhs,
                 rhs=rhs,
@@ -239,6 +240,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         )
 
         def callback(out, cfg):
+            """Strip padding rows from the output if padding was applied."""
             if padded_size > 0:
                 out = out[:mSize]
             return out

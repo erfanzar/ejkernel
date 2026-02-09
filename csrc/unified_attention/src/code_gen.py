@@ -39,11 +39,20 @@ void run_unified_attention_<{DTYPE}, {HEAD_DIM}>(UaParams &params, cudaStream_t 
 
 @dataclass(frozen=True)
 class Kernel:
+    """A single unified attention kernel instantiation variant.
+
+    Attributes:
+        sm: Target SM version.
+        dtype: Data-type key (``"fp16"`` or ``"bf16"``).
+        head_dim: Head dimension.
+    """
+
     sm: int
     dtype: str
     head_dim: int
 
     def render(self) -> str:
+        """Render the C++ template instantiation source for this kernel."""
         return PRELUDE.format(
             DTYPE=DTYPE_MAP[self.dtype],
             HEAD_DIM=self.head_dim,
@@ -51,10 +60,12 @@ class Kernel:
 
     @property
     def filename(self) -> str:
+        """Derive the output ``.cu`` filename from this kernel's parameters."""
         return f"ua_fwd_hdim{self.head_dim}_{self.dtype}_sm{self.sm}.cu"
 
 
 def iter_kernels(sms: tuple[int, ...]) -> list[Kernel]:
+    """Return all kernel variants for the given SM versions."""
     return [
         Kernel(sm=sm, dtype=dtype, head_dim=head_dim)
         for dtype, head_dim, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMS, sms)
@@ -62,12 +73,18 @@ def iter_kernels(sms: tuple[int, ...]) -> list[Kernel]:
 
 
 def _write_if_changed(path: Path, content: str) -> None:
+    """Write *content* to *path* only if it differs from the existing file."""
     if path.exists() and path.read_text() == content:
         return
     path.write_text(content)
 
 
 def generate(output_dir: Path, sms: tuple[int, ...]) -> int:
+    """Write all generated ``.cu`` files into *output_dir*.
+
+    Returns:
+        The total number of files written.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for kernel in iter_kernels(sms):
@@ -77,6 +94,7 @@ def generate(output_dir: Path, sms: tuple[int, ...]) -> int:
 
 
 def main() -> None:
+    """Parse CLI arguments and generate unified attention instantiation stubs."""
     parser = argparse.ArgumentParser(
         prog="code_gen",
         description="Generate unified attention kernel instantiation stubs.",

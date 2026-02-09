@@ -72,7 +72,7 @@ from beartype import beartype
 from jaxtyping import Array, Float, Int32
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._kernel import ragged_paged_attention as _ragged_paged_attention
+from ._xla_impl_fwd import ragged_paged_attention as _ragged_paged_attention
 
 
 @kernel_registry.register("ragged_page_attention_v3", Platform.XLA, Backend.ANY)

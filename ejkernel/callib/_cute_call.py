@@ -46,7 +46,19 @@ _NAMED_CALL_CACHE_LOCK = threading.Lock()
 
 
 def _device_set_from_sharding(sharding: Any) -> set | None:
-    """Extract the participating devices from a sharding object."""
+    """Extract the participating devices from a sharding object.
+
+    Attempts to retrieve device information by checking ``device_set`` and
+    ``devices`` attributes on the sharding, calling them if they are callable.
+
+    Args:
+        sharding: A JAX sharding object that may expose ``device_set`` or
+            ``devices`` as an attribute or method.
+
+    Returns:
+        A set of devices referenced by the sharding, or ``None`` if the
+        device information could not be determined.
+    """
     for attr_name in ("device_set", "devices"):
         try:
             attr = getattr(sharding, attr_name, None)
@@ -64,7 +76,19 @@ def _device_set_from_sharding(sharding: Any) -> set | None:
 
 
 def _array_device_set(arg: Any) -> set | None:
-    """Return the device set for a JAX array or tracer."""
+    """Return the device set for a JAX array or tracer.
+
+    Inspects ``arg`` for device placement by checking ``device``, ``devices``,
+    and ``sharding`` attributes on concrete arrays, and ``aval.sharding`` on
+    JAX tracers.
+
+    Args:
+        arg: A potential JAX array or tracer whose device placement is needed.
+
+    Returns:
+        A set containing the device(s) that ``arg`` resides on, or ``None``
+        if device information cannot be determined (e.g. for non-array values).
+    """
     if isinstance(arg, jax.Array):
         device_attr = getattr(arg, "device", None)
         if device_attr is not None:
@@ -107,7 +131,23 @@ def _assert_single_device_args(
     *,
     allow_sharded_tracers: bool,
 ) -> None:
-    """Validate that array arguments are placed on one logical device."""
+    """Validate that array arguments are placed on one logical device.
+
+    Ensures all provided array arguments reside on the same single device.
+    Optionally allows sharded tracers when running inside ``jax.shard_map``.
+
+    Args:
+        array_args: Sequence of array or tracer arguments to validate.
+        device_index: Optional requested device index to verify against.
+        allow_sharded_tracers: If ``True``, sharded tracers (from
+            ``jax.shard_map``) are permitted without raising an error.
+
+    Raises:
+        AssertionError: If any argument spans multiple devices (unless it is
+            a tracer and ``allow_sharded_tracers`` is ``True``), if arguments
+            reside on different devices, or if the detected device conflicts
+            with the requested ``device_index``.
+    """
     device_sets: list[tuple[int, set, bool]] = []
     for idx, arg in enumerate(array_args):
         devs = _array_device_set(arg)
@@ -156,7 +196,12 @@ def _assert_single_device_args(
 
 
 def _has_multi_accelerators() -> bool:
-    """Check whether more than one non-CPU accelerator is available."""
+    """Check whether more than one non-CPU accelerator is available.
+
+    Returns:
+        ``True`` if more than one non-CPU device is visible to JAX,
+        ``False`` otherwise (including when device enumeration fails).
+    """
     try:
         devices = jax.devices()
     except Exception:
@@ -166,7 +211,14 @@ def _has_multi_accelerators() -> bool:
 
 
 def _in_shard_map_context() -> bool:
-    """Check whether execution is currently inside a ``jax.shard_map`` context."""
+    """Check whether execution is currently inside a ``jax.shard_map`` context.
+
+    Probes JAX internal thread-local state for an active mesh environment
+    or axis environment, which indicates that ``jax.shard_map`` is in effect.
+
+    Returns:
+        ``True`` if a shard-map mesh context is detected, ``False`` otherwise.
+    """
     try:
         from jax._src import mesh as mesh_lib
 
@@ -191,7 +243,18 @@ def _in_shard_map_context() -> bool:
 
 
 def _leaf_shape_dtype(leaf: Any) -> tuple[tuple[int, ...] | None, jnp.dtype | None]:
-    """Read ``(shape, dtype)`` from an output leaf or tracer."""
+    """Read ``(shape, dtype)`` from an output leaf or tracer.
+
+    Inspects the leaf for ``shape`` and ``dtype`` attributes directly, then
+    falls back to checking its ``aval`` attribute (for JAX tracers).
+
+    Args:
+        leaf: An array, tracer, or shaped object to inspect.
+
+    Returns:
+        A tuple of ``(shape, dtype)`` where each element is ``None`` if the
+        corresponding attribute could not be determined.
+    """
     shape = getattr(leaf, "shape", None)
     dtype = getattr(leaf, "dtype", None)
     if shape is not None and dtype is not None:
@@ -210,7 +273,24 @@ def _validate_out_leaves(
     flat_out: Sequence[Any],
     flat_out_shapes: Sequence[jax.ShapeDtypeStruct] | None,
 ) -> None:
-    """Validate explicit output leaves and optional output shape contracts."""
+    """Validate explicit output leaves and optional output shape contracts.
+
+    Checks that all output leaves are JAX arrays or tracers with inferrable
+    shape and dtype. When ``flat_out_shapes`` is provided, additionally
+    verifies that leaves match the expected shapes and dtypes.
+
+    Args:
+        flat_out: Flattened sequence of output leaves (arrays or tracers).
+        flat_out_shapes: Optional sequence of ``jax.ShapeDtypeStruct``
+            specifying the expected shape and dtype for each output leaf.
+
+    Raises:
+        ValueError: If ``flat_out`` is empty, or if the number of output
+            leaves does not match ``flat_out_shapes``, or if a shape/dtype
+            mismatch is detected.
+        TypeError: If any leaf is not a JAX array or tracer, or if
+            shape/dtype cannot be inferred from a leaf.
+    """
     if not flat_out:
         raise ValueError("`out` must contain at least one output array.")
 
@@ -243,7 +323,17 @@ def _validate_out_leaves(
 
 
 def _shape_specs_from_out_leaves(flat_out: Sequence[Any]) -> list[jax.ShapeDtypeStruct]:
-    """Build shape/dtype structs from explicit ``out`` leaves."""
+    """Build shape/dtype structs from explicit ``out`` leaves.
+
+    Args:
+        flat_out: Flattened sequence of output leaves (arrays or tracers).
+
+    Returns:
+        List of ``jax.ShapeDtypeStruct`` instances inferred from each leaf.
+
+    Raises:
+        TypeError: If shape or dtype cannot be inferred from any leaf.
+    """
     specs: list[jax.ShapeDtypeStruct] = []
     for i, leaf in enumerate(flat_out):
         shape, dtype = _leaf_shape_dtype(leaf)
@@ -254,12 +344,29 @@ def _shape_specs_from_out_leaves(flat_out: Sequence[Any]) -> list[jax.ShapeDtype
 
 
 def _shape_key(shape: Any) -> tuple[str, ...]:
-    """Normalize shape values to a stable, hashable key."""
+    """Normalize shape values to a stable, hashable key.
+
+    Args:
+        shape: An iterable of dimension sizes (integers or symbolic values).
+
+    Returns:
+        A tuple of string representations suitable for use as a hash key.
+    """
     return tuple(str(d) for d in tuple(shape))
 
 
 def _arg_contract_key(arg: Any) -> tuple[Any, ...]:
-    """Build a cache-key fragment for an argument."""
+    """Build a cache-key fragment for an argument.
+
+    Produces a hashable tuple that uniquely identifies the argument's type
+    contract (shape/dtype for arrays, value for scalars, type info for others).
+
+    Args:
+        arg: An input argument (array, scalar, dtype, or arbitrary object).
+
+    Returns:
+        A hashable tuple encoding the argument's contract for cache lookups.
+    """
     if isinstance(arg, (jax.Array, core.Tracer)):
         shape, dtype = _leaf_shape_dtype(arg)
         return ("array", _shape_key(shape or ()), str(dtype))
@@ -271,7 +378,16 @@ def _arg_contract_key(arg: Any) -> tuple[Any, ...]:
 
 
 def _out_contract_key(output_contract_shapes: Sequence[jax.ShapeDtypeStruct] | None) -> tuple[Any, ...]:
-    """Build a stable key for expected output contracts."""
+    """Build a stable key for expected output contracts.
+
+    Args:
+        output_contract_shapes: Optional sequence of ``jax.ShapeDtypeStruct``
+            describing the expected output shapes and dtypes.
+
+    Returns:
+        A hashable tuple encoding the output contract, or an empty tuple
+        if ``output_contract_shapes`` is ``None``.
+    """
     if output_contract_shapes is None:
         return ()
     return tuple((_shape_key(spec.shape), str(jnp.dtype(spec.dtype))) for spec in output_contract_shapes)
@@ -293,6 +409,31 @@ def cute_call(
     The provided ``call`` must be primitive-backed and return output arrays.
     ``out`` is accepted for compatibility and treated as output metadata
     contract (shape/dtype/tree), not as a destination buffer.
+
+    Args:
+        *args: Positional arguments forwarded to the CuTe kernel callable.
+        call: The CuTe kernel callable to execute. Must be a primitive-backed
+            function that returns output arrays (e.g. from
+            ``build_cute_ffi_call``).
+        out_shape: Expected output shape/dtype specification(s) used to build
+            the output contract. Can be a single ``ShapeDtype`` or a sequence.
+        out: Optional explicit output array(s) whose shape/dtype/tree are used
+            as the output contract. Not used as a destination buffer.
+        name: Optional name for the kernel call, used for JAX named scopes
+            and internal caching.
+        device: Optional device index to validate input placement against.
+
+    Returns:
+        The output(s) produced by the CuTe kernel, unflattened to match
+        the ``out`` or ``out_shape`` pytree structure.
+
+    Raises:
+        ValueError: If CuTe is not installed, ``call`` is ``None``, neither
+            ``out`` nor ``out_shape`` is provided, or the callable returns
+            ``None``.
+        AssertionError: If array arguments span multiple devices, or if
+            multiple accelerators are detected without an active
+            ``jax.shard_map`` context.
     """
     if not CAN_USE_CUTE:
         raise ValueError("`cute_call` is only available when CUTLASS CuTe is installed.")
@@ -329,6 +470,22 @@ def cute_call(
     array_args = [arg for arg in flat_args if isinstance(arg, (jax.Array, core.Tracer))]
 
     def _coerce_function_output(function_out: Any) -> Any:
+        """Validate and restructure the callable's raw output.
+
+        Ensures the callable returned non-None arrays, validates them against
+        the output contract, and reshapes the result to match the expected
+        output pytree when ``out`` was provided.
+
+        Args:
+            function_out: Raw output from the CuTe kernel callable.
+
+        Returns:
+            The validated (and possibly restructured) output.
+
+        Raises:
+            ValueError: If ``function_out`` is ``None`` or if the number of
+                output leaves does not match the ``out`` specification.
+        """
         if function_out is None:
             raise ValueError(
                 "`cute_call` expected `call` to return output arrays. "

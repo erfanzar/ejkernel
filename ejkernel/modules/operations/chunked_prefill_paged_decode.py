@@ -168,6 +168,7 @@ class ChunkedPrefillPagedDecode(Kernel[ChunkedPrefillPagedDecodeConfig, tuple[Ar
             Float[Array, "num_blocks block_size num_kv_heads head_dim"],
             Float[Array, "num_blocks block_size num_kv_heads head_dim"],
         ]:
+            """Shard-local chunked prefill + paged decode forwarding to self.run."""
             return self.run(
                 queries=queries,
                 keys=keys,

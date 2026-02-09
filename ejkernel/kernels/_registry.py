@@ -68,7 +68,7 @@ import textwrap
 import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Literal, TypeVar, overload
 
 import jax
@@ -309,7 +309,7 @@ def _types_are_equivalent(type1: Any, type2: Any) -> bool:
     return normalized1 == normalized2
 
 
-class Platform(str, Enum):
+class Platform(StrEnum):
     """Supported kernel implementation platforms.
 
     Each member identifies a compilation/execution framework used to
@@ -330,7 +330,7 @@ class Platform(str, Enum):
     XLA = "xla"
 
 
-class Backend(str, Enum):
+class Backend(StrEnum):
     """Target hardware backends for kernel execution.
 
     Used to tag kernel implementations with the hardware they target.

@@ -60,23 +60,33 @@ def _page_attention_fwd(
     attn_scale: float,
     block_size: int,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
-    """
-    Forward pass for page attention using JAX/XLA.
+    """Forward pass for paged attention using JAX/XLA.
 
-    This implements paged attention where KV cache is stored in blocks (pages).
-    Each sequence has a block table that maps logical positions to physical blocks.
+    Implements paged attention where the KV cache is stored in non-contiguous
+    blocks (pages). Each sequence has a block table that maps logical block
+    indices to physical block indices in the cache. The function iterates
+    over all blocks for each sequence, computes attention scores, applies
+    validity masking based on context length, and produces the final output.
+
+    Supports GQA/MQA by reshaping queries to group query heads that share
+    the same KV head.
 
     Args:
-        query: Query tensor [num_seqs, num_heads, head_dim]
-        key_cache: Paged key cache [num_blocks, num_kv_heads, block_size, head_dim]
-        value_cache: Paged value cache [num_blocks, num_kv_heads, block_size, head_dim]
-        context_lens: Length of context for each sequence [num_seqs]
-        block_tables: Block table mapping [num_seqs, max_blocks]
-        attn_scale: Attention scaling factor
-        block_size: Size of each block/page
+        query: Query tensor of shape [num_seqs, num_heads, head_dim].
+            Each sequence has a single query token (decode phase).
+        key_cache: Paged key cache of shape
+            [num_blocks, num_kv_heads, block_size, head_dim].
+        value_cache: Paged value cache of shape
+            [num_blocks, num_kv_heads, block_size, head_dim].
+        context_lens: Context length per sequence of shape [num_seqs].
+            Determines how many tokens are valid in each sequence's cache.
+        block_tables: Block table mapping of shape [num_seqs, max_blocks].
+            Maps logical block positions to physical block indices.
+        attn_scale: Attention scaling factor applied to QK^T scores.
+        block_size: Number of tokens per cache block/page (static argument).
 
     Returns:
-        Attention output [num_seqs, num_heads, head_dim]
+        Attention output of shape [num_seqs, num_heads, head_dim].
     """
     num_seqs, num_heads, head_dim = query.shape
     num_kv_heads = key_cache.shape[1]
@@ -89,13 +99,37 @@ def _page_attention_fwd(
     query = query * attn_scale
 
     def attend_sequence(seq_idx):
-        """Compute attention for a single sequence."""
+        """Compute paged attention output for a single sequence.
+
+        Gathers key/value blocks from the paged cache using the block
+        table, computes attention scores across all blocks, applies
+        softmax, and returns the weighted sum of values.
+
+        Args:
+            seq_idx: Index of the sequence in the batch.
+
+        Returns:
+            Attention output of shape [num_heads, head_dim] for this sequence.
+        """
         q = query[seq_idx]
         context_len = context_lens[seq_idx]
         blocks = block_tables[seq_idx]
 
         def attend_block(block_idx):
-            """Attend to a single block."""
+            """Compute attention scores and gather values for a single cache block.
+
+            Looks up the physical block from the block table, computes
+            QK^T scores for all tokens in the block, and applies a
+            validity mask based on the sequence's context length.
+
+            Args:
+                block_idx: Logical block index within this sequence's block table.
+
+            Returns:
+                Tuple of (scores, v_block) where scores has shape
+                [num_kv_heads, q_heads_per_kv_head, block_size] and v_block
+                has shape [num_kv_heads, block_size, head_dim].
+            """
             physical_block = blocks[block_idx]
 
             k_block = key_cache[physical_block]

@@ -118,7 +118,27 @@ def _ssm1_fwd_rule(
     tuple[Float[Array, "batch seq_len intermediate_size"], Float[Array, "batch intermediate_size ssm_state_size"]],
     tuple,
 ]:
-    """Forward rule with residuals for backward."""
+    """Forward rule for SSM1 custom VJP, returning residuals for backward.
+
+    Runs the SSM1 forward computation and saves all intermediate values
+    needed by the backward pass (hidden states, inputs, discretized tensors).
+
+    Args:
+        hidden_states: Input tensor [batch, seq_len, intermediate_size].
+        A: A matrix (real form, typically negative) [intermediate_size, ssm_state_size].
+        B: B parameter [batch, seq_len, ssm_state_size].
+        C: C parameter [batch, seq_len, ssm_state_size].
+        D: Skip connection [intermediate_size].
+        dt: Time step (after softplus) [batch, seq_len, intermediate_size].
+        initial_state: Initial hidden state [batch, intermediate_size, ssm_state_size],
+            or None to use zeros.
+        use_single_step: If True and seq_len=1, use optimized single-step path.
+
+    Returns:
+        Tuple of:
+            - primals: Tuple of (output, final_state).
+            - residuals: Tuple of tensors saved for the backward pass.
+    """
     batch_size, seq_len, intermediate_size = hidden_states.shape
     ssm_state_size = B.shape[-1]
 
@@ -162,7 +182,23 @@ def _ssm1_bwd_rule(
     residuals: tuple,
     grads: tuple,
 ) -> tuple:
-    """Backward rule with custom implementation."""
+    """Backward rule for SSM1 custom VJP.
+
+    Computes gradients for all SSM1 parameters using saved residuals
+    from the forward pass. Delegates to the specialized backward
+    implementation in ``_ssm1_bwd``.
+
+    Args:
+        use_single_step: Non-differentiable flag from forward (True if
+            single-step inference was used).
+        residuals: Tuple of tensors saved by ``_ssm1_fwd_rule``, containing
+            (hidden_states, A, B, C, D, dt, all_hidden_states, initial_state).
+        grads: Tuple of output gradients (do, dfinal_state).
+
+    Returns:
+        Tuple of gradients (dx, dA, dB, dC, dD, ddt, d_initial_state)
+        matching the primal inputs of ``_ssm1_core``.
+    """
     hidden_states, A, B, C, D, dt, all_hidden_states, initial_state = residuals
     do, dfinal_state = grads
 
