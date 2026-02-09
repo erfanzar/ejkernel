@@ -51,27 +51,14 @@ QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 GemvMode = Literal["auto", "on", "off"]
 RevSplitKMode = Literal["auto", "on", "off"]
 
-_NF4_TABLE = None
-_E2M1_TABLE = None
-_E4M3_TABLE = None
-_E8M0_EXP2_TABLE = None
+def _get_decode_tables() -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Build decode lookup tables as local arrays (no global state)."""
 
-
-def _get_decode_tables():
-    """Lazily materialize decode lookup tables to avoid backend init on import."""
-
-    global _NF4_TABLE, _E2M1_TABLE, _E4M3_TABLE, _E8M0_EXP2_TABLE
-
-    if _NF4_TABLE is None:
-        _NF4_TABLE = _get_nf4_table()
-    if _E2M1_TABLE is None:
-        _E2M1_TABLE, _ = _get_e2m1_table()
-    if _E4M3_TABLE is None:
-        _E4M3_TABLE, _ = _get_e4m3_table()
-    if _E8M0_EXP2_TABLE is None:
-        _E8M0_EXP2_TABLE = jnp.exp2(jnp.arange(256, dtype=jnp.uint8).astype(jnp.int8).astype(jnp.float32))
-
-    return _NF4_TABLE, _E2M1_TABLE, _E4M3_TABLE, _E8M0_EXP2_TABLE
+    nf4_table = _get_nf4_table()
+    e2m1_table, _ = _get_e2m1_table()
+    e4m3_table, _ = _get_e4m3_table()
+    e8m0_exp2_table = jnp.exp2(jnp.arange(256, dtype=jnp.uint8).astype(jnp.int8).astype(jnp.float32))
+    return nf4_table, e2m1_table, e4m3_table, e8m0_exp2_table
 
 
 @triton.jit
@@ -2051,7 +2038,7 @@ def quantized_matmul_dequant_triton(
     use_bf16: bool = True,
 ) -> jax.Array:
     """Dequantize packed weights into BF16/FP16 for two-stage matmul."""
-    _get_decode_tables()
+    nf4_table, e2m1_table, e4m3_table, e8m0_exp2_table = _get_decode_tables()
     mode = mode.lower()
     group_size, bits = _resolve_qparams(mode, group_size, bits)
 
@@ -2094,7 +2081,7 @@ def quantized_matmul_dequant_triton(
         (w_deq,) = triton_call(
             w,
             scales,
-            _NF4_TABLE,
+            nf4_table,
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2149,8 +2136,8 @@ def quantized_matmul_dequant_triton(
         (w_deq,) = triton_call(
             w,
             scales,
-            _E2M1_TABLE,
-            _E8M0_EXP2_TABLE,
+            e2m1_table,
+            e8m0_exp2_table,
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2173,8 +2160,8 @@ def quantized_matmul_dequant_triton(
         (w_deq,) = triton_call(
             w,
             scales,
-            _E4M3_TABLE,
-            _E8M0_EXP2_TABLE,
+            e4m3_table,
+            e8m0_exp2_table,
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2197,8 +2184,8 @@ def quantized_matmul_dequant_triton(
         (w_deq,) = triton_call(
             w,
             scales,
-            _E2M1_TABLE,
-            _E4M3_TABLE,
+            e2m1_table,
+            e4m3_table,
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2221,7 +2208,7 @@ def quantized_matmul_dequant_triton(
         (w_deq,) = triton_call(
             w,
             scales,
-            _E4M3_TABLE,
+            e4m3_table,
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2303,7 +2290,6 @@ def quantized_matmul_triton(
         ValueError: If bits/group_size are invalid for the selected mode.
         ValueError: If input shapes are invalid or inconsistent.
     """
-    _get_decode_tables()
     mode = mode.lower()
     group_size, bits = _resolve_qparams(mode, group_size, bits)
     gemv_mode = normalize_gemv_mode(gemv_mode)
@@ -2373,6 +2359,8 @@ def quantized_matmul_triton(
             block_n=block_n,
         )
 
+    nf4_table, e2m1_table, e4m3_table, e8m0_exp2_table = _get_decode_tables()
+
     stride_xm, stride_xk = strides_from_shape(x.shape)
     stride_wq0, stride_wq1 = strides_from_shape(w.shape)
     stride_ws0, stride_ws1 = strides_from_shape(scales.shape)
@@ -2418,7 +2406,7 @@ def quantized_matmul_triton(
             (w_deq,) = triton_call(
                 w,
                 scales,
-                _NF4_TABLE,
+                nf4_table,
                 N,
                 K,
                 out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2473,8 +2461,8 @@ def quantized_matmul_triton(
             (w_deq,) = triton_call(
                 w,
                 scales,
-                _E2M1_TABLE,
-                _E8M0_EXP2_TABLE,
+                e2m1_table,
+                e8m0_exp2_table,
                 N,
                 K,
                 out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2497,8 +2485,8 @@ def quantized_matmul_triton(
             (w_deq,) = triton_call(
                 w,
                 scales,
-                _E4M3_TABLE,
-                _E8M0_EXP2_TABLE,
+                e4m3_table,
+                e8m0_exp2_table,
                 N,
                 K,
                 out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2521,8 +2509,8 @@ def quantized_matmul_triton(
             (w_deq,) = triton_call(
                 w,
                 scales,
-                _E2M1_TABLE,
-                _E4M3_TABLE,
+                e2m1_table,
+                e4m3_table,
                 N,
                 K,
                 out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2545,7 +2533,7 @@ def quantized_matmul_triton(
             (w_deq,) = triton_call(
                 w,
                 scales,
-                _E4M3_TABLE,
+                e4m3_table,
                 N,
                 K,
                 out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
@@ -2587,7 +2575,7 @@ def quantized_matmul_triton(
             x,
             w,
             scales,
-            _NF4_TABLE,
+            nf4_table,
             M,
             N,
             K,
@@ -2663,8 +2651,8 @@ def quantized_matmul_triton(
             x,
             w,
             scales,
-            _E2M1_TABLE,
-            _E8M0_EXP2_TABLE,
+            e2m1_table,
+            e8m0_exp2_table,
             M,
             N,
             K,
@@ -2696,8 +2684,8 @@ def quantized_matmul_triton(
             x,
             w,
             scales,
-            _E4M3_TABLE,
-            _E8M0_EXP2_TABLE,
+            e4m3_table,
+            e8m0_exp2_table,
             M,
             N,
             K,
@@ -2729,8 +2717,8 @@ def quantized_matmul_triton(
             x,
             w,
             scales,
-            _E2M1_TABLE,
-            _E4M3_TABLE,
+            e2m1_table,
+            e4m3_table,
             M,
             N,
             K,
@@ -2762,7 +2750,7 @@ def quantized_matmul_triton(
             x,
             w,
             scales,
-            _E4M3_TABLE,
+            e4m3_table,
             M,
             N,
             K,

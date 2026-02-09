@@ -36,27 +36,14 @@ from ejkernel.quantization._utils.fp_tables import _get_e2m1_table, _get_e4m3_ta
 
 QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 
-_NF4_TABLE = None
-_E2M1_TABLE = None
-_E4M3_TABLE = None
-_E8M0_EXP2_TABLE = None
+def _get_decode_tables() -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Build decode lookup tables as local arrays (no global state)."""
 
-
-def _get_decode_tables():
-    """Lazily materialize decode lookup tables to avoid backend init on import."""
-
-    global _NF4_TABLE, _E2M1_TABLE, _E4M3_TABLE, _E8M0_EXP2_TABLE
-
-    if _NF4_TABLE is None:
-        _NF4_TABLE = _get_nf4_table()
-    if _E2M1_TABLE is None:
-        _E2M1_TABLE, _ = _get_e2m1_table()
-    if _E4M3_TABLE is None:
-        _E4M3_TABLE, _ = _get_e4m3_table()
-    if _E8M0_EXP2_TABLE is None:
-        _E8M0_EXP2_TABLE = jnp.exp2(jnp.arange(256, dtype=jnp.uint8).astype(jnp.int8).astype(jnp.float32))
-
-    return _NF4_TABLE, _E2M1_TABLE, _E4M3_TABLE, _E8M0_EXP2_TABLE
+    nf4_table = _get_nf4_table()
+    e2m1_table, _ = _get_e2m1_table()
+    e4m3_table, _ = _get_e4m3_table()
+    e8m0_exp2_table = jnp.exp2(jnp.arange(256, dtype=jnp.uint8).astype(jnp.int8).astype(jnp.float32))
+    return nf4_table, e2m1_table, e4m3_table, e8m0_exp2_table
 
 
 def _mode_to_id(mode: str) -> int:
@@ -474,7 +461,7 @@ def quantized_matmul_triton_gemv(
     block_n: int,
 ) -> jax.Array:
     """Run dedicated Triton GEMV family kernels for M==1 quantized matmul."""
-    _get_decode_tables()
+    nf4_table, e2m1_table, e4m3_table, e8m0_exp2_table = _get_decode_tables()
     if int(x.shape[0]) != 1:
         raise ValueError("Dedicated GEMV kernels require M == 1.")
 
@@ -512,10 +499,10 @@ def quantized_matmul_triton_gemv(
             w,
             scales,
             bias_arg,
-            _NF4_TABLE,
-            _E2M1_TABLE,
-            _E4M3_TABLE,
-            _E8M0_EXP2_TABLE,
+            nf4_table,
+            e2m1_table,
+            e4m3_table,
+            e8m0_exp2_table,
             N,
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=out_shape, dtype=jnp.float32)],
@@ -551,10 +538,10 @@ def quantized_matmul_triton_gemv(
         w,
         scales,
         bias_arg,
-        _NF4_TABLE,
-        _E2M1_TABLE,
-        _E4M3_TABLE,
-        _E8M0_EXP2_TABLE,
+        nf4_table,
+        e2m1_table,
+        e4m3_table,
+        e8m0_exp2_table,
         N,
         K,
         out_shape=[jax.ShapeDtypeStruct(shape=out_shape, dtype=jnp.float32)],
