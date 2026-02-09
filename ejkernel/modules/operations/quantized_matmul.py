@@ -479,7 +479,16 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         Returns:
             The registered kernel implementation function.
         """
-        platform = detect_platform(self.op_id, cfg.platform, prefer_cuda=True)
+        try:
+            backend_name = jax.default_backend()
+        except Exception:
+            backend_name = "cpu"
+        platform = detect_platform(
+            self.op_id,
+            cfg.platform,
+            prefer_pallas=backend_name == "tpu",
+            prefer_cuda=backend_name in ("gpu", "cuda"),
+        )
         return kernel_registry.get(self.op_id, platform=platform, backend=cfg.backend)
 
     def run(

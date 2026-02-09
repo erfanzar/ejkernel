@@ -89,6 +89,11 @@ from ._pallas_impl_fwd import (
     paged_flash_attention_kernel_inline_seq_dim,
 )
 
+if hasattr(pl, "ANY"):
+    _HBM_ANY = pl.ANY
+else:
+    _HBM_ANY = pltpu.ANY
+
 
 @kernel_registry.register("page_attention", Platform.PALLAS, Backend.TPU)
 @ejit(
@@ -297,8 +302,8 @@ def page_attention(
 
     in_specs = [
         q_block_spec,
-        pl.BlockSpec(memory_space=pltpu.ANY),
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=_HBM_ANY),
+        pl.BlockSpec(memory_space=_HBM_ANY),
     ]
     scratch_shapes = (
         pltpu.VMEM((2, pages_per_compute_block, page_size, head_dim), key_cache.dtype),

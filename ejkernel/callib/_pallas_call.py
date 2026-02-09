@@ -49,6 +49,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+if hasattr(pl, "ANY"):
+    _HBM_ANY = pl.ANY
+else:
+    _HBM_ANY = pltpu.ANY
+
 
 def buffered_pallas_call(
     kernel: Callable[..., Any],
@@ -249,7 +254,7 @@ def buffered_pallas_call(
             _emit_pipeline(_pipeline, grid=grid, in_specs=in_specs_, out_specs=out_specs_)(*input_output_refs)
 
         bs_smem = pl.BlockSpec(memory_space=pltpu.SMEM)
-        bs_hbm = pl.BlockSpec(memory_space=pltpu.ANY)
+        bs_hbm = pl.BlockSpec(memory_space=_HBM_ANY)
 
         smem_specs = (jax.tree.map(lambda _: bs_smem, grid_dynamic),)
         smem_specs += jax.tree.map(lambda _: bs_smem, smem_args)

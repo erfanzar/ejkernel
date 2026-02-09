@@ -86,6 +86,11 @@ from ._pallas_impl_fwd import (
     chunked_prefill_attention_kernel,
 )
 
+if hasattr(pl, "ANY"):
+    _HBM_ANY = pl.ANY
+else:
+    _HBM_ANY = pltpu.ANY
+
 
 @kernel_registry.register("prefill_page_attention", Platform.PALLAS, Backend.TPU)
 @ejit(
@@ -186,8 +191,8 @@ def prefill_page_attention(
             num_scalar_prefetch=3,
             in_specs=[
                 q_block_spec,
-                pl.BlockSpec(memory_space=pltpu.ANY),
-                pl.BlockSpec(memory_space=pltpu.ANY),
+                pl.BlockSpec(memory_space=_HBM_ANY),
+                pl.BlockSpec(memory_space=_HBM_ANY),
             ],
             out_specs=[
                 q_block_spec,

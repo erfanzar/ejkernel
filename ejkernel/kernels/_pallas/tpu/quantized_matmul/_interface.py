@@ -48,6 +48,14 @@ from ._pallas_impl_core import (
 from ._pallas_impl_fwd import _pallas_qmm_transpose_false
 
 
+def _biases_to_zeros(scales: jax.Array, biases: jax.Array | None) -> jax.Array | None:
+    """Convert internal affine additive biases back to canonical affine zeros."""
+    if biases is None:
+        return None
+    safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+    return -biases / safe_scale
+
+
 def _is_packed_tpu_legal(
     *,
     is_input_grad: bool,
@@ -120,6 +128,7 @@ def _operate_impl(
     del gemv_mode, revsplit_k, revsplit_k_parts
     del use_bf16
     compute_in_bf16 = True
+    zeros = _biases_to_zeros(scales, biases)
 
     if transpose:
         # Keep transpose=True on XLA baseline for now.
@@ -127,12 +136,11 @@ def _operate_impl(
             x,
             w,
             scales,
-            None,
+            zeros,
             transpose=transpose,
             group_size=group_size,
             bits=bits,
             mode=mode,
-            biases=biases,
             block_m=block_m,
             block_n=block_n,
             block_k=block_k,
@@ -176,12 +184,11 @@ def _operate_impl(
         x,
         w,
         scales,
-        None,
+        zeros,
         transpose=transpose,
         group_size=group_size,
         bits=bits,
         mode=mode,
-        biases=biases,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,

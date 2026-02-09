@@ -91,6 +91,11 @@ from ._pallas_impl_fwd import (
 )
 from ._utils import get_tuned_block_sizes
 
+if hasattr(pl, "ANY"):
+    _HBM_ANY = pl.ANY
+else:
+    _HBM_ANY = pltpu.ANY
+
 
 @ejit(
     static_argnames=[
@@ -204,7 +209,7 @@ def _ragged_page_attention(
     softmax_aux_reshaped = jnp.repeat(softmax_aux_reshaped, head_dim, axis=-1)
     softmax_aux_block_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
 
-    in_specs = [q_block_spec, pl.BlockSpec(memory_space=pltpu.ANY), softmax_aux_block_spec]
+    in_specs = [q_block_spec, pl.BlockSpec(memory_space=_HBM_ANY), softmax_aux_block_spec]
     out_specs = q_block_spec
     lm_scratch = pltpu.VMEM((num_kv_heads_per_blk, num_q_per_blk * num_q_heads_per_kv_head, head_dim), jnp.float32)
     acc_scratch = pltpu.VMEM((num_q_per_blk, num_q_heads_per_blk, head_dim), jnp.float32)

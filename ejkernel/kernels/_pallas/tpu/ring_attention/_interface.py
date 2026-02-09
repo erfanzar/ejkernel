@@ -83,6 +83,8 @@ from jaxtyping import Float, Int
 from ejkernel.ops import BwdParams, FwdParams
 
 from ...._registry import Backend, Platform, kernel_registry
+from ...._xla.attention import attention as _xla_attention
+from ...._xla.ring_attention import ring_attention as _xla_ring_attention
 from ._ring_splash import (
     DEFAULT_MASK_VALUE,
     RING_AXIS,
@@ -301,16 +303,68 @@ def ring_attention(
     Raises:
         NotImplementedError: If bias is provided (not supported).
     """
+    # Get dimensions
+    _, q_len, num_heads, head_dim = query.shape
+    _, kv_len, num_kv_heads, _ = key.shape
+
+    aux = None
+    if softmax_aux is not None:
+        aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
+        if aux.ndim != 1:
+            raise ValueError(f"softmax_aux must be 1D, got shape {aux.shape}.")
+
+    # Single-device/non-sharded path: delegate to XLA ring attention.
+    if axis_name is None:
+        needs_ring_semantics = (
+            q_segment_ids is not None
+            or kv_segment_ids is not None
+            or q_position_ids is not None
+            or kv_position_ids is not None
+            or chunk_size is not None
+            or mask_builder is not None
+        )
+        if not needs_ring_semantics:
+            out, _ = _xla_attention(
+                query=query,
+                key=key,
+                value=value,
+                bias=bias,
+                softmax_aux=softmax_aux,
+                softmax_scale=softmax_scale,
+                logits_soft_cap=logits_soft_cap,
+                causal=causal,
+                sliding_window=sliding_window,
+            )
+            return out.astype(jnp.float32)
+
+        return _xla_ring_attention(
+            query=query,
+            key=key,
+            value=value,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
+            q_position_ids=q_position_ids,
+            kv_position_ids=kv_position_ids,
+            softmax_aux=softmax_aux,
+            bias=bias,
+            mask_builder=mask_builder,
+            sliding_window=sliding_window,
+            chunk_size=chunk_size,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            softmax_scale=softmax_scale,
+            axis_name=None,
+            fwd_params=fwd_params,
+            bwd_params=bwd_params,
+            fused_backward=fused_backward,
+        )
+
     if bias is not None:
         raise NotImplementedError(
             "Attention bias is not supported in splash ring attention. "
             "Please remove the bias parameter or use a different kernel."
         )
     del mask_builder, fused_backward
-
-    # Get dimensions
-    _, q_len, num_heads, head_dim = query.shape
-    _, kv_len, num_kv_heads, _ = key.shape
 
     # Determine if this is MQA (multi-query attention)
     is_mqa = num_kv_heads == 1 and num_heads > 1
@@ -340,12 +394,8 @@ def ring_attention(
     ring_axis = axis_name if axis_name is not None else RING_AXIS
 
     sinks = None
-    if softmax_aux is not None:
-        aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
-        if aux.ndim == 1:
-            sinks = jnp.broadcast_to(logsumexp(aux), (num_heads,))
-        else:
-            raise ValueError(f"softmax_aux must be 1D, got shape {aux.shape}.")
+    if aux is not None:
+        sinks = jnp.broadcast_to(logsumexp(aux), (num_heads,))
 
     # Create segment IDs if provided
     segment_ids = None

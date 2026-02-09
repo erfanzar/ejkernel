@@ -28,6 +28,8 @@ from ejkernel.ops import ConfigCache, ConfigSelectorChain, Executor, Kernel, get
 class TestConfig:
     """Test configuration with different parameters per platform."""
 
+    __test__ = False
+
     algorithm: str = "default"
     block_size: int = 128
 
