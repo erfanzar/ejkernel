@@ -30,6 +30,7 @@ Available Kernels:
     - grouped_matmul/v2: Grouped matrix multiplication
 """
 
+from .all_gather_matmul import all_gather_matmul
 from .blocksparse_attention import blocksparse_attention as blocksparse_attention
 from .flash_attention import flash_attention
 from .grouped_matmul import grouped_matmul
@@ -40,9 +41,11 @@ from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
+from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
 
 __all__ = (
+    "all_gather_matmul",
     "blocksparse_attention",
     "flash_attention",
     "grouped_matmul",
@@ -53,5 +56,6 @@ __all__ = (
     "ragged_decode_attention",
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
+    "reduce_scatter_matmul",
     "ring_attention",
 )

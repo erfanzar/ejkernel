@@ -403,6 +403,34 @@ def _tpu_predecode_fits_memory_model(k: int, n: int) -> bool:
     return (k * n * 2) <= cap
 
 
+def _prefer_packed_tpu_path(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    mode: str,
+    bits: int,
+    group_size: int,
+) -> bool:
+    """Heuristic for preferring packed TPU path over predecode.
+
+    Mirrors the kernel-side heuristic so higher-layer autotune can treat
+    packed/predecode as separate candidate configurations.
+    """
+    if bits not in (4, 8):
+        return False
+    if mode != "nf4":
+        return False
+    enough_n = n >= max(512, 2 * block_n)
+    enough_m = m >= max(64, block_m // 2)
+    enough_k = k >= max(256, block_k)
+    valid_grouping = group_size <= block_n
+    return enough_n and enough_m and enough_k and valid_grouping
+
+
 def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
     """Generate a heuristic configuration for TPU Pallas quantized matmul.
 
@@ -435,6 +463,50 @@ def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> 
         block_n = max(128, align_n)
         block_k = 128
 
+    packed_legal = False
+    try:
+        from ejkernel.kernels._pallas.tpu.quantized_matmul._pallas_impl_core import (
+            is_packed_tpu_legal_forward as _packed_legal_forward,
+        )
+
+        x = _inv_arg(inv, "x", 0)
+        w = _inv_arg(inv, "w", 1)
+        scales = _inv_arg(inv, "scales", 2)
+        packed_legal = bool(
+            _packed_legal_forward(
+                x,
+                w,
+                scales,
+                group_size=group_size,
+                bits=bits,
+                block_m=block_m,
+                block_n=block_n,
+                block_k=block_k,
+            )
+        )
+    except Exception:
+        packed_legal = False
+
+    predecode_ok = _tpu_predecode_fits_memory_model(k, n)
+    if packed_legal and _prefer_packed_tpu_path(
+        m=m,
+        n=n,
+        k=k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        mode=mode,
+        bits=bits,
+        group_size=group_size,
+    ):
+        tpu_path = "packed"
+    elif predecode_ok:
+        tpu_path = "predecode"
+    elif packed_legal:
+        tpu_path = "packed"
+    else:
+        tpu_path = "hybrid"
+
     return QuantizedMatmulConfig(
         block_m=block_m,
         block_n=block_n,
@@ -443,6 +515,7 @@ def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> 
         num_stages=2,
         use_bf16=True,
         split_k=None,
+        tpu_path=tpu_path,
         platform="pallas",
         backend="tpu",
     )
@@ -493,23 +566,49 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
         _packed_legal_forward = None
 
     configs: list[QuantizedMatmulConfig] = []
+    predecode_ok = _tpu_predecode_fits_memory_model(k, n)
+
     for bm in bm_opts:
         for bn in bn_opts:
             for bk in bk_opts:
-                cfg = QuantizedMatmulConfig(
-                    block_m=bm,
-                    block_n=bn,
-                    block_k=bk,
-                    num_warps=4,
-                    num_stages=2,
-                    use_bf16=True,
-                    split_k=None,
-                    platform="pallas",
-                    backend="tpu",
-                )
+                packed_legal = False
                 if _packed_legal_forward is not None and bits in (4, 8):
-                    # Keep candidates that are legal for packed path, or that can
-                    # still run through predecode memory model.
+                    packed_legal = bool(
+                        _packed_legal_forward(
+                            x,
+                            w,
+                            scales,
+                            group_size=group_size,
+                            bits=bits,
+                            block_m=bm,
+                            block_n=bn,
+                            block_k=bk,
+                        )
+                    )
+                path_opts: list[str] = []
+                if predecode_ok:
+                    path_opts.append("predecode")
+                if packed_legal:
+                    path_opts.append("packed")
+                if predecode_ok and packed_legal:
+                    path_opts.append("hybrid")
+
+                for path in path_opts:
+                    cfg = QuantizedMatmulConfig(
+                        block_m=bm,
+                        block_n=bn,
+                        block_k=bk,
+                        num_warps=4,
+                        num_stages=2,
+                        use_bf16=True,
+                        split_k=None,
+                        tpu_path=path,
+                        platform="pallas",
+                        backend="tpu",
+                    )
+                    configs.append(cfg)
+                if not path_opts and _packed_legal_forward is not None and bits in (4, 8):
+                    # Keep candidates that can at least execute via backend fallback.
                     if _packed_legal_forward(
                         x,
                         w,
@@ -519,10 +618,21 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
                         block_m=bm,
                         block_n=bn,
                         block_k=bk,
-                    ) or _tpu_predecode_fits_memory_model(k, n):
-                        configs.append(cfg)
-                else:
-                    configs.append(cfg)
+                    ):
+                        configs.append(
+                            QuantizedMatmulConfig(
+                                block_m=bm,
+                                block_n=bn,
+                                block_k=bk,
+                                num_warps=4,
+                                num_stages=2,
+                                use_bf16=True,
+                                split_k=None,
+                                tpu_path="packed",
+                                platform="pallas",
+                                backend="tpu",
+                            )
+                        )
 
     if not configs:
         configs.append(_pallas_tpu_heuristic_cfg(inv))
@@ -840,16 +950,26 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
                 num_stages=cfg.num_stages,
                 use_bf16=cfg.use_bf16,
                 split_k=cfg.split_k,
+                tpu_path=cfg.tpu_path,
                 platform=platform,
                 backend=cfg.backend,
             )
 
         impl = self.get_impl(cfg)
-        return impl(
-            x,
-            w,
-            scales,
-            zeros,
+        resolved_platform = _resolved_platform
+        if resolved_platform is None:
+            try:
+                backend_name = jax.default_backend()
+            except Exception:
+                backend_name = "cpu"
+            resolved_platform = detect_platform(
+                self.op_id,
+                cfg.platform,
+                prefer_pallas=backend_name == "tpu",
+                prefer_cuda=backend_name in ("gpu", "cuda"),
+            ).value
+
+        impl_kwargs = dict(
             transpose=transpose,
             group_size=group_size,
             bits=bits,
@@ -865,6 +985,16 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
             num_warps=cfg.num_warps,
             num_stages=cfg.num_stages,
             split_k=cfg.split_k,
+        )
+        if resolved_platform == Platform.PALLAS.value and cfg.tpu_path is not None:
+            impl_kwargs["tpu_path"] = cfg.tpu_path
+
+        return impl(
+            x,
+            w,
+            scales,
+            zeros,
+            **impl_kwargs,
         )
 
     def heuristic_cfg(self, inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:

@@ -153,6 +153,7 @@ def _is_packed_tpu_legal(
         "group_size",
         "bits",
         "mode",
+        "tpu_path",
         "block_m",
         "block_n",
         "block_k",
@@ -172,6 +173,7 @@ def _operate_impl(
     group_size: int,
     bits: int,
     mode: str,
+    tpu_path: str,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -196,6 +198,7 @@ def _operate_impl(
         group_size: Elements per quantization group.
         bits: Quantization bit width.
         mode: Backend quantization mode string.
+        tpu_path: TPU path routing mode ("hybrid", "packed", "predecode").
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -229,7 +232,9 @@ def _operate_impl(
             use_bf16=compute_in_bf16,
         )
 
-    path = get_qmm_tpu_path()
+    path = str(tpu_path).strip().lower()
+    if path not in {"hybrid", "packed", "predecode"}:
+        path = get_qmm_tpu_path()
     packed_legal = _is_packed_tpu_legal(
         is_input_grad=False,
         x_or_dy=x,
@@ -278,7 +283,7 @@ def _operate_impl(
     )
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 15))
+@functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 16))
 def _operate(
     x: jax.Array,
     w: jax.Array,
@@ -288,6 +293,7 @@ def _operate(
     group_size: int,
     bits: int,
     mode: str,
+    tpu_path: str,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -301,7 +307,7 @@ def _operate(
     This function is decorated with ``jax.custom_vjp`` so that the
     backward pass uses the dedicated Pallas input-gradient kernel
     (``_operate_bwd``) instead of JAX's default automatic differentiation.
-    Arguments at positions 4-14 are marked as non-differentiable
+    Arguments at positions 4-15 are marked as non-differentiable
     static configuration.
 
     Args:
@@ -313,6 +319,7 @@ def _operate(
         group_size: Elements per quantization group.
         bits: Quantization bit width.
         mode: Backend quantization mode string.
+        tpu_path: TPU path routing mode ("hybrid", "packed", "predecode").
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -333,6 +340,7 @@ def _operate(
         group_size=group_size,
         bits=bits,
         mode=mode,
+        tpu_path=tpu_path,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -352,6 +360,7 @@ def _operate_fwd(
     group_size: int,
     bits: int,
     mode: str,
+    tpu_path: str,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -380,6 +389,7 @@ def _operate_fwd(
         group_size=group_size,
         bits=bits,
         mode=mode,
+        tpu_path=tpu_path,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -396,6 +406,7 @@ def _operate_bwd(
     group_size: int,
     bits: int,
     mode: str,
+    tpu_path: str,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -420,7 +431,9 @@ def _operate_bwd(
     """
     del gemv_mode, revsplit_k, revsplit_k_parts
     w, scales, biases = residual
-    path = get_qmm_tpu_path()
+    path = str(tpu_path).strip().lower()
+    if path not in {"hybrid", "packed", "predecode"}:
+        path = get_qmm_tpu_path()
     packed_legal = False
     if not transpose:
         packed_legal = _is_packed_tpu_legal(
@@ -472,6 +485,7 @@ def quantized_matmul(
     revsplit_k: RevSplitKMode = "auto",
     revsplit_k_parts: int | None = None,
     *,
+    tpu_path: str | None = None,
     block_m: int = 128,
     block_n: int = 128,
     block_k: int = 64,
@@ -508,6 +522,8 @@ def quantized_matmul(
         gemv_mode: GEMV dispatch mode (ignored on TPU).
         revsplit_k: Reverse split-K mode (ignored on TPU).
         revsplit_k_parts: Reverse split-K partition count (ignored on TPU).
+        tpu_path: Optional TPU path routing mode override
+            ("hybrid", "packed", "predecode"). If None, reads env/default.
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -543,6 +559,7 @@ def quantized_matmul(
         affine_biases = None
 
     backend_mode = to_backend_mode(mode, bits)
+    resolved_tpu_path = get_qmm_tpu_path() if tpu_path is None else str(tpu_path).strip().lower()
 
     return _operate(
         x,
@@ -553,6 +570,7 @@ def quantized_matmul(
         group_size,
         bits,
         backend_mode,
+        resolved_tpu_path,
         block_m,
         block_n,
         block_k,

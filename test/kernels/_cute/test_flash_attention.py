@@ -27,8 +27,8 @@ if not _has_cutlass:
 if jax.devices()[0].platform != "gpu":
     pytest.skip("CUTE tests require GPU backend", allow_module_level=True)
 
-from ejkernel.kernels._cute.flash_attention import flash_attention as cute_flash_attention
 from ejkernel.kernels._cuda.flash_attention import flash_attention as cuda_flash_attention
+from ejkernel.kernels._cute.flash_attention import flash_attention as cute_flash_attention
 from ejkernel.kernels._xla.flash_attention import flash_attention as xla_flash_attention
 
 _HAS_CUDA_FLASH = True

@@ -4,6 +4,7 @@ ejkernel.kernels._xla package
 .. toctree::
    :maxdepth: 2
 
+   all_gather_matmul/index
    attention/index
    blocksparse_attention/index
    chunked_prefill_paged_decode/index
@@ -23,6 +24,7 @@ ejkernel.kernels._xla package
    ragged_page_attention_v2/index
    ragged_page_attention_v3/index
    recurrent/index
+   reduce_scatter_matmul/index
    ring_attention/index
    rwkv4/index
    rwkv6/index

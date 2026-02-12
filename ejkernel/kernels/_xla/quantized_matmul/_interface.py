@@ -39,6 +39,7 @@ def quantized_matmul(
     revsplit_k: RevSplitKMode = "auto",
     revsplit_k_parts: int | None = None,
     *,
+    tpu_path: str | None = None,
     block_m: int = 128,
     block_n: int = 128,
     block_k: int = 64,
@@ -99,6 +100,7 @@ def quantized_matmul(
         - This implementation serves as the fallback for other backends
           when shapes or runtime constraints are unsupported.
     """
+    del tpu_path
     return _quantized_matmul_impl(
         x,
         w,

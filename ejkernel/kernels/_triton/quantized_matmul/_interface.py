@@ -188,6 +188,7 @@ def quantized_matmul(
     revsplit_k: RevSplitKMode = "auto",
     revsplit_k_parts: int | None = None,
     *,
+    tpu_path: str | None = None,
     block_m: int = 128,
     block_n: int = 128,
     block_k: int = 64,
@@ -201,6 +202,7 @@ def quantized_matmul(
     ``zeros`` is used only for affine mode and is converted to per-group
     additive offsets right before launching Triton kernels.
     """
+    del tpu_path
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
     _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
     gemv_mode = normalize_gemv_mode(gemv_mode)

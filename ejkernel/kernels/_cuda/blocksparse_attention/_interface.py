@@ -42,13 +42,31 @@ from jaxtyping import Array, ArrayLike, Bool, Float, Int
 
 from ejkernel.callib import ejit
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
-from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask, create_sparsity_mask
 from ejkernel.ops import BwdParams, FwdParams
 
 from ._cuda_impl import blocksparse_attention_cuda
 
 if typing.TYPE_CHECKING:
     from ejkernel.kernels._pallas.tpu.blocksparse_attention._masks import Mask
+    from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask
+
+
+_TRITON_SPARSE_MASK_TYPE: type[typing.Any] | None = None
+
+try:
+    from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask as _TRITON_SPARSE_MASK_TYPE
+    from ejkernel.kernels._triton.blocksparse_attention._mask import create_sparsity_mask
+except ModuleNotFoundError as _triton_mask_import_error:  # pragma: no cover
+    if _triton_mask_import_error.name != "triton":
+        raise
+    _triton_mask_import_exc = _triton_mask_import_error
+
+    def create_sparsity_mask(*args: typing.Any, _err: Exception = _triton_mask_import_exc, **kwargs: typing.Any):  # type: ignore[override]
+        del args, kwargs
+        raise ValueError(
+            "`blocksparse_attention` mask auto-generation requires Triton "
+            "(install `ejkernel[gpu]`), or pass precomputed `qkv_layouts`."
+        ) from _err
 
 
 def _build_fwd_params(q_blocksize: int, kv_blocksize: int, num_stages: int | None, num_warps: int | None) -> FwdParams:
@@ -618,9 +636,9 @@ def blocksparse_attention(
     kv_positions: Int[Array, "batch kv_len"] | None = None,
     softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
-    | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
-    | None = None,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | Int[Array, "batch num_heads_or_1 seq_len kv_len"] | None
+    ) = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
     logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,
@@ -715,7 +733,7 @@ def blocksparse_attention(
 
     if mask_builder is not None and qkv_layouts is None:
         qkv_layouts = mask_builder()
-    if isinstance(qkv_layouts, SparseMask):
+    if _TRITON_SPARSE_MASK_TYPE is not None and isinstance(qkv_layouts, _TRITON_SPARSE_MASK_TYPE):
         qkv_layouts = (qkv_layouts,)
 
     if fwd_params is None:

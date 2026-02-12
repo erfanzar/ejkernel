@@ -338,7 +338,7 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 
 ✅ = Production ready | - = Not available
 
-\* CuTe backend uses TVM-FFI primitive path with fused kernels. \* Quantized MatMul on TPU uses hybrid dispatch (packed Pallas / predecode / XLA fallback).
+\* CuTe backend uses TVM-FFI primitive path with fused kernels. \* Quantized MatMul on TPU uses hybrid dispatch (packed Pallas / predecode / XLA fallback). \* Distributed matmul ops (`all_gather_matmul`, `reduce_scatter_matmul`) intentionally do not perform runtime fallback between distributed backends; choose `platform`/`cfg.platform` explicitly.
 
 ## Advanced Usage
 

@@ -393,6 +393,31 @@ class GroupedMatmulConfig(BaseOperationConfig):
 
 
 @dataclass
+class AllGatherMatmulConfig(BaseOperationConfig):
+    """Configuration for All-Gather Matmul operation."""
+
+    block_n: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class ReduceScatterMatmulConfig(BaseOperationConfig):
+    """Configuration for Reduce-Scatter Matmul operation."""
+
+    block_m: int = 128
+    block_n: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class QuantizedMatmulConfig(BaseOperationConfig):
     """Configuration for Quantized Matrix Multiplication operation.
 
@@ -404,6 +429,8 @@ class QuantizedMatmulConfig(BaseOperationConfig):
         num_stages: Number of pipeline stages (default: 3)
         use_bf16: Use BF16 for the dot input tiles (default: True)
         split_k: Optional split-K factor for Triton kernels (default: None)
+        tpu_path: Optional TPU Pallas path override
+            ("hybrid", "packed", "predecode"). None uses backend default.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
@@ -415,6 +442,7 @@ class QuantizedMatmulConfig(BaseOperationConfig):
     num_stages: int = 3
     use_bf16: bool = True
     split_k: int | None = None
+    tpu_path: Literal["hybrid", "packed", "predecode"] | None = None
 
     __hash__ = hash_fn
 

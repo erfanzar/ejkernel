@@ -44,6 +44,12 @@ output = flash_attention(query, key, value, platform="xla")  # Force XLA
 output = flash_attention(query, key, value, platform="triton")  # Force Triton
 ```
 
+Distributed matmul note (`all_gather_matmul`, `reduce_scatter_matmul`):
+
+- These operations intentionally do **not** perform runtime fallback between distributed backends.
+- If the chosen backend cannot execute the provided shape/constraints, the call fails.
+- Choose `platform`/`cfg.platform` explicitly for production deployments.
+
 ### Configuration and Autotuning
 
 Modules support automatic performance tuning. On first invocation with new input shapes, the system benchmarks multiple configurations and caches the optimal one:
@@ -432,14 +438,14 @@ output = flash_attention(query, key, value, mask_info=mask_info)
 
 ### 3. Choose the right attention variant
 
-| Use Case | Recommended |
-|----------|-------------|
-| Standard training | `flash_attention` |
-| Inference serving | `page_attention` or `ragged_page_attention_v3` |
-| Very long sequences (>128K) | `ring_attention` |
-| Sparse patterns | `native_sparse_attention` or `blocksparse_attention` |
-| Streaming inference | `recurrent_attention` |
-| MoE layers | `grouped_matmul` |
+| Use Case                    | Recommended                                          |
+| --------------------------- | ---------------------------------------------------- |
+| Standard training           | `flash_attention`                                    |
+| Inference serving           | `page_attention` or `ragged_page_attention_v3`       |
+| Very long sequences (>128K) | `ring_attention`                                     |
+| Sparse patterns             | `native_sparse_attention` or `blocksparse_attention` |
+| Streaming inference         | `recurrent_attention`                                |
+| MoE layers                  | `grouped_matmul`                                     |
 
 ### 4. Profile before optimizing
 

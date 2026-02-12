@@ -60,6 +60,8 @@ from ._pallas_impl_core import (
     _pad_2d,
     _pad_2d_optional,
     _unpack_bits_4_8,
+    choose_packed_n_subtile,
+    estimate_qmm_tpu_vmem_limit_bytes,
     get_predecoded_dense_weight,
     pallas_dense_matmul,
 )
@@ -148,6 +150,14 @@ def _pallas_qmm_input_grad_transpose_false_packed(
     num_k = k_pad // block_k
     block_words = block_n // values_per_word
     block_groups = block_n // group_size
+    n_subtile = choose_packed_n_subtile(
+        block_n=block_n,
+        group_size=group_size,
+        values_per_word=values_per_word,
+    )
+    subtile_words = n_subtile // values_per_word
+    subtile_groups = n_subtile // group_size
+    num_n_subtiles = block_n // n_subtile
     # dX = dY @ W^T, contract over N.
     dot_dims = (((1,), (1,)), ((), ()))
 
@@ -158,14 +168,21 @@ def _pallas_qmm_input_grad_transpose_false_packed(
         def _zero_acc():
             acc_ref[...] = jnp.zeros_like(acc_ref)
 
-        q = _unpack_bits_4_8(w_ref[...], bits)
-        w_deq = _dequantize_tile(q, s_ref[...], None, mode, group_size).astype(jnp.bfloat16)
-        acc_ref[...] += jax.lax.dot_general(
-            dy_ref[...].astype(jnp.bfloat16),
-            w_deq,
-            dot_dims,
-            preferred_element_type=jnp.float32,
-        )
+        for n_j in range(num_n_subtiles):
+            n_start = n_j * n_subtile
+            n_end = n_start + n_subtile
+            word_start = n_j * subtile_words
+            word_end = word_start + subtile_words
+            group_start = n_j * subtile_groups
+            group_end = group_start + subtile_groups
+            q = _unpack_bits_4_8(w_ref[:, word_start:word_end], bits)
+            w_deq = _dequantize_tile(q, s_ref[:, group_start:group_end], None, mode, group_size).astype(jnp.bfloat16)
+            acc_ref[...] += jax.lax.dot_general(
+                dy_ref[:, n_start:n_end].astype(jnp.bfloat16),
+                w_deq,
+                dot_dims,
+                preferred_element_type=jnp.float32,
+            )
 
         @pl.when(n_i == num_n - 1)
         def _store():
@@ -178,14 +195,27 @@ def _pallas_qmm_input_grad_transpose_false_packed(
         def _zero_acc():
             acc_ref[...] = jnp.zeros_like(acc_ref)
 
-        q = _unpack_bits_4_8(w_ref[...], bits)
-        w_deq = _dequantize_tile(q, s_ref[...], b_ref[...], mode, group_size).astype(jnp.bfloat16)
-        acc_ref[...] += jax.lax.dot_general(
-            dy_ref[...].astype(jnp.bfloat16),
-            w_deq,
-            dot_dims,
-            preferred_element_type=jnp.float32,
-        )
+        for n_j in range(num_n_subtiles):
+            n_start = n_j * n_subtile
+            n_end = n_start + n_subtile
+            word_start = n_j * subtile_words
+            word_end = word_start + subtile_words
+            group_start = n_j * subtile_groups
+            group_end = group_start + subtile_groups
+            q = _unpack_bits_4_8(w_ref[:, word_start:word_end], bits)
+            w_deq = _dequantize_tile(
+                q,
+                s_ref[:, group_start:group_end],
+                b_ref[:, group_start:group_end],
+                mode,
+                group_size,
+            ).astype(jnp.bfloat16)
+            acc_ref[...] += jax.lax.dot_general(
+                dy_ref[:, n_start:n_end].astype(jnp.bfloat16),
+                w_deq,
+                dot_dims,
+                preferred_element_type=jnp.float32,
+            )
 
         @pl.when(n_i == num_n - 1)
         def _store():
@@ -203,6 +233,16 @@ def _pallas_qmm_input_grad_transpose_false_packed(
     w_bytes = k_pad * words_pad * jnp.dtype(w_q.dtype).itemsize
     s_bytes = k_pad * groups_pad * jnp.dtype(scales.dtype).itemsize
     o_bytes = m_pad * k_pad * jnp.dtype(jnp.float32).itemsize
+    tile_dy_bytes = block_m * block_n * jnp.dtype(jnp.bfloat16).itemsize
+    tile_w_bytes = block_k * block_words * jnp.dtype(w_q.dtype).itemsize
+    tile_s_bytes = block_k * block_groups * jnp.dtype(scales.dtype).itemsize
+    tile_o_bytes = block_m * block_k * jnp.dtype(jnp.float32).itemsize
+    tile_b_bytes = 0 if biases_pad is None else (block_k * block_groups * jnp.dtype(biases_pad.dtype).itemsize)
+    vmem_limit_bytes = estimate_qmm_tpu_vmem_limit_bytes(
+        io_bytes=tile_dy_bytes + tile_w_bytes + tile_s_bytes + tile_b_bytes + tile_o_bytes,
+        scratch_bytes=tile_o_bytes,
+        has_double_buffer=(num_m > 1 or num_n > 1 or num_k > 1),
+    )
     cost_estimate = pl.CostEstimate(
         flops=flops, bytes_accessed=dy_bytes + w_bytes + s_bytes + o_bytes, transcendentals=0
     )
@@ -218,7 +258,10 @@ def _pallas_qmm_input_grad_transpose_false_packed(
                 grid=grid,
                 scratch_shapes=[pltpu.VMEM((block_m, block_k), jnp.float32)],
             ),
-            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "arbitrary", "parallel")),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("parallel", "arbitrary", "parallel"),
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
             cost_estimate=cost_estimate,
         )(dy_pad, w_q_pad, scales_pad)
     else:
@@ -232,7 +275,10 @@ def _pallas_qmm_input_grad_transpose_false_packed(
                 grid=grid,
                 scratch_shapes=[pltpu.VMEM((block_m, block_k), jnp.float32)],
             ),
-            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "arbitrary", "parallel")),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("parallel", "arbitrary", "parallel"),
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
             cost_estimate=cost_estimate,
         )(dy_pad, w_q_pad, scales_pad, biases_pad)
     return out[:m, :k]
@@ -295,7 +341,18 @@ def _pallas_qmm_input_grad_transpose_false_predecode(
     )
 
 
-def _prefer_packed_path(n: int, block_n: int, mode: str) -> bool:
+def _prefer_packed_path(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    mode: str,
+    bits: int,
+    group_size: int,
+) -> bool:
     """Heuristic deciding whether the packed kernel is preferred for dX.
 
     Packed wins most consistently for large-N NF4 workloads; affine is
@@ -303,15 +360,27 @@ def _prefer_packed_path(n: int, block_n: int, mode: str) -> bool:
     matmul scheduling.
 
     Args:
+        m: Output M dimension of dX.
         n: Contraction (N) dimension size for the backward pass.
+        k: Output K dimension of dX.
+        block_m: M-dimension tile size.
         block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
         mode: Quantization mode string.
+        bits: Quantization bit-width.
+        group_size: Quantization group size.
 
     Returns:
         True if the packed path is expected to be faster.
     """
+    if bits not in (4, 8):
+        return False
     if mode == "nf4":
-        return n >= max(512, 2 * block_n)
+        enough_n = n >= max(512, 2 * block_n)
+        enough_m = m >= max(64, block_m // 2)
+        enough_k = k >= max(256, block_k)
+        valid_grouping = group_size <= block_n
+        return enough_n and enough_m and enough_k and valid_grouping
     return False
 
 
@@ -390,7 +459,19 @@ def _quantized_matmul_input_grad_hybrid(
             use_bf16=use_bf16,
         )
 
-    if packed_legal and _prefer_packed_path(n, block_n, mode):
+    m = dy.shape[0]
+    k = w_q.shape[0]
+    if packed_legal and _prefer_packed_path(
+        m=m,
+        n=n,
+        k=k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        mode=mode,
+        bits=bits,
+        group_size=group_size,
+    ):
         return _pallas_qmm_input_grad_transpose_false_packed(
             dy,
             w_q,

@@ -56,6 +56,17 @@ from . import _pallas as pallas
 from . import _xla as xla
 from ._registry import Backend, Platform, kernel_registry
 
+
+def _is_optional_cute_dependency_error(err: ModuleNotFoundError) -> bool:
+    """Return True when a CuTe import failed due to optional GPU deps.
+
+    CuTe kernels require CUTLASS and CUDA Python bindings.  Missing either
+    should not fail importing ``ejkernel``; we simply disable the CuTe backend.
+    """
+    name = err.name or ""
+    return name == "cutlass" or name.startswith("cutlass.") or name == "cuda" or name.startswith("cuda.")
+
+
 try:
     build_cuda_libs = cuda.build_cuda_libs
 except Exception:  # pragma: no cover
@@ -75,7 +86,9 @@ except Exception:  # pragma: no cover
 try:
     from . import _triton as triton
 except ModuleNotFoundError as err:  # pragma: no cover
-    if err.name != "triton":
+    if err.name not in {"triton", "jax.experimental.pallas.triton"} and not (
+        isinstance(err.name, str) and err.name.startswith("triton")
+    ):
         raise
     triton = None  # type: ignore[assignment]
 
@@ -84,7 +97,7 @@ if _has_cutlass:
     try:
         from . import _cute as cute
     except ModuleNotFoundError as err:  # pragma: no cover
-        if not str(err.name).startswith("cutlass"):
+        if not _is_optional_cute_dependency_error(err):
             raise
         cute = None  # type: ignore[assignment]
 else:  # pragma: no cover

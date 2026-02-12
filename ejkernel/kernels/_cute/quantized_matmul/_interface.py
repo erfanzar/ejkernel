@@ -226,6 +226,7 @@ def quantized_matmul(
     revsplit_k: RevSplitKMode = "auto",
     revsplit_k_parts: int | None = None,
     *,
+    tpu_path: str | None = None,
     block_m: int = 128,
     block_n: int = 128,
     block_k: int = 64,
@@ -270,7 +271,7 @@ def quantized_matmul(
         ValueError: If ``zeros`` is ``None`` when mode is ``"affine"``,
             or non-``None`` for non-affine modes.
     """
-    del num_warps, num_stages, split_k
+    del tpu_path, num_warps, num_stages, split_k
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
     _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
     gemv_mode = normalize_gemv_mode(gemv_mode)

@@ -85,10 +85,12 @@ Note:
     select the best available backend for your hardware.
 """
 
+from .all_gather_matmul import AllGatherMatmul, all_gather_matmul
 from .attention import Attention, attention
 from .blocksparse_attention import BlockSparseAttention, blocksparse_attention
 from .chunked_prefill_paged_decode import ChunkedPrefillPagedDecode, chunked_prefill_paged_decode
 from .configs import (
+    AllGatherMatmulConfig,
     AttentionConfig,
     BlockSparseAttentionConfig,
     ChunkedPrefillPagedDecodeConfig,
@@ -108,6 +110,7 @@ from .configs import (
     RaggedPageAttentionv2Config,
     RaggedPageAttentionv3Config,
     RecurrentAttentionConfig,
+    ReduceScatterMatmulConfig,
     RingAttentionConfig,
     RWKV4Config,
     RWKV6Config,
@@ -134,6 +137,7 @@ from .ragged_decode_attention import RaggedDecodeAttention, ragged_decode_attent
 from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attention_v2
 from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attention_v3
 from .recurrent import RecurrentAttention, recurrent_attention
+from .reduce_scatter_matmul import ReduceScatterMatmul, reduce_scatter_matmul
 from .ring_attention import RingAttention, ring_attention
 from .rwkv4 import RWKV4, rwkv4
 from .rwkv6 import RWKV6, rwkv6
@@ -147,6 +151,8 @@ __all__ = (
     "RWKV4",
     "RWKV6",
     "RWKV7",
+    "AllGatherMatmul",
+    "AllGatherMatmulConfig",
     "Attention",
     "AttentionConfig",
     "BlockSparseAttention",
@@ -191,6 +197,8 @@ __all__ = (
     "RaggedPageAttentionv3Config",
     "RecurrentAttention",
     "RecurrentAttentionConfig",
+    "ReduceScatterMatmul",
+    "ReduceScatterMatmulConfig",
     "RingAttention",
     "RingAttentionConfig",
     "ScaledDotProductAttention",
@@ -201,6 +209,7 @@ __all__ = (
     "StateSpaceV2Config",
     "UnifiedAttention",
     "UnifiedAttentionConfig",
+    "all_gather_matmul",
     "attention",
     "blocksparse_attention",
     "chunked_prefill_paged_decode",
@@ -222,6 +231,7 @@ __all__ = (
     "ragged_page_attention_v2",
     "ragged_page_attention_v3",
     "recurrent_attention",
+    "reduce_scatter_matmul",
     "ring_attention",
     "rwkv4",
     "rwkv6",

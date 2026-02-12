@@ -45,7 +45,9 @@ Environment Variables:
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import threading
 from collections import OrderedDict
 
@@ -64,6 +66,8 @@ from ejkernel.quantization._utils.fp_tables import (
 _QMM_PATHS = frozenset(("hybrid", "packed", "predecode"))
 _DEFAULT_PREDECODE_CACHE_MAX_ITEMS = 2
 _DEFAULT_PREDECODE_MAX_BYTES = 256 * 1024 * 1024
+_DEFAULT_TPU_VMEM_LIMIT_BYTES = 96 * 1024 * 1024
+_DEFAULT_TPU_V7_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
 
 _PREDECODE_CACHE: OrderedDict[tuple, jax.Array] = OrderedDict()
 _PREDECODE_CACHE_LOCK = threading.Lock()
@@ -80,6 +84,15 @@ def _ceil_div(a: int, b: int) -> int:
         The smallest integer >= a/b.
     """
     return (a + b - 1) // b
+
+
+def _lcm(a: int, b: int) -> int:
+    """Compute least common multiple for positive integers."""
+    if a <= 0:
+        return max(1, int(b))
+    if b <= 0:
+        return max(1, int(a))
+    return abs(a * b) // math.gcd(a, b)
 
 
 def _pad_2d(x: jax.Array, pad0: int, pad1: int) -> jax.Array:
@@ -369,6 +382,62 @@ def get_predecode_max_bytes() -> int:
         Max bytes per predecoded buffer (default: 256 MiB).
     """
     return _parse_int_env("EJKERNEL_QMM_TPU_MAX_PREDECODE_BYTES", _DEFAULT_PREDECODE_MAX_BYTES)
+
+
+def _get_tpu_version() -> int:
+    """Return numeric TPU version, or -1 when unavailable."""
+    try:
+        kind = jax.devices()[0].device_kind
+    except Exception:
+        return -1
+    match = re.match(r"^TPU[^\d]*(\d+)", kind)
+    if match is None:
+        return -1
+    return int(match.group(1))
+
+
+def get_qmm_tpu_vmem_limit_bytes() -> int:
+    """Return VMEM compiler budget for TPU QMM kernels."""
+    env_limit = _parse_int_env("EJKERNEL_QMM_TPU_VMEM_LIMIT_BYTES", -1)
+    if env_limit > 0:
+        return env_limit
+    if _get_tpu_version() == 7:
+        return _DEFAULT_TPU_V7_VMEM_LIMIT_BYTES
+    return _DEFAULT_TPU_VMEM_LIMIT_BYTES
+
+
+def estimate_qmm_tpu_vmem_limit_bytes(
+    *,
+    io_bytes: int,
+    scratch_bytes: int,
+    has_double_buffer: bool,
+) -> int:
+    """Estimate per-kernel VMEM usage and cap it to device budget."""
+    # Account for compute/vreg spill headroom similarly to other TPU kernels.
+    estimated = 2 * (max(0, int(io_bytes)) + max(0, int(scratch_bytes)))
+    if has_double_buffer:
+        estimated += max(0, int(io_bytes))
+    estimated = max(1, estimated)
+    return min(estimated, get_qmm_tpu_vmem_limit_bytes())
+
+
+def choose_packed_n_subtile(
+    *,
+    block_n: int,
+    group_size: int,
+    values_per_word: int,
+    max_subtile: int = 256,
+) -> int:
+    """Pick an N-subtile width for packed kernels to reduce unpack/dequant pressure."""
+    align = _lcm(group_size, values_per_word)
+    target = min(block_n, max_subtile)
+    target = max(align, (target // align) * align)
+    n_subtile = target
+    while n_subtile > align and block_n % n_subtile != 0:
+        n_subtile -= align
+    if n_subtile <= 0 or block_n % n_subtile != 0:
+        return block_n
+    return n_subtile
 
 
 def _decode_e2m1(code: jax.Array) -> jax.Array:
@@ -816,6 +885,14 @@ def pallas_dense_matmul(
     lhs_bytes = m_pad * k_pad * jnp.dtype(jnp.bfloat16).itemsize
     rhs_bytes = n_pad * k_pad * jnp.dtype(jnp.bfloat16).itemsize
     out_bytes = m_pad * n_pad * jnp.dtype(jnp.float32).itemsize
+    tile_lhs_bytes = block_m * block_k * jnp.dtype(jnp.bfloat16).itemsize
+    tile_rhs_bytes = block_n * block_k * jnp.dtype(jnp.bfloat16).itemsize
+    tile_out_bytes = block_m * block_n * jnp.dtype(jnp.float32).itemsize
+    vmem_limit_bytes = estimate_qmm_tpu_vmem_limit_bytes(
+        io_bytes=tile_lhs_bytes + tile_rhs_bytes + tile_out_bytes,
+        scratch_bytes=tile_out_bytes,
+        has_double_buffer=(num_m > 1 or num_n > 1 or num_k > 1),
+    )
     cost_estimate = pl.CostEstimate(
         flops=flops,
         bytes_accessed=lhs_bytes + rhs_bytes + out_bytes,
@@ -832,7 +909,10 @@ def pallas_dense_matmul(
             grid=grid,
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)],
         ),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "arbitrary")),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "arbitrary"),
+            vmem_limit_bytes=vmem_limit_bytes,
+        ),
         cost_estimate=cost_estimate,
     )(lhs_pad, rhs_pad)
     return out[:m, :n]
@@ -848,8 +928,11 @@ __all__ = (
     "_pad_2d",
     "_pad_2d_optional",
     "_unpack_bits_4_8",
+    "choose_packed_n_subtile",
+    "estimate_qmm_tpu_vmem_limit_bytes",
     "get_predecoded_dense_weight",
     "get_qmm_tpu_path",
+    "get_qmm_tpu_vmem_limit_bytes",
     "is_packed_tpu_legal_forward",
     "is_packed_tpu_legal_input_grad",
     "pallas_dense_matmul",

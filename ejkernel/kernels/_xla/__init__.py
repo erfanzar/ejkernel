@@ -60,6 +60,7 @@ Note:
     (Triton, Pallas, CUDA) are not available for the current hardware.
 """
 
+from .all_gather_matmul import all_gather_matmul
 from .attention import attention
 from .blocksparse_attention import blocksparse_attention
 from .chunked_prefill_paged_decode import chunked_prefill_paged_decode
@@ -79,6 +80,7 @@ from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v3 import ragged_page_attention_v3
 from .recurrent import recurrent
+from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
 from .rwkv4 import rwkv4
 from .rwkv6 import rwkv6
@@ -89,6 +91,7 @@ from .state_space_v2 import state_space_v2
 from .unified_attention import unified_attention
 
 __all__ = [
+    "all_gather_matmul",
     "apply_native_sparse_attention",
     "attention",
     "blocksparse_attention",
@@ -110,6 +113,7 @@ __all__ = [
     "ragged_page_attention_v3",
     "recurrent",
     "recurrent_gla",
+    "reduce_scatter_matmul",
     "ring_attention",
     "rwkv4",
     "rwkv6",

@@ -4,6 +4,7 @@ ejkernel.modules.operations package
 .. toctree::
    :maxdepth: 2
 
+   all_gather_matmul
    attention
    blocksparse_attention
    chunked_prefill_paged_decode
@@ -24,6 +25,7 @@ ejkernel.modules.operations package
    ragged_page_attention_v2
    ragged_page_attention_v3
    recurrent
+   reduce_scatter_matmul
    ring_attention
    rwkv4
    rwkv6
