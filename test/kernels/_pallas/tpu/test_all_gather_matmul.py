@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require
 
 
 def _candidate_tp_sizes() -> tuple[int, ...]:
-    n = len(jax.devices("tpu"))
+    n = len(jax.devices())
     if n <= 1:
         return (1,)
     sizes = [2]
