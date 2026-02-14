@@ -255,12 +255,32 @@ def quantize_array(
     group_size: int | None = None,
     bits: int | None = None,
     mode: QuantizationMode = "affine",
-    axis: QuantizationAxis = "row",
+    axis: QuantizationAxis | None = None,
     runtime_config: QuantRuntimeConfig | None = None,
 ) -> QuantizedArray:
-    """Quantize *w* and return a ``QuantizedArray`` container."""
-    axis_n = normalize_axis(axis)
+    """Quantize *w* and return a ``QuantizedArray`` container.
+
+    If *axis* is omitted, a compatible axis is inferred from the input shape:
+    - Prefer ``axis='row'`` when ``w.shape[-2]`` is divisible by ``group_size``.
+    - Otherwise use ``axis='col'`` when ``w.shape[-1]`` is divisible by ``group_size``.
+    """
     mode_n, group_size_n, bits_n, _ = resolve_qparams(mode, group_size, bits)
+    if axis is None:
+        if w.ndim < 2:
+            raise ValueError("quantize_array expects inputs with two or more dimensions.")
+        if int(w.shape[-2]) % group_size_n == 0:
+            axis_n: QuantizationAxis = "row"
+        elif int(w.shape[-1]) % group_size_n == 0:
+            axis_n = "col"
+        else:
+            raise ValueError(
+                "group_size is incompatible with both possible grouping axes. "
+                f"input_shape={tuple(w.shape)}, group_size={group_size_n}, "
+                f"dim[-2]={int(w.shape[-2])}, dim[-1]={int(w.shape[-1])}. "
+                "Pass axis='row' or axis='col' explicitly."
+            )
+    else:
+        axis_n = normalize_axis(axis)
     out = quantize(
         w,
         group_size=group_size_n,

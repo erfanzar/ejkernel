@@ -209,16 +209,12 @@ def _quantize_candidate_cfgs(
     mode: QuantizationMode,
 ) -> list[QuantRuntimeConfig]:
     """Build quantize autotune candidates around *base*."""
-    if mode != "affine":
-        return [base]
-    backend = jax.default_backend()
-    if backend == "tpu":
-        meta_opts = ("bf16", "input", "fp32")
-    else:
-        meta_opts = ("fp16", "input", "fp32")
-    candidates = [base]
-    candidates.extend(replace(base, affine_metadata_dtype=meta) for meta in meta_opts)
-    return _dedupe_cfgs(candidates)
+    # For quantize, prefer stable "store once, use many times" artifacts.
+    # The default backend-tuned config already picks a compact metadata dtype
+    # (bf16 on TPU, fp16 elsewhere). Callers can override via runtime_config
+    # if they want input/fp32 metadata for parity or debugging.
+    del mode
+    return [base]
 
 
 def _dequantize_candidate_cfgs(base: QuantRuntimeConfig) -> list[QuantRuntimeConfig]:
