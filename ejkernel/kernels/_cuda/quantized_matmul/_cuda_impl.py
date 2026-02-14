@@ -223,7 +223,6 @@ def quantized_matmul_cuda(
     Raises:
         ValueError: If *bits* is not in {4, 8} or incompatible
             with the chosen *mode*.
-        ValueError: If *transpose* is ``True`` (currently unsupported).
         ValueError: If *scales* is not rank-2 or its shape is inconsistent
             with *x* and *w*.
         ValueError: If the packed weight width does not match the expected
