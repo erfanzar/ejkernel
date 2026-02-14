@@ -16,12 +16,18 @@ import argparse
 import json
 import subprocess
 import sys
+import statistics
 from pathlib import Path
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--baseline", type=Path, required=True)
+    p.add_argument(
+        "--baseline",
+        type=Path,
+        default=Path("benchmarks/baselines/qmm_llm_gpu_xla_strict.json"),
+        help="Baseline JSON path (default: benchmarks/baselines/qmm_llm_gpu_xla_strict.json).",
+    )
     p.add_argument("--workdir", type=Path, default=Path("benchmark_outputs"))
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iterations", type=int, default=30)
@@ -30,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--axis", type=str, default="both", choices=["row", "col", "both"])
     p.add_argument("--shape-grid", type=str, default="llm_all", choices=["llm_all", "llm_mlp"])
     p.add_argument("--m-values", type=str, default="1,128")
-    p.add_argument("--platforms", type=str, default="auto,cuda,cute,triton,xla,pallas")
+    p.add_argument("--platforms", type=str, default="xla")
     p.add_argument("--modes", type=str, default="affine,nf4,mxfp4,mxfp8,nvfp4,nvfp8")
     p.add_argument("--affine-bits", type=str, default="4,8")
     p.add_argument("--affine-group-size", type=int, default=128)
@@ -39,16 +45,40 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--gate-platforms",
         type=str,
-        default="auto",
-        help="Comma-separated platform names to gate (default: auto).",
+        default="",
+        help="Comma-separated platform names to gate. Empty means all platforms in the baseline.",
     )
     p.add_argument("--hard-regression-threshold", type=float, default=0.02)
     p.add_argument(
         "--strict-fuse",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Run benchmark with strict_fuse enabled (disallow XLA dense fallback).",
     )
+    p.add_argument(
+        "--repeats",
+        type=int,
+        default=4,
+        help=(
+            "Repeat the full benchmark N times and aggregate medians for more stable gating "
+            "(default: 4; see --rolling-window)."
+        ),
+    )
+    p.add_argument(
+        "--rolling-window",
+        type=int,
+        default=3,
+        help=(
+            "If > 0, aggregate only the last N repeats (rolling median window). "
+            "This is useful when the first run is a cold-start outlier (default: 3)."
+        ),
+    )
     p.add_argument("--write-new-baseline", action="store_true")
+    p.add_argument(
+        "--allow-metadata-mismatch",
+        action="store_true",
+        help="Allow gating against a baseline with different run settings (dtype/shape grid/platforms/etc).",
+    )
     return p.parse_args()
 
 
@@ -115,6 +145,50 @@ def _parse_list(spec: str) -> set[str]:
     return {c.strip() for c in spec.split(",") if c.strip()}
 
 
+def _aggregate_payloads(payloads: list[tuple[dict, list[dict]]]) -> tuple[dict, list[dict]]:
+    """Aggregate multiple benchmark runs into a single (metadata, rows) payload."""
+    if not payloads:
+        raise ValueError("Expected at least one payload to aggregate.")
+
+    metas, rows_list = zip(*payloads, strict=True)
+    meta = dict(metas[0])
+    meta["repeats"] = len(payloads)
+
+    by_key: dict[str, list[dict]] = {}
+    for rows in rows_list:
+        for row in rows:
+            key = row.get("benchmark_key")
+            if key is None:
+                continue
+            by_key.setdefault(str(key), []).append(row)
+
+    out_rows: list[dict] = []
+    for key, runs in by_key.items():
+        base = dict(runs[0])
+        base["benchmark_key"] = key
+
+        errors = [r.get("error") for r in runs if r.get("error") is not None]
+        if errors:
+            base["error"] = str(errors[0])
+            out_rows.append(base)
+            continue
+
+        # If any run used dense fallback, keep that fact.
+        base["uses_dense_reference"] = any(bool(r.get("uses_dense_reference")) for r in runs)
+
+        for field in ("compile_ms", "median_ms", "p95_ms", "p99_ms", "gflops_estimate"):
+            vals = [r.get(field) for r in runs if r.get(field) is not None]
+            if len(vals) != len(runs):
+                base[field] = None
+                continue
+            base[field] = float(statistics.median(float(v) for v in vals))
+
+        out_rows.append(base)
+
+    out_rows.sort(key=lambda r: str(r.get("benchmark_key", "")))
+    return meta, out_rows
+
+
 def _maybe_write_baseline(path: Path, payload: dict, enabled: bool) -> None:
     if not enabled:
         return
@@ -127,11 +201,27 @@ def main() -> int:
     args = _parse_args()
     args.workdir.mkdir(parents=True, exist_ok=True)
 
-    cur_out = args.workdir / "qmm_llm_current.json"
-    _run_bench(cur_out, args)
+    payloads: list[tuple[dict, list[dict]]] = []
+    repeats = max(1, int(args.repeats))
+    for idx in range(repeats):
+        suffix = "" if repeats == 1 else f"_run{idx+1}"
+        cur_out = args.workdir / f"qmm_llm_current{suffix}.json"
+        _run_bench(cur_out, args)
+        payloads.append(_load_payload(cur_out))
 
-    cur_meta, cur_rows = _load_payload(cur_out)
+    window = max(0, int(args.rolling_window))
+    if window and len(payloads) > window:
+        payloads = payloads[-window:]
+
+    cur_meta, cur_rows = _aggregate_payloads(payloads)
+    cur_meta["repeats_total"] = repeats
+    cur_meta["rolling_window"] = window
     cur_by_key = _rows_by_key(cur_rows)
+
+    if args.write_new_baseline:
+        payload = {"metadata": cur_meta, "rows": cur_rows}
+        _maybe_write_baseline(args.baseline, payload, True)
+        return 0
 
     if not args.baseline.exists():
         print("[qmm_perf_gate] baseline missing: writing current results as baseline and exiting success.", flush=True)
@@ -147,6 +237,36 @@ def main() -> int:
     errors: list[tuple[str, str]] = []
     dense_fallbacks: list[str] = []
     missing: list[str] = []
+
+    # Gating is only meaningful when the baseline/current runs match. Require
+    # key run-protocol fields unless explicitly overridden.
+    if base_meta and cur_meta and not args.allow_metadata_mismatch:
+        mismatches = []
+        for field in (
+            "backend",
+            "dtype",
+            "shape_grid",
+            "m_values",
+            "axis",
+            "platforms",
+            "strict_fuse",
+            "warmup",
+            "iterations",
+            "seeds",
+            "repeats",
+            "repeats_total",
+            "rolling_window",
+        ):
+            if base_meta.get(field) != cur_meta.get(field):
+                mismatches.append(field)
+        if mismatches:
+            print(
+                "[qmm_perf_gate] FAIL: baseline/current metadata differ in: "
+                + ", ".join(mismatches)
+                + " (rerun with --write-new-baseline, or pass --allow-metadata-mismatch)",
+                flush=True,
+            )
+            return 2
 
     for key, base_row in base_by_key.items():
         plat = str(base_row.get("platform", ""))
@@ -207,22 +327,8 @@ def main() -> int:
     if ok:
         print("[qmm_perf_gate] PASS", flush=True)
 
-    if args.write_new_baseline:
-        payload = {"metadata": cur_meta, "rows": cur_rows}
-        _maybe_write_baseline(args.baseline, payload, True)
-
-    # Print a tiny metadata mismatch hint (non-fatal).
-    if base_meta and cur_meta:
-        mismatches = []
-        for field in ("backend", "device", "dtype", "shape_grid", "m_values", "axis", "platforms", "strict_fuse"):
-            if base_meta.get(field) != cur_meta.get(field):
-                mismatches.append(field)
-        if mismatches:
-            print(f"[qmm_perf_gate] NOTE: baseline/current metadata differ in: {', '.join(mismatches)}", flush=True)
-
     return 0 if ok else 2
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

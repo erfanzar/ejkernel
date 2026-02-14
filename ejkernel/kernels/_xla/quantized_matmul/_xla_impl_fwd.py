@@ -437,7 +437,9 @@ def _blocked_quantized_matmul(
             Updated accumulator with this K-tile's contribution added.
         """
         off_k = k_idx * block_k
-        x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k)).astype(compute_dtype)
+        x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k))
+        if x_pad.dtype != jnp.float32:
+            x_tile = x_tile.astype(compute_dtype)
         w_tile = decode_tile(off_k, off_n)
         acc = acc + _dot_general(x_tile, w_tile)
         return acc
@@ -493,7 +495,9 @@ def _blocked_quantized_matmul(
                     Updated accumulator.
                 """
                 off_k = idx * block_k
-                x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k)).astype(compute_dtype)
+                x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k))
+                if x_pad.dtype != jnp.float32:
+                    x_tile = x_tile.astype(compute_dtype)
                 w_tile = w_tiles[idx]
                 return carry + _dot_general(x_tile, w_tile)
 
@@ -570,10 +574,6 @@ def _operate(
         Matrix multiplication result of shape (M, N) in float32.
     """
     del gemv_mode, revsplit_k, revsplit_k_parts
-    if mode in ("affine", "nf4") and scales.dtype != jnp.float32 and not use_bf16:
-        scales = scales.astype(jnp.float32)
-        if biases is not None:
-            biases = biases.astype(jnp.float32)
 
     can_fuse = bits in (4, 8)
     can_fuse = can_fuse and block_m > 0 and block_n > 0 and block_k > 0
@@ -594,10 +594,13 @@ def _operate(
                 block_k=block_k,
                 use_bf16=use_bf16,
             )
-        except ValueError:
+        except ValueError as e:
             # Shape or tiling mismatch.
             if not allow_dense_fallback:
-                raise
+                raise ValueError(
+                    "XLA blocked quantized_matmul preconditions failed and dense dequantize+matmul fallback is "
+                    "disabled (allow_dense_fallback=False)."
+                ) from e
 
     if not allow_dense_fallback:
         raise ValueError(

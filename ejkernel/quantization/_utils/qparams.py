@@ -388,3 +388,147 @@ def resolve_prepack_axis(*, axis: str | None, transpose: bool) -> QuantizationAx
     if axis is not None:
         return normalize_axis(axis)
     return "row" if bool(transpose) else "col"
+
+
+def _ceil_div(a: int, b: int) -> int:
+    if b <= 0:
+        raise ValueError(f"ceil_div expects b > 0, got b={b}.")
+    return (int(a) + int(b) - 1) // int(b)
+
+
+def validate_packed_quantized_matmul_layout(
+    x,
+    w_q,
+    scales,
+    zeros,
+    *,
+    mode: QuantizationMode,
+    group_size: int,
+    bits: int,
+    axis: QuantizationAxis,
+    transpose: bool,
+) -> tuple[int, int]:
+    """Validate packed QMM weight/metadata layout against the canonical contract.
+
+    This is a fast, shape-only preflight intended to catch mismatched packed
+    layouts (e.g., swapping axis='row'/'col' inputs) before dispatching into
+    fused kernels where layout mismatches can silently trigger slow fallbacks.
+
+    Canonical runtime contract:
+      - axis='row' <-> transpose=False: w_q is (K, ceil(N / values_per_word)),
+        scales/zeros are (K, N // group_size).
+      - axis='col' <-> transpose=True: w_q is (N, ceil(K / values_per_word)),
+        scales/zeros are (N, K // group_size).
+
+    Returns:
+      Tuple of (K, N) inferred from inputs.
+
+    Raises:
+      ValueError: When shapes/dtypes are inconsistent with the contract.
+    """
+    axis_n = normalize_axis(axis)
+    transpose_n = bool(transpose)
+    expected_transpose = axis_n == "col"
+    if expected_transpose != transpose_n:
+        raise ValueError(
+            "Inconsistent axis/transpose combination: "
+            f"axis={axis_n!r} requires transpose={expected_transpose}, got transpose={transpose_n}."
+        )
+
+    group_size = int(group_size)
+    bits = int(bits)
+    if group_size <= 0:
+        raise ValueError(f"group_size must be > 0, got {group_size}.")
+    if bits <= 0:
+        raise ValueError(f"bits must be > 0, got {bits}.")
+    values_per_word = 32 // bits
+    if values_per_word <= 0:
+        raise ValueError(f"Invalid bits={bits}: values_per_word={values_per_word}.")
+
+    x_shape = getattr(x, "shape", None)
+    w_shape = getattr(w_q, "shape", None)
+    s_shape = getattr(scales, "shape", None)
+    if x_shape is None or w_shape is None or s_shape is None:
+        raise ValueError("validate_packed_quantized_matmul_layout expects array-like inputs with .shape.")
+
+    if len(x_shape) < 1:
+        raise ValueError(f"x must have at least 1 dimension, got x.shape={tuple(x_shape)}.")
+    if len(w_shape) != 2:
+        raise ValueError(f"w_q must be rank-2, got w_q.shape={tuple(w_shape)}.")
+    if len(s_shape) != 2:
+        raise ValueError(f"scales must be rank-2, got scales.shape={tuple(s_shape)}.")
+
+    # Dtype sanity checks catch common metadata mixups early.
+    w_dtype = getattr(w_q, "dtype", None)
+    if w_dtype is not None and str(w_dtype) != "uint32":
+        raise ValueError(f"w_q must be uint32 packed codes, got w_q.dtype={w_dtype!s}.")
+
+    s_dtype = getattr(scales, "dtype", None)
+    s_name = str(s_dtype) if s_dtype is not None else "<unknown>"
+    if mode in {"mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
+        if s_dtype is not None and str(s_dtype) != "uint8":
+            raise ValueError(f"{mode} scales must be uint8, got scales.dtype={s_name}.")
+    else:
+        if s_dtype is not None and "float" not in s_name:
+            raise ValueError(f"{mode} scales must be a floating dtype, got scales.dtype={s_name}.")
+
+    if mode == "affine":
+        if zeros is None:
+            raise ValueError("affine quantized_matmul requires zeros.")
+        z_shape = getattr(zeros, "shape", None)
+        if z_shape is None:
+            raise ValueError("zeros must be array-like when provided.")
+        if tuple(z_shape) != tuple(s_shape):
+            raise ValueError(
+                "affine zeros must have the same shape as scales. "
+                f"zeros.shape={tuple(z_shape)} scales.shape={tuple(s_shape)}."
+            )
+        z_dtype = getattr(zeros, "dtype", None)
+        z_name = str(z_dtype) if z_dtype is not None else "<unknown>"
+        if z_dtype is not None and "float" not in z_name:
+            raise ValueError(f"affine zeros must be a floating dtype, got zeros.dtype={z_name}.")
+    else:
+        if zeros is not None:
+            raise ValueError(f"zeros must be None for non-affine mode={mode!r}.")
+
+    K = int(x_shape[-1])
+    if axis_n == "row":
+        if int(w_shape[0]) != K:
+            raise ValueError(
+                "Packed layout mismatch for axis='row': expected w_q.shape[0] == K. "
+                f"x.shape={tuple(x_shape)} w_q.shape={tuple(w_shape)} scales.shape={tuple(s_shape)}."
+            )
+        if int(s_shape[0]) != K:
+            raise ValueError(
+                "Packed layout mismatch for axis='row': expected scales.shape[0] == K. "
+                f"x.shape={tuple(x_shape)} w_q.shape={tuple(w_shape)} scales.shape={tuple(s_shape)}."
+            )
+        N = int(s_shape[1]) * group_size
+        exp_words = _ceil_div(N, values_per_word)
+        if int(w_shape[1]) != exp_words:
+            raise ValueError(
+                "Packed layout mismatch for axis='row': expected w_q.shape[1] == ceil(N/values_per_word). "
+                f"got w_q.shape[1]={int(w_shape[1])}, expected={exp_words}, "
+                f"N={N}, values_per_word={values_per_word}."
+            )
+        return K, N
+
+    # axis == "col"
+    if int(s_shape[1]) * group_size != K:
+        raise ValueError(
+            "Packed layout mismatch for axis='col': expected scales.shape[1] * group_size == K. "
+            f"scales.shape={tuple(s_shape)} group_size={group_size} x.shape={tuple(x_shape)}."
+        )
+    exp_words = _ceil_div(K, values_per_word)
+    if int(w_shape[1]) != exp_words:
+        raise ValueError(
+            "Packed layout mismatch for axis='col': expected w_q.shape[1] == ceil(K/values_per_word). "
+            f"got w_q.shape[1]={int(w_shape[1])}, expected={exp_words}, "
+            f"K={K}, values_per_word={values_per_word}."
+        )
+    if int(w_shape[0]) != int(s_shape[0]):
+        raise ValueError(
+            "Packed layout mismatch for axis='col': expected w_q.shape[0] == scales.shape[0] (N). "
+            f"w_q.shape={tuple(w_shape)} scales.shape={tuple(s_shape)}."
+        )
+    return K, int(w_shape[0])

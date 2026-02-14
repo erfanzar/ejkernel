@@ -17,8 +17,18 @@ from pathlib import Path
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline-quant", type=Path, required=True)
-    parser.add_argument("--baseline-dequant", type=Path, required=True)
+    parser.add_argument(
+        "--baseline-quant",
+        type=Path,
+        default=Path("benchmarks/baselines/quantize_gpu.json"),
+        help="Quantize baseline JSON path (default: benchmarks/baselines/quantize_gpu.json).",
+    )
+    parser.add_argument(
+        "--baseline-dequant",
+        type=Path,
+        default=Path("benchmarks/baselines/dequantize_gpu.json"),
+        help="Dequantize baseline JSON path (default: benchmarks/baselines/dequantize_gpu.json).",
+    )
     parser.add_argument("--workdir", type=Path, default=Path("benchmark_outputs"))
     parser.add_argument("--warmup", type=int, default=12)
     parser.add_argument("--iterations", type=int, default=60)
@@ -163,6 +173,11 @@ def main() -> int:
     quant_baseline = _to_median_map(_load_rows(args.baseline_quant)) if args.baseline_quant.exists() else {}
     dequant_baseline = _to_median_map(_load_rows(args.baseline_dequant)) if args.baseline_dequant.exists() else {}
 
+    if args.write_new_baseline:
+        _maybe_write_baseline(args.baseline_quant, quant_rows, True)
+        _maybe_write_baseline(args.baseline_dequant, dequant_rows, True)
+        return 0
+
     if not quant_baseline or not dequant_baseline:
         print("[quant_perf_gate] baseline missing: writing current results as baseline and exiting success.")
         _maybe_write_baseline(args.baseline_quant, quant_rows, True)
@@ -182,8 +197,6 @@ def main() -> int:
         label="dequantize",
     )
 
-    _maybe_write_baseline(args.baseline_quant, quant_rows, args.write_new_baseline)
-    _maybe_write_baseline(args.baseline_dequant, dequant_rows, args.write_new_baseline)
     return 0 if (q_ok and dq_ok) else 2
 
 

@@ -87,6 +87,7 @@ from ejkernel.quantization._utils.qparams import (
     resolve_qparams,
     resolve_runtime_axis_and_transpose,
     select_qmm_kernel_family,
+    validate_packed_quantized_matmul_layout,
 )
 
 from ..base import detect_platform
@@ -278,19 +279,23 @@ def _infer_mkn(inv: Invocation[QuantizedMatmulConfig, Array], group_size: int) -
 def _prefer_bf16(x: Array) -> bool:
     """Determine whether to prefer bfloat16 accumulation for the given input.
 
-    Returns True unless the input is explicitly float16, in which case
-    float16 accumulation may be preferred for consistency.
+    Returns True only when the activation dtype is already bfloat16.
+
+    On GPU, float16 is the typical fast-path compute type for quantized matmul
+    and matches the default quant/dequant runtime config. Using bfloat16
+    for float32 activations can introduce extra rounding error vs the reference
+    dequantize+matmul path.
 
     Args:
         x: Input array to check dtype of.
 
     Returns:
-        True if bfloat16 is preferred, False if float16 is detected.
+        True if bfloat16 is preferred, False otherwise.
     """
     dt = getattr(x, "dtype", None)
     if dt is None:
         return True
-    return dt != jnp.float16
+    return dt == jnp.bfloat16
 
 
 def _pick_split_k(m: int, k: int, block_k: int) -> int:
@@ -862,6 +867,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         gemv_mode: GemvMode = "auto",
         revsplit_k: RevSplitKMode = "auto",
         revsplit_k_parts: int | None = None,
+        allow_dense_fallback: bool = True,
         _resolved_platform: str | None = None,
         platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
         *,
@@ -941,6 +947,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
             gemv_mode=gemv_mode,
             revsplit_k=revsplit_k,
             revsplit_k_parts=revsplit_k_parts,
+            allow_dense_fallback=allow_dense_fallback,
             block_m=cfg.block_m,
             block_n=cfg.block_n,
             block_k=cfg.block_k,
@@ -1139,7 +1146,16 @@ def _quantized_matmul_impl(
     if bits is not None:
         bits = _static_int(bits, "bits")
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
-    axis, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    if axis is None:
+        raise ValueError("_quantized_matmul_impl expects axis to be resolved (pass axis='row' or axis='col').")
+    if axis not in {"row", "col"}:
+        raise ValueError(f"_quantized_matmul_impl expected axis in {{'row','col'}}, got {axis!r}.")
+    expected_transpose = axis == "col"
+    if expected_transpose != bool(transpose):
+        raise ValueError(
+            "_quantized_matmul_impl received inconsistent axis/transpose: "
+            f"axis={axis!r} requires transpose={expected_transpose}, got transpose={bool(transpose)}."
+        )
     gemv_mode = normalize_gemv_mode(gemv_mode)
     revsplit_k = normalize_revsplitk_mode(revsplit_k)
     revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
@@ -1292,7 +1308,7 @@ def quantized_matmul(
     Returns:
         Matrix multiplication result of shape (M, N).
     """
-    mode_n, _, bits_n, _ = resolve_qparams(mode, group_size, bits)
+    mode_n, group_size_n, bits_n, _ = resolve_qparams(mode, group_size, bits)
 
     if strict_fuse is None:
         env = os.getenv("EJKERNEL_QMM_STRICT_FUSED", "").strip().lower()
@@ -1324,6 +1340,17 @@ def quantized_matmul(
         )
         fuse = False
     runtime_axis, runtime_transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    validate_packed_quantized_matmul_layout(
+        x,
+        w,
+        scales,
+        zeros,
+        mode=mode_n,
+        group_size=group_size_n,
+        bits=bits_n,
+        axis=runtime_axis,
+        transpose=runtime_transpose,
+    )
 
     def _inner(xi, wi, si, zi):
         """Dispatch to _quantized_matmul_impl with captured quantization parameters."""

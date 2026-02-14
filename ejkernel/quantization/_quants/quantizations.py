@@ -55,6 +55,7 @@ from .._utils.grouping import _quantize_to_codebook, _reshape_groups
 from .._utils.qparams import (
     QuantizationAxis,
     QuantizationMode,
+    validate_packed_quantized_matmul_layout,
     normalize_axis,
     resolve_prepack_axis,
     resolve_qparams,
@@ -1064,18 +1065,29 @@ def quantized_matmul(
         Matrix multiplication result with shape ``(..., N)`` where N is the
         output dimension of the weight matrix.
     """
-    if axis is not None:
-        _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    mode_n, group_size_n, bits_n, _ = resolve_qparams(mode, group_size, bits)
+    runtime_axis, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    validate_packed_quantized_matmul_layout(
+        x,
+        w,
+        scales,
+        zeros,
+        mode=mode_n,
+        group_size=group_size_n,
+        bits=bits_n,
+        axis=runtime_axis,
+        transpose=transpose,
+    )
 
     # Runtime layout determines dequant axis convention.
-    dequant_axis: QuantizationAxis = "col" if transpose else "row"
+    dequant_axis: QuantizationAxis = runtime_axis
     w_f = dequantize(
         w,
         scales,
         zeros,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
+        group_size=group_size_n,
+        bits=bits_n,
+        mode=mode_n,
         axis=dequant_axis,
     )
     rhs = w_f.T if transpose else w_f
