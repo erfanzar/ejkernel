@@ -486,6 +486,7 @@ def quantized_matmul(
     revsplit_k_parts: int | None = None,
     *,
     tpu_path: str | None = None,
+    allow_dense_fallback: bool = True,
     block_m: int = 128,
     block_n: int = 128,
     block_k: int = 64,
@@ -541,6 +542,7 @@ def quantized_matmul(
     """
     del num_warps, num_stages, split_k
     del use_bf16
+    del allow_dense_fallback
 
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
     _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)

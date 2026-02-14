@@ -258,6 +258,19 @@ def test_bitpack_alignment_and_padding_behavior(bits: int, values_per_word: int,
         _pack_bits(values, bits, prefer_fast_u4_u8=True, strict_shape_alignment=True)
 
 
+def test_quantized_array_is_jittable_pytree():
+    key_x, key_w = jax.random.split(jax.random.PRNGKey(2026), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float16)
+    w = jax.random.normal(key_w, (128, 64), dtype=jnp.float16)
+
+    wq = prepack_quantized_array(w, mode="affine", bits=4, group_size=64, transpose=True)
+
+    fn = jax.jit(lambda xi, wi: wi.matmul(xi, fuse=False))
+    y = fn(x, wq)
+    assert y.shape == (8, 128)
+    assert bool(jnp.all(jnp.isfinite(y)))
+
+
 def test_quantized_array_roundtrip_and_constructor_validation():
     key = jax.random.PRNGKey(7)
     w = jax.random.normal(key, (64, 128), dtype=jnp.float32)

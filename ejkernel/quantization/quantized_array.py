@@ -34,6 +34,7 @@ from ._utils.qparams import (
 from .runtime import QuantRuntimeConfig
 
 
+@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class QuantizedArray:
     """Packed quantized tensor with all metadata required for runtime use."""
@@ -46,6 +47,26 @@ class QuantizedArray:
     bits: int
     axis: QuantizationAxis
     runtime_config: QuantRuntimeConfig | None = None
+
+    def tree_flatten(self):
+        children = (self.data, self.scales, self.zeros)
+        aux = (self.mode, int(self.group_size), int(self.bits), self.axis, self.runtime_config)
+        return children, aux
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        mode, group_size, bits, axis, runtime_config = aux
+        data, scales, zeros = children
+        return cls(
+            data=data,
+            scales=scales,
+            zeros=zeros,
+            mode=mode,
+            group_size=int(group_size),
+            bits=int(bits),
+            axis=axis,
+            runtime_config=runtime_config,
+        )
 
     @staticmethod
     def _shape_or_none(x: jax.Array | None) -> tuple[int, ...] | None:
@@ -212,6 +233,7 @@ class QuantizedArray:
         x: jax.Array,
         *,
         fuse: bool = True,
+        strict_fuse: bool | None = None,
         transpose: bool | None = None,
         axis: QuantizationAxis | None = None,
         platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
@@ -234,6 +256,7 @@ class QuantizedArray:
                 axis=axis_n,
                 platform=platform,
                 fuse=True,
+                strict_fuse=strict_fuse,
             )
 
         return dense_quantized_matmul(

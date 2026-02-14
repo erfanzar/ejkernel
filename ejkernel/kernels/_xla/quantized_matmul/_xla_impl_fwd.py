@@ -518,6 +518,7 @@ def _blocked_quantized_matmul(
         "block_n",
         "block_k",
         "use_bf16",
+        "allow_dense_fallback",
         "gemv_mode",
         "revsplit_k",
         "revsplit_k_parts",
@@ -536,6 +537,7 @@ def _operate(
     block_n,
     block_k,
     use_bf16,
+    allow_dense_fallback,
     gemv_mode,
     revsplit_k,
     revsplit_k_parts,
@@ -561,6 +563,8 @@ def _operate(
         block_n: Tile size for N dimension.
         block_k: Tile size for K dimension.
         use_bf16: Whether to use BF16 for intermediate computations.
+        allow_dense_fallback: If False, disallow the dequantize+matmul fallback
+            path when the blocked fused path is illegal, and raise instead.
 
     Returns:
         Matrix multiplication result of shape (M, N) in float32.
@@ -591,8 +595,15 @@ def _operate(
                 use_bf16=use_bf16,
             )
         except ValueError:
-            # Shape or tiling mismatch, fall back to dequantize+matmul.
-            pass
+            # Shape or tiling mismatch.
+            if not allow_dense_fallback:
+                raise
+
+    if not allow_dense_fallback:
+        raise ValueError(
+            "XLA blocked quantized_matmul requires a legal blocked configuration; "
+            "dense dequantize+matmul fallback is disabled (allow_dense_fallback=False)."
+        )
 
     zeros = None
     if mode == "affine":
@@ -622,6 +633,7 @@ def quantized_matmul(
     block_n: int = 128,
     block_k: int = 64,
     use_bf16: bool = True,
+    allow_dense_fallback: bool = True,
     num_warps: int | None = None,
     num_stages: int | None = None,
     split_k: int | None = None,
@@ -722,6 +734,7 @@ def quantized_matmul(
         block_n=block_n,
         block_k=block_k,
         use_bf16=use_bf16,
+        allow_dense_fallback=bool(allow_dense_fallback),
         gemv_mode=gemv_mode,
         revsplit_k=revsplit_k,
         revsplit_k_parts=revsplit_k_parts,

@@ -1096,6 +1096,7 @@ def _quantized_matmul_impl(
     gemv_mode: GemvMode = "auto",
     revsplit_k: RevSplitKMode = "auto",
     revsplit_k_parts: int | None = None,
+    allow_dense_fallback: bool = True,
     platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
@@ -1119,6 +1120,9 @@ def _quantized_matmul_impl(
         gemv_mode: GEMV kernel selection mode ("auto", "on", "off").
         revsplit_k: Reverse split-K mode ("auto", "on", "off").
         revsplit_k_parts: Number of parts for reverse split-K.
+        allow_dense_fallback: When dispatching to XLA, controls whether the
+            XLA implementation may fall back to dequantize+matmul when blocked
+            fusion preconditions are not met.
         platform: Platform override.
         cfg: Optional configuration override.
 
@@ -1139,6 +1143,7 @@ def _quantized_matmul_impl(
     gemv_mode = normalize_gemv_mode(gemv_mode)
     revsplit_k = normalize_revsplitk_mode(revsplit_k)
     revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
+    allow_dense_fallback = _static_bool(allow_dense_fallback, "allow_dense_fallback")
 
     if int(x.shape[0]) == 1 and mode in {"mxfp4", "mxfp8"} and gemv_mode == "on":
         warnings.warn(
@@ -1181,6 +1186,9 @@ def _quantized_matmul_impl(
         prefer_triton=prefer_triton,
     )
     dispatch_platform = resolved.value
+    extra_kwargs = {}
+    if resolved == Platform.XLA:
+        extra_kwargs["allow_dense_fallback"] = allow_dense_fallback
 
     if resolved in (Platform.TRITON, Platform.CUDA, Platform.CUTE):
         with policy_override(
@@ -1205,6 +1213,7 @@ def _quantized_matmul_impl(
                 _resolved_platform=resolved.value,
                 platform=dispatch_platform,
                 _cfg=cfg,
+                **extra_kwargs,
             )
 
     return _quantized_matmul_executor(
@@ -1224,6 +1233,7 @@ def _quantized_matmul_impl(
         _resolved_platform=resolved.value,
         platform=dispatch_platform,
         _cfg=cfg,
+        **extra_kwargs,
     )
 
 
@@ -1243,6 +1253,7 @@ def quantized_matmul(
     revsplit_k: RevSplitKMode = "auto",
     revsplit_k_parts: int | None = None,
     fuse: bool = True,
+    strict_fuse: bool | None = None,
     platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
@@ -1272,6 +1283,9 @@ def quantized_matmul(
         revsplit_k_parts: Number of parts for reverse split-K.
         fuse: If True, run platform fused quantized kernels. If False, force
             reference path (dequantize then matmul) using XLA/JAX ops.
+        strict_fuse: If True, disallow dense dequantize+matmul fallbacks inside
+            fused implementations (notably the XLA backend). When None, reads
+            environment variable ``EJKERNEL_QMM_STRICT_FUSED``.
         platform: Platform override (triton/pallas/cuda/cute/xla/auto).
         cfg: Optional configuration override.
 
@@ -1280,17 +1294,31 @@ def quantized_matmul(
     """
     mode_n, _, bits_n, _ = resolve_qparams(mode, group_size, bits)
 
+    if strict_fuse is None:
+        env = os.getenv("EJKERNEL_QMM_STRICT_FUSED", "").strip().lower()
+        strict_fuse = env in {"1", "true", "on", "yes"}
+    strict_fuse_n = _static_bool(strict_fuse, "strict_fuse")
+
     fuse = _static_bool(fuse, "fuse")
+    if strict_fuse_n and not fuse:
+        raise ValueError("strict_fuse=True requires fuse=True.")
+
     if fuse and mode_n == "affine" and bits_n not in (4, 8):
+        msg = "fuse=True with affine bits not in {4,8} is unsupported."
+        if strict_fuse_n:
+            raise ValueError(msg)
         warnings.warn(
-            "fuse=True with affine bits not in {4,8} falls back to reference dequantize+matmul path.",
+            f"{msg} Falling back to reference dequantize+matmul path.",
             RuntimeWarning,
             stacklevel=2,
         )
         fuse = False
     if fuse and jax.default_backend() == "mps":
+        msg = "fuse=True on MPS currently falls back to reference dequantize+matmul for stability."
+        if strict_fuse_n:
+            raise ValueError(msg)
         warnings.warn(
-            "fuse=True on MPS currently falls back to reference dequantize+matmul for stability.",
+            msg,
             RuntimeWarning,
             stacklevel=2,
         )
@@ -1327,6 +1355,7 @@ def quantized_matmul(
             gemv_mode=gemv_mode,
             revsplit_k=revsplit_k,
             revsplit_k_parts=revsplit_k_parts,
+            allow_dense_fallback=not strict_fuse_n,
             platform=platform,
             cfg=cfg,
         )
