@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +63,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-configs", type=int, default=0)
     parser.add_argument("--hard-regression-threshold", type=float, default=0.02)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="Repeat the full microbench suite N times and aggregate medians for more stable gating (default: 3).",
+    )
+    parser.add_argument(
+        "--rolling-window",
+        type=int,
+        default=3,
+        help="If > 0, aggregate only the last N repeats (default: 3).",
+    )
     parser.add_argument("--write-new-baseline", action="store_true")
     return parser.parse_args()
 
@@ -104,6 +117,41 @@ def _load_rows(path: Path) -> list[dict]:
     if not isinstance(payload, list):
         raise ValueError(f"{path} must contain a list of benchmark rows.")
     return [row for row in payload if isinstance(row, dict)]
+
+
+def _aggregate_rows(runs: list[list[dict]]) -> list[dict]:
+    if not runs:
+        raise ValueError("Expected at least one run to aggregate.")
+
+    by_key: dict[str, list[dict]] = {}
+    for rows in runs:
+        for row in rows:
+            key = row.get("benchmark_key")
+            if key is None:
+                continue
+            by_key.setdefault(str(key), []).append(row)
+
+    out_rows: list[dict] = []
+    for key, rs in by_key.items():
+        base = dict(rs[0])
+        base["benchmark_key"] = key
+        base["repeats"] = len(rs)
+
+        for field in ("compile_ms", "median_ms", "p95_ms", "p99_ms", "throughput_elems_per_s"):
+            vals = [r.get(field) for r in rs if r.get(field) is not None]
+            if len(vals) != len(rs):
+                base[field] = None
+                continue
+            base[field] = float(statistics.median(float(v) for v in vals))
+
+        # This is only meaningful when running the microbench scripts directly
+        # with a baseline. For aggregated gate artifacts, keep it unset.
+        base["relative_delta_vs_baseline"] = None
+
+        out_rows.append(base)
+
+    out_rows.sort(key=lambda r: str(r.get("benchmark_key", "")))
+    return out_rows
 
 
 def _to_median_map(rows: list[dict]) -> dict[str, float]:
@@ -159,14 +207,28 @@ def main() -> int:
     args = _parse_args()
     args.workdir.mkdir(parents=True, exist_ok=True)
 
-    quant_out = args.workdir / "quantize_current.json"
-    dequant_out = args.workdir / "dequantize_current.json"
+    repeats = max(1, int(args.repeats))
+    window = max(0, int(args.rolling_window))
 
-    _run_bench("benchmark_quantize.py", quant_out, args)
-    _run_bench("benchmark_dequantize.py", dequant_out, args)
+    quant_runs: list[list[dict]] = []
+    dequant_runs: list[list[dict]] = []
+    for idx in range(repeats):
+        suffix = "" if repeats == 1 else f"_run{idx+1}"
+        quant_out = args.workdir / f"quantize_current{suffix}.json"
+        dequant_out = args.workdir / f"dequantize_current{suffix}.json"
 
-    quant_rows = _load_rows(quant_out)
-    dequant_rows = _load_rows(dequant_out)
+        _run_bench("benchmark_quantize.py", quant_out, args)
+        _run_bench("benchmark_dequantize.py", dequant_out, args)
+
+        quant_runs.append(_load_rows(quant_out))
+        dequant_runs.append(_load_rows(dequant_out))
+
+    if window and repeats > window:
+        quant_runs = quant_runs[-window:]
+        dequant_runs = dequant_runs[-window:]
+
+    quant_rows = _aggregate_rows(quant_runs)
+    dequant_rows = _aggregate_rows(dequant_runs)
 
     quant_current = _to_median_map(quant_rows)
     dequant_current = _to_median_map(dequant_rows)
