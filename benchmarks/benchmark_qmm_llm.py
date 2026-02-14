@@ -40,7 +40,7 @@ from ejkernel.quantization import QuantRuntimeConfig, prepack_quantized_weights
 qmm_op = importlib.import_module("ejkernel.modules.operations.quantized_matmul")
 
 Axis = Literal["row", "col"]
-PlatformName = Literal["auto", "cuda", "cute", "triton", "xla"]
+PlatformName = Literal["auto", "cuda", "cute", "triton", "xla", "pallas"]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -49,6 +49,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--iterations", type=int, default=30)
     p.add_argument("--seeds", type=str, default="0")
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
+    p.add_argument(
+        "--strict-fuse",
+        action="store_true",
+        help="Disallow internal dense dequantize+matmul fallbacks inside fused implementations (e.g. XLA).",
+    )
     p.add_argument("--axis", type=str, default="row", choices=["row", "col", "both"])
     p.add_argument(
         "--shape-grid",
@@ -67,7 +72,7 @@ def _parse_args() -> argparse.Namespace:
         "--platforms",
         type=str,
         default="auto,cuda,cute,triton,xla",
-        help="Comma-separated platforms to benchmark: auto,cuda,cute,triton,xla.",
+        help="Comma-separated platforms to benchmark: auto,cuda,cute,triton,xla,pallas.",
     )
     p.add_argument(
         "--modes",
@@ -189,6 +194,8 @@ def _path_tag(
         return prefix + ("cuda_custom_call_transpose" if transpose else "cuda_custom_call")
     if plat == "cute":
         return prefix + "cute_dsl"
+    if plat == "pallas":
+        return prefix + "pallas"
     return prefix + f"{plat}"
 
 
@@ -326,6 +333,7 @@ def _bench_one(
     w_q: jax.Array,
     scales: jax.Array,
     zeros: jax.Array | None,
+    strict_fuse: bool,
     warmup: int,
     iters: int,
 ) -> dict[str, Any]:
@@ -356,6 +364,7 @@ def _bench_one(
             transpose=transpose,
             platform=plat,
             fuse=True,
+            strict_fuse=bool(strict_fuse),
         )
     )
 
@@ -414,6 +423,7 @@ def _bench_one(
             "p99_ms": p99_ms,
             "gflops_estimate": gflops,
             "uses_dense_reference": "xla_dequant_matmul" in tag,
+            "strict_fuse": bool(strict_fuse),
             "error": None,
         }
     except Exception as e:
@@ -448,6 +458,7 @@ def _bench_one(
             "p99_ms": None,
             "gflops_estimate": None,
             "uses_dense_reference": "xla_dequant_matmul" in tag,
+            "strict_fuse": bool(strict_fuse),
             "error": f"{type(e).__name__}: {e}",
         }
 
@@ -472,10 +483,11 @@ def main() -> int:
     args = _parse_args()
     dtype = _dtype_from_name(args.dtype)
     runtime_cfg = QuantRuntimeConfig.fastest_for_backend()
+    strict_fuse = bool(args.strict_fuse)
     platforms_raw = _parse_str_list(args.platforms)
     platforms: list[PlatformName] = []
     for plat in platforms_raw:
-        if plat not in ("auto", "cuda", "cute", "triton", "xla"):
+        if plat not in ("auto", "cuda", "cute", "triton", "xla", "pallas"):
             raise ValueError(f"Unsupported platform {plat!r}.")
         platforms.append(plat)  # type: ignore[arg-type]
 
@@ -544,6 +556,7 @@ def main() -> int:
                 w_q=w_q,
                 scales=scales,
                 zeros=zeros,
+                strict_fuse=strict_fuse,
                 warmup=int(args.warmup),
                 iters=int(args.iterations),
             )
@@ -581,6 +594,7 @@ def main() -> int:
             "m_values": args.m_values,
             "axis": args.axis,
             "platforms": ",".join(platforms),
+            "strict_fuse": bool(strict_fuse),
             "env": {
                 "EJKERNEL_QMM_TWO_STAGE": os.getenv("EJKERNEL_QMM_TWO_STAGE", None),
                 "EJKERNEL_QMM_DEQUANT_CACHE": os.getenv("EJKERNEL_QMM_DEQUANT_CACHE", None),
