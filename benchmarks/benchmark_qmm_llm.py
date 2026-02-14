@@ -186,7 +186,7 @@ def _path_tag(
     if plat == "triton":
         return prefix + ("triton_two_stage" if _triton_two_stage_path(m=m, n=n, k=k) else "triton_fused")
     if plat == "cuda":
-        return prefix + ("cuda_custom_call" if not transpose else "cuda_fallback_expected")
+        return prefix + ("cuda_custom_call_transpose" if transpose else "cuda_custom_call")
     if plat == "cute":
         return prefix + "cute_dsl"
     return prefix + f"{plat}"
@@ -285,6 +285,31 @@ def _build_cfgs(args: argparse.Namespace) -> list[_Cfg]:
                                         seed=seed,
                                     )
                                 )
+                        continue
+                    if mode_l in {"mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
+                        # Explicit MX/NV modes have fixed (bits, group_size).
+                        if mode_l in {"mxfp4", "mxfp8"}:
+                            bits = 4 if mode_l == "mxfp4" else 8
+                            group_size = 32
+                        else:
+                            bits = 4 if mode_l == "nvfp4" else 8
+                            group_size = 16
+                        group_dim = n if axis == "row" else k
+                        if group_dim % int(group_size) != 0:
+                            continue
+                        for seed in seeds:
+                            cfgs.append(
+                                _Cfg(
+                                    m=m,
+                                    n=n,
+                                    k=k,
+                                    mode=mode_l,
+                                    bits=int(bits),
+                                    group_size=int(group_size),
+                                    axis=axis,
+                                    seed=seed,
+                                )
+                            )
                         continue
                     # Other modes can be added later; keep this benchmark focused.
     if args.max_configs and args.max_configs > 0:
@@ -440,8 +465,6 @@ def _effective_platform(*, platform: PlatformName, axis: Axis) -> str:
     else:
         resolved = Platform(platform)
 
-    if resolved == Platform.CUDA and axis == "col":
-        resolved = qmm_op._fallback_platform_for_cuda_transpose()
     return resolved.value
 
 

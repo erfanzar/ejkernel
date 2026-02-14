@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 import os
+from functools import lru_cache
 from typing import Literal
 
 import jax
@@ -724,16 +725,105 @@ def _parse_output_dtype(value: str):
     return None
 
 
+@lru_cache(maxsize=1)
+def _cuda_max_shared_mem_per_block_bytes() -> int | None:
+    """Best-effort query of CUDA's max shared memory per block (opt-in limit).
+
+    JAX's Triton runtime will attempt to launch autotune candidates as-is; when
+    a config requires more shared memory than the device allows by default,
+    JAX logs messages like "Unable to launch autotune config on device".
+
+    Prefer querying `cudaDevAttrMaxSharedMemoryPerBlockOptin` (attribute 97) so
+    we do not over-prune on GPUs where the Triton launcher opts-in to the larger
+    shared-memory limit. Fall back to `cudaDevAttrMaxSharedMemoryPerBlock`
+    (attribute 8) when the opt-in attribute isn't available.
+    """
+    try:
+        import ctypes
+    except Exception:
+        return None
+
+    lib = None
+    for name in ("libcudart.so", "libcudart.so.12", "libcudart.so.11.0"):
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        return None
+
+    cudaGetDevice = getattr(lib, "cudaGetDevice", None)
+    cudaDeviceGetAttribute = getattr(lib, "cudaDeviceGetAttribute", None)
+    if cudaGetDevice is None or cudaDeviceGetAttribute is None:
+        return None
+
+    cudaGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    cudaGetDevice.restype = ctypes.c_int
+    cudaDeviceGetAttribute.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    cudaDeviceGetAttribute.restype = ctypes.c_int
+
+    dev = ctypes.c_int()
+    if int(cudaGetDevice(ctypes.byref(dev))) != 0:
+        return None
+
+    def _get_attr(attr_id: int) -> int | None:
+        val = ctypes.c_int()
+        if int(cudaDeviceGetAttribute(ctypes.byref(val), attr_id, int(dev.value))) != 0:
+            return None
+        out = int(val.value)
+        return out if out > 0 else None
+
+    cudaDevAttrMaxSharedMemoryPerBlockOptin = 97
+    cudaDevAttrMaxSharedMemoryPerBlock = 8
+    return _get_attr(cudaDevAttrMaxSharedMemoryPerBlockOptin) or _get_attr(cudaDevAttrMaxSharedMemoryPerBlock)
+
+
+@lru_cache(maxsize=1)
+def _qmm_smem_limit_bytes() -> int:
+    """Return an estimate of usable shared memory per CTA for QMM kernels."""
+    # Conservative default for non-CUDA environments.
+    default = 96 * 1024
+    try:
+        backend = jax.default_backend()
+    except Exception:
+        backend = "cpu"
+    if backend not in ("gpu", "cuda"):
+        return default
+
+    # Prefer the device-reported per-block limit (opt-in when available).
+    limit = _cuda_max_shared_mem_per_block_bytes()
+    if limit is None:
+        return default
+
+    # Keep the historical 96KB cap for compile time bounds, but honor smaller
+    # device limits to avoid invalid configs (and warnings) during autotune.
+    return min(default, int(limit))
+
+
+def _qmm_estimated_smem_bytes(*, bm: int, bn: int, bk: int, num_stages: int) -> int:
+    # Two tiles (A: BMxBK, B: BKxBN) with 16-bit elements, pipelined by num_stages.
+    return int((bm * bk + bk * bn) * 2 * num_stages)
+
+
 def _qmm_autotune_configs(mode: str, *, bits: int | None = None) -> list[triton.Config]:
     """Generate autotune configurations for quantized matmul kernels.
 
     Produces a curated set of Triton configurations tuned per mode, while
     keeping compile time bounded. Configurations that exceed the shared
-    memory limit (96 KB) are filtered out.
+    memory limit are filtered out.
     """
     mode = mode.lower()
     configs: list[triton.Config] = []
-    smem_limit = 96 * 1024
+    smem_limit = _qmm_smem_limit_bytes()
+    # Minifloat decode modes tend to be more register/smem heavy; keep the
+    # search space limited to configs that reliably launch on common GPUs.
+    if mode in {"mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
+        smem_limit = min(smem_limit, 64 * 1024)
 
     if mode == "nf4":
         bm_choices = (32, 64, 128)
@@ -773,7 +863,12 @@ def _qmm_autotune_configs(mode: str, *, bits: int | None = None) -> list[triton.
                     stages_choices = (1, 2, 3, 4)
 
                 for num_stages in stages_choices:
-                    smem = (bm * bk + bk * bn) * 2 * num_stages
+                    # Empirically, some nf4 configs (notably BN=256, BK=64 with
+                    # pipelining) can fail to launch on common NVIDIA GPUs,
+                    # spamming "Unable to launch autotune config" warnings.
+                    if mode == "nf4" and bn >= 256 and bk == 64 and num_stages > 1:
+                        continue
+                    smem = _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages)
                     if smem > smem_limit:
                         continue
 
@@ -797,7 +892,7 @@ def _qmm_autotune_configs(mode: str, *, bits: int | None = None) -> list[triton.
                             )
 
     for bm, bn, bk, num_warps, num_stages, split_k in extra:
-        smem = (bm * bk + bk * bn) * 2 * num_stages
+        smem = _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages)
         if smem > smem_limit:
             continue
         configs.append(
@@ -815,7 +910,9 @@ def _qmm_autotune_configs_large(mode: str, *, bits: int | None = None) -> list[t
     """Generate a compact config set specialized for large square-ish shapes."""
     mode = mode.lower()
     configs: list[triton.Config] = []
-    smem_limit = 96 * 1024
+    smem_limit = _qmm_smem_limit_bytes()
+    if mode in {"mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
+        smem_limit = min(smem_limit, 64 * 1024)
 
     if mode == "nf4":
         bm_choices = (128, 256)
@@ -830,14 +927,18 @@ def _qmm_autotune_configs_large(mode: str, *, bits: int | None = None) -> list[t
 
     split_ks = (1, 2)
     num_warps_choices = (4, 8)
-    num_stages_choices = (2, 3, 4)
+    # Include stage=1 for nf4 so BN=256 cells have a valid candidate without
+    # tripping launch constraints on some GPUs.
+    num_stages_choices = (1, 2, 3) if mode == "nf4" else (2, 3, 4)
 
     for bm in bm_choices:
         for bn in bn_choices:
             for bk in bk_choices:
                 for num_warps in num_warps_choices:
                     for num_stages in num_stages_choices:
-                        smem = (bm * bk + bk * bn) * 2 * num_stages
+                        if mode == "nf4" and bn >= 256 and bk == 64 and num_stages > 1:
+                            continue
+                        smem = _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages)
                         if smem > smem_limit:
                             continue
                         for split_k in split_ks:
@@ -880,6 +981,7 @@ def _qmm_config_pruner(configs, nargs, **_kwargs):
     k = int(nargs["K"])
     group_size = int(nargs.get("GROUP_SIZE", 0))
     requested_split_k = int(nargs.get("SPLIT_K", 1))
+    smem_limit = _qmm_smem_limit_bytes()
 
     def _nearest_choices(value: int, choices: tuple[int, ...], count: int) -> set[int]:
         ranked = sorted(choices, key=lambda x: abs(x - value))
@@ -901,6 +1003,11 @@ def _qmm_config_pruner(configs, nargs, **_kwargs):
         bn = cfg.kwargs["BN"]
         bk = cfg.kwargs["BK"]
         split_k = cfg.kwargs["SPLIT_K"]
+        num_stages = int(getattr(cfg, "num_stages", 1))
+
+        # Avoid configs that will never launch due to shared memory limits.
+        if _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages) > smem_limit:
+            continue
 
         if bm not in bm_keep or bn not in bn_keep or bk not in bk_keep:
             continue

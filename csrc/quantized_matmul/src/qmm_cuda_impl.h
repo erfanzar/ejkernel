@@ -546,6 +546,36 @@ __global__ void DequantToBf16Kernel(const uint32_t *wq, const ScaleT *scales,
   }
 }
 
+template <typename ScaleT, typename BiasT>
+__global__ void DequantToHalfKernel(const uint32_t *wq, const ScaleT *scales,
+                                    const BiasT *biases, half *out, int64_t K,
+                                    int64_t N, int64_t n_words, int64_t n_groups,
+                                    int64_t group_size, int bits, int64_t mode,
+                                    int64_t transpose) {
+  int64_t total = K * N;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+  bool transposed = transpose != 0;
+
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t k = idx / N;
+    int64_t n = idx - k * N;
+    const uint32_t *wq_row =
+        transposed ? (wq + n * n_words) : (wq + k * n_words);
+    uint32_t q = LoadPackedQ(wq_row, transposed ? k : n, bits);
+    int64_t g = transposed ? (k / group_size) : (n / group_size);
+    float val =
+        DequantValue(q, scales, biases, n, k, g, n_groups, transposed, mode);
+    out[idx] = __float2half_rn(val);
+  }
+}
+
 template <typename XType, typename ScaleT, typename BiasT, typename OutT>
 __global__ void QmmFusedKernel(const XType *x, const uint32_t *wq,
                                const ScaleT *scales, const BiasT *biases,
@@ -1198,6 +1228,7 @@ struct DequantCache {
   int64_t group_size = 0;
   int bits = 0;
   int mode = -1;
+  int64_t transpose = 0;
   int device = -1;
   size_t bytes = 0;
   half *buffer = nullptr;
@@ -1227,6 +1258,7 @@ struct DequantCache {
     group_size = 0;
     bits = 0;
     mode = -1;
+    transpose = 0;
     device = -1;
     bf16_valid = false;
   }
@@ -1263,10 +1295,6 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
   if (bits != kBits4 && bits != kBits8) {
     return MakeInvalid("CUDA quantized_matmul supports bits in {4, 8}.");
   }
-  if (transpose != 0) {
-    return MakeInvalid(
-        "CUDA quantized_matmul does not support transpose=True.");
-  }
   if (mode == 0 && !(bits == kBits4 || bits == kBits8)) {
     return MakeInvalid("affine mode supports bits in {4,8} on CUDA.");
   }
@@ -1301,6 +1329,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
   int64_t K_w = w_dims[0];
   int64_t N_words = w_dims[1];
   bool use_bf16_gemm = x.element_type() == xla::ffi::DataType::BF16;
+  bool transposed = transpose != 0;
 
   QmmKernelFamily kernel_family = QmmKernelFamily::kGemm;
   int64_t revsplit_parts_effective = 0;
@@ -1317,18 +1346,37 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
 
   int64_t n_groups = 0;
   int64_t N = 0;
-  if (K_w != K) {
-    return MakeInvalid("Weight K dimension does not match input K.");
-  }
-  if (s_dims[0] != K) {
-    return MakeInvalid("scales shape must be (K, N/group_size).");
-  }
-  n_groups = s_dims[1];
-  N = n_groups * group_size;
-  int64_t expected_words =
-      (static_cast<int64_t>(N) * bits + 31) / 32;
-  if (N_words != expected_words) {
-    return MakeInvalid("packed weight shape does not match N and bits.");
+  if (transposed) {
+    // Weights stored in NxK (packed), scales/biases stored in (N, K/group_size).
+    N = K_w;
+    if (s_dims[0] != N) {
+      return MakeInvalid("scales shape must be (N, K/group_size) for transpose=True.");
+    }
+    if (group_size <= 0 || (K % group_size) != 0) {
+      return MakeInvalid("K must be divisible by group_size for transpose=True.");
+    }
+    n_groups = s_dims[1];
+    if (n_groups != (K / group_size)) {
+      return MakeInvalid("scales second dimension must be K/group_size for transpose=True.");
+    }
+    int64_t expected_words = (static_cast<int64_t>(K) * bits + 31) / 32;
+    if (N_words != expected_words) {
+      return MakeInvalid("packed weight shape does not match K and bits for transpose=True.");
+    }
+  } else {
+    // Weights stored in KxN (packed), scales/biases stored in (K, N/group_size).
+    if (K_w != K) {
+      return MakeInvalid("Weight K dimension does not match input K.");
+    }
+    if (s_dims[0] != K) {
+      return MakeInvalid("scales shape must be (K, N/group_size).");
+    }
+    n_groups = s_dims[1];
+    N = n_groups * group_size;
+    int64_t expected_words = (static_cast<int64_t>(N) * bits + 31) / 32;
+    if (N_words != expected_words) {
+      return MakeInvalid("packed weight shape does not match N and bits.");
+    }
   }
 
   if (o_dims[0] != M || o_dims[1] != N) {
@@ -1566,7 +1614,8 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                  g_dequant_cache.n_words == N_words &&
                  g_dequant_cache.n_groups == n_groups &&
                  g_dequant_cache.group_size == group_size &&
-                 g_dequant_cache.bits == bits && g_dequant_cache.mode == mode;
+                 g_dequant_cache.bits == bits && g_dequant_cache.mode == mode &&
+                 g_dequant_cache.transpose == transpose;
     if (match) {
       if (!use_bf16_gemm) {
         w_deq = g_dequant_cache.buffer;
@@ -1604,6 +1653,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
       g_dequant_cache.group_size = group_size;
       g_dequant_cache.bits = bits;
       g_dequant_cache.mode = mode;
+      g_dequant_cache.transpose = transpose;
       g_dequant_cache.device = current_device;
       g_dequant_cache.bf16_valid = false;
       if (!use_bf16_gemm) {
@@ -1635,7 +1685,84 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
 
   auto scales_dtype = scales.element_type();
   if (need_dequantize && !use_bf16_gemm) {
-    if (mode == 0) {
+    if (transpose != 0) {
+      auto launch_dequant_half = [&](auto *scales_ptr, auto *biases_ptr) {
+        using ScaleT = std::remove_pointer_t<decltype(scales_ptr)>;
+        using BiasT = std::remove_pointer_t<decltype(biases_ptr)>;
+        DequantToHalfKernel<ScaleT, BiasT><<<grid, block, 0, stream>>>(
+            wq_ptr, scales_ptr, biases_ptr, w_deq, K, N, N_words, n_groups,
+            group_size, bits, mode, transpose);
+      };
+
+      if (mode == 0) {
+        auto biases_buf = *biases;
+        auto bias_dtype = biases_buf.element_type();
+        if (bias_dtype != scales_dtype) {
+          return MakeInvalid("biases dtype must match scales dtype.");
+        }
+        if (scales_dtype == xla::ffi::DataType::F32) {
+          launch_dequant_half(
+              static_cast<const float *>(scales.untyped_data()),
+              static_cast<const float *>(biases_buf.untyped_data()));
+        } else if (scales_dtype == xla::ffi::DataType::F16) {
+          launch_dequant_half(
+              static_cast<const half *>(scales.untyped_data()),
+              static_cast<const half *>(biases_buf.untyped_data()));
+        } else if (scales_dtype == xla::ffi::DataType::BF16) {
+          launch_dequant_half(
+              static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
+              static_cast<const __nv_bfloat16 *>(biases_buf.untyped_data()));
+        } else {
+          return MakeInvalid(
+              "scales/biases dtype must be float32/float16/bfloat16.");
+        }
+      } else if (mode == 1) {
+        if (scales_dtype == xla::ffi::DataType::F32) {
+          launch_dequant_half(static_cast<const float *>(scales.untyped_data()),
+                              static_cast<const float *>(nullptr));
+        } else if (scales_dtype == xla::ffi::DataType::F16) {
+          launch_dequant_half(static_cast<const half *>(scales.untyped_data()),
+                              static_cast<const half *>(nullptr));
+        } else if (scales_dtype == xla::ffi::DataType::BF16) {
+          launch_dequant_half(
+              static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
+              static_cast<const __nv_bfloat16 *>(nullptr));
+        } else {
+          return MakeInvalid(
+              "scales dtype must be float32/float16/bfloat16 for nf4.");
+        }
+      } else if (mode == 2) {
+        if (scales_dtype != xla::ffi::DataType::U8 || bits != kBits4) {
+          return MakeInvalid("mxfp4 requires scales dtype uint8 and bits=4.");
+        }
+        launch_dequant_half(
+            static_cast<const uint8_t *>(scales.untyped_data()),
+            static_cast<const uint8_t *>(nullptr));
+      } else if (mode == 3) {
+        if (scales_dtype != xla::ffi::DataType::U8 || bits != kBits8) {
+          return MakeInvalid("mxfp8 requires scales dtype uint8 and bits=8.");
+        }
+        launch_dequant_half(
+            static_cast<const uint8_t *>(scales.untyped_data()),
+            static_cast<const uint8_t *>(nullptr));
+      } else if (mode == 4) {
+        if (scales_dtype != xla::ffi::DataType::U8 || bits != kBits4) {
+          return MakeInvalid("nvfp4 requires scales dtype uint8 and bits=4.");
+        }
+        launch_dequant_half(
+            static_cast<const uint8_t *>(scales.untyped_data()),
+            static_cast<const uint8_t *>(nullptr));
+      } else if (mode == 5) {
+        if (scales_dtype != xla::ffi::DataType::U8 || bits != kBits8) {
+          return MakeInvalid("nvfp8 requires scales dtype uint8 and bits=8.");
+        }
+        launch_dequant_half(
+            static_cast<const uint8_t *>(scales.untyped_data()),
+            static_cast<const uint8_t *>(nullptr));
+      } else {
+        return MakeInvalid("Unsupported mode for CUDA quantized_matmul.");
+      }
+    } else if (mode == 0) {
       auto biases_buf = *biases;
       auto bias_dtype = biases_buf.element_type();
       if (bias_dtype != scales_dtype) {

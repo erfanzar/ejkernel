@@ -108,43 +108,6 @@ def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tup
     return group_size, bits
 
 
-def _fallback_platform_for_cuda_transpose() -> Platform:
-    """Determine the fallback platform when CUDA does not support transpose.
-
-    CUDA quantized_matmul does not support axis='col' (transpose=True).
-    This function probes available implementations and returns the best
-    fallback platform in order of preference: Triton > CuTe > XLA.
-
-    Returns:
-        Platform enum value for the best available fallback.
-    """
-
-    def _has_impl(cand: Platform, backend: str) -> bool:
-        """Check whether a kernel implementation exists for the given platform and backend."""
-        try:
-            kernel_registry.get("quantized_matmul", platform=cand, backend=backend)
-            return True
-        except ValueError:
-            return False
-
-    try:
-        backend = jax.default_backend()
-    except Exception:
-        backend = "cpu"
-
-    if backend in ("gpu", "cuda"):
-        for cand in (Platform.TRITON, Platform.CUTE):
-            if _has_impl(cand, "gpu"):
-                return cand
-    if _has_impl(Platform.XLA, "any"):
-        return Platform.XLA
-
-    for cand, back in ((Platform.TRITON, "gpu"), (Platform.CUTE, "gpu"), (Platform.XLA, "any")):
-        if _has_impl(cand, back):
-            return cand
-    return Platform.XLA
-
-
 def _static_bool(value, name: str) -> bool:
     """Extract a concrete boolean value, raising if it is a JAX tracer.
 
@@ -1206,8 +1169,9 @@ def _quantized_matmul_impl(
         backend_name = "cpu"
 
     prefer_cuda = backend_name in ("gpu", "cuda") and axis != "col"
-    # CUDA kernels do not support transpose=True (axis='col'); prefer Triton to
-    # avoid "CUDA then fallback" behavior and to keep the path fused.
+    # Prefer Triton for axis='col' (transpose=True) on CUDA backends by default.
+    # CUDA supports transpose=True, but Triton is generally more competitive
+    # for fused transpose workloads unless proven otherwise.
     prefer_triton = backend_name in ("gpu", "cuda") and axis == "col"
     resolved = detect_platform(
         "quantized_matmul",
@@ -1216,14 +1180,6 @@ def _quantized_matmul_impl(
         prefer_cuda=prefer_cuda,
         prefer_triton=prefer_triton,
     )
-    if resolved == Platform.CUDA and axis == "col":
-        fallback = _fallback_platform_for_cuda_transpose()
-        warnings.warn(
-            (f"CUDA quantized_matmul does not support axis='col' (transpose=True); falling back to {fallback.value}."),
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        resolved = fallback
     dispatch_platform = resolved.value
 
     if resolved in (Platform.TRITON, Platform.CUDA, Platform.CUTE):

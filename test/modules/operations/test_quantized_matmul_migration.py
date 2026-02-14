@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib
 
 import jax
@@ -181,14 +182,29 @@ def test_quantized_matmul_affine_uses_zeros_only():
     assert y_zero.shape == (x.shape[0], w.shape[0])
 
 
-def test_axis_col_cuda_request_falls_back_to_xla(monkeypatch: pytest.MonkeyPatch):
+def test_axis_col_cuda_request_does_not_fallback(monkeypatch: pytest.MonkeyPatch):
     def _fake_detect_platform(_algorithm, platform="auto", **_kwargs):
         if platform in ("auto", None):
             return qmm_module.Platform.CUDA
         return qmm_module.Platform(platform) if isinstance(platform, str) else platform
 
     monkeypatch.setattr(qmm_module, "detect_platform", _fake_detect_platform)
-    monkeypatch.setattr(qmm_module, "_fallback_platform_for_cuda_transpose", lambda: qmm_module.Platform.XLA)
+    captured: dict[str, object] = {}
+
+    class _FakeExecutor:
+        chooser = object()
+
+        def __call__(self, _kernel, **kwargs):
+            captured.update(kwargs)
+            x = kwargs["x"]
+            w = kwargs["w"]
+            transpose = bool(kwargs["transpose"])
+            m = int(x.shape[0])
+            n = int(w.shape[0]) if transpose else int(kwargs["scales"].shape[1]) * int(kwargs["group_size"])
+            return jnp.zeros((m, n), dtype=x.dtype)
+
+    monkeypatch.setattr(qmm_module, "_quantized_matmul_executor", _FakeExecutor())
+    monkeypatch.setattr(qmm_module, "policy_override", lambda *_a, **_k: contextlib.nullcontext())
 
     key_x, key_w = jax.random.split(jax.random.PRNGKey(3), 2)
     x = jax.random.normal(key_x, (4, 32), dtype=jnp.float32)
@@ -201,21 +217,22 @@ def test_axis_col_cuda_request_falls_back_to_xla(monkeypatch: pytest.MonkeyPatch
         axis="col",
     )
 
-    with pytest.warns(RuntimeWarning, match="axis='col'"):
-        y = quantized_matmul(
-            x,
-            w_q,
-            scales,
-            zeros,
-            transpose=True,
-            mode="affine",
-            bits=4,
-            group_size=32,
-            axis="col",
-            platform="auto",
-        )
+    y = quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        transpose=True,
+        mode="affine",
+        bits=4,
+        group_size=32,
+        axis="col",
+        platform="auto",
+    )
 
     assert y.shape == (x.shape[0], w.shape[0])
+    assert captured.get("_resolved_platform") == "cuda"
+    assert captured.get("platform") == "cuda"
 
 
 def test_quantized_matmul_auto_platform_sets_backend_preferences(monkeypatch: pytest.MonkeyPatch):

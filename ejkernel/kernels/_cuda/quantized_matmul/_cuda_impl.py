@@ -156,9 +156,9 @@ def _mode_to_id(mode: str) -> int:
 def _expected_words(n: int, bits: int) -> int:
     """Compute the number of 32-bit words required to store *n* elements at *bits* each.
 
-    This is the expected second dimension of the packed weight tensor
-    ``w`` (shape ``(K, expected_words)``), where each ``uint32`` word
-    packs ``floor(32 / bits)`` quantized values.
+    This is the expected packed width (second dimension) for the packed
+    weight tensor ``w``. Each ``uint32`` word packs ``floor(32 / bits)``
+    quantized values.
 
     Args:
         n: Number of output features (columns).
@@ -197,16 +197,18 @@ def quantized_matmul_cuda(
 
     Args:
         x: Input activation matrix of shape ``(M, K)`` with a float dtype.
-        w: Packed quantized weight matrix of shape ``(K, ceil(N * bits / 32))``
-            with ``uint32`` dtype, where *N* is the number of output
-            features.
-        scales: Per-group scale factors of shape ``(K, N / group_size)``.
+        w: Packed quantized weight matrix (uint32). Shape depends on *transpose*:
+            - transpose=False: ``(K, ceil(N * bits / 32))``
+            - transpose=True: ``(N, ceil(K * bits / 32))``
+        scales: Per-group scale factors. Shape depends on *transpose*:
+            - transpose=False: ``(K, N / group_size)``
+            - transpose=True: ``(N, K / group_size)``
         biases: Internal additive affine offsets with the same shape as
             *scales* (derived from canonical affine ``zeros`` metadata).
             Required only when *mode* is ``"affine"``.
         transpose: Whether the weight matrix is stored in ``(N, K)``
-            layout. Currently **must** be ``False``; passing ``True``
-            raises :class:`ValueError`.
+            layout. When ``True``, CUDA dequantizes ``w`` into a ``(K, N)``
+            buffer and runs GEMM (x @ w.T) via cuBLASLt.
         group_size: Number of output features per quantization group.
             Defaults depend on *mode*: 64 for ``affine``/``nf4``,
             32 for ``mxfp4``/``mxfp8``, and 16 for ``nvfp4``/``nvfp8``.
@@ -238,9 +240,6 @@ def quantized_matmul_cuda(
     mode_id = _mode_to_id(mode)
     group_size = int(group_size)
     bits = int(bits)
-    if transpose:
-        raise ValueError("CUDA quantized_matmul does not support transpose=True.")
-
     m, k = int(x.shape[0]), int(x.shape[1])
     kernel_family, family_revsplit_parts = select_qmm_kernel_family(
         m=m,
@@ -256,6 +255,8 @@ def quantized_matmul_cuda(
         revsplit_k_parts = 0 if revsplit_k_parts is None else int(revsplit_k_parts)
     if scales.ndim != 2:
         raise ValueError("CUDA quantized_matmul scales must be rank-2.")
+    if biases is not None and (biases.ndim != 2 or biases.shape != scales.shape):
+        raise ValueError("CUDA quantized_matmul biases shape must match scales shape.")
     if transpose:
         if scales.shape[0] != int(w.shape[0]):
             raise ValueError("CUDA quantized_matmul scales shape must be (N, K/group_size) for transpose=True.")
