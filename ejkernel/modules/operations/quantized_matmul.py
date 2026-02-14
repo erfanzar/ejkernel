@@ -1205,11 +1205,16 @@ def _quantized_matmul_impl(
     except Exception:
         backend_name = "cpu"
 
+    prefer_cuda = backend_name in ("gpu", "cuda") and axis != "col"
+    # CUDA kernels do not support transpose=True (axis='col'); prefer Triton to
+    # avoid "CUDA then fallback" behavior and to keep the path fused.
+    prefer_triton = backend_name in ("gpu", "cuda") and axis == "col"
     resolved = detect_platform(
         "quantized_matmul",
         platform if platform is not None else (cfg.platform if cfg is not None else "auto"),
         prefer_pallas=backend_name == "tpu",
-        prefer_cuda=backend_name in ("gpu", "cuda"),
+        prefer_cuda=prefer_cuda,
+        prefer_triton=prefer_triton,
     )
     if resolved == Platform.CUDA and axis == "col":
         fallback = _fallback_platform_for_cuda_transpose()

@@ -26,6 +26,8 @@ this falls back to dequantize+matmul.
 
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
@@ -73,6 +75,15 @@ def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tup
 def _ceil_div(a: int, b: int) -> int:
     """Compute ceiling division of a by b."""
     return (a + b - 1) // b
+
+
+def _lcm(a: int, b: int) -> int:
+    """Compute least common multiple of two positive integers."""
+    if a <= 0:
+        return int(b)
+    if b <= 0:
+        return int(a)
+    return abs(a * b) // math.gcd(a, b)
 
 
 def _pad_2d(x: jax.Array, pad0: int, pad1: int) -> jax.Array:
@@ -677,6 +688,16 @@ def quantized_matmul(
     gemv_mode = normalize_gemv_mode(gemv_mode)
     revsplit_k = normalize_revsplitk_mode(revsplit_k)
     revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
+
+    # Keep the "blocked" XLA path enabled for common transpose=True cases by
+    # ensuring block_k matches the kernel preconditions. Without this, some
+    # (transpose=True, group_size=128) configurations hit a ValueError and
+    # silently fall back to dequantize+matmul (dense path).
+    if transpose:
+        values_per_word = 32 // int(bits)
+        if block_k % values_per_word != 0 or block_k % int(group_size) != 0:
+            block_k = _lcm(int(block_k), int(values_per_word))
+            block_k = _lcm(int(block_k), int(group_size))
 
     if mode == "affine":
         if zeros is None:
