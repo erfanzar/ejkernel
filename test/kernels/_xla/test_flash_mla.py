@@ -145,4 +145,3 @@ def test_flash_mla_matches_reference_shared_rope_term():
 
     assert out.shape == ref.shape
     assert jnp.allclose(out, ref, rtol=1e-4, atol=1e-4)
-

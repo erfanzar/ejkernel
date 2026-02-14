@@ -46,4 +46,3 @@ def test_native_sparse_attention_with_g_cmp_runs_without_block_indices():
 
     assert out.shape == (b, t, hq, d)
     assert jnp.all(jnp.isfinite(out))
-

@@ -54,4 +54,3 @@ def test_basic_matches_xla():
 
     assert out_gpu.shape == out_xla.shape
     assert jnp.allclose(out_gpu, out_xla, rtol=1e-2, atol=1e-2)
-

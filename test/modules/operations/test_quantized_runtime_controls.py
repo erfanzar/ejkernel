@@ -1,0 +1,437 @@
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from ejkernel.modules.operations import quantized_matmul
+from ejkernel.quantization import (
+    QuantRuntimeConfig,
+    QuantizedArray,
+    dense_quantized_matmul,
+    dequantize,
+    prepack_quantized_array,
+    prepack_quantized_weights,
+    quantize,
+    quantize_array,
+)
+from ejkernel.quantization.runtime import resolve_runtime_config
+from ejkernel.quantization._utils.bitpack import _pack_bits, _unpack_bits
+
+
+@pytest.mark.parametrize(
+    "mode,group_size,bits",
+    [
+        ("nf4", 64, 4),
+        ("mxfp4", 32, 4),
+        ("mxfp8", 32, 8),
+        ("nvfp4", 16, 4),
+        ("nvfp8", 16, 8),
+    ],
+)
+def test_runtime_codebook_modes_match_reference_dequant(mode: str, group_size: int, bits: int):
+    key = jax.random.PRNGKey(42)
+    w = jax.random.normal(key, (64, 128), dtype=jnp.float32)
+
+    cfg_new = QuantRuntimeConfig(enable_threshold_codebook=True, enable_parity_fallback=False)
+    cfg_ref = QuantRuntimeConfig(enable_threshold_codebook=False, enable_parity_fallback=True)
+
+    wq_new, s_new = quantize(w, mode=mode, group_size=group_size, bits=bits, axis="row", runtime_config=cfg_new)
+    wq_ref, s_ref = quantize(w, mode=mode, group_size=group_size, bits=bits, axis="row", runtime_config=cfg_ref)
+
+    dq_new = dequantize(wq_new, s_new, None, mode=mode, group_size=group_size, bits=bits, axis="row")
+    dq_ref = dequantize(wq_ref, s_ref, None, mode=mode, group_size=group_size, bits=bits, axis="row")
+
+    np.testing.assert_allclose(np.asarray(dq_new), np.asarray(dq_ref), rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "mode,group_size,bits",
+    [
+        ("affine", 64, 1),
+        ("affine", 64, 2),
+        ("affine", 64, 4),
+        ("nf4", 64, 4),
+        ("mxfp4", 32, 4),
+        ("mxfp8", 32, 8),
+        ("nvfp4", 16, 4),
+        ("nvfp8", 16, 8),
+    ],
+)
+def test_zero_tensor_quant_dequant_is_finite(mode: str, group_size: int, bits: int):
+    w = jnp.zeros((64, 128), dtype=jnp.float32)
+    out = quantize(w, mode=mode, group_size=group_size, bits=bits, axis="row")
+
+    if mode == "affine":
+        w_q, scales, zeros = out
+        w_dq = dequantize(w_q, scales, zeros, mode=mode, group_size=group_size, bits=bits, axis="row")
+    else:
+        w_q, scales = out
+        w_dq = dequantize(w_q, scales, None, mode=mode, group_size=group_size, bits=bits, axis="row")
+
+    assert bool(jnp.all(jnp.isfinite(w_dq)))
+
+
+@pytest.mark.parametrize(
+    "meta_mode,expected_dtype",
+    [
+        ("fp16", jnp.float16),
+        ("bf16", jnp.bfloat16),
+        ("fp32", jnp.float32),
+    ],
+)
+def test_affine_metadata_dtype_control(meta_mode: str, expected_dtype: jnp.dtype):
+    key = jax.random.PRNGKey(123)
+    w = jax.random.normal(key, (64, 128), dtype=jnp.float32)
+    cfg = QuantRuntimeConfig(affine_metadata_dtype=meta_mode)
+    w_q, scales, zeros = quantize(
+        w,
+        mode="affine",
+        bits=4,
+        group_size=64,
+        axis="row",
+        runtime_config=cfg,
+    )
+    assert scales.dtype == expected_dtype
+    assert zeros.dtype == expected_dtype
+
+    out = dequantize(
+        w_q,
+        scales,
+        zeros,
+        mode="affine",
+        bits=4,
+        group_size=64,
+        axis="row",
+        runtime_config=cfg,
+    )
+    assert out.dtype == jnp.float32
+
+
+@pytest.mark.parametrize(
+    "out_mode,expected_dtype",
+    [
+        ("fp16", jnp.float16),
+        ("bf16", jnp.bfloat16),
+        ("fp32", jnp.float32),
+        ("compute", jnp.float16),
+    ],
+)
+def test_dequant_output_dtype_control(out_mode: str, expected_dtype: jnp.dtype):
+    key = jax.random.PRNGKey(331)
+    w = jax.random.normal(key, (64, 128), dtype=jnp.float32)
+    q_cfg = QuantRuntimeConfig(affine_metadata_dtype="fp16")
+    w_q, scales, zeros = quantize(
+        w,
+        mode="affine",
+        bits=4,
+        group_size=64,
+        axis="row",
+        runtime_config=q_cfg,
+    )
+    dq_cfg = QuantRuntimeConfig(
+        prefer_compute_dtype="fp16",
+        dequant_output_dtype=out_mode,
+    )
+    out = dequantize(
+        w_q,
+        scales,
+        zeros,
+        mode="affine",
+        bits=4,
+        group_size=64,
+        axis="row",
+        runtime_config=dq_cfg,
+    )
+    assert out.dtype == expected_dtype
+
+
+def test_dequant_unpack_policy_parity():
+    key = jax.random.PRNGKey(777)
+    w = jax.random.normal(key, (64, 128), dtype=jnp.float32)
+    w_q, scales = quantize(
+        w,
+        mode="nf4",
+        bits=4,
+        group_size=64,
+        axis="row",
+        runtime_config=QuantRuntimeConfig(enable_threshold_codebook=True),
+    )
+    out_fast = dequantize(
+        w_q,
+        scales,
+        None,
+        mode="nf4",
+        bits=4,
+        group_size=64,
+        axis="row",
+        runtime_config=QuantRuntimeConfig(dequant_unpack_policy="fast"),
+    )
+    out_generic = dequantize(
+        w_q,
+        scales,
+        None,
+        mode="nf4",
+        bits=4,
+        group_size=64,
+        axis="row",
+        runtime_config=QuantRuntimeConfig(dequant_unpack_policy="generic"),
+    )
+    np.testing.assert_allclose(np.asarray(out_fast), np.asarray(out_generic), rtol=1e-6, atol=1e-6)
+
+
+def test_runtime_config_none_uses_fastest_profile():
+    assert resolve_runtime_config(None) == QuantRuntimeConfig.fastest_for_backend()
+
+
+def test_dense_quantized_matmul_alignment_padding_equivalence():
+    key_x, key_w = jax.random.split(jax.random.PRNGKey(909), 2)
+    x = jax.random.normal(key_x, (7, 192), dtype=jnp.float32)
+    # N=130 intentionally misaligned to test output-dimension padding/slicing.
+    w = jax.random.normal(key_w, (130, 192), dtype=jnp.float32)
+    w_q, scales, zeros = prepack_quantized_weights(
+        w,
+        mode="affine",
+        bits=4,
+        group_size=64,
+        axis="col",
+    )
+    y_no_pad = dense_quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        transpose=True,
+        mode="affine",
+        bits=4,
+        group_size=64,
+        axis="col",
+        align_multiple=0,
+    )
+    y_pad = dense_quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        transpose=True,
+        mode="affine",
+        bits=4,
+        group_size=64,
+        axis="col",
+        align_multiple=128,
+    )
+    np.testing.assert_allclose(np.asarray(y_pad), np.asarray(y_no_pad), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "bits,values_per_word,mask",
+    [
+        (1, 32, 0x1),
+        (2, 16, 0x3),
+        (4, 8, 0xF),
+        (8, 4, 0xFF),
+    ],
+)
+def test_bitpack_alignment_and_padding_behavior(bits: int, values_per_word: int, mask: int):
+    values = (jnp.arange(20, dtype=jnp.uint32).reshape(2, 10) & jnp.uint32(mask)).astype(jnp.uint32)
+
+    packed = _pack_bits(values, bits, prefer_fast_u4_u8=True, strict_shape_alignment=False)
+    unpacked = _unpack_bits(packed, values.shape[-1], bits, prefer_fast_u4_u8=True)
+    np.testing.assert_array_equal(np.asarray(values), np.asarray(unpacked))
+
+    with pytest.raises(ValueError, match=f"multiple of {values_per_word}"):
+        _pack_bits(values, bits, prefer_fast_u4_u8=True, strict_shape_alignment=True)
+
+
+def test_quantized_array_roundtrip_and_constructor_validation():
+    key = jax.random.PRNGKey(7)
+    w = jax.random.normal(key, (64, 128), dtype=jnp.float32)
+
+    q_aff = quantize_array(w, mode="affine", bits=4, group_size=32, axis="row")
+    assert isinstance(q_aff, QuantizedArray)
+    assert q_aff.zeros is not None
+    assert len(q_aff.as_tuple()) == 3
+    dq = q_aff.dequantize()
+    assert dq.shape == (w.shape[1], w.shape[0])
+    assert bool(jnp.all(jnp.isfinite(dq)))
+
+    q_nf4 = quantize_array(w, mode="nf4", axis="row")
+    assert q_nf4.zeros is None
+    assert len(q_nf4.as_tuple()) == 2
+
+    q_aff2 = quantize_array(w, mode="affine", bits=2, group_size=64, axis="row")
+    assert q_aff2.bits == 2
+    assert q_aff2.actual_bits_per_value > 2.0
+
+    with pytest.raises(ValueError, match="requires `zeros`"):
+        QuantizedArray.from_quantized(
+            q_aff.data,
+            q_aff.scales,
+            None,
+            mode="affine",
+            bits=q_aff.bits,
+            group_size=q_aff.group_size,
+            axis=q_aff.axis,
+        )
+
+    with pytest.raises(ValueError, match="zeros must be None"):
+        QuantizedArray.from_quantized(
+            q_nf4.data,
+            q_nf4.scales,
+            jnp.zeros_like(q_nf4.scales),
+            mode="nf4",
+            bits=q_nf4.bits,
+            group_size=q_nf4.group_size,
+            axis=q_nf4.axis,
+        )
+
+
+def test_quantized_matmul_fuse_false_matches_dense_reference():
+    key_x, key_w = jax.random.split(jax.random.PRNGKey(11), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4, group_size=32, axis="row")
+
+    y_fallback = quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        mode="affine",
+        bits=4,
+        group_size=32,
+        axis="row",
+        platform="xla",
+        fuse=False,
+    )
+    y_dense = dense_quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        mode="affine",
+        bits=4,
+        group_size=32,
+        axis="row",
+    )
+    np.testing.assert_allclose(np.asarray(y_fallback), np.asarray(y_dense), rtol=1e-6, atol=1e-6)
+
+
+def test_quantized_matmul_fuse_true_runtime_behavior():
+    key_x, key_w = jax.random.split(jax.random.PRNGKey(12), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4, group_size=32, axis="row")
+
+    y_fallback = quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        mode="affine",
+        bits=4,
+        group_size=32,
+        axis="row",
+        platform="xla",
+        fuse=False,
+    )
+
+    if jax.default_backend() == "mps":
+        with pytest.warns(RuntimeWarning, match="falls back to reference"):
+            y_fused = quantized_matmul(
+                x,
+                w_q,
+                scales,
+                zeros,
+                mode="affine",
+                bits=4,
+                group_size=32,
+                axis="row",
+                platform="xla",
+                fuse=True,
+            )
+        np.testing.assert_allclose(np.asarray(y_fused), np.asarray(y_fallback), rtol=1e-6, atol=1e-6)
+    else:
+        y_fused = quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            mode="affine",
+            bits=4,
+            group_size=32,
+            axis="row",
+            platform="xla",
+            fuse=True,
+        )
+        assert y_fused.shape == y_fallback.shape
+        assert bool(jnp.all(jnp.isfinite(y_fused)))
+        np.testing.assert_allclose(np.asarray(y_fused), np.asarray(y_fallback), rtol=1e-2, atol=1e-2)
+
+
+def test_quantized_array_matmul_fuse_switch():
+    key_x, key_w = jax.random.split(jax.random.PRNGKey(13), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    q = prepack_quantized_array(w, mode="affine", bits=4, group_size=32, axis="row")
+
+    y_ref = q.matmul(x, axis="row", fuse=False)
+    if jax.default_backend() == "mps":
+        with pytest.warns(RuntimeWarning, match="falls back to reference"):
+            y_fused = q.matmul(x, axis="row", fuse=True, platform="xla")
+        np.testing.assert_allclose(np.asarray(y_fused), np.asarray(y_ref), rtol=1e-6, atol=1e-6)
+    else:
+        y_fused = q.matmul(x, axis="row", fuse=True, platform="xla")
+        assert y_fused.shape == y_ref.shape
+        assert bool(jnp.all(jnp.isfinite(y_fused)))
+
+
+@pytest.mark.parametrize("bits", [1, 2])
+def test_quantized_matmul_affine_low_bits_uses_fallback(bits: int):
+    key_x, key_w = jax.random.split(jax.random.PRNGKey(27 + bits), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=bits, group_size=32, axis="row")
+
+    with pytest.warns(RuntimeWarning, match="affine bits not in \\{4,8\\}"):
+        y_auto = quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            mode="affine",
+            bits=bits,
+            group_size=32,
+            axis="row",
+            platform="xla",
+            fuse=True,
+        )
+
+    y_ref = quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        mode="affine",
+        bits=bits,
+        group_size=32,
+        axis="row",
+        platform="xla",
+        fuse=False,
+    )
+    np.testing.assert_allclose(np.asarray(y_auto), np.asarray(y_ref), rtol=1e-6, atol=1e-6)

@@ -30,6 +30,7 @@ BackendQuantizationMode = QuantizationMode
 GemvMode = Literal["auto", "on", "off"]
 RevSplitKMode = Literal["auto", "on", "off"]
 KernelFamily = Literal["gemm", "gemm_splitk", "gemv_splitk", "gemv_revsplitk"]
+AFFINE_NF4_GROUP_SIZES = {16, 32, 64, 128, 256, 512, 1024}
 
 
 def normalize_axis(axis: str | None, *, default: QuantizationAxis = "row") -> QuantizationAxis:
@@ -102,8 +103,8 @@ def resolve_qparams(
     the rules for the chosen quantization mode.
 
     Mode-specific rules:
-        - affine: bits in {4, 8} (default 4), group_size in {32, 64, 128} (default 64).
-        - nf4: bits fixed to 4, group_size in {32, 64, 128} (default 64).
+        - affine: bits in {1, 2, 4, 8} (default 4), group_size in {16, 32, 64, 128, 256, 512, 1024} (default 64).
+        - nf4: bits fixed to 4, group_size in {16, 32, 64, 128, 256, 512, 1024} (default 64).
         - mxfp4 / mxfp8: bits fixed to 4 or 8 respectively, group_size must be 32.
         - nvfp4 / nvfp8: bits fixed to 4 or 8 respectively, group_size must be 16.
 
@@ -122,17 +123,17 @@ def resolve_qparams(
     mode, bits, used_legacy = normalize_mode_and_bits(mode, bits)
 
     if mode == "affine":
-        bits = 4 if bits is None else _require_bits(bits, {4, 8})
+        bits = 4 if bits is None else _require_bits(bits, {1, 2, 4, 8})
         group_size = 64 if group_size is None else int(group_size)
-        if group_size not in {32, 64, 128}:
-            raise ValueError("affine mode supports group_size in {32,64,128}.")
+        if group_size not in AFFINE_NF4_GROUP_SIZES:
+            raise ValueError("affine mode supports group_size in {16,32,64,128,256,512,1024}.")
         return mode, group_size, bits, used_legacy
 
     if mode == "nf4":
         bits = 4
         group_size = 64 if group_size is None else int(group_size)
-        if group_size not in {32, 64, 128}:
-            raise ValueError("nf4 mode supports group_size in {32,64,128}.")
+        if group_size not in AFFINE_NF4_GROUP_SIZES:
+            raise ValueError("nf4 mode supports group_size in {16,32,64,128,256,512,1024}.")
         return mode, group_size, bits, used_legacy
 
     if mode in {"mxfp4", "mxfp8"}:
@@ -233,7 +234,7 @@ def normalize_revsplitk_parts(parts: int | None) -> int | None:
 def is_effective_4bit_mode(mode: QuantizationMode, bits: int) -> bool:
     """Check whether the effective runtime quantization is 4-bit.
 
-    For affine mode, the bit-width is user-configurable and may be 4 or 8.
+    For affine mode, the bit-width is user-configurable and may be 1, 2, 4, or 8.
     For other modes, the effective bit-width is determined by the mode name
     (e.g., nf4, mxfp4, nvfp4 are all 4-bit).
 

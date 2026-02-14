@@ -9,6 +9,7 @@ exp.py
 env.py
 run_test.py
 benchmark_plots/*
+benchmark_outputs/
 # Distribution / packaging
 .Python
 build/

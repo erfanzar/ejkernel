@@ -85,6 +85,7 @@ def test_matches_reference(with_softmax_aux, use_jit):
     ) = _build_inputs(seed=0, with_softmax_aux=with_softmax_aux)
 
     if use_jit:
+
         def _run(queries, kv_pages, context_lens, block_tables, query_start_loc, num_seqs_arr):
             return ragged_page_attention_v2(
                 queries,

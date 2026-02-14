@@ -66,10 +66,10 @@ class Kernel:
     @property
     def filename(self) -> str:
         """Derive the output ``.cu`` filename from this kernel's parameters."""
-        return f"blocksparse_fwd_hdim{self.qk_head_dim}_vhdim{self.v_head_dim}_" f"{self.dtype}_sm{self.sm}.cu"
+        return f"blocksparse_fwd_hdim{self.qk_head_dim}_vhdim{self.v_head_dim}_{self.dtype}_sm{self.sm}.cu"
 
 
-def get_all_kernels() -> list[Kernel]: # type: ignore
+def get_all_kernels() -> list[Kernel]:  # type: ignore
     """Yield all kernel variants across dtypes, head dimensions, and SM versions."""
     for dtype, head_dim, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM):
         yield Kernel(

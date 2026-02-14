@@ -26,10 +26,13 @@ from .bitpack import _pack_bits, _unpack_bits
 from .fp_tables import (
     _get_e2m1_max,
     _get_e2m1_table,
+    _get_e2m1_threshold_map,
     _get_e4m3_max,
     _get_e4m3_table,
     _get_e4m3_table_q,
+    _get_e4m3_q_threshold_map,
     _get_nf4_table,
+    _get_nf4_threshold_map,
 )
 from .grouping import _quantize_to_codebook, _require_bits, _reshape_groups
 from .qparams import (
@@ -61,10 +64,13 @@ __all__ = [
     "RevSplitKMode",
     "_get_e2m1_max",
     "_get_e2m1_table",
+    "_get_e2m1_threshold_map",
     "_get_e4m3_max",
     "_get_e4m3_table",
     "_get_e4m3_table_q",
+    "_get_e4m3_q_threshold_map",
     "_get_nf4_table",
+    "_get_nf4_threshold_map",
     "_pack_bits",
     "_quantize_to_codebook",
     "_require_bits",

@@ -37,9 +37,7 @@ class TestStateSpaceV2:
         D = jnp.ones((num_heads,))
         dt = jnp.ones((batch, seq_len, num_heads)) * 0.1
 
-        output, ssm_state, conv_state = state_space_v2(
-            x, A, B, C, D, dt, n_groups=n_groups
-        )
+        output, ssm_state, conv_state = state_space_v2(x, A, B, C, D, dt, n_groups=n_groups)
 
         assert output.shape == (batch, seq_len, intermediate_size)
         assert ssm_state.shape == (batch, num_heads, head_dim, ssm_state_size)
@@ -82,9 +80,7 @@ class TestStateSpaceV2:
 
         initial_state = jnp.ones((batch, num_heads, head_dim, ssm_state_size)) * 0.5
 
-        output, ssm_state, _ = state_space_v2(
-            x, A, B, C, D, dt, initial_state=initial_state, n_groups=n_groups
-        )
+        output, ssm_state, _ = state_space_v2(x, A, B, C, D, dt, initial_state=initial_state, n_groups=n_groups)
 
         assert output.shape == (batch, seq_len, num_heads * head_dim)
         assert ssm_state.shape == (batch, num_heads, head_dim, ssm_state_size)
@@ -104,9 +100,7 @@ class TestStateSpaceV2:
         gate = jnp.ones((batch, seq_len, intermediate_size)) * 2.0
 
         output_no_gate, _, _ = state_space_v2(x, A, B, C, D, dt, n_groups=n_groups)
-        output_with_gate, _, _ = state_space_v2(
-            x, A, B, C, D, dt, gate=gate, n_groups=n_groups, act_fn=jax.nn.silu
-        )
+        output_with_gate, _, _ = state_space_v2(x, A, B, C, D, dt, gate=gate, n_groups=n_groups, act_fn=jax.nn.silu)
 
         assert output_with_gate.shape == output_no_gate.shape
         assert not jnp.allclose(output_with_gate, output_no_gate)
@@ -125,14 +119,10 @@ class TestStateSpaceV2:
         gate = jnp.ones((batch, seq_len, intermediate_size)) * 2.0
 
         output_simple_gate, _, _ = state_space_v2(
-            x, A, B, C, D, dt,
-            gate=gate, n_groups=n_groups,
-            use_gated_rmsnorm=False, act_fn=jax.nn.silu
+            x, A, B, C, D, dt, gate=gate, n_groups=n_groups, use_gated_rmsnorm=False, act_fn=jax.nn.silu
         )
         output_rmsnorm_gate, _, _ = state_space_v2(
-            x, A, B, C, D, dt,
-            gate=gate, n_groups=n_groups,
-            use_gated_rmsnorm=True, act_fn=jax.nn.silu
+            x, A, B, C, D, dt, gate=gate, n_groups=n_groups, use_gated_rmsnorm=True, act_fn=jax.nn.silu
         )
 
         assert output_rmsnorm_gate.shape == output_simple_gate.shape
@@ -152,9 +142,7 @@ class TestStateSpaceV2:
             B = jnp.ones((batch, seq_len, n_groups, ssm_state_size)) * 0.1
             C = jnp.ones((batch, seq_len, n_groups, ssm_state_size)) * 0.1
 
-            output, ssm_state, _ = state_space_v2(
-                x, A, B, C, D, dt, n_groups=n_groups
-            )
+            output, ssm_state, _ = state_space_v2(x, A, B, C, D, dt, n_groups=n_groups)
 
             assert output.shape == (batch, seq_len, num_heads * head_dim)
             assert ssm_state.shape == (batch, num_heads, head_dim, ssm_state_size)
@@ -171,9 +159,7 @@ class TestStateSpaceV2:
         dt = jnp.ones((batch, 1, num_heads)) * 0.1
         initial_state = jnp.ones((batch, num_heads, head_dim, ssm_state_size)) * 0.5
 
-        output, ssm_state, _ = state_space_v2(
-            x, A, B, C, D, dt, initial_state=initial_state, n_groups=n_groups
-        )
+        output, ssm_state, _ = state_space_v2(x, A, B, C, D, dt, initial_state=initial_state, n_groups=n_groups)
 
         assert output.shape == (batch, 1, num_heads * head_dim)
         assert ssm_state.shape == (batch, num_heads, head_dim, ssm_state_size)
@@ -191,9 +177,7 @@ class TestStateSpaceV2:
         dt = jnp.ones((batch, seq_len, num_heads)) * 0.1
         conv_state_in = jnp.ones((batch, conv_dim, d_conv)) * 0.3
 
-        _, _, conv_state_out = state_space_v2(
-            x, A, B, C, D, dt, conv_state=conv_state_in, n_groups=n_groups
-        )
+        _, _, conv_state_out = state_space_v2(x, A, B, C, D, dt, conv_state=conv_state_in, n_groups=n_groups)
 
         assert jnp.allclose(conv_state_out, conv_state_in)
 
@@ -222,9 +206,7 @@ class TestStateSpaceV2:
 
         # Process in two parts
         _, state_1, _ = state_space_v2(x_1, A, B, C, D, dt, n_groups=n_groups)
-        _, state_2, _ = state_space_v2(
-            x_2, A, B, C, D, dt, initial_state=state_1, n_groups=n_groups
-        )
+        _, state_2, _ = state_space_v2(x_2, A, B, C, D, dt, initial_state=state_1, n_groups=n_groups)
 
         # Final states should match
         assert jnp.allclose(state_full, state_2, atol=1e-5)
@@ -275,15 +257,9 @@ class TestStateSpaceV2:
         dt = jnp.ones((batch, seq_len, num_heads)) * 0.1
         gate = jnp.ones((batch, seq_len, intermediate_size)) * 2.0
 
-        output_silu, _, _ = state_space_v2(
-            x, A, B, C, D, dt, gate=gate, n_groups=n_groups, act_fn=jax.nn.silu
-        )
-        output_gelu, _, _ = state_space_v2(
-            x, A, B, C, D, dt, gate=gate, n_groups=n_groups, act_fn=jax.nn.gelu
-        )
-        output_relu, _, _ = state_space_v2(
-            x, A, B, C, D, dt, gate=gate, n_groups=n_groups, act_fn=jax.nn.relu
-        )
+        output_silu, _, _ = state_space_v2(x, A, B, C, D, dt, gate=gate, n_groups=n_groups, act_fn=jax.nn.silu)
+        output_gelu, _, _ = state_space_v2(x, A, B, C, D, dt, gate=gate, n_groups=n_groups, act_fn=jax.nn.gelu)
+        output_relu, _, _ = state_space_v2(x, A, B, C, D, dt, gate=gate, n_groups=n_groups, act_fn=jax.nn.relu)
 
         # Different activations should produce different results
         assert not jnp.allclose(output_silu, output_gelu)

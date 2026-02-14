@@ -56,4 +56,3 @@ def test_basic_matches_xla():
     out_xla = ragged_decode_xla(q, k, v, starts, ends)
     assert out_gpu.shape == out_xla.shape
     assert jnp.allclose(out_gpu, out_xla, rtol=2e-2, atol=2e-2)
-

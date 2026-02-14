@@ -67,11 +67,7 @@ def _group_sizes_for_mode(mode: str) -> list[int]:
 
 @pytest.mark.parametrize(
     "mode,group_size",
-    [
-        (mode, gs)
-        for mode in ["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
-        for gs in _group_sizes_for_mode(mode)
-    ],
+    [(mode, gs) for mode in ["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"] for gs in _group_sizes_for_mode(mode)],
 )
 @pytest.mark.parametrize("x_dtype", [jnp.float16, jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("m", [8192])

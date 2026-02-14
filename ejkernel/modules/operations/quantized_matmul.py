@@ -1281,6 +1281,7 @@ def quantized_matmul(
     gemv_mode: GemvMode = "auto",
     revsplit_k: RevSplitKMode = "auto",
     revsplit_k_parts: int | None = None,
+    fuse: bool = True,
     platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
@@ -1299,7 +1300,7 @@ def quantized_matmul(
             None for non-affine modes.
         transpose: If True, compute x @ dequantize(w).T.
         group_size: Quantization group size. If None, uses mode default.
-        bits: Quantization bit-width. Honored for affine ({4,8});
+        bits: Quantization bit-width. Honored for affine ({1,2,4,8});
             ignored for nf4/mxfp4/mxfp8/nvfp4/nvfp8.
         mode: Quantization mode. One of
             {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}.
@@ -1308,16 +1309,50 @@ def quantized_matmul(
         gemv_mode: GEMV kernel selection mode ("auto", "on", "off").
         revsplit_k: Reverse split-K mode ("auto", "on", "off").
         revsplit_k_parts: Number of parts for reverse split-K.
+        fuse: If True, run platform fused quantized kernels. If False, force
+            reference path (dequantize then matmul) using XLA/JAX ops.
         platform: Platform override (triton/pallas/cuda/cute/xla/auto).
         cfg: Optional configuration override.
 
     Returns:
         Matrix multiplication result of shape (M, N).
     """
+    mode_n, _, bits_n, _ = resolve_qparams(mode, group_size, bits)
+
+    fuse = _static_bool(fuse, "fuse")
+    if fuse and mode_n == "affine" and bits_n not in (4, 8):
+        warnings.warn(
+            "fuse=True with affine bits not in {4,8} falls back to reference dequantize+matmul path.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        fuse = False
+    if fuse and jax.default_backend() == "mps":
+        warnings.warn(
+            "fuse=True on MPS currently falls back to reference dequantize+matmul for stability.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        fuse = False
     runtime_axis, runtime_transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
 
     def _inner(xi, wi, si, zi):
         """Dispatch to _quantized_matmul_impl with captured quantization parameters."""
+        if not fuse:
+            from ejkernel.quantization._quants.quantizations import quantized_matmul as dense_quantized_matmul
+
+            return dense_quantized_matmul(
+                xi,
+                wi,
+                si,
+                zi,
+                transpose=runtime_transpose,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                axis=runtime_axis,
+            )
+
         return _quantized_matmul_impl(
             xi,
             wi,

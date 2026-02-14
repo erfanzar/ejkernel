@@ -110,4 +110,3 @@ def test_decode_attention_xla_matches_reference_basic():
 
     assert jnp.allclose(out.astype(jnp.float32), ref_out.astype(jnp.float32), rtol=1e-2, atol=2e-2)
     assert jnp.allclose(lse, ref_lse, rtol=1e-3, atol=1e-3)
-

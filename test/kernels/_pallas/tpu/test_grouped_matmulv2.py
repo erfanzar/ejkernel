@@ -75,4 +75,3 @@ def test_backward_shapes():
     assert drhs.shape == rhs.shape
     assert jnp.isfinite(dlhs).all()
     assert jnp.isfinite(drhs).all()
-

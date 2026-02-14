@@ -74,7 +74,7 @@ def test_segment_ids_match_attention_mask():
     seg = jnp.array([[0] * 6 + [1] * 6], dtype=jnp.int32)
     out_bs = blocksparse_attention(q, k, v, q_segment_ids=seg, kv_segment_ids=seg, causal=False)
 
-    mask = (seg[:, :, None] == seg[:, None, :])  # (B, T, T)
+    mask = seg[:, :, None] == seg[:, None, :]  # (B, T, T)
     mask = mask[:, None, :, :]  # (B, 1, T, T)
 
     out_ref, _ = attention(_bhtd_to_bthd(q), _bhtd_to_bthd(k), _bhtd_to_bthd(v), attention_mask=mask, dtype=jnp.float32)

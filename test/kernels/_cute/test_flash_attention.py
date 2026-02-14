@@ -172,11 +172,9 @@ def test_flash_attention_cute_varlen_matches_equivalent_mask():
     k_idx = jnp.arange(k_len, dtype=jnp.int32)[None, :]
     shift = (k_lens - q_lens)[:, None, None]
     shifted_causal = k_idx[:, None, :] <= (q_idx[:, :, None] + shift)
-    var_mask = (
-        (q_idx < q_lens[:, None])[:, :, None]
-        & (k_idx < k_lens[:, None])[:, None, :]
-        & shifted_causal
-    )[:, None, :, :]
+    var_mask = ((q_idx < q_lens[:, None])[:, :, None] & (k_idx < k_lens[:, None])[:, None, :] & shifted_causal)[
+        :, None, :, :
+    ]
 
     out_cute = cute_flash_attention(
         q,

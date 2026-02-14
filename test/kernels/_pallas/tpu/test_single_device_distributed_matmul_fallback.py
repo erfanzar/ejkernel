@@ -44,4 +44,3 @@ def test_reduce_scatter_matmul_tp_size_one_falls_back_to_local_matmul():
 
     assert out.shape == expected.shape
     assert jnp.array_equal(out, expected)
-
