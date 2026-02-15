@@ -362,10 +362,12 @@ def _prefer_packed_path(
         return False
     if mode == "nf4":
         enough_n = n >= max(512, 2 * block_n)
-        enough_m = m >= max(64, block_m // 2)
         enough_k = k >= max(256, block_k)
         valid_grouping = group_size <= block_n
-        return enough_n and enough_m and enough_k and valid_grouping
+        # Empirically, NF4 benefits from avoiding the full predecode-to-dense
+        # materialization even for decode-like M; prefer the packed fused path
+        # whenever the kernel is otherwise legal.
+        return enough_n and enough_k and valid_grouping
     return False
 
 
