@@ -20,13 +20,28 @@ import statistics
 from pathlib import Path
 
 
+def _default_backend_slug() -> str:
+    try:
+        import jax
+
+        backend = jax.default_backend()
+    except Exception:
+        backend = "gpu"
+    backend = str(backend).lower()
+    # Some environments may report "cuda"; normalize to our baseline naming.
+    if backend == "cuda":
+        backend = "gpu"
+    return backend
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
+    default_baseline = Path(f"benchmarks/baselines/qmm_llm_{_default_backend_slug()}_xla_strict.json")
     p.add_argument(
         "--baseline",
         type=Path,
-        default=Path("benchmarks/baselines/qmm_llm_gpu_xla_strict.json"),
-        help="Baseline JSON path (default: benchmarks/baselines/qmm_llm_gpu_xla_strict.json).",
+        default=default_baseline,
+        help=f"Baseline JSON path (default: {default_baseline}).",
     )
     p.add_argument("--workdir", type=Path, default=Path("benchmark_outputs"))
     p.add_argument("--warmup", type=int, default=5)

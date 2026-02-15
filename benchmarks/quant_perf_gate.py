@@ -16,19 +16,35 @@ import sys
 from pathlib import Path
 
 
+def _default_backend_slug() -> str:
+    try:
+        import jax
+
+        backend = jax.default_backend()
+    except Exception:
+        backend = "gpu"
+    backend = str(backend).lower()
+    if backend == "cuda":
+        backend = "gpu"
+    return backend
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    slug = _default_backend_slug()
+    default_quant = Path(f"benchmarks/baselines/quantize_{slug}.json")
+    default_dequant = Path(f"benchmarks/baselines/dequantize_{slug}.json")
     parser.add_argument(
         "--baseline-quant",
         type=Path,
-        default=Path("benchmarks/baselines/quantize_gpu.json"),
-        help="Quantize baseline JSON path (default: benchmarks/baselines/quantize_gpu.json).",
+        default=default_quant,
+        help=f"Quantize baseline JSON path (default: {default_quant}).",
     )
     parser.add_argument(
         "--baseline-dequant",
         type=Path,
-        default=Path("benchmarks/baselines/dequantize_gpu.json"),
-        help="Dequantize baseline JSON path (default: benchmarks/baselines/dequantize_gpu.json).",
+        default=default_dequant,
+        help=f"Dequantize baseline JSON path (default: {default_dequant}).",
     )
     parser.add_argument("--workdir", type=Path, default=Path("benchmark_outputs"))
     parser.add_argument("--warmup", type=int, default=12)
