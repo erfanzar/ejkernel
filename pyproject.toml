@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "ejkernel"
-version = "0.0.60"
+version = "0.0.65"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
@@ -68,6 +68,7 @@ cuda = [
 ]
 tpu = ["jax[tpu]>=0.9.0"]
 triton = ["triton==3.6.0"]
+mps = ["jax-metallib==0.9.1"]
 profile = [
     "xprof>=2.20.6",
     "tb-nightly>=2.21.0a20250820",

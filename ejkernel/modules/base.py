@@ -189,7 +189,7 @@ class KernelConfig:
     num_warps: int = 4
     num_stages: int = 2
     platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] = "auto"
-    backend: Backend | Literal["gpu", "tpu", "cpu", "any"] = Backend.ANY
+    backend: Backend | Literal["gpu", "mps", "tpu", "cpu", "any"] = Backend.ANY
     algorithm: str | None = None
     priority: int = 0
 
