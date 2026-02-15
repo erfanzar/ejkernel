@@ -349,22 +349,17 @@ def resolve_runtime_axis_and_transpose(
     Returns:
         Tuple of (resolved_axis, resolved_transpose).
 
-    Raises:
-        ValueError: If axis and transpose are inconsistent (e.g.,
-            axis="row" with transpose=True).
+    Notes:
+        When ``axis`` is explicitly provided, it is treated as the source of
+        truth and ``transpose`` is ignored. This keeps the public API ergonomic:
+        callers may pass ``axis='col'`` without also setting ``transpose=True``.
     """
     if axis is None:
         return ("col" if transpose else "row"), transpose
 
     axis_n = normalize_axis(axis)
     expected_transpose = axis_n == "col"
-    if expected_transpose != bool(transpose):
-        raise ValueError(
-            "Inconsistent axis/transpose combination: "
-            "axis='row' requires transpose=False, "
-            "axis='col' requires transpose=True."
-        )
-    return axis_n, bool(transpose)
+    return axis_n, expected_transpose
 
 
 def resolve_prepack_axis(*, axis: str | None, transpose: bool) -> QuantizationAxis:
