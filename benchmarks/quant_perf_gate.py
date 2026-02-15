@@ -10,23 +10,59 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
 import statistics
 import subprocess
 import sys
 from pathlib import Path
 
 
-def _default_backend_slug() -> str:
-    try:
-        import jax
+def _normalize_backend(name: str) -> str:
+    name = str(name).strip().lower()
+    if name == "cuda":
+        return "gpu"
+    if name in {"gpu", "tpu", "cpu", "mps"}:
+        return name
+    return "gpu"
 
-        backend = jax.default_backend()
-    except Exception:
-        backend = "gpu"
-    backend = str(backend).lower()
-    if backend == "cuda":
-        backend = "gpu"
-    return backend
+
+def _default_backend_slug() -> str:
+    """Best-effort backend detection without importing JAX.
+
+    This script spawns subprocesses that initialize JAX. Importing/initializing
+    JAX in the parent process can lock exclusive devices (notably TPU) and make
+    the subprocess benchmarks fail. Keep detection env/probe-only.
+    """
+    override = os.getenv("EJKERNEL_PERF_GATE_BACKEND") or os.getenv("EJKERNEL_BASELINE_BACKEND")
+    if override:
+        return _normalize_backend(override)
+
+    jax_platform = os.getenv("JAX_PLATFORM_NAME") or os.getenv("JAX_PLATFORMS")
+    if jax_platform:
+        first = str(jax_platform).split(",")[0].strip()
+        if first:
+            return _normalize_backend(first)
+
+    if os.path.exists("/dev/accel0") or os.path.exists("/dev/accel"):
+        return "tpu"
+    for key in ("TPU_NAME", "TPU_WORKER_ID", "TPU_ACCELERATOR_TYPE", "XRT_TPU_CONFIG", "COLAB_TPU_ADDR"):
+        if os.getenv(key):
+            return "tpu"
+
+    cuda_vis = os.getenv("CUDA_VISIBLE_DEVICES")
+    if cuda_vis and cuda_vis.strip() not in {"", "-1", "none", "void"}:
+        return "gpu"
+    nvidia_vis = os.getenv("NVIDIA_VISIBLE_DEVICES")
+    if nvidia_vis and nvidia_vis.strip() not in {"", "void"}:
+        return "gpu"
+    if os.getenv("ROCR_VISIBLE_DEVICES") or os.getenv("HIP_VISIBLE_DEVICES"):
+        return "gpu"
+
+    if sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+        return "mps"
+
+    return "cpu"
 
 
 def _parse_args() -> argparse.Namespace:
