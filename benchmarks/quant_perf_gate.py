@@ -189,10 +189,15 @@ def _evaluate_gate(
     label: str,
 ) -> tuple[bool, list[tuple[str, float, float, float]]]:
     regressions: list[tuple[str, float, float, float]] = []
+    missing = sorted(set(current).difference(baseline))
+    if missing:
+        print(f"[quant_perf_gate] {label}: FAIL (missing {len(missing)} baseline rows; rerun with --write-new-baseline)")
+        for key in missing[:20]:
+            print(f"  - {key}")
+        return False, regressions
+
     for key, cur_ms in current.items():
-        base_ms = baseline.get(key)
-        if base_ms is None:
-            continue
+        base_ms = baseline[key]
         delta = (cur_ms - base_ms) / base_ms
         if delta > threshold:
             regressions.append((key, base_ms, cur_ms, delta))
