@@ -154,6 +154,7 @@ def _is_packed_tpu_legal(
         "bits",
         "mode",
         "tpu_path",
+        "allow_dense_fallback",
         "block_m",
         "block_n",
         "block_k",
@@ -174,6 +175,7 @@ def _operate_impl(
     bits: int,
     mode: str,
     tpu_path: str,
+    allow_dense_fallback: bool,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -230,6 +232,7 @@ def _operate_impl(
             block_n=block_n,
             block_k=block_k,
             use_bf16=compute_in_bf16,
+            allow_dense_fallback=allow_dense_fallback,
         )
 
     path = str(tpu_path).strip().lower()
@@ -280,10 +283,11 @@ def _operate_impl(
         block_n=block_n,
         block_k=block_k,
         use_bf16=compute_in_bf16,
+        allow_dense_fallback=allow_dense_fallback,
     )
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 16))
+@functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 17))
 def _operate(
     x: jax.Array,
     w: jax.Array,
@@ -294,6 +298,7 @@ def _operate(
     bits: int,
     mode: str,
     tpu_path: str,
+    allow_dense_fallback: bool,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -341,6 +346,7 @@ def _operate(
         bits=bits,
         mode=mode,
         tpu_path=tpu_path,
+        allow_dense_fallback=allow_dense_fallback,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -361,6 +367,7 @@ def _operate_fwd(
     bits: int,
     mode: str,
     tpu_path: str,
+    allow_dense_fallback: bool,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -390,6 +397,7 @@ def _operate_fwd(
         bits=bits,
         mode=mode,
         tpu_path=tpu_path,
+        allow_dense_fallback=allow_dense_fallback,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -407,6 +415,7 @@ def _operate_bwd(
     bits: int,
     mode: str,
     tpu_path: str,
+    allow_dense_fallback: bool,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -460,6 +469,7 @@ def _operate_bwd(
         block_n=block_n,
         block_k=block_k,
         use_bf16=use_bf16,
+        allow_dense_fallback=allow_dense_fallback,
         path=path,
         packed_legal=packed_legal,
     )
@@ -542,7 +552,6 @@ def quantized_matmul(
     """
     del num_warps, num_stages, split_k
     del use_bf16
-    del allow_dense_fallback
 
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
     _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
@@ -573,6 +582,7 @@ def quantized_matmul(
         bits,
         backend_mode,
         resolved_tpu_path,
+        bool(allow_dense_fallback),
         block_m,
         block_n,
         block_k,

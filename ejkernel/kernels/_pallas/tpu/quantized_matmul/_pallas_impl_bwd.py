@@ -510,6 +510,7 @@ def _quantized_matmul_input_grad_hybrid(
         "block_n",
         "block_k",
         "use_bf16",
+        "allow_dense_fallback",
         "path",
         "packed_legal",
     ],
@@ -528,6 +529,7 @@ def quantized_matmul_input_grad(
     block_n: int,
     block_k: int,
     use_bf16: bool,
+    allow_dense_fallback: bool,
     path: str,
     packed_legal: bool,
 ) -> jax.Array:
@@ -592,6 +594,7 @@ def quantized_matmul_input_grad(
             block_n=block_n,
             block_k=block_k,
             use_bf16=True,
+            allow_dense_fallback=allow_dense_fallback,
         )
 
     if bits in (4, 8):
@@ -614,6 +617,11 @@ def quantized_matmul_input_grad(
         except Exception:
             pass
 
+    if not allow_dense_fallback:
+        raise ValueError(
+            "TPU Pallas input-grad is falling back to dense dequantize+matmul, but "
+            "dense fallback is disabled (allow_dense_fallback=False)."
+        )
     w_f = dequantize(w_q, scales, zeros, group_size=group_size, bits=bits, mode=mode)
     return jax.lax.dot_general(dy, w_f, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
 

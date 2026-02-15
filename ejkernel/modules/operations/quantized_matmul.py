@@ -1203,7 +1203,7 @@ def _quantized_matmul_impl(
     )
     dispatch_platform = resolved.value
     extra_kwargs = {}
-    if resolved == Platform.XLA:
+    if resolved in (Platform.XLA, Platform.PALLAS):
         extra_kwargs["allow_dense_fallback"] = allow_dense_fallback
 
     if resolved in (Platform.TRITON, Platform.CUDA, Platform.CUTE):
