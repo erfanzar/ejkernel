@@ -55,11 +55,11 @@ from .._utils.grouping import _quantize_to_codebook, _reshape_groups
 from .._utils.qparams import (
     QuantizationAxis,
     QuantizationMode,
-    validate_packed_quantized_matmul_layout,
     normalize_axis,
     resolve_prepack_axis,
     resolve_qparams,
     resolve_runtime_axis_and_transpose,
+    validate_packed_quantized_matmul_layout,
 )
 from ..runtime import QuantRuntimeConfig, resolve_runtime_config
 

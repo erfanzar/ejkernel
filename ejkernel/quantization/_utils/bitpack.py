@@ -88,9 +88,7 @@ def _pack_bits_fast_grouped(
     n = values.shape[-1]
     rem = n % values_per_word
     if strict_shape_alignment and rem != 0:
-        raise ValueError(
-            f"u{bits} fast path requires the last dimension to be a multiple of {values_per_word}."
-        )
+        raise ValueError(f"u{bits} fast path requires the last dimension to be a multiple of {values_per_word}.")
 
     if rem != 0:
         pad = values_per_word - rem

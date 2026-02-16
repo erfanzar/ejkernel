@@ -703,6 +703,30 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return value.lower() in {"1", "true", "yes", "y"}
 
 
+def _parse_positive_int_env(name: str, default: int) -> int:
+    """Parse a positive integer env var with a safe fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        return int(default)
+    return max(1, value)
+
+
+def _parse_nonnegative_int_env(name: str, default: int) -> int:
+    """Parse a non-negative integer env var with a safe fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        return int(default)
+    return max(0, value)
+
+
 def _parse_matmul_precision(value: str):
     value = value.lower()
     if value == "highest":
@@ -974,7 +998,8 @@ def _qmm_config_pruner(configs, nargs, **_kwargs):
     """Lightweight config pruning based on problem shape.
 
     Reduces autotune compile time by skipping configs that are
-    clearly mismatched with the input dimensions.
+    clearly mismatched with the input dimensions and by capping
+    the candidate set size after scoring.
     """
     m = int(nargs["M"])
     n = int(nargs["N"])
@@ -982,6 +1007,9 @@ def _qmm_config_pruner(configs, nargs, **_kwargs):
     group_size = int(nargs.get("GROUP_SIZE", 0))
     requested_split_k = int(nargs.get("SPLIT_K", 1))
     smem_limit = _qmm_smem_limit_bytes()
+    max_candidates_default = _parse_positive_int_env("EJKERNEL_TRITON_QMM_AUTOTUNE_MAX_CANDIDATES", 12)
+    max_candidates_large_default = _parse_positive_int_env("EJKERNEL_TRITON_QMM_AUTOTUNE_MAX_CANDIDATES_LARGE", 8)
+    min_smem_large_default = _parse_nonnegative_int_env("EJKERNEL_TRITON_QMM_AUTOTUNE_MIN_SMEM_BYTES_LARGE", 24 * 1024)
 
     def _nearest_choices(value: int, choices: tuple[int, ...], count: int) -> set[int]:
         ranked = sorted(choices, key=lambda x: abs(x - value))
@@ -994,6 +1022,7 @@ def _qmm_config_pruner(configs, nargs, **_kwargs):
     pruned = []
     large_mn = m >= 2048 and n >= 2048
     large_k = k >= 4096
+    min_smem_bytes = min_smem_large_default if (large_mn and large_k) else 0
     if large_mn and large_k:
         bm_keep = {128}
         bn_keep = {128, 256}
@@ -1004,9 +1033,14 @@ def _qmm_config_pruner(configs, nargs, **_kwargs):
         bk = cfg.kwargs["BK"]
         split_k = cfg.kwargs["SPLIT_K"]
         num_stages = int(getattr(cfg, "num_stages", 1))
+        smem = _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages)
 
         # Avoid configs that will never launch due to shared memory limits.
-        if _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages) > smem_limit:
+        if smem > smem_limit:
+            continue
+        # For large GEMM shapes, drop tiny-SMEM tiles that are almost always
+        # throughput-poor but still expensive to autotune.
+        if min_smem_bytes > 0 and smem < min_smem_bytes:
             continue
 
         if bm not in bm_keep or bn not in bn_keep or bk not in bk_keep:
@@ -1031,7 +1065,32 @@ def _qmm_config_pruner(configs, nargs, **_kwargs):
 
         pruned.append(cfg)
     if pruned:
-        return pruned
+
+        def _score(cfg) -> tuple[int, int, int, int, int]:
+            bm = int(cfg.kwargs["BM"])
+            bn = int(cfg.kwargs["BN"])
+            bk = int(cfg.kwargs["BK"])
+            split_k = int(cfg.kwargs.get("SPLIT_K", 1))
+            split_penalty = 0 if split_k == requested_split_k else 1
+            distance = abs(bm - m) + abs(bn - n) + abs(bk - k)
+            tile_volume = bm * bn * bk
+            smem = _qmm_estimated_smem_bytes(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                num_stages=int(getattr(cfg, "num_stages", 1)),
+            )
+            return (
+                split_penalty,
+                distance,
+                -tile_volume,
+                -smem,
+                -int(getattr(cfg, "num_warps", 1)),
+            )
+
+        pruned.sort(key=_score)
+        max_candidates = max_candidates_large_default if (large_mn and large_k) else max_candidates_default
+        return pruned[:max_candidates]
 
     # Keep autotune alive for legal-but-narrow shapes (notably M==1 overrides).
     fallback = [cfg for cfg in configs if int(cfg.kwargs.get("SPLIT_K", 1)) == requested_split_k]

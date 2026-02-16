@@ -21,7 +21,6 @@ import pytest
 from ejkernel.modules.operations import quantized_matmul
 from ejkernel.quantization import prepack_quantized_weights
 
-
 # Mode budgets from ../quant-plans/jax_numerics_validation.md.
 # We validate relative errors between fuse=True and fuse=False (dense reference)
 # runs on GPU for strict-fuse QMM calls.
@@ -106,7 +105,15 @@ def test_qmm_strict_fuse_gpu_parity_budgets():
                     assert bool(jnp.all(jnp.isfinite(zeros.astype(jnp.float32))))
 
                 fn_ref = jax.jit(
-                    lambda xi, wi, si, zi: quantized_matmul(
+                    lambda xi,
+                    wi,
+                    si,
+                    zi,
+                    mode=mode,
+                    bits=bits,
+                    group_size=group_size,
+                    axis=axis,
+                    transpose=transpose: quantized_matmul(
                         xi,
                         wi,
                         si,
@@ -121,7 +128,15 @@ def test_qmm_strict_fuse_gpu_parity_budgets():
                     )
                 )
                 fn_fused = jax.jit(
-                    lambda xi, wi, si, zi: quantized_matmul(
+                    lambda xi,
+                    wi,
+                    si,
+                    zi,
+                    mode=mode,
+                    bits=bits,
+                    group_size=group_size,
+                    axis=axis,
+                    transpose=transpose: quantized_matmul(
                         xi,
                         wi,
                         si,
@@ -156,4 +171,3 @@ def test_qmm_strict_fuse_gpu_parity_budgets():
                     f"mode={mode} bits={bits} group_size={group_size} axis={axis} m={m}: "
                     f"relative_mean_abs={rel_abs_f:.4e} > budget={bud_rel_abs:.4e}"
                 )
-

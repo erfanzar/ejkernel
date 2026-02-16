@@ -21,8 +21,8 @@ import pytest
 
 from ejkernel.modules.operations import quantized_matmul
 from ejkernel.quantization import (
-    QuantRuntimeConfig,
     QuantizedArray,
+    QuantRuntimeConfig,
     dense_quantized_matmul,
     dequantize,
     prepack_quantized_array,
@@ -30,8 +30,8 @@ from ejkernel.quantization import (
     quantize,
     quantize_array,
 )
-from ejkernel.quantization.runtime import resolve_runtime_config
 from ejkernel.quantization._utils.bitpack import _pack_bits, _unpack_bits
+from ejkernel.quantization.runtime import resolve_runtime_config
 
 
 @pytest.mark.parametrize(

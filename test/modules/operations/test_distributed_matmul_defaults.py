@@ -7,11 +7,15 @@ import pytest
 np = pytest.importorskip("numpy")
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
-from jax.sharding import Mesh, PartitionSpec
+jax_sharding = importlib.import_module("jax.sharding")
+Mesh = jax_sharding.Mesh
+PartitionSpec = jax_sharding.PartitionSpec
 
 ag_mod = importlib.import_module("ejkernel.modules.operations.all_gather_matmul")
 rs_mod = importlib.import_module("ejkernel.modules.operations.reduce_scatter_matmul")
-from ejkernel.modules.operations.configs import AllGatherMatmulConfig, ReduceScatterMatmulConfig
+configs_mod = importlib.import_module("ejkernel.modules.operations.configs")
+AllGatherMatmulConfig = configs_mod.AllGatherMatmulConfig
+ReduceScatterMatmulConfig = configs_mod.ReduceScatterMatmulConfig
 
 
 def _single_device_mesh() -> Mesh:

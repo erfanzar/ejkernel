@@ -371,6 +371,35 @@ def _tpu_predecode_fits_memory_model(k: int, n: int) -> bool:
     return (k * n * 2) <= cap
 
 
+def _parse_positive_int_env(name: str, default: int) -> int:
+    """Parse a positive integer env var with a safe fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        return int(default)
+    return max(1, value)
+
+
+def _parse_nonnegative_int_env(name: str, default: int) -> int:
+    """Parse a non-negative integer env var with a safe fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        return int(default)
+    return max(0, value)
+
+
+def _tpu_tile_working_set_bytes(*, block_m: int, block_n: int, block_k: int) -> int:
+    """Estimate per-tile bytes touched by fused TPU QMM hot loop."""
+    return int((block_m * block_k + block_k * block_n) * 2)
+
+
 def _prefer_packed_tpu_path(
     *,
     m: int,
@@ -504,7 +533,7 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
     """
     mode = str(inv.kwargs.get("mode", "affine"))
     group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
-    _m, k, n, _ = _infer_mkn(inv, group_size)
+    m, k, n, _ = _infer_mkn(inv, group_size)
 
     values_per_word = 32 // bits if bits in (4, 8) else 1
     align_n = _lcm(128, _lcm(group_size, values_per_word))
@@ -523,6 +552,15 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
         bn_opts = [max(align_n, 128)]
         bk_opts = (128,)
 
+    max_candidates_default = _parse_positive_int_env("EJKERNEL_QMM_TPU_AUTOTUNE_MAX_CANDIDATES", 12)
+    max_candidates_large_default = _parse_positive_int_env("EJKERNEL_QMM_TPU_AUTOTUNE_MAX_CANDIDATES_LARGE", 8)
+    min_tile_bytes_large_default = _parse_nonnegative_int_env(
+        "EJKERNEL_QMM_TPU_AUTOTUNE_MIN_TILE_BYTES_LARGE",
+        96 * 1024,
+    )
+    large_problem = m >= 128 and n >= 4096 and k >= 4096
+    min_tile_bytes = min_tile_bytes_large_default if large_problem else 0
+
     x = _inv_arg(inv, "x", 0)
     w = _inv_arg(inv, "w", 1)
     scales = _inv_arg(inv, "scales", 2)
@@ -535,10 +573,32 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
 
     configs: list[QuantizedMatmulConfig] = []
     predecode_ok = _tpu_predecode_fits_memory_model(k, n)
+    target_bm = 256 if m >= 2048 else 128
+    target_bn = _nearest_choices(n, tuple(bn_opts), count=1)[0]
+    target_bk = 256 if k >= 4096 else 128
+    prefer_packed = bool(
+        bits in (4, 8)
+        and _prefer_packed_tpu_path(
+            m=m,
+            n=n,
+            k=k,
+            block_m=target_bm,
+            block_n=target_bn,
+            block_k=target_bk,
+            mode=mode,
+            bits=bits,
+            group_size=group_size,
+        )
+    )
 
     for bm in bm_opts:
         for bn in bn_opts:
             for bk in bk_opts:
+                if (
+                    min_tile_bytes > 0
+                    and _tpu_tile_working_set_bytes(block_m=bm, block_n=bn, block_k=bk) < min_tile_bytes
+                ):
+                    continue
                 packed_legal = False
                 if _packed_legal_forward is not None and bits in (4, 8):
                     packed_legal = bool(
@@ -601,6 +661,38 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
                                 backend="tpu",
                             )
                         )
+
+    if configs:
+
+        def _path_rank(path: str) -> int:
+            if prefer_packed:
+                order = {"packed": 0, "hybrid": 1, "predecode": 2}
+            else:
+                order = {"predecode": 0, "packed": 1, "hybrid": 2}
+            return order.get(path, 3)
+
+        def _score(cfg: QuantizedMatmulConfig) -> tuple[int, int, int]:
+            distance = abs(cfg.block_m - target_bm) + abs(cfg.block_n - target_bn) + abs(cfg.block_k - target_bk)
+            tile_work = cfg.block_m * cfg.block_n * cfg.block_k
+            return (_path_rank(cfg.tpu_path), distance, -tile_work)
+
+        dedup: dict[
+            tuple[int, int, int, str, str, str],
+            QuantizedMatmulConfig,
+        ] = {}
+        for cfg in configs:
+            key = (
+                int(cfg.block_m),
+                int(cfg.block_n),
+                int(cfg.block_k),
+                str(cfg.tpu_path),
+                str(cfg.platform),
+                str(cfg.backend),
+            )
+            dedup.setdefault(key, cfg)
+        ranked = sorted(dedup.values(), key=_score)
+        max_candidates = max_candidates_large_default if large_problem else max_candidates_default
+        return ranked[:max_candidates]
 
     if not configs:
         configs.append(_pallas_tpu_heuristic_cfg(inv))
@@ -1082,7 +1174,10 @@ _quantized_matmul_executor: Executor[QuantizedMatmulConfig, Array] = Executor(
             cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
             validate_backward=False,
         ),
-        tuner=Tuner(warmup=5, iters=100),
+        tuner=Tuner(
+            warmup=_parse_nonnegative_int_env("EJKERNEL_QMM_AUTOTUNE_WARMUP", 5),
+            iters=_parse_positive_int_env("EJKERNEL_QMM_AUTOTUNE_ITERS", 100),
+        ),
         persistent=PersistentCache("quantized-matmul", cfg_type=QuantizedMatmulConfig),
     )
 )

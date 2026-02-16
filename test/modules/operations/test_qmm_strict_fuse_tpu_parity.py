@@ -21,7 +21,6 @@ import pytest
 from ejkernel.modules.operations import quantized_matmul
 from ejkernel.quantization import prepack_quantized_weights
 
-
 _BUDGETS = {
     # Match GPU parity budgets (kept intentionally loose; this is a smoke test).
     "affine": (1.5e-2, 2.5e-2),
@@ -89,7 +88,15 @@ def test_qmm_strict_fuse_tpu_parity_smoke(monkeypatch):
                     zeros = None
 
                 fn_ref = jax.jit(
-                    lambda xi, wi, si, zi: quantized_matmul(
+                    lambda xi,
+                    wi,
+                    si,
+                    zi,
+                    mode=mode,
+                    bits=bits,
+                    group_size=group_size,
+                    axis=axis,
+                    transpose=transpose: quantized_matmul(
                         xi,
                         wi,
                         si,
@@ -107,7 +114,16 @@ def test_qmm_strict_fuse_tpu_parity_smoke(monkeypatch):
 
                 for platform in ("xla", "pallas"):
                     fn_fused = jax.jit(
-                        lambda xi, wi, si, zi: quantized_matmul(
+                        lambda xi,
+                        wi,
+                        si,
+                        zi,
+                        mode=mode,
+                        bits=bits,
+                        group_size=group_size,
+                        axis=axis,
+                        transpose=transpose,
+                        platform=platform: quantized_matmul(
                             xi,
                             wi,
                             si,
@@ -140,4 +156,3 @@ def test_qmm_strict_fuse_tpu_parity_smoke(monkeypatch):
                         f"plat={platform} mode={mode} bits={bits} group_size={group_size} axis={axis} m={m}: "
                         f"relative_mean_abs={rel_abs_f:.4e} > budget={bud_rel_abs:.4e}"
                     )
-

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import importlib.util
 
 import jax
@@ -27,9 +28,12 @@ if not _has_cutlass:
 if jax.devices()[0].platform != "gpu":
     pytest.skip("CUTE tests require GPU backend", allow_module_level=True)
 
-from ejkernel.kernels._cuda.flash_attention import flash_attention as cuda_flash_attention
-from ejkernel.kernels._cute.flash_attention import flash_attention as cute_flash_attention
-from ejkernel.kernels._xla.flash_attention import flash_attention as xla_flash_attention
+_cuda_flash_module = importlib.import_module("ejkernel.kernels._cuda.flash_attention")
+cuda_flash_attention = _cuda_flash_module.flash_attention
+_cute_flash_module = importlib.import_module("ejkernel.kernels._cute.flash_attention")
+cute_flash_attention = _cute_flash_module.flash_attention
+_xla_flash_module = importlib.import_module("ejkernel.kernels._xla.flash_attention")
+xla_flash_attention = _xla_flash_module.flash_attention
 
 _HAS_CUDA_FLASH = True
 try:
@@ -238,7 +242,7 @@ def test_flash_attention_cute_dropout_is_explicitly_rejected():
     k = jax.random.normal(kk, (1, 16, 4, 32), dtype=jnp.float16)
     v = jax.random.normal(kv, (1, 16, 4, 32), dtype=jnp.float16)
 
-    with pytest.raises(EjkernelRuntimeError, match="dropout_seed is not supported|dropout_prob must be 0.0"):
+    with pytest.raises(EjkernelRuntimeError, match=r"dropout_seed is not supported|dropout_prob must be 0\.0"):
         _ = cute_flash_attention(q, k, v, dropout_prob=0.1, dropout_seed=7, causal=True)
 
 
