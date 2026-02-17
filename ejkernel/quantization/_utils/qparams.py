@@ -469,7 +469,7 @@ def validate_packed_quantized_matmul_layout(
 
     if mode == "affine":
         if zeros is None:
-            raise ValueError("affine quantized_matmul requires zeros.")
+            raise ValueError("affine quantized_matmul requires `zeros`.")
         z_shape = getattr(zeros, "shape", None)
         if z_shape is None:
             raise ValueError("zeros must be array-like when provided.")

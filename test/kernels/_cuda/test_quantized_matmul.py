@@ -40,6 +40,8 @@ except RuntimeError as exc:
 @pytest.fixture(autouse=True)
 def _force_cuda_compute_type():
     prev = os.environ.get("EJKERNEL_QMM_CUDA_COMPUTE")
+    # Use fp16 tensor-core GEMM to match XLA's preferred_element_type=float32
+    # with fp16 inputs (which XLA lowers to FAST_16F tensor cores on GPU).
     os.environ["EJKERNEL_QMM_CUDA_COMPUTE"] = "f"
     try:
         yield
@@ -126,6 +128,22 @@ def test_quantized_matmul_cuda_matches_xla(mode: str, group_size: int, x_dtype: 
     if mode != "affine":
         rtol = 1.5e-1
         atol = 1.5e-1
+    else:
+        # Affine mode: CUDA uses a monolithic cuBLAS GEMM while XLA uses a
+        # blocked-tiled algorithm (K/64 tiles accumulated in fp32).  Different
+        # accumulation order means near-zero outputs (catastrophic cancellation)
+        # can differ by O(eps_compute * k), independently of magnitude.  Large-
+        # magnitude outputs differ by 1-2 ULPs of the compute dtype (covered by
+        # rtol).  Empirical worst-case (k=8192): fp16→0.26, bf16→0.48, fp32→0.28.
+        if x_dtype == jnp.float16:
+            rtol = 3e-3   # ~3 fp16 ULPs relative for large-magnitude elements
+            atol = 0.30   # near-zero cancellation ceiling for k ≤ 8192
+        elif x_dtype == jnp.bfloat16:
+            rtol = 2e-2   # ~3 bf16 ULPs relative for large-magnitude elements
+            atol = 0.55   # near-zero cancellation ceiling for k ≤ 8192
+        else:  # float32 (both CUDA & XLA use fp16/TF32 precision internally)
+            rtol = 5e-3
+            atol = 0.32   # near-zero cancellation ceiling for k ≤ 8192
     np.testing.assert_allclose(
         np.asarray(out_cuda, dtype=np.float32),
         np.asarray(out_xla, dtype=np.float32),

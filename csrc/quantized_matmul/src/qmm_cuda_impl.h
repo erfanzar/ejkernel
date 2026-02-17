@@ -116,6 +116,13 @@ __global__ void convert_f32_to_bf16(const float *in, __nv_bfloat16 *out,
   }
 }
 
+__global__ void convert_f16_to_f32(const half *in, float *out, int64_t size) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < size) {
+    out[idx] = __half2float(in[idx]);
+  }
+}
+
 inline bool IsFiniteInt64(int64_t v) {
   return v >= 0 && v <= std::numeric_limits<int32_t>::max();
 }
@@ -540,9 +547,16 @@ __global__ void DequantToBf16Kernel(const uint32_t *wq, const ScaleT *scales,
         transposed ? (wq + n * n_words) : (wq + k * n_words);
     uint32_t q = LoadPackedQ(wq_row, transposed ? k : n, bits);
     int64_t g = transposed ? (k / group_size) : (n / group_size);
-    float val =
-        DequantValue(q, scales, biases, n, k, g, n_groups, transposed, mode);
-    out[idx] = __float2bfloat16(val);
+    __nv_bfloat16 result;
+    if (mode == 0) {
+      int64_t s_idx = transposed ? (n * n_groups + g) : (k * n_groups + g);
+      result = DequantAffineToBf16(q, scales[s_idx], biases[s_idx]);
+    } else {
+      float val =
+          DequantValue(q, scales, biases, n, k, g, n_groups, transposed, mode);
+      result = __float2bfloat16(val);
+    }
+    out[idx] = result;
   }
 }
 
@@ -1885,12 +1899,18 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
 
   const half *x_half = nullptr;
   const __nv_bfloat16 *x_bf16 = nullptr;
+  const float *x_f32 = nullptr;
   size_t x_elems = static_cast<size_t>(M) * static_cast<size_t>(K);
+  // When x is fp32, keep it in fp32 and pair with an fp32 upcast of w_deq for
+  // a full-precision fp32 GEMM that matches XLA's dot_general(fp32, fp16, pref=fp32).
+  bool x_is_f32 = (!use_bf16_gemm && x.element_type() == xla::ffi::DataType::F32);
 
   if (use_bf16_gemm) {
     x_bf16 = static_cast<const __nv_bfloat16 *>(x.untyped_data());
   } else if (x.element_type() == xla::ffi::DataType::F16) {
     x_half = static_cast<const half *>(x.untyped_data());
+  } else if (x_is_f32) {
+    x_f32 = static_cast<const float *>(x.untyped_data());
   } else {
     size_t x_half_bytes = x_elems * sizeof(half);
     auto x_half_opt = scratch.Allocate(x_half_bytes, alignof(half));
@@ -1901,11 +1921,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     half *x_half_out = reinterpret_cast<half *>(x_half_ptr);
     dim3 cblock(256);
     dim3 cgrid(static_cast<uint32_t>((x_elems + cblock.x - 1) / cblock.x));
-    if (x.element_type() == xla::ffi::DataType::F32) {
-      convert_f32_to_f16<<<cgrid, cblock, 0, stream>>>(
-          static_cast<const float *>(x.untyped_data()), x_half_out,
-          static_cast<int64_t>(x_elems));
-    } else if (x.element_type() == xla::ffi::DataType::BF16) {
+    if (x.element_type() == xla::ffi::DataType::BF16) {
       convert_bf16_to_f16<<<cgrid, cblock, 0, stream>>>(
           static_cast<const __nv_bfloat16 *>(x.untyped_data()), x_half_out,
           static_cast<int64_t>(x_elems));
@@ -2091,22 +2107,53 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     }
   }
 
+  // For fp32 x: upcast dequanted fp16 w to fp32 so both operands are fp32.
+  // This matches XLA's dot_general(fp32, fp16, pref=fp32) which does not
+  // truncate the fp32 activations, keeping full precision.
+  float *w_deq_f32 = nullptr;
+  if (x_is_f32 && w_deq != nullptr) {
+    int64_t w_elems = static_cast<int64_t>(K) * static_cast<int64_t>(N);
+    size_t w_f32_bytes = static_cast<size_t>(w_elems) * sizeof(float);
+    auto w_f32_opt = scratch.Allocate(w_f32_bytes, alignof(float));
+    if (!w_f32_opt.has_value()) {
+      return MakeInternal("Failed to allocate scratch buffer for fp32 w upcast.");
+    }
+    w_deq_f32 = reinterpret_cast<float *>(*w_f32_opt);
+    dim3 cblock(256);
+    dim3 cgrid(static_cast<uint32_t>((w_elems + cblock.x - 1) / cblock.x));
+    convert_f16_to_f32<<<cgrid, cblock, 0, stream>>>(w_deq, w_deq_f32, w_elems);
+    if (Error err = CheckCuda(cudaPeekAtLastError(), "f16_to_f32 w upcast launch");
+        err.failure()) {
+      return err;
+    }
+  }
+
   GemmBackend backend = GetGemmBackend();
   cublasComputeType_t compute_type = ResolveCublasComputeType(x_dtype, out_dtype);
   if (use_bf16_gemm) {
     compute_type = CUBLAS_COMPUTE_32F_FAST_16BF;
+  } else if (x_is_f32) {
+    // Pedantic fp32 GEMM: no TF32/fp16 shortcuts, matches XLA's precision for
+    // dot_general(fp32, fp16, preferred_element_type=fp32). On Ampere+, standard
+    // COMPUTE_32F uses TF32 (10-bit mantissa), same as fp16. PEDANTIC forces true
+    // 23-bit fp32, matching how XLA upcast fp16 w to fp32 for the GEMM.
+    compute_type = CUBLAS_COMPUTE_32F_PEDANTIC;
   } else if (compute_type == CUBLAS_COMPUTE_32F_FAST_16BF) {
     // Inputs are dequantized/cast to FP16 for GEMM, so use a FP16 compute path.
     compute_type = CUBLAS_COMPUTE_32F_FAST_16F;
   }
   const void *gemm_a_ptr =
       use_bf16_gemm ? static_cast<const void *>(w_deq_bf16)
+      : x_is_f32    ? static_cast<const void *>(w_deq_f32)
                     : static_cast<const void *>(w_deq);
   const void *gemm_b_ptr =
       use_bf16_gemm ? static_cast<const void *>(x_bf16)
+      : x_is_f32    ? static_cast<const void *>(x_f32)
                     : static_cast<const void *>(x_half);
-  cudaDataType_t gemm_a_type = use_bf16_gemm ? CUDA_R_16BF : CUDA_R_16F;
-  cudaDataType_t gemm_b_type = use_bf16_gemm ? CUDA_R_16BF : CUDA_R_16F;
+  cudaDataType_t gemm_a_type =
+      use_bf16_gemm ? CUDA_R_16BF : (x_is_f32 ? CUDA_R_32F : CUDA_R_16F);
+  cudaDataType_t gemm_b_type =
+      use_bf16_gemm ? CUDA_R_16BF : (x_is_f32 ? CUDA_R_32F : CUDA_R_16F);
 
   if (use_bf16_gemm &&
       (backend == GemmBackend::kCutlass ||
@@ -2160,7 +2207,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     if (!err.failure()) {
       return finalize_bf16();
     }
-    if (!use_bf16_gemm) {
+    if (!use_bf16_gemm && !x_is_f32) {
       Error cutlass_err = dispatch_cutlass([&](auto *out_ptr) {
         return RunCutlassGemm(w_deq, x_half, out_ptr, M, N, K, stream, scratch);
       });
@@ -2181,7 +2228,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     if (StrictGemmBackend()) {
       return err;
     }
-  } else if (backend == GemmBackend::kCutlass) {
+  } else if (backend == GemmBackend::kCutlass && !x_is_f32) {
     Error err = dispatch_cutlass([&](auto *out_ptr) {
       return RunCutlassGemm(w_deq, x_half, out_ptr, M, N, K, stream, scratch);
     });
@@ -2191,7 +2238,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     if (StrictGemmBackend()) {
       return err;
     }
-  } else if (backend == GemmBackend::kCutlassTuned) {
+  } else if (backend == GemmBackend::kCutlassTuned && !x_is_f32) {
     Error err = dispatch_cutlass([&](auto *out_ptr) {
       return RunCutlassGemmTuned(w_deq, x_half, out_ptr, M, N, K, stream,
                                  scratch);

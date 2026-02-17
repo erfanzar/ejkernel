@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -452,7 +452,7 @@ requires-dist = [
     { name = "jax", specifier = "~=0.9.0" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.9.0" },
     { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.9.0" },
-    { name = "jax-metallib", marker = "extra == 'mps'", specifier = "==0.9.1" },
+    { name = "jax-metallib", marker = "extra == 'mps'", specifier = "==0.9.4" },
     { name = "jax-tvm-ffi", marker = "extra == 'cuda'", specifier = "==0.1.2" },
     { name = "jaxlib", specifier = "~=0.9.0" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
@@ -893,15 +893,15 @@ with-cuda = [
 
 [[package]]
 name = "jax-metallib"
-version = "0.9.1"
+version = "0.9.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jax" },
     { name = "jaxlib" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5a/79/f229d52bf17bdc0108fddd6caf527eed78a242fe5dc14e23b5a23361b01e/jax_metallib-0.9.1.tar.gz", hash = "sha256:09ce4d944d0ffa212c12ca8742665d776de333e4f549d8655acda9585e55aed6", size = 161371, upload-time = "2026-02-14T19:00:38.508Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4d/1b/0a91b264690cb7b2caa4673099ae19a4e8e152385557fc7a5e962abde673/jax_metallib-0.9.4.tar.gz", hash = "sha256:1a851486867c291bfa02baa42b02f2c44286a8e475f557636b4d5b61bc1fc4b5", size = 257326, upload-time = "2026-02-17T17:42:47.285Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/29/80/be7ed0aebc963f9a51e9e3ef45021780b68a2af7b3aa2e2a79669a409ec7/jax_metallib-0.9.1-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:816bf346b3f1b12e5f6aee6156d80e4da1ae2413203e4a032806b8379ef01d51", size = 6674100, upload-time = "2026-02-14T19:00:34.713Z" },
+    { url = "https://files.pythonhosted.org/packages/75/a3/1e00232b1bc3e5c777af1389ca5e5b8799f5de309b6b5aa0518be6c17fb3/jax_metallib-0.9.4-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:498c81fd07f0718cb0dcd7a3224af3ade973cf00464c5109f00bd17481f22f03", size = 6770169, upload-time = "2026-02-17T17:42:44.793Z" },
 ]
 
 [[package]]
