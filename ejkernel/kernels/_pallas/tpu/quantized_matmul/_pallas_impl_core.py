@@ -33,8 +33,10 @@ Key Components:
       for bf16 matrix multiplication with fp32 accumulation
 
 Environment Variables:
-    - EJKERNEL_QMM_TPU_PATH: Selects "hybrid", "packed", or "predecode"
-      execution path (default: "hybrid")
+    - EJKERNEL_QMM_TPU_PATH: Selects execution path for TPU QMM.
+      TPU Pallas currently supports packed-only execution; "hybrid" and
+      "predecode" are accepted as legacy aliases and normalize to "packed"
+      (default: "packed")
     - EJKERNEL_QMM_TPU_PREDECODE_CACHE: Enable/disable predecode caching
       (default: True)
     - EJKERNEL_QMM_TPU_PREDECODE_CACHE_MAX_ITEMS: Max cached dense weights
@@ -57,13 +59,7 @@ from jax import core as jax_core
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ejkernel.quantization._utils.fp_tables import (
-    _get_e2m1_table,
-    _get_e4m3_table,
-    _get_nf4_table,
-)
-
-_QMM_PATHS = frozenset(("hybrid", "packed", "predecode"))
+_QMM_PATHS = frozenset(("packed", "hybrid", "predecode"))
 _DEFAULT_PREDECODE_CACHE_MAX_ITEMS = 2
 _DEFAULT_PREDECODE_MAX_BYTES = 256 * 1024 * 1024
 _DEFAULT_TPU_VMEM_LIMIT_BYTES = 96 * 1024 * 1024
@@ -349,12 +345,13 @@ def get_qmm_tpu_path() -> str:
     """Read the preferred QMM TPU execution path from the environment.
 
     Returns:
-        One of "hybrid", "packed", or "predecode" (default: "hybrid").
+        Always "packed". Legacy values ("hybrid", "predecode") are accepted
+        for backward compatibility and normalize to "packed".
     """
-    path = os.getenv("EJKERNEL_QMM_TPU_PATH", "hybrid").strip().lower()
+    path = os.getenv("EJKERNEL_QMM_TPU_PATH", "packed").strip().lower()
     if path not in _QMM_PATHS:
-        return "hybrid"
-    return path
+        return "packed"
+    return "packed"
 
 
 def get_predecode_cache_enabled() -> bool:
@@ -441,7 +438,7 @@ def choose_packed_n_subtile(
 
 
 def _decode_e2m1(code: jax.Array) -> jax.Array:
-    """Decode E2M1 (MXFP4) codes to float32 via lookup table.
+    """Decode E2M1 (MXFP4) codes to float32.
 
     Args:
         code: Integer code array with values in [0, 7].
@@ -449,12 +446,19 @@ def _decode_e2m1(code: jax.Array) -> jax.Array:
     Returns:
         Float32 array of decoded values.
     """
-    table, _ = _get_e2m1_table()
-    return table[code.astype(jnp.int32)]
+    c = code.astype(jnp.uint32)
+    sign = ((c >> jnp.uint32(3)) & jnp.uint32(0x1)).astype(jnp.int32)
+    exp = ((c >> jnp.uint32(1)) & jnp.uint32(0x3)).astype(jnp.int32)
+    mant = (c & jnp.uint32(0x1)).astype(jnp.int32)
+    mant_f = mant.astype(jnp.float32) * jnp.float32(0.5)
+    subnormal = mant_f
+    normal = (jnp.float32(1.0) + mant_f) * jnp.exp2((exp - jnp.int32(1)).astype(jnp.float32))
+    vals = jnp.where(exp == 0, subnormal, normal)
+    return jnp.where(sign == 0, vals, -vals)
 
 
 def _decode_e4m3(code: jax.Array) -> jax.Array:
-    """Decode E4M3 (FP8) codes to float32 via lookup table.
+    """Decode E4M3 (FP8) codes to float32.
 
     Args:
         code: Integer code array with values in [0, 255].
@@ -462,12 +466,21 @@ def _decode_e4m3(code: jax.Array) -> jax.Array:
     Returns:
         Float32 array of decoded values.
     """
-    table, _ = _get_e4m3_table()
-    return table[code.astype(jnp.int32)]
+    c = code.astype(jnp.uint32)
+    sign = ((c >> jnp.uint32(7)) & jnp.uint32(0x1)).astype(jnp.int32)
+    exp = ((c >> jnp.uint32(3)) & jnp.uint32(0xF)).astype(jnp.int32)
+    mant = (c & jnp.uint32(0x7)).astype(jnp.int32)
+    mant_f = mant.astype(jnp.float32) / jnp.float32(8.0)
+    subnormal = mant_f * jnp.float32(0.015625)
+    normal = (jnp.float32(1.0) + mant_f) * jnp.exp2((exp - jnp.int32(7)).astype(jnp.float32))
+    vals = jnp.where(exp == 0, subnormal, normal)
+    nan_mask = (exp == 0xF) & (mant == 0x7)
+    vals = jnp.where(nan_mask, jnp.nan, vals)
+    return jnp.where(sign == 0, vals, -vals)
 
 
 def _decode_nf4(code: jax.Array) -> jax.Array:
-    """Decode NF4 (NormalFloat4) codes to float32 via lookup table.
+    """Decode NF4 (NormalFloat4) codes to float32.
 
     Args:
         code: Integer code array with values in [0, 15].
@@ -475,8 +488,70 @@ def _decode_nf4(code: jax.Array) -> jax.Array:
     Returns:
         Float32 array of decoded values.
     """
-    table = _get_nf4_table()
-    return table[code.astype(jnp.int32)]
+    c = code.astype(jnp.int32)
+    # Table-free mapping avoids capturing array constants inside Pallas kernels.
+    vals = jnp.where(
+        c == 0,
+        jnp.float32(-1.0),
+        jnp.where(
+            c == 1,
+            jnp.float32(-0.6961928),
+            jnp.where(
+                c == 2,
+                jnp.float32(-0.52507305),
+                jnp.where(
+                    c == 3,
+                    jnp.float32(-0.3949175),
+                    jnp.where(
+                        c == 4,
+                        jnp.float32(-0.28444138),
+                        jnp.where(
+                            c == 5,
+                            jnp.float32(-0.18477343),
+                            jnp.where(
+                                c == 6,
+                                jnp.float32(-0.091050036),
+                                jnp.where(
+                                    c == 7,
+                                    jnp.float32(0.0),
+                                    jnp.where(
+                                        c == 8,
+                                        jnp.float32(0.0795803),
+                                        jnp.where(
+                                            c == 9,
+                                            jnp.float32(0.1609302),
+                                            jnp.where(
+                                                c == 10,
+                                                jnp.float32(0.2461123),
+                                                jnp.where(
+                                                    c == 11,
+                                                    jnp.float32(0.33791524),
+                                                    jnp.where(
+                                                        c == 12,
+                                                        jnp.float32(0.44070983),
+                                                        jnp.where(
+                                                            c == 13,
+                                                            jnp.float32(0.562617),
+                                                            jnp.where(
+                                                                c == 14,
+                                                                jnp.float32(0.72295684),
+                                                                jnp.float32(1.0),
+                                                            ),
+                                                        ),
+                                                    ),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return vals
 
 
 def _unpack_bits_4_8(words: jax.Array, bits: int) -> jax.Array:

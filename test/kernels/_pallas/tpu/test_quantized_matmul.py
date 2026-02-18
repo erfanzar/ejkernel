@@ -25,7 +25,6 @@ from ejkernel.quantization import prepack_quantized_weights
 
 pallas_qmm_iface = importlib.import_module("ejkernel.kernels._pallas.tpu.quantized_matmul._interface")
 pallas_qmm_bwd = importlib.import_module("ejkernel.kernels._pallas.tpu.quantized_matmul._pallas_impl_bwd")
-pallas_qmm_core = importlib.import_module("ejkernel.kernels._pallas.tpu.quantized_matmul._pallas_impl_core")
 pallas_qmm_fwd = importlib.import_module("ejkernel.kernels._pallas.tpu.quantized_matmul._pallas_impl_fwd")
 
 
@@ -204,7 +203,7 @@ def test_quantized_matmul_pallas_ignores_use_bf16_flag():
     )
 
 
-def test_quantized_matmul_pallas_large_n_hybrid_matches_xla(monkeypatch: pytest.MonkeyPatch):
+def test_quantized_matmul_pallas_large_n_packed_matches_xla(monkeypatch: pytest.MonkeyPatch):
     key = jax.random.PRNGKey(1337)
     kx, kw = jax.random.split(key, 2)
     m, k, n = 16, 128, 256
@@ -218,7 +217,7 @@ def test_quantized_matmul_pallas_large_n_hybrid_matches_xla(monkeypatch: pytest.
     w_q = jax.device_put(w_q, dev)
     scales = jax.device_put(scales, dev)
     biases = jax.device_put(biases, dev)
-    monkeypatch.setenv("EJKERNEL_QMM_TPU_PATH", "hybrid")
+    monkeypatch.setenv("EJKERNEL_QMM_TPU_PATH", "packed")
 
     out_pallas = pallas_quantized_matmul(
         x,
@@ -253,7 +252,7 @@ def test_quantized_matmul_pallas_large_n_hybrid_matches_xla(monkeypatch: pytest.
     )
 
 
-def test_quantized_matmul_pallas_hybrid_uses_predecode_when_packed_illegal(monkeypatch: pytest.MonkeyPatch):
+def test_quantized_matmul_pallas_packed_illegal_falls_back_to_xla(monkeypatch: pytest.MonkeyPatch):
     key = jax.random.PRNGKey(1441)
     kx, kw = jax.random.split(key, 2)
     m, k, n = 16, 128, 256
@@ -267,17 +266,13 @@ def test_quantized_matmul_pallas_hybrid_uses_predecode_when_packed_illegal(monke
     w_q = jax.device_put(w_q, dev)
     scales = jax.device_put(scales, dev)
     biases = jax.device_put(biases, dev)
-    monkeypatch.setenv("EJKERNEL_QMM_TPU_PATH", "hybrid")
+    monkeypatch.setenv("EJKERNEL_QMM_TPU_PATH", "packed")
 
-    def _forbidden_xla(*args, **kwargs):
-        raise AssertionError("Unexpected XLA fallback in hybrid Pallas path.")
+    def _force_illegal(*args, **kwargs):
+        return False
 
-    def _forbidden_packed(*args, **kwargs):
-        raise AssertionError("Packed path should be illegal for this shape.")
-
-    monkeypatch.setattr(pallas_qmm_iface, "_xla_quantized_matmul", _forbidden_xla)
-    monkeypatch.setattr(pallas_qmm_fwd, "_pallas_qmm_transpose_false_packed", _forbidden_packed)
-    out = pallas_quantized_matmul(
+    monkeypatch.setattr(pallas_qmm_iface, "_is_packed_tpu_legal", _force_illegal)
+    out_pallas = pallas_quantized_matmul(
         x,
         w_q,
         scales,
@@ -288,8 +283,25 @@ def test_quantized_matmul_pallas_hybrid_uses_predecode_when_packed_illegal(monke
         group_size=64,
         block_n=128,
     )
-    out = jax.block_until_ready(out)
-    assert out.shape == (m, n)
+    out_xla = xla_quantized_matmul(
+        x,
+        w_q,
+        scales,
+        biases,
+        transpose=False,
+        mode="affine",
+        bits=4,
+        group_size=64,
+        block_n=128,
+    )
+    out_pallas = jax.block_until_ready(out_pallas)
+    out_xla = jax.block_until_ready(out_xla)
+    np.testing.assert_allclose(
+        np.asarray(out_pallas, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=6e-2,
+        atol=6e-2,
+    )
 
 
 def test_quantized_matmul_pallas_large_n_grad_input_matches_xla(monkeypatch: pytest.MonkeyPatch):
@@ -306,7 +318,7 @@ def test_quantized_matmul_pallas_large_n_grad_input_matches_xla(monkeypatch: pyt
     w_q = jax.device_put(w_q, dev)
     scales = jax.device_put(scales, dev)
     biases = jax.device_put(biases, dev)
-    monkeypatch.setenv("EJKERNEL_QMM_TPU_PATH", "hybrid")
+    monkeypatch.setenv("EJKERNEL_QMM_TPU_PATH", "packed")
 
     def _loss_pallas(x_in):
         y = pallas_quantized_matmul(
@@ -346,8 +358,11 @@ def test_quantized_matmul_pallas_large_n_grad_input_matches_xla(monkeypatch: pyt
     )
 
 
-def test_quantized_matmul_pallas_predecode_cache_hits(monkeypatch: pytest.MonkeyPatch):
-    key = jax.random.PRNGKey(1661)
+@pytest.mark.parametrize("legacy_path", ["hybrid", "predecode"])
+def test_quantized_matmul_pallas_legacy_paths_alias_to_packed(
+    monkeypatch: pytest.MonkeyPatch, legacy_path: str
+):
+    key = jax.random.PRNGKey(1777 if legacy_path == "hybrid" else 1888)
     kx, kw = jax.random.split(key, 2)
     m, k, n = 8, 128, 256
 
@@ -361,18 +376,9 @@ def test_quantized_matmul_pallas_predecode_cache_hits(monkeypatch: pytest.Monkey
     scales = jax.device_put(scales, dev)
     biases = jax.device_put(biases, dev)
 
-    monkeypatch.setenv("EJKERNEL_QMM_TPU_PATH", "predecode")
-    monkeypatch.setenv("EJKERNEL_QMM_TPU_PREDECODE_CACHE", "1")
-    monkeypatch.setenv("EJKERNEL_QMM_TPU_PREDECODE_CACHE_MAX_ITEMS", "2")
-    calls = {"count": 0}
-    orig = pallas_qmm_core._predecode_dense_weight
-
-    def _counted(*args, **kwargs):
-        calls["count"] += 1
-        return orig(*args, **kwargs)
-
-    monkeypatch.setattr(pallas_qmm_core, "_predecode_dense_weight", _counted)
-    y0 = pallas_quantized_matmul(
+    assert pallas_qmm_iface._normalize_tpu_path(legacy_path) == "packed"
+    assert pallas_qmm_iface._normalize_tpu_path("packed") == "packed"
+    out_legacy = pallas_quantized_matmul(
         x,
         w_q,
         scales,
@@ -381,9 +387,9 @@ def test_quantized_matmul_pallas_predecode_cache_hits(monkeypatch: pytest.Monkey
         mode="affine",
         bits=4,
         group_size=64,
-        block_n=128,
+        tpu_path=legacy_path,
     )
-    y1 = pallas_quantized_matmul(
+    out_packed = pallas_quantized_matmul(
         x,
         w_q,
         scales,
@@ -392,64 +398,15 @@ def test_quantized_matmul_pallas_predecode_cache_hits(monkeypatch: pytest.Monkey
         mode="affine",
         bits=4,
         group_size=64,
-        block_n=128,
+        tpu_path="packed",
     )
-    y0 = jax.block_until_ready(y0)
-    y1 = jax.block_until_ready(y1)
+    out_legacy = jax.block_until_ready(out_legacy)
+    out_packed = jax.block_until_ready(out_packed)
     np.testing.assert_allclose(
-        np.asarray(y0, dtype=np.float32),
-        np.asarray(y1, dtype=np.float32),
+        np.asarray(out_legacy, dtype=np.float32),
+        np.asarray(out_packed, dtype=np.float32),
         rtol=0.0,
         atol=0.0,
-    )
-    assert calls["count"] == 1
-
-
-def test_quantized_matmul_pallas_predecode_memory_cap_falls_back_to_xla(monkeypatch: pytest.MonkeyPatch):
-    key = jax.random.PRNGKey(1777)
-    kx, kw = jax.random.split(key, 2)
-    m, k, n = 8, 128, 256
-
-    x = jax.random.normal(kx, (m, k), dtype=jnp.bfloat16)
-    w = jax.random.normal(kw, (n, k), dtype=jnp.bfloat16)
-    w_q, scales, biases = prepack_quantized_weights(w, mode="affine", bits=4, group_size=64)
-
-    dev = jax.devices("tpu")[0]
-    x = jax.device_put(x, dev)
-    w_q = jax.device_put(w_q, dev)
-    scales = jax.device_put(scales, dev)
-    biases = jax.device_put(biases, dev)
-
-    monkeypatch.setenv("EJKERNEL_QMM_TPU_PATH", "predecode")
-    monkeypatch.setenv("EJKERNEL_QMM_TPU_MAX_PREDECODE_BYTES", "1")
-
-    out_pallas = pallas_quantized_matmul(
-        x,
-        w_q,
-        scales,
-        biases,
-        transpose=False,
-        mode="affine",
-        bits=4,
-        group_size=64,
-    )
-    out_xla = xla_quantized_matmul(
-        x,
-        w_q,
-        scales,
-        biases,
-        transpose=False,
-        mode="affine",
-        bits=4,
-        group_size=64,
-    )
-    out_pallas = jax.block_until_ready(out_pallas)
-    out_xla = jax.block_until_ready(out_xla)
-    np.testing.assert_allclose(
-        np.asarray(out_pallas, dtype=np.float32),
-        np.asarray(out_xla, dtype=np.float32),
-        rtol=6e-2,
-        atol=6e-2,
     )
 
 

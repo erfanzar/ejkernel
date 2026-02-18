@@ -234,6 +234,8 @@ class QuantizedArray:
         *,
         fuse: bool = True,
         strict_fuse: bool | None = None,
+        tpu_path: Literal["packed"] | None = None,
+        allow_dense_fallback: bool | None = None,
         transpose: bool | None = None,
         axis: QuantizationAxis | None = None,
         platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
@@ -257,6 +259,8 @@ class QuantizedArray:
                 platform=platform,
                 fuse=True,
                 strict_fuse=strict_fuse,
+                tpu_path=tpu_path,
+                allow_dense_fallback=allow_dense_fallback,
             )
 
         return dense_quantized_matmul(

@@ -429,8 +429,9 @@ class QuantizedMatmulConfig(BaseOperationConfig):
         num_stages: Number of pipeline stages (default: 3)
         use_bf16: Use BF16 for the dot input tiles (default: True)
         split_k: Optional split-K factor for Triton kernels (default: None)
-        tpu_path: Optional TPU Pallas path override
-            ("hybrid", "packed", "predecode"). None uses backend default.
+        tpu_path: Optional TPU Pallas path override.
+            TPU Pallas uses packed-only execution. Legacy values
+            ("hybrid", "predecode") are accepted and normalized to packed.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
@@ -442,7 +443,7 @@ class QuantizedMatmulConfig(BaseOperationConfig):
     num_stages: int = 3
     use_bf16: bool = True
     split_k: int | None = None
-    tpu_path: Literal["hybrid", "packed", "predecode"] | None = None
+    tpu_path: Literal["packed"] | None = None
 
     __hash__ = hash_fn
 

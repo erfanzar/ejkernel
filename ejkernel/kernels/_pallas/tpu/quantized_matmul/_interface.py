@@ -27,9 +27,9 @@ registry and provides:
 - **Custom VJP**: ``_operate`` / ``_operate_fwd`` / ``_operate_bwd``
   implement a ``jax.custom_vjp`` so that the backward pass uses the
   Pallas input-gradient kernel instead of JAX's default AD.
-- **Hybrid dispatch**: Both forward and backward paths select between
-  the packed fused kernel and predecode-to-dense path according to
-  the ``EJKERNEL_QMM_TPU_PATH`` environment variable or a heuristic.
+- **Packed-only dispatch**: TPU Pallas runs packed fused kernels only.
+  Legacy path values (``"hybrid"``, ``"predecode"``) are normalized to
+  packed for compatibility.
 - **XLA fallback**: transpose=True, unsupported bit widths, or tiling
   failures silently fall back to the XLA quantized matmul backend.
 """
@@ -147,6 +147,12 @@ def _is_packed_tpu_legal(
     )
 
 
+def _normalize_tpu_path(path: str | None) -> str:
+    """Normalize TPU path selection to packed-only execution."""
+    del path
+    return "packed"
+
+
 @ejit(
     static_argnames=[
         "transpose",
@@ -186,10 +192,10 @@ def _operate_impl(
 ) -> jax.Array:
     """Core forward implementation for TPU Pallas quantized matmul.
 
-    Attempts the Pallas hybrid packed/predecode path for 4/8-bit
-    transpose=False workloads. Falls back to the XLA quantized matmul
-    backend when transpose=True, when bit widths are unsupported, or
-    when the Pallas path raises an exception.
+    Attempts the packed TPU Pallas path for 4/8-bit transpose=False
+    workloads. Falls back to the XLA quantized matmul backend when
+    transpose=True, when bit widths are unsupported, or when packed
+    dispatch fails.
 
     Args:
         x: Activation tensor [M, K].
@@ -200,7 +206,7 @@ def _operate_impl(
         group_size: Elements per quantization group.
         bits: Quantization bit width.
         mode: Backend quantization mode string.
-        tpu_path: TPU path routing mode ("hybrid", "packed", "predecode").
+        tpu_path: TPU path routing mode (legacy values normalize to packed).
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -235,9 +241,7 @@ def _operate_impl(
             allow_dense_fallback=allow_dense_fallback,
         )
 
-    path = str(tpu_path).strip().lower()
-    if path not in {"hybrid", "packed", "predecode"}:
-        path = get_qmm_tpu_path()
+    path = _normalize_tpu_path(tpu_path if tpu_path is not None else get_qmm_tpu_path())
     packed_legal = _is_packed_tpu_legal(
         is_input_grad=False,
         x_or_dy=x,
@@ -268,7 +272,8 @@ def _operate_impl(
                 packed_legal=packed_legal,
             )
         except Exception:
-            pass
+            if not allow_dense_fallback:
+                raise
 
     return _xla_quantized_matmul(
         x,
@@ -324,7 +329,7 @@ def _operate(
         group_size: Elements per quantization group.
         bits: Quantization bit width.
         mode: Backend quantization mode string.
-        tpu_path: TPU path routing mode ("hybrid", "packed", "predecode").
+        tpu_path: TPU path routing mode (legacy values normalize to packed).
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -440,9 +445,7 @@ def _operate_bwd(
     """
     del gemv_mode, revsplit_k, revsplit_k_parts
     w, scales, biases = residual
-    path = str(tpu_path).strip().lower()
-    if path not in {"hybrid", "packed", "predecode"}:
-        path = get_qmm_tpu_path()
+    path = _normalize_tpu_path(tpu_path if tpu_path is not None else get_qmm_tpu_path())
     packed_legal = False
     if not transpose:
         packed_legal = _is_packed_tpu_legal(
@@ -515,10 +518,9 @@ def quantized_matmul(
     (``biases = -zeros * scales``) before entering the Pallas/XLA kernels.
     Non-affine modes must pass ``zeros=None``.
 
-    The forward and backward passes each select between a packed fused
-    Pallas kernel and a predecode-to-dense path, controlled by the
-    ``EJKERNEL_QMM_TPU_PATH`` environment variable or a built-in heuristic.
-    transpose=True and unsupported bit widths fall back to XLA.
+    TPU Pallas uses packed fused kernels for transpose=False forward/backward.
+    Legacy path selectors are normalized to packed. transpose=True and
+    unsupported bit widths fall back to XLA.
 
     Args:
         x: Activation tensor [M, K].
@@ -533,8 +535,9 @@ def quantized_matmul(
         gemv_mode: GEMV dispatch mode (ignored on TPU).
         revsplit_k: Reverse split-K mode (ignored on TPU).
         revsplit_k_parts: Reverse split-K partition count (ignored on TPU).
-        tpu_path: Optional TPU path routing mode override
-            ("hybrid", "packed", "predecode"). If None, reads env/default.
+        tpu_path: Optional TPU path routing mode override.
+            ``"packed"`` is active; ``"hybrid"`` and ``"predecode"`` are
+            accepted as aliases and normalize to packed.
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -570,7 +573,7 @@ def quantized_matmul(
         affine_biases = None
 
     backend_mode = to_backend_mode(mode, bits)
-    resolved_tpu_path = get_qmm_tpu_path() if tpu_path is None else str(tpu_path).strip().lower()
+    resolved_tpu_path = _normalize_tpu_path(get_qmm_tpu_path() if tpu_path is None else tpu_path)
 
     return _operate(
         x,

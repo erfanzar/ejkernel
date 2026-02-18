@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import ejkernel.modules.operations.quantized_matmul as qmm_op
 from ejkernel.modules.operations import quantized_matmul
 from ejkernel.quantization import (
     QuantizedArray,
@@ -399,6 +400,71 @@ def test_quantized_matmul_fuse_true_runtime_behavior():
         np.testing.assert_allclose(np.asarray(y_fused), np.asarray(y_fallback), rtol=2e-2, atol=7e-2)
 
 
+def test_quantized_matmul_strict_fuse_conflicts_with_allow_dense_fallback():
+    key_x, key_w = jax.random.split(jax.random.PRNGKey(121), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4, group_size=32, axis="row")
+
+    with pytest.raises(ValueError, match="allow_dense_fallback=True is incompatible"):
+        quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            mode="affine",
+            bits=4,
+            group_size=32,
+            axis="row",
+            platform="xla",
+            fuse=True,
+            strict_fuse=True,
+            allow_dense_fallback=True,
+        )
+
+
+def test_quantized_matmul_explicit_tpu_controls_no_env(monkeypatch):
+    key_x, key_w = jax.random.split(jax.random.PRNGKey(122), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4, group_size=32, axis="row")
+
+    captured: dict[str, object] = {}
+    original_impl = qmm_op._quantized_matmul_impl
+
+    def _fake_impl(xi, wi, si, zi, /, **kwargs):
+        captured["allow_dense_fallback"] = kwargs["allow_dense_fallback"]
+        captured["cfg"] = kwargs.get("cfg")
+        n = int(si.shape[-1]) * int(kwargs["group_size"])
+        return jnp.zeros((int(xi.shape[0]), n), dtype=jnp.float32)
+
+    monkeypatch.setattr(qmm_op, "_quantized_matmul_impl", _fake_impl)
+    try:
+        y = qmm_op.quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            mode="affine",
+            bits=4,
+            group_size=32,
+            axis="row",
+            platform="pallas",
+            fuse=True,
+            strict_fuse=False,
+            allow_dense_fallback=False,
+            tpu_path="packed",
+        )
+    finally:
+        monkeypatch.setattr(qmm_op, "_quantized_matmul_impl", original_impl)
+
+    assert y.shape == (8, 32)
+    assert captured["allow_dense_fallback"] is False
+    cfg = captured["cfg"]
+    assert cfg is not None
+    assert cfg.tpu_path == "packed"
+
+
 def test_quantized_array_matmul_fuse_switch():
     key_x, key_w = jax.random.split(jax.random.PRNGKey(13), 2)
     x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
@@ -414,6 +480,41 @@ def test_quantized_array_matmul_fuse_switch():
         y_fused = q.matmul(x, axis="row", fuse=True, platform="xla")
         assert y_fused.shape == y_ref.shape
         assert bool(jnp.all(jnp.isfinite(y_fused)))
+
+
+def test_quantized_array_matmul_forwards_tpu_controls(monkeypatch):
+    key_x, key_w = jax.random.split(jax.random.PRNGKey(123), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    q = prepack_quantized_array(w, mode="affine", bits=4, group_size=32, axis="row")
+
+    captured: dict[str, object] = {}
+    import ejkernel.modules.operations as ops
+
+    original_fused = ops.quantized_matmul
+
+    def _fake_fused(xi, wi, si, zi, /, **kwargs):
+        captured.update(kwargs)
+        n = int(si.shape[-1]) * int(kwargs["group_size"])
+        return jnp.zeros((int(xi.shape[0]), n), dtype=jnp.float32)
+
+    monkeypatch.setattr(ops, "quantized_matmul", _fake_fused)
+    try:
+        y = q.matmul(
+            x,
+            axis="row",
+            fuse=True,
+            platform="pallas",
+            strict_fuse=False,
+            allow_dense_fallback=False,
+            tpu_path="packed",
+        )
+    finally:
+        monkeypatch.setattr(ops, "quantized_matmul", original_fused)
+
+    assert y.shape == (8, 32)
+    assert captured["allow_dense_fallback"] is False
+    assert captured["tpu_path"] == "packed"
 
 
 @pytest.mark.parametrize("bits", [1, 2])

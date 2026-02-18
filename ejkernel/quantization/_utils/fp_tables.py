@@ -134,34 +134,29 @@ def _build_threshold_map(codebook: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarra
     return sorted_idx, boundaries
 
 
-_E2M1_TABLE, _E2M1_NAN_MASK = _make_fp_table(2, 1, nan_all_ones=False)
-_E4M3_TABLE, _E4M3_NAN_MASK = _make_fp_table(4, 3, nan_all_ones=True)
-_E4M3_TABLE_Q = jnp.where(_E4M3_NAN_MASK, jnp.inf, _E4M3_TABLE)
-_NF4_TABLE = jnp.asarray(
-    [
-        -1.0,
-        -0.6961928009986877,
-        -0.5250730514526367,
-        -0.39491748809814453,
-        -0.28444138169288635,
-        -0.18477343022823334,
-        -0.09105003625154495,
-        0.0,
-        0.07958029955625534,
-        0.16093020141124725,
-        0.24611230194568634,
-        0.33791524171829224,
-        0.44070982933044434,
-        0.5626170039176941,
-        0.7229568362236023,
-        1.0,
-    ],
-    dtype=jnp.float32,
-)
-
-_E2M1_SORTED_IDX, _E2M1_BOUNDARIES = _build_threshold_map(_E2M1_TABLE)
-_E4M3_Q_SORTED_IDX, _E4M3_Q_BOUNDARIES = _build_threshold_map(_E4M3_TABLE_Q)
-_NF4_SORTED_IDX, _NF4_BOUNDARIES = _build_threshold_map(_NF4_TABLE)
+def _build_nf4_table() -> jnp.ndarray:
+    """Build NF4 (NormalFloat 4-bit) codebook tensor."""
+    return jnp.asarray(
+        [
+            -1.0,
+            -0.6961928009986877,
+            -0.5250730514526367,
+            -0.39491748809814453,
+            -0.28444138169288635,
+            -0.18477343022823334,
+            -0.09105003625154495,
+            0.0,
+            0.07958029955625534,
+            0.16093020141124725,
+            0.24611230194568634,
+            0.33791524171829224,
+            0.44070982933044434,
+            0.5626170039176941,
+            0.7229568362236023,
+            1.0,
+        ],
+        dtype=jnp.float32,
+    )
 
 
 def _get_e2m1_table() -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -174,7 +169,7 @@ def _get_e2m1_table() -> tuple[jnp.ndarray, jnp.ndarray]:
     Returns:
         Tuple of (value_table, nan_mask). The table has 16 entries.
     """
-    return _E2M1_TABLE, _E2M1_NAN_MASK
+    return _make_fp_table(2, 1, nan_all_ones=False)
 
 
 def _get_e4m3_table() -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -186,7 +181,7 @@ def _get_e4m3_table() -> tuple[jnp.ndarray, jnp.ndarray]:
     Returns:
         Tuple of (value_table, nan_mask). The table has 256 entries.
     """
-    return _E4M3_TABLE, _E4M3_NAN_MASK
+    return _make_fp_table(4, 3, nan_all_ones=True)
 
 
 def _get_e4m3_table_q() -> jnp.ndarray:
@@ -199,7 +194,8 @@ def _get_e4m3_table_q() -> jnp.ndarray:
     Returns:
         E4M3 value table with NaN entries replaced by infinity.
     """
-    return _E4M3_TABLE_Q
+    table, nan_mask = _get_e4m3_table()
+    return jnp.where(nan_mask, jnp.inf, table)
 
 
 def _get_e2m1_max() -> jnp.ndarray:
@@ -208,7 +204,8 @@ def _get_e2m1_max() -> jnp.ndarray:
     Returns:
         Scalar float32 containing max(abs(E2M1 values)) = 6.0.
     """
-    return jnp.max(jnp.abs(_E2M1_TABLE))
+    table, _ = _get_e2m1_table()
+    return jnp.max(jnp.abs(table))
 
 
 def _get_e4m3_max() -> jnp.ndarray:
@@ -219,7 +216,8 @@ def _get_e4m3_max() -> jnp.ndarray:
     Returns:
         Scalar float32 containing max(abs(E4M3 values)) = 448.0.
     """
-    return jnp.max(jnp.abs(jnp.where(_E4M3_NAN_MASK, 0.0, _E4M3_TABLE)))
+    table, nan_mask = _get_e4m3_table()
+    return jnp.max(jnp.abs(jnp.where(nan_mask, 0.0, table)))
 
 
 def _get_nf4_table() -> jnp.ndarray:
@@ -239,19 +237,19 @@ def _get_nf4_table() -> jnp.ndarray:
     References:
         QLoRA: Efficient Finetuning of Quantized LLMs (Dettmers et al., 2023)
     """
-    return _NF4_TABLE
+    return _build_nf4_table()
 
 
 def _get_e2m1_threshold_map() -> tuple[jnp.ndarray, jnp.ndarray]:
     """Get cached threshold map (sorted_idx, boundaries) for E2M1 codebook."""
-    return _E2M1_SORTED_IDX, _E2M1_BOUNDARIES
+    return _build_threshold_map(_get_e2m1_table()[0])
 
 
 def _get_e4m3_q_threshold_map() -> tuple[jnp.ndarray, jnp.ndarray]:
     """Get cached threshold map (sorted_idx, boundaries) for E4M3-quant codebook."""
-    return _E4M3_Q_SORTED_IDX, _E4M3_Q_BOUNDARIES
+    return _build_threshold_map(_get_e4m3_table_q())
 
 
 def _get_nf4_threshold_map() -> tuple[jnp.ndarray, jnp.ndarray]:
     """Get cached threshold map (sorted_idx, boundaries) for NF4 codebook."""
-    return _NF4_SORTED_IDX, _NF4_BOUNDARIES
+    return _build_threshold_map(_get_nf4_table())
