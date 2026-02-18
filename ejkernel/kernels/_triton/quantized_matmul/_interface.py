@@ -19,6 +19,7 @@ from __future__ import annotations
 import functools
 
 import jax
+import jax.custom_batching
 import jax.numpy as jnp
 import jaxtyping
 from beartype import beartype
@@ -39,6 +40,140 @@ from ejkernel.quantization._utils.qparams import (
 from ..._registry import Backend, Platform, kernel_registry
 from ._triton_impl_bwd import quantized_matmul_input_grad
 from ._triton_impl_fwd import quantized_matmul_forward
+
+
+def _kernel_fwd(x, w, scales, biases, static_args):
+    return quantized_matmul_forward(
+        x,
+        w,
+        scales,
+        biases,
+        transpose=static_args[0],
+        group_size=static_args[1],
+        bits=static_args[2],
+        mode=static_args[3],
+        block_m=static_args[4],
+        block_n=static_args[5],
+        block_k=static_args[6],
+        use_bf16=static_args[7],
+        num_warps=static_args[8],
+        num_stages=static_args[9],
+        split_k=static_args[10],
+        gemv_mode=static_args[11],
+        revsplit_k=static_args[12],
+        revsplit_k_parts=static_args[13],
+    )
+
+
+def _kernel_bwd(grad_out, w, scales, biases, static_args):
+    return quantized_matmul_input_grad(
+        grad_out,
+        w,
+        scales,
+        biases,
+        transpose=static_args[0],
+        group_size=static_args[1],
+        bits=static_args[2],
+        mode=static_args[3],
+        block_m=static_args[4],
+        block_n=static_args[5],
+        block_k=static_args[6],
+        use_bf16=static_args[7],
+        num_warps=static_args[8],
+        num_stages=static_args[9],
+        split_k=static_args[10],
+        gemv_mode=static_args[11],
+        revsplit_k=static_args[12],
+        revsplit_k_parts=static_args[13],
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_vmap_wrapper(static_args: tuple):
+    @jax.custom_batching.custom_vmap
+    def _call(x, w, scales, biases):
+        return _kernel_fwd(x, w, scales, biases, static_args)
+
+    @_call.def_vmap
+    def _call_vmap(axis_size, in_batched, x, w, scales, biases):
+        x_bat, w_bat, scales_bat, biases_bat = in_batched
+
+        if not any(in_batched):
+            return _kernel_fwd(x, w, scales, biases, static_args), False
+
+        if x_bat and not w_bat and not scales_bat and not biases_bat:
+            leading_shape = x.shape[:-2]
+            m = x.shape[-2]
+            k = x.shape[-1]
+            x_flat = x.reshape((-1, k))
+            out_flat = _call(x_flat, w, scales, biases)
+            n = out_flat.shape[-1]
+            out = out_flat.reshape((*leading_shape, m, n))
+            return out, True
+
+        array_args = [x, w, scales, biases]
+        batched_flags = [x_bat, w_bat, scales_bat, biases_bat]
+        mapped_args = []
+        for arg, is_bat in zip(array_args, batched_flags, strict=False):
+            if arg is None:
+                mapped_args.append(None)
+            elif is_bat:
+                mapped_args.append(arg)
+            else:
+                mapped_args.append(jnp.broadcast_to(arg, (axis_size, *arg.shape)))
+
+        def _single(sliced):
+            x_i, w_i, scales_i, biases_i = sliced
+            return _call(x_i, w_i, scales_i, biases_i)
+
+        out = jax.lax.map(_single, tuple(mapped_args))
+        return out, True
+
+    return _call
+
+
+@functools.lru_cache(maxsize=64)
+def _get_bwd_vmap_wrapper(static_args: tuple):
+    @jax.custom_batching.custom_vmap
+    def _call(grad_out, w, scales, biases):
+        return _kernel_bwd(grad_out, w, scales, biases, static_args)
+
+    @_call.def_vmap
+    def _call_vmap(axis_size, in_batched, grad_out, w, scales, biases):
+        go_bat, w_bat, scales_bat, biases_bat = in_batched
+
+        if not any(in_batched):
+            return _kernel_bwd(grad_out, w, scales, biases, static_args), False
+
+        if go_bat and not w_bat and not scales_bat and not biases_bat:
+            leading_shape = grad_out.shape[:-2]
+            m = grad_out.shape[-2]
+            n = grad_out.shape[-1]
+            go_flat = grad_out.reshape((-1, n))
+            out_flat = _call(go_flat, w, scales, biases)
+            k = out_flat.shape[-1]
+            out = out_flat.reshape((*leading_shape, m, k))
+            return out, True
+
+        array_args = [grad_out, w, scales, biases]
+        batched_flags = [go_bat, w_bat, scales_bat, biases_bat]
+        mapped_args = []
+        for arg, is_bat in zip(array_args, batched_flags, strict=False):
+            if arg is None:
+                mapped_args.append(None)
+            elif is_bat:
+                mapped_args.append(arg)
+            else:
+                mapped_args.append(jnp.broadcast_to(arg, (axis_size, *arg.shape)))
+
+        def _single(sliced):
+            go_i, w_i, scales_i, biases_i = sliced
+            return _call(go_i, w_i, scales_i, biases_i)
+
+        out = jax.lax.map(_single, tuple(mapped_args))
+        return out, True
+
+    return _call
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 18))
@@ -62,26 +197,23 @@ def _operate(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ):
-    return quantized_matmul_forward(
-        x,
-        w,
-        scales,
-        biases,
-        transpose=transpose,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        use_bf16=use_bf16,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        split_k=split_k,
-        gemv_mode=gemv_mode,
-        revsplit_k=revsplit_k,
-        revsplit_k_parts=revsplit_k_parts,
+    static_args = (
+        transpose,
+        group_size,
+        bits,
+        mode,
+        block_m,
+        block_n,
+        block_k,
+        use_bf16,
+        num_warps,
+        num_stages,
+        split_k,
+        gemv_mode,
+        revsplit_k,
+        revsplit_k_parts,
     )
+    return _get_vmap_wrapper(static_args)(x, w, scales, biases)
 
 
 def _operate_fwd(
@@ -104,26 +236,23 @@ def _operate_fwd(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ):
-    out = quantized_matmul_forward(
-        x,
-        w,
-        scales,
-        biases,
-        transpose=transpose,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        use_bf16=use_bf16,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        split_k=split_k,
-        gemv_mode=gemv_mode,
-        revsplit_k=revsplit_k,
-        revsplit_k_parts=revsplit_k_parts,
+    static_args = (
+        transpose,
+        group_size,
+        bits,
+        mode,
+        block_m,
+        block_n,
+        block_k,
+        use_bf16,
+        num_warps,
+        num_stages,
+        split_k,
+        gemv_mode,
+        revsplit_k,
+        revsplit_k_parts,
     )
+    out = _get_vmap_wrapper(static_args)(x, w, scales, biases)
     return out, (w, scales, biases)
 
 
@@ -146,26 +275,23 @@ def _operate_bwd(
     grad_out,
 ):
     w, scales, biases = residual
-    grad_x = quantized_matmul_input_grad(
-        grad_out,
-        w,
-        scales,
-        biases,
-        transpose=transpose,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        use_bf16=use_bf16,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        split_k=split_k,
-        gemv_mode=gemv_mode,
-        revsplit_k=revsplit_k,
-        revsplit_k_parts=revsplit_k_parts,
+    static_args = (
+        transpose,
+        group_size,
+        bits,
+        mode,
+        block_m,
+        block_n,
+        block_k,
+        use_bf16,
+        num_warps,
+        num_stages,
+        split_k,
+        gemv_mode,
+        revsplit_k,
+        revsplit_k_parts,
     )
+    grad_x = _get_bwd_vmap_wrapper(static_args)(grad_out, w, scales, biases)
     return grad_x, None, None, None
 
 
