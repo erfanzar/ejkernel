@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -452,7 +452,7 @@ requires-dist = [
     { name = "jax", specifier = "~=0.9.0" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.9.0" },
     { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.9.0" },
-    { name = "jax-metallib", marker = "extra == 'mps'", specifier = "==0.9.4" },
+    { name = "jax-metallib", marker = "extra == 'mps'", specifier = "==0.9.4.5" },
     { name = "jax-tvm-ffi", marker = "extra == 'cuda'", specifier = "==0.1.2" },
     { name = "jaxlib", specifier = "~=0.9.0" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
@@ -893,15 +893,15 @@ with-cuda = [
 
 [[package]]
 name = "jax-metallib"
-version = "0.9.4"
+version = "0.9.4.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jax" },
     { name = "jaxlib" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4d/1b/0a91b264690cb7b2caa4673099ae19a4e8e152385557fc7a5e962abde673/jax_metallib-0.9.4.tar.gz", hash = "sha256:1a851486867c291bfa02baa42b02f2c44286a8e475f557636b4d5b61bc1fc4b5", size = 257326, upload-time = "2026-02-17T17:42:47.285Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ec/c9/3a502351f36fe6e708e5de42dabfdf673ca30dd6d7bce9355b26a3697d72/jax_metallib-0.9.4.5.tar.gz", hash = "sha256:1444757a4e5dd6157f17ccc09a36affa972521e6fbf79ea49c44046e55b027dd", size = 272819, upload-time = "2026-02-17T23:09:42.894Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/75/a3/1e00232b1bc3e5c777af1389ca5e5b8799f5de309b6b5aa0518be6c17fb3/jax_metallib-0.9.4-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:498c81fd07f0718cb0dcd7a3224af3ade973cf00464c5109f00bd17481f22f03", size = 6770169, upload-time = "2026-02-17T17:42:44.793Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/21/4fdf355e73c1f00449a1e44b84b81846eb3b95ba43c7c1431d5c19ef083d/jax_metallib-0.9.4.5-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:ddd4aa76def4eb00630de5cf7bc8d13e33c7c2d4939b209e482b66ff66f62e80", size = 6782490, upload-time = "2026-02-17T23:09:47.673Z" },
 ]
 
 [[package]]

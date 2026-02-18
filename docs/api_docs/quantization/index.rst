@@ -6,3 +6,5 @@ ejkernel.quantization package
 
    _quants/index
    _utils/index
+   quantized_array
+   runtime
