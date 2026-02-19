@@ -74,6 +74,7 @@ from jax.sharding import PartitionSpec, Sharding, SingleDeviceSharding
 from ejkernel.loggings import get_logger
 
 from ..config.cache import overlay_cache
+from ..config.selection import _is_autotune_progress_enabled
 from ..utils.fingerprint import device_fingerprint
 from .profiler import Profiler
 
@@ -163,6 +164,10 @@ class Autotuner(Generic[Cfg]):
         Tests each candidate configuration by compiling and timing the
         function execution, then returns all measurements for analysis.
 
+        Set ``EJKERNEL_AUTOTUNE_PROGRESS=1`` to display a live tqdm progress
+        bar showing the current candidate, best time so far, and remaining
+        steps.
+
         Args:
             make_fn: Factory function that creates a function given a config
             args: Positional arguments for the function being optimized
@@ -173,23 +178,55 @@ class Autotuner(Generic[Cfg]):
             AutotuneData containing all performance measurements
 
         """
-        measures = []
-        for cfg in candidates:
+        candidates = list(candidates)
+        show_progress = _is_autotune_progress_enabled()
+        pbar = None
+        if show_progress:
             try:
-                fn = make_fn(cfg)
-                c = jax.jit(fn).lower(*args, **kwargs).compile()
+                from tqdm import tqdm
 
-                for _ in range(self.warmup):
-                    _ = c(*args, **kwargs).block_until_ready()
+                pbar = tqdm(
+                    total=len(candidates),
+                    desc="autotune",
+                    unit="cfg",
+                    dynamic_ncols=True,
+                    leave=True,
+                )
+            except ImportError:
+                autotune_logger.warning("EJKERNEL_AUTOTUNE_PROGRESS=1 but tqdm is not installed; progress bar disabled.")
 
-                t0 = time.perf_counter()
-                for _ in range(self.iters):
-                    _ = c(*args, **kwargs).block_until_ready()
-                dt = (time.perf_counter() - t0) / self.iters
-                measures.append(Measurement(cfg, dt))
-            except Exception as e:
-                autotune_logger.warning(f"Configuration {cfg} failed: {e}")
-                measures.append(Measurement(cfg, float("inf")))
+        measures = []
+        best_t = float("inf")
+        try:
+            for cfg in candidates:
+                if pbar is not None:
+                    pbar.set_postfix_str(
+                        f"cfg={cfg}  best={best_t * 1e3:.3f}ms" if best_t < float("inf") else f"cfg={cfg}"
+                    )
+                try:
+                    fn = make_fn(cfg)
+                    c = jax.jit(fn).lower(*args, **kwargs).compile()
+
+                    for _ in range(self.warmup):
+                        _ = c(*args, **kwargs).block_until_ready()
+
+                    t0 = time.perf_counter()
+                    for _ in range(self.iters):
+                        _ = c(*args, **kwargs).block_until_ready()
+                    dt = (time.perf_counter() - t0) / self.iters
+                    measures.append(Measurement(cfg, dt))
+                    if dt < best_t:
+                        best_t = dt
+                except Exception as e:
+                    autotune_logger.warning(f"Configuration {cfg} failed: {e}")
+                    measures.append(Measurement(cfg, float("inf")))
+                if pbar is not None:
+                    pbar.update(1)
+        finally:
+            if pbar is not None:
+                if best_t < float("inf"):
+                    pbar.set_postfix_str(f"best={best_t * 1e3:.3f}ms")
+                pbar.close()
 
         if not measures or all(m.seconds == float("inf") for m in measures):
             autotune_logger.warning("All candidate configurations failed to execute; returning empty measurements.")
@@ -316,6 +353,15 @@ def autotune_recorded(hyperparameter_selector, *, show_progress=False, repetitio
     dev = device_fingerprint()
     invs = get_invocations(dev)
     entries = []
+
+    show_progress = show_progress or _is_autotune_progress_enabled()
+    _tqdm = None
+    if show_progress:
+        try:
+            from tqdm import tqdm as _tqdm
+        except ImportError:
+            autotune_logger.warning("EJKERNEL_AUTOTUNE_PROGRESS=1 but tqdm is not installed; progress bar disabled.")
+
     for op_id_v, d in invs.items():
         for call_key, (kernel, args, kwargs) in d.items():
             inv_args, inv_kwargs = kernel.prepare(*args, **kwargs)
@@ -337,10 +383,31 @@ def autotune_recorded(hyperparameter_selector, *, show_progress=False, repetitio
                 return partial(_run, cfg=c, **_static)
 
             best_cfg, best_t = None, float("inf")
-            for c in candidates:
-                t = benchmark(mk(c), *inv_args, **dyn_kwargs)
-                if t < best_t:
-                    best_cfg, best_t = c, t
+            pbar = None
+            if _tqdm is not None and len(candidates) > 0:
+                pbar = _tqdm(
+                    total=len(candidates),
+                    desc=f"autotune {op_id_v}",
+                    unit="cfg",
+                    dynamic_ncols=True,
+                    leave=True,
+                )
+            try:
+                for c in candidates:
+                    if pbar is not None:
+                        pbar.set_postfix_str(
+                            f"cfg={c}  best={best_t * 1e3:.3f}ms" if best_t < float("inf") else f"cfg={c}"
+                        )
+                    t = benchmark(mk(c), *inv_args, **dyn_kwargs)
+                    if t < best_t:
+                        best_cfg, best_t = c, t
+                    if pbar is not None:
+                        pbar.update(1)
+            finally:
+                if pbar is not None:
+                    if best_cfg is not None:
+                        pbar.set_postfix_str(f"best={best_t * 1e3:.3f}ms  cfg={best_cfg}")
+                    pbar.close()
 
             hyperparameter_selector.cache.put(dev, op_id_v, call_key, best_cfg)
             if hyperparameter_selector.persistent and hyperparameter_selector.persist_autotune:
@@ -1219,7 +1286,7 @@ class FNAutotuner:
                         results = wrapped.timing_results
                     else:
                         optimal_hyperparams = {
-                            k: (v[0] if isinstance(v, list) else v) for k, v in (hyperparams or {}).items()
+                            k: v[0] if isinstance(v, list) else v for k, v in (hyperparams or {}).items()
                         }
                         results = []
                 else:

@@ -83,6 +83,7 @@ Out = TypeVar("Out")
 
 autotune_logger = get_logger("ejKernel-Selection")
 _backward_autotune_enabled: ContextVar[bool] = ContextVar("ejkernel_backward_autotune_enabled", default=True)
+_autotune_progress_enabled: ContextVar[bool] = ContextVar("ejkernel_autotune_progress", default=False)
 
 
 @dataclass
@@ -195,6 +196,63 @@ class forward_autotune_only:
 def _is_backward_autotune_enabled() -> bool:
     """Return whether backward validation is currently enabled for autotune."""
     return bool(_backward_autotune_enabled.get())
+
+
+def _is_autotune_progress_enabled() -> bool:
+    """Return whether autotune progress bars are enabled.
+
+    Checks the ``ContextVar`` first, then falls back to the
+    ``EJKERNEL_AUTOTUNE_PROGRESS`` environment variable.
+    """
+    if _autotune_progress_enabled.get():
+        return True
+    return os.getenv("EJKERNEL_AUTOTUNE_PROGRESS", "0") == "1"
+
+
+class log_autotune_progress:
+    """Context manager that enables tqdm progress bars during autotuning.
+
+    Safe to use inside or outside ``jax.jit`` — autotuning itself always
+    runs at Python level so the ``ContextVar`` is never traced.
+
+    Example::
+
+        with log_autotune_progress():
+            result = model(x)           # any autotune triggered here shows a bar
+
+        # or nest with other context managers
+        with log_autotune_progress(), forward_autotune_only():
+            result = model(x)
+    """
+
+    def __init__(self):
+        self._token = None
+
+    def __enter__(self):
+        self._token = _autotune_progress_enabled.set(True)
+        return self
+
+    def __exit__(self, *exc):
+        if self._token is not None:
+            _autotune_progress_enabled.reset(self._token)
+
+
+def set_autotune_progress(enabled: bool = True) -> None:
+    """Imperatively enable or disable autotune progress bars.
+
+    Unlike :class:`log_autotune_progress`, this persists until changed
+    again (or until the ``ContextVar`` context is exited).  Useful for
+    one-off toggling in notebooks or scripts::
+
+        from ejkernel.ops.config import set_autotune_progress
+        set_autotune_progress(True)
+        # ... all subsequent autotune calls show progress ...
+        set_autotune_progress(False)
+
+    Args:
+        enabled: Whether to show progress bars.
+    """
+    _autotune_progress_enabled.set(enabled)
 
 
 class Tuner(Generic[Cfg]):
@@ -389,6 +447,10 @@ class Tuner(Generic[Cfg]):
         Tests each candidate configuration by measuring its execution time
         and selects the configuration with the lowest average execution time.
 
+        Set ``EJKERNEL_AUTOTUNE_PROGRESS=1`` to display a live tqdm progress
+        bar showing the current candidate, best time so far, and remaining
+        steps.
+
         Args:
             make_fn: Factory function that creates a function given a config
             args: Positional arguments for the function being benchmarked
@@ -401,18 +463,50 @@ class Tuner(Generic[Cfg]):
         Raises:
             RuntimeError: If no candidates are provided for testing
         """
+        candidates = list(candidates)
+        show_progress = _is_autotune_progress_enabled()
+        pbar = None
+        if show_progress:
+            try:
+                from tqdm import tqdm
+
+                pbar = tqdm(
+                    total=len(candidates),
+                    desc="autotune",
+                    unit="cfg",
+                    dynamic_ncols=True,
+                    leave=True,
+                )
+            except ImportError:
+                autotune_logger.warning("EJKERNEL_AUTOTUNE_PROGRESS=1 but tqdm is not installed; progress bar disabled.")
+
         best_cfg, best_t = None, float("inf")
         last_err = None
-        for cfg in candidates:
-            try:
-                t = self.measure(make_fn(cfg), *args, **kwargs)
-                if os.getenv("EJKERNEL_LOG_AUTOTUNE", "0") == "1":
-                    autotune_logger.info(pprint.pformat({"config": cfg, "time": t}))
-            except Exception as e:
-                last_err = e
-                continue
-            if t < best_t:
-                best_cfg, best_t = cfg, t
+        try:
+            for cfg in candidates:
+                if pbar is not None:
+                    pbar.set_postfix_str(
+                        f"cfg={cfg}  best={best_t * 1e3:.3f}ms" if best_t < float("inf") else f"cfg={cfg}"
+                    )
+                try:
+                    t = self.measure(make_fn(cfg), *args, **kwargs)
+                    if os.getenv("EJKERNEL_LOG_AUTOTUNE", "0") == "1":
+                        autotune_logger.info(pprint.pformat({"config": cfg, "time": t}))
+                except Exception as e:
+                    last_err = e
+                    if pbar is not None:
+                        pbar.update(1)
+                    continue
+                if t < best_t:
+                    best_cfg, best_t = cfg, t
+                if pbar is not None:
+                    pbar.update(1)
+        finally:
+            if pbar is not None:
+                if best_cfg is not None:
+                    pbar.set_postfix_str(f"best={best_t * 1e3:.3f}ms  cfg={best_cfg}")
+                pbar.close()
+
         if best_cfg is None:
             if last_err:
                 traceback.print_exception(last_err)
@@ -610,6 +704,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                     if validate_backward and getattr(kernel, "supports_grad_validation", False):
                         f._ejk_validate_backward = True
                     return f
+
             else:
                 run_method = _get_platform_method(kernel, "run", platform, context) or kernel.run
 

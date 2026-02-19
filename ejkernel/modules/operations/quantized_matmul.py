@@ -35,7 +35,7 @@ Key Features:
     - Split-K for improved parallelism on tall-skinny matrices
     - GEMV specialization for M=1 workloads
     - Custom VJP for backward pass compatibility
-    - TPU Pallas support with packed path optimization
+    - TPU default strategy selection between predecode-once and packed fused paths
 
 Mathematical Formulation:
     output = x @ dequantize(w, scales, zeros)
@@ -373,10 +373,237 @@ def _tpu_tile_working_set_bytes(*, block_m: int, block_n: int, block_k: int) -> 
     return int((block_m * block_k + block_k * block_n) * 2)
 
 
+def _is_tracer_value(x: object) -> bool:
+    """Return True when ``x`` is a JAX tracer."""
+    return isinstance(x, jax.core.Tracer)
+
+
+def _env_tpu_default_strategy() -> str:
+    """Read TPU default QMM strategy.
+
+    Supported values:
+      - ``predecode_once`` (default)
+      - ``packed``
+    """
+    raw = os.getenv("EJKERNEL_QMM_TPU_DEFAULT_STRATEGY", "predecode_once").strip().lower()
+    if raw in {"predecode_once", "packed"}:
+        return raw
+    return "predecode_once"
+
+
+_QMM_BESTCFG_NON_AFFINE_MODES = frozenset({"nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"})
+_QMM_TPU_BESTCFG_POLICY: dict[str, dict[str, dict[str, object]]] = {
+    "affine": {
+        "small": {"fuse": False, "platform": "xla"},
+        "large": {
+            "fuse": True,
+            "platform": "pallas",
+            "strict_fuse": True,
+            "allow_dense_fallback": False,
+            "tpu_path": "predecode",
+        },
+        "default": {"fuse": False, "platform": "xla"},
+    },
+    # Non-affine modes (nf4/mxfp*/nvfp*) use fused Pallas packed kernels
+    # on TPU regardless of whether weights are concrete or traced.
+    # The Pallas packed kernel is fully trace-safe: legality checks use
+    # only .shape attributes (concrete during tracing), and in-kernel
+    # dequant is pure arithmetic (jnp.where chains, bit ops) — no table
+    # lookups or captured constants.  allow_dense_fallback=True provides
+    # a safety net: if packed tiling is somehow illegal, the XLA fallback
+    # is still available.
+    "non_affine": {
+        "small": {
+            "fuse": True,
+            "platform": "pallas",
+            "strict_fuse": False,
+            "allow_dense_fallback": True,
+            "tpu_path": "packed",
+        },
+        "large": {
+            "fuse": True,
+            "platform": "pallas",
+            "strict_fuse": False,
+            "allow_dense_fallback": True,
+            "tpu_path": "packed",
+        },
+        "default": {
+            "fuse": True,
+            "platform": "pallas",
+            "strict_fuse": False,
+            "allow_dense_fallback": True,
+            "tpu_path": "packed",
+        },
+    },
+    "default": {
+        "default": {"fuse": False, "platform": "xla"},
+    },
+}
+
+
+def _qmm_bestcfg_mode_key(mode: str) -> str:
+    mode_n = str(mode).strip().lower()
+    if mode_n == "affine":
+        return "affine"
+    if mode_n in _QMM_BESTCFG_NON_AFFINE_MODES:
+        return "non_affine"
+    return "default"
+
+
+def _lookup_best_qmm_policy(
+    *,
+    backend_name: str,
+    mode: str,
+    m_tokens: int,
+    runtime_axis: QuantizationAxis,
+    runtime_transpose: bool,
+    weights_concrete: bool,
+) -> dict[str, object]:
+    """Return best-known policy controls for QMM runtime selection.
+
+    For non-affine modes on TPU, the fused Pallas packed kernel is used
+    regardless of whether weights are concrete or traced.  The Pallas
+    kernel's in-kernel dequant uses pure arithmetic (no table lookups),
+    making it both trace-safe and significantly faster than the XLA
+    gather-based codebook decode path.
+    """
+    if backend_name != "tpu":
+        return {}
+    if runtime_axis != "row" or runtime_transpose:
+        return {}
+
+    threshold = _parse_positive_int_env("EJKERNEL_QMM_TPU_BESTCFG_SMALL_M", 1024)
+    size_key = "small" if int(m_tokens) <= int(threshold) else "large"
+    mode_key = _qmm_bestcfg_mode_key(mode)
+    mode_table = _QMM_TPU_BESTCFG_POLICY.get(mode_key, _QMM_TPU_BESTCFG_POLICY["default"])
+    chosen = mode_table.get(size_key, mode_table.get("default", {}))
+    return dict(chosen) if isinstance(chosen, dict) else {}
+
+
+def _should_try_tpu_predecode_once_default(
+    *,
+    fuse: bool,
+    backend_name: str,
+    runtime_axis: QuantizationAxis,
+    runtime_transpose: bool,
+    platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None,
+    strategy_override: Literal["predecode_once", "packed"] | None = None,
+) -> bool:
+    """Whether to attempt the TPU predecode-once default path."""
+    if not fuse:
+        return False
+    if backend_name != "tpu":
+        return False
+    if runtime_axis != "row" or runtime_transpose:
+        return False
+    # Respect explicit non-Pallas platform requests.
+    if platform not in (None, "auto", "pallas"):
+        return False
+    strategy = strategy_override if strategy_override is not None else _env_tpu_default_strategy()
+    return strategy == "predecode_once"
+
+
+def _maybe_tpu_predecode_once_matmul(
+    x: Array,
+    w: Array,
+    scales: Array,
+    zeros: Array | None,
+    *,
+    mode: QuantizationMode,
+    group_size: int,
+    bits: int,
+) -> Array | None:
+    """Try TPU predecode-once + dense matmul.
+
+    Returns ``None`` when the path is inapplicable (e.g. traced weights, unsupported
+    bits, cache cap exceeded), allowing caller to fall back to fused dispatch.
+    """
+    if bits not in (4, 8):
+        return None
+    # Predecode-once requires concrete quantized metadata.
+    if _is_tracer_value(w) or _is_tracer_value(scales) or (zeros is not None and _is_tracer_value(zeros)):
+        return None
+    try:
+        from ejkernel.kernels._pallas.tpu.quantized_matmul._pallas_impl_core import get_predecoded_dense_weight
+    except Exception:
+        return None
+
+    if mode == "affine":
+        if zeros is None:
+            return None
+        safe_scale = jnp.where(scales == 0, jnp.ones_like(scales), scales)
+        biases = -zeros * safe_scale
+    else:
+        biases = None
+
+    try:
+        dense_w = get_predecoded_dense_weight(
+            w,
+            scales,
+            biases,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+    except Exception:
+        return None
+
+    return jax.lax.dot_general(
+        x.astype(jnp.bfloat16),
+        dense_w.astype(jnp.bfloat16),
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.bfloat16,
+    )
+
+
+def _packed_legal_block_n(
+    n: int,
+    *,
+    group_size: int,
+    bits: int,
+    align_n: int,
+    vmem_cap: int = 4096,
+) -> int:
+    """Return the smallest packed-legal block_n for the given N dimension.
+
+    Mosaic TPU tiling requires that for a 2-D BlockSpec ``(block_k, block_n // X)``
+    the trailing-dimension tile either equals the padded dimension or is a multiple
+    of 128.  For packed-quantized kernels ``X`` is ``values_per_word`` (weight) and
+    ``group_size`` (scales), so the cheapest legal choice is ``block_n == n_pad``
+    which makes both tile sizes exactly equal to the padded dimension.
+
+    For very large *N* where ``n_pad`` would blow the VMEM budget, the fallback
+    is the packed-lane alignment ``lcm(128 * values_per_word, 128 * group_size)``
+    which guarantees both tile sizes are multiples of 128.
+
+    Args:
+        n: The output dimension (unpacked, pre-padding).
+        group_size: Elements per quantization group.
+        bits: Quantization bit width (4 or 8).
+        align_n: Base alignment for n (``lcm(128, lcm(group_size, values_per_word))``).
+        vmem_cap: Maximum acceptable block_n (default 4096).
+
+    Returns:
+        A packed-legal ``block_n`` value.
+    """
+    n_pad = max(align_n, _ceil_div(n, align_n) * align_n)
+    if n_pad <= vmem_cap:
+        return n_pad
+    values_per_word = 32 // bits if bits in (4, 8) else 1
+    packed_lane_align = _lcm(128 * values_per_word, 128 * group_size)
+    bn = max(packed_lane_align, _ceil_div(n, packed_lane_align) * packed_lane_align)
+    # If the computed bn exceeds the cap, prefer n_pad anyway (the Pallas
+    # compiler will handle VMEM spilling for correctness).
+    return min(bn, n_pad)
+
+
 def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
     """Generate a heuristic configuration for TPU Pallas quantized matmul.
 
     Selects block sizes based on matrix dimensions and quantization parameters.
+    For packed-fused execution the block_n must satisfy Mosaic TPU tiling
+    constraints; this heuristic prefers ``n_pad`` (the full padded N) which is
+    always packed-legal and avoids the costly normalization fallback.
 
     Args:
         inv: The kernel invocation containing input tensors and kwargs.
@@ -391,11 +618,11 @@ def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> 
     align_n = _lcm(128, _lcm(group_size, values_per_word))
 
     block_m = 256 if m >= 2048 else 128
-    block_n = 256 if n >= 1024 else 128
     block_k = 256 if k >= 4096 else 128
-
-    block_n = max(align_n, _ceil_div(block_n, align_n) * align_n)
     block_k = max(128, _ceil_div(block_k, 128) * 128)
+
+    # Pick a block_n that is guaranteed packed-legal for TPU Mosaic.
+    block_n = _packed_legal_block_n(n, group_size=group_size, bits=bits, align_n=align_n)
 
     return QuantizedMatmulConfig(
         block_m=block_m,
@@ -1316,8 +1543,9 @@ def quantized_matmul(
     revsplit_k_parts: int | None = None,
     fuse: bool = True,
     strict_fuse: bool | None = None,
-    tpu_path: Literal["packed"] | None = None,
+    tpu_path: Literal["packed", "hybrid", "predecode"] | None = None,
     allow_dense_fallback: bool | None = None,
+    use_best_config: bool = False,
     platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
@@ -1327,6 +1555,16 @@ def quantized_matmul(
     selection and a custom backward pass that dequantizes weights for the
     gradient computation. Supports affine, nf4, mxfp4, mxfp8, nvfp4, and
     nvfp8 quantization modes.
+
+    TPU default strategy:
+        When running on TPU with ``fuse=True`` and row-wise layout
+        (``axis='row'`` / ``transpose=False``), this API first attempts a
+        predecode-once dense matmul path by default. If that path is not
+        applicable (e.g. traced quantized metadata), execution falls back to
+        the fused backend dispatcher (typically TPU Pallas packed path).
+        This behavior is controlled by environment variable
+        ``EJKERNEL_QMM_TPU_DEFAULT_STRATEGY`` with supported values:
+        ``"predecode_once"`` (default) and ``"packed"``.
 
     Args:
         x: Input matrix of shape (M, K) in float dtype.
@@ -1347,16 +1585,30 @@ def quantized_matmul(
         revsplit_k_parts: Number of parts for reverse split-K.
         fuse: If True, run platform fused quantized kernels. If False, force
             reference path (dequantize then matmul) using XLA/JAX ops.
+            On TPU row-wise fused calls, default behavior may route through
+            predecode-once first (see TPU default strategy above).
         strict_fuse: If True, disallow dense dequantize+matmul fallbacks inside
             fused implementations (notably the XLA backend). When None, reads
             environment variable ``EJKERNEL_QMM_STRICT_FUSED``.
-        tpu_path: Optional TPU Pallas path override for fused execution.
-            TPU Pallas uses packed-only execution. Legacy values
-            ``"hybrid"`` and ``"predecode"`` are accepted and normalized
-            to ``"packed"``.
+        tpu_path: Optional TPU strategy override for fused TPU execution.
+            Accepted values:
+            - ``"packed"``: force packed fused path dispatch.
+            - ``"predecode"`` or ``"hybrid"``: force predecode-once attempt
+              first, then fall back to packed fused dispatch when needed.
+            This override applies per call and takes precedence over
+            ``EJKERNEL_QMM_TPU_DEFAULT_STRATEGY``.
         allow_dense_fallback: Explicitly control whether fused implementations
             may fall back to dense dequantize+matmul. If None, defaults to
             ``not strict_fuse``.
+        use_best_config: If True, apply ejkernel's built-in backend/mode/size
+            policy table to fill runtime controls (fuse/platform/TPU strategy).
+            For non-affine modes on TPU, this policy is tracer-aware:
+            traced packed metadata prefers unfused XLA, while concrete packed
+            metadata prefers predecode-once first.
+            Explicit non-default values for ``strict_fuse``,
+            ``allow_dense_fallback``, ``platform``, and ``tpu_path`` are
+            preserved. ``fuse=True`` may still be downshifted to ``False`` by
+            policy.
         platform: Platform override (triton/pallas/cuda/cute/xla/auto).
         cfg: Optional configuration override.
 
@@ -1364,6 +1616,43 @@ def quantized_matmul(
         Matrix multiplication result of shape (M, N).
     """
     mode_n, group_size_n, bits_n, _ = resolve_qparams(mode, group_size, bits)
+    runtime_axis, runtime_transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    use_best_config_n = _static_bool(use_best_config, "use_best_config")
+    weights_concrete = (
+        not _is_tracer_value(w)
+        and not _is_tracer_value(scales)
+        and (zeros is None or not _is_tracer_value(zeros))
+    )
+
+    try:
+        backend_name = jax.default_backend()
+    except Exception:
+        backend_name = "cpu"
+
+    if use_best_config_n:
+        policy = _lookup_best_qmm_policy(
+            backend_name=backend_name,
+            mode=mode_n,
+            m_tokens=int(x.shape[0]),
+            runtime_axis=runtime_axis,
+            runtime_transpose=runtime_transpose,
+            weights_concrete=weights_concrete,
+        )
+        if policy:
+            if fuse is True and "fuse" in policy:
+                fuse = bool(policy["fuse"])
+            if strict_fuse is None and "strict_fuse" in policy:
+                strict_fuse = bool(policy["strict_fuse"])
+            if allow_dense_fallback is None and "allow_dense_fallback" in policy:
+                allow_dense_fallback = bool(policy["allow_dense_fallback"])
+            if platform in (None, "auto") and "platform" in policy:
+                policy_platform = str(policy["platform"]).strip().lower()
+                if policy_platform in {"triton", "pallas", "cuda", "cute", "xla", "auto"}:
+                    platform = policy_platform
+            if tpu_path is None and "tpu_path" in policy:
+                policy_tpu_path = str(policy["tpu_path"]).strip().lower()
+                if policy_tpu_path in {"packed", "hybrid", "predecode"}:
+                    tpu_path = policy_tpu_path
 
     if strict_fuse is None:
         env = os.getenv("EJKERNEL_QMM_STRICT_FUSED", "").strip().lower()
@@ -1380,28 +1669,33 @@ def quantized_matmul(
     if strict_fuse_n and not fuse:
         raise ValueError("strict_fuse=True requires fuse=True.")
 
+    tpu_strategy_override: Literal["predecode_once", "packed"] | None = None
     if tpu_path is not None:
         tpu_path_n = str(tpu_path).strip().lower()
         if tpu_path_n not in {"hybrid", "packed", "predecode"}:
             raise ValueError(
                 f"tpu_path must be one of {{'hybrid','packed','predecode'}}, got {tpu_path!r}."
             )
-        tpu_path_n = "packed"
-        if cfg is None:
-            cfg = QuantizedMatmulConfig(tpu_path=tpu_path_n)
-        else:
-            cfg = QuantizedMatmulConfig(
-                block_m=cfg.block_m,
-                block_n=cfg.block_n,
-                block_k=cfg.block_k,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
-                use_bf16=cfg.use_bf16,
-                split_k=cfg.split_k,
-                tpu_path=tpu_path_n,
-                platform=cfg.platform,
-                backend=cfg.backend,
-            )
+        tpu_strategy_override = "predecode_once" if tpu_path_n in {"hybrid", "predecode"} else "packed"
+        # Kernel-level tpu_path is packed-only. Preserve predecode/hybrid as
+        # strategy overrides at this wrapper level; only force cfg.tpu_path
+        # when caller explicitly requests packed.
+        if tpu_path_n == "packed":
+            if cfg is None:
+                cfg = QuantizedMatmulConfig(tpu_path="packed")
+            else:
+                cfg = QuantizedMatmulConfig(
+                    block_m=cfg.block_m,
+                    block_n=cfg.block_n,
+                    block_k=cfg.block_k,
+                    num_warps=cfg.num_warps,
+                    num_stages=cfg.num_stages,
+                    use_bf16=cfg.use_bf16,
+                    split_k=cfg.split_k,
+                    tpu_path="packed",
+                    platform=cfg.platform,
+                    backend=cfg.backend,
+                )
 
     if fuse and mode_n == "affine" and bits_n not in (4, 8):
         msg = "fuse=True with affine bits not in {4,8} is unsupported."
@@ -1413,7 +1707,7 @@ def quantized_matmul(
             stacklevel=2,
         )
         fuse = False
-    if fuse and jax.default_backend() == "mps":
+    if fuse and backend_name == "mps":
         msg = "fuse=True on MPS currently falls back to reference dequantize+matmul for stability."
         if strict_fuse_n:
             raise ValueError(msg)
@@ -1423,7 +1717,14 @@ def quantized_matmul(
             stacklevel=2,
         )
         fuse = False
-    runtime_axis, runtime_transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    use_tpu_predecode_once_default = _should_try_tpu_predecode_once_default(
+        fuse=fuse,
+        backend_name=backend_name,
+        runtime_axis=runtime_axis,
+        runtime_transpose=runtime_transpose,
+        platform=platform,
+        strategy_override=tpu_strategy_override,
+    )
     validate_packed_quantized_matmul_layout(
         x,
         w,
@@ -1452,6 +1753,19 @@ def quantized_matmul(
                 mode=mode,
                 axis=runtime_axis,
             )
+
+        if use_tpu_predecode_once_default:
+            out = _maybe_tpu_predecode_once_matmul(
+                xi,
+                wi,
+                si,
+                zi,
+                mode=mode_n,
+                group_size=group_size_n,
+                bits=bits_n,
+            )
+            if out is not None:
+                return out
 
         return _quantized_matmul_impl(
             xi,

@@ -24,17 +24,18 @@ pollution, then prints a concise table with:
   - live and peak HBM usage from ``jax.Device.memory_stats()``
 
 Example:
-  ./.venv/bin/python test/bench_qmm_tpu_pallas_vs_xla.py --m 32 --k 4096 --n 4096 --iters 20
+  ./.venv/bin/python bench/bench_qmm_tpu_pallas_vs_xla.py --m 32 --k 4096 --n 4096 --iters 20
 """
 
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
-# Avoid stdlib shadowing from test/types when executing this file directly.
-if sys.path and sys.path[0].endswith("/test"):
+# Avoid stdlib shadowing from sibling dirs when executing this file directly.
+if sys.path and (sys.path[0].endswith("/test") or sys.path[0].endswith("/bench")):
     sys.path.pop(0)
-_REPO_ROOT = __file__.rsplit("/test/", 1)[0]
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
 if _REPO_ROOT and _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 

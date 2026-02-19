@@ -416,6 +416,7 @@ dependencies = [
     { name = "jaxlib" },
     { name = "jaxtyping" },
     { name = "pydantic" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -459,6 +460,7 @@ requires-dist = [
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'cuda'", specifier = ">=4.4.0.dev1" },
     { name = "pydantic", specifier = ">=2.11.10" },
     { name = "tb-nightly", marker = "extra == 'profile'", specifier = ">=2.21.0a20250820" },
+    { name = "tqdm", specifier = ">=4.67.1" },
     { name = "triton", marker = "extra == 'cuda'", specifier = "==3.6.0" },
     { name = "triton", marker = "extra == 'triton'", specifier = "==3.6.0" },
     { name = "xprof", marker = "extra == 'profile'", specifier = ">=2.20.6" },

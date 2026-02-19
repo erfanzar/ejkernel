@@ -14,12 +14,13 @@
 
 from __future__ import annotations
 
+import importlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import ejkernel.modules.operations.quantized_matmul as qmm_op
 from ejkernel.modules.operations import quantized_matmul
 from ejkernel.quantization import (
     QuantizedArray,
@@ -33,6 +34,19 @@ from ejkernel.quantization import (
 )
 from ejkernel.quantization._utils.bitpack import _pack_bits, _unpack_bits
 from ejkernel.quantization.runtime import resolve_runtime_config
+
+qmm_op = importlib.import_module("ejkernel.modules.operations.quantized_matmul")
+
+
+def _prng_key_or_skip(seed: int) -> jax.Array:
+    """Build a PRNG key or skip when TPU runtime is unavailable in this process."""
+    try:
+        return jax.random.PRNGKey(seed)
+    except RuntimeError as err:
+        msg = str(err)
+        if "Unable to initialize backend 'tpu'" in msg or "libtpu.so" in msg:
+            pytest.skip("Skipping test: JAX TPU backend is unavailable in this process.")
+        raise
 
 
 @pytest.mark.parametrize(
@@ -463,6 +477,223 @@ def test_quantized_matmul_explicit_tpu_controls_no_env(monkeypatch):
     cfg = captured["cfg"]
     assert cfg is not None
     assert cfg.tpu_path == "packed"
+
+
+def test_quantized_matmul_use_best_config_populates_missing_controls(monkeypatch):
+    key_x, key_w = jax.random.split(_prng_key_or_skip(1001), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4, group_size=32, axis="row")
+
+    captured: dict[str, object] = {}
+    original_impl = qmm_op._quantized_matmul_impl
+
+    def _fake_policy(**_kwargs):
+        return {
+            "fuse": True,
+            "strict_fuse": False,
+            "allow_dense_fallback": False,
+            "platform": "pallas",
+            "tpu_path": "packed",
+        }
+
+    def _fake_impl(xi, wi, si, zi, /, **kwargs):
+        captured["allow_dense_fallback"] = kwargs["allow_dense_fallback"]
+        captured["platform"] = kwargs["platform"]
+        captured["cfg"] = kwargs.get("cfg")
+        n = int(si.shape[-1]) * int(kwargs["group_size"])
+        return jnp.zeros((int(xi.shape[0]), n), dtype=jnp.float32)
+
+    monkeypatch.setattr(qmm_op, "_lookup_best_qmm_policy", _fake_policy)
+    monkeypatch.setattr(qmm_op, "_quantized_matmul_impl", _fake_impl)
+    try:
+        y = qmm_op.quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            mode="affine",
+            bits=4,
+            group_size=32,
+            axis="row",
+            platform="auto",
+            fuse=True,
+            use_best_config=True,
+        )
+    finally:
+        monkeypatch.setattr(qmm_op, "_quantized_matmul_impl", original_impl)
+
+    assert y.shape == (8, 32)
+    assert captured["allow_dense_fallback"] is False
+    assert captured["platform"] == "pallas"
+    cfg = captured["cfg"]
+    assert cfg is not None
+    assert cfg.tpu_path == "packed"
+
+
+def test_quantized_matmul_use_best_config_respects_explicit_controls(monkeypatch):
+    key_x, key_w = jax.random.split(_prng_key_or_skip(1002), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4, group_size=32, axis="row")
+
+    captured: dict[str, object] = {}
+    original_impl = qmm_op._quantized_matmul_impl
+
+    def _fake_policy(**_kwargs):
+        return {
+            "fuse": True,
+            "strict_fuse": False,
+            "allow_dense_fallback": True,
+            "platform": "pallas",
+            "tpu_path": "packed",
+        }
+
+    def _fake_impl(xi, wi, si, zi, /, **kwargs):
+        captured["allow_dense_fallback"] = kwargs["allow_dense_fallback"]
+        captured["platform"] = kwargs["platform"]
+        captured["cfg"] = kwargs.get("cfg")
+        n = int(si.shape[-1]) * int(kwargs["group_size"])
+        return jnp.zeros((int(xi.shape[0]), n), dtype=jnp.float32)
+
+    monkeypatch.setattr(qmm_op, "_lookup_best_qmm_policy", _fake_policy)
+    monkeypatch.setattr(qmm_op, "_should_try_tpu_predecode_once_default", lambda **_kwargs: False)
+    monkeypatch.setattr(qmm_op, "_quantized_matmul_impl", _fake_impl)
+    try:
+        y = qmm_op.quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            mode="affine",
+            bits=4,
+            group_size=32,
+            axis="row",
+            platform="xla",
+            fuse=True,
+            strict_fuse=True,
+            allow_dense_fallback=False,
+            tpu_path="predecode",
+            use_best_config=True,
+        )
+    finally:
+        monkeypatch.setattr(qmm_op, "_quantized_matmul_impl", original_impl)
+
+    assert y.shape == (8, 32)
+    assert captured["allow_dense_fallback"] is False
+    assert captured["platform"] == "xla"
+    assert captured["cfg"] is None
+
+
+def test_quantized_matmul_use_best_config_can_disable_fuse(monkeypatch):
+    key_x, key_w = jax.random.split(_prng_key_or_skip(1003), 2)
+    x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
+    w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
+    w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=4, group_size=32, axis="row")
+
+    original_impl = qmm_op._quantized_matmul_impl
+
+    def _fake_policy(**_kwargs):
+        return {"fuse": False, "platform": "xla"}
+
+    def _fail_impl(*_args, **_kwargs):
+        raise AssertionError("_quantized_matmul_impl should not be called when policy disables fuse.")
+
+    monkeypatch.setattr(qmm_op, "_lookup_best_qmm_policy", _fake_policy)
+    monkeypatch.setattr(qmm_op, "_quantized_matmul_impl", _fail_impl)
+    try:
+        y_auto = qmm_op.quantized_matmul(
+            x,
+            w_q,
+            scales,
+            zeros,
+            mode="affine",
+            bits=4,
+            group_size=32,
+            axis="row",
+            platform="xla",
+            fuse=True,
+            use_best_config=True,
+        )
+    finally:
+        monkeypatch.setattr(qmm_op, "_quantized_matmul_impl", original_impl)
+
+    y_ref = qmm_op.quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        mode="affine",
+        bits=4,
+        group_size=32,
+        axis="row",
+        platform="xla",
+        fuse=False,
+        use_best_config=False,
+    )
+    np.testing.assert_allclose(np.asarray(y_auto), np.asarray(y_ref), rtol=1e-6, atol=1e-6)
+
+
+def test_lookup_best_qmm_policy_non_affine_concrete_prefers_packed_pallas():
+    policy = qmm_op._lookup_best_qmm_policy(
+        backend_name="tpu",
+        mode="mxfp8",
+        m_tokens=16,
+        runtime_axis="row",
+        runtime_transpose=False,
+        weights_concrete=True,
+    )
+    assert policy["fuse"] is True
+    assert policy["platform"] == "pallas"
+    assert policy["tpu_path"] == "packed"
+
+
+def test_lookup_best_qmm_policy_non_affine_traced_prefers_packed_pallas():
+    """Non-affine traced weights should use fused Pallas packed kernel.
+
+    The Pallas packed kernel is trace-safe: legality checks use only
+    .shape (concrete during tracing), and in-kernel dequant is pure
+    arithmetic (jnp.where chains, bit ops) with no table lookups.
+    """
+    policy = qmm_op._lookup_best_qmm_policy(
+        backend_name="tpu",
+        mode="mxfp8",
+        m_tokens=16,
+        runtime_axis="row",
+        runtime_transpose=False,
+        weights_concrete=False,
+    )
+    assert policy["fuse"] is True
+    assert policy["platform"] == "pallas"
+    assert policy["tpu_path"] == "packed"
+
+
+def test_lookup_best_qmm_policy_nf4_concrete_small_prefers_packed_pallas():
+    policy = qmm_op._lookup_best_qmm_policy(
+        backend_name="tpu",
+        mode="nf4",
+        m_tokens=16,
+        runtime_axis="row",
+        runtime_transpose=False,
+        weights_concrete=True,
+    )
+    assert policy["fuse"] is True
+    assert policy["platform"] == "pallas"
+    assert policy["tpu_path"] == "packed"
+
+
+def test_lookup_best_qmm_policy_nf4_concrete_large_prefers_packed_pallas():
+    policy = qmm_op._lookup_best_qmm_policy(
+        backend_name="tpu",
+        mode="nf4",
+        m_tokens=2048,
+        runtime_axis="row",
+        runtime_transpose=False,
+        weights_concrete=True,
+    )
+    assert policy["fuse"] is True
+    assert policy["platform"] == "pallas"
+    assert policy["tpu_path"] == "packed"
 
 
 def test_quantized_array_matmul_fuse_switch():
