@@ -809,15 +809,14 @@ def _cuda_max_shared_mem_per_block_bytes() -> int | None:
 
 @lru_cache(maxsize=1)
 def _qmm_smem_limit_bytes() -> int:
-    """Return an estimate of usable shared memory per CTA for QMM kernels."""
-    # Conservative default for non-CUDA environments.
+    """Return an estimate of usable shared memory per CTA for QMM kernels.
+
+    This helper is used while constructing module-level autotune config lists,
+    so it must not query JAX runtime backend state (which would eagerly
+    initialize backends at import time).
+    """
+    # Conservative default when CUDA runtime querying is unavailable.
     default = 96 * 1024
-    try:
-        backend = jax.default_backend()
-    except Exception:
-        backend = "cpu"
-    if backend not in ("gpu", "cuda"):
-        return default
 
     # Prefer the device-reported per-block limit (opt-in when available).
     limit = _cuda_max_shared_mem_per_block_bytes()

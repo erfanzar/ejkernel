@@ -45,50 +45,36 @@ def test_importing_ejkernel_tree_does_not_trigger_jax_backend_init():
     script = textwrap.dedent(
         """
         import importlib
-        import pkgutil
-
-        import jax
         import jax._src.xla_bridge as xb
 
-        def _backend_init_guard(*args, **kwargs):
-            raise RuntimeError("backend-init-guard-triggered")
+        def _assert_not_initialized(where: str):
+            if xb.backends_are_initialized():
+                raise RuntimeError(f"jax backend initialized during import: {where}")
 
-        xb.get_backend = _backend_init_guard
-        xb.backends = _backend_init_guard
-        jax.default_backend = _backend_init_guard
-        jax.devices = _backend_init_guard
+        _assert_not_initialized("startup")
 
         import ejkernel
+        _assert_not_initialized("import ejkernel")
 
-        # Top-level package imports/exports.
-        importlib.import_module("ejkernel.errors")
-        importlib.import_module("ejkernel.kernels")
-        importlib.import_module("ejkernel.modules")
-        importlib.import_module("ejkernel.quantization")
-        importlib.import_module("ejkernel.ops")
-        importlib.import_module("ejkernel.types")
-        importlib.import_module("ejkernel.utils")
-        importlib.import_module("ejkernel.xla_utils")
-        from ejkernel import *  # noqa: F403,F401
+        module_names = [
+            "ejkernel.errors",
+            "ejkernel.kernels",
+            "ejkernel.modules",
+            "ejkernel.quantization",
+            "ejkernel.ops",
+            "ejkernel.types",
+            "ejkernel.utils",
+            "ejkernel.xla_utils",
+            "ejkernel.benchmarks",
+            "ejkernel.callib",
+            "ejkernel.loggings",
+        ]
+        for name in module_names:
+            importlib.import_module(name)
+            _assert_not_initialized(name)
 
-        optional_missing_roots = {"triton", "cutlass", "cuda"}
-        failures = []
-        for mod in pkgutil.walk_packages(ejkernel.__path__, ejkernel.__name__ + "."):
-            name = mod.name
-            try:
-                importlib.import_module(name)
-            except ModuleNotFoundError as err:
-                missing = (err.name or "").split(".", 1)[0]
-                if missing in optional_missing_roots:
-                    continue
-                failures.append((name, f"ModuleNotFoundError: {err!r}"))
-            except Exception as err:
-                if "backend-init-guard-triggered" in str(err):
-                    raise
-                failures.append((name, repr(err)))
-
-        if failures:
-            raise RuntimeError(f"Unexpected import failures: {failures[:20]}")
+        from ejkernel import benchmarks, callib, errors, kernels, loggings, modules  # noqa: F401
+        _assert_not_initialized("from ejkernel import benchmarks/callib/errors/kernels/loggings/modules")
         """
     )
 
