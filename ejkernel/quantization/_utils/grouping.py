@@ -24,7 +24,77 @@ import jax
 from jax import numpy as jnp
 
 
-def _quantize_to_codebook(values: jax.Array, codebook: jax.Array) -> jax.Array:
+def _quantize_to_codebook_argmin(values: jax.Array, codebook: jax.Array) -> jax.Array:
+    """Reference argmin-based codebook quantization."""
+    min_dist = jnp.abs(values - codebook[0])
+    min_idx = jnp.zeros(values.shape, dtype=jnp.int32)
+
+    def _body(i: int, state: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+        cur_min_dist, cur_min_idx = state
+        dist = jnp.abs(values - codebook[i])
+        better = dist < cur_min_dist
+        cur_min_dist = jnp.where(better, dist, cur_min_dist)
+        cur_min_idx = jnp.where(better, i, cur_min_idx)
+        return cur_min_dist, cur_min_idx
+
+    _, min_idx = jax.lax.fori_loop(1, codebook.shape[0], _body, (min_dist, min_idx))
+    return min_idx.astype(jnp.uint32)
+
+
+def _quantize_to_codebook_threshold(values: jax.Array, codebook: jax.Array) -> jax.Array:
+    """Threshold bucketization codebook quantization.
+
+    Sorts the codebook once, quantizes values by midpoint boundaries, and maps
+    back to original codebook indices. Ties resolve toward the lower bucket.
+    """
+    codebook = codebook.astype(jnp.float32)
+    sorted_idx = jnp.argsort(codebook).astype(jnp.int32)
+    sorted_vals = codebook[sorted_idx]
+    if sorted_vals.shape[0] == 1:
+        return jnp.zeros(values.shape, dtype=jnp.uint32)
+    boundaries = ((sorted_vals[:-1] + sorted_vals[1:]) * 0.5).astype(jnp.float32)
+    return _quantize_to_codebook_threshold_from_map(values, sorted_idx=sorted_idx, boundaries=boundaries)
+
+
+def _quantize_to_codebook_threshold_from_map(
+    values: jax.Array,
+    *,
+    sorted_idx: jax.Array,
+    boundaries: jax.Array,
+) -> jax.Array:
+    """Threshold quantization from precomputed sorted index/boundary tensors."""
+    values = values.astype(jnp.float32)
+
+    if sorted_idx.shape[0] == 1:
+        return jnp.zeros(values.shape, dtype=jnp.uint32)
+
+    if jax.default_backend() == "mps":
+        # MPS currently lacks a stable searchsorted lowering for this pattern.
+        lo = jnp.zeros(values.shape, dtype=jnp.int32)
+        hi = jnp.full(values.shape, boundaries.shape[0], dtype=jnp.int32)
+        steps = int((boundaries.shape[0] + 1).bit_length())
+        for _ in range(steps):
+            mid = (lo + hi) >> 1
+            mid_vals = jnp.take(boundaries, mid, mode="clip")
+            go_left = values <= mid_vals
+            hi = jnp.where(go_left, mid, hi)
+            lo = jnp.where(go_left, lo, mid + 1)
+        bins = lo
+    else:
+        bins = jnp.searchsorted(boundaries, values, side="left")
+
+    bins = jnp.clip(bins, 0, sorted_idx.shape[0] - 1)
+    return sorted_idx[bins].astype(jnp.uint32)
+
+
+def _quantize_to_codebook(
+    values: jax.Array,
+    codebook: jax.Array,
+    *,
+    use_argmin_fallback: bool = False,
+    sorted_idx: jax.Array | None = None,
+    boundaries: jax.Array | None = None,
+) -> jax.Array:
     """Quantize values to nearest codebook entries.
 
     For each value, finds the index of the closest codebook entry using
@@ -50,31 +120,11 @@ def _quantize_to_codebook(values: jax.Array, codebook: jax.Array) -> jax.Array:
     if codebook.shape[0] == 0:
         raise ValueError("codebook must be non-empty.")
 
-    min_dist = jnp.abs(values - codebook[0])
-    min_idx = jnp.zeros(values.shape, dtype=jnp.int32)
-
-    def _body(i: int, state: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
-        """Update running argmin state for codebook entry ``i``.
-
-        Compares each value against ``codebook[i]`` and updates the running
-        minimum distance and best index arrays where the new entry is closer.
-
-        Args:
-            i: Current codebook index being evaluated.
-            state: Tuple of (current_min_distances, current_best_indices).
-
-        Returns:
-            Updated tuple of (min_distances, best_indices).
-        """
-        cur_min_dist, cur_min_idx = state
-        dist = jnp.abs(values - codebook[i])
-        better = dist < cur_min_dist
-        cur_min_dist = jnp.where(better, dist, cur_min_dist)
-        cur_min_idx = jnp.where(better, i, cur_min_idx)
-        return cur_min_dist, cur_min_idx
-
-    _, min_idx = jax.lax.fori_loop(1, codebook.shape[0], _body, (min_dist, min_idx))
-    return min_idx.astype(jnp.uint32)
+    if use_argmin_fallback:
+        return _quantize_to_codebook_argmin(values, codebook)
+    if sorted_idx is not None and boundaries is not None:
+        return _quantize_to_codebook_threshold_from_map(values, sorted_idx=sorted_idx, boundaries=boundaries)
+    return _quantize_to_codebook_threshold(values, codebook)
 
 
 def _reshape_groups(w: jax.Array, group_size: int) -> tuple[jax.Array, int]:

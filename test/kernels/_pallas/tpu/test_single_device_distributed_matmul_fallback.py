@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import importlib
+
 import pytest
 
 jnp = pytest.importorskip("jax.numpy")
 
-from ejkernel.kernels._pallas.tpu.all_gather_matmul._pallas_impl import all_gather_matmul
-from ejkernel.kernels._pallas.tpu.reduce_scatter_matmul._pallas_impl import reduce_scatter_matmul
+_all_gather_module = importlib.import_module("ejkernel.kernels._pallas.tpu.all_gather_matmul._pallas_impl")
+all_gather_matmul = _all_gather_module.all_gather_matmul
+_reduce_scatter_module = importlib.import_module(
+    "ejkernel.kernels._pallas.tpu.reduce_scatter_matmul._pallas_impl"
+)
+reduce_scatter_matmul = _reduce_scatter_module.reduce_scatter_matmul
 
 
 @pytest.mark.parametrize("rhs_transpose", [False, True])
@@ -44,4 +50,3 @@ def test_reduce_scatter_matmul_tp_size_one_falls_back_to_local_matmul():
 
     assert out.shape == expected.shape
     assert jnp.array_equal(out, expected)
-

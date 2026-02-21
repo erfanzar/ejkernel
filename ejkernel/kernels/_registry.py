@@ -338,13 +338,15 @@ class Backend(StrEnum):
     backend query, making it suitable for platform-agnostic implementations.
 
     Attributes:
-        GPU: NVIDIA (or compatible) GPU backend.
+        GPU: GPU backend (typically CUDA/ROCm-class).
+        MPS: Apple Silicon Metal/MPS backend (``jax.default_backend() == "mps"``).
         TPU: Google TPU backend.
         CPU: CPU-only backend.
         ANY: Wildcard backend matching any hardware target.
     """
 
     GPU = "gpu"
+    MPS = "mps"
     TPU = "tpu"
     CPU = "cpu"
     ANY = "any"
@@ -412,7 +414,7 @@ class KernelRegistry:
         self,
         algorithm: str,
         platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla"],
-        backend: Backend | Literal["gpu", "tpu", "cpu", "any"],
+        backend: Backend | Literal["gpu", "mps", "tpu", "cpu", "any"],
         priority: int = 0,
     ) -> Callable[[F], F]: ...
 
@@ -500,7 +502,7 @@ class KernelRegistry:
         self,
         algorithm: str,
         platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
-        backend: Backend | Literal["gpu", "tpu", "cpu", "any"] | None = None,
+        backend: Backend | Literal["gpu", "mps", "tpu", "cpu", "any"] | None = None,
     ) -> Callable:
         """Retrieve the best matching kernel implementation.
 

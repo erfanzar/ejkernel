@@ -15,7 +15,7 @@
 """Quantization functions for weight compression.
 
 Supported quantization modes:
-- ``affine`` with bits in ``{4, 8}``
+- ``affine`` with bits in ``{1, 2, 4, 8}``
 - ``nf4`` (4-bit normal-float codebook)
 - ``mxfp4`` / ``mxfp8``
 - ``nvfp4`` / ``nvfp8``
@@ -27,6 +27,11 @@ Quantization axis is explicit via ``axis``:
 
 from __future__ import annotations
 
+import os
+import time
+from dataclasses import replace
+from threading import Lock
+
 import jax
 from jax import numpy as jnp
 
@@ -34,12 +39,17 @@ from ejkernel.callib._ejit import ejit
 
 from .._utils.bitpack import _pack_bits, _unpack_bits
 from .._utils.fp_tables import (
+    _decode_e2m1_codes,
+    _decode_e4m3_codes,
     _get_e2m1_max,
     _get_e2m1_table,
+    _get_e2m1_threshold_map,
     _get_e4m3_max,
+    _get_e4m3_q_threshold_map,
     _get_e4m3_table,
     _get_e4m3_table_q,
     _get_nf4_table,
+    _get_nf4_threshold_map,
 )
 from .._utils.grouping import _quantize_to_codebook, _reshape_groups
 from .._utils.qparams import (
@@ -49,7 +59,334 @@ from .._utils.qparams import (
     resolve_prepack_axis,
     resolve_qparams,
     resolve_runtime_axis_and_transpose,
+    validate_packed_quantized_matmul_layout,
 )
+from ..runtime import QuantRuntimeConfig, resolve_runtime_config
+
+_AUTOTUNE_CACHE_LOCK = Lock()
+_AUTOTUNE_QUANT_CFG_CACHE: dict[tuple, QuantRuntimeConfig] = {}
+_AUTOTUNE_DEQUANT_CFG_CACHE: dict[tuple, QuantRuntimeConfig] = {}
+
+
+def clear_runtime_autotune_cache() -> None:
+    """Clear cached runtime autotune decisions for quantize/dequantize."""
+    with _AUTOTUNE_CACHE_LOCK:
+        _AUTOTUNE_QUANT_CFG_CACHE.clear()
+        _AUTOTUNE_DEQUANT_CFG_CACHE.clear()
+
+
+def runtime_autotune_cache_sizes() -> tuple[int, int]:
+    """Return ``(quantize_cells, dequantize_cells)`` cached by runtime autotune."""
+    with _AUTOTUNE_CACHE_LOCK:
+        return len(_AUTOTUNE_QUANT_CFG_CACHE), len(_AUTOTUNE_DEQUANT_CFG_CACHE)
+
+
+def _autotune_enabled() -> bool:
+    """Check whether runtime autotuning is enabled."""
+    flag = os.getenv("EJKERNEL_QRUNTIME_AUTOTUNE", "1").strip().lower()
+    return flag not in {"0", "false", "off", "no"}
+
+
+def _is_tracing_tree(tree) -> bool:
+    """Return True if any leaf in *tree* is a JAX tracer."""
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if isinstance(leaf, jax.core.Tracer):
+            return True
+    return False
+
+
+def _block_tree(tree) -> None:
+    """Block on all array leaves in *tree*."""
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if hasattr(leaf, "block_until_ready"):
+            leaf.block_until_ready()
+
+
+def _bench_ms(
+    fn,
+    args: tuple,
+    *,
+    warmup: int | None = None,
+    iters: int | None = None,
+) -> float:
+    """Measure median runtime in milliseconds for a jitted callable."""
+    if warmup is None:
+        warmup = max(1, int(os.getenv("EJKERNEL_QRUNTIME_AUTOTUNE_WARMUP", "2")))
+    if iters is None:
+        iters = max(1, int(os.getenv("EJKERNEL_QRUNTIME_AUTOTUNE_ITERS", "4")))
+    out = fn(*args)
+    _block_tree(out)
+    for _ in range(warmup):
+        out = fn(*args)
+        _block_tree(out)
+
+    samples: list[float] = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        out = fn(*args)
+        _block_tree(out)
+        samples.append((time.perf_counter() - t0) * 1000.0)
+    samples.sort()
+    return float(samples[len(samples) // 2])
+
+
+def _autotune_min_gain() -> float:
+    """Return minimum relative win required to replace the baseline config."""
+    return max(0.0, float(os.getenv("EJKERNEL_QRUNTIME_AUTOTUNE_MIN_GAIN", "0.03")))
+
+
+def _dedupe_cfgs(candidates: list[QuantRuntimeConfig]) -> list[QuantRuntimeConfig]:
+    """Deduplicate candidate runtime configs while preserving order."""
+    seen: set[tuple] = set()
+    out: list[QuantRuntimeConfig] = []
+    for cfg in candidates:
+        sig = (
+            cfg.enable_u4_u8_fastpath,
+            cfg.enable_threshold_codebook,
+            cfg.enable_parity_fallback,
+            cfg.strict_shape_alignment,
+            cfg.prefer_compute_dtype,
+            cfg.affine_metadata_dtype,
+            cfg.dequant_output_dtype,
+            cfg.dequant_unpack_policy,
+        )
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(cfg)
+    return out
+
+
+def _quant_autotune_key(
+    w: jax.Array,
+    *,
+    mode: QuantizationMode,
+    group_size: int,
+    bits: int,
+    axis: QuantizationAxis,
+) -> tuple:
+    """Build cache key for quantize autotuning."""
+    return (
+        jax.default_backend(),
+        "quantize",
+        mode,
+        int(group_size),
+        int(bits),
+        axis,
+        tuple(int(d) for d in w.shape),
+        str(w.dtype),
+    )
+
+
+def _dequant_autotune_key(
+    w_q: jax.Array,
+    scales: jax.Array,
+    zeros: jax.Array | None,
+    *,
+    mode: QuantizationMode,
+    group_size: int,
+    bits: int,
+    axis: QuantizationAxis,
+) -> tuple:
+    """Build cache key for dequantize autotuning."""
+    return (
+        jax.default_backend(),
+        "dequantize",
+        mode,
+        int(group_size),
+        int(bits),
+        axis,
+        tuple(int(d) for d in w_q.shape),
+        str(w_q.dtype),
+        tuple(int(d) for d in scales.shape),
+        str(scales.dtype),
+        None if zeros is None else str(zeros.dtype),
+    )
+
+
+def _quantize_candidate_cfgs(
+    base: QuantRuntimeConfig,
+    *,
+    mode: QuantizationMode,
+) -> list[QuantRuntimeConfig]:
+    """Build quantize autotune candidates around *base*."""
+    # For quantize, prefer stable "store once, use many times" artifacts.
+    # The default backend-tuned config already picks a compact metadata dtype
+    # (bf16 on TPU, fp16 elsewhere). Callers can override via runtime_config
+    # if they want input/fp32 metadata for parity or debugging.
+    del mode
+    return [base]
+
+
+def _dequantize_candidate_cfgs(base: QuantRuntimeConfig) -> list[QuantRuntimeConfig]:
+    """Build dequantize autotune candidates around *base*."""
+    backend = jax.default_backend()
+    if backend == "tpu":
+        compute_opts = ("bf16", "fp32")
+    elif backend in {"gpu", "cuda", "mps"}:
+        compute_opts = ("fp16", "fp32")
+    else:
+        compute_opts = ("fp32",)
+
+    if backend in {"gpu", "cuda", "mps", "tpu"}:
+        output_opts = ("compute", "fp32")
+    else:
+        output_opts = ("fp32",)
+
+    unpack_opts = ("auto", "fast", "generic")
+    candidates = [base]
+    for compute_dtype in compute_opts:
+        for output_dtype in output_opts:
+            for unpack_policy in unpack_opts:
+                candidates.append(
+                    replace(
+                        base,
+                        prefer_compute_dtype=compute_dtype,
+                        dequant_output_dtype=output_dtype,
+                        dequant_unpack_policy=unpack_policy,
+                    )
+                )
+    max_candidates = max(1, int(os.getenv("EJKERNEL_QRUNTIME_AUTOTUNE_MAX_CANDIDATES", "12")))
+    return _dedupe_cfgs(candidates)[:max_candidates]
+
+
+def _maybe_autotune_quantize_runtime_cfg(
+    w: jax.Array,
+    *,
+    mode: QuantizationMode,
+    group_size: int,
+    bits: int,
+    axis: QuantizationAxis,
+    base_cfg: QuantRuntimeConfig,
+) -> QuantRuntimeConfig:
+    """Pick and cache a fast quantize runtime config for this shape/mode cell."""
+    if not _autotune_enabled() or _is_tracing_tree(w):
+        return base_cfg
+
+    key = _quant_autotune_key(w, mode=mode, group_size=group_size, bits=bits, axis=axis)
+    with _AUTOTUNE_CACHE_LOCK:
+        cached = _AUTOTUNE_QUANT_CFG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    best_cfg = base_cfg
+    best_ms = float("inf")
+    min_gain = _autotune_min_gain()
+    for cand in _quantize_candidate_cfgs(base_cfg, mode=mode):
+        try:
+            fn = jax.jit(
+                lambda x, _cand=cand: quantize(
+                    x,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                    axis=axis,
+                    runtime_config=_cand,
+                )
+            )
+            ms = _bench_ms(fn, (w,))
+        except Exception:
+            continue
+        if ms < best_ms * (1.0 - min_gain):
+            best_ms = ms
+            best_cfg = cand
+
+    with _AUTOTUNE_CACHE_LOCK:
+        _AUTOTUNE_QUANT_CFG_CACHE.setdefault(key, best_cfg)
+        return _AUTOTUNE_QUANT_CFG_CACHE[key]
+
+
+def _maybe_autotune_dequantize_runtime_cfg(
+    w_q: jax.Array,
+    scales: jax.Array,
+    zeros: jax.Array | None,
+    *,
+    mode: QuantizationMode,
+    group_size: int,
+    bits: int,
+    axis: QuantizationAxis,
+    base_cfg: QuantRuntimeConfig,
+) -> QuantRuntimeConfig:
+    """Pick and cache a fast dequantize runtime config for this shape/mode cell."""
+    if not _autotune_enabled() or _is_tracing_tree((w_q, scales, zeros)):
+        return base_cfg
+
+    key = _dequant_autotune_key(
+        w_q,
+        scales,
+        zeros,
+        mode=mode,
+        group_size=group_size,
+        bits=bits,
+        axis=axis,
+    )
+    with _AUTOTUNE_CACHE_LOCK:
+        cached = _AUTOTUNE_DEQUANT_CFG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    best_cfg = base_cfg
+    best_ms = float("inf")
+    min_gain = _autotune_min_gain()
+    for cand in _dequantize_candidate_cfgs(base_cfg):
+        try:
+            fn = jax.jit(
+                lambda q, s, z, _cand=cand: dequantize(
+                    q,
+                    s,
+                    z,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                    axis=axis,
+                    runtime_config=_cand,
+                )
+            )
+            ms = _bench_ms(fn, (w_q, scales, zeros))
+        except Exception:
+            continue
+        if ms < best_ms * (1.0 - min_gain):
+            best_ms = ms
+            best_cfg = cand
+
+    if best_cfg != base_cfg:
+        try:
+            confirm_warmup = max(2, int(os.getenv("EJKERNEL_QRUNTIME_AUTOTUNE_CONFIRM_WARMUP", "3")))
+            confirm_iters = max(4, int(os.getenv("EJKERNEL_QRUNTIME_AUTOTUNE_CONFIRM_ITERS", "8")))
+            fn_base = jax.jit(
+                lambda q, s, z: dequantize(
+                    q,
+                    s,
+                    z,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                    axis=axis,
+                    runtime_config=base_cfg,
+                )
+            )
+            fn_best = jax.jit(
+                lambda q, s, z: dequantize(
+                    q,
+                    s,
+                    z,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                    axis=axis,
+                    runtime_config=best_cfg,
+                )
+            )
+            base_ms = _bench_ms(fn_base, (w_q, scales, zeros), warmup=confirm_warmup, iters=confirm_iters)
+            tuned_ms = _bench_ms(fn_best, (w_q, scales, zeros), warmup=confirm_warmup, iters=confirm_iters)
+            if tuned_ms >= base_ms * (1.0 - min_gain):
+                best_cfg = base_cfg
+        except Exception:
+            best_cfg = base_cfg
+
+    with _AUTOTUNE_CACHE_LOCK:
+        _AUTOTUNE_DEQUANT_CFG_CACHE.setdefault(key, best_cfg)
+        return _AUTOTUNE_DEQUANT_CFG_CACHE[key]
 
 
 def _to_quant_layout(w: jax.Array, axis: QuantizationAxis) -> jax.Array:
@@ -77,6 +414,374 @@ def _to_quant_layout(w: jax.Array, axis: QuantizationAxis) -> jax.Array:
     return jnp.swapaxes(w, -2, -1) if axis == "row" else w
 
 
+def _resolve_affine_metadata_dtype(w_layout: jax.Array, runtime_cfg: QuantRuntimeConfig) -> jnp.dtype:
+    """Resolve storage dtype for affine scales/zeros metadata."""
+    mode = runtime_cfg.affine_metadata_dtype
+    if mode == "input":
+        return w_layout.dtype
+    if mode == "bf16":
+        return jnp.bfloat16
+    if mode == "fp16":
+        return jnp.float16
+    if mode == "fp32":
+        return jnp.float32
+    raise ValueError(f"Unsupported affine metadata dtype mode: {mode!r}.")
+
+
+def _pack_group_codes(
+    w_layout: jax.Array,
+    q: jax.Array,
+    bits: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> jax.Array:
+    """Pack grouped quantization codes into uint32 storage layout."""
+    return _pack_bits(
+        q.reshape(*w_layout.shape[:-1], -1),
+        bits,
+        prefer_fast_u4_u8=runtime_cfg.enable_u4_u8_fastpath,
+        strict_shape_alignment=runtime_cfg.strict_shape_alignment,
+    )
+
+
+def _use_argmin_codebook(runtime_cfg: QuantRuntimeConfig) -> bool:
+    """Select reference argmin codebook quantization when requested."""
+    return runtime_cfg.enable_parity_fallback or not runtime_cfg.enable_threshold_codebook
+
+
+def _quantize_affine(
+    w_layout: jax.Array,
+    w_groups: jax.Array,
+    *,
+    bits: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Quantize groups with affine (scale + zero-point) metadata."""
+    qmax = 2**bits - 1
+    meta_dtype = _resolve_affine_metadata_dtype(w_layout, runtime_cfg)
+    alpha = jnp.max(w_groups, axis=-1)
+    beta = jnp.min(w_groups, axis=-1)
+
+    scale = (alpha - beta) / qmax
+    scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
+    zero = -beta / scale
+
+    q = jnp.round(w_groups / scale[..., None] + zero[..., None])
+    q = jnp.clip(q, 0, qmax).astype(jnp.uint32)
+    packed = _pack_group_codes(w_layout, q, bits, runtime_cfg)
+    return packed, scale.astype(meta_dtype), zero.astype(meta_dtype)
+
+
+def _quantize_nf4(
+    w_layout: jax.Array,
+    w_groups: jax.Array,
+    *,
+    bits: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Quantize groups into NF4 codebook indices and per-group absmax scales."""
+    codebook = _get_nf4_table()
+    nf4_sorted_idx, nf4_boundaries = _get_nf4_threshold_map()
+    max_abs = jnp.max(jnp.abs(w_groups), axis=-1)
+    scale = jnp.where(max_abs == 0, jnp.ones_like(max_abs), max_abs)
+    normalized = w_groups / scale[..., None]
+    q = _quantize_to_codebook(
+        normalized,
+        codebook,
+        use_argmin_fallback=_use_argmin_codebook(runtime_cfg),
+        sorted_idx=nf4_sorted_idx,
+        boundaries=nf4_boundaries,
+    )
+    packed = _pack_group_codes(w_layout, q, bits, runtime_cfg)
+    return packed, scale.astype(w_layout.dtype)
+
+
+def _quantize_mxfp(
+    w_layout: jax.Array,
+    w_groups: jax.Array,
+    *,
+    bits: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Quantize groups using MXFP shared-exponent scaling."""
+    max_abs = jnp.max(jnp.abs(w_groups), axis=-1)
+    if bits == 4:
+        vmax = _get_e2m1_max()
+        codebook, _ = _get_e2m1_table()
+        codebook_sorted_idx, codebook_boundaries = _get_e2m1_threshold_map()
+    else:
+        vmax = _get_e4m3_max()
+        codebook = _get_e4m3_table_q()
+        codebook_sorted_idx, codebook_boundaries = _get_e4m3_q_threshold_map()
+
+    exp = jnp.where(max_abs > 0, jnp.ceil(jnp.log2(max_abs / vmax)), 0.0)
+    exp = jnp.clip(exp, -128, 127).astype(jnp.int8)
+
+    scale = jnp.exp2(exp.astype(jnp.float32))
+    scale = jnp.where(scale == 0, 1.0, scale)
+    normalized = w_groups / scale[..., None]
+    q = _quantize_to_codebook(
+        normalized,
+        codebook,
+        use_argmin_fallback=_use_argmin_codebook(runtime_cfg),
+        sorted_idx=codebook_sorted_idx,
+        boundaries=codebook_boundaries,
+    )
+    packed = _pack_group_codes(w_layout, q, bits, runtime_cfg)
+    return packed, exp.astype(jnp.uint8)
+
+
+def _quantize_nvfp(
+    w_layout: jax.Array,
+    w_groups: jax.Array,
+    *,
+    bits: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Quantize groups using NVFP value codes and E4M3 quantized scales."""
+    scale_sorted_idx, scale_boundaries = _get_e4m3_q_threshold_map()
+    if bits == 4:
+        vmax = _get_e2m1_max()
+        q_codebook, _ = _get_e2m1_table()
+        q_sorted_idx, q_boundaries = _get_e2m1_threshold_map()
+    else:
+        vmax = _get_e4m3_max()
+        q_codebook = _get_e4m3_table_q()
+        q_sorted_idx, q_boundaries = _get_e4m3_q_threshold_map()
+
+    max_abs = jnp.max(jnp.abs(w_groups), axis=-1)
+    scale_raw = jnp.where(max_abs > 0, max_abs / vmax, 0.0)
+    scale_codebook = _get_e4m3_table_q()
+    scale_q = _quantize_to_codebook(
+        scale_raw,
+        scale_codebook,
+        use_argmin_fallback=_use_argmin_codebook(runtime_cfg),
+        sorted_idx=scale_sorted_idx,
+        boundaries=scale_boundaries,
+    ).astype(jnp.uint32)
+
+    e4m3_table, _ = _get_e4m3_table()
+    scale = e4m3_table[scale_q.astype(jnp.int32)]
+    scale = jnp.where(scale == 0, 1.0, scale)
+    normalized = w_groups / scale[..., None]
+
+    q = _quantize_to_codebook(
+        normalized,
+        q_codebook,
+        use_argmin_fallback=_use_argmin_codebook(runtime_cfg),
+        sorted_idx=q_sorted_idx,
+        boundaries=q_boundaries,
+    )
+    packed = _pack_group_codes(w_layout, q, bits, runtime_cfg)
+    return packed, scale_q.astype(jnp.uint8)
+
+
+def _resolve_compute_dtype(runtime_cfg: QuantRuntimeConfig) -> jnp.dtype:
+    """Resolve arithmetic dtype for dequantization math."""
+    mode = runtime_cfg.prefer_compute_dtype
+    if mode == "bf16":
+        return jnp.bfloat16
+    if mode == "fp16":
+        return jnp.float16
+    if mode == "fp32":
+        return jnp.float32
+    raise ValueError(f"Unsupported compute dtype mode: {mode!r}.")
+
+
+def _resolve_dequant_output_dtype(runtime_cfg: QuantRuntimeConfig, compute_dtype: jnp.dtype) -> jnp.dtype:
+    """Resolve output dtype for dequantized tensors."""
+    mode = runtime_cfg.dequant_output_dtype
+    if mode == "compute":
+        return compute_dtype
+    if mode == "bf16":
+        return jnp.bfloat16
+    if mode == "fp16":
+        return jnp.float16
+    if mode == "fp32":
+        return jnp.float32
+    raise ValueError(f"Unsupported dequant output dtype mode: {mode!r}.")
+
+
+def _prefer_fast_unpack(
+    *,
+    runtime_cfg: QuantRuntimeConfig,
+    mode: QuantizationMode,
+    bits: int,
+    batch_size_hint: int,
+) -> bool:
+    """Select fast-vs-generic unpack strategy for dequantization."""
+    del mode, bits, batch_size_hint
+    policy = runtime_cfg.dequant_unpack_policy
+    if policy == "fast":
+        return runtime_cfg.enable_u4_u8_fastpath
+    if policy == "generic":
+        return False
+    if policy != "auto":
+        raise ValueError(f"Unsupported dequant unpack policy: {policy!r}.")
+    return runtime_cfg.enable_u4_u8_fastpath
+
+
+def _prefer_arith_minifloat_decode(runtime_cfg: QuantRuntimeConfig) -> bool:
+    """Select arithmetic decode over table lookup for FP4/FP8 codebooks."""
+    policy = runtime_cfg.minifloat_decode_policy
+    if policy == "arith":
+        return True
+    if policy == "table":
+        return False
+    if policy != "auto":
+        raise ValueError(f"Unsupported minifloat decode policy: {policy!r}.")
+    # Default to table lookup; it tends to map to fast constant-memory gathers.
+    return False
+
+
+def _unpack_groups(
+    w_q: jax.Array,
+    scales: jax.Array,
+    *,
+    mode: QuantizationMode,
+    group_size: int,
+    bits: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> tuple[jax.Array, int]:
+    """Unpack bitpacked codes and reshape to ``(..., n_groups, group_size)``."""
+    n_groups = scales.shape[-1]
+    n = n_groups * group_size
+    batch_size_hint = 1
+    if scales.ndim > 1:
+        for dim in scales.shape[:-1]:
+            batch_size_hint *= int(dim)
+    q = _unpack_bits(
+        w_q,
+        n,
+        bits,
+        prefer_fast_u4_u8=_prefer_fast_unpack(
+            runtime_cfg=runtime_cfg,
+            mode=mode,
+            bits=bits,
+            batch_size_hint=batch_size_hint,
+        ),
+    )
+    return q.reshape(*scales.shape[:-1], n_groups, group_size), n
+
+
+def _dequantize_affine_bits(
+    w_q: jax.Array,
+    scales: jax.Array,
+    zeros: jax.Array,
+    *,
+    group_size: int,
+    bits: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> jax.Array:
+    """Affine dequantization specialized by static bit-width."""
+    compute_dtype = _resolve_compute_dtype(runtime_cfg)
+    output_dtype = _resolve_dequant_output_dtype(runtime_cfg, compute_dtype)
+    q, n = _unpack_groups(w_q, scales, mode="affine", group_size=group_size, bits=bits, runtime_cfg=runtime_cfg)
+    q = q.astype(compute_dtype)
+    scales_f = scales.astype(compute_dtype)
+    zeros_f = zeros.astype(compute_dtype)
+    out = (q - zeros_f[..., None]) * scales_f[..., None]
+    if out.dtype != output_dtype:
+        out = out.astype(output_dtype)
+    return out.reshape(*scales.shape[:-1], n)
+
+
+def _dequantize_nf4(
+    w_q: jax.Array,
+    scales: jax.Array,
+    *,
+    group_size: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> jax.Array:
+    """NF4 dequantization hot path."""
+    compute_dtype = _resolve_compute_dtype(runtime_cfg)
+    output_dtype = _resolve_dequant_output_dtype(runtime_cfg, compute_dtype)
+    q, n = _unpack_groups(w_q, scales, mode="nf4", group_size=group_size, bits=4, runtime_cfg=runtime_cfg)
+    q = q.astype(jnp.int32)
+    table = _get_nf4_table().astype(compute_dtype)
+    vals = table[q]
+    out = vals * scales.astype(compute_dtype)[..., None]
+    if out.dtype != output_dtype:
+        out = out.astype(output_dtype)
+    return out.reshape(*scales.shape[:-1], n)
+
+
+def _dequantize_mxfp_bits(
+    w_q: jax.Array,
+    scales: jax.Array,
+    *,
+    group_size: int,
+    bits: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> jax.Array:
+    """MXFP dequantization specialized for 4-bit/8-bit payloads."""
+    compute_dtype = _resolve_compute_dtype(runtime_cfg)
+    output_dtype = _resolve_dequant_output_dtype(runtime_cfg, compute_dtype)
+    q, n = _unpack_groups(
+        w_q,
+        scales,
+        mode="mxfp4" if bits == 4 else "mxfp8",
+        group_size=group_size,
+        bits=bits,
+        runtime_cfg=runtime_cfg,
+    )
+    if _prefer_arith_minifloat_decode(runtime_cfg):
+        vals = _decode_e2m1_codes(q, dtype=compute_dtype) if bits == 4 else _decode_e4m3_codes(q, dtype=compute_dtype)
+    else:
+        q_i = q.astype(jnp.int32)
+        if bits == 4:
+            table, _ = _get_e2m1_table()
+        else:
+            table, _ = _get_e4m3_table()
+        table = table.astype(compute_dtype)
+        vals = table[q_i]
+    # MXFP scales are shared exponents (int8); ldexp maps to x * 2**exp and is
+    # often cheaper than exp2 + multiply for integer exponents.
+    exp_i = scales.astype(jnp.int8).astype(jnp.int32)
+    out = jnp.ldexp(vals, exp_i[..., None])
+    if out.dtype != output_dtype:
+        out = out.astype(output_dtype)
+    return out.reshape(*scales.shape[:-1], n)
+
+
+def _dequantize_nvfp_bits(
+    w_q: jax.Array,
+    scales: jax.Array,
+    *,
+    group_size: int,
+    bits: int,
+    runtime_cfg: QuantRuntimeConfig,
+) -> jax.Array:
+    """NVFP dequantization specialized for 4-bit/8-bit payloads."""
+    compute_dtype = _resolve_compute_dtype(runtime_cfg)
+    output_dtype = _resolve_dequant_output_dtype(runtime_cfg, compute_dtype)
+    q, n = _unpack_groups(
+        w_q,
+        scales,
+        mode="nvfp4" if bits == 4 else "nvfp8",
+        group_size=group_size,
+        bits=bits,
+        runtime_cfg=runtime_cfg,
+    )
+    if _prefer_arith_minifloat_decode(runtime_cfg):
+        q_vals = _decode_e2m1_codes(q, dtype=compute_dtype) if bits == 4 else _decode_e4m3_codes(q, dtype=compute_dtype)
+        scale_vals = _decode_e4m3_codes(scales, dtype=compute_dtype)
+        out = q_vals * scale_vals[..., None]
+    else:
+        q_i = q.astype(jnp.int32)
+        e4m3_table, _ = _get_e4m3_table()
+        if bits == 4:
+            q_table, _ = _get_e2m1_table()
+        else:
+            q_table = e4m3_table
+        q_table = q_table.astype(compute_dtype)
+        scale_table = e4m3_table.astype(compute_dtype)
+        vals = q_table[q_i]
+        out = vals * scale_table[scales.astype(jnp.int32)][..., None]
+    if out.dtype != output_dtype:
+        out = out.astype(output_dtype)
+    return out.reshape(*scales.shape[:-1], n)
+
+
 def quantize(
     w: jax.Array,
     /,
@@ -84,6 +789,7 @@ def quantize(
     bits: int | None = None,
     mode: QuantizationMode = "affine",
     axis: QuantizationAxis = "row",
+    runtime_config: QuantRuntimeConfig | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Quantize weights into packed uint32 codes with per-group scaling.
 
@@ -102,6 +808,8 @@ def quantize(
             "nvfp4", "nvfp8".
         axis: Quantization axis determining how groups are formed:
             "row" groups over output channels, "col" groups over input channels.
+        runtime_config: Optional runtime fast-path policy. When omitted,
+            defaults are used.
 
     Returns:
         For affine mode: tuple of (w_q, scales, zeros) where the dequantization
@@ -111,73 +819,38 @@ def quantize(
     """
     axis = normalize_axis(axis)
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
+    runtime_cfg = resolve_runtime_config(runtime_config)
+    if runtime_config is None:
+        runtime_cfg = _maybe_autotune_quantize_runtime_cfg(
+            w,
+            mode=mode,
+            group_size=group_size,
+            bits=bits,
+            axis=axis,
+            base_cfg=runtime_cfg,
+        )
 
     w_layout = _to_quant_layout(w, axis)
+    if w_layout.shape[-1] % group_size != 0:
+        raise ValueError(
+            "group_size is incompatible with the effective grouping axis. "
+            f"input_shape={tuple(w.shape)}, axis={axis!r}, runtime_layout_shape={tuple(w_layout.shape)}, "
+            f"group_dim={w_layout.shape[-1]}, group_size={group_size}. "
+            "For grouping over the original last dimension, use axis='col'."
+        )
     w_groups, _ = _reshape_groups(w_layout, group_size)
 
     if mode == "affine":
-        qmax = 2**bits - 1
-        alpha = jnp.max(w_groups, axis=-1)
-        beta = jnp.min(w_groups, axis=-1)
-
-        scale = (alpha - beta) / qmax
-        scale = jnp.where(scale == 0, jnp.ones_like(scale), scale)
-        zero = -beta / scale
-
-        q = jnp.round(w_groups / scale[..., None] + zero[..., None])
-        q = jnp.clip(q, 0, qmax).astype(jnp.uint32)
-        packed = _pack_bits(q.reshape(*w_layout.shape[:-1], -1), bits)
-        return packed, scale.astype(w.dtype), zero.astype(w.dtype)
+        return _quantize_affine(w_layout, w_groups, bits=bits, runtime_cfg=runtime_cfg)
 
     if mode == "nf4":
-        codebook = _get_nf4_table()
-        max_abs = jnp.max(jnp.abs(w_groups), axis=-1)
-        scale = jnp.where(max_abs == 0, jnp.ones_like(max_abs), max_abs)
-        normalized = w_groups / scale[..., None]
-        q = _quantize_to_codebook(normalized, codebook)
-        packed = _pack_bits(q.reshape(*w_layout.shape[:-1], -1), bits)
-        return packed, scale.astype(w.dtype)
+        return _quantize_nf4(w_layout, w_groups, bits=bits, runtime_cfg=runtime_cfg)
 
     if mode in {"mxfp4", "mxfp8"}:
-        max_abs = jnp.max(jnp.abs(w_groups), axis=-1)
-        if bits == 4:
-            vmax = _get_e2m1_max()
-            codebook, _ = _get_e2m1_table()
-        else:
-            vmax = _get_e4m3_max()
-            codebook = _get_e4m3_table_q()
-
-        exp = jnp.where(max_abs > 0, jnp.ceil(jnp.log2(max_abs / vmax)), 0.0)
-        exp = jnp.clip(exp, -128, 127).astype(jnp.int8)
-
-        scale = jnp.exp2(exp.astype(jnp.float32))
-        scale = jnp.where(scale == 0, 1.0, scale)
-        normalized = w_groups / scale[..., None]
-
-        q = _quantize_to_codebook(normalized, codebook)
-        packed = _pack_bits(q.reshape(*w_layout.shape[:-1], -1), bits)
-        return packed, exp.astype(jnp.uint8)
+        return _quantize_mxfp(w_layout, w_groups, bits=bits, runtime_cfg=runtime_cfg)
 
     # mode in {"nvfp4", "nvfp8"}
-    if bits == 4:
-        vmax = _get_e2m1_max()
-        q_codebook, _ = _get_e2m1_table()
-    else:
-        vmax = _get_e4m3_max()
-        q_codebook = _get_e4m3_table_q()
-
-    scale_raw = jnp.where(jnp.max(jnp.abs(w_groups), axis=-1) > 0, jnp.max(jnp.abs(w_groups), axis=-1) / vmax, 0.0)
-    scale_codebook = _get_e4m3_table_q()
-    scale_q = _quantize_to_codebook(scale_raw, scale_codebook).astype(jnp.uint32)
-
-    e4m3_table, _ = _get_e4m3_table()
-    scale = e4m3_table[scale_q.astype(jnp.int32)]
-    scale = jnp.where(scale == 0, 1.0, scale)
-
-    normalized = w_groups / scale[..., None]
-    q = _quantize_to_codebook(normalized, q_codebook)
-    packed = _pack_bits(q.reshape(*w_layout.shape[:-1], -1), bits)
-    return packed, scale_q.astype(jnp.uint8)
+    return _quantize_nvfp(w_layout, w_groups, bits=bits, runtime_cfg=runtime_cfg)
 
 
 def dequantize(
@@ -189,6 +862,7 @@ def dequantize(
     bits: int | None = None,
     mode: QuantizationMode = "affine",
     axis: QuantizationAxis = "row",
+    runtime_config: QuantRuntimeConfig | None = None,
 ) -> jax.Array:
     """Dequantize packed uint32 weights back to floating-point values.
 
@@ -209,75 +883,145 @@ def dequantize(
         mode: Quantization mode matching the one used during quantization.
         axis: Quantization axis (kept for API symmetry; not used in
             current implementation).
+        runtime_config: Optional runtime fast-path policy. When omitted,
+            defaults are used.
 
     Returns:
-        Dequantized float tensor with the same leading dimensions as scales
-        and last dimension equal to ``n_groups * group_size``.
+        Dequantized tensor with the same leading dimensions as scales and last
+        dimension equal to ``n_groups * group_size``. Output dtype follows
+        ``runtime_config.dequant_output_dtype``.
 
     Raises:
         ValueError: If zeros is None for affine mode.
     """
     axis = normalize_axis(axis)
+    axis_n = axis
     del axis  # kept for API symmetry and future layout-aware validation.
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
+    runtime_cfg = resolve_runtime_config(runtime_config)
+    if runtime_config is None:
+        runtime_cfg = _maybe_autotune_dequantize_runtime_cfg(
+            w_q,
+            scales,
+            zeros,
+            mode=mode,
+            group_size=group_size,
+            bits=bits,
+            axis=axis_n,
+            base_cfg=runtime_cfg,
+        )
 
     if mode == "affine":
         if zeros is None:
             raise ValueError("affine dequantize requires `zeros`.")
-
-        n_groups = scales.shape[-1]
-        n = n_groups * group_size
-        q = _unpack_bits(w_q, n, bits).astype(jnp.float32)
-        q = q.reshape(*scales.shape[:-1], n_groups, group_size)
-        out = (q - zeros[..., None]) * scales[..., None]
-        return out.reshape(*scales.shape[:-1], n)
+        if bits == 1:
+            return _dequantize_affine_bits(
+                w_q,
+                scales,
+                zeros,
+                group_size=group_size,
+                bits=1,
+                runtime_cfg=runtime_cfg,
+            )
+        if bits == 2:
+            return _dequantize_affine_bits(
+                w_q,
+                scales,
+                zeros,
+                group_size=group_size,
+                bits=2,
+                runtime_cfg=runtime_cfg,
+            )
+        if bits == 4:
+            return _dequantize_affine_bits(
+                w_q,
+                scales,
+                zeros,
+                group_size=group_size,
+                bits=4,
+                runtime_cfg=runtime_cfg,
+            )
+        return _dequantize_affine_bits(
+            w_q,
+            scales,
+            zeros,
+            group_size=group_size,
+            bits=8,
+            runtime_cfg=runtime_cfg,
+        )
 
     if mode == "nf4":
-        n_groups = scales.shape[-1]
-        n = n_groups * group_size
-        q = _unpack_bits(w_q, n, bits).astype(jnp.int32)
-        q = q.reshape(*scales.shape[:-1], n_groups, group_size)
-        table = _get_nf4_table()
-        vals = table[q]
-        out = vals * scales[..., None]
-        return out.reshape(*scales.shape[:-1], n)
+        return _dequantize_nf4(
+            w_q,
+            scales,
+            group_size=group_size,
+            runtime_cfg=runtime_cfg,
+        )
 
     if mode in {"mxfp4", "mxfp8"}:
-        n_groups = scales.shape[-1]
-        n = n_groups * group_size
-        q = _unpack_bits(w_q, n, bits).astype(jnp.int32)
-        q = q.reshape(*scales.shape[:-1], n_groups, group_size)
-
         if bits == 4:
-            table, _ = _get_e2m1_table()
-        else:
-            table, _ = _get_e4m3_table()
-
-        vals = table[q]
-        exp = scales.astype(jnp.int8).astype(jnp.float32)
-        scale = jnp.exp2(exp)
-        out = vals * scale[..., None]
-        return out.reshape(*scales.shape[:-1], n)
+            return _dequantize_mxfp_bits(
+                w_q,
+                scales,
+                group_size=group_size,
+                bits=4,
+                runtime_cfg=runtime_cfg,
+            )
+        return _dequantize_mxfp_bits(
+            w_q,
+            scales,
+            group_size=group_size,
+            bits=8,
+            runtime_cfg=runtime_cfg,
+        )
 
     # mode in {"nvfp4", "nvfp8"}
-    n_groups = scales.shape[-1]
-    n = n_groups * group_size
-    q = _unpack_bits(w_q, n, bits).astype(jnp.int32)
-    q = q.reshape(*scales.shape[:-1], n_groups, group_size)
-
-    e4m3_table, _ = _get_e4m3_table()
     if bits == 4:
-        q_table, _ = _get_e2m1_table()
-    else:
-        q_table = e4m3_table
+        return _dequantize_nvfp_bits(
+            w_q,
+            scales,
+            group_size=group_size,
+            bits=4,
+            runtime_cfg=runtime_cfg,
+        )
+    return _dequantize_nvfp_bits(
+        w_q,
+        scales,
+        group_size=group_size,
+        bits=8,
+        runtime_cfg=runtime_cfg,
+    )
 
-    vals = q_table[q]
-    scale = e4m3_table[scales.astype(jnp.int32)]
-    out = vals * scale[..., None]
-    return out.reshape(*scales.shape[:-1], n)
+
+def _resolve_matmul_align_multiple(align_multiple: int | None) -> int:
+    """Resolve K/N alignment multiple for dense dequantize-then-matmul path."""
+    if align_multiple is not None:
+        return max(0, int(align_multiple))
+    env = os.getenv("EJKERNEL_QMM_ALIGN_MULTIPLE")
+    if env is not None and env.strip() != "":
+        return max(0, int(env))
+    backend = jax.default_backend()
+    if backend in {"gpu", "cuda", "mps", "tpu"}:
+        return 128
+    return 0
 
 
-@ejit(static_argnames=["transpose", "group_size", "bits", "mode", "axis"])
+def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.Array, int]:
+    """Pad *x* along *axis* to a given multiple, returning (padded, original_size)."""
+    if multiple <= 1:
+        return x, int(x.shape[axis])
+    axis_n = axis if axis >= 0 else x.ndim + axis
+    n = int(x.shape[axis_n])
+    rem = n % multiple
+    if rem == 0:
+        return x, n
+    pad = multiple - rem
+    pad_spec = [(0, 0)] * x.ndim
+    pad_spec[axis_n] = (0, pad)
+    return jnp.pad(x, pad_spec), n
+
+
+@ejit(static_argnames=["transpose", "group_size", "bits", "mode", "axis", "align_multiple"])
 def quantized_matmul(
     x: jax.Array,
     w: jax.Array,
@@ -289,6 +1033,7 @@ def quantized_matmul(
     bits: int | None = None,
     mode: QuantizationMode = "affine",
     axis: QuantizationAxis | None = None,
+    align_multiple: int | None = None,
 ) -> jax.Array:
     """Dense reference quantized matrix multiplication via dequantize-then-matmul.
 
@@ -313,26 +1058,48 @@ def quantized_matmul(
         mode: Quantization mode matching the one used during quantization.
         axis: Explicit quantization axis. If provided, overrides the transpose
             flag for consistency.
+        align_multiple: Optional K/N padding multiple for the dense reference
+            path. ``None`` uses backend defaults (e.g., 128 on TPU/GPU/MPS).
 
     Returns:
         Matrix multiplication result with shape ``(..., N)`` where N is the
         output dimension of the weight matrix.
     """
-    if axis is not None:
-        _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    mode_n, group_size_n, bits_n, _ = resolve_qparams(mode, group_size, bits)
+    runtime_axis, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
+    validate_packed_quantized_matmul_layout(
+        x,
+        w,
+        scales,
+        zeros,
+        mode=mode_n,
+        group_size=group_size_n,
+        bits=bits_n,
+        axis=runtime_axis,
+        transpose=transpose,
+    )
 
     # Runtime layout determines dequant axis convention.
-    dequant_axis: QuantizationAxis = "col" if transpose else "row"
+    dequant_axis: QuantizationAxis = runtime_axis
     w_f = dequantize(
         w,
         scales,
         zeros,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
+        group_size=group_size_n,
+        bits=bits_n,
+        mode=mode_n,
         axis=dequant_axis,
     )
-    return x @ w_f.T if transpose else x @ w_f
+    rhs = w_f.T if transpose else w_f
+    align_n = _resolve_matmul_align_multiple(align_multiple)
+    if align_n <= 1:
+        return x @ rhs
+
+    x_pad, _ = _pad_axis_to_multiple(x, axis=-1, multiple=align_n)
+    rhs_pad, _ = _pad_axis_to_multiple(rhs, axis=-2, multiple=align_n)
+    rhs_pad, n_orig = _pad_axis_to_multiple(rhs_pad, axis=-1, multiple=align_n)
+    out = x_pad @ rhs_pad
+    return out[..., :n_orig]
 
 
 def prepack_quantized_weights(
@@ -343,6 +1110,7 @@ def prepack_quantized_weights(
     mode: QuantizationMode = "affine",
     transpose: bool = True,
     axis: QuantizationAxis | None = None,
+    runtime_config: QuantRuntimeConfig | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Prepack logical ``(out_features, in_features)`` weights for quantized matmul.
 
@@ -366,10 +1134,18 @@ def prepack_quantized_weights(
         transpose: Legacy flag for axis inference when ``axis`` is None.
         axis: Explicit quantization axis ("row" or "col"). Overrides
             ``transpose`` when provided.
+        runtime_config: Optional runtime fast-path policy passed to ``quantize``.
 
     Returns:
         For affine mode: tuple of (w_q, scales, zeros).
         For other modes: tuple of (w_q, scales).
     """
     axis = resolve_prepack_axis(axis=axis, transpose=transpose)
-    return quantize(w, group_size=group_size, bits=bits, mode=mode, axis=axis)
+    return quantize(
+        w,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        axis=axis,
+        runtime_config=runtime_config,
+    )

@@ -25,7 +25,14 @@ Supported Quantization Modes:
     - **nvfp4/nvfp8**: NVIDIA microscaling FP4/FP8 modes.
 
 Basic Usage:
-    >>> from ejkernel.quantization import quantize, dequantize, prepack_quantized_weights
+    >>> from ejkernel.quantization import (
+    ...     QuantRuntimeConfig,
+    ...     QuantizedArray,
+    ...     quantize_array,
+    ...     quantize,
+    ...     dequantize,
+    ...     prepack_quantized_weights,
+    ... )
     >>>
     >>> # Quantize weights
     >>> w_q, scales, zeros = quantize(weights, mode="affine", bits=4, axis="row")
@@ -35,6 +42,10 @@ Basic Usage:
     >>>
     >>> # For optimized matmul kernels, use prepack_quantized_weights
     >>> w_q, scales, zeros = prepack_quantized_weights(weights, mode="affine", axis="row")
+    >>>
+    >>> # Container-style API
+    >>> packed: QuantizedArray = quantize_array(weights, mode="nf4", axis="row")
+    >>> weights_fp = packed.dequantize()
 
 For fused quantized matmul kernels with better performance, see
 `ejkernel.modules.operations.quantized_matmul`.
@@ -49,17 +60,27 @@ Affine ``zeros`` metadata usage:
 from ._quants.quantizations import (
     QuantizationAxis,
     QuantizationMode,
+    clear_runtime_autotune_cache,
     dequantize,
     prepack_quantized_weights,
     quantize,
+    runtime_autotune_cache_sizes,
 )
 from ._quants.quantizations import quantized_matmul as dense_quantized_matmul
+from .quantized_array import QuantizedArray, prepack_quantized_array, quantize_array
+from .runtime import QuantRuntimeConfig
 
 __all__ = [
+    "QuantRuntimeConfig",
     "QuantizationAxis",
     "QuantizationMode",
+    "QuantizedArray",
+    "clear_runtime_autotune_cache",
     "dense_quantized_matmul",
     "dequantize",
+    "prepack_quantized_array",
     "prepack_quantized_weights",
     "quantize",
+    "quantize_array",
+    "runtime_autotune_cache_sizes",
 ]

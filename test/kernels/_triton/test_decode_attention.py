@@ -85,4 +85,3 @@ def test_decode_attention_matches_xla_smoke():
         rtol=2e-2,
         atol=2e-2,
     )
-

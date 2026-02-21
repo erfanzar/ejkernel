@@ -28,6 +28,7 @@ def _has_tpu():
     except Exception:
         return False
 
+
 pytestmark = pytest.mark.skipif(not _has_tpu(), reason="Pallas TPU tests require TPU backend")
 
 

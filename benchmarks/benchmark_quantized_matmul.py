@@ -136,9 +136,7 @@ if __name__ == "__main__":
         if target_raw:
             target = float(target_raw)
             if median_ratio > target:
-                print(
-                    f"[quantized_matmul] Acceptance failed: median ratio {median_ratio:.3f} > target {target:.3f}"
-                )
+                print(f"[quantized_matmul] Acceptance failed: median ratio {median_ratio:.3f} > target {target:.3f}")
                 raise SystemExit(2)
 
     bench.plot(f"benchmark_plots/{spec.op_name}")

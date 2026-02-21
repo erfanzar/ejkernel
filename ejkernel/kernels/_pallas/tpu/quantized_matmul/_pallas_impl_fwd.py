@@ -14,20 +14,8 @@
 
 """Forward TPU Pallas kernels for quantized matrix multiplication.
 
-This module implements the forward-pass TPU Pallas kernels for quantized
-matrix multiplication (Y = X @ dequant(W)). It provides two execution paths
-that are dispatched by a hybrid router:
-
-Execution Paths:
-    - **Packed (fused)**: Unpacks quantized codes, dequantizes, and multiplies
-      in a single Pallas kernel. Best for large-N NF4 workloads where the
-      unpack/dequant overhead is hidden by the matmul.
-    - **Predecode (two-stage)**: First materializes a dense bfloat16 weight
-      via ``get_predecoded_dense_weight``, then calls ``pallas_dense_matmul``.
-      Generally faster for affine mode due to TPU-friendly dense scheduling.
-
-The ``_pallas_qmm_transpose_false`` dispatcher selects between packed and
-predecode based on the ``path`` argument or the hybrid heuristic.
+This module implements the forward-pass TPU Pallas packed fused kernel for
+quantized matrix multiplication (Y = X @ dequant(W)).
 
 Grid Strategy (Packed Path):
     3D grid (num_M, num_N, num_K) where M and N tiles are parallel and K
@@ -38,6 +26,10 @@ Grid Strategy (Packed Path):
 Supported Modes:
     - affine: ``code * scale + bias``
     - nf4: NormalFloat4 lookup with scale
+    - mxfp4: E2M1 codebook with shared power-of-2 scales
+    - mxfp8: E4M3 codebook with shared power-of-2 scales
+    - nvfp4: E2M1 codebook with E4M3-decoded scales
+    - nvfp8: E4M3 codebook with E4M3-decoded scales
 """
 
 from __future__ import annotations
@@ -56,11 +48,10 @@ from ._pallas_impl_core import (
     _unpack_bits_4_8,
     choose_packed_n_subtile,
     estimate_qmm_tpu_vmem_limit_bytes,
-    get_predecoded_dense_weight,
-    pallas_dense_matmul,
+    get_qmm_tpu_vmem_limit_bytes,
 )
 
-_PACKED_SUPPORTED_MODES = frozenset(("affine", "nf4"))
+_PACKED_SUPPORTED_MODES = frozenset(("affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"))
 
 
 def _pallas_qmm_transpose_false_packed(
@@ -227,11 +218,15 @@ def _pallas_qmm_transpose_false_packed(
     tile_s_bytes = block_k * block_groups * jnp.dtype(scales.dtype).itemsize
     tile_o_bytes = block_m * block_n * jnp.dtype(jnp.float32).itemsize
     tile_b_bytes = 0 if biases_pad is None else (block_k * block_groups * jnp.dtype(biases_pad.dtype).itemsize)
-    vmem_limit_bytes = estimate_qmm_tpu_vmem_limit_bytes(
+    estimated_vmem_limit = estimate_qmm_tpu_vmem_limit_bytes(
         io_bytes=tile_x_bytes + tile_w_bytes + tile_s_bytes + tile_b_bytes + tile_o_bytes,
         scratch_bytes=tile_o_bytes,
         has_double_buffer=(num_m > 1 or num_n > 1 or num_k > 1),
     )
+    # Keep a floor so compiler scoped VMEM budgeting does not reject otherwise
+    # legal packed kernels for common decode tiles.
+    vmem_budget = get_qmm_tpu_vmem_limit_bytes()
+    vmem_limit_bytes = min(vmem_budget, max(estimated_vmem_limit, 32 * 1024 * 1024))
     cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=x_bytes + w_bytes + s_bytes + o_bytes, transcendentals=0)
 
     if biases_pad is None:
@@ -271,104 +266,6 @@ def _pallas_qmm_transpose_false_packed(
     return out[:m, :n]
 
 
-def _pallas_qmm_transpose_false_predecode(
-    x: jax.Array,
-    w_q: jax.Array,
-    scales: jax.Array,
-    biases: jax.Array | None,
-    *,
-    group_size: int,
-    bits: int,
-    mode: str,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    use_bf16: bool,
-) -> jax.Array:
-    """Predecode-to-dense TPU Pallas path for forward Y = X @ dequant(W).
-
-    First materializes a full dense bfloat16 weight matrix from the quantized
-    representation (using cached predecoding when possible), then delegates
-    to ``pallas_dense_matmul`` for the actual matmul.
-
-    Args:
-        x: Activation tensor [M, K].
-        w_q: Packed quantized weight [K, N_packed].
-        scales: Per-group scale tensor [K, N // group_size].
-        biases: Optional per-group additive bias.
-        group_size: Elements per quantization group.
-        bits: Quantization bit width (4 or 8).
-        mode: Quantization mode string.
-        block_m: M-dimension tile size for dense matmul.
-        block_n: N-dimension tile size for dense matmul.
-        block_k: K-dimension tile size for dense matmul.
-        use_bf16: Ignored (TPU always uses bfloat16).
-
-    Returns:
-        Float32 result [M, N].
-    """
-    del use_bf16
-    w_dense = get_predecoded_dense_weight(
-        w_q,
-        scales,
-        biases,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
-    )
-    return pallas_dense_matmul(
-        x,
-        w_dense,
-        transpose_rhs=False,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-    )
-
-
-def _prefer_packed_path(
-    *,
-    m: int,
-    n: int,
-    k: int,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    mode: str,
-    bits: int,
-    group_size: int,
-) -> bool:
-    """Heuristic deciding whether the packed kernel is preferred over predecode.
-
-    Packed wins most consistently for large-N NF4 workloads; affine is
-    typically on-par or faster with predecode due to TPU-friendly dense
-    matmul scheduling.
-
-    Args:
-        m: Output M dimension.
-        n: Output N dimension.
-        k: Reduction K dimension.
-        block_m: M-dimension tile size.
-        block_n: N-dimension tile size.
-        block_k: K-dimension tile size.
-        mode: Quantization mode string.
-        bits: Quantization bit-width.
-        group_size: Quantization group size.
-
-    Returns:
-        True if the packed path is expected to be faster.
-    """
-    if bits not in (4, 8):
-        return False
-    if mode == "nf4":
-        enough_n = n >= max(512, 2 * block_n)
-        enough_m = m >= max(64, block_m // 2)
-        enough_k = k >= max(256, block_k)
-        valid_grouping = group_size <= block_n
-        return enough_n and enough_m and enough_k and valid_grouping
-    return False
-
-
 def _pallas_qmm_transpose_false(
     x: jax.Array,
     w_q: jax.Array,
@@ -385,14 +282,10 @@ def _pallas_qmm_transpose_false(
     path: str,
     packed_legal: bool,
 ) -> jax.Array:
-    """Dispatch forward TPU QMM based on hybrid/packed/predecode path.
+    """Dispatch forward TPU QMM for packed-only execution.
 
-    Selects between the packed fused kernel and the predecode-to-dense
-    path for the forward pass (Y = X @ dequant(W)):
-
-    - ``path="packed"``: Forces the packed fused kernel (raises if illegal).
-    - ``path="predecode"``: Forces the predecode-to-dense path.
-    - ``path="hybrid"``: Uses ``_prefer_packed_path`` heuristic to choose.
+    The TPU Pallas path is packed-only. Legacy path selectors are accepted
+    at higher layers and normalized before this function is called.
 
     Args:
         x: Activation tensor [M, K].
@@ -406,7 +299,7 @@ def _pallas_qmm_transpose_false(
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
         use_bf16: Whether to use bfloat16 (ignored on TPU).
-        path: Execution path (``"packed"``, ``"predecode"``, or ``"hybrid"``).
+        path: Execution path selector (legacy-compatible, packed-only here).
         packed_legal: Whether the packed path satisfies TPU tiling constraints.
 
     Returns:
@@ -415,64 +308,10 @@ def _pallas_qmm_transpose_false(
     Raises:
         ValueError: If ``path="packed"`` but ``packed_legal`` is False.
     """
-    n = scales.shape[-1] * group_size
-    if path == "packed":
-        if not packed_legal:
-            raise ValueError("Packed TPU path requested but current tiling is illegal.")
-        return _pallas_qmm_transpose_false_packed(
-            x,
-            w_q,
-            scales,
-            biases,
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            use_bf16=use_bf16,
-        )
-    if path == "predecode":
-        return _pallas_qmm_transpose_false_predecode(
-            x,
-            w_q,
-            scales,
-            biases,
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            use_bf16=use_bf16,
-        )
-
-    m, k = x.shape
-    if packed_legal and _prefer_packed_path(
-        m=m,
-        n=n,
-        k=k,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        mode=mode,
-        bits=bits,
-        group_size=group_size,
-    ):
-        return _pallas_qmm_transpose_false_packed(
-            x,
-            w_q,
-            scales,
-            biases,
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            use_bf16=use_bf16,
-        )
-    return _pallas_qmm_transpose_false_predecode(
+    del path
+    if not packed_legal:
+        raise ValueError("Packed TPU path requested but current tiling is illegal.")
+    return _pallas_qmm_transpose_false_packed(
         x,
         w_q,
         scales,
@@ -490,5 +329,4 @@ def _pallas_qmm_transpose_false(
 __all__ = (
     "_pallas_qmm_transpose_false",
     "_pallas_qmm_transpose_false_packed",
-    "_pallas_qmm_transpose_false_predecode",
 )

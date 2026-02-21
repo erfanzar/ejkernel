@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 constexpr int kDequantElemsPerThread = 4;
 
@@ -314,6 +315,45 @@ __device__ __forceinline__ float ToFloat(__nv_bfloat16 v) {
 
 __device__ __forceinline__ half ToHalf(float v) { return __float2half_rn(v); }
 
+// Dequantize affine value matching XLA's _decode_tile_affine precision:
+// cast q to scale dtype, multiply in that dtype, add bias in that dtype.
+template <typename ScaleT, typename BiasT>
+__device__ __forceinline__ half DequantAffineToHalf(uint32_t q, ScaleT scale,
+                                                    BiasT bias) {
+  if constexpr (std::is_same_v<ScaleT, half> && std::is_same_v<BiasT, half>) {
+    half qh = __int2half_rn(static_cast<int>(q));
+    return __hadd(__hmul(qh, scale), bias);
+  } else if constexpr (std::is_same_v<ScaleT, __nv_bfloat16> &&
+                       std::is_same_v<BiasT, __nv_bfloat16>) {
+    __nv_bfloat16 qb = __float2bfloat16(static_cast<float>(q));
+    return __float2half_rn(__bfloat162float(__hadd(__hmul(qb, scale), bias)));
+  } else {
+    float val = static_cast<float>(q) * ToFloat(scale) + ToFloat(bias);
+    return ToHalf(val);
+  }
+}
+
+// Same as DequantAffineToHalf but outputs bfloat16, matching XLA for bf16 path.
+// XLA _decode_tile_affine: q.astype(scale_tile.dtype) * scale_tile + bias_tile
+// then w.astype(float16).astype(bfloat16) — fp16 arithmetic then bf16 cast.
+template <typename ScaleT, typename BiasT>
+__device__ __forceinline__ __nv_bfloat16
+DequantAffineToBf16(uint32_t q, ScaleT scale, BiasT bias) {
+  if constexpr (std::is_same_v<ScaleT, half> && std::is_same_v<BiasT, half>) {
+    // Match XLA: fp16 arithmetic -> float16 result -> bfloat16 cast.
+    half qh = __int2half_rn(static_cast<int>(q));
+    half result_h = __hadd(__hmul(qh, scale), bias);
+    return __float2bfloat16(__half2float(result_h));
+  } else if constexpr (std::is_same_v<ScaleT, __nv_bfloat16> &&
+                       std::is_same_v<BiasT, __nv_bfloat16>) {
+    __nv_bfloat16 qb = __float2bfloat16(static_cast<float>(q));
+    return __hadd(__hmul(qb, scale), bias);
+  } else {
+    float val = static_cast<float>(q) * ToFloat(scale) + ToFloat(bias);
+    return __float2bfloat16(val);
+  }
+}
+
 template <int Bits, typename ScaleT, typename BiasT>
 __global__ void dequant_affine_int(const uint32_t *wq, const ScaleT *scales,
                                    const BiasT *biases, half *out, int64_t K,
@@ -347,10 +387,8 @@ __global__ void dequant_affine_int(const uint32_t *wq, const ScaleT *scales,
     }
     uint32_t q = low | (high << low_bits);
     int64_t g = n / group_size;
-    float scale = ToFloat(scales[k * n_groups + g]);
-    float bias = ToFloat(biases[k * n_groups + g]);
-    float val = static_cast<float>(q) * scale + bias;
-    out[idx] = ToHalf(val);
+    out[idx] = DequantAffineToHalf(q, scales[k * n_groups + g],
+                                   biases[k * n_groups + g]);
   }
 }
 
@@ -387,10 +425,8 @@ __global__ void dequant_affine_int_gs(const uint32_t *wq, const ScaleT *scales,
     }
     uint32_t q = low | (high << low_bits);
     int64_t g = n / GroupSize;
-    float scale = ToFloat(scales[k * n_groups + g]);
-    float bias = ToFloat(biases[k * n_groups + g]);
-    float val = static_cast<float>(q) * scale + bias;
-    out[idx] = ToHalf(val);
+    out[idx] = DequantAffineToHalf(q, scales[k * n_groups + g],
+                                   biases[k * n_groups + g]);
   }
 }
 

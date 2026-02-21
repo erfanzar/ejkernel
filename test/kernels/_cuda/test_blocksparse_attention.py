@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+import importlib.util
 import shutil
 
 import jax
@@ -20,7 +22,6 @@ import numpy as np
 import pytest
 
 from ejkernel.kernels._cuda.blocksparse_attention import blocksparse_attention as cuda_blocksparse_attention
-from ejkernel.kernels._triton.blocksparse_attention import blocksparse_attention as triton_blocksparse_attention
 from ejkernel.kernels._xla.blocksparse_attention import blocksparse_attention as xla_blocksparse_attention
 from ejkernel.ops import BwdParams, FwdParams
 
@@ -28,6 +29,15 @@ pytestmark = pytest.mark.skipif(
     jax.devices()[0].platform != "gpu" or shutil.which("nvcc") is None,
     reason="CUDA blocksparse tests require GPU backend and nvcc",
 )
+
+_HAS_TRITON = importlib.util.find_spec("triton") is not None
+triton_blocksparse_attention = None
+if _HAS_TRITON:
+    try:
+        _triton_blocksparse_module = importlib.import_module("ejkernel.kernels._triton.blocksparse_attention")
+        triton_blocksparse_attention = _triton_blocksparse_module.blocksparse_attention
+    except Exception:
+        _HAS_TRITON = False
 
 
 def _device_put_all(dev, *arrays):
@@ -167,7 +177,9 @@ def test_blocksparse_attention_cuda_noncausal_matches_xla():
     np.testing.assert_allclose(out_cuda, out_xla, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton is required for CUDA-vs-Triton gradient parity")
 def test_blocksparse_attention_cuda_grad_matches_triton_and_vjp():
+    assert triton_blocksparse_attention is not None
     key = jax.random.PRNGKey(123)
     kq, kk, kv = jax.random.split(key, 3)
 

@@ -30,6 +30,51 @@ from __future__ import annotations
 from jax import numpy as jnp
 
 
+def _decode_e2m1_codes(codes: jnp.ndarray, *, dtype: jnp.dtype) -> jnp.ndarray:
+    """Decode E2M1 (FP4) codes to float values without a lookup table.
+
+    Matches the semantics of :func:`_make_fp_table(exp_bits=2, mant_bits=1)`.
+    """
+    codes_u = codes.astype(jnp.uint32)
+    sign = (codes_u >> 3) & jnp.uint32(0x1)
+    exp = (codes_u >> 1) & jnp.uint32(0x3)
+    mant = codes_u & jnp.uint32(0x1)
+
+    # bias = 1 for exp_bits=2
+    mant_f = mant.astype(dtype) * jnp.asarray(0.5, dtype=dtype)
+    exp_is_zero = exp == 0
+
+    sub = mant_f  # 2**(1-bias) == 1
+    norm = jnp.ldexp(jnp.asarray(1.0, dtype=dtype) + mant_f, exp.astype(jnp.int32) - 1)
+    val = jnp.where(exp_is_zero, sub, norm)
+    return jnp.where(sign.astype(bool), -val, val)
+
+
+def _decode_e4m3_codes(codes: jnp.ndarray, *, dtype: jnp.dtype) -> jnp.ndarray:
+    """Decode E4M3 (FP8) codes to float values without a lookup table.
+
+    Matches the semantics of :func:`_make_fp_table(exp_bits=4, mant_bits=3, nan_all_ones=True)`.
+    """
+    codes_u = codes.astype(jnp.uint32)
+    sign = (codes_u >> 7) & jnp.uint32(0x1)
+    exp = (codes_u >> 3) & jnp.uint32(0xF)
+    mant = codes_u & jnp.uint32(0x7)
+
+    bias = 7
+    mant_f = mant.astype(dtype) * jnp.asarray(1.0 / 8.0, dtype=dtype)
+    exp_is_zero = exp == 0
+    exp_is_max = exp == 0xF
+
+    sub = jnp.ldexp(mant_f, 1 - bias)
+    norm = jnp.ldexp(jnp.asarray(1.0, dtype=dtype) + mant_f, exp.astype(jnp.int32) - bias)
+    val = jnp.where(exp_is_zero, sub, norm)
+    val = jnp.where(sign.astype(bool), -val, val)
+
+    nan_mask = exp_is_max & (mant == 0x7)
+    nan_val = jnp.asarray(jnp.nan, dtype=dtype)
+    return jnp.where(nan_mask, nan_val, val)
+
+
 def _make_fp_table(exp_bits: int, mant_bits: int, *, nan_all_ones: bool) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Generate a lookup table for a minifloat format.
 
@@ -75,6 +120,43 @@ def _make_fp_table(exp_bits: int, mant_bits: int, *, nan_all_ones: bool) -> tupl
         nan_mask = jnp.zeros_like(exp_is_max, dtype=bool)
 
     return val, nan_mask
+
+
+def _build_threshold_map(codebook: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Build sorted-index and midpoint-boundary tensors for threshold quantization."""
+    codebook = codebook.astype(jnp.float32)
+    sorted_idx = jnp.argsort(codebook).astype(jnp.int32)
+    sorted_vals = codebook[sorted_idx]
+    if sorted_vals.shape[0] <= 1:
+        boundaries = jnp.zeros((0,), dtype=jnp.float32)
+    else:
+        boundaries = ((sorted_vals[:-1] + sorted_vals[1:]) * 0.5).astype(jnp.float32)
+    return sorted_idx, boundaries
+
+
+def _build_nf4_table() -> jnp.ndarray:
+    """Build NF4 (NormalFloat 4-bit) codebook tensor."""
+    return jnp.asarray(
+        [
+            -1.0,
+            -0.6961928009986877,
+            -0.5250730514526367,
+            -0.39491748809814453,
+            -0.28444138169288635,
+            -0.18477343022823334,
+            -0.09105003625154495,
+            0.0,
+            0.07958029955625534,
+            0.16093020141124725,
+            0.24611230194568634,
+            0.33791524171829224,
+            0.44070982933044434,
+            0.5626170039176941,
+            0.7229568362236023,
+            1.0,
+        ],
+        dtype=jnp.float32,
+    )
 
 
 def _get_e2m1_table() -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -155,24 +237,19 @@ def _get_nf4_table() -> jnp.ndarray:
     References:
         QLoRA: Efficient Finetuning of Quantized LLMs (Dettmers et al., 2023)
     """
-    return jnp.asarray(
-        [
-            -1.0,
-            -0.6961928009986877,
-            -0.5250730514526367,
-            -0.39491748809814453,
-            -0.28444138169288635,
-            -0.18477343022823334,
-            -0.09105003625154495,
-            0.0,
-            0.07958029955625534,
-            0.16093020141124725,
-            0.24611230194568634,
-            0.33791524171829224,
-            0.44070982933044434,
-            0.5626170039176941,
-            0.7229568362236023,
-            1.0,
-        ],
-        dtype=jnp.float32,
-    )
+    return _build_nf4_table()
+
+
+def _get_e2m1_threshold_map() -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Get cached threshold map (sorted_idx, boundaries) for E2M1 codebook."""
+    return _build_threshold_map(_get_e2m1_table()[0])
+
+
+def _get_e4m3_q_threshold_map() -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Get cached threshold map (sorted_idx, boundaries) for E4M3-quant codebook."""
+    return _build_threshold_map(_get_e4m3_table_q())
+
+
+def _get_nf4_threshold_map() -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Get cached threshold map (sorted_idx, boundaries) for NF4 codebook."""
+    return _build_threshold_map(_get_nf4_table())

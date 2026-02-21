@@ -273,3 +273,218 @@ def test_quantized_matmul_triton_m1_gemv_paths_match_xla(mode: str, bits: int):
         rtol=7e-2,
         atol=7e-2,
     )
+
+
+@pytest.mark.parametrize(
+    "mode,bits",
+    [
+        ("affine", 4),
+        ("nf4", 4),
+        ("mxfp4", 4),
+    ],
+)
+def test_quantized_matmul_triton_vmap_over_x_matches_xla(mode: str, bits: int):
+    """vmap over x with shared weights — uses the reshape fast-path."""
+    key = jax.random.PRNGKey(31)
+    kx, kw = jax.random.split(key, 2)
+    b, m, k, n = 3, 8, 64, 64
+
+    x = jax.random.normal(kx, (b, m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, zeros = packed
+    else:
+        w_q, scales = packed
+        zeros = None
+
+    dev = jax.devices("gpu")[0]
+    x, w_q, scales = _device_put_all(dev, x, w_q, scales)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
+
+    def _single_triton(xi):
+        return triton_quantized_matmul(
+            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+        )
+
+    def _single_xla(xi):
+        return xla_quantized_matmul(
+            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+        )
+
+    out_triton = jax.block_until_ready(jax.vmap(_single_triton)(x))
+    out_xla = jax.block_until_ready(jax.vmap(_single_xla)(x))
+
+    assert out_triton.shape == (b, m, n)
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=6e-2,
+        atol=6e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,bits",
+    [
+        ("mxfp4", 4),
+        ("nf4", 4),
+    ],
+)
+def test_quantized_matmul_triton_jit_vmap_over_all_inputs(mode: str, bits: int):
+    """vmap over x, w, and scales — uses the lax.map fallback."""
+    key = jax.random.PRNGKey(37)
+    kx, kpack = jax.random.split(key, 2)
+    b, m, k, n = 2, 8, 64, 64
+
+    x = jax.random.normal(kx, (b, m, k), dtype=jnp.float16)
+    pack_keys = jax.random.split(kpack, b)
+
+    w_q_parts, scales_parts = [], []
+    for pk in pack_keys:
+        w = jax.random.normal(pk, (n, k), dtype=jnp.float16)
+        w_q_i, scales_i = prepack_quantized_weights(w, mode=mode, bits=bits)
+        w_q_parts.append(w_q_i)
+        scales_parts.append(scales_i)
+
+    w_q_batched = jnp.stack(w_q_parts, axis=0)
+    scales_batched = jnp.stack(scales_parts, axis=0)
+
+    dev = jax.devices("gpu")[0]
+    x, w_q_batched, scales_batched = _device_put_all(dev, x, w_q_batched, scales_batched)
+
+    def _single_triton(xi, wi, si):
+        return triton_quantized_matmul(
+            xi, wi, si, None, transpose=False, mode=mode, bits=bits,
+        )
+
+    def _single_xla(xi, wi, si):
+        return xla_quantized_matmul(
+            xi, wi, si, None, transpose=False, mode=mode, bits=bits,
+        )
+
+    out_triton = jax.block_until_ready(
+        jax.jit(jax.vmap(_single_triton))(x, w_q_batched, scales_batched)
+    )
+    out_xla = jax.block_until_ready(
+        jax.jit(jax.vmap(_single_xla))(x, w_q_batched, scales_batched)
+    )
+
+    assert out_triton.shape == (b, m, n)
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=9e-2,
+        atol=9e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,bits",
+    [
+        ("affine", 4),
+        ("nf4", 4),
+        ("mxfp4", 4),
+    ],
+)
+def test_quantized_matmul_triton_nested_vmap_over_x_matches_xla(mode: str, bits: int):
+    """Nested vmap over x with shared weights exercises rank>3 reshape fast-path."""
+    key = jax.random.PRNGKey(41)
+    kx, kw = jax.random.split(key, 2)
+    b1, b2, m, k, n = 2, 3, 8, 64, 64
+
+    x = jax.random.normal(kx, (b1, b2, m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, zeros = packed
+    else:
+        w_q, scales = packed
+        zeros = None
+
+    dev = jax.devices("gpu")[0]
+    x, w_q, scales = _device_put_all(dev, x, w_q, scales)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
+
+    def _single_triton(xi):
+        return triton_quantized_matmul(
+            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+        )
+
+    def _single_xla(xi):
+        return xla_quantized_matmul(
+            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+        )
+
+    out_triton = jax.block_until_ready(jax.vmap(jax.vmap(_single_triton))(x))
+    out_xla = jax.block_until_ready(jax.vmap(jax.vmap(_single_xla))(x))
+
+    assert out_triton.shape == (b1, b2, m, n)
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=7e-2,
+        atol=7e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,bits",
+    [
+        ("affine", 4),
+        ("nf4", 4),
+    ],
+)
+def test_quantized_matmul_triton_nested_vmap_grad_over_x_matches_xla(mode: str, bits: int):
+    """Nested vmap gradient checks backward rank>3 reshape fast-path."""
+    key = jax.random.PRNGKey(43)
+    kx, kw = jax.random.split(key, 2)
+    b1, b2, m, k, n = 2, 3, 8, 64, 64
+
+    x = jax.random.normal(kx, (b1, b2, m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+
+    packed = prepack_quantized_weights(w, mode=mode, bits=bits)
+    if mode == "affine":
+        w_q, scales, zeros = packed
+    else:
+        w_q, scales = packed
+        zeros = None
+
+    dev = jax.devices("gpu")[0]
+    x, w_q, scales = _device_put_all(dev, x, w_q, scales)
+    if zeros is not None:
+        zeros = jax.device_put(zeros, dev)
+
+    def _single_triton(xi):
+        return triton_quantized_matmul(
+            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+        )
+
+    def _single_xla(xi):
+        return xla_quantized_matmul(
+            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+        )
+
+    def _loss_triton(x_in):
+        y = jax.vmap(jax.vmap(_single_triton))(x_in)
+        return jnp.mean(y.astype(jnp.float32))
+
+    def _loss_xla(x_in):
+        y = jax.vmap(jax.vmap(_single_xla))(x_in)
+        return jnp.mean(y.astype(jnp.float32))
+
+    g_triton = jax.block_until_ready(jax.grad(_loss_triton)(x))
+    g_xla = jax.block_until_ready(jax.grad(_loss_xla)(x))
+
+    assert g_triton.shape == (b1, b2, m, k)
+    np.testing.assert_allclose(
+        np.asarray(g_triton, dtype=np.float32),
+        np.asarray(g_xla, dtype=np.float32),
+        rtol=9e-2,
+        atol=9e-2,
+    )

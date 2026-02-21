@@ -137,4 +137,3 @@ def test_supports_mqa():
     out = scaled_dot_product_attention(q, k, v, causal=True)
     assert out.shape == (b, t, hq, d)
     assert jnp.isfinite(out).all()
-

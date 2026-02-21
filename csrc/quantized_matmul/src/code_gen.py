@@ -169,10 +169,7 @@ class Kernel:
     def gs_func_name(self, group_size: int) -> str:
         """Return the group-size-specialized C function name."""
         if self.kind == "affine":
-            return (
-                f"LaunchDequantAffineBits{self.bits}"
-                f"{DTYPE_SUFFIX[self.dtype]}Gs{group_size}"
-            )
+            return f"LaunchDequantAffineBits{self.bits}{DTYPE_SUFFIX[self.dtype]}Gs{group_size}"
         if self.kind == "nf4":
             return f"LaunchDequantNf4{DTYPE_SUFFIX[self.dtype]}Gs{group_size}"
         raise ValueError(f"Group size specialization not supported: {self.kind}")
@@ -183,18 +180,12 @@ class Kernel:
             gs_wrappers = []
             for group_size in GROUP_SIZES:
                 gs_wrappers.append(
-                    "void {func_name}({signature}) {{\n"
+                    f"void {self.gs_func_name(group_size)}({self.signature()}) {{\n"
                     "  (void)group_size;\n"
-                    "  dequant_affine_int_gs<{bits}, {group_size}, {ctype}, {ctype}>"
+                    f"  dequant_affine_int_gs<{self.bits}, {group_size}, {self.ctype}, {self.ctype}>"
                     "<<<grid, block, 0, stream>>>(wq, scales, biases, out, K, N, "
                     "n_words, n_groups);\n"
-                    "}}\n".format(
-                        func_name=self.gs_func_name(group_size),
-                        signature=self.signature(),
-                        bits=self.bits,
-                        group_size=group_size,
-                        ctype=self.ctype,
-                    )
+                    "}\n"
                 )
             return AFFINE_TEMPLATE.format(
                 func_name=self.func_name,
@@ -207,17 +198,12 @@ class Kernel:
             gs_wrappers = []
             for group_size in GROUP_SIZES:
                 gs_wrappers.append(
-                    "void {func_name}({signature}) {{\n"
+                    f"void {self.gs_func_name(group_size)}({self.signature()}) {{\n"
                     "  (void)group_size;\n"
-                    "  dequant_nf4_int_gs<4, {group_size}, {ctype}>"
+                    f"  dequant_nf4_int_gs<4, {group_size}, {self.ctype}>"
                     "<<<grid, block, 0, stream>>>(wq, scales, out, K, N, n_words, "
                     "n_groups);\n"
-                    "}}\n".format(
-                        func_name=self.gs_func_name(group_size),
-                        signature=self.signature(),
-                        group_size=group_size,
-                        ctype=self.ctype,
-                    )
+                    "}\n"
                 )
             return NF4_TEMPLATE.format(
                 func_name=self.func_name,
@@ -290,10 +276,7 @@ def _render_dispatch_header(kernels: list[Kernel]) -> str:
         lines.append(f"void {kernel.func_name}({kernel.signature()});\n")
         if kernel.kind in ("affine", "nf4"):
             for group_size in GROUP_SIZES:
-                lines.append(
-                    f"void {kernel.gs_func_name(group_size)}("
-                    f"{kernel.signature()});\n"
-                )
+                lines.append(f"void {kernel.gs_func_name(group_size)}({kernel.signature()});\n")
     lines.append("\n")
     lines.append("using DequantAffineF32Fn = void (*)(")
     lines.append(
@@ -344,14 +327,10 @@ def _render_dispatch_header(kernels: list[Kernel]) -> str:
                 ret = "DequantNf4F16Fn"
             else:
                 ret = "DequantNf4BF16Fn"
-        lines.append(
-            f"inline {ret} Resolve{kernel.func_name}(int64_t group_size) {{\n"
-        )
+        lines.append(f"inline {ret} Resolve{kernel.func_name}(int64_t group_size) {{\n")
         lines.append("  switch (group_size) {\n")
         for group_size in GROUP_SIZES:
-            lines.append(
-                f"  case {group_size}: return &{kernel.gs_func_name(group_size)};\n"
-            )
+            lines.append(f"  case {group_size}: return &{kernel.gs_func_name(group_size)};\n")
         lines.append(f"  default: return &{kernel.func_name};\n")
         lines.append("  }\n")
         lines.append("}\n\n")

@@ -31,7 +31,15 @@ Classes:
 
 from .cache import ConfigCache, overlay_cache
 from .persistent import PersistentCache
-from .selection import AutotunePolicy, ConfigSelectorChain, Tuner, forward_autotune_only, policy_override
+from .selection import (
+    AutotunePolicy,
+    ConfigSelectorChain,
+    Tuner,
+    forward_autotune_only,
+    log_autotune_progress,
+    policy_override,
+    set_autotune_progress,
+)
 
 __all__ = (
     "AutotunePolicy",
@@ -40,6 +48,8 @@ __all__ = (
     "PersistentCache",
     "Tuner",
     "forward_autotune_only",
+    "log_autotune_progress",
     "overlay_cache",
     "policy_override",
+    "set_autotune_progress",
 )

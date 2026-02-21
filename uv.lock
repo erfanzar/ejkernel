@@ -406,7 +406,7 @@ wheels = [
 
 [[package]]
 name = "ejkernel"
-version = "0.0.60"
+version = "0.0.66"
 source = { editable = "." }
 dependencies = [
     { name = "beartype" },
@@ -416,6 +416,7 @@ dependencies = [
     { name = "jaxlib" },
     { name = "jaxtyping" },
     { name = "pydantic" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -427,6 +428,9 @@ cuda = [
 ]
 dev = [
     { name = "eformer" },
+]
+mps = [
+    { name = "jax-metallib" },
 ]
 profile = [
     { name = "tb-nightly" },
@@ -449,18 +453,20 @@ requires-dist = [
     { name = "jax", specifier = "~=0.9.0" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.9.0" },
     { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.9.0" },
+    { name = "jax-metallib", marker = "extra == 'mps'", specifier = "==0.9.4.5" },
     { name = "jax-tvm-ffi", marker = "extra == 'cuda'", specifier = "==0.1.2" },
     { name = "jaxlib", specifier = "~=0.9.0" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'cuda'", specifier = ">=4.4.0.dev1" },
     { name = "pydantic", specifier = ">=2.11.10" },
     { name = "tb-nightly", marker = "extra == 'profile'", specifier = ">=2.21.0a20250820" },
+    { name = "tqdm", specifier = ">=4.67.1" },
     { name = "triton", marker = "extra == 'cuda'", specifier = "==3.6.0" },
     { name = "triton", marker = "extra == 'triton'", specifier = "==3.6.0" },
     { name = "xprof", marker = "extra == 'profile'", specifier = ">=2.20.6" },
     { name = "xprof-nightly", marker = "extra == 'profile'", specifier = ">=2.21.6a20250820" },
 ]
-provides-extras = ["cuda", "tpu", "triton", "profile", "dev"]
+provides-extras = ["cuda", "tpu", "triton", "mps", "profile", "dev"]
 
 [[package]]
 name = "etils"
@@ -885,6 +891,19 @@ with-cuda = [
     { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux'" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform == 'linux'" },
     { name = "nvidia-nvvm" },
+]
+
+[[package]]
+name = "jax-metallib"
+version = "0.9.4.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jax" },
+    { name = "jaxlib" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ec/c9/3a502351f36fe6e708e5de42dabfdf673ca30dd6d7bce9355b26a3697d72/jax_metallib-0.9.4.5.tar.gz", hash = "sha256:1444757a4e5dd6157f17ccc09a36affa972521e6fbf79ea49c44046e55b027dd", size = 272819, upload-time = "2026-02-17T23:09:42.894Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/21/4fdf355e73c1f00449a1e44b84b81846eb3b95ba43c7c1431d5c19ef083d/jax_metallib-0.9.4.5-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:ddd4aa76def4eb00630de5cf7bc8d13e33c7c2d4939b209e482b66ff66f62e80", size = 6782490, upload-time = "2026-02-17T23:09:47.673Z" },
 ]
 
 [[package]]

@@ -27,9 +27,9 @@ registry and provides:
 - **Custom VJP**: ``_operate`` / ``_operate_fwd`` / ``_operate_bwd``
   implement a ``jax.custom_vjp`` so that the backward pass uses the
   Pallas input-gradient kernel instead of JAX's default AD.
-- **Hybrid dispatch**: Both forward and backward paths select between
-  the packed fused kernel and predecode-to-dense path according to
-  the ``EJKERNEL_QMM_TPU_PATH`` environment variable or a heuristic.
+- **Packed-only dispatch**: TPU Pallas runs packed fused kernels only.
+  Legacy path values (``"hybrid"``, ``"predecode"``) are normalized to
+  packed for compatibility.
 - **XLA fallback**: transpose=True, unsupported bit widths, or tiling
   failures silently fall back to the XLA quantized matmul backend.
 """
@@ -61,6 +61,8 @@ from ...._registry import Backend, Platform, kernel_registry
 from ...._xla.quantized_matmul import quantized_matmul as _xla_quantized_matmul
 from ._pallas_impl_bwd import quantized_matmul_input_grad
 from ._pallas_impl_core import (
+    _ceil_div,
+    _lcm,
     get_qmm_tpu_path,
     is_packed_tpu_legal_forward,
     is_packed_tpu_legal_input_grad,
@@ -147,6 +149,51 @@ def _is_packed_tpu_legal(
     )
 
 
+def _normalize_tpu_path(path: str | None) -> str:
+    """Normalize TPU path selection to packed-only execution."""
+    del path
+    return "packed"
+
+
+def _recover_packed_legal_blocks(
+    x: jax.Array,
+    w_q: jax.Array,
+    scales: jax.Array,
+    *,
+    group_size: int,
+    bits: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+) -> tuple[int, int, int, bool]:
+    """Try to find packed-legal block sizes when the caller's choice is illegal.
+
+    The primary strategy is to set ``block_n = n_pad`` which is always packed-legal
+    (it makes the trailing BlockSpec dimension equal to the padded dimension).
+    ``block_m`` is clamped to ``m_pad`` when ``M`` is small, avoiding an oversized
+    sublane tile.
+
+    Returns ``(block_m, block_n, block_k, legal)`` where *legal* indicates whether
+    the returned sizes pass the packed-legality check.
+    """
+    values_per_word = 32 // bits
+    align_n = _lcm(128, _lcm(group_size, values_per_word))
+    m = int(x.shape[0])
+    n = int(scales.shape[-1]) * group_size
+    int(x.shape[1])
+    n_pad = max(align_n, _ceil_div(n, align_n) * align_n)
+    m_pad = max(8, _ceil_div(m, 8) * 8)
+    bm = min(block_m, m_pad)
+    bm = max(8, _ceil_div(bm, 8) * 8)
+    bk = max(128, _ceil_div(block_k, 128) * 128)
+    legal = is_packed_tpu_legal_forward(
+        x, w_q, scales,
+        group_size=group_size, bits=bits,
+        block_m=bm, block_n=n_pad, block_k=bk,
+    )
+    return bm, n_pad, bk, bool(legal)
+
+
 @ejit(
     static_argnames=[
         "transpose",
@@ -154,6 +201,7 @@ def _is_packed_tpu_legal(
         "bits",
         "mode",
         "tpu_path",
+        "allow_dense_fallback",
         "block_m",
         "block_n",
         "block_k",
@@ -174,6 +222,7 @@ def _operate_impl(
     bits: int,
     mode: str,
     tpu_path: str,
+    allow_dense_fallback: bool,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -184,10 +233,10 @@ def _operate_impl(
 ) -> jax.Array:
     """Core forward implementation for TPU Pallas quantized matmul.
 
-    Attempts the Pallas hybrid packed/predecode path for 4/8-bit
-    transpose=False workloads. Falls back to the XLA quantized matmul
-    backend when transpose=True, when bit widths are unsupported, or
-    when the Pallas path raises an exception.
+    Attempts the packed TPU Pallas path for 4/8-bit transpose=False
+    workloads. Falls back to the XLA quantized matmul backend when
+    transpose=True, when bit widths are unsupported, or when packed
+    dispatch fails.
 
     Args:
         x: Activation tensor [M, K].
@@ -198,7 +247,7 @@ def _operate_impl(
         group_size: Elements per quantization group.
         bits: Quantization bit width.
         mode: Backend quantization mode string.
-        tpu_path: TPU path routing mode ("hybrid", "packed", "predecode").
+        tpu_path: TPU path routing mode (legacy values normalize to packed).
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -230,11 +279,10 @@ def _operate_impl(
             block_n=block_n,
             block_k=block_k,
             use_bf16=compute_in_bf16,
+            allow_dense_fallback=allow_dense_fallback,
         )
 
-    path = str(tpu_path).strip().lower()
-    if path not in {"hybrid", "packed", "predecode"}:
-        path = get_qmm_tpu_path()
+    path = _normalize_tpu_path(tpu_path if tpu_path is not None else get_qmm_tpu_path())
     packed_legal = _is_packed_tpu_legal(
         is_input_grad=False,
         x_or_dy=x,
@@ -248,6 +296,17 @@ def _operate_impl(
     )
 
     if bits in (4, 8):
+        fwd_bm, fwd_bn, fwd_bk = block_m, block_n, block_k
+        if not packed_legal:
+            # Auto-recover: try n_pad as block_n which is always packed-legal.
+            rec_bm, rec_bn, rec_bk, rec_legal = _recover_packed_legal_blocks(
+                x, w, scales,
+                group_size=group_size, bits=bits,
+                block_m=block_m, block_n=block_n, block_k=block_k,
+            )
+            if rec_legal:
+                fwd_bm, fwd_bn, fwd_bk = rec_bm, rec_bn, rec_bk
+                packed_legal = True
         try:
             return _pallas_qmm_transpose_false(
                 x,
@@ -257,15 +316,16 @@ def _operate_impl(
                 group_size=group_size,
                 bits=bits,
                 mode=mode,
-                block_m=block_m,
-                block_n=block_n,
-                block_k=block_k,
+                block_m=fwd_bm,
+                block_n=fwd_bn,
+                block_k=fwd_bk,
                 use_bf16=compute_in_bf16,
                 path=path,
                 packed_legal=packed_legal,
             )
         except Exception:
-            pass
+            if not allow_dense_fallback:
+                raise
 
     return _xla_quantized_matmul(
         x,
@@ -280,10 +340,11 @@ def _operate_impl(
         block_n=block_n,
         block_k=block_k,
         use_bf16=compute_in_bf16,
+        allow_dense_fallback=allow_dense_fallback,
     )
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 16))
+@functools.partial(jax.custom_vjp, nondiff_argnums=range(4, 17))
 def _operate(
     x: jax.Array,
     w: jax.Array,
@@ -294,6 +355,7 @@ def _operate(
     bits: int,
     mode: str,
     tpu_path: str,
+    allow_dense_fallback: bool,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -319,7 +381,7 @@ def _operate(
         group_size: Elements per quantization group.
         bits: Quantization bit width.
         mode: Backend quantization mode string.
-        tpu_path: TPU path routing mode ("hybrid", "packed", "predecode").
+        tpu_path: TPU path routing mode (legacy values normalize to packed).
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -341,6 +403,7 @@ def _operate(
         bits=bits,
         mode=mode,
         tpu_path=tpu_path,
+        allow_dense_fallback=allow_dense_fallback,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -361,6 +424,7 @@ def _operate_fwd(
     bits: int,
     mode: str,
     tpu_path: str,
+    allow_dense_fallback: bool,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -390,6 +454,7 @@ def _operate_fwd(
         bits=bits,
         mode=mode,
         tpu_path=tpu_path,
+        allow_dense_fallback=allow_dense_fallback,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -407,6 +472,7 @@ def _operate_bwd(
     bits: int,
     mode: str,
     tpu_path: str,
+    allow_dense_fallback: bool,
     block_m: int,
     block_n: int,
     block_k: int,
@@ -431,9 +497,7 @@ def _operate_bwd(
     """
     del gemv_mode, revsplit_k, revsplit_k_parts
     w, scales, biases = residual
-    path = str(tpu_path).strip().lower()
-    if path not in {"hybrid", "packed", "predecode"}:
-        path = get_qmm_tpu_path()
+    path = _normalize_tpu_path(tpu_path if tpu_path is not None else get_qmm_tpu_path())
     packed_legal = False
     if not transpose:
         packed_legal = _is_packed_tpu_legal(
@@ -460,6 +524,7 @@ def _operate_bwd(
         block_n=block_n,
         block_k=block_k,
         use_bf16=use_bf16,
+        allow_dense_fallback=allow_dense_fallback,
         path=path,
         packed_legal=packed_legal,
     )
@@ -486,6 +551,7 @@ def quantized_matmul(
     revsplit_k_parts: int | None = None,
     *,
     tpu_path: str | None = None,
+    allow_dense_fallback: bool = True,
     block_m: int = 128,
     block_n: int = 128,
     block_k: int = 64,
@@ -504,10 +570,9 @@ def quantized_matmul(
     (``biases = -zeros * scales``) before entering the Pallas/XLA kernels.
     Non-affine modes must pass ``zeros=None``.
 
-    The forward and backward passes each select between a packed fused
-    Pallas kernel and a predecode-to-dense path, controlled by the
-    ``EJKERNEL_QMM_TPU_PATH`` environment variable or a built-in heuristic.
-    transpose=True and unsupported bit widths fall back to XLA.
+    TPU Pallas uses packed fused kernels for transpose=False forward/backward.
+    Legacy path selectors are normalized to packed. transpose=True and
+    unsupported bit widths fall back to XLA.
 
     Args:
         x: Activation tensor [M, K].
@@ -522,8 +587,9 @@ def quantized_matmul(
         gemv_mode: GEMV dispatch mode (ignored on TPU).
         revsplit_k: Reverse split-K mode (ignored on TPU).
         revsplit_k_parts: Reverse split-K partition count (ignored on TPU).
-        tpu_path: Optional TPU path routing mode override
-            ("hybrid", "packed", "predecode"). If None, reads env/default.
+        tpu_path: Optional TPU path routing mode override.
+            ``"packed"`` is active; ``"hybrid"`` and ``"predecode"`` are
+            accepted as aliases and normalize to packed.
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -559,7 +625,25 @@ def quantized_matmul(
         affine_biases = None
 
     backend_mode = to_backend_mode(mode, bits)
-    resolved_tpu_path = get_qmm_tpu_path() if tpu_path is None else str(tpu_path).strip().lower()
+    resolved_tpu_path = _normalize_tpu_path(get_qmm_tpu_path() if tpu_path is None else tpu_path)
+
+    # Pre-dispatch packed-legality recovery: if the caller's block_n is
+    # illegal for packed TPU execution, try n_pad which is always legal.
+    # This guards direct calls (e.g. from benchmarks) that bypass the
+    # QuantizedMatmul.run() normalization.
+    if not transpose and bits in (4, 8):
+        if not is_packed_tpu_legal_forward(
+            x, w, scales,
+            group_size=group_size, bits=bits,
+            block_m=block_m, block_n=block_n, block_k=block_k,
+        ):
+            rec_bm, rec_bn, rec_bk, rec_legal = _recover_packed_legal_blocks(
+                x, w, scales,
+                group_size=group_size, bits=bits,
+                block_m=block_m, block_n=block_n, block_k=block_k,
+            )
+            if rec_legal:
+                block_m, block_n, block_k = rec_bm, rec_bn, rec_bk
 
     return _operate(
         x,
@@ -571,6 +655,7 @@ def quantized_matmul(
         bits,
         backend_mode,
         resolved_tpu_path,
+        bool(allow_dense_fallback),
         block_m,
         block_n,
         block_k,

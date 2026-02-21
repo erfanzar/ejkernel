@@ -144,9 +144,7 @@ def test_segment_ids_to_mask_conversions():
 
     mask_float = segment_ids_to_mask((q_segments, kv_segments), dtype=jnp.float32)
     mask_cross = jax.device_get(mask_float[:, 0] > 0.5)
-    expected_cross = (q_arr[:, :, None] == kv_arr[:, None, :]) & (
-        (q_arr >= 0)[:, :, None] & (kv_arr >= 0)[:, None, :]
-    )
+    expected_cross = (q_arr[:, :, None] == kv_arr[:, None, :]) & ((q_arr >= 0)[:, :, None] & (kv_arr >= 0)[:, None, :])
     assert mask_float.dtype == jnp.float32
     assert mask_float.shape == (1, 1, 4, 5)
     assert np.array_equal(mask_cross, expected_cross)
@@ -166,9 +164,7 @@ def test_segment_ids_to_qkv_masks_cross_attention():
     q_mask, kv_mask, attn = segment_ids_to_qkv_masks(q_segments, kv_segments)
     expected_q = q_arr >= 0
     expected_kv = kv_arr >= 0
-    expected_attn = (q_arr[:, :, None] == kv_arr[:, None, :]) & (
-        expected_q[:, :, None] & expected_kv[:, None, :]
-    )
+    expected_attn = (q_arr[:, :, None] == kv_arr[:, None, :]) & (expected_q[:, :, None] & expected_kv[:, None, :])
 
     assert np.array_equal(jax.device_get(q_mask), expected_q)
     assert np.array_equal(jax.device_get(kv_mask), expected_kv)
@@ -999,10 +995,13 @@ def test_apply_chunked_multi_batch_padding():
         return mask_info.apply_chunked(chunk_size=3)
 
     # Two batches with different padding patterns
-    segment_ids = jnp.array([
-        [1, 1, 1, 1, 1, 1],  # No padding
-        [1, 1, 1, 1, -1, -1],  # Last 2 are padding
-    ], dtype=jnp.int32)
+    segment_ids = jnp.array(
+        [
+            [1, 1, 1, 1, 1, 1],  # No padding
+            [1, 1, 1, 1, -1, -1],  # Last 2 are padding
+        ],
+        dtype=jnp.int32,
+    )
 
     chunked = run_chunked(segment_ids)
 
@@ -1033,11 +1032,14 @@ def test_apply_chunked_batch_independence():
         return mask_info.apply_chunked(chunk_size=2)
 
     # Three batches with varying padding
-    segment_ids = jnp.array([
-        [1, 1, 1, 1, 1, 1, 1, 1],  # No padding
-        [1, 1, 1, 1, 1, -1, -1, -1],  # Last 3 padding
-        [1, 1, -1, -1, -1, -1, -1, -1],  # Last 6 padding
-    ], dtype=jnp.int32)
+    segment_ids = jnp.array(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1],  # No padding
+            [1, 1, 1, 1, 1, -1, -1, -1],  # Last 3 padding
+            [1, 1, -1, -1, -1, -1, -1, -1],  # Last 6 padding
+        ],
+        dtype=jnp.int32,
+    )
 
     chunked = run_chunked(segment_ids)
 

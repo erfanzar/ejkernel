@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
+from functools import cache, lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -33,13 +35,52 @@ def _has_triton() -> bool:
     return importlib.util.find_spec("triton") is not None
 
 
-def pytest_ignore_collect(collection_path: Path, config: Any) -> bool:
-    if _has_triton():
-        return False
+@cache
+def _has_module(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
 
-    if collection_path.name in _TRITON_ONLY_TEST_BASENAMES:
+
+@lru_cache(maxsize=1)
+def _has_gpu_backend() -> bool:
+    if not _has_module("jax"):
+        return False
+    try:
+        import jax
+    except Exception:
+        return False
+    try:
+        devices = jax.devices()
+    except Exception:
+        return False
+    return bool(devices) and devices[0].platform == "gpu"
+
+
+@lru_cache(maxsize=1)
+def _has_nvcc() -> bool:
+    return shutil.which("nvcc") is not None
+
+
+def _triton_available() -> bool:
+    return _has_triton() and _has_gpu_backend()
+
+
+def _cute_available() -> bool:
+    return _has_module("cutlass") and _has_gpu_backend()
+
+
+def _cuda_available() -> bool:
+    return _has_gpu_backend() and _has_nvcc()
+
+
+def pytest_ignore_collect(collection_path: Path, config: Any) -> bool:
+    parts = set(collection_path.parts)
+    is_kernel_test = "test" in parts and "kernels" in parts
+    if is_kernel_test and "_triton" in parts and not _triton_available():
+        return True
+    if is_kernel_test and "_cute" in parts and not _cute_available():
+        return True
+    if is_kernel_test and "_cuda" in parts and not _cuda_available():
         return True
 
-    # Also ignore the entire Triton test directory when Triton isn't installed.
-    parts = set(collection_path.parts)
-    return "test" in parts and "kernels" in parts and "_triton" in parts
+    # Ignore standalone Triton-dependent tests outside test/kernels/_triton.
+    return collection_path.name in _TRITON_ONLY_TEST_BASENAMES and not _triton_available()

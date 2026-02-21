@@ -26,6 +26,8 @@ this falls back to dequantize+matmul.
 
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
@@ -73,6 +75,15 @@ def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tup
 def _ceil_div(a: int, b: int) -> int:
     """Compute ceiling division of a by b."""
     return (a + b - 1) // b
+
+
+def _lcm(a: int, b: int) -> int:
+    """Compute least common multiple of two positive integers."""
+    if a <= 0:
+        return int(b)
+    if b <= 0:
+        return int(a)
+    return abs(a * b) // math.gcd(a, b)
 
 
 def _pad_2d(x: jax.Array, pad0: int, pad1: int) -> jax.Array:
@@ -426,7 +437,9 @@ def _blocked_quantized_matmul(
             Updated accumulator with this K-tile's contribution added.
         """
         off_k = k_idx * block_k
-        x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k)).astype(compute_dtype)
+        x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k))
+        if x_pad.dtype != jnp.float32:
+            x_tile = x_tile.astype(compute_dtype)
         w_tile = decode_tile(off_k, off_n)
         acc = acc + _dot_general(x_tile, w_tile)
         return acc
@@ -482,7 +495,9 @@ def _blocked_quantized_matmul(
                     Updated accumulator.
                 """
                 off_k = idx * block_k
-                x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k)).astype(compute_dtype)
+                x_tile = jax.lax.dynamic_slice(x_pad, (off_m, off_k), (block_m, block_k))
+                if x_pad.dtype != jnp.float32:
+                    x_tile = x_tile.astype(compute_dtype)
                 w_tile = w_tiles[idx]
                 return carry + _dot_general(x_tile, w_tile)
 
@@ -507,6 +522,7 @@ def _blocked_quantized_matmul(
         "block_n",
         "block_k",
         "use_bf16",
+        "allow_dense_fallback",
         "gemv_mode",
         "revsplit_k",
         "revsplit_k_parts",
@@ -525,6 +541,7 @@ def _operate(
     block_n,
     block_k,
     use_bf16,
+    allow_dense_fallback,
     gemv_mode,
     revsplit_k,
     revsplit_k_parts,
@@ -550,15 +567,13 @@ def _operate(
         block_n: Tile size for N dimension.
         block_k: Tile size for K dimension.
         use_bf16: Whether to use BF16 for intermediate computations.
+        allow_dense_fallback: If False, disallow the dequantize+matmul fallback
+            path when the blocked fused path is illegal, and raise instead.
 
     Returns:
         Matrix multiplication result of shape (M, N) in float32.
     """
     del gemv_mode, revsplit_k, revsplit_k_parts
-    if mode in ("affine", "nf4") and scales.dtype != jnp.float32 and not use_bf16:
-        scales = scales.astype(jnp.float32)
-        if biases is not None:
-            biases = biases.astype(jnp.float32)
 
     can_fuse = bits in (4, 8)
     can_fuse = can_fuse and block_m > 0 and block_n > 0 and block_k > 0
@@ -579,9 +594,19 @@ def _operate(
                 block_k=block_k,
                 use_bf16=use_bf16,
             )
-        except ValueError:
-            # Shape or tiling mismatch, fall back to dequantize+matmul.
-            pass
+        except ValueError as e:
+            # Shape or tiling mismatch.
+            if not allow_dense_fallback:
+                raise ValueError(
+                    "XLA blocked quantized_matmul preconditions failed and dense dequantize+matmul fallback is "
+                    "disabled (allow_dense_fallback=False)."
+                ) from e
+
+    if not allow_dense_fallback:
+        raise ValueError(
+            "XLA blocked quantized_matmul requires a legal blocked configuration; "
+            "dense dequantize+matmul fallback is disabled (allow_dense_fallback=False)."
+        )
 
     zeros = None
     if mode == "affine":
@@ -611,6 +636,7 @@ def quantized_matmul(
     block_n: int = 128,
     block_k: int = 64,
     use_bf16: bool = True,
+    allow_dense_fallback: bool = True,
     num_warps: int | None = None,
     num_stages: int | None = None,
     split_k: int | None = None,
@@ -678,6 +704,16 @@ def quantized_matmul(
     revsplit_k = normalize_revsplitk_mode(revsplit_k)
     revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
 
+    # Keep the "blocked" XLA path enabled for common transpose=True cases by
+    # ensuring block_k matches the kernel preconditions. Without this, some
+    # (transpose=True, group_size=128) configurations hit a ValueError and
+    # silently fall back to dequantize+matmul (dense path).
+    if transpose:
+        values_per_word = 32 // int(bits)
+        if block_k % values_per_word != 0 or block_k % int(group_size) != 0:
+            block_k = _lcm(int(block_k), int(values_per_word))
+            block_k = _lcm(int(block_k), int(group_size))
+
     if mode == "affine":
         if zeros is None:
             raise ValueError("affine quantized_matmul requires `zeros`.")
@@ -701,6 +737,7 @@ def quantized_matmul(
         block_n=block_n,
         block_k=block_k,
         use_bf16=use_bf16,
+        allow_dense_fallback=bool(allow_dense_fallback),
         gemv_mode=gemv_mode,
         revsplit_k=revsplit_k,
         revsplit_k_parts=revsplit_k_parts,

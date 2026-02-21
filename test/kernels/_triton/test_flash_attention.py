@@ -158,6 +158,7 @@ class TestCombinedFeatures:
         assert out.shape == (batch, seq_len, num_heads, head_dim)
         assert jnp.all(jnp.isfinite(out))
 
+
 def test_flash_attention_matches_xla_smoke():
     key = jax.random.PRNGKey(0)
     kq, kk, kv, ka = jax.random.split(key, 4)

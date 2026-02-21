@@ -198,6 +198,51 @@ class TestStateSpaceV1:
             assert output.shape == (batch, seq_len, intermediate_size)
             assert ssm_state.shape == (batch, intermediate_size, ssm_state_size)
 
+    def test_bf16_state_with_fp32_A_preserves_state_dtype(self):
+        """Carry/state dtype should stay stable even when A is float32."""
+        batch, seq_len, intermediate_size, ssm_state_size = 2, 4, 32, 16
+
+        hidden_states = jnp.ones((batch, seq_len, intermediate_size), dtype=jnp.bfloat16)
+        A = (-jnp.ones((intermediate_size, ssm_state_size)) * 0.1).astype(jnp.float32)
+        B = (jnp.ones((batch, seq_len, ssm_state_size)) * 0.1).astype(jnp.bfloat16)
+        C = (jnp.ones((batch, seq_len, ssm_state_size)) * 0.1).astype(jnp.bfloat16)
+        D = jnp.ones((intermediate_size,), dtype=jnp.bfloat16)
+        dt = (jnp.ones((batch, seq_len, intermediate_size)) * 0.1).astype(jnp.bfloat16)
+        initial_state = jnp.zeros((batch, intermediate_size, ssm_state_size), dtype=jnp.bfloat16)
+
+        output, ssm_state, _ = state_space_v1(
+            hidden_states,
+            A,
+            B,
+            C,
+            D,
+            dt,
+            initial_state=initial_state,
+        )
+
+        assert output.dtype == jnp.bfloat16
+        assert ssm_state.dtype == jnp.bfloat16
+
+    def test_bf16_state_with_fp32_A_backward_scan_carry_dtype(self):
+        """Backward scan should keep carry dtype stable for mixed-precision inputs."""
+        batch, seq_len, intermediate_size, ssm_state_size = 1, 3, 16, 8
+
+        hidden_states = jnp.ones((batch, seq_len, intermediate_size), dtype=jnp.bfloat16)
+        A = (-jnp.ones((intermediate_size, ssm_state_size)) * 0.1).astype(jnp.float32)
+        B = (jnp.ones((batch, seq_len, ssm_state_size)) * 0.1).astype(jnp.bfloat16)
+        C = (jnp.ones((batch, seq_len, ssm_state_size)) * 0.1).astype(jnp.bfloat16)
+        D = jnp.ones((intermediate_size,), dtype=jnp.bfloat16)
+        dt = (jnp.ones((batch, seq_len, intermediate_size)) * 0.1).astype(jnp.bfloat16)
+        initial_state = jnp.zeros((batch, intermediate_size, ssm_state_size), dtype=jnp.bfloat16)
+
+        def loss_fn(h):
+            out, _state, _ = state_space_v1(h, A, B, C, D, dt, initial_state=initial_state)
+            return jnp.sum(out.astype(jnp.float32))
+
+        grad_h = jax.grad(loss_fn)(hidden_states)
+        assert grad_h.shape == hidden_states.shape
+        assert grad_h.dtype == jnp.bfloat16
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -83,7 +83,6 @@ def test_flash_attention_dropout_seed_changes_output():
     assert not jnp.allclose(out0, out1)
 
 
-
 @pytest.mark.skipif(device_platform() != "gpu", reason="GPU-only CUDA validation")
 def test_flash_attention_cuda_softcap_matches_xla():
     key = jax.random.PRNGKey(8)

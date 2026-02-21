@@ -73,9 +73,8 @@ def _ref_chunked_prefill(
             if sliding_window is not None and sliding_window > 0:
                 left = max(0, right - int(sliding_window))
 
-            logits = (
-                jnp.einsum("hd,khd->hk", q[t].astype(jnp.float32), k[left:right].astype(jnp.float32))
-                * float(softmax_scale)
+            logits = jnp.einsum("hd,khd->hk", q[t].astype(jnp.float32), k[left:right].astype(jnp.float32)) * float(
+                softmax_scale
             )
             if logits_soft_cap is not None and logits_soft_cap > 0:
                 logits = float(logits_soft_cap) * jnp.tanh(logits / float(logits_soft_cap))
@@ -181,4 +180,3 @@ def test_chunked_prefill_paged_decode_xla_updates_cache_and_matches_reference():
         stored_v = new_vc[blk_ids].reshape(num_blocks * block_size, num_kv_heads, head_dim)[:kv_len]
         assert jnp.allclose(stored_k.astype(jnp.float32), k_full[s].astype(jnp.float32))
         assert jnp.allclose(stored_v.astype(jnp.float32), v_full[s].astype(jnp.float32))
-

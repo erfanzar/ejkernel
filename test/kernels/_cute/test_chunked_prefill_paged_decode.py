@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import importlib.util
 import math
 
@@ -26,12 +27,14 @@ if not _has_cutlass:
 if jax.devices()[0].platform != "gpu":
     pytest.skip("CUTE tests require GPU backend", allow_module_level=True)
 
-from ejkernel.kernels._cute.chunked_prefill_paged_decode import (
-    chunked_prefill_paged_decode as cute_chunked_prefill_paged_decode,
+_cute_chunked_prefill_module = importlib.import_module(
+    "ejkernel.kernels._cute.chunked_prefill_paged_decode"
 )
-from ejkernel.kernels._xla.chunked_prefill_paged_decode import (
-    chunked_prefill_paged_decode as xla_chunked_prefill_paged_decode,
+cute_chunked_prefill_paged_decode = _cute_chunked_prefill_module.chunked_prefill_paged_decode
+_xla_chunked_prefill_module = importlib.import_module(
+    "ejkernel.kernels._xla.chunked_prefill_paged_decode"
 )
+xla_chunked_prefill_paged_decode = _xla_chunked_prefill_module.chunked_prefill_paged_decode
 
 
 def _write_tokens_to_cache(
