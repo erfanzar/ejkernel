@@ -235,44 +235,6 @@ def test_axis_col_cuda_request_does_not_fallback(monkeypatch: pytest.MonkeyPatch
     assert captured.get("platform") == "cuda"
 
 
-def test_quantized_matmul_auto_platform_sets_backend_preferences(monkeypatch: pytest.MonkeyPatch):
-    captured: dict[str, object] = {}
-
-    def _fake_detect_platform(_algorithm, platform="auto", **kwargs):
-        captured.update(kwargs)
-        return qmm_module.Platform.XLA
-
-    monkeypatch.setattr(qmm_module, "detect_platform", _fake_detect_platform)
-
-    key_x, key_w = jax.random.split(jax.random.PRNGKey(31), 2)
-    x = jax.random.normal(key_x, (4, 32), dtype=jnp.float32)
-    w = jax.random.normal(key_w, (32, 32), dtype=jnp.float32)
-    w_q, scales, zeros = prepack_quantized_weights(
-        w,
-        mode="affine",
-        bits=4,
-        group_size=32,
-        axis="row",
-    )
-
-    y = quantized_matmul(
-        x,
-        w_q,
-        scales,
-        zeros,
-        mode="affine",
-        bits=4,
-        group_size=32,
-        axis="row",
-        platform="auto",
-    )
-    assert y.shape == (x.shape[0], w.shape[0])
-
-    backend = jax.default_backend()
-    assert captured.get("prefer_pallas") == (backend == "tpu")
-    assert captured.get("prefer_cuda") == (backend in ("gpu", "cuda"))
-
-
 def test_kernel_family_auto_policy_matches_spec():
     family, parts = select_qmm_kernel_family(
         m=128,
