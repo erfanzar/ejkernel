@@ -101,21 +101,28 @@ def _ssm1_fwd(
     batch_size, _seq_len, intermediate_size = hidden_states.shape
     ssm_state_size = B.shape[-1]
 
+    state_dtype = initial_state.dtype if initial_state is not None else hidden_states.dtype
+    output_dtype = hidden_states.dtype
+
     if initial_state is None:
         initial_state = jnp.zeros(
             (batch_size, intermediate_size, ssm_state_size),
-            dtype=jnp.float32,
+            dtype=state_dtype,
         )
+    else:
+        initial_state = initial_state.astype(state_dtype)
 
     # Discretization
     # dA = exp(A * dt) where A is [d, n] and dt is [batch, seq_len, d]
     # Result: [batch, seq_len, d, n]
-    discrete_A = jnp.exp(A[None, None, :, :] * dt[:, :, :, None])
+    discrete_A = jnp.exp(A[None, None, :, :] * dt[:, :, :, None]).astype(state_dtype)
 
     # dB * x = (dt * B) * x
     # dt: [batch, seq_len, d], B: [batch, seq_len, n]
     # Result: [batch, seq_len, d, n]
-    discrete_Bx = dt[:, :, :, None] * B[:, None, :, :].swapaxes(1, 2) * hidden_states[:, :, :, None]
+    discrete_Bx = (
+        dt[:, :, :, None] * B[:, None, :, :].swapaxes(1, 2) * hidden_states[:, :, :, None]
+    ).astype(state_dtype)
 
     def process_batch(x_b, dA_b, dBx_b, C_b, h0):
         """Process a single batch element through the SSM1 recurrence.
@@ -152,10 +159,14 @@ def _ssm1_fwd(
             (h,) = carry
 
             # State update
-            new_h = dA_t * h + dBx_t
+            new_h = (dA_t * h + dBx_t).astype(h.dtype)
 
             # Output
-            y_t = jnp.sum(new_h * C_t[None, :], axis=-1) + D * x_t
+            c_t = C_t.astype(output_dtype)
+            y_t = (
+                jnp.sum(new_h.astype(output_dtype) * c_t[None, :], axis=-1)
+                + D.astype(output_dtype) * x_t.astype(output_dtype)
+            ).astype(output_dtype)
 
             return (new_h,), (new_h, y_t)
 
@@ -201,17 +212,23 @@ def _ssm1_single_step_fwd(
     Returns:
         Tuple of (output, new_state)
     """
+    state_dtype = ssm_state.dtype
+    output_dtype = hidden_state.dtype
+
     # Discretization
     # dA = exp(A * dt)
-    discrete_A = jnp.exp(A[None, :, :] * dt[:, :, None])  # [batch, d, n]
+    discrete_A = jnp.exp(A[None, :, :] * dt[:, :, None]).astype(state_dtype)  # [batch, d, n]
 
     # dB * x = dt * B * x
-    discrete_Bx = dt[:, :, None] * B[:, None, :] * hidden_state[:, :, None]  # [batch, d, n]
+    discrete_Bx = (dt[:, :, None] * B[:, None, :] * hidden_state[:, :, None]).astype(state_dtype)  # [batch, d, n]
 
     # State update
-    new_state = discrete_A * ssm_state + discrete_Bx
+    new_state = (discrete_A * ssm_state + discrete_Bx).astype(state_dtype)
 
     # Output: y = h @ C + D * x
-    y = jnp.sum(new_state * C[:, None, :], axis=-1) + D[None, :] * hidden_state
+    y = (
+        jnp.sum(new_state.astype(output_dtype) * C.astype(output_dtype)[:, None, :], axis=-1)
+        + D.astype(output_dtype)[None, :] * hidden_state.astype(output_dtype)
+    ).astype(output_dtype)
 
     return y, new_state

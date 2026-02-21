@@ -121,6 +121,7 @@ def _ssm1_bwd(
                 Tuple of (dh_prev, (dx_t, dB_t, dC_t, ddt_t, dA_contrib)).
             """
             dh_next = carry
+            carry_dtype = dh_next.dtype
             _t_idx, x_t, B_t, C_t, dt_t, h_t, h_prev_t, do_t = inputs
 
             # Compute dA_t for this timestep
@@ -155,7 +156,7 @@ def _ssm1_bwd(
             dA_contrib = dh_t * dt_t[:, None] * dA_t * h_prev_t  # [d, n]
 
             # Propagate gradient to previous hidden state
-            dh_prev = dh_t * dA_t
+            dh_prev = (dh_t * dA_t).astype(carry_dtype)
 
             outputs = (dx_t, dB_t, dC_t, ddt_t, dA_contrib)
             return dh_prev, outputs

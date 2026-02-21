@@ -301,6 +301,21 @@ class TestPlatformSpecificKernels:
         selector_after.choose(inv, kernel)
         assert tuner_after.last_validate_backward is True
 
+    def test_tuner_measure_backward_accepts_tuple_outputs(self):
+        """Backward autotune validation should handle tuple/pytree outputs."""
+        tuner = Tuner(warmup=0, iters=1)
+        x = jnp.arange(8, dtype=jnp.float32)
+
+        def fn(x_):
+            y = x_ * 2.0
+            return y, {"mean": jnp.mean(y)}
+
+        fn._ejk_validate_backward = True
+        fn._ejk_method = "regular"
+
+        elapsed = tuner.measure(fn, x)
+        assert elapsed >= 0.0
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

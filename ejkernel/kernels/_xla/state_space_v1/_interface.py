@@ -145,7 +145,7 @@ def _ssm1_fwd_rule(
     if initial_state is None:
         initial_state = jnp.zeros(
             (batch_size, intermediate_size, ssm_state_size),
-            dtype=jnp.float32,
+            dtype=hidden_states.dtype,
         )
 
     if use_single_step and seq_len == 1:

@@ -409,12 +409,39 @@ class Tuner(Generic[Cfg]):
                 it_t, it_n = iter(theta), iter(nondiff)
                 return tuple(next(it_t) if m else next(it_n) for m in diff_mask)
 
+            def _scalarize_output(output):
+                """Reduce array/scalar leaves from arbitrary pytrees into a scalar loss.
+
+                Some kernels return tuple/dict outputs (e.g. ``(output, aux)``). Backward
+                validation only needs a scalar objective, so we sum every numeric leaf.
+                """
+                leaves = jtu.tree_leaves(output)
+                total = None
+                for leaf in leaves:
+                    if isinstance(leaf, (jax.Array, np.ndarray, jcore.Tracer)):
+                        arr = jnp.asarray(leaf)
+                    elif np.isscalar(leaf):
+                        arr = jnp.asarray(leaf)
+                    else:
+                        continue
+                    if not np.issubdtype(arr.dtype, np.number):
+                        continue
+                    part = jnp.sum(arr)
+                    total = part if total is None else (total + part)
+                if total is None:
+                    raise TypeError(
+                        "Autotune backward validation requires at least one numeric array/scalar in function output."
+                    )
+                if jnp.iscomplexobj(total):
+                    total = jnp.real(total)
+                return total
+
             def loss(theta, nondiff):
                 """Compute scalar loss for backward pass validation timing."""
                 arrs = _merge(theta, nondiff)
                 (aa, kk) = _restore_args_kwargs(arrs)
                 y = fn(*aa, **kk)
-                return jnp.sum(y)
+                return _scalarize_output(y)
 
             try:
                 grad_core = jax.jit(jax.grad(loss, argnums=0))
