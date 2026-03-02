@@ -5,7 +5,9 @@ import jax.numpy as jnp
 import pytest
 
 from ejkernel.errors import EjkernelRuntimeError
-from ejkernel.modules.operations import blocksparse_attention
+from ejkernel.modules.operations import BlockSparseAttention, blocksparse_attention
+from ejkernel.modules.operations.configs import BlockSparseAttentionConfig
+from ejkernel.ops import BwdParams, FwdParams
 from ejkernel.types import MaskInfo
 
 from ._utils import assert_allclose, dense_attention_reference, rand_qkv
@@ -93,3 +95,27 @@ def test_blocksparse_attention_bias_raises_on_xla():
     bias = jnp.zeros((1, 4, 8, 8), dtype=jnp.bfloat16)
     with pytest.raises(EjkernelRuntimeError):
         blocksparse_attention(q_t, k_t, v_t, None, bias, platform="xla")
+
+
+def test_blocksparse_attention_run_forwards_cfg_fwd_and_bwd_params(monkeypatch):
+    kernel = BlockSparseAttention()
+    captured: dict[str, object] = {}
+
+    def _fake_impl(**kwargs):
+        captured.update(kwargs)
+        return jnp.zeros_like(kwargs["query"])
+
+    monkeypatch.setattr(kernel, "get_impl", lambda _cfg: _fake_impl)
+
+    q = jnp.ones((1, 2, 8, 16), dtype=jnp.float32)
+    k = jnp.ones((1, 2, 8, 16), dtype=jnp.float32)
+    v = jnp.ones((1, 2, 8, 16), dtype=jnp.float32)
+
+    fwd_params = FwdParams(q_blocksize=256, kv_blocksize=128, num_stages=2, num_warps=4)
+    bwd_params = BwdParams(q_blocksize=512, kv_blocksize=1024, num_stages=2, num_warps=4)
+    cfg = BlockSparseAttentionConfig(fwd_params=fwd_params, bwd_params=bwd_params, platform="pallas", backend="tpu")
+
+    _ = kernel.run(query=q, key=k, value=v, causal=False, cfg=cfg)
+
+    assert captured["fwd_params"] is fwd_params
+    assert captured["bwd_params"] is bwd_params

@@ -33,6 +33,7 @@ Available Kernels:
 from .all_gather_matmul import all_gather_matmul
 from .blocksparse_attention import blocksparse_attention as blocksparse_attention
 from .flash_attention import flash_attention
+from .flash_mla import flash_mla
 from .grouped_matmul import grouped_matmul
 from .grouped_matmulv2 import grouped_matmulv2
 from .page_attention import page_attention
@@ -48,6 +49,7 @@ __all__ = (
     "all_gather_matmul",
     "blocksparse_attention",
     "flash_attention",
+    "flash_mla",
     "grouped_matmul",
     "grouped_matmulv2",
     "page_attention",

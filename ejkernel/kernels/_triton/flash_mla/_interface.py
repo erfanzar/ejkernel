@@ -79,7 +79,7 @@ Reference:
 
 import jaxtyping
 from beartype import beartype
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Bool, DTypeLike, Float, Int, PRNGKeyArray
 
 from ..._registry import Backend, Platform, kernel_registry
 
@@ -96,6 +96,15 @@ def flash_mla(
     softmax_scale: float | None = None,
     causal: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    attention_mask: Bool[Array, "batch heads_or_1 seq_len kv_len"] | None = None,
+    bias: Float[Array, "batch heads_or_1 seq_len kv_len"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
+    logits_soft_cap: float | None = None,
+    deterministic: bool = True,
+    dropout_rng: PRNGKeyArray | None = None,
+    dropout_prob: float = 0.0,
+    sliding_window: int | tuple[int, int] | None = None,
+    softmax_dtype: DTypeLike | None = None,
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
     """Flash Multi-head Latent Attention (Triton GPU implementation placeholder).
 
@@ -126,6 +135,15 @@ def flash_mla(
         causal: If True, applies causal masking to prevent attending to future tokens.
         cu_seqlens: Cumulative sequence lengths for variable-length batching.
             Shape `[num_seqs + 1]` where each entry marks sequence boundaries.
+        attention_mask: Optional boolean attention mask.
+        bias: Optional additive attention bias.
+        softmax_aux: Optional attention sink logits.
+        logits_soft_cap: Optional tanh soft-cap for logits.
+        deterministic: If True, disables dropout.
+        dropout_rng: Optional PRNG key used for dropout.
+        dropout_prob: Dropout probability for attention weights.
+        sliding_window: Optional sliding-window attention constraint.
+        softmax_dtype: Optional dtype for softmax accumulation.
 
     Returns:
         Attention output of shape `[batch, seq_len, q_heads, v_head_dim]`.

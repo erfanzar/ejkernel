@@ -43,7 +43,7 @@ import os as _os
 _os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 _os.environ.setdefault("CUTE_DSL_ENABLE_TVM_FFI", "1")
 
-__version__ = "0.0.66" # 666 3ta 6 dare baqali sare koche kishmish dare
+__version__ = "0.0.67"
 
 from . import errors, kernels, modules, types, utils, xla_utils
 from .errors import EjkernelRuntimeError
@@ -55,6 +55,7 @@ __all__ = (
     "Backend",
     "EjkernelRuntimeError",
     "Platform",
+    "errors",
     "kernel_registry",
     "kernels",
     "modules",

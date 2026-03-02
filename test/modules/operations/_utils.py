@@ -161,9 +161,19 @@ def dense_attention_reference(
     return out.astype(q.dtype), weights.astype(jnp.float32)
 
 
-def assert_allclose(a: Any, b: Any, *, atol: float, rtol: float = 0.0):
+def assert_allclose(
+    a: Any,
+    b: Any,
+    *,
+    atol: float,
+    rtol: float = 0.0,
+    err_msg: str | None = None,
+):
     a32 = jnp.asarray(a, dtype=jnp.float32)
     b32 = jnp.asarray(b, dtype=jnp.float32)
     if not jnp.allclose(a32, b32, atol=atol, rtol=rtol):
         diff = jnp.max(jnp.abs(a32 - b32))
-        raise AssertionError(f"not allclose: max(|a-b|)={float(diff)} atol={atol} rtol={rtol}")
+        msg = f"not allclose: max(|a-b|)={float(diff)} atol={atol} rtol={rtol}"
+        if err_msg:
+            msg = f"{err_msg}: {msg}"
+        raise AssertionError(msg)

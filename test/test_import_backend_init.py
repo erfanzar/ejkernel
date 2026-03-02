@@ -39,9 +39,6 @@ import pytest  # noqa
 
 
 def test_importing_ejkernel_tree_does_not_trigger_jax_backend_init():
-    if importlib.util.find_spec("jax") is None:
-        pytest.skip("JAX is not installed in this environment.")
-
     script = textwrap.dedent(
         """
         import importlib

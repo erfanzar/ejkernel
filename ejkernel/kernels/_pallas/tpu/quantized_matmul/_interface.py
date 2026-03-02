@@ -62,6 +62,7 @@ from ...._xla.quantized_matmul import quantized_matmul as _xla_quantized_matmul
 from ._pallas_impl_bwd import quantized_matmul_input_grad
 from ._pallas_impl_core import (
     _ceil_div,
+    _get_tpu_version,
     _lcm,
     get_qmm_tpu_path,
     is_packed_tpu_legal_forward,
@@ -153,6 +154,23 @@ def _normalize_tpu_path(path: str | None) -> str:
     """Normalize TPU path selection to packed-only execution."""
     del path
     return "packed"
+
+
+def _should_force_xla_wide_packed_v4(*, bits: int, block_n: int) -> bool:
+    """Return True when TPU v4 packed fused tiles are known to exceed VMEM.
+
+    TPU v4 commonly runs out of VMEM for packed fused QMM when ``block_n`` is
+    256 or larger. In those cases, route to the XLA implementation instead of
+    attempting a packed Pallas compile that deterministically fails.
+    """
+    if bits not in (4, 8):
+        return False
+    if block_n < 256:
+        return False
+    try:
+        return _get_tpu_version() == 4
+    except Exception:
+        return False
 
 
 def _recover_packed_legal_blocks(
@@ -307,6 +325,22 @@ def _operate_impl(
             if rec_legal:
                 fwd_bm, fwd_bn, fwd_bk = rec_bm, rec_bn, rec_bk
                 packed_legal = True
+        if _should_force_xla_wide_packed_v4(bits=bits, block_n=fwd_bn):
+            return _xla_quantized_matmul(
+                x,
+                w,
+                scales,
+                zeros,
+                transpose=transpose,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                block_m=block_m,
+                block_n=block_n,
+                block_k=block_k,
+                use_bf16=compute_in_bf16,
+                allow_dense_fallback=allow_dense_fallback,
+            )
         try:
             return _pallas_qmm_transpose_false(
                 x,
@@ -497,6 +531,24 @@ def _operate_bwd(
     """
     del gemv_mode, revsplit_k, revsplit_k_parts
     w, scales, biases = residual
+    if (not transpose) and _should_force_xla_wide_packed_v4(bits=bits, block_n=block_n):
+        zeros = _biases_to_zeros(scales, biases)
+        grad_x = _xla_quantized_matmul(
+            grad_out,
+            w,
+            scales,
+            zeros,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            use_bf16=True,
+            allow_dense_fallback=allow_dense_fallback,
+        )
+        return grad_x, None, None, None
     path = _normalize_tpu_path(tpu_path if tpu_path is not None else get_qmm_tpu_path())
     packed_legal = False
     if not transpose:
@@ -642,7 +694,7 @@ def quantized_matmul(
                 group_size=group_size, bits=bits,
                 block_m=block_m, block_n=block_n, block_k=block_k,
             )
-            if rec_legal:
+            if rec_legal and not _should_force_xla_wide_packed_v4(bits=bits, block_n=rec_bn):
                 block_m, block_n, block_k = rec_bm, rec_bn, rec_bk
 
     return _operate(

@@ -2805,10 +2805,10 @@ def blocksparse_attention(
         block_q=min(fwd_params.q_blocksize, query_length),
         block_kv_compute=min(fwd_params.kv_blocksize, kv_length),
         block_kv=min(fwd_params.kv_blocksize, kv_length),
-        block_q_dkv=min(bwd_params.kv_blocksize, query_length),
+        block_q_dkv=min(bwd_params.q_blocksize, query_length),
         block_kv_dkv=min(bwd_params.kv_blocksize, kv_length),
         block_kv_dkv_compute=min(bwd_params.kv_blocksize, kv_length),
-        block_q_dq=min(bwd_params.kv_blocksize, query_length),
+        block_q_dq=min(bwd_params.q_blocksize, query_length),
         block_kv_dq=min(bwd_params.kv_blocksize, kv_length),
         use_fused_bwd_kernel=fused_backward,
     )

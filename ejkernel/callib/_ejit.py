@@ -84,7 +84,7 @@ ALLOW_FULL_CACHE = check_bool_flag("ALLOW_FULL_CACHE", False)
 CACHE_DIR = get_cache_dir()
 COMPILE_FUNC_DIR = os.getenv("COMPILE_FUNC_DIR", CACHE_DIR / "ejit_compiled_functions")
 
-if not isinstance(COMPILE_FUNC_DIR, str):
+if not isinstance(COMPILE_FUNC_DIR, str) and hasattr(COMPILE_FUNC_DIR, "mkdir"):
     COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 
 COMPILED_FILE_NAME = "compiled.executable"
@@ -251,36 +251,43 @@ def ejit(
         inline=inline,
         keep_unused=keep_unused,
     )
-    try:
-        func_source = inspect.getsource(func)
-        hardware_sig = _get_hardware_signature()
-        jit_options_sig = str((static_argnums, static_argnames, donate_argnums, in_shardings, out_shardings))
-        static_key_part = "".join([func_source, hardware_sig, jit_options_sig])
-    except Exception as e:
-        warnings.warn(
-            f"Could not create static cache key for ejit function '{func.__name__}'. "
-            f"Falling back to regular jit. Error: {e}",
-            stacklevel=2,
-        )
+    jit_options_sig = str((static_argnums, static_argnames, donate_argnums, in_shardings, out_shardings))
+    static_key_part: str | None = None
+    static_key_disabled = False
 
-        return jitted_function
+    def _resolve_static_key_part() -> str | None:
+        """Lazily resolve cache key components to avoid import-time backend init."""
+        nonlocal static_key_part, static_key_disabled
+        if static_key_disabled:
+            return None
+        if static_key_part is not None:
+            return static_key_part
+        try:
+            func_source = inspect.getsource(func)
+            hardware_sig = _get_hardware_signature()
+            static_key_part = "".join([func_source, hardware_sig, jit_options_sig])
+            return static_key_part
+        except Exception as e:
+            static_key_disabled = True
+            warnings.warn(
+                f"Could not create static cache key for ejit function '{func.__name__}'. "
+                f"Falling back to regular jit. Error: {e}",
+                stacklevel=2,
+            )
+            return None
 
     static_arg_indices = (
         set(static_argnums)
         if isinstance(static_argnums, list | tuple)
-        else {static_argnums}
-        if static_argnums is not None
-        else set()
+        else {static_argnums} if static_argnums is not None else set()
     )
     static_arg_names_set = (
         set(static_argnames)
         if isinstance(static_argnames, list | tuple)
-        else {static_argnames}
-        if static_argnames is not None
-        else set()
+        else {static_argnames} if static_argnames is not None else set()
     )
 
-    def get_compiled_and_cache(args_sig: str, args, kwargs) -> Compiled | None:
+    def get_compiled_and_cache(static_key: str, args_sig: str, args, kwargs) -> Compiled | None:
         """Retrieve or compile a function with the given argument signature.
 
         Handles the cache lookup and compilation "slow path":
@@ -296,7 +303,7 @@ def ejit(
         Returns:
             Compiled function if successful, None otherwise
         """
-        compilation_key = hashlib.md5((static_key_part + args_sig).encode("utf-8")).hexdigest()
+        compilation_key = hashlib.md5((static_key + args_sig).encode("utf-8")).hexdigest()
 
         if compilation_key in COMPILED_CACHE and not RECOMPILE_FORCE:
             return COMPILED_CACHE[compilation_key]
@@ -347,8 +354,11 @@ def ejit(
             The result of calling the compiled (or jitted) function.
         """
         try:
+            local_static_key_part = _resolve_static_key_part()
+            if local_static_key_part is None:
+                return jitted_function(*args, **kwargs)
             args_sig = _get_args_signature(args, kwargs)
-            compiled_func = get_compiled_and_cache(args_sig, args, kwargs)
+            compiled_func = get_compiled_and_cache(local_static_key_part, args_sig, args, kwargs)
 
         except Exception as e:
             warnings.warn(

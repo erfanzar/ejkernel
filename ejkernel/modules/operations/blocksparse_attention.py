@@ -341,6 +341,8 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             sequence_parallelism_mesh_axis_name=sequence_parallelism_mesh_axis_name,
             qkv_layouts=qkv_layouts,
             softmax_scale=softmax_scale,
+            fwd_params=cfg.fwd_params,
+            bwd_params=cfg.bwd_params,
             mask_builder=mask_builder,
             sliding_window=sliding_window,
             chunk_size=chunk_size,

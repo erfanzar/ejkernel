@@ -323,11 +323,6 @@ def test_quantized_matmul_operation_tpu_path_predecode_does_not_force_packed_cfg
     assert seen["cfg"] is None
 
 
-# ---------------------------------------------------------------------------
-# Traced non-affine fused dispatch tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "mode,bits",
     [("nf4", 4), ("mxfp4", 4), ("mxfp8", 8), ("nvfp4", 4), ("nvfp8", 8)],
@@ -408,7 +403,7 @@ def test_packed_legality_auto_recovery_does_not_crash(mode: str, bits: int):
 
 def test_packed_legal_block_n_helper():
     """Unit test for the _packed_legal_block_n heuristic."""
-    from ejkernel.modules.operations.quantized_matmul import _packed_legal_block_n, _lcm
+    from ejkernel.modules.operations.quantized_matmul import _lcm, _packed_legal_block_n
 
     # NF4: bits=4, group_size=64 → n_pad should be picked for N=1024
     align_n = _lcm(128, _lcm(64, 8))  # 128

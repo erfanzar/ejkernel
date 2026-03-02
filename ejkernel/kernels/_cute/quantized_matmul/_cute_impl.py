@@ -657,11 +657,6 @@ def _build_naive_qmm_host_fns(
     return qmm_host_runtime, qmm_host_jax
 
 
-# ---------------------------------------------------------------------------
-# Tiled SMEM kernel builder
-# ---------------------------------------------------------------------------
-
-
 def _build_tiled_qmm_host_fns(
     *,
     mode: str,
@@ -724,7 +719,6 @@ def _build_tiled_qmm_host_fns(
 
     use_nf4_lut = mode.lower() == "nf4"
 
-    # ---- with-bias variant ----
     if with_bias:
 
         @cute.kernel
@@ -937,7 +931,6 @@ def _build_tiled_qmm_host_fns(
 
         return qmm_host_runtime, qmm_host_jax
 
-    # ---- no-bias variant ----
 
     @cute.kernel
     def qmm_tiled_kernel(
@@ -1141,11 +1134,6 @@ def _build_tiled_qmm_host_fns(
         )
 
     return qmm_host_runtime, qmm_host_jax
-
-
-# ---------------------------------------------------------------------------
-# MMA tensor-core kernel builder (Ampere SM80+)
-# ---------------------------------------------------------------------------
 
 
 def _make_mma_smem_layout(
@@ -1597,7 +1585,6 @@ def _build_mma_qmm_host_fns(
 
         return qmm_host_runtime, qmm_host_jax
 
-    # ---- no-bias variant ----
 
     @cute.kernel
     def qmm_mma_kernel(
@@ -1841,11 +1828,6 @@ def _build_mma_qmm_host_fns(
         )
 
     return qmm_host_runtime, qmm_host_jax
-
-
-# ---------------------------------------------------------------------------
-# MMA pipelined kernel builder (cp.async + multi-stage SMEM)
-# ---------------------------------------------------------------------------
 
 
 def _build_mma_pipelined_qmm_host_fns(
@@ -2298,7 +2280,6 @@ def _build_mma_pipelined_qmm_host_fns(
 
         return qmm_host_runtime, qmm_host_jax
 
-    # ---- no-bias variant ----
 
     @cute.kernel
     def qmm_pipe_kernel(
@@ -2660,11 +2641,6 @@ def _build_mma_pipelined_qmm_host_fns(
         )
 
     return qmm_host_runtime, qmm_host_jax
-
-
-# ---------------------------------------------------------------------------
-# Dispatcher: MMA → tiled → naive fallback
-# ---------------------------------------------------------------------------
 
 
 def _build_fused_qmm_host_fns(

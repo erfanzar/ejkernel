@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoski).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,11 @@ Key Features:
 2. On-the-fly projection: Reconstructs K and V using learned projection matrices
 3. RoPE integration: Supports separate RoPE components via b_q/b_k tensors
 4. GQA support: Handles grouped-query attention with kv_heads < q_heads
+5. Attention masking: Boolean mask and additive bias support
+6. Logits soft-capping: Numerical stability via tanh-based capping (Gemma2/3)
+7. Attention sinks: Auxiliary sink logits for StreamingLLM-style patterns
+8. Sliding-window: Local attention for efficient long-context processing
+9. Dropout: Optional attention-weight dropout during training
 
 The attention computation is:
     K = key_value @ w_kc  (project to per-head keys)
@@ -67,7 +72,7 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Bool, DTypeLike, Float, Int, PRNGKeyArray  # noqa: F401
 
 
 def _repeat_kv_for_gqa(x: Array, q_heads: int) -> Array:
@@ -98,6 +103,52 @@ def _repeat_kv_for_gqa(x: Array, q_heads: int) -> Array:
     return jnp.repeat(x, reps, axis=2)
 
 
+def _normalize_softmax_aux(
+    softmax_aux: Array,
+    *,
+    num_heads: int,
+    dtype: jnp.dtype,
+) -> Array:
+    """Normalize softmax_aux into per-head sink logits [num_heads, num_sinks].
+
+    Attention sinks are auxiliary logits that participate in softmax
+    normalization but don't contribute to the output, letting the model
+    absorb probability mass (StreamingLLM-style).
+
+    Args:
+        softmax_aux: Sink logits in one of these formats:
+            - 1D (num_sinks,): Shared across all heads
+            - 1D (num_heads,): Per-head single sink
+            - 2D (num_heads, num_sinks): Per-head multiple sinks
+            - 2D (1, num_sinks): Broadcast across all heads
+        num_heads: Number of attention heads after GQA expansion.
+        dtype: Target dtype for the output tensor.
+
+    Returns:
+        Normalized sink logits with shape [num_heads, num_sinks].
+
+    Raises:
+        ValueError: If softmax_aux has incompatible shape or rank > 2.
+    """
+    aux = jnp.asarray(softmax_aux, dtype=dtype)
+
+    if aux.ndim == 1:
+        if aux.shape[0] == num_heads:
+            return aux[:, None]  # [num_heads, 1]
+        return jnp.broadcast_to(aux[None, :], (num_heads, aux.shape[0]))
+
+    if aux.ndim == 2:
+        if aux.shape[0] == num_heads:
+            return aux
+        if aux.shape[0] == 1:
+            return jnp.broadcast_to(aux, (num_heads, aux.shape[1]))
+        raise ValueError(
+            f"softmax_aux first dim must be 1 or num_heads ({num_heads}); got {aux.shape[0]}."
+        )
+
+    raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}.")
+
+
 def _flash_mla_xla(
     query: Array,
     key_value: Array,
@@ -107,31 +158,55 @@ def _flash_mla_xla(
     b_k: Array | None,
     softmax_scale: float | None,
     causal: bool,
+    attention_mask: Array | None,
+    bias: Array | None,
+    softmax_aux: Array | None,
+    logits_soft_cap: float | None,
+    deterministic: bool,
+    dropout_rng: Array | None,
+    dropout_prob: float,
+    sliding_window: int | tuple[int, int] | None,
+    softmax_dtype: jnp.dtype | None,
 ) -> Array:
     """Core XLA implementation of Flash MLA attention.
 
     Performs the MLA attention computation by:
     1. Projecting compressed key_value to full keys and values
     2. Optionally incorporating RoPE components from b_q/b_k
-    3. Computing scaled dot-product attention with optional causal masking
-    4. Handling GQA by repeating KV heads to match query heads
+    3. Applying logits soft-capping, sliding window, causal and custom masks
+    4. Softmax with optional attention sinks and dropout
+    5. Computing weighted values
 
     Args:
-        query: Query tensor [batch, seq_len, q_heads, q_head_dim]
-        key_value: Compressed KV latent [batch, seq_len, kv_lora_rank]
+        query: Query tensor [batch, seq_q, q_heads, q_head_dim]
+        key_value: Compressed KV latent [batch, kv_len, kv_lora_rank]
         w_kc: Key projection [kv_lora_rank, kv_heads, qk_nope_head_dim]
         w_vc: Value projection [kv_lora_rank, kv_heads, v_head_dim]
-        b_q: Optional query RoPE component [batch, seq_len, qk_rope_head_dim]
-        b_k: Optional key RoPE component [batch, seq_len, qk_rope_head_dim]
+        b_q: Optional query RoPE component [batch, seq_q, qk_rope_head_dim]
+        b_k: Optional key RoPE component [batch, kv_len, qk_rope_head_dim]
         softmax_scale: Attention scale factor. If None, computed from dimensions.
         causal: Apply causal masking if True.
+        attention_mask: Boolean mask [batch, heads_or_1, seq_q, kv_len].
+        bias: Additive bias [batch, heads_or_1, seq_q, kv_len].
+        softmax_aux: Attention sink logits (see _normalize_softmax_aux).
+        logits_soft_cap: Tanh soft-cap value for logits (Gemma2/3).
+        deterministic: Disable dropout when True.
+        dropout_rng: JAX PRNG key for dropout.
+        dropout_prob: Attention-weight dropout probability.
+        sliding_window: Local attention window size or (left, right) tuple.
+        softmax_dtype: Dtype for softmax accumulation; defaults to float32.
 
     Returns:
-        Attention output [batch, seq_len, q_heads, v_head_dim]
+        Attention output [batch, seq_q, q_heads, v_head_dim]
 
     Raises:
         ValueError: On shape mismatches or invalid configurations.
     """
+    if softmax_dtype is None:
+        softmax_dtype = jnp.float32
+    if not deterministic and dropout_prob > 0.0 and dropout_rng is None:
+        raise ValueError("dropout_rng must be provided when deterministic=False and dropout_prob > 0.")
+
     if query.ndim != 4:
         raise ValueError("query must have shape (batch, seq_len, q_heads, head_dim).")
     if key_value.ndim != 3:
@@ -191,39 +266,51 @@ def _flash_mla_xla(
                     f"Got query head_dim={q_dim}, expected {d_nope}."
                 )
 
-    q_f32 = query.astype(jnp.float32)
-    kv_f32 = key_value.astype(jnp.float32)
-    w_kc_f32 = w_kc.astype(jnp.float32)
-    w_vc_f32 = w_vc.astype(jnp.float32)
+    q_f = query.astype(jnp.float32)
+    kv_f = key_value.astype(jnp.float32)
+    w_kc_f = w_kc.astype(jnp.float32)
+    w_vc_f = w_vc.astype(jnp.float32)
 
-    k_nope = jnp.einsum("btr,rhd->bthd", kv_f32, w_kc_f32, optimize=True)
-    v = jnp.einsum("btr,rhd->bthd", kv_f32, w_vc_f32, optimize=True)
+    k_nope = jnp.einsum("btr,rhd->bthd", kv_f, w_kc_f, optimize=True)
+    v = jnp.einsum("btr,rhd->bthd", kv_f, w_vc_f, optimize=True)
 
     k_nope = _repeat_kv_for_gqa(k_nope, q_heads)
     v = _repeat_kv_for_gqa(v, q_heads)
 
+    # logits: [batch, q_heads, seq_q, seq_k]
     if b_k is None:
-        logits = jnp.einsum("bqhd,bkhd->bhqk", q_f32, k_nope, optimize=True)
+        logits = jnp.einsum("bqhd,bkhd->bhqk", q_f, k_nope, optimize=True)
         d_scale = float(d_nope)
     elif b_q is None:
         rope_dim = int(b_k.shape[2])
-        q_nope = q_f32[..., :d_nope]
-        q_rope = q_f32[..., d_nope : d_nope + rope_dim]
+        q_nope = q_f[..., :d_nope]
+        q_rope = q_f[..., d_nope : d_nope + rope_dim]
         logits_nope = jnp.einsum("bqhd,bkhd->bhqk", q_nope, k_nope, optimize=True)
         logits_rope = jnp.einsum("bqhd,bkd->bhqk", q_rope, b_k.astype(jnp.float32), optimize=True)
         logits = logits_nope + logits_rope
         d_scale = float(d_nope + rope_dim)
     else:
-        logits_nope = jnp.einsum("bqhd,bkhd->bhqk", q_f32, k_nope, optimize=True)
+        logits_nope = jnp.einsum("bqhd,bkhd->bhqk", q_f, k_nope, optimize=True)
         logits_rope = jnp.einsum("bqd,bkd->bqk", b_q.astype(jnp.float32), b_k.astype(jnp.float32), optimize=True)
         logits = logits_nope + logits_rope[:, None, :, :]
         d_scale = float(d_nope + int(b_k.shape[2]))
 
-    if softmax_scale is None:
-        scale = float(1.0 / math.sqrt(d_scale))
-    else:
-        scale = float(softmax_scale)
+    scale = float(1.0 / math.sqrt(d_scale)) if softmax_scale is None else float(softmax_scale)
     logits = logits * jnp.asarray(scale, dtype=jnp.float32)
+
+    if logits_soft_cap is not None:
+        logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
+
+    if sliding_window is not None:
+        left_w, right_w = (
+            (sliding_window, sliding_window)
+            if isinstance(sliding_window, int)
+            else sliding_window
+        )
+        q_pos = jnp.arange(seq_len_q)[:, None]
+        k_pos = jnp.arange(seq_len_k)[None, :]
+        win_mask = (k_pos >= q_pos - left_w) & (k_pos <= q_pos + right_w)
+        logits = jnp.where(win_mask[None, None, :, :], logits, jnp.finfo(logits.dtype).min)
 
     if causal:
         q_idx = jnp.arange(seq_len_q)[:, None]
@@ -231,7 +318,30 @@ def _flash_mla_xla(
         causal_mask = k_idx <= q_idx
         logits = jnp.where(causal_mask[None, None, :, :], logits, jnp.finfo(logits.dtype).min)
 
-    weights = jax.nn.softmax(logits, axis=-1)
+    if bias is not None:
+        logits = logits + bias.astype(jnp.float32)
+    elif attention_mask is not None:
+        if attention_mask.dtype != jnp.bool_:
+            attention_mask = attention_mask.astype(jnp.bool_)
+        logits = jnp.where(attention_mask, logits, jnp.finfo(logits.dtype).min)
+
+    if softmax_aux is not None:
+        aux = _normalize_softmax_aux(softmax_aux, num_heads=q_heads, dtype=jnp.float32)
+        # aux: [q_heads, n_sinks] → broadcast to [batch, q_heads, seq_q, n_sinks]
+        sinks = jnp.broadcast_to(aux[None, :, None, :], (batch, q_heads, seq_len_q, aux.shape[-1]))
+        combined = jnp.concatenate([logits, sinks], axis=-1)
+        combined = combined.astype(softmax_dtype)
+        combined = combined - jnp.max(combined, axis=-1, keepdims=True)
+        probs = jax.nn.softmax(combined, axis=-1).astype(jnp.float32)
+        weights = probs[..., :seq_len_k]
+    else:
+        weights = jax.nn.softmax(logits.astype(softmax_dtype), axis=-1).astype(jnp.float32)
+
+    if not deterministic and dropout_prob > 0.0:
+        keep_prob = 1.0 - dropout_prob
+        keep = jax.random.bernoulli(dropout_rng, keep_prob, weights.shape[-2:])
+        weights = weights * (keep.astype(jnp.float32) / float(keep_prob))
+
     out = jnp.einsum("bhqk,bkhd->bqhd", weights, v, optimize=True)
     return out.astype(query.dtype)
 
@@ -246,6 +356,15 @@ def flash_mla(
     softmax_scale: float | None = None,
     causal: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    attention_mask: Float[Array, "batch heads_or_1 seq_len kv_len"] | None = None,
+    bias: Float[Array, "batch heads_or_1 seq_len kv_len"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
+    logits_soft_cap: float | None = None,
+    deterministic: bool = True,
+    dropout_rng: PRNGKeyArray | None = None,
+    dropout_prob: float = 0.0,
+    sliding_window: int | tuple[int, int] | None = None,
+    softmax_dtype: DTypeLike | None = None,
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
     """Flash Multi-head Latent Attention (MLA) using XLA backend.
 
@@ -286,6 +405,29 @@ def flash_mla(
         causal: Whether to apply causal masking for autoregressive attention.
         cu_seqlens: Cumulative sequence lengths for packed variable-length
             sequences. Currently not supported in XLA implementation.
+        attention_mask: Optional boolean attention mask.
+            Shape: [batch, 1 or q_heads, seq_len, kv_len].
+            True = attend, False = ignore.  Ignored when ``bias`` is provided.
+        bias: Optional additive attention bias (e.g. ALiBi, RPE).
+            Shape: [batch, 1 or q_heads, seq_len, kv_len].
+            Takes precedence over ``attention_mask``.
+        softmax_aux: Optional attention sink logits for StreamingLLM-style
+            patterns.  Supported shapes:
+            - [num_sinks]: Shared across all heads
+            - [q_heads]: One sink per head
+            - [q_heads, num_sinks]: Multiple sinks per head
+            These logits participate in softmax but don't contribute to output.
+        logits_soft_cap: Optional float for capping attention logits via tanh:
+            ``cap * tanh(logits / cap)``.  Prevents score explosion (Gemma2/3).
+        deterministic: If True, disables dropout (default).
+        dropout_rng: JAX PRNG key for dropout.  Required when
+            ``deterministic=False`` and ``dropout_prob > 0``.
+        dropout_prob: Dropout probability applied to attention weights.
+        sliding_window: Optional sliding window attention constraint.
+            - int: Symmetric window of that radius
+            - (left, right): Asymmetric window
+        softmax_dtype: Dtype for softmax accumulation.  Defaults to float32
+            for numerical stability.
 
     Returns:
         Attention output tensor.
@@ -317,11 +459,11 @@ def flash_mla(
         >>> output.shape
         (2, 1024, 32, 64)
         >>>
-        >>> # With RoPE
-        >>> rope_dim = 32
-        >>> query_with_rope = jnp.ones((batch, seq_len, q_heads, head_dim + rope_dim))
-        >>> b_k = jnp.ones((batch, seq_len, rope_dim))
-        >>> output = flash_mla(query_with_rope, key_value, w_kc, w_vc, b_k=b_k, causal=True)
+        >>> # With logits soft cap and sliding window
+        >>> output = flash_mla(
+        ...     query, key_value, w_kc, w_vc,
+        ...     causal=True, logits_soft_cap=50.0, sliding_window=256,
+        ... )
     """
     if cu_seqlens is not None:
         raise NotImplementedError("cu_seqlens is not supported for XLA flash_mla yet.")
@@ -334,4 +476,13 @@ def flash_mla(
         b_k=b_k,
         softmax_scale=softmax_scale,
         causal=causal,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_aux=softmax_aux,
+        logits_soft_cap=logits_soft_cap,
+        deterministic=deterministic,
+        dropout_rng=dropout_rng,
+        dropout_prob=dropout_prob,
+        sliding_window=sliding_window,
+        softmax_dtype=softmax_dtype,
     )

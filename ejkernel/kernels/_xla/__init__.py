@@ -29,6 +29,7 @@ Available Operations:
     Attention Mechanisms:
         - attention: Standard multi-head attention
         - flash_attention: Memory-efficient attention with tiling
+        - flash_mla: Multi-head Latent Attention (MLA)
         - blocksparse_attention: Block-sparse attention patterns
         - native_sparse_attention: Sparse attention with flexible patterns
         - ring_attention: Distributed ring attention for long sequences

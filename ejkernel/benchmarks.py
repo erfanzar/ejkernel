@@ -67,12 +67,30 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-from rich import box
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
-from rich.table import Table
-from rich.text import Text
+
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+    from rich.table import Table
+    from rich.text import Text
+except ImportError:  # pragma: no cover
+    box = None  # type:ignore[assignment]
+
+    class _NoRich:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("rich is required for ejkernel.benchmarks rendering utilities.")
+
+    Console = _NoRich  # type:ignore[assignment]
+    Panel = _NoRich  # type:ignore[assignment]
+    Progress = _NoRich  # type:ignore[assignment]
+    SpinnerColumn = _NoRich  # type:ignore[assignment]
+    BarColumn = _NoRich  # type:ignore[assignment]
+    TaskProgressColumn = _NoRich  # type:ignore[assignment]
+    TextColumn = _NoRich  # type:ignore[assignment]
+    Table = _NoRich  # type:ignore[assignment]
+    Text = _NoRich  # type:ignore[assignment]
 
 try:
     import matplotlib.patches as mpatches  # type:ignore

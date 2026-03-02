@@ -72,7 +72,7 @@ from __future__ import annotations
 import os
 from typing import Literal
 
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Bool, DTypeLike, Float, Int, PRNGKeyArray
 
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
@@ -144,6 +144,15 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
         softmax_scale: float | None = None,
         causal: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+        attention_mask: Bool[Array, "batch heads_or_1 seq_len kv_len"] | None = None,
+        bias: Float[Array, "batch heads_or_1 seq_len kv_len"] | None = None,
+        softmax_aux: Float[Array, "..."] | None = None,
+        logits_soft_cap: float | None = None,
+        deterministic: bool = True,
+        dropout_rng: PRNGKeyArray | None = None,
+        dropout_prob: float = 0.0,
+        sliding_window: int | tuple[int, int] | None = None,
+        softmax_dtype: DTypeLike | None = None,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         *,
         cfg: FlashMLAConfig,
@@ -160,15 +169,20 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
             softmax_scale: Optional scaling factor for attention scores
             causal: Whether to apply causal masking (default: False)
             cu_seqlens: Cumulative sequence lengths for variable-length sequences
+            attention_mask: Optional boolean mask [batch, 1/heads, seq_len, kv_len]
+            bias: Optional additive attention bias [batch, 1/heads, seq_len, kv_len]
+            softmax_aux: Optional attention sink logits
+            logits_soft_cap: Optional logits capping via tanh
+            deterministic: If True, disables dropout (default: True)
+            dropout_rng: JAX PRNG key for dropout
+            dropout_prob: Dropout probability (default: 0.0)
+            sliding_window: Optional sliding window constraint
+            softmax_dtype: Dtype for softmax accumulation
             platform: Optional platform override ("triton", "pallas", "cuda", "xla")
             cfg: Kernel configuration object
 
         Returns:
             Attention output [batch, seq_len, q_heads, head_dim]
-
-        Note:
-            The kv_lora_rank determines the compression ratio. Lower ranks
-            save more memory but may reduce quality. Typical values: 64-256.
         """
 
         if platform is not None:
@@ -191,6 +205,15 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
             softmax_scale=softmax_scale,
             causal=causal,
             cu_seqlens=cu_seqlens,
+            attention_mask=attention_mask,
+            bias=bias,
+            softmax_aux=softmax_aux,
+            logits_soft_cap=logits_soft_cap,
+            deterministic=deterministic,
+            dropout_rng=dropout_rng,
+            dropout_prob=dropout_prob,
+            sliding_window=sliding_window,
+            softmax_dtype=softmax_dtype,
         )
 
     def heuristic_cfg(self, inv: Invocation[FlashMLAConfig, Array]) -> FlashMLAConfig:
@@ -273,6 +296,15 @@ def flash_mla(
     *,
     softmax_scale: float | None = None,
     causal: bool = False,
+    attention_mask: Bool[Array, "batch heads_or_1 seq_len kv_len"] | None = None,
+    bias: Float[Array, "batch heads_or_1 seq_len kv_len"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
+    logits_soft_cap: float | None = None,
+    deterministic: bool = True,
+    dropout_rng: PRNGKeyArray | None = None,
+    dropout_prob: float = 0.0,
+    sliding_window: int | tuple[int, int] | None = None,
+    softmax_dtype: DTypeLike | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: FlashMLAConfig | None = None,
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
@@ -293,6 +325,15 @@ def flash_mla(
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
         softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
         causal: Whether to apply causal masking (default: False)
+        attention_mask: Optional boolean mask [batch, 1/heads, seq_len, kv_len]
+        bias: Optional additive attention bias [batch, 1/heads, seq_len, kv_len]
+        softmax_aux: Optional attention sink logits
+        logits_soft_cap: Optional logits capping via tanh
+        deterministic: If True, disables dropout (default: True)
+        dropout_rng: JAX PRNG key for dropout
+        dropout_prob: Dropout probability (default: 0.0)
+        sliding_window: Optional sliding window constraint
+        softmax_dtype: Dtype for softmax accumulation
         platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
         cfg: Optional configuration override
 
@@ -314,9 +355,13 @@ def flash_mla(
         ...     causal=True,
         ... )
 
-    Note:
-        The kv_lora_rank determines the compression ratio. Lower ranks
-        save more memory but may reduce quality. Typical values: 64-256.
+        >>> # With attention mask and sliding window
+        >>> output = flash_mla(
+        ...     query, key_value, w_kc, w_vc,
+        ...     causal=True,
+        ...     logits_soft_cap=50.0,
+        ...     sliding_window=256,
+        ... )
     """
     return _mla_executor(
         FlashMLA(),
@@ -329,6 +374,15 @@ def flash_mla(
         softmax_scale=softmax_scale,
         causal=causal,
         cu_seqlens=cu_seqlens,
+        attention_mask=attention_mask,
+        bias=bias,
+        softmax_aux=softmax_aux,
+        logits_soft_cap=logits_soft_cap,
+        deterministic=deterministic,
+        dropout_rng=dropout_rng,
+        dropout_prob=dropout_prob,
+        sliding_window=sliding_window,
+        softmax_dtype=softmax_dtype,
         platform=platform,
         _cfg=cfg,
     )
