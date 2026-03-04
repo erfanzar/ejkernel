@@ -136,14 +136,14 @@ def test_quantized_matmul_cuda_matches_xla(mode: str, group_size: int, x_dtype: 
         # magnitude outputs differ by 1-2 ULPs of the compute dtype (covered by
         # rtol).  Empirical worst-case (k=8192): fp16→0.26, bf16→0.48, fp32→0.28.
         if x_dtype == jnp.float16:
-            rtol = 3e-3   # ~3 fp16 ULPs relative for large-magnitude elements
-            atol = 0.30   # near-zero cancellation ceiling for k ≤ 8192
+            rtol = 3e-3  # ~3 fp16 ULPs relative for large-magnitude elements
+            atol = 0.30  # near-zero cancellation ceiling for k ≤ 8192
         elif x_dtype == jnp.bfloat16:
-            rtol = 2e-2   # ~3 bf16 ULPs relative for large-magnitude elements
-            atol = 0.55   # near-zero cancellation ceiling for k ≤ 8192
+            rtol = 2e-2  # ~3 bf16 ULPs relative for large-magnitude elements
+            atol = 0.55  # near-zero cancellation ceiling for k ≤ 8192
         else:  # float32 (both CUDA & XLA use fp16/TF32 precision internally)
             rtol = 5e-3
-            atol = 0.32   # near-zero cancellation ceiling for k ≤ 8192
+            atol = 0.32  # near-zero cancellation ceiling for k ≤ 8192
     np.testing.assert_allclose(
         np.asarray(out_cuda, dtype=np.float32),
         np.asarray(out_xla, dtype=np.float32),

@@ -345,9 +345,16 @@ def test_non_affine_traced_uses_fused_pallas_not_xla(mode: str, bits: int):
 
     # Reference: unfused XLA path
     out_ref = quantized_matmul(
-        x, w_q, scales, zeros,
-        transpose=False, mode=mode, bits=bits,
-        platform="xla", fuse=False, use_best_config=False,
+        x,
+        w_q,
+        scales,
+        zeros,
+        transpose=False,
+        mode=mode,
+        bits=bits,
+        platform="xla",
+        fuse=False,
+        use_best_config=False,
     )
 
     # Under jax.jit with use_best_config=True — should route through
@@ -355,8 +362,13 @@ def test_non_affine_traced_uses_fused_pallas_not_xla(mode: str, bits: int):
     @jax.jit
     def fn(xi, wi, si):
         return quantized_matmul(
-            xi, wi, si, None,
-            transpose=False, mode=mode, bits=bits,
+            xi,
+            wi,
+            si,
+            None,
+            transpose=False,
+            mode=mode,
+            bits=bits,
             use_best_config=True,
         )
 
@@ -386,13 +398,23 @@ def test_packed_legality_auto_recovery_does_not_crash(mode: str, bits: int):
 
     # Intentionally illegal block_n=128 for packed path
     illegal_cfg = QuantizedMatmulConfig(
-        block_m=128, block_n=128, block_k=128,
-        tpu_path="packed", platform="pallas", backend="tpu",
+        block_m=128,
+        block_n=128,
+        block_k=128,
+        tpu_path="packed",
+        platform="pallas",
+        backend="tpu",
     )
     out = quantized_matmul(
-        x, w_q, scales, None,
-        transpose=False, mode=mode, bits=bits,
-        platform="pallas", tpu_path="packed",
+        x,
+        w_q,
+        scales,
+        None,
+        transpose=False,
+        mode=mode,
+        bits=bits,
+        platform="pallas",
+        tpu_path="packed",
         allow_dense_fallback=True,
         cfg=illegal_cfg,
     )

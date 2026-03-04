@@ -120,9 +120,9 @@ def _ssm1_fwd(
     # dB * x = (dt * B) * x
     # dt: [batch, seq_len, d], B: [batch, seq_len, n]
     # Result: [batch, seq_len, d, n]
-    discrete_Bx = (
-        dt[:, :, :, None] * B[:, None, :, :].swapaxes(1, 2) * hidden_states[:, :, :, None]
-    ).astype(state_dtype)
+    discrete_Bx = (dt[:, :, :, None] * B[:, None, :, :].swapaxes(1, 2) * hidden_states[:, :, :, None]).astype(
+        state_dtype
+    )
 
     def process_batch(x_b, dA_b, dBx_b, C_b, h0):
         """Process a single batch element through the SSM1 recurrence.

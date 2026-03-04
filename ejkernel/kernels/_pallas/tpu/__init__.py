@@ -21,6 +21,7 @@ High Bandwidth Memory (HBM) for efficient execution.
 
 Available Kernels:
     - flash_attention: Memory-efficient exact attention
+    - multi_latent_ragged_page_attention: MLA ragged paged attention
     - blocksparse_attention: Block-sparse attention patterns
     - ring_attention: Distributed attention across devices
     - page_attention: Paged KV cache attention
@@ -36,6 +37,9 @@ from .flash_attention import flash_attention
 from .flash_mla import flash_mla
 from .grouped_matmul import grouped_matmul
 from .grouped_matmulv2 import grouped_matmulv2
+from .multi_latent_ragged_page_attention import (
+    multi_latent_ragged_page_attention,
+)
 from .page_attention import page_attention
 from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
@@ -52,6 +56,7 @@ __all__ = (
     "flash_mla",
     "grouped_matmul",
     "grouped_matmulv2",
+    "multi_latent_ragged_page_attention",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",

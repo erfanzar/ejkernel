@@ -105,50 +105,38 @@ def test_qmm_strict_fuse_gpu_parity_budgets():
                     assert bool(jnp.all(jnp.isfinite(zeros.astype(jnp.float32))))
 
                 fn_ref = jax.jit(
-                    lambda xi,
-                    wi,
-                    si,
-                    zi,
-                    mode=mode,
-                    bits=bits,
-                    group_size=group_size,
-                    axis=axis,
-                    transpose=transpose: quantized_matmul(
-                        xi,
-                        wi,
-                        si,
-                        zi,
-                        mode=mode,
-                        bits=bits,
-                        group_size=group_size,
-                        axis=axis,
-                        transpose=transpose,
-                        platform="xla",
-                        fuse=False,
+                    lambda xi, wi, si, zi, mode=mode, bits=bits, group_size=group_size, axis=axis, transpose=transpose: (
+                        quantized_matmul(
+                            xi,
+                            wi,
+                            si,
+                            zi,
+                            mode=mode,
+                            bits=bits,
+                            group_size=group_size,
+                            axis=axis,
+                            transpose=transpose,
+                            platform="xla",
+                            fuse=False,
+                        )
                     )
                 )
                 fn_fused = jax.jit(
-                    lambda xi,
-                    wi,
-                    si,
-                    zi,
-                    mode=mode,
-                    bits=bits,
-                    group_size=group_size,
-                    axis=axis,
-                    transpose=transpose: quantized_matmul(
-                        xi,
-                        wi,
-                        si,
-                        zi,
-                        mode=mode,
-                        bits=bits,
-                        group_size=group_size,
-                        axis=axis,
-                        transpose=transpose,
-                        platform="xla",
-                        fuse=True,
-                        strict_fuse=True,
+                    lambda xi, wi, si, zi, mode=mode, bits=bits, group_size=group_size, axis=axis, transpose=transpose: (
+                        quantized_matmul(
+                            xi,
+                            wi,
+                            si,
+                            zi,
+                            mode=mode,
+                            bits=bits,
+                            group_size=group_size,
+                            axis=axis,
+                            transpose=transpose,
+                            platform="xla",
+                            fuse=True,
+                            strict_fuse=True,
+                        )
                     )
                 )
 

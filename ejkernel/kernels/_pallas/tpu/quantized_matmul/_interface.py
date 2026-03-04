@@ -205,9 +205,14 @@ def _recover_packed_legal_blocks(
     bm = max(8, _ceil_div(bm, 8) * 8)
     bk = max(128, _ceil_div(block_k, 128) * 128)
     legal = is_packed_tpu_legal_forward(
-        x, w_q, scales,
-        group_size=group_size, bits=bits,
-        block_m=bm, block_n=n_pad, block_k=bk,
+        x,
+        w_q,
+        scales,
+        group_size=group_size,
+        bits=bits,
+        block_m=bm,
+        block_n=n_pad,
+        block_k=bk,
     )
     return bm, n_pad, bk, bool(legal)
 
@@ -318,9 +323,14 @@ def _operate_impl(
         if not packed_legal:
             # Auto-recover: try n_pad as block_n which is always packed-legal.
             rec_bm, rec_bn, rec_bk, rec_legal = _recover_packed_legal_blocks(
-                x, w, scales,
-                group_size=group_size, bits=bits,
-                block_m=block_m, block_n=block_n, block_k=block_k,
+                x,
+                w,
+                scales,
+                group_size=group_size,
+                bits=bits,
+                block_m=block_m,
+                block_n=block_n,
+                block_k=block_k,
             )
             if rec_legal:
                 fwd_bm, fwd_bn, fwd_bk = rec_bm, rec_bn, rec_bk
@@ -685,14 +695,24 @@ def quantized_matmul(
     # QuantizedMatmul.run() normalization.
     if not transpose and bits in (4, 8):
         if not is_packed_tpu_legal_forward(
-            x, w, scales,
-            group_size=group_size, bits=bits,
-            block_m=block_m, block_n=block_n, block_k=block_k,
+            x,
+            w,
+            scales,
+            group_size=group_size,
+            bits=bits,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
         ):
             rec_bm, rec_bn, rec_bk, rec_legal = _recover_packed_legal_blocks(
-                x, w, scales,
-                group_size=group_size, bits=bits,
-                block_m=block_m, block_n=block_n, block_k=block_k,
+                x,
+                w,
+                scales,
+                group_size=group_size,
+                bits=bits,
+                block_m=block_m,
+                block_n=block_n,
+                block_k=block_k,
             )
             if rec_legal and not _should_force_xla_wide_packed_v4(bits=bits, block_n=rec_bn):
                 block_m, block_n, block_k = rec_bm, rec_bn, rec_bk

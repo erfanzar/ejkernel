@@ -99,9 +99,7 @@ def flash_mla(
     if dropout_rng is not None:
         reasons.append("dropout_rng is not supported")
     if reasons:
-        raise EjkernelRuntimeError(
-            "flash_mla (platform=pallas/tpu): " + "; ".join(reasons)
-        )
+        raise EjkernelRuntimeError("flash_mla (platform=pallas/tpu): " + "; ".join(reasons))
     del cu_seqlens, softmax_aux, dropout_rng, dropout_prob, deterministic, softmax_dtype
 
     window_tuple: tuple[int, int] | None = None
@@ -122,58 +120,38 @@ def flash_mla(
     batch, seq_q, q_heads, q_head_dim = query.shape
     batch_kv, kv_len, kv_lora_rank = key_value.shape
     if batch_kv != batch:
-        raise ValueError(
-            f"batch mismatch: query batch={batch} key_value batch={batch_kv}."
-        )
+        raise ValueError(f"batch mismatch: query batch={batch} key_value batch={batch_kv}.")
     if kv_len != seq_q:
-        raise ValueError(
-            f"seq_len mismatch: query={seq_q} key_value={kv_len}."
-        )
+        raise ValueError(f"seq_len mismatch: query={seq_q} key_value={kv_len}.")
     if w_kc.shape[0] != kv_lora_rank or w_vc.shape[0] != kv_lora_rank:
-        raise ValueError(
-            f"kv_lora_rank mismatch: kv={kv_lora_rank} "
-            f"w_kc[0]={w_kc.shape[0]} w_vc[0]={w_vc.shape[0]}."
-        )
+        raise ValueError(f"kv_lora_rank mismatch: kv={kv_lora_rank} w_kc[0]={w_kc.shape[0]} w_vc[0]={w_vc.shape[0]}.")
     kv_heads = int(w_kc.shape[1])
     if int(w_vc.shape[1]) != kv_heads:
-        raise ValueError(
-            f"kv_heads mismatch: w_kc={kv_heads} w_vc={w_vc.shape[1]}."
-        )
+        raise ValueError(f"kv_heads mismatch: w_kc={kv_heads} w_vc={w_vc.shape[1]}.")
     if q_heads % kv_heads != 0:
-        raise ValueError(
-            f"q_heads ({q_heads}) must be divisible by kv_heads ({kv_heads})."
-        )
+        raise ValueError(f"q_heads ({q_heads}) must be divisible by kv_heads ({kv_heads}).")
     d_nope = int(w_kc.shape[2])
 
     if b_k is None:
         rope_mode = ROPE_NONE
         if q_head_dim != d_nope:
-            raise ValueError(
-                f"No RoPE: query head_dim ({q_head_dim}) must equal "
-                f"w_kc head_dim ({d_nope})."
-            )
+            raise ValueError(f"No RoPE: query head_dim ({q_head_dim}) must equal w_kc head_dim ({d_nope}).")
         effective_dim = d_nope
     elif b_q is None:
         rope_mode = ROPE_FUSED
         rope_dim = int(b_k.shape[2])
         if q_head_dim != d_nope + rope_dim:
             raise ValueError(
-                f"Fused RoPE: query head_dim ({q_head_dim}) must equal "
-                f"d_nope+rope_dim ({d_nope + rope_dim})."
+                f"Fused RoPE: query head_dim ({q_head_dim}) must equal d_nope+rope_dim ({d_nope + rope_dim})."
             )
         effective_dim = d_nope + rope_dim
     else:
         rope_mode = ROPE_DECOUPLED
         rope_dim = int(b_k.shape[2])
         if b_q.shape[2] != rope_dim:
-            raise ValueError(
-                f"b_q/b_k rope_dim mismatch: {b_q.shape[2]} vs {rope_dim}."
-            )
+            raise ValueError(f"b_q/b_k rope_dim mismatch: {b_q.shape[2]} vs {rope_dim}.")
         if q_head_dim != d_nope:
-            raise ValueError(
-                f"Decoupled RoPE: query head_dim ({q_head_dim}) must equal "
-                f"d_nope ({d_nope})."
-            )
+            raise ValueError(f"Decoupled RoPE: query head_dim ({q_head_dim}) must equal d_nope ({d_nope}).")
         effective_dim = d_nope + rope_dim
 
     if softmax_scale is None:

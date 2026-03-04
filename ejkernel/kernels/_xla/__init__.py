@@ -38,11 +38,13 @@ Available Operations:
 
     Page/Serving Attention:
         - page_attention: Paged KV-cache attention
+        - multi_latent_ragged_page_attention: MLA ragged paged attention
         - ragged_page_attention_v2/v3: Variable-length page attention
         - ragged_decode_attention: Decode-phase attention
 
     Linear/Recurrent Attention:
         - recurrent_gla: Gated linear attention (recurrent form)
+        - gated_delta_rule: Gated delta rule linear attention
         - lightning_attn: Lightning attention with decay
         - recurrent: General recurrent attention mechanism
         - kernel_delta_attention: Delta-rule linear attention
@@ -68,11 +70,13 @@ from .chunked_prefill_paged_decode import chunked_prefill_paged_decode
 from .decode_attention import decode_attention
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
+from .gated_delta_rule import gated_delta_rule
 from .gla import recurrent_gla
 from .grouped_matmul import grouped_matmul
 from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
 from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
+from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .native_sparse_attention import apply_native_sparse_attention
 from .page_attention import page_attention
 from .prefill_page_attention import prefill_page_attention
@@ -100,12 +104,14 @@ __all__ = [
     "decode_attention",
     "flash_attention",
     "flash_mla",
+    "gated_delta_rule",
     "grouped_matmul",
     "kda",
     "kda_decay",
     "kernel_delta_attention",
     "lightning_attn",
     "mean_pooling",
+    "multi_latent_ragged_page_attention",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",

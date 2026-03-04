@@ -57,7 +57,8 @@ Example:
 """
 
 import hashlib
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 from ejkernel.ops import BwdParams, FwdParams
@@ -137,6 +138,24 @@ class BaseOperationConfig:
     backend: str = "any"
 
     __hash__ = hash_fn
+
+    def to_dict(self) -> dict:
+        """Serialize this config to a plain dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Deserialize a config from a plain dictionary."""
+        return cls(**data)
+
+    def to_json(self) -> str:
+        """Serialize this config to a JSON string."""
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, s: str):
+        """Deserialize a config from a JSON string."""
+        return cls.from_dict(json.loads(s))
 
 
 @dataclass
@@ -533,6 +552,31 @@ class RaggedPageAttentionv3Config(BaseOperationConfig):
 
 
 @dataclass
+class MultiLatentRaggedPageAttentionConfig(BaseOperationConfig):
+    """Configuration for Multi-Latent Ragged Page Attention.
+
+    Args:
+        chunk_prefill_size: Optional chunk size for prefill sequences.
+        num_kv_pages_per_block: KV pages per kernel block (None = auto).
+        num_queries_per_block: Queries per kernel block (None = auto).
+        vmem_limit_bytes: Optional TPU VMEM hint for Pallas backend.
+        num_warps: Kept for API consistency (unused on XLA/Pallas paths).
+        num_stages: Kept for API consistency (unused on XLA/Pallas paths).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: \"any\").
+    """
+
+    chunk_prefill_size: int | None = None
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    vmem_limit_bytes: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class GLAttentionConfig(BaseOperationConfig):
     """Configuration for Gated Linear Attention operation.
 
@@ -591,6 +635,27 @@ class KernelDeltaAttentionConfig(BaseOperationConfig):
     """
 
     pass
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class GatedDeltaRuleConfig(BaseOperationConfig):
+    """Configuration for Gated Delta Rule (GDR) operation.
+
+    The primary tunable parameter is ``chunk_size``, which controls the
+    trade-off between intra-chunk parallelism and inter-chunk state
+    propagation overhead.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+        chunk_size: Chunk size for the chunked forward pass (default: 64).
+            Larger chunks increase parallelism but also increase memory for
+            intra-chunk attention matrices. Typical values: 32, 64, 128.
+    """
+
+    chunk_size: int = 64
 
     __hash__ = hash_fn
 

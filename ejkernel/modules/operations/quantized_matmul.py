@@ -1619,9 +1619,7 @@ def quantized_matmul(
     runtime_axis, runtime_transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
     use_best_config_n = _static_bool(use_best_config, "use_best_config")
     weights_concrete = (
-        not _is_tracer_value(w)
-        and not _is_tracer_value(scales)
-        and (zeros is None or not _is_tracer_value(zeros))
+        not _is_tracer_value(w) and not _is_tracer_value(scales) and (zeros is None or not _is_tracer_value(zeros))
     )
 
     try:
@@ -1673,9 +1671,7 @@ def quantized_matmul(
     if tpu_path is not None:
         tpu_path_n = str(tpu_path).strip().lower()
         if tpu_path_n not in {"hybrid", "packed", "predecode"}:
-            raise ValueError(
-                f"tpu_path must be one of {{'hybrid','packed','predecode'}}, got {tpu_path!r}."
-            )
+            raise ValueError(f"tpu_path must be one of {{'hybrid','packed','predecode'}}, got {tpu_path!r}.")
         tpu_strategy_override = "predecode_once" if tpu_path_n in {"hybrid", "predecode"} else "packed"
         # Kernel-level tpu_path is packed-only. Preserve predecode/hybrid as
         # strategy overrides at this wrapper level; only force cfg.tpu_path

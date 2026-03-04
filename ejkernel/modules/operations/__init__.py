@@ -48,6 +48,7 @@ State Space Models:
 Additional Operations:
     - GroupedMatmul: Efficient grouped matrix multiplication (for MoE)
     - MeanPooling: Sequence mean pooling operation
+    - MultiLatentRaggedPageAttention: MLA ragged paged attention
     - QuantizedMatmul: Packed uint32 quantized matmul
 
 Features:
@@ -97,11 +98,13 @@ from .configs import (
     DecodeAttentionConfig,
     FlashAttentionConfig,
     FlashMLAConfig,
+    GatedDeltaRuleConfig,
     GLAttentionConfig,
     GroupedMatmulConfig,
     KernelDeltaAttentionConfig,
     LightningAttentionConfig,
     MeanPoolingConfig,
+    MultiLatentRaggedPageAttentionConfig,
     NativeSparseAttentionConfig,
     PageAttentionConfig,
     PrefillPageAttentionConfig,
@@ -123,11 +126,16 @@ from .configs import (
 )
 from .decode_attention import DecodeAttention, decode_attention
 from .flash_attention import FlashAttention, flash_attention
+from .gated_delta_rule import GatedDeltaRule, gated_delta_rule
 from .gated_linear_attention import GLAttention, gla_attention
 from .grouped_matmul import GroupedMatmul, grouped_matmul
 from .kernel_delta_attention import KernelDeltaAttention, kda_attention, kernel_delta_attention
 from .lightning_attention import LightningAttention, lightning_attention
 from .multi_head_latent_attention import FlashMLA, flash_mla
+from .multi_latent_ragged_page_attention import (
+    MultiLatentRaggedPageAttention,
+    multi_latent_ragged_page_attention,
+)
 from .native_sparse_attention import NativeSparseAttention, native_sparse_attention
 from .page_attention import PageAttention, page_attention
 from .pooling import MeanPooling, mean_pooling
@@ -146,6 +154,8 @@ from .scaled_dot_product_attention import ScaledDotProductAttention, scaled_dot_
 from .state_space_v1 import StateSpaceV1, state_space_v1
 from .state_space_v2 import StateSpaceV2, state_space_v2
 from .unified_attention import UnifiedAttention, unified_attention
+
+gdr_attention = gated_delta_rule
 
 __all__ = (
     "RWKV4",
@@ -167,6 +177,8 @@ __all__ = (
     "FlashMLAConfig",
     "GLAttention",
     "GLAttentionConfig",
+    "GatedDeltaRule",
+    "GatedDeltaRuleConfig",
     "GroupedMatmul",
     "GroupedMatmulConfig",
     "KernelDeltaAttention",
@@ -175,6 +187,8 @@ __all__ = (
     "LightningAttentionConfig",
     "MeanPooling",
     "MeanPoolingConfig",
+    "MultiLatentRaggedPageAttention",
+    "MultiLatentRaggedPageAttentionConfig",
     "NativeSparseAttention",
     "NativeSparseAttentionConfig",
     "PageAttention",
@@ -216,12 +230,15 @@ __all__ = (
     "decode_attention",
     "flash_attention",
     "flash_mla",
+    "gated_delta_rule",
+    "gdr_attention",
     "gla_attention",
     "grouped_matmul",
     "kda_attention",
     "kernel_delta_attention",
     "lightning_attention",
     "mean_pooling",
+    "multi_latent_ragged_page_attention",
     "native_sparse_attention",
     "page_attention",
     "prefill_page_attention",

@@ -27,13 +27,9 @@ if not _has_cutlass:
 if jax.devices()[0].platform != "gpu":
     pytest.skip("CUTE tests require GPU backend", allow_module_level=True)
 
-_cute_chunked_prefill_module = importlib.import_module(
-    "ejkernel.kernels._cute.chunked_prefill_paged_decode"
-)
+_cute_chunked_prefill_module = importlib.import_module("ejkernel.kernels._cute.chunked_prefill_paged_decode")
 cute_chunked_prefill_paged_decode = _cute_chunked_prefill_module.chunked_prefill_paged_decode
-_xla_chunked_prefill_module = importlib.import_module(
-    "ejkernel.kernels._xla.chunked_prefill_paged_decode"
-)
+_xla_chunked_prefill_module = importlib.import_module("ejkernel.kernels._xla.chunked_prefill_paged_decode")
 xla_chunked_prefill_paged_decode = _xla_chunked_prefill_module.chunked_prefill_paged_decode
 
 

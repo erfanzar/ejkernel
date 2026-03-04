@@ -8,9 +8,7 @@ jnp = pytest.importorskip("jax.numpy")
 
 _all_gather_module = importlib.import_module("ejkernel.kernels._pallas.tpu.all_gather_matmul._pallas_impl")
 all_gather_matmul = _all_gather_module.all_gather_matmul
-_reduce_scatter_module = importlib.import_module(
-    "ejkernel.kernels._pallas.tpu.reduce_scatter_matmul._pallas_impl"
-)
+_reduce_scatter_module = importlib.import_module("ejkernel.kernels._pallas.tpu.reduce_scatter_matmul._pallas_impl")
 reduce_scatter_matmul = _reduce_scatter_module.reduce_scatter_matmul
 
 

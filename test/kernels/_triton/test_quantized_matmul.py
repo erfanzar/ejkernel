@@ -306,12 +306,24 @@ def test_quantized_matmul_triton_vmap_over_x_matches_xla(mode: str, bits: int):
 
     def _single_triton(xi):
         return triton_quantized_matmul(
-            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+            xi,
+            w_q,
+            scales,
+            zeros,
+            transpose=False,
+            mode=mode,
+            bits=bits,
         )
 
     def _single_xla(xi):
         return xla_quantized_matmul(
-            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+            xi,
+            w_q,
+            scales,
+            zeros,
+            transpose=False,
+            mode=mode,
+            bits=bits,
         )
 
     out_triton = jax.block_until_ready(jax.vmap(_single_triton)(x))
@@ -357,20 +369,28 @@ def test_quantized_matmul_triton_jit_vmap_over_all_inputs(mode: str, bits: int):
 
     def _single_triton(xi, wi, si):
         return triton_quantized_matmul(
-            xi, wi, si, None, transpose=False, mode=mode, bits=bits,
+            xi,
+            wi,
+            si,
+            None,
+            transpose=False,
+            mode=mode,
+            bits=bits,
         )
 
     def _single_xla(xi, wi, si):
         return xla_quantized_matmul(
-            xi, wi, si, None, transpose=False, mode=mode, bits=bits,
+            xi,
+            wi,
+            si,
+            None,
+            transpose=False,
+            mode=mode,
+            bits=bits,
         )
 
-    out_triton = jax.block_until_ready(
-        jax.jit(jax.vmap(_single_triton))(x, w_q_batched, scales_batched)
-    )
-    out_xla = jax.block_until_ready(
-        jax.jit(jax.vmap(_single_xla))(x, w_q_batched, scales_batched)
-    )
+    out_triton = jax.block_until_ready(jax.jit(jax.vmap(_single_triton))(x, w_q_batched, scales_batched))
+    out_xla = jax.block_until_ready(jax.jit(jax.vmap(_single_xla))(x, w_q_batched, scales_batched))
 
     assert out_triton.shape == (b, m, n)
     np.testing.assert_allclose(
@@ -412,12 +432,24 @@ def test_quantized_matmul_triton_nested_vmap_over_x_matches_xla(mode: str, bits:
 
     def _single_triton(xi):
         return triton_quantized_matmul(
-            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+            xi,
+            w_q,
+            scales,
+            zeros,
+            transpose=False,
+            mode=mode,
+            bits=bits,
         )
 
     def _single_xla(xi):
         return xla_quantized_matmul(
-            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+            xi,
+            w_q,
+            scales,
+            zeros,
+            transpose=False,
+            mode=mode,
+            bits=bits,
         )
 
     out_triton = jax.block_until_ready(jax.vmap(jax.vmap(_single_triton))(x))
@@ -462,12 +494,24 @@ def test_quantized_matmul_triton_nested_vmap_grad_over_x_matches_xla(mode: str, 
 
     def _single_triton(xi):
         return triton_quantized_matmul(
-            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+            xi,
+            w_q,
+            scales,
+            zeros,
+            transpose=False,
+            mode=mode,
+            bits=bits,
         )
 
     def _single_xla(xi):
         return xla_quantized_matmul(
-            xi, w_q, scales, zeros, transpose=False, mode=mode, bits=bits,
+            xi,
+            w_q,
+            scales,
+            zeros,
+            transpose=False,
+            mode=mode,
+            bits=bits,
         )
 
     def _loss_triton(x_in):

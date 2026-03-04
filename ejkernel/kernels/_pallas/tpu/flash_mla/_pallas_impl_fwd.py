@@ -65,9 +65,7 @@ def _flash_mla_kernel(q_tile_ref, *args, save_residuals=False, **kwargs):
     """Dispatcher - iterates over the batch dimension within the tile."""
     block_b = q_tile_ref.shape[0]
     for bi in range(block_b):
-        _flash_mla_kernel_single_batch(
-            bi, q_tile_ref, *args, save_residuals=save_residuals, **kwargs
-        )
+        _flash_mla_kernel_single_batch(bi, q_tile_ref, *args, save_residuals=save_residuals, **kwargs)
 
 
 def _flash_mla_kernel_single_batch(
@@ -130,12 +128,8 @@ def _flash_mla_kernel_single_batch(
         w_kc = w_kc_tile_ref[0]  # [kv_lora_rank, d_nope]
         w_vc = w_vc_tile_ref[0]  # [kv_lora_rank, v_head_dim]
 
-        k_nope = jax.lax.dot(
-            kv, w_kc, preferred_element_type=jnp.float32
-        )  # [block_k, d_nope]
-        v = jax.lax.dot(
-            kv, w_vc, preferred_element_type=jnp.float32
-        )  # [block_k, v_head_dim]
+        k_nope = jax.lax.dot(kv, w_kc, preferred_element_type=jnp.float32)  # [block_k, d_nope]
+        v = jax.lax.dot(kv, w_vc, preferred_element_type=jnp.float32)  # [block_k, v_head_dim]
 
         if rope_mode == ROPE_NONE:
             # q: [block_q, d_nope],  k_nope: [block_k, d_nope]
@@ -152,11 +146,15 @@ def _flash_mla_kernel_single_batch(
             q_rope = q_f32[:, d_nope:]
             bk = bk_tile_ref[bi].astype(jnp.float32)  # [block_k, rope_dim]
             s_nope = jax.lax.dot_general(
-                q_nope, k_nope, TRANS_B_DIM_NUMBERS,
+                q_nope,
+                k_nope,
+                TRANS_B_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             )
             s_rope = jax.lax.dot_general(
-                q_rope, bk, TRANS_B_DIM_NUMBERS,
+                q_rope,
+                bk,
+                TRANS_B_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             )
             s = s_nope + s_rope
@@ -171,7 +169,9 @@ def _flash_mla_kernel_single_batch(
                 preferred_element_type=jnp.float32,
             )
             s_rope = jax.lax.dot_general(
-                bq, bk, TRANS_B_DIM_NUMBERS,
+                bq,
+                bk,
+                TRANS_B_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             )
             s = s_nope + s_rope
@@ -202,9 +202,7 @@ def _flash_mla_kernel_single_batch(
             row_ids += q_seq_idx * block_q
             col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
             col_ids += kv_seq_idx * block_k
-            window_mask = (col_ids >= (row_ids - window_left)) & (
-                col_ids <= (row_ids + window_right)
-            )
+            window_mask = (col_ids >= (row_ids - window_left)) & (col_ids <= (row_ids + window_right))
             mask = window_mask if mask is None else jnp.logical_and(mask, window_mask)
 
         if mask is not None:
@@ -215,9 +213,7 @@ def _flash_mla_kernel_single_batch(
 
         block_k_repeats, rem = divmod(block_k, MIN_BLOCK_SIZE)
         if rem:
-            raise NotImplementedError(
-                f"block_k={block_k} must be a multiple of {MIN_BLOCK_SIZE}"
-            )
+            raise NotImplementedError(f"block_k={block_k} must be a multiple of {MIN_BLOCK_SIZE}")
         p = jnp.exp(s - pltpu.repeat(m_next, block_k_repeats, 1))
 
         alpha = jnp.exp(m_prev - m_next)
@@ -235,10 +231,7 @@ def _flash_mla_kernel_single_batch(
                 def l_broadcast(val):
                     return val[:, :v_head_dim]
             else:
-                raise NotImplementedError(
-                    f"v_head_dim={v_head_dim} should be a multiple of "
-                    f"{MIN_BLOCK_SIZE} if larger"
-                )
+                raise NotImplementedError(f"v_head_dim={v_head_dim} should be a multiple of {MIN_BLOCK_SIZE} if larger")
 
         l_scratch_ref[bi, 0] = l_next
         m_scratch_ref[bi, 0] = m_next
@@ -246,9 +239,7 @@ def _flash_mla_kernel_single_batch(
         l_next_inv = jnp.where(l_next == 0.0, 1.0, 1.0 / l_next)
         acc_scratch_ref[bi, 0] *= l_broadcast(l_corr * l_next_inv)
 
-        o_curr = jax.lax.dot(
-            p.astype(v.dtype), v, preferred_element_type=jnp.float32
-        )
+        o_curr = jax.lax.dot(p.astype(v.dtype), v, preferred_element_type=jnp.float32)
         acc_scratch_ref[bi, 0] += o_curr * l_broadcast(l_next_inv)
 
     num_kv_blocks = kv_seq_len // block_k
@@ -361,9 +352,7 @@ def _flash_mla_pallas_call(
 
     def bias_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
         if causal:
-            should_run = below_or_on_diag(
-                q_seq_index, block_q, kv_seq_index, block_k
-            )
+            should_run = below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k)
             next_q = lax.select(
                 should_run,
                 q_seq_index,
@@ -388,23 +377,11 @@ def _flash_mla_pallas_call(
         pl.BlockSpec((1, kv_lora_rank, d_nope), w_index_map),
         pl.BlockSpec((1, kv_lora_rank, v_head_dim), w_index_map),
         # b_q
-        (
-            pl.BlockSpec((block_b, block_q, b_q.shape[-1]), bq_index_map)
-            if b_q is not None
-            else None
-        ),
+        (pl.BlockSpec((block_b, block_q, b_q.shape[-1]), bq_index_map) if b_q is not None else None),
         # b_k
-        (
-            pl.BlockSpec((block_b, block_k, b_k.shape[-1]), bk_index_map)
-            if b_k is not None
-            else None
-        ),
+        (pl.BlockSpec((block_b, block_k, b_k.shape[-1]), bk_index_map) if b_k is not None else None),
         # bias
-        (
-            pl.BlockSpec((block_b, 1, block_q, block_k), bias_index_map)
-            if bias is not None
-            else None
-        ),
+        (pl.BlockSpec((block_b, 1, block_q, block_k), bias_index_map) if bias is not None else None),
     ]
 
     def lm_out_index_map(batch_index, head_index, q_seq_index, _):
@@ -419,9 +396,7 @@ def _flash_mla_pallas_call(
 
     if save_residuals:
         lm_spec = pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_out_index_map)
-        lm_shape = jax.ShapeDtypeStruct(
-            shape=(batch_size, q_heads, seq_q, MIN_BLOCK_SIZE), dtype=jnp.float32
-        )
+        lm_shape = jax.ShapeDtypeStruct(shape=(batch_size, q_heads, seq_q, MIN_BLOCK_SIZE), dtype=jnp.float32)
         out_specs.extend([lm_spec, lm_spec])
         out_shape.extend([lm_shape, lm_shape])
     else:

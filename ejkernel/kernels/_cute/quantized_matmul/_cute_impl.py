@@ -931,7 +931,6 @@ def _build_tiled_qmm_host_fns(
 
         return qmm_host_runtime, qmm_host_jax
 
-
     @cute.kernel
     def qmm_tiled_kernel(
         x: cute.Tensor,
@@ -1584,7 +1583,6 @@ def _build_mma_qmm_host_fns(
             )
 
         return qmm_host_runtime, qmm_host_jax
-
 
     @cute.kernel
     def qmm_mma_kernel(
@@ -2279,7 +2277,6 @@ def _build_mma_pipelined_qmm_host_fns(
             )
 
         return qmm_host_runtime, qmm_host_jax
-
 
     @cute.kernel
     def qmm_pipe_kernel(

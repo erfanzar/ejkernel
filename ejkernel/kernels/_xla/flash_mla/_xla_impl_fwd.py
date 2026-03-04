@@ -142,9 +142,7 @@ def _normalize_softmax_aux(
             return aux
         if aux.shape[0] == 1:
             return jnp.broadcast_to(aux, (num_heads, aux.shape[1]))
-        raise ValueError(
-            f"softmax_aux first dim must be 1 or num_heads ({num_heads}); got {aux.shape[0]}."
-        )
+        raise ValueError(f"softmax_aux first dim must be 1 or num_heads ({num_heads}); got {aux.shape[0]}.")
 
     raise ValueError(f"softmax_aux must be 1D or 2D, got shape {aux.shape}.")
 
@@ -302,11 +300,7 @@ def _flash_mla_xla(
         logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
     if sliding_window is not None:
-        left_w, right_w = (
-            (sliding_window, sliding_window)
-            if isinstance(sliding_window, int)
-            else sliding_window
-        )
+        left_w, right_w = (sliding_window, sliding_window) if isinstance(sliding_window, int) else sliding_window
         q_pos = jnp.arange(seq_len_q)[:, None]
         k_pos = jnp.arange(seq_len_k)[None, :]
         win_mask = (k_pos >= q_pos - left_w) & (k_pos <= q_pos + right_w)

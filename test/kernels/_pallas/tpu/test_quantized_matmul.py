@@ -359,9 +359,7 @@ def test_quantized_matmul_pallas_large_n_grad_input_matches_xla(monkeypatch: pyt
 
 
 @pytest.mark.parametrize("legacy_path", ["hybrid", "predecode"])
-def test_quantized_matmul_pallas_legacy_paths_alias_to_packed(
-    monkeypatch: pytest.MonkeyPatch, legacy_path: str
-):
+def test_quantized_matmul_pallas_legacy_paths_alias_to_packed(monkeypatch: pytest.MonkeyPatch, legacy_path: str):
     key = jax.random.PRNGKey(1777 if legacy_path == "hybrid" else 1888)
     kx, kw = jax.random.split(key, 2)
     m, k, n = 8, 128, 256

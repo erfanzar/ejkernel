@@ -91,9 +91,7 @@ def _mla_dense_reference(
         logits = logits_soft_cap * jnp.tanh(logits / logits_soft_cap)
 
     if sliding_window is not None:
-        left_w, right_w = (
-            (sliding_window, sliding_window) if isinstance(sliding_window, int) else sliding_window
-        )
+        left_w, right_w = (sliding_window, sliding_window) if isinstance(sliding_window, int) else sliding_window
         q_pos = jnp.arange(seq_q)[:, None]
         k_pos = jnp.arange(kv_len)[None, :]
         win = (k_pos >= q_pos - left_w) & (k_pos <= q_pos + right_w)
@@ -161,7 +159,13 @@ def test_flash_mla_basic_runs_on_xla():
 def test_flash_mla_no_rope_causal_matches_reference():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(10),
-        batch=2, seq_len=16, q_heads=4, kv_heads=2, d_nope=32, kv_rank=64, v_dim=32,
+        batch=2,
+        seq_len=16,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=32,
+        kv_rank=64,
+        v_dim=32,
     )
     out = xla_flash_mla(q, c, wkc, wvc, causal=True)
     ref = _mla_dense_reference(q, c, wkc, wvc, causal=True)
@@ -209,7 +213,13 @@ def test_flash_mla_decoupled_rope_matches_reference():
 def test_flash_mla_non_causal_matches_reference():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(40),
-        batch=1, seq_len=12, q_heads=8, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=1,
+        seq_len=12,
+        q_heads=8,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     out = xla_flash_mla(q, c, wkc, wvc, causal=False)
     ref = _mla_dense_reference(q, c, wkc, wvc, causal=False)
@@ -221,8 +231,13 @@ def test_flash_mla_gqa_multiple_ratios():
     for q_heads, kv_heads in [(4, 1), (4, 2), (8, 2), (6, 3)]:
         q, c, wkc, wvc = _rand_mla_inputs(
             jax.random.PRNGKey(q_heads * 100 + kv_heads),
-            batch=1, seq_len=12, q_heads=q_heads, kv_heads=kv_heads,
-            d_nope=16, kv_rank=32, v_dim=16,
+            batch=1,
+            seq_len=12,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            d_nope=16,
+            kv_rank=32,
+            v_dim=16,
         )
         out = xla_flash_mla(q, c, wkc, wvc, causal=True)
         ref = _mla_dense_reference(q, c, wkc, wvc, causal=True)
@@ -233,7 +248,13 @@ def test_flash_mla_gqa_multiple_ratios():
 def test_flash_mla_attention_mask_matches_reference():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(50),
-        batch=2, seq_len=12, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=2,
+        seq_len=12,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     # Mask that blocks last 4 KV positions for first batch
     mask = jnp.ones((2, 1, 12, 12), dtype=jnp.bool_)
@@ -249,7 +270,13 @@ def test_flash_mla_attention_mask_matches_reference():
 def test_flash_mla_bias_matches_reference():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(60),
-        batch=1, seq_len=12, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=1,
+        seq_len=12,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     bias = jax.random.normal(jax.random.PRNGKey(61), (1, 4, 12, 12)) * 0.5
 
@@ -261,7 +288,13 @@ def test_flash_mla_bias_matches_reference():
 def test_flash_mla_logits_soft_cap_matches_reference():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(70),
-        batch=2, seq_len=12, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=2,
+        seq_len=12,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     out = xla_flash_mla(q, c, wkc, wvc, causal=True, logits_soft_cap=10.0)
     ref = _mla_dense_reference(q, c, wkc, wvc, causal=True, logits_soft_cap=10.0)
@@ -271,7 +304,13 @@ def test_flash_mla_logits_soft_cap_matches_reference():
 def test_flash_mla_sliding_window_matches_reference():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(80),
-        batch=1, seq_len=16, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=1,
+        seq_len=16,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     out = xla_flash_mla(q, c, wkc, wvc, sliding_window=4)
     ref = _mla_dense_reference(q, c, wkc, wvc, sliding_window=4)
@@ -281,7 +320,13 @@ def test_flash_mla_sliding_window_matches_reference():
 def test_flash_mla_asymmetric_sliding_window_matches_reference():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(85),
-        batch=1, seq_len=16, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=1,
+        seq_len=16,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     out = xla_flash_mla(q, c, wkc, wvc, sliding_window=(6, 2))
     ref = _mla_dense_reference(q, c, wkc, wvc, sliding_window=(6, 2))
@@ -291,7 +336,13 @@ def test_flash_mla_asymmetric_sliding_window_matches_reference():
 def test_flash_mla_softmax_aux_matches_reference():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(90),
-        batch=2, seq_len=12, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=2,
+        seq_len=12,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     sinks = jnp.zeros((3,))  # 3 shared sink logits
 
@@ -304,7 +355,13 @@ def test_flash_mla_combined_features_match_reference():
     """Test multiple features used together."""
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(100),
-        batch=2, seq_len=16, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=2,
+        seq_len=16,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     kwargs = dict(causal=True, sliding_window=6, logits_soft_cap=15.0)
 
@@ -335,7 +392,13 @@ def test_flash_mla_rope_with_bias_and_causal():
 def test_flash_mla_dropout_produces_different_outputs():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(120),
-        batch=2, seq_len=16, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=2,
+        seq_len=16,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     rng1 = jax.random.PRNGKey(0)
     rng2 = jax.random.PRNGKey(1)
@@ -356,7 +419,13 @@ def test_flash_mla_dropout_produces_different_outputs():
 def test_flash_mla_deterministic_ignores_dropout():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(130),
-        batch=1, seq_len=8, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=1,
+        seq_len=8,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     rng = jax.random.PRNGKey(42)
 
@@ -370,7 +439,13 @@ def test_flash_mla_deterministic_ignores_dropout():
 def test_flash_mla_dropout_without_rng_raises():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(131),
-        batch=1, seq_len=8, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=1,
+        seq_len=8,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
 
     with pytest.raises(ValueError, match="dropout_rng must be provided"):
@@ -381,7 +456,13 @@ def test_flash_mla_seq_len_1():
     """Single-token sequence (decode step)."""
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(140),
-        batch=2, seq_len=1, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=2,
+        seq_len=1,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     out = xla_flash_mla(q, c, wkc, wvc, causal=True)
     ref = _mla_dense_reference(q, c, wkc, wvc, causal=True)
@@ -392,7 +473,13 @@ def test_flash_mla_seq_len_1():
 def test_flash_mla_custom_softmax_scale():
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(150),
-        batch=1, seq_len=8, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=1,
+        seq_len=8,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     scale = 0.05
     out = xla_flash_mla(q, c, wkc, wvc, causal=True, softmax_scale=scale)
@@ -414,7 +501,13 @@ def test_flash_mla_xla_backward_no_rope():
     """XLA backward: no RoPE, causal. Compare grads against reference."""
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(200),
-        batch=2, seq_len=12, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=2,
+        seq_len=12,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     kwargs = dict(causal=True)
     grads_xla = _grad_loss_fn(xla_flash_mla, q, c, wkc, wvc, **kwargs)
@@ -480,7 +573,13 @@ def test_flash_mla_xla_backward_with_bias():
     """XLA backward: no RoPE, causal, with additive bias."""
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(230),
-        batch=1, seq_len=12, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=1,
+        seq_len=12,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     bias = jax.random.normal(jax.random.PRNGKey(231), (1, 4, 12, 12)) * 0.3
 
@@ -488,12 +587,8 @@ def test_flash_mla_xla_backward_with_bias():
         out = fn(q_, c_, wkc_, wvc_, causal=True, bias=bias_)
         return jnp.sum(out)
 
-    grads_xla = jax.grad(loss_with_bias, argnums=(1, 2, 3, 4, 5))(
-        xla_flash_mla, q, c, wkc, wvc, bias
-    )
-    grads_ref = jax.grad(loss_with_bias, argnums=(1, 2, 3, 4, 5))(
-        _mla_dense_reference, q, c, wkc, wvc, bias
-    )
+    grads_xla = jax.grad(loss_with_bias, argnums=(1, 2, 3, 4, 5))(xla_flash_mla, q, c, wkc, wvc, bias)
+    grads_ref = jax.grad(loss_with_bias, argnums=(1, 2, 3, 4, 5))(_mla_dense_reference, q, c, wkc, wvc, bias)
 
     names = ["dq", "dc", "dwkc", "dwvc", "dbias"]
     for name, g_xla, g_ref in zip(names, grads_xla, grads_ref, strict=False):
@@ -504,7 +599,13 @@ def test_flash_mla_xla_backward_soft_cap():
     """XLA backward: no RoPE, causal, with logits soft cap."""
     q, c, wkc, wvc = _rand_mla_inputs(
         jax.random.PRNGKey(240),
-        batch=2, seq_len=12, q_heads=4, kv_heads=2, d_nope=16, kv_rank=32, v_dim=16,
+        batch=2,
+        seq_len=12,
+        q_heads=4,
+        kv_heads=2,
+        d_nope=16,
+        kv_rank=32,
+        v_dim=16,
     )
     kwargs = dict(causal=True, logits_soft_cap=10.0)
     grads_xla = _grad_loss_fn(xla_flash_mla, q, c, wkc, wvc, **kwargs)

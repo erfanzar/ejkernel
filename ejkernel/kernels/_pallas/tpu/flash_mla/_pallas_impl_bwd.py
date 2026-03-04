@@ -94,9 +94,7 @@ def _flash_mla_dkv_kernel(
         dk_scratch_ref[:, :] = jnp.zeros(dk_scratch_ref.shape, dk_scratch_ref.dtype)
         dv_scratch_ref[:, :] = jnp.zeros(dv_scratch_ref.shape, dv_scratch_ref.dtype)
         if rope_mode != ROPE_NONE:
-            db_k_scratch_ref[:, :] = jnp.zeros(
-                db_k_scratch_ref.shape, db_k_scratch_ref.dtype
-            )
+            db_k_scratch_ref[:, :] = jnp.zeros(db_k_scratch_ref.shape, db_k_scratch_ref.dtype)
 
     if causal:
         should_run = below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k)
@@ -114,18 +112,20 @@ def _flash_mla_dkv_kernel(
         di = di_tile_ref[0, 0, :, :]
 
         if rope_mode == ROPE_NONE:
-            logits = lax.dot_general(
-                q, k_nope, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-            )
+            logits = lax.dot_general(q, k_nope, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
         elif rope_mode == ROPE_FUSED:
             q_nope = q[:, :d_nope]
             q_rope = q[:, d_nope:]
             bk = bk_tile_ref[0, :, :].astype(jnp.float32)
             logits = lax.dot_general(
-                q_nope, k_nope, TRANS_B_DIM_NUMBERS,
+                q_nope,
+                k_nope,
+                TRANS_B_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             ) + lax.dot_general(
-                q_rope, bk, TRANS_B_DIM_NUMBERS,
+                q_rope,
+                bk,
+                TRANS_B_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             )
         else:  # ROPE_DECOUPLED
@@ -133,9 +133,7 @@ def _flash_mla_dkv_kernel(
             bk = bk_tile_ref[0, :, :].astype(jnp.float32)
             logits = lax.dot_general(
                 q, k_nope, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-            ) + lax.dot_general(
-                bq, bk, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-            )
+            ) + lax.dot_general(bq, bk, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
         if softmax_scale != 1.0:
             logits *= softmax_scale
@@ -164,9 +162,7 @@ def _flash_mla_dkv_kernel(
             row_ids += q_seq_index * block_q
             col_ids = lax.broadcasted_iota(jnp.int32, mask_shape, 1)
             col_ids += kv_seq_index * block_k
-            window_mask = (col_ids >= (row_ids - window_left)) & (
-                col_ids <= (row_ids + window_right)
-            )
+            window_mask = (col_ids >= (row_ids - window_left)) & (col_ids <= (row_ids + window_right))
             mask = window_mask if mask is None else jnp.logical_and(mask, window_mask)
 
         if mask is not None:
@@ -176,14 +172,10 @@ def _flash_mla_dkv_kernel(
         p = jnp.exp(logits - pltpu.repeat(m, kv_repeats, axis=1))
         p = p * pltpu.repeat(1.0 / l, kv_repeats, axis=1)
 
-        dv = lax.dot(
-            p.T.astype(do.dtype), do, preferred_element_type=jnp.float32
-        )
+        dv = lax.dot(p.T.astype(do.dtype), do, preferred_element_type=jnp.float32)
         dv_scratch_ref[:, :] += dv.astype(dv_scratch_ref.dtype)
 
-        dp = lax.dot_general(
-            do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-        )
+        dp = lax.dot_general(do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
         ds = (dp - pltpu.repeat(di, kv_repeats, axis=1)) * p
 
@@ -194,29 +186,25 @@ def _flash_mla_dkv_kernel(
             ds = ds * softmax_scale
 
         if rope_mode == ROPE_NONE:
-            dk = lax.dot(
-                ds.T.astype(q.dtype), q, preferred_element_type=jnp.float32
-            )
+            dk = lax.dot(ds.T.astype(q.dtype), q, preferred_element_type=jnp.float32)
         elif rope_mode == ROPE_FUSED:
             q_nope = q[:, :d_nope]
             q_rope = q[:, d_nope:]
             dk = lax.dot(
-                ds.T.astype(q_nope.dtype), q_nope,
+                ds.T.astype(q_nope.dtype),
+                q_nope,
                 preferred_element_type=jnp.float32,
             )
             db_k_inc = lax.dot(
-                ds.T.astype(q_rope.dtype), q_rope,
+                ds.T.astype(q_rope.dtype),
+                q_rope,
                 preferred_element_type=jnp.float32,
             )
             db_k_scratch_ref[:, :] += db_k_inc.astype(db_k_scratch_ref.dtype)
         else:  # ROPE_DECOUPLED
-            dk = lax.dot(
-                ds.T.astype(q.dtype), q, preferred_element_type=jnp.float32
-            )
+            dk = lax.dot(ds.T.astype(q.dtype), q, preferred_element_type=jnp.float32)
             bq = bq_tile_ref[0, :, :].astype(jnp.float32)
-            db_k_inc = lax.dot(
-                ds.T.astype(bq.dtype), bq, preferred_element_type=jnp.float32
-            )
+            db_k_inc = lax.dot(ds.T.astype(bq.dtype), bq, preferred_element_type=jnp.float32)
             db_k_scratch_ref[:, :] += db_k_inc.astype(db_k_scratch_ref.dtype)
 
         dk_scratch_ref[:, :] += dk.astype(dk_scratch_ref.dtype)
@@ -226,9 +214,7 @@ def _flash_mla_dkv_kernel(
         dk_tile_ref[0, 0, :, :] = dk_scratch_ref[:, :].astype(dk_tile_ref.dtype)
         dv_tile_ref[0, 0, :, :] = dv_scratch_ref[:, :].astype(dv_tile_ref.dtype)
         if rope_mode != ROPE_NONE and db_k_tile_ref is not None:
-            db_k_tile_ref[0, 0, :, :] = db_k_scratch_ref[:, :].astype(
-                db_k_tile_ref.dtype
-            )
+            db_k_tile_ref[0, 0, :, :] = db_k_scratch_ref[:, :].astype(db_k_tile_ref.dtype)
 
 
 def _flash_mla_bwd_dkv(
@@ -327,33 +313,17 @@ def _flash_mla_bwd_dkv(
         pl.BlockSpec((1, 1, block_q, q_head_dim), q_index_map),
         pl.BlockSpec((1, 1, block_k, d_nope), kv_index_map),
         pl.BlockSpec((1, 1, block_k, v_head_dim), kv_index_map),
-        (
-            pl.BlockSpec((1, block_q, b_q.shape[-1]), bq_index_map)
-            if b_q is not None
-            else None
-        ),
-        (
-            pl.BlockSpec((1, block_k, b_k.shape[-1]), bk_index_map)
-            if b_k is not None
-            else None
-        ),
-        (
-            pl.BlockSpec((1, 1, block_q, block_k), bias_index_map)
-            if bias is not None
-            else None
-        ),
+        (pl.BlockSpec((1, block_q, b_q.shape[-1]), bq_index_map) if b_q is not None else None),
+        (pl.BlockSpec((1, block_k, b_k.shape[-1]), bk_index_map) if b_k is not None else None),
+        (pl.BlockSpec((1, 1, block_q, block_k), bias_index_map) if bias is not None else None),
         pl.BlockSpec((1, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
         pl.BlockSpec((1, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
         pl.BlockSpec((1, 1, block_q, v_head_dim), do_index_map),
         pl.BlockSpec((1, 1, block_q, MIN_BLOCK_SIZE), do_index_map),
     ]
 
-    dk_shape = jax.ShapeDtypeStruct(
-        (batch_size, q_heads, kv_len, d_nope), q.dtype
-    )
-    dv_shape = jax.ShapeDtypeStruct(
-        (batch_size, q_heads, kv_len, v_head_dim), q.dtype
-    )
+    dk_shape = jax.ShapeDtypeStruct((batch_size, q_heads, kv_len, d_nope), q.dtype)
+    dv_shape = jax.ShapeDtypeStruct((batch_size, q_heads, kv_len, v_head_dim), q.dtype)
 
     dk_spec = pl.BlockSpec((1, 1, block_k, d_nope), dkv_index_map)
     dv_spec = pl.BlockSpec((1, 1, block_k, v_head_dim), dkv_index_map)
@@ -362,9 +332,7 @@ def _flash_mla_bwd_dkv(
     out_specs = [dk_spec, dv_spec]
 
     if rope_mode != ROPE_NONE:
-        db_k_shape = jax.ShapeDtypeStruct(
-            (batch_size, q_heads, kv_len, rope_dim), jnp.float32
-        )
+        db_k_shape = jax.ShapeDtypeStruct((batch_size, q_heads, kv_len, rope_dim), jnp.float32)
         db_k_spec = pl.BlockSpec((1, 1, block_k, rope_dim), dkv_index_map)
         out_shapes.append(db_k_shape)
         out_specs.append(db_k_spec)
@@ -463,9 +431,7 @@ def _flash_mla_dq_kernel(
     def _init():
         dq_scratch_ref[:, :] = jnp.zeros(dq_scratch_ref.shape, dq_scratch_ref.dtype)
         if rope_mode == ROPE_DECOUPLED:
-            db_q_scratch_ref[:, :] = jnp.zeros(
-                db_q_scratch_ref.shape, db_q_scratch_ref.dtype
-            )
+            db_q_scratch_ref[:, :] = jnp.zeros(db_q_scratch_ref.shape, db_q_scratch_ref.dtype)
 
     if causal:
         should_run = below_or_on_diag(q_seq_index, block_q, kv_seq_index, block_k)
@@ -485,18 +451,20 @@ def _flash_mla_dq_kernel(
         di = di_tile_ref[0, 0, :, :]
 
         if rope_mode == ROPE_NONE:
-            logits = lax.dot_general(
-                q, k_nope, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-            )
+            logits = lax.dot_general(q, k_nope, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
         elif rope_mode == ROPE_FUSED:
             q_nope = q[:, :d_nope]
             q_rope = q[:, d_nope:]
             bk = bk_tile_ref[0, :, :].astype(jnp.float32)
             logits = lax.dot_general(
-                q_nope, k_nope, TRANS_B_DIM_NUMBERS,
+                q_nope,
+                k_nope,
+                TRANS_B_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             ) + lax.dot_general(
-                q_rope, bk, TRANS_B_DIM_NUMBERS,
+                q_rope,
+                bk,
+                TRANS_B_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             )
         else:  # ROPE_DECOUPLED
@@ -504,9 +472,7 @@ def _flash_mla_dq_kernel(
             bk = bk_tile_ref[0, :, :].astype(jnp.float32)
             logits = lax.dot_general(
                 q, k_nope, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-            ) + lax.dot_general(
-                bq, bk, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-            )
+            ) + lax.dot_general(bq, bk, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
         if softmax_scale != 1.0:
             logits *= softmax_scale
@@ -535,9 +501,7 @@ def _flash_mla_dq_kernel(
             row_ids += q_seq_index * block_q
             col_ids = lax.broadcasted_iota(jnp.int32, mask_shape, 1)
             col_ids += kv_seq_index * block_k
-            window_mask = (col_ids >= (row_ids - window_left)) & (
-                col_ids <= (row_ids + window_right)
-            )
+            window_mask = (col_ids >= (row_ids - window_left)) & (col_ids <= (row_ids + window_right))
             mask = window_mask if mask is None else jnp.logical_and(mask, window_mask)
 
         if mask is not None:
@@ -547,9 +511,7 @@ def _flash_mla_dq_kernel(
         p = jnp.exp(logits - pltpu.repeat(m, kv_repeats, axis=1))
         p = p * pltpu.repeat(1.0 / l, kv_repeats, axis=1)
 
-        dp = lax.dot_general(
-            do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32
-        )
+        dp = lax.dot_general(do, v, TRANS_B_DIM_NUMBERS, preferred_element_type=jnp.float32)
 
         ds = (dp - pltpu.repeat(di, kv_repeats, axis=1)) * p
 
@@ -564,28 +526,27 @@ def _flash_mla_dq_kernel(
 
         if rope_mode == ROPE_NONE:
             dq_inc = lax.dot(
-                ds.astype(k_nope.dtype), k_nope,
+                ds.astype(k_nope.dtype),
+                k_nope,
                 preferred_element_type=jnp.float32,
             )
         elif rope_mode == ROPE_FUSED:
             bk = bk_tile_ref[0, :, :].astype(jnp.float32)
             dq_nope = lax.dot(
-                ds.astype(k_nope.dtype), k_nope,
+                ds.astype(k_nope.dtype),
+                k_nope,
                 preferred_element_type=jnp.float32,
             )
-            dq_rope = lax.dot(
-                ds.astype(bk.dtype), bk, preferred_element_type=jnp.float32
-            )
+            dq_rope = lax.dot(ds.astype(bk.dtype), bk, preferred_element_type=jnp.float32)
             dq_inc = jnp.concatenate([dq_nope, dq_rope], axis=-1)
         else:  # ROPE_DECOUPLED
             dq_inc = lax.dot(
-                ds.astype(k_nope.dtype), k_nope,
+                ds.astype(k_nope.dtype),
+                k_nope,
                 preferred_element_type=jnp.float32,
             )
             bk = bk_tile_ref[0, :, :].astype(jnp.float32)
-            db_q_inc = lax.dot(
-                ds.astype(bk.dtype), bk, preferred_element_type=jnp.float32
-            )
+            db_q_inc = lax.dot(ds.astype(bk.dtype), bk, preferred_element_type=jnp.float32)
             db_q_scratch_ref[:, :] += db_q_inc.astype(db_q_scratch_ref.dtype)
 
         dq_scratch_ref[:, :] += dq_inc.astype(dq_scratch_ref.dtype)
@@ -593,17 +554,13 @@ def _flash_mla_dq_kernel(
     @pl.when(should_not_run)
     def _zero_dbias():
         if dbias_tile_ref is not None:
-            dbias_tile_ref[0, 0, :, :] = jnp.zeros(
-                (block_q, block_k), dbias_tile_ref.dtype
-            )
+            dbias_tile_ref[0, 0, :, :] = jnp.zeros((block_q, block_k), dbias_tile_ref.dtype)
 
     @pl.when(kv_seq_index == kv_seq_len // block_k - 1)
     def _store():
         dq_tile_ref[0, 0, :, :] = dq_scratch_ref[:, :].astype(dq_tile_ref.dtype)
         if rope_mode == ROPE_DECOUPLED and db_q_tile_ref is not None:
-            db_q_tile_ref[0, 0, :, :] = db_q_scratch_ref[:, :].astype(
-                db_q_tile_ref.dtype
-            )
+            db_q_tile_ref[0, 0, :, :] = db_q_scratch_ref[:, :].astype(db_q_tile_ref.dtype)
 
 
 def _flash_mla_bwd_dq(
@@ -686,21 +643,9 @@ def _flash_mla_bwd_dq(
         pl.BlockSpec((1, 1, block_q, q_head_dim), q_index_map),
         pl.BlockSpec((1, 1, block_k, d_nope), kv_index_map),
         pl.BlockSpec((1, 1, block_k, v_head_dim), kv_index_map),
-        (
-            pl.BlockSpec((1, block_q, b_q.shape[-1]), bq_index_map)
-            if b_q is not None
-            else None
-        ),
-        (
-            pl.BlockSpec((1, block_k, b_k.shape[-1]), bk_index_map)
-            if b_k is not None
-            else None
-        ),
-        (
-            pl.BlockSpec((1, 1, block_q, block_k), bias_index_map)
-            if bias is not None
-            else None
-        ),
+        (pl.BlockSpec((1, block_q, b_q.shape[-1]), bq_index_map) if b_q is not None else None),
+        (pl.BlockSpec((1, block_k, b_k.shape[-1]), bk_index_map) if b_k is not None else None),
+        (pl.BlockSpec((1, 1, block_q, block_k), bias_index_map) if bias is not None else None),
         pl.BlockSpec((1, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
         pl.BlockSpec((1, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
         pl.BlockSpec((1, 1, block_q, v_head_dim), q_index_map),
@@ -726,9 +671,7 @@ def _flash_mla_bwd_dq(
         out_specs.append(None)
 
     if rope_mode == ROPE_DECOUPLED:
-        db_q_shape = jax.ShapeDtypeStruct(
-            (batch_size, q_heads, seq_q, b_q.shape[-1]), jnp.float32
-        )
+        db_q_shape = jax.ShapeDtypeStruct((batch_size, q_heads, seq_q, b_q.shape[-1]), jnp.float32)
         db_q_spec = pl.BlockSpec((1, 1, block_q, b_q.shape[-1]), q_index_map)
         out_shapes.append(db_q_shape)
         out_specs.append(db_q_spec)
@@ -881,12 +824,8 @@ def _flash_mla_bwd_impl(
 
     # [B, q_heads, kv_len, d] → [B, kv_heads, kv_len, d]
     if gqa_ratio > 1:
-        dk_nope_kv = dk_nope_all.reshape(
-            batch_size, kv_heads, gqa_ratio, kv_len, d_nope
-        ).sum(axis=2)
-        dv_kv = dv_all.reshape(
-            batch_size, kv_heads, gqa_ratio, kv_len, v_head_dim
-        ).sum(axis=2)
+        dk_nope_kv = dk_nope_all.reshape(batch_size, kv_heads, gqa_ratio, kv_len, d_nope).sum(axis=2)
+        dv_kv = dv_all.reshape(batch_size, kv_heads, gqa_ratio, kv_len, v_head_dim).sum(axis=2)
     else:
         dk_nope_kv = dk_nope_all
         dv_kv = dv_all

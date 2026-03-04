@@ -88,42 +88,8 @@ def test_qmm_strict_fuse_tpu_parity_smoke(monkeypatch):
                     zeros = None
 
                 fn_ref = jax.jit(
-                    lambda xi,
-                    wi,
-                    si,
-                    zi,
-                    mode=mode,
-                    bits=bits,
-                    group_size=group_size,
-                    axis=axis,
-                    transpose=transpose: quantized_matmul(
-                        xi,
-                        wi,
-                        si,
-                        zi,
-                        mode=mode,
-                        bits=bits,
-                        group_size=group_size,
-                        axis=axis,
-                        transpose=transpose,
-                        platform="xla",
-                        fuse=False,
-                    )
-                )
-                y_ref = fn_ref(x, w_q, scales, zeros)
-
-                for platform in ("xla", "pallas"):
-                    fn_fused = jax.jit(
-                        lambda xi,
-                        wi,
-                        si,
-                        zi,
-                        mode=mode,
-                        bits=bits,
-                        group_size=group_size,
-                        axis=axis,
-                        transpose=transpose,
-                        platform=platform: quantized_matmul(
+                    lambda xi, wi, si, zi, mode=mode, bits=bits, group_size=group_size, axis=axis, transpose=transpose: (
+                        quantized_matmul(
                             xi,
                             wi,
                             si,
@@ -133,9 +99,30 @@ def test_qmm_strict_fuse_tpu_parity_smoke(monkeypatch):
                             group_size=group_size,
                             axis=axis,
                             transpose=transpose,
-                            platform=platform,
-                            fuse=True,
-                            strict_fuse=True,
+                            platform="xla",
+                            fuse=False,
+                        )
+                    )
+                )
+                y_ref = fn_ref(x, w_q, scales, zeros)
+
+                for platform in ("xla", "pallas"):
+                    fn_fused = jax.jit(
+                        lambda xi, wi, si, zi, mode=mode, bits=bits, group_size=group_size, axis=axis, transpose=transpose, platform=platform: (
+                            quantized_matmul(
+                                xi,
+                                wi,
+                                si,
+                                zi,
+                                mode=mode,
+                                bits=bits,
+                                group_size=group_size,
+                                axis=axis,
+                                transpose=transpose,
+                                platform=platform,
+                                fuse=True,
+                                strict_fuse=True,
+                            )
                         )
                     )
                     y_fused = fn_fused(x, w_q, scales, zeros)

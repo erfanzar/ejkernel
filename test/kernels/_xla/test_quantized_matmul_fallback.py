@@ -82,4 +82,3 @@ def test_xla_quantized_matmul_disallow_dense_fallback_raises():
 
     with pytest.raises(ValueError, match="allow_dense_fallback"):
         _ = fn(x, w_q, scales, zeros)
-

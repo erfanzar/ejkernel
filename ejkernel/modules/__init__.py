@@ -35,6 +35,7 @@ Available Attention Modules:
         - NativeSparseAttention: Sparse attention with explicit block patterns
 
     Linear/Recurrent Attention:
+        - GatedDeltaRule: Gated delta rule linear attention
         - GLAttention: Gated linear attention mechanism
         - LightningAttention: Lightning attention with decay
         - KernelDeltaAttention: Linear attention with delta rule updates
@@ -45,6 +46,7 @@ Available Attention Modules:
 
     Memory-Efficient Attention:
         - FlashMLA: Multi-head latent attention with low-rank KV compression
+        - MultiLatentRaggedPageAttention: MLA ragged paged attention with cache updates
 
 Linear Recurrent Models:
     - RWKV4: Linear attention with time-decay
@@ -90,6 +92,8 @@ from .operations import (
     FlashAttentionConfig,
     FlashMLA,
     FlashMLAConfig,
+    GatedDeltaRule,
+    GatedDeltaRuleConfig,
     GLAttention,
     GLAttentionConfig,
     GroupedMatmul,
@@ -100,6 +104,8 @@ from .operations import (
     LightningAttentionConfig,
     MeanPooling,
     MeanPoolingConfig,
+    MultiLatentRaggedPageAttention,
+    MultiLatentRaggedPageAttentionConfig,
     NativeSparseAttention,
     NativeSparseAttentionConfig,
     PageAttention,
@@ -140,12 +146,14 @@ from .operations import (
     decode_attention,
     flash_attention,
     flash_mla,
+    gated_delta_rule,
     gla_attention,
     grouped_matmul,
     kda_attention,
     kernel_delta_attention,
     lightning_attention,
     mean_pooling,
+    multi_latent_ragged_page_attention,
     native_sparse_attention,
     page_attention,
     prefill_page_attention,
@@ -186,6 +194,8 @@ __all__ = (
     "FlashMLAConfig",
     "GLAttention",
     "GLAttentionConfig",
+    "GatedDeltaRule",
+    "GatedDeltaRuleConfig",
     "GroupedMatmul",
     "GroupedMatmulConfig",
     "KernelDeltaAttention",
@@ -194,6 +204,8 @@ __all__ = (
     "LightningAttentionConfig",
     "MeanPooling",
     "MeanPoolingConfig",
+    "MultiLatentRaggedPageAttention",
+    "MultiLatentRaggedPageAttentionConfig",
     "NativeSparseAttention",
     "NativeSparseAttentionConfig",
     "PageAttention",
@@ -234,12 +246,14 @@ __all__ = (
     "decode_attention",
     "flash_attention",
     "flash_mla",
+    "gated_delta_rule",
     "gla_attention",
     "grouped_matmul",
     "kda_attention",
     "kernel_delta_attention",
     "lightning_attention",
     "mean_pooling",
+    "multi_latent_ragged_page_attention",
     "native_sparse_attention",
     "page_attention",
     "prefill_page_attention",
