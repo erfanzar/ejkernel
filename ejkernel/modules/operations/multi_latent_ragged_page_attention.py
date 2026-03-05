@@ -130,9 +130,9 @@ class MultiLatentRaggedPageAttention(Kernel[MultiLatentRaggedPageAttentionConfig
 
     def run(
         self,
-        queries_nope: Float[Array, "total_tokens num_q_heads qk_nope_dim"],
+        queries_nope: Float[Array, "total_tokens num_q_heads kv_latent_dim"],
         queries_pe: Float[Array, "total_tokens num_q_heads qk_pe_dim"],
-        keys_values: Float[Array, "total_tokens qk_nope_dim"],
+        keys_values: Float[Array, "total_tokens kv_latent_dim"],
         keys_pe: Float[Array, "total_tokens qk_pe_dim"],
         kv_cache: Float[Array, "num_pages page_size_per_kv_packing kv_packing kv_dim_padded"],
         kv_lens: Int32[Array, "max_num_seqs"],
@@ -147,15 +147,10 @@ class MultiLatentRaggedPageAttention(Kernel[MultiLatentRaggedPageAttentionConfig
         q_scale: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        chunk_prefill_size: int | None = None,
-        num_kv_pages_per_block: int | None = None,
-        num_queries_per_block: int | None = None,
-        vmem_limit_bytes: int | None = None,
-        debug_mode: bool = False,
         platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
         cfg: MultiLatentRaggedPageAttentionConfig,
     ) -> tuple[
-        Float[Array, "total_tokens num_q_heads qk_nope_dim"],
+        Float[Array, "total_tokens num_q_heads kv_latent_dim"],
         Float[Array, "num_pages page_size_per_kv_packing kv_packing kv_dim_padded"],
     ]:
         """Execute multi-latent ragged paged attention.
@@ -204,18 +199,6 @@ class MultiLatentRaggedPageAttention(Kernel[MultiLatentRaggedPageAttentionConfig
             q_scale: Optional multiplicative scale applied to queries.
             k_scale: Optional multiplicative scale applied to keys.
             v_scale: Optional multiplicative scale applied to values.
-            chunk_prefill_size: Maximum number of query tokens to
-                process per chunk during prefill. Limits peak memory
-                for long-context sequences (``None`` = no chunking).
-            num_kv_pages_per_block: Number of KV cache pages loaded per
-                compute block. Larger values improve arithmetic
-                intensity but increase register/VMEM pressure.
-            num_queries_per_block: Number of query tokens processed per
-                compute block. Autotuned over [16, 32].
-            vmem_limit_bytes: TPU VMEM budget hint for the Pallas
-                backend (ignored on non-TPU platforms).
-            debug_mode: Enable extra assertions and debug output in the
-                Pallas kernel (default: ``False``).
             platform: Override automatic platform selection.
             cfg: Kernel configuration object (from autotuner or manual).
 
@@ -256,15 +239,10 @@ class MultiLatentRaggedPageAttention(Kernel[MultiLatentRaggedPageAttentionConfig
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            chunk_prefill_size=(chunk_prefill_size if chunk_prefill_size is not None else cfg.chunk_prefill_size),
-            num_kv_pages_per_block=(
-                num_kv_pages_per_block if num_kv_pages_per_block is not None else cfg.num_kv_pages_per_block
-            ),
-            num_queries_per_block=(
-                num_queries_per_block if num_queries_per_block is not None else cfg.num_queries_per_block
-            ),
-            vmem_limit_bytes=(vmem_limit_bytes if vmem_limit_bytes is not None else cfg.vmem_limit_bytes),
-            debug_mode=debug_mode,
+            chunk_prefill_size=cfg.chunk_prefill_size,
+            num_kv_pages_per_block=cfg.num_kv_pages_per_block,
+            num_queries_per_block=cfg.num_queries_per_block,
+            vmem_limit_bytes=cfg.vmem_limit_bytes,
         )
 
     def _estimate_kv_pages(
@@ -373,9 +351,9 @@ _mlrpa_executor: Executor[MultiLatentRaggedPageAttentionConfig, tuple[Array, Arr
 
 
 def multi_latent_ragged_page_attention(
-    queries_nope: Float[Array, "total_tokens num_q_heads qk_nope_dim"],
+    queries_nope: Float[Array, "total_tokens num_q_heads kv_latent_dim"],
     queries_pe: Float[Array, "total_tokens num_q_heads qk_pe_dim"],
-    keys_values: Float[Array, "total_tokens qk_nope_dim"],
+    keys_values: Float[Array, "total_tokens kv_latent_dim"],
     keys_pe: Float[Array, "total_tokens qk_pe_dim"],
     kv_cache: Float[Array, "num_pages page_size_per_kv_packing kv_packing kv_dim_padded"],
     kv_lens: Int32[Array, "max_num_seqs"],
@@ -391,15 +369,10 @@ def multi_latent_ragged_page_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    chunk_prefill_size: int | None = None,
-    num_kv_pages_per_block: int | None = None,
-    num_queries_per_block: int | None = None,
-    vmem_limit_bytes: int | None = None,
-    debug_mode: bool = False,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: MultiLatentRaggedPageAttentionConfig | None = None,
 ) -> tuple[
-    Float[Array, "total_tokens num_q_heads qk_nope_dim"],
+    Float[Array, "total_tokens num_q_heads kv_latent_dim"],
     Float[Array, "num_pages page_size_per_kv_packing kv_packing kv_dim_padded"],
 ]:
     """Execute Multi-Latent Ragged Page Attention with automatic optimization.
@@ -436,11 +409,6 @@ def multi_latent_ragged_page_attention(
         q_scale: Multiplicative query scale.
         k_scale: Multiplicative key scale.
         v_scale: Multiplicative value scale.
-        chunk_prefill_size: Max query tokens per prefill chunk.
-        num_kv_pages_per_block: KV pages per compute block.
-        num_queries_per_block: Query tokens per compute block.
-        vmem_limit_bytes: TPU VMEM budget hint (Pallas only).
-        debug_mode: Enable debug assertions (Pallas only).
         platform: Override platform selection.
         cfg: Optional kernel configuration.
 
@@ -469,11 +437,6 @@ def multi_latent_ragged_page_attention(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
-        chunk_prefill_size=chunk_prefill_size,
-        num_kv_pages_per_block=num_kv_pages_per_block,
-        num_queries_per_block=num_queries_per_block,
-        vmem_limit_bytes=vmem_limit_bytes,
-        debug_mode=debug_mode,
         platform=platform,
         _cfg=cfg,
     )

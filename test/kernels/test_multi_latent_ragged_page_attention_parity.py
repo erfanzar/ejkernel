@@ -27,6 +27,12 @@ from ejkernel.kernels._pallas.tpu.multi_latent_ragged_page_attention import (
 )
 from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.kernels._xla.multi_latent_ragged_page_attention import _interface as xla_interface
+from ejkernel.modules.operations import (
+    MultiLatentRaggedPageAttention,
+)
+from ejkernel.modules.operations import (
+    multi_latent_ragged_page_attention as op_functional,
+)
 
 
 class TestMultiLatentRaggedPageAttentionParity:
@@ -90,6 +96,32 @@ class TestMultiLatentRaggedPageAttentionParity:
         )
         assert callable(xla_impl)
         assert callable(pallas_impl)
+
+    def test_operation_run_does_not_expose_impl_params(self):
+        """Implementation-detail kwargs are only available via cfg, not run()."""
+        run_sig = inspect.signature(MultiLatentRaggedPageAttention.run)
+        run_params = set(run_sig.parameters)
+        for impl_only in (
+            "chunk_prefill_size",
+            "num_kv_pages_per_block",
+            "num_queries_per_block",
+            "vmem_limit_bytes",
+            "debug_mode",
+        ):
+            assert impl_only not in run_params, f"{impl_only} should not be in run() signature"
+
+    def test_operation_functional_does_not_expose_impl_params(self):
+        """Implementation-detail kwargs are only available via cfg, not the functional API."""
+        func_sig = inspect.signature(op_functional)
+        func_params = set(func_sig.parameters)
+        for impl_only in (
+            "chunk_prefill_size",
+            "num_kv_pages_per_block",
+            "num_queries_per_block",
+            "vmem_limit_bytes",
+            "debug_mode",
+        ):
+            assert impl_only not in func_params, f"{impl_only} should not be in functional API signature"
 
 
 if __name__ == "__main__":

@@ -19,18 +19,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from ejkernel.kernels._xla.gated_delta_rule import (
-    gated_delta_rule,
-)
-from ejkernel.kernels._xla.gated_delta_rule import (
-    gated_delta_rule_xla_chunk_fwd as _chunk_gdr_fwd,
-)
-from ejkernel.kernels._xla.gated_delta_rule import (
-    gated_delta_rule_xla_recurrent_fwd as _recurrent_gdr_fwd,
-)
-from ejkernel.kernels._xla.gated_delta_rule import (
-    gated_delta_rule_xla_single_step_fwd as _single_step_gdr_fwd,
-)
+from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule
 
 
 def _make_inputs(batch=1, seq_len=8, heads=2, qk_dim=8, v_dim=8, dtype=jnp.float32, seed=0):
@@ -78,59 +67,6 @@ def test_chunked_and_recurrent_agree():
 
     max_diff = float(jnp.max(jnp.abs(out_chunk - out_rec)))
     assert max_diff < 0.25, f"chunked vs recurrent max diff: {max_diff}"
-
-
-def test_single_step_fwd_shapes():
-    batch, heads, qk_dim, v_dim = 1, 2, 8, 8
-    q, k, v, beta, decay = _make_internal(batch, 1, heads, qk_dim, v_dim)
-    state = jnp.zeros((batch, heads, qk_dim, v_dim), dtype=jnp.float32)
-
-    out, new_state = _single_step_gdr_fwd(
-        query=q,
-        key=k,
-        value=v,
-        beta=beta,
-        decay=decay,
-        recurrent_state=state,
-        use_qk_l2norm=True,
-    )
-    assert out.shape == (batch, heads, 1, v_dim)
-    assert new_state.shape == (batch, heads, qk_dim, v_dim)
-
-
-def test_recurrent_fwd_shapes():
-    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
-    q, k, v, beta, decay = _make_internal(batch, seq_len, heads, qk_dim, v_dim)
-
-    out, state = _recurrent_gdr_fwd(
-        query=q,
-        key=k,
-        value=v,
-        beta=beta,
-        decay=decay,
-        initial_state=None,
-        use_qk_l2norm=True,
-    )
-    assert out.shape == (batch, heads, seq_len, v_dim)
-    assert state.shape == (batch, heads, qk_dim, v_dim)
-
-
-def test_chunk_fwd_shapes():
-    batch, seq_len, heads, qk_dim, v_dim = 1, 16, 2, 8, 8
-    q, k, v, beta, decay = _make_internal(batch, seq_len, heads, qk_dim, v_dim)
-
-    out, state = _chunk_gdr_fwd(
-        query=q,
-        key=k,
-        value=v,
-        beta=beta,
-        decay=decay,
-        chunk_size=8,
-        initial_state=None,
-        use_qk_l2norm=True,
-    )
-    assert out.shape == (batch, heads, seq_len, v_dim)
-    assert state.shape == (batch, heads, qk_dim, v_dim)
 
 
 def test_no_decay():

@@ -104,3 +104,58 @@ def test_multi_latent_ragged_page_attention_xla_updates_cache_values():
     )
 
     assert not bool(jnp.array_equal(updated_cache, batch["kv_cache"]))
+
+
+def test_multi_latent_ragged_page_attention_xla_with_sliding_window():
+    batch = _make_inputs(seed=7)
+    kv_cache0 = batch["kv_cache"].copy()
+
+    out, updated_cache = multi_latent_ragged_page_attention(
+        batch["queries_nope"],
+        batch["queries_pe"],
+        batch["keys_values"],
+        batch["keys_pe"],
+        kv_cache0,
+        batch["kv_lens"],
+        batch["block_tables"],
+        batch["query_start_loc"],
+        batch["distribution"],
+        sliding_window=2,
+    )
+
+    assert out.shape == batch["queries_nope"].shape
+    assert updated_cache.shape == batch["kv_cache"].shape
+    assert jnp.isfinite(out).all()
+
+
+def test_multi_latent_ragged_page_attention_xla_q_scale_does_not_alter_shape():
+    """q_scale is accepted but no longer normalises queries in the XLA path."""
+    batch = _make_inputs(seed=99)
+
+    out_no_scale, _ = multi_latent_ragged_page_attention(
+        batch["queries_nope"],
+        batch["queries_pe"],
+        batch["keys_values"],
+        batch["keys_pe"],
+        batch["kv_cache"].copy(),
+        batch["kv_lens"],
+        batch["block_tables"],
+        batch["query_start_loc"],
+        batch["distribution"],
+    )
+
+    out_with_scale, _ = multi_latent_ragged_page_attention(
+        batch["queries_nope"],
+        batch["queries_pe"],
+        batch["keys_values"],
+        batch["keys_pe"],
+        batch["kv_cache"].copy(),
+        batch["kv_lens"],
+        batch["block_tables"],
+        batch["query_start_loc"],
+        batch["distribution"],
+        q_scale=0.5,
+    )
+
+    assert out_no_scale.shape == out_with_scale.shape
+    assert jnp.isfinite(out_with_scale).all()

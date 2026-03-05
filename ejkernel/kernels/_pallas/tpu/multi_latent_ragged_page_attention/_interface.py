@@ -32,9 +32,9 @@ from ._pallas_impl_fwd import DEFAULT_MASK_VALUE, mla_ragged_paged_attention
 @kernel_registry.register("multi_latent_ragged_page_attention", Platform.PALLAS, Backend.TPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def multi_latent_ragged_page_attention(
-    queries_nope: Float[Array, "total_tokens num_q_heads qk_nope_dim"],
+    queries_nope: Float[Array, "total_tokens num_q_heads kv_latent_dim"],
     queries_pe: Float[Array, "total_tokens num_q_heads qk_pe_dim"],
-    keys_values: Float[Array, "total_tokens qk_nope_dim"],
+    keys_values: Float[Array, "total_tokens kv_latent_dim"],
     keys_pe: Float[Array, "total_tokens qk_pe_dim"],
     kv_cache: Float[Array, "num_pages page_size_per_kv_packing kv_packing kv_dim_padded"],
     kv_lens: Int32[Array, "max_num_seqs"],
@@ -55,7 +55,7 @@ def multi_latent_ragged_page_attention(
     vmem_limit_bytes: int | None = None,
     debug_mode: bool = False,
 ) -> tuple[
-    Float[Array, "total_tokens num_q_heads qk_nope_dim"],
+    Float[Array, "total_tokens num_q_heads kv_latent_dim"],
     Float[Array, "num_pages page_size_per_kv_packing kv_packing kv_dim_padded"],
 ]:
     """Compute TPU MLA ragged paged attention and update paged KV cache.
@@ -137,7 +137,6 @@ def multi_latent_ragged_page_attention(
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
-        debug_mode=debug_mode,
     )
 
 

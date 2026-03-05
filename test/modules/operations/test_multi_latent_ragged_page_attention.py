@@ -137,3 +137,34 @@ def test_multi_latent_ragged_page_attention_operation_class_api_runs_xla():
 
     assert out.shape == queries_nope.shape
     assert cache_out.shape == kv_cache.shape
+
+
+def test_multi_latent_ragged_page_attention_operation_with_sliding_window_xla():
+    (
+        queries_nope,
+        queries_pe,
+        keys_values,
+        keys_pe,
+        kv_cache,
+        kv_lens,
+        block_tables,
+        query_start_loc,
+        distribution,
+    ) = _make_inputs(seed=3)
+
+    out, cache_out = multi_latent_ragged_page_attention(
+        queries_nope,
+        queries_pe,
+        keys_values,
+        keys_pe,
+        kv_cache,
+        kv_lens,
+        block_tables,
+        query_start_loc,
+        distribution,
+        sliding_window=4,
+        platform="xla",
+    )
+
+    assert out.shape == queries_nope.shape
+    assert cache_out.shape == kv_cache.shape

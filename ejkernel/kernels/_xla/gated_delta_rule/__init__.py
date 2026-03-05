@@ -32,4 +32,4 @@ Reference:
 
 from ._interface import gated_delta_rule
 
-__all__ = "gated_delta_rule"
+__all__ = ("gated_delta_rule",)

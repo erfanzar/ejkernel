@@ -391,16 +391,6 @@ def multi_latent_ragged_page_attention_impl(
                 (q_block_size, num_q_heads, pe_dim),
             )
 
-            if q_scale is not None:
-                q_nope_block = q_nope_block / q_scale
-                q_pe_block = q_pe_block / q_scale
-                if jnp.issubdtype(kv_cache.dtype, jnp.floating):
-                    finfo = jnp.finfo(kv_cache.dtype)
-                    q_nope_block = jnp.clip(q_nope_block, finfo.min, finfo.max)
-                    q_pe_block = jnp.clip(q_pe_block, finfo.min, finfo.max)
-                q_nope_block = q_nope_block.astype(kv_cache.dtype)
-                q_pe_block = q_pe_block.astype(kv_cache.dtype)
-
             q_local = q_off + q_offsets
             q_valid = q_local < q_len
             q_positions = write_start + q_local

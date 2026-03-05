@@ -134,3 +134,59 @@ def test_multi_latent_ragged_page_attention_pallas_matches_xla():
     assert cache_p.shape == cache_x.shape
     assert jnp.allclose(out_p, out_x, rtol=0, atol=0.25)
     assert jnp.allclose(cache_p, cache_x, rtol=0, atol=0.25)
+
+
+def test_multi_latent_ragged_page_attention_pallas_sliding_window():
+    batch = _make_inputs(seed=77)
+    kv_cache0 = batch["kv_cache"].copy()
+
+    out, updated_cache = multi_latent_ragged_page_attention(
+        batch["queries_nope"],
+        batch["queries_pe"],
+        batch["keys_values"],
+        batch["keys_pe"],
+        kv_cache0,
+        batch["kv_lens"],
+        batch["block_tables"],
+        batch["query_start_loc"],
+        batch["distribution"],
+        sliding_window=4,
+    )
+
+    assert out.shape == batch["queries_nope"].shape
+    assert updated_cache.shape == batch["kv_cache"].shape
+    assert jnp.isfinite(out).all()
+    assert jnp.isfinite(updated_cache).all()
+
+
+def test_multi_latent_ragged_page_attention_pallas_fused_cache_update():
+    """Verify that the fused Pallas cache update produces the same result as XLA."""
+    batch_pallas = _make_inputs(seed=200)
+    batch_xla = {k: v.copy() if hasattr(v, "copy") else v for k, v in batch_pallas.items()}
+
+    _, cache_p = multi_latent_ragged_page_attention(
+        batch_pallas["queries_nope"],
+        batch_pallas["queries_pe"],
+        batch_pallas["keys_values"],
+        batch_pallas["keys_pe"],
+        batch_pallas["kv_cache"],
+        batch_pallas["kv_lens"],
+        batch_pallas["block_tables"],
+        batch_pallas["query_start_loc"],
+        batch_pallas["distribution"],
+    )
+
+    _, cache_x = xla_multi_latent_ragged_page_attention(
+        batch_xla["queries_nope"],
+        batch_xla["queries_pe"],
+        batch_xla["keys_values"],
+        batch_xla["keys_pe"],
+        batch_xla["kv_cache"],
+        batch_xla["kv_lens"],
+        batch_xla["block_tables"],
+        batch_xla["query_start_loc"],
+        batch_xla["distribution"],
+    )
+
+    assert cache_p.shape == cache_x.shape
+    assert jnp.allclose(cache_p, cache_x, rtol=0, atol=0.25), "Fused Pallas cache update diverges from XLA reference"
