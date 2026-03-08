@@ -11,11 +11,13 @@ ejkernel.kernels._xla package
    decode_attention/index
    flash_attention/index
    flash_mla/index
+   gated_delta_rule/index
    gla/index
    grouped_matmul/index
    kernel_delta_attention/index
    lightning_attn/index
    mean_pooling/index
+   multi_latent_ragged_page_attention/index
    native_sparse_attention/index
    page_attention/index
    prefill_page_attention/index

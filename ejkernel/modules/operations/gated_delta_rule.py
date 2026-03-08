@@ -90,33 +90,6 @@ from ..base import detect_platform
 from .configs import GatedDeltaRuleConfig
 
 
-def _normalize_chunk_candidates(
-    chunk_size: int,
-    autotune_chunk_candidates: tuple[int, ...] | list[int] | None = None,
-) -> tuple[int, ...]:
-    """Resolve candidate chunk sizes for autotune selection.
-
-    Args:
-        chunk_size: Base chunk size from the invocation kwargs.
-        autotune_chunk_candidates: Explicit candidate list, or None to
-            derive ``[chunk_size/2, chunk_size, chunk_size*2]``.
-
-    Returns:
-        Sorted, deduplicated tuple of positive candidate chunk sizes.
-    """
-    if autotune_chunk_candidates is not None:
-        candidates = [int(x) for x in autotune_chunk_candidates]
-    else:
-        half = max(1, int(chunk_size) // 2)
-        candidates = [half, int(chunk_size), int(chunk_size) * 2]
-
-    candidates.append(int(chunk_size))
-    candidates = [x for x in candidates if x > 0]
-    if not candidates:
-        return (int(chunk_size),)
-    return tuple(sorted(set(candidates)))
-
-
 class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
     """Gated Delta Rule (GDR) operation.
 
@@ -317,12 +290,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         Returns:
             Configuration matching the caller's chunk_size.
         """
-        chunk_size = int(inv.kwargs.get("chunk_size", 64))
-        return GatedDeltaRuleConfig(
-            chunk_size=chunk_size,
-            platform="auto",
-            backend="any",
-        )
+        return GatedDeltaRuleConfig(chunk_size=64, platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[GatedDeltaRuleConfig, Array]):
         """Generate candidate configurations for chunk-size autotuning.
@@ -337,19 +305,9 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         Returns:
             List of GatedDeltaRuleConfig candidates to benchmark.
         """
-        chunk_size = int(inv.kwargs.get("chunk_size", 64))
-        candidates = _normalize_chunk_candidates(
-            chunk_size=chunk_size,
-            autotune_chunk_candidates=inv.kwargs.get("autotune_chunk_candidates", None),
-        )
-        return [
-            GatedDeltaRuleConfig(
-                chunk_size=int(c),
-                platform="auto",
-                backend="any",
-            )
-            for c in candidates
-        ]
+
+        cands = [32, 64]
+        return [GatedDeltaRuleConfig(chunk_size=c, platform="auto", backend="any") for c in cands]
 
     heuristic_cfg_shard_map = heuristic_cfg
     candidate_cfgs_shard_map = candidate_cfgs
@@ -366,7 +324,7 @@ _executor: Executor[GatedDeltaRuleConfig, Array] = Executor(
             cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "autotune"),
             validate_backward=True,
         ),
-        tuner=Tuner(warmup=1, iters=8),
+        tuner=Tuner(warmup=10, iters=40),
         persistent=PersistentCache("gated_delta_rule"),
     )
 )
@@ -381,7 +339,6 @@ def gated_delta_rule(
     initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
     /,
     *,
-    chunk_size: int = 64,
     autotune_chunk_candidates: tuple[int, ...] | list[int] | None = None,
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
@@ -471,6 +428,31 @@ def gated_delta_rule(
         ...     initial_state=state, return_state=True,
         ... )
     """
+    # Fast path: single-step inference bypasses the executor/autotuner.
+    if query.shape[1] == 1 and initial_state is not None:
+        from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import (
+            _single_step_gdr_fwd,
+        )
+
+        q = query.transpose(0, 2, 1, 3)
+        k = key.transpose(0, 2, 1, 3)
+        v = value.transpose(0, 2, 1, 3)
+        b = beta.transpose(0, 2, 1)
+        d = decay.transpose(0, 2, 1) if decay is not None else None
+        out, final_state = _single_step_gdr_fwd(
+            query=q,
+            key=k,
+            value=v,
+            beta=b,
+            decay=d,
+            recurrent_state=initial_state,
+            use_qk_l2norm=use_qk_l2norm,
+        )
+        out = out.transpose(0, 2, 1, 3)
+        if return_state:
+            return out, final_state
+        return out
+
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
@@ -483,7 +465,6 @@ def gated_delta_rule(
         beta=beta,
         decay=decay,
         initial_state=initial_state,
-        chunk_size=int(chunk_size),
         autotune_chunk_candidates=autotune_chunk_candidates,
         use_qk_l2norm=use_qk_l2norm,
         use_chunked=use_chunked,

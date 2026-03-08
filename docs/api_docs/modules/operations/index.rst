@@ -11,11 +11,13 @@ ejkernel.modules.operations package
    configs
    decode_attention
    flash_attention
+   gated_delta_rule
    gated_linear_attention
    grouped_matmul
    kernel_delta_attention
    lightning_attention
    multi_head_latent_attention
+   multi_latent_ragged_page_attention
    native_sparse_attention
    page_attention
    pooling

@@ -7,8 +7,11 @@ ejkernel.kernels._pallas.tpu package
    all_gather_matmul/index
    blocksparse_attention/index
    flash_attention/index
+   flash_mla/index
+   gated_delta_rule/index
    grouped_matmul/index
    grouped_matmulv2/index
+   multi_latent_ragged_page_attention/index
    page_attention/index
    prefill_page_attention/index
    quantized_matmul/index

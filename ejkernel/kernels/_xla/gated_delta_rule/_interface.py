@@ -29,7 +29,6 @@ from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_fwd import _chunk_gdr_fwd, _recurrent_gdr_fwd, _single_step_gdr_fwd
 
 
-@kernel_registry.register("gdr", Platform.XLA, Backend.ANY)
 @kernel_registry.register("gated_delta_rule", Platform.XLA, Backend.ANY)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def gated_delta_rule(

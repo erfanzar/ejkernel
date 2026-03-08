@@ -16,10 +16,14 @@
 
 from __future__ import annotations
 
+import importlib
+
 import jax
 import jax.numpy as jnp
+import pytest
 
 from ejkernel import modules
+from ejkernel.kernels._xla.gated_delta_rule import gated_delta_rule as gated_delta_rule_xla
 from ejkernel.modules import operations
 from ejkernel.modules.operations import (
     GatedDeltaRule,
@@ -28,7 +32,7 @@ from ejkernel.modules.operations import (
     gdr_attention,
 )
 
-from ._utils import assert_allclose
+from ._utils import assert_allclose, device_platform
 
 
 def test_gdr_is_exported_from_modules_init_files():
@@ -102,6 +106,46 @@ def test_gdr_single_step_with_state():
     assert state_next.shape == (batch, heads, qk_dim, v_dim)
 
 
+def test_gdr_single_step_function_fast_path_bypasses_executor(monkeypatch):
+    batch, heads, qk_dim, v_dim = 1, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, 1, heads, qk_dim, v_dim, dtype=jnp.bfloat16, seed=21)
+    init = jax.random.normal(
+        jax.random.PRNGKey(22),
+        (batch, heads, qk_dim, v_dim),
+        dtype=jnp.bfloat16,
+    )
+    cfg = GatedDeltaRuleConfig(chunk_size=8, platform="xla", backend="any")
+    module_impl = importlib.import_module("ejkernel.modules.operations.gated_delta_rule")
+
+    def _fail_executor(*args, **kwargs):
+        raise AssertionError("single-step inference should bypass the executor")
+
+    monkeypatch.setattr(module_impl, "_executor", _fail_executor)
+
+    out_fast, state_fast = module_impl.gated_delta_rule(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        init,
+        return_state=True,
+        cfg=cfg,
+    )
+    out_xla, state_xla = gated_delta_rule_xla(
+        q,
+        k,
+        v,
+        beta,
+        decay,
+        initial_state=init,
+        use_chunked=False,
+    )
+
+    assert_allclose(out_fast, out_xla, atol=0.01)
+    assert_allclose(state_fast, state_xla, atol=0.03)
+
+
 def test_gdr_class_api():
     batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
     q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim)
@@ -146,3 +190,23 @@ def test_gdr_use_qk_l2norm_toggle():
     assert out_norm.shape == out_nonorm.shape
     # Results should differ when L2 norm is toggled
     assert not jnp.allclose(out_norm.astype(jnp.float32), out_nonorm.astype(jnp.float32), atol=1e-3)
+
+
+@pytest.mark.skipif(device_platform() != "tpu", reason="TPU-only cross-backend comparison (pallas vs xla)")
+def test_gdr_pallas_matches_xla_and_auto_dispatches_on_tpu():
+    batch, seq_len, heads, qk_dim, v_dim = 1, 8, 2, 8, 8
+    q, k, v, beta, decay = _make_inputs(batch, seq_len, heads, qk_dim, v_dim, dtype=jnp.float32, seed=7)
+    cfg_xla = GatedDeltaRuleConfig(chunk_size=8, platform="xla", backend="any")
+    cfg_pallas = GatedDeltaRuleConfig(chunk_size=8, platform="pallas", backend="any")
+    cfg_auto = GatedDeltaRuleConfig(chunk_size=8, platform="auto", backend="any")
+
+    out_xla, state_xla = gated_delta_rule(q, k, v, beta, decay, return_state=True, use_chunked=True, cfg=cfg_xla)
+    out_pallas, state_pallas = gated_delta_rule(
+        q, k, v, beta, decay, return_state=True, use_chunked=True, cfg=cfg_pallas
+    )
+    out_auto, state_auto = gated_delta_rule(q, k, v, beta, decay, return_state=True, use_chunked=True, cfg=cfg_auto)
+
+    assert_allclose(out_pallas, out_xla, atol=0.25)
+    assert_allclose(state_pallas, state_xla, atol=0.25)
+    assert_allclose(out_auto, out_pallas, atol=0.0)
+    assert_allclose(state_auto, state_pallas, atol=0.0)

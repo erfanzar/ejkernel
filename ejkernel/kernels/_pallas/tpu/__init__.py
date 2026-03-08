@@ -35,11 +35,10 @@ from .all_gather_matmul import all_gather_matmul
 from .blocksparse_attention import blocksparse_attention as blocksparse_attention
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
+from .gated_delta_rule import gated_delta_rule
 from .grouped_matmul import grouped_matmul
 from .grouped_matmulv2 import grouped_matmulv2
-from .multi_latent_ragged_page_attention import (
-    multi_latent_ragged_page_attention,
-)
+from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
 from .page_attention import page_attention
 from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
@@ -54,6 +53,7 @@ __all__ = (
     "blocksparse_attention",
     "flash_attention",
     "flash_mla",
+    "gated_delta_rule",
     "grouped_matmul",
     "grouped_matmulv2",
     "multi_latent_ragged_page_attention",
