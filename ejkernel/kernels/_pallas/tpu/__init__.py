@@ -21,7 +21,11 @@ High Bandwidth Memory (HBM) for efficient execution.
 
 Available Kernels:
     - flash_attention: Memory-efficient exact attention
+    - flash_mla: Multi-head latent attention forward pass
+    - deepseek_attn: DeepSeek Sparse Attention (MLA + Lightning Indexer)
+    - gated_delta_rule: Gated delta rule linear attention
     - multi_latent_ragged_page_attention: MLA ragged paged attention
+    - multi_latent_ragged_page_attention_v2: MLA ragged paged attention v2
     - blocksparse_attention: Block-sparse attention patterns
     - ring_attention: Distributed attention across devices
     - page_attention: Paged KV cache attention
@@ -33,12 +37,15 @@ Available Kernels:
 
 from .all_gather_matmul import all_gather_matmul
 from .blocksparse_attention import blocksparse_attention as blocksparse_attention
+from .deepseek_attn import deepseek_attn
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
 from .gated_delta_rule import gated_delta_rule
 from .grouped_matmul import grouped_matmul
 from .grouped_matmulv2 import grouped_matmulv2
+from .grouped_matmulv3 import grouped_matmulv3
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
+from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .page_attention import page_attention
 from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
@@ -51,12 +58,15 @@ from .ring_attention import ring_attention
 __all__ = (
     "all_gather_matmul",
     "blocksparse_attention",
+    "deepseek_attn",
     "flash_attention",
     "flash_mla",
     "gated_delta_rule",
     "grouped_matmul",
     "grouped_matmulv2",
+    "grouped_matmulv3",
     "multi_latent_ragged_page_attention",
+    "multi_latent_ragged_page_attention_v2",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",

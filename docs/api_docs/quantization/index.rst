@@ -6,5 +6,6 @@ ejkernel.quantization package
 
    _quants/index
    _utils/index
+   turboquant/index
    quantized_array
    runtime

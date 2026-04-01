@@ -148,7 +148,13 @@ def test_pallas_realistic_dims_fwd_bwd(dtype):
     """Test with dimensions matching real models (K=128, V=128, C=64, many chunks)."""
     batch, seq_len, heads, qk_dim, v_dim = 1, 512, 2, 128, 128
     q, k, v, beta, decay = _make_inputs(
-        batch=batch, seq_len=seq_len, heads=heads, qk_dim=qk_dim, v_dim=v_dim, dtype=dtype, seed=7,
+        batch=batch,
+        seq_len=seq_len,
+        heads=heads,
+        qk_dim=qk_dim,
+        v_dim=v_dim,
+        dtype=dtype,
+        seed=7,
     )
 
     out, state = gated_delta_rule_pallas(q, k, v, beta, decay, chunk_size=64, use_chunked=True)
@@ -168,7 +174,13 @@ def test_pallas_realistic_dims_fwd_bwd(dtype):
 def test_pallas_realistic_dims_matches_xla():
     """Pallas matches XLA at realistic dims (f32 for tight tolerance)."""
     q, k, v, beta, decay = _make_inputs(
-        batch=1, seq_len=256, heads=2, qk_dim=128, v_dim=128, dtype=jnp.float32, seed=8,
+        batch=1,
+        seq_len=256,
+        heads=2,
+        qk_dim=128,
+        v_dim=128,
+        dtype=jnp.float32,
+        seed=8,
     )
     out_p, st_p = gated_delta_rule_pallas(q, k, v, beta, decay, chunk_size=64, use_chunked=True)
     out_x, st_x = gated_delta_rule_xla(q, k, v, beta, decay, chunk_size=64, use_chunked=False)

@@ -28,7 +28,9 @@ Available Attention Modules:
         - PageAttention: Paged KV cache for decode phase
         - PrefillPageAttention: Chunked prefill with paged KV cache
         - RaggedPageAttentionv2: Page attention for variable-length sequences
+        - RaggedPageAttentionv2TurboQuant: TurboQuant-compressed read-only page attention
         - RaggedPageAttentionv3: Advanced variable-length page attention
+        - RaggedPageAttentionv3TurboQuant: TurboQuant-compressed fused page attention
 
     Sparse Attention:
         - BlockSparseAttention: Memory-efficient block-sparse attention
@@ -45,8 +47,10 @@ Available Attention Modules:
         - RingAttention: Distributed attention with ring topology
 
     Memory-Efficient Attention:
+        - DeepSeekAttention: DeepSeek Sparse Attention (MLA + Lightning Indexer)
         - FlashMLA: Multi-head latent attention with low-rank KV compression
         - MultiLatentRaggedPageAttention: MLA ragged paged attention with cache updates
+        - MultiLatentRaggedPageAttentionV2: MLA ragged paged attention v2
 
 Linear Recurrent Models:
     - RWKV4: Linear attention with time-decay
@@ -88,6 +92,8 @@ from .operations import (
     ChunkedPrefillPagedDecodeConfig,
     DecodeAttention,
     DecodeAttentionConfig,
+    DeepSeekAttention,
+    DeepSeekAttentionConfig,
     FlashAttention,
     FlashAttentionConfig,
     FlashMLA,
@@ -106,6 +112,8 @@ from .operations import (
     MeanPoolingConfig,
     MultiLatentRaggedPageAttention,
     MultiLatentRaggedPageAttentionConfig,
+    MultiLatentRaggedPageAttentionV2,
+    MultiLatentRaggedPageAttentionV2Config,
     NativeSparseAttention,
     NativeSparseAttentionConfig,
     PageAttention,
@@ -118,8 +126,12 @@ from .operations import (
     RaggedDecodeAttentionConfig,
     RaggedPageAttentionv2,
     RaggedPageAttentionv2Config,
+    RaggedPageAttentionv2TurboQuant,
+    RaggedPageAttentionv2TurboQuantConfig,
     RaggedPageAttentionv3,
     RaggedPageAttentionv3Config,
+    RaggedPageAttentionv3TurboQuant,
+    RaggedPageAttentionv3TurboQuantConfig,
     RecurrentAttention,
     RecurrentAttentionConfig,
     ReduceScatterMatmul,
@@ -144,6 +156,7 @@ from .operations import (
     blocksparse_attention,
     chunked_prefill_paged_decode,
     decode_attention,
+    deepseek_attn,
     flash_attention,
     flash_mla,
     gated_delta_rule,
@@ -155,13 +168,16 @@ from .operations import (
     lightning_attention,
     mean_pooling,
     multi_latent_ragged_page_attention,
+    multi_latent_ragged_page_attention_v2,
     native_sparse_attention,
     page_attention,
     prefill_page_attention,
     quantized_matmul,
     ragged_decode_attention,
     ragged_page_attention_v2,
+    ragged_page_attention_v2_turboquant,
     ragged_page_attention_v3,
+    ragged_page_attention_v3_turboquant,
     recurrent_attention,
     reduce_scatter_matmul,
     ring_attention,
@@ -189,6 +205,8 @@ __all__ = (
     "ChunkedPrefillPagedDecodeConfig",
     "DecodeAttention",
     "DecodeAttentionConfig",
+    "DeepSeekAttention",
+    "DeepSeekAttentionConfig",
     "FlashAttention",
     "FlashAttentionConfig",
     "FlashMLA",
@@ -207,6 +225,8 @@ __all__ = (
     "MeanPoolingConfig",
     "MultiLatentRaggedPageAttention",
     "MultiLatentRaggedPageAttentionConfig",
+    "MultiLatentRaggedPageAttentionV2",
+    "MultiLatentRaggedPageAttentionV2Config",
     "NativeSparseAttention",
     "NativeSparseAttentionConfig",
     "PageAttention",
@@ -224,8 +244,12 @@ __all__ = (
     "RaggedDecodeAttentionConfig",
     "RaggedPageAttentionv2",
     "RaggedPageAttentionv2Config",
+    "RaggedPageAttentionv2TurboQuant",
+    "RaggedPageAttentionv2TurboQuantConfig",
     "RaggedPageAttentionv3",
     "RaggedPageAttentionv3Config",
+    "RaggedPageAttentionv3TurboQuant",
+    "RaggedPageAttentionv3TurboQuantConfig",
     "RecurrentAttention",
     "RecurrentAttentionConfig",
     "ReduceScatterMatmul",
@@ -245,6 +269,7 @@ __all__ = (
     "blocksparse_attention",
     "chunked_prefill_paged_decode",
     "decode_attention",
+    "deepseek_attn",
     "flash_attention",
     "flash_mla",
     "gated_delta_rule",
@@ -256,13 +281,16 @@ __all__ = (
     "lightning_attention",
     "mean_pooling",
     "multi_latent_ragged_page_attention",
+    "multi_latent_ragged_page_attention_v2",
     "native_sparse_attention",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",
     "ragged_decode_attention",
     "ragged_page_attention_v2",
+    "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",
+    "ragged_page_attention_v3_turboquant",
     "recurrent_attention",
     "reduce_scatter_matmul",
     "ring_attention",

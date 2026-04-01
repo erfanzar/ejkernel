@@ -118,17 +118,26 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         - Dynamic routing architectures
     """
 
-    def __init__(self, use_v2: bool = False):
+    def __init__(self, version: int = 1):
         """Initialize Grouped Matmul module.
 
         Sets up the kernel with the operation identifier for registry lookup
         and configuration management.
 
         Args:
-            use_v2: If True, use the v2 implementation of grouped matmul
-                which may have different performance characteristics.
+            version: Grouped matmul implementation version to dispatch.
+                Supported values are 1, 2, and 3.
         """
-        super().__init__(op_id="grouped_matmulv2" if use_v2 else "grouped_matmul")
+        match version:
+            case 1:
+                op_id = "grouped_matmul"
+            case 2:
+                op_id = "grouped_matmulv2"
+            case 3:
+                op_id = "grouped_matmulv3"
+            case _:
+                raise ValueError(f"Unsupported grouped matmul version: {version}")
+        super().__init__(op_id=op_id)
 
     def get_impl(self, cfg: GroupedMatmulConfig):
         """Get kernel implementation from registry.
@@ -153,6 +162,8 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         preferred_element_type: DTypeLike = jnp.float32,
         group_offset: Int[Array, "..."] | None = None,
         existing_out: Float[Array, "m n"] | None = None,
+        rhs_scale: Float[Array, "num_groups num_blocks 1 n"] | None = None,
+        rhs_bias: Float[Array, "num_groups 1 n"] | None = None,
         transpose_rhs: bool = False,
         interpret: bool = False,
         do_padding: bool = True,
@@ -216,6 +227,8 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
                 preferred_element_type=preferred_element_type,
                 group_offset=group_offset,
                 existing_out=existing_out,
+                rhs_scale=rhs_scale,
+                rhs_bias=rhs_bias,
                 transpose_rhs=transpose_rhs,
                 interpret=interpret,
                 precision=precision,
@@ -255,6 +268,8 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         preferred_element_type: DTypeLike = jnp.float32,
         group_offset: Int[Array, "..."] | None = None,
         existing_out: Float[Array, "m n"] | None = None,
+        rhs_scale: Float[Array, "num_groups num_blocks 1 n"] | None = None,
+        rhs_bias: Float[Array, "num_groups 1 n"] | None = None,
         transpose_rhs: bool = False,
         interpret: bool = False,
         do_padding: bool = True,
@@ -290,6 +305,9 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         if preferred_element_type is None:
             preferred_element_type = jnp.float32
 
+        if self.op_id != "grouped_matmulv3" and (rhs_scale is not None or rhs_bias is not None):
+            raise ValueError("rhs_scale and rhs_bias are only supported by grouped_matmulv3.")
+
         if platform is not None:
             cfg = GroupedMatmulConfig(
                 block_m=cfg.block_m,
@@ -317,7 +335,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
                     lhs = jax.lax.pad(lhs, jnp.array(0.0, dtype=lhs.dtype), [(0, padded_size, 0), (0, 0, 0)])
             tiling = (min(cfg.block_m, mSize), min(cfg.block_k, kSize), min(cfg.block_n, nSize))
 
-        out = impl(
+        impl_kwargs = dict(
             lhs=lhs,
             rhs=rhs,
             group_sizes=group_sizes,
@@ -329,6 +347,10 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
             interpret=interpret,
             precision=precision,
         )
+        if self.op_id == "grouped_matmulv3":
+            impl_kwargs["rhs_scale"] = rhs_scale
+            impl_kwargs["rhs_bias"] = rhs_bias
+        out = impl(**impl_kwargs)
         if do_padding and padded_size > 0:
             out = out[:mSize]
         return out
@@ -422,11 +444,14 @@ def grouped_matmul(
     /,
     *,
     preferred_element_type: DTypeLike = jnp.float32,
+    rhs_scale: Float[Array, "num_groups num_blocks 1 n"] | None = None,
+    rhs_bias: Float[Array, "num_groups 1 n"] | None = None,
     transpose_rhs: bool = False,
     interpret: bool = False,
     do_padding: bool = True,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     use_v2: bool = False,
+    use_v3: bool = False,
     out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
     platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
     cfg: GroupedMatmulConfig | None = None,
@@ -469,18 +494,25 @@ def grouped_matmul(
         >>> out = grouped_matmul(..., platform="pallas")
     """
 
+    if use_v2 and use_v3:
+        raise ValueError("use_v2 and use_v3 are mutually exclusive.")
+
+    version = 3 if use_v3 else 2 if use_v2 else 1
+
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
 
     return _grouped_matmul_executor(
-        GroupedMatmul(use_v2=use_v2),
+        GroupedMatmul(version=version),
         lhs=lhs,
         rhs=rhs,
         group_sizes=group_sizes,
         preferred_element_type=preferred_element_type,
         group_offset=group_offset,
         existing_out=existing_out,
+        rhs_scale=rhs_scale,
+        rhs_bias=rhs_bias,
         transpose_rhs=transpose_rhs,
         interpret=interpret,
         do_padding=do_padding,

@@ -373,7 +373,7 @@ def _chunk_gdr_fwd_core(
         state_decayed = state * g_end_exp_i[:, :, None, None]
         k_scaled = k_i * g_diff_exp_i[:, :, :, None]
         state_update = jnp.einsum("bhik,bhiv->bhkv", k_scaled, v_new, precision=_MATMUL_PRECISION)
-        new_state = state_decayed + state_update
+        new_state = (state_decayed + state_update).astype(state.dtype)
 
         return new_state, core_out.astype(input_dtype)
 

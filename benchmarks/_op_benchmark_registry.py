@@ -434,6 +434,17 @@ def _cfgs_kernel_delta():
     return _limit_configs(configs)
 
 
+def _cfgs_gdr():
+    """Generate benchmark configs for gated delta rule."""
+    configs = _grid(
+        batch=[1, 2, 4],
+        seq=[128, 256, 512, 1024],
+        heads=[4, 8],
+        dim=[64, 128],
+    )
+    return _limit_configs(configs)
+
+
 def _cfgs_lightning():
     """Generate benchmark configs for lightning attention."""
     configs = _grid(
@@ -1011,6 +1022,23 @@ def _gen_kernel_delta_inputs(config: dict[str, Any]):
     return q, k, v, beta
 
 
+def _gen_gdr_inputs(config: dict[str, Any]):
+    """Generate q, k, v, beta, decay tensors for gated delta rule."""
+    batch = config.get("batch", 2)
+    seq = config.get("seq", 128)
+    heads = config.get("heads", 4)
+    dim = config.get("dim", 64)
+    dtype = config.get("dtype", _default_dtype())
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+    q = jax.random.normal(k1, (batch, seq, heads, dim), dtype=dtype)
+    k = jax.random.normal(k2, (batch, seq, heads, dim), dtype=dtype)
+    v = jax.random.normal(k3, (batch, seq, heads, dim), dtype=dtype)
+    beta = jax.nn.sigmoid(jax.random.normal(k4, (batch, seq, heads), dtype=jnp.float32))
+    decay = jax.random.normal(k5, (batch, seq, heads), dtype=jnp.float32) * -0.01
+    return q, k, v, beta, decay
+
+
 def _gen_lightning_inputs(config: dict[str, Any]):
     """Generate q, k, v, layer_idx, num_layers for lightning attention."""
     q, k, v, _, _ = _gen_mha_inputs(config)
@@ -1265,6 +1293,14 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         op_fn=ops.kernel_delta_attention,
         input_generator=_gen_kernel_delta_inputs,
         configs=_cfgs_kernel_delta(),
+    ),
+    "gated_delta_rule": OpBenchmarkSpec(
+        op_name="gated_delta_rule",
+        algorithm="gated_delta_rule",
+        op_fn=ops.gated_delta_rule,
+        input_generator=_gen_gdr_inputs,
+        configs=_cfgs_gdr(),
+        bench_bwd=True,
     ),
     "lightning_attention": OpBenchmarkSpec(
         op_name="lightning_attention",

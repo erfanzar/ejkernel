@@ -30,6 +30,7 @@ Available Operations:
         - attention: Standard multi-head attention
         - flash_attention: Memory-efficient attention with tiling
         - flash_mla: Multi-head Latent Attention (MLA)
+        - deepseek_attn: DeepSeek Sparse Attention (MLA + Lightning Indexer)
         - blocksparse_attention: Block-sparse attention patterns
         - native_sparse_attention: Sparse attention with flexible patterns
         - ring_attention: Distributed ring attention for long sequences
@@ -39,6 +40,7 @@ Available Operations:
     Page/Serving Attention:
         - page_attention: Paged KV-cache attention
         - multi_latent_ragged_page_attention: MLA ragged paged attention
+        - multi_latent_ragged_page_attention_v2: MLA ragged paged attention v2
         - ragged_page_attention_v2/v3: Variable-length page attention
         - ragged_decode_attention: Decode-phase attention
 
@@ -68,22 +70,27 @@ from .attention import attention
 from .blocksparse_attention import blocksparse_attention
 from .chunked_prefill_paged_decode import chunked_prefill_paged_decode
 from .decode_attention import decode_attention
+from .deepseek_attn import deepseek_attn
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
 from .gated_delta_rule import gated_delta_rule
 from .gla import recurrent_gla
 from .grouped_matmul import grouped_matmul
+from .grouped_matmulv3 import grouped_matmulv3
 from .kernel_delta_attention import kda, kda_decay, kernel_delta_attention
 from .lightning_attn import lightning_attn
 from .mean_pooling import mean_pooling
 from .multi_latent_ragged_page_attention import multi_latent_ragged_page_attention
+from .multi_latent_ragged_page_attention_v2 import multi_latent_ragged_page_attention_v2
 from .native_sparse_attention import apply_native_sparse_attention
 from .page_attention import page_attention
 from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
 from .ragged_page_attention_v2 import ragged_page_attention_v2
+from .ragged_page_attention_v2_turboquant import ragged_page_attention_v2_turboquant
 from .ragged_page_attention_v3 import ragged_page_attention_v3
+from .ragged_page_attention_v3_turboquant import ragged_page_attention_v3_turboquant
 from .recurrent import recurrent
 from .reduce_scatter_matmul import reduce_scatter_matmul
 from .ring_attention import ring_attention
@@ -102,22 +109,27 @@ __all__ = [
     "blocksparse_attention",
     "chunked_prefill_paged_decode",
     "decode_attention",
+    "deepseek_attn",
     "flash_attention",
     "flash_mla",
     "gated_delta_rule",
     "grouped_matmul",
+    "grouped_matmulv3",
     "kda",
     "kda_decay",
     "kernel_delta_attention",
     "lightning_attn",
     "mean_pooling",
     "multi_latent_ragged_page_attention",
+    "multi_latent_ragged_page_attention_v2",
     "page_attention",
     "prefill_page_attention",
     "quantized_matmul",
     "ragged_decode_attention",
     "ragged_page_attention_v2",
+    "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",
+    "ragged_page_attention_v3_turboquant",
     "recurrent",
     "recurrent_gla",
     "reduce_scatter_matmul",

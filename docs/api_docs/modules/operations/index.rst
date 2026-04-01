@@ -10,6 +10,7 @@ ejkernel.modules.operations package
    chunked_prefill_paged_decode
    configs
    decode_attention
+   deepseek_attn
    flash_attention
    gated_delta_rule
    gated_linear_attention
@@ -18,6 +19,7 @@ ejkernel.modules.operations package
    lightning_attention
    multi_head_latent_attention
    multi_latent_ragged_page_attention
+   multi_latent_ragged_page_attention_v2
    native_sparse_attention
    page_attention
    pooling
@@ -25,7 +27,9 @@ ejkernel.modules.operations package
    quantized_matmul
    ragged_decode_attention
    ragged_page_attention_v2
+   ragged_page_attention_v2_turboquant
    ragged_page_attention_v3
+   ragged_page_attention_v3_turboquant
    recurrent
    reduce_scatter_matmul
    ring_attention

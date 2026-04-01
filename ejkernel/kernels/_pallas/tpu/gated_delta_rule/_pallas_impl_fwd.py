@@ -33,14 +33,16 @@ from jaxtyping import Array, Float
 
 from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_with_inv
 
-_P = lax.Precision.HIGHEST
+_P = lax.Precision.DEFAULT
 
 
 def _dot(a, b):
+    """Matrix multiply with the module-level precision setting."""
     return lax.dot(a, b, precision=_P)
 
 
 def _chunk_blockspec(shape: tuple[int, ...]) -> pl.BlockSpec:
+    """Create a Pallas BlockSpec indexed by ``(batch, head)`` with remaining axes at 0."""
     return pl.BlockSpec(shape, lambda b, h: (b, h, *([0] * (len(shape) - 2))))
 
 
@@ -140,6 +142,7 @@ def _gdr_fused_fwd_kernel(
 
 
 def _run_fused_fwd_step(q_chunk, k_chunk, v_chunk, beta_chunk, decay_chunk, state):
+    """Launch the fused Pallas kernel for one chunk and return (output, new_state)."""
     bsz, num_heads, C, qk_dim = q_chunk.shape
     v_dim = v_chunk.shape[-1]
     call = pl.pallas_call(
@@ -181,6 +184,15 @@ def _chunk_gdr_fwd_core(
     *,
     save_residual: bool,
 ):
+    """Core chunked GDR forward: chunk inputs, scan over chunks, collect outputs.
+
+    Optionally saves residuals (pre-scan states, chunked inputs, L2-norm
+    inverses) for the backward pass.
+
+    Returns:
+        ``(output, final_state, residual)`` where *residual* is None when
+        ``save_residual=False``.
+    """
     B, H, L, K_dim = query.shape
     V_dim = value.shape[-1]
     input_dtype = query.dtype
@@ -229,6 +241,7 @@ def _chunk_gdr_fwd_core(
     )
 
     def chunk_step(state, inputs):
+        """Single scan step: run fused kernel on one chunk, return new state."""
         q_i, k_i, v_i, b_i, d_i = inputs
         core_out, new_state = _run_fused_fwd_step(q_i, k_i, v_i, b_i, d_i, state)
         return new_state, (core_out, state)
@@ -264,6 +277,7 @@ def _chunk_gdr_fwd_core(
 
 
 def _chunk_gdr_fwd_impl(query, key, value, beta, decay, chunk_size, initial_state, use_qk_l2norm):
+    """Inference-only chunked GDR forward (no residuals saved)."""
     output, final_state, _ = _chunk_gdr_fwd_core(
         query,
         key,
@@ -297,6 +311,7 @@ def _chunk_gdr_fwd(
 
 
 def _chunk_gdr_fwd_rule(query, key, value, beta, decay, chunk_size, initial_state, use_qk_l2norm):
+    """Forward rule for ``custom_vjp``: run forward with residual saving."""
     output, final_state, residual = _chunk_gdr_fwd_core(
         query,
         key,
@@ -312,6 +327,7 @@ def _chunk_gdr_fwd_rule(query, key, value, beta, decay, chunk_size, initial_stat
 
 
 def _chunk_gdr_bwd_rule(chunk_size, use_qk_l2norm, res, g):
+    """Backward rule for ``custom_vjp``: delegates to the XLA analytical backward."""
     from ._pallas_impl_bwd import _chunk_gdr_bwd
 
     return _chunk_gdr_bwd(chunk_size, use_qk_l2norm, res, g)
@@ -321,6 +337,7 @@ _chunk_gdr_fwd.defvjp(_chunk_gdr_fwd_rule, _chunk_gdr_bwd_rule)
 
 
 def _gdr_single_step_fwd_kernel(q_ref, k_ref, v_ref, beta_ref, decay_ref, state_ref, out_ref, final_state_ref):
+    """Pallas kernel body for a single-token GDR update: decay state, apply delta rule, write output."""
     q_t = q_ref[0, 0, 0].astype(jnp.float32)
     k_t = k_ref[0, 0, 0].astype(jnp.float32)
     v_t = v_ref[0, 0, 0].astype(jnp.float32)
@@ -369,6 +386,7 @@ def _run_single_step_forward(query, key, value, beta, decay, recurrent_state):
 
 
 def _single_step_gdr_fwd_impl(query, key, value, beta, decay, recurrent_state, use_qk_l2norm):
+    """Single-step forward with optional L2-norm, saving residuals for backward."""
     input_dtype = query.dtype
     decay_was_none = decay is None
     q_inv_norm = k_inv_norm = None
@@ -428,6 +446,7 @@ def _single_step_gdr_fwd(
 
 
 def _single_step_gdr_fwd_rule(query, key, value, beta, decay, recurrent_state, use_qk_l2norm):
+    """Forward rule for single-step ``custom_vjp``: run forward with residuals."""
     output, final_state, residual = _single_step_gdr_fwd_impl(
         query,
         key,
@@ -441,6 +460,7 @@ def _single_step_gdr_fwd_rule(query, key, value, beta, decay, recurrent_state, u
 
 
 def _single_step_gdr_bwd_rule(use_qk_l2norm, res, g):
+    """Backward rule for single-step ``custom_vjp``: delegates to analytical backward."""
     from ._pallas_impl_bwd import _single_step_gdr_bwd
 
     return _single_step_gdr_bwd(use_qk_l2norm, res, g)

@@ -21,6 +21,7 @@ platform selection (XLA, Triton, Pallas, CUDA) and optional autotuning.
 
 Available Attention Variants:
     - Attention: Standard multi-head attention with XLA optimization
+    - DeepSeekAttention: DeepSeek Sparse Attention (MLA + Lightning Indexer)
     - FlashAttention: Memory-efficient O(N) complexity attention
     - FlashMLA: Multi-head latent attention with low-rank KV compression
     - GLAttention: Gated linear attention mechanism
@@ -30,7 +31,9 @@ Available Attention Variants:
     - PageAttention: Paged KV cache for serving workloads
     - PrefillPageAttention: Chunked prefill attention with paged KV cache
     - RaggedPageAttentionv2: Page attention for variable-length sequences
+    - RaggedPageAttentionv2TurboQuant: TurboQuant-compressed read-only page attention
     - RaggedPageAttentionv3: Advanced page attention for variable-length sequences v3
+    - RaggedPageAttentionv3TurboQuant: TurboQuant-compressed fused page attention
     - RecurrentAttention: Stateful recurrent attention
     - RingAttention: Distributed attention with ring topology
     - ScaledDotProductAttention: Standard scaled dot-product attention
@@ -49,6 +52,7 @@ Additional Operations:
     - GroupedMatmul: Efficient grouped matrix multiplication (for MoE)
     - MeanPooling: Sequence mean pooling operation
     - MultiLatentRaggedPageAttention: MLA ragged paged attention
+    - MultiLatentRaggedPageAttentionV2: MLA ragged paged attention v2
     - QuantizedMatmul: Packed uint32 quantized matmul
 
 Features:
@@ -96,6 +100,7 @@ from .configs import (
     BlockSparseAttentionConfig,
     ChunkedPrefillPagedDecodeConfig,
     DecodeAttentionConfig,
+    DeepSeekAttentionConfig,
     FlashAttentionConfig,
     FlashMLAConfig,
     GatedDeltaRuleConfig,
@@ -105,13 +110,16 @@ from .configs import (
     LightningAttentionConfig,
     MeanPoolingConfig,
     MultiLatentRaggedPageAttentionConfig,
+    MultiLatentRaggedPageAttentionV2Config,
     NativeSparseAttentionConfig,
     PageAttentionConfig,
     PrefillPageAttentionConfig,
     QuantizedMatmulConfig,
     RaggedDecodeAttentionConfig,
     RaggedPageAttentionv2Config,
+    RaggedPageAttentionv2TurboQuantConfig,
     RaggedPageAttentionv3Config,
+    RaggedPageAttentionv3TurboQuantConfig,
     RecurrentAttentionConfig,
     ReduceScatterMatmulConfig,
     RingAttentionConfig,
@@ -125,6 +133,7 @@ from .configs import (
     UnifiedAttentionConfig,
 )
 from .decode_attention import DecodeAttention, decode_attention
+from .deepseek_attn import DeepSeekAttention, deepseek_attn
 from .flash_attention import FlashAttention, flash_attention
 from .gated_delta_rule import GatedDeltaRule, gated_delta_rule
 from .gated_linear_attention import GLAttention, gla_attention
@@ -136,6 +145,10 @@ from .multi_latent_ragged_page_attention import (
     MultiLatentRaggedPageAttention,
     multi_latent_ragged_page_attention,
 )
+from .multi_latent_ragged_page_attention_v2 import (
+    MultiLatentRaggedPageAttentionV2,
+    multi_latent_ragged_page_attention_v2,
+)
 from .native_sparse_attention import NativeSparseAttention, native_sparse_attention
 from .page_attention import PageAttention, page_attention
 from .pooling import MeanPooling, mean_pooling
@@ -143,7 +156,15 @@ from .prefill_page_attention import PrefillPageAttention, prefill_page_attention
 from .quantized_matmul import QuantizedMatmul, quantized_matmul
 from .ragged_decode_attention import RaggedDecodeAttention, ragged_decode_attention
 from .ragged_page_attention_v2 import RaggedPageAttentionv2, ragged_page_attention_v2
+from .ragged_page_attention_v2_turboquant import (
+    RaggedPageAttentionv2TurboQuant,
+    ragged_page_attention_v2_turboquant,
+)
 from .ragged_page_attention_v3 import RaggedPageAttentionv3, ragged_page_attention_v3
+from .ragged_page_attention_v3_turboquant import (
+    RaggedPageAttentionv3TurboQuant,
+    ragged_page_attention_v3_turboquant,
+)
 from .recurrent import RecurrentAttention, recurrent_attention
 from .reduce_scatter_matmul import ReduceScatterMatmul, reduce_scatter_matmul
 from .ring_attention import RingAttention, ring_attention
@@ -171,6 +192,8 @@ __all__ = (
     "ChunkedPrefillPagedDecodeConfig",
     "DecodeAttention",
     "DecodeAttentionConfig",
+    "DeepSeekAttention",
+    "DeepSeekAttentionConfig",
     "FlashAttention",
     "FlashAttentionConfig",
     "FlashMLA",
@@ -189,6 +212,8 @@ __all__ = (
     "MeanPoolingConfig",
     "MultiLatentRaggedPageAttention",
     "MultiLatentRaggedPageAttentionConfig",
+    "MultiLatentRaggedPageAttentionV2",
+    "MultiLatentRaggedPageAttentionV2Config",
     "NativeSparseAttention",
     "NativeSparseAttentionConfig",
     "PageAttention",
@@ -207,8 +232,12 @@ __all__ = (
     "RaggedDecodeAttentionConfig",
     "RaggedPageAttentionv2",
     "RaggedPageAttentionv2Config",
+    "RaggedPageAttentionv2TurboQuant",
+    "RaggedPageAttentionv2TurboQuantConfig",
     "RaggedPageAttentionv3",
     "RaggedPageAttentionv3Config",
+    "RaggedPageAttentionv3TurboQuant",
+    "RaggedPageAttentionv3TurboQuantConfig",
     "RecurrentAttention",
     "RecurrentAttentionConfig",
     "ReduceScatterMatmul",
@@ -228,6 +257,7 @@ __all__ = (
     "blocksparse_attention",
     "chunked_prefill_paged_decode",
     "decode_attention",
+    "deepseek_attn",
     "flash_attention",
     "flash_mla",
     "gated_delta_rule",
@@ -239,6 +269,7 @@ __all__ = (
     "lightning_attention",
     "mean_pooling",
     "multi_latent_ragged_page_attention",
+    "multi_latent_ragged_page_attention_v2",
     "native_sparse_attention",
     "page_attention",
     "prefill_page_attention",
@@ -246,7 +277,9 @@ __all__ = (
     "quantized_matmul",
     "ragged_decode_attention",
     "ragged_page_attention_v2",
+    "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",
+    "ragged_page_attention_v3_turboquant",
     "recurrent_attention",
     "reduce_scatter_matmul",
     "ring_attention",

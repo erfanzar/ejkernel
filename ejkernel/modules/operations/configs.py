@@ -101,9 +101,10 @@ def hash_fn(self) -> int:
         Integer hash value derived from the object's attribute values.
 
     Note:
-        Only includes float, int, bool, dict, and list attributes in the hash.
+        Only includes float, int, bool, dict, list, and tuple attributes in
+        the hash.
     """
-    shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
+    shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list | tuple))
     return get_safe_hash_int(shu)
 
 
@@ -530,6 +531,41 @@ class RaggedPageAttentionv2Config(BaseOperationConfig):
 
 
 @dataclass
+class RaggedPageAttentionv2TurboQuantConfig(BaseOperationConfig):
+    """Configuration for Ragged Page Attention v2 with TurboQuant compression.
+
+    Controls the tiling strategy for the read-only TurboQuant-compressed
+    paged attention kernel.  The two block-size parameters determine how
+    queries and KV pages are grouped during the attention computation:
+
+    * Larger ``num_kv_pages_per_block`` reduces loop overhead but increases
+      per-iteration memory.
+    * Larger ``num_queries_per_block`` amortises the cost of pre-rotating
+      and pre-projecting queries across more tokens.
+
+    When either is ``None``, the kernel selects a default based on the
+    total number of pages per sequence.
+
+    Attributes:
+        num_kv_pages_per_block: Number of KV pages to process per block
+            in the inner attention loop.  ``None`` for automatic selection.
+        num_queries_per_block: Number of query tokens to process per block.
+            ``None`` defaults to 8.
+        num_warps: Kept for API parity with backend kernels (unused on XLA).
+        num_stages: Kept for API parity with backend kernels (unused on XLA).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: ``"any"``).
+    """
+
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RaggedPageAttentionv3Config(BaseOperationConfig):
     """Configuration for Ragged Page Attention operation.
 
@@ -540,6 +576,48 @@ class RaggedPageAttentionv3Config(BaseOperationConfig):
         num_stages: Number of pipeline stages (default: 1)
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
+    """
+
+    chunk_prefill_size: int | None = None
+    num_kv_pages_per_block: int | None = None
+    num_queries_per_block: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class RaggedPageAttentionv3TurboQuantConfig(BaseOperationConfig):
+    """Configuration for Ragged Page Attention v3 with TurboQuant compression.
+
+    Controls the tiling strategy for the fused compress-and-attend
+    TurboQuant paged attention kernel.  This extends the v2 config with
+    an additional ``chunk_prefill_size`` parameter for prefill workloads.
+
+    The two block-size parameters determine how queries and KV pages are
+    grouped during both the compression phase and the attention computation:
+
+    * Larger ``num_kv_pages_per_block`` reduces loop overhead but increases
+      per-iteration memory.
+    * Larger ``num_queries_per_block`` amortises pre-rotation/pre-projection
+      cost and batches more tokens in the KV-write phase.
+
+    When either is ``None``, the kernel selects a default based on the
+    total number of pages per sequence.
+
+    Attributes:
+        chunk_prefill_size: Optional chunk size for prefill workloads.
+            Accepted for API parity with the standard RPA v3 config;
+            currently unused in the XLA TurboQuant backend.
+        num_kv_pages_per_block: Number of KV pages to process per block
+            in the inner attention loop.  ``None`` for automatic selection.
+        num_queries_per_block: Number of query tokens to process per block.
+            ``None`` defaults to 8.
+        num_warps: Kept for API parity with backend kernels (unused on XLA).
+        num_stages: Kept for API parity with backend kernels (unused on XLA).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: ``"any"``).
     """
 
     chunk_prefill_size: int | None = None
@@ -572,6 +650,67 @@ class MultiLatentRaggedPageAttentionConfig(BaseOperationConfig):
     vmem_limit_bytes: int | None = None
     num_warps: int = 4
     num_stages: int = 1
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class MultiLatentRaggedPageAttentionV2Config(BaseOperationConfig):
+    """Configuration for Multi-Latent Ragged Page Attention v2.
+
+    Args:
+        chunk_prefill_size: Optional chunk size for prefill sequences.
+        num_kv_pages_per_block: KV pages per kernel block. May be a single
+            int or a `(decode, prefill, mixed)` tuple.
+        num_queries_per_block: Queries per kernel block. May be a single int
+            or a `(decode, prefill, mixed)` tuple.
+        vmem_limit_bytes: Optional TPU VMEM hint for Pallas backend.
+        num_warps: Kept for API consistency (unused on XLA/Pallas paths).
+        num_stages: Kept for API consistency (unused on XLA/Pallas paths).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
+
+    chunk_prefill_size: int | None = None
+    num_kv_pages_per_block: tuple[int, int, int] | int | None = None
+    num_queries_per_block: tuple[int, int, int] | int | None = None
+    vmem_limit_bytes: int | None = None
+    num_warps: int = 4
+    num_stages: int = 1
+
+    def __post_init__(self):
+        """Normalize list-based JSON payloads back into tuples."""
+
+        def _normalize(
+            value: tuple[int, int, int] | list[int] | int | None,
+            field_name: str,
+        ) -> tuple[int, int, int] | int | None:
+            """Convert JSON-deserialized lists back to tuples and validate length.
+
+            Args:
+                value: Block-size value — may be a tuple, list, int, or None.
+                field_name: Config field name (for error messages).
+
+            Returns:
+                Validated value as tuple, int, or None.
+
+            Raises:
+                ValueError: If a tuple/list with length != 3 is provided.
+            """
+            if isinstance(value, list):
+                value = tuple(value)
+            if isinstance(value, tuple) and len(value) != 3:
+                raise ValueError(f"{field_name} must have exactly three entries.")
+            return value
+
+        self.num_kv_pages_per_block = _normalize(
+            self.num_kv_pages_per_block,
+            "num_kv_pages_per_block",
+        )
+        self.num_queries_per_block = _normalize(
+            self.num_queries_per_block,
+            "num_queries_per_block",
+        )
 
     __hash__ = hash_fn
 
@@ -765,6 +904,35 @@ class FlashMLAConfig(BaseOperationConfig):
         backend: Backend specification (default: "any")
     """
 
+    block_q: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class DeepSeekAttentionConfig(BaseOperationConfig):
+    """Configuration for DeepSeek Sparse Attention (DSA) operation.
+
+    DSA combines MLA attention with a Lightning Indexer that dynamically
+    selects top-k KV tokens per query, reducing complexity from O(L^2) to O(L*k).
+
+    Args:
+        index_topk: Number of KV tokens to select per query (default: 2048).
+        block_q: Query block size for tiled implementations (default: 128).
+        block_k: Key block size for tiled implementations (default: 128).
+        num_warps: Number of warps for Triton kernels (default: 4).
+        num_stages: Number of pipeline stages (default: 2).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+
+    Reference:
+        DeepSeek-V3.2: https://arxiv.org/abs/2512.02556
+    """
+
+    index_topk: int = 2048
     block_q: int = 128
     block_k: int = 128
     num_warps: int = 4
