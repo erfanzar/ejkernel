@@ -290,7 +290,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         Returns:
             Configuration matching the caller's chunk_size.
         """
-        return GatedDeltaRuleConfig(chunk_size=64, platform="auto", backend="any")
+        return GatedDeltaRuleConfig(chunk_size=256, platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[GatedDeltaRuleConfig, Array]):
         """Generate candidate configurations for chunk-size autotuning.
@@ -306,7 +306,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
             List of GatedDeltaRuleConfig candidates to benchmark.
         """
 
-        cands = [32, 64]
+        cands = [128, 256]
         return [GatedDeltaRuleConfig(chunk_size=c, platform="auto", backend="any") for c in cands]
 
     heuristic_cfg_shard_map = heuristic_cfg

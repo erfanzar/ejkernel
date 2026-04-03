@@ -31,7 +31,107 @@ from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float
 
 from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_bwd
-from ._pallas_impl_fwd import _chunk_blockspec, _dot, _neumann_inv
+from ._pallas_impl_fwd import _N_FUSE, _chunk_blockspec, _dot, _neumann_inv
+
+
+def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
+    """Backward for a single chunk. Returns (d_state, d_q, d_k, d_v, d_beta, d_decay)."""
+    lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
+    strict_lower = lower_mask - jnp.eye(C, dtype=jnp.float32)
+    upper_mask = jnp.triu(jnp.ones((C, C), dtype=jnp.float32))
+
+    v_beta = v * beta[:, None]
+    k_beta = k * beta[:, None]
+
+    g_cumsum = jnp.sum(lower_mask * decay[None, :], axis=1, keepdims=True)
+    g_diff = g_cumsum - g_cumsum.T
+    decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
+
+    attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
+    attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
+    attn = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
+
+    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))
+    g_end = g_cumsum[C - 1 : C, :]
+    g_end_exp = jnp.exp(jnp.clip(g_end, -20.0, 20.0))
+    g_diff_state_exp = jnp.exp(jnp.clip(g_end - g_cumsum, -20.0, 20.0))
+
+    def _s(x):
+        return jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    k_beta_scaled = k_beta * g_cumsum_exp
+    value_local = _s(_dot(attn, v_beta))
+    k_cumdecay = _s(_dot(attn, k_beta_scaled))
+
+    attn_qk_base = _dot(q, k.T)
+    attn_qk = _s(attn_qk_base * decay_mask)
+    q_scaled = q * g_cumsum_exp
+    v_prime = _s(_dot(k_cumdecay, state_pre))
+    v_new = _s(value_local - v_prime)
+    k_scaled = k * g_diff_state_exp
+
+    d_state = _s(d_state_next * g_end_exp)
+    d_g_end = jnp.sum(d_state_next * state_pre)
+
+    d_k_scaled = _s(_dot(v_new, d_state_next.T))
+    d_v_new = _s(_dot(k_scaled, d_state_next))
+    d_attn_qk = _s(_dot(d_out, v_new.T))
+    d_v_new = _s(d_v_new + _dot(attn_qk.T, d_out))
+
+    d_value_local = d_v_new
+    d_v_prime = -d_v_new
+
+    d_k_cumdecay = _s(_dot(d_v_prime, state_pre.T))
+    d_state = _s(d_state + _dot(k_cumdecay.T, d_v_prime))
+    d_q_scaled = _s(_dot(d_out, state_pre.T))
+    d_state = _s(d_state + _dot(q_scaled.T, d_out))
+
+    d_q = d_q_scaled * g_cumsum_exp
+    d_g_exp = jnp.sum(d_q_scaled * q, axis=-1, keepdims=True)
+    d_k = d_k_scaled * g_diff_state_exp
+    d_g_diff = jnp.sum(d_k_scaled * k, axis=-1, keepdims=True)
+
+    d_attn_qk_base = _s(d_attn_qk * decay_mask)
+    d_decay_mask_from_qk = d_attn_qk * attn_qk_base
+    d_q = d_q + _dot(d_attn_qk_base, k)
+    d_k = d_k + _dot(d_attn_qk_base.T, q)
+
+    d_attn = _s(_dot(d_value_local, v_beta.T) + _dot(d_k_cumdecay, k_beta_scaled.T))
+    d_value_beta = _s(_dot(attn.T, d_value_local))
+    d_key_beta_scaled = _s(_dot(attn.T, d_k_cumdecay))
+
+    d_key_beta = d_key_beta_scaled * g_cumsum_exp
+    d_g_exp = d_g_exp + jnp.sum(d_key_beta_scaled * k_beta, axis=-1, keepdims=True)
+
+    tmp = _dot(attn.T, d_attn)
+    d_k_attn = _s(-_dot(tmp, attn.T))
+    d_k_attn = d_k_attn * strict_lower
+
+    kk = _dot(k_beta, k.T)
+    d_kk = d_k_attn * decay_mask
+    d_decay_mask = _s((d_decay_mask_from_qk + d_k_attn * kk) * lower_mask)
+
+    d_key_beta = d_key_beta + _dot(d_kk, k)
+    d_k = d_k + _dot(d_kk.T, k_beta)
+
+    d_v = d_value_beta * beta[:, None]
+    d_beta = jnp.sum(d_value_beta * v, axis=-1, keepdims=True)
+    d_k = d_k + d_key_beta * beta[:, None]
+    d_beta = d_beta + jnp.sum(d_key_beta * k, axis=-1, keepdims=True)
+
+    d_decay_f = _s(d_decay_mask * decay_mask)
+    d_g_row = jnp.sum(d_decay_f, axis=-1, keepdims=True)
+    d_g_col = jnp.sum(d_decay_f.T, axis=1, keepdims=True)
+    d_g = d_g_row - d_g_col
+    d_g = d_g + d_g_exp * g_cumsum_exp
+
+    d_g_diff_term = d_g_diff * g_diff_state_exp
+    d_g_end_total = jnp.sum(d_g_diff_term) + d_g_end * g_end_exp
+    d_g = d_g - d_g_diff_term
+    d_decay_final = _dot(upper_mask, d_g) + d_g_end_total
+
+    d_state = _s(d_state)
+    return d_state, d_q, d_k, d_v, d_beta, d_decay_final
 
 
 def _gdr_bwd_grad_kernel(
@@ -50,158 +150,68 @@ def _gdr_bwd_grad_kernel(
     d_beta_ref,
     d_decay_ref,
 ):
-    """Reverse gradient scan step with full recomputation, all in VMEM.
+    """Reverse gradient scan step processing N_FUSE chunks per kernel call."""
+    total_rows = q_ref.shape[2]
+    C = total_rows // _N_FUSE
 
-    Recomputes Neumann series, decay masks, and all forward intermediates
-    from raw (q, k, v, beta, decay, state_pre), then computes final
-    d_q, d_k, d_v, d_beta, d_decay for a single chunk.
-    """
-    C = q_ref.shape[2]
-    K = q_ref.shape[3]
-    V = v_ref.shape[3]
-    ones_K = jnp.ones((K, 1), dtype=jnp.float32)
-    ones_V = jnp.ones((V, 1), dtype=jnp.float32)
-    ones_C = jnp.ones((C, 1), dtype=jnp.float32)
-
-    state_pre = state_pre_ref[0, 0].astype(jnp.float32)
-    state_pre = jnp.nan_to_num(state_pre, nan=0.0, posinf=0.0, neginf=0.0)
-    q = q_ref[0, 0].astype(jnp.float32)
-    k = k_ref[0, 0].astype(jnp.float32)
-    v = v_ref[0, 0].astype(jnp.float32)
-    beta = beta_ref[0, 0, :, 0].astype(jnp.float32)
-    decay = decay_ref[0, 0, :, 0].astype(jnp.float32)
-    d_out = d_out_ref[0, 0].astype(jnp.float32)
-    d_out = jnp.nan_to_num(d_out, nan=0.0, posinf=0.0, neginf=0.0)
     d_state_next = d_state_next_ref[0, 0].astype(jnp.float32)
     d_state_next = jnp.nan_to_num(d_state_next, nan=0.0, posinf=0.0, neginf=0.0)
 
-    lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
-    strict_lower = lower_mask - jnp.eye(C, dtype=jnp.float32)
-    upper_mask = jnp.triu(jnp.ones((C, C), dtype=jnp.float32))
+    # Process chunks in REVERSE order within the fused group
+    for i in range(_N_FUSE - 1, -1, -1):
+        s = i * C
+        q = q_ref[0, 0, s : s + C].astype(jnp.float32)
+        k = k_ref[0, 0, s : s + C].astype(jnp.float32)
+        v = v_ref[0, 0, s : s + C].astype(jnp.float32)
+        beta = beta_ref[0, 0, 0, i * C : (i + 1) * C]
+        decay = decay_ref[0, 0, 0, i * C : (i + 1) * C]
+        d_out = d_out_ref[0, 0, s : s + C].astype(jnp.float32)
+        # For state_pre: need the state BEFORE this chunk was processed.
+        # state_pre_ref holds the state before the FIRST chunk in the fused group.
+        # For subsequent chunks, we need to recompute state by running forward.
+        if i == 0:
+            state_pre = state_pre_ref[0, 0].astype(jnp.float32)
+            state_pre = jnp.nan_to_num(state_pre, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            # Recompute state_pre for chunk i by running forward chunks 0..i-1
+            from ._pallas_impl_fwd import _process_one_chunk
 
-    v_beta = v * beta[:, None]
-    k_beta = k * beta[:, None]
+            sp = state_pre_ref[0, 0].astype(jnp.float32)
+            sp = jnp.nan_to_num(sp, nan=0.0, posinf=0.0, neginf=0.0)
+            for j in range(i):
+                sj = j * C
+                qj = q_ref[0, 0, sj : sj + C].astype(jnp.float32)
+                kj = k_ref[0, 0, sj : sj + C].astype(jnp.float32)
+                vj = v_ref[0, 0, sj : sj + C].astype(jnp.float32)
+                bj = beta_ref[0, 0, 0, j * C : (j + 1) * C]
+                dj = decay_ref[0, 0, 0, j * C : (j + 1) * C]
+                _, sp = _process_one_chunk(qj, kj, vj, bj, dj, sp, C)
+            state_pre = sp
 
-    g_cumsum = _dot(lower_mask, decay)
-    g_diff = g_cumsum[:, None] - g_cumsum[None, :]
-    decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
+        d_st, d_q_c, d_k_c, d_v_c, d_beta_c, d_decay_c = _bwd_one_chunk(
+            q,
+            k,
+            v,
+            beta,
+            decay,
+            d_out,
+            state_pre,
+            d_state_next,
+            C,
+        )
+        d_state_next = jnp.nan_to_num(d_st, nan=0.0, posinf=0.0, neginf=0.0)
 
-    attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
-    attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
-    attn = _neumann_inv(attn_neg, C)
-    attn = jnp.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
+        d_q_ref[0, 0, s : s + C] = jnp.nan_to_num(d_q_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_q_ref.dtype)
+        d_k_ref[0, 0, s : s + C] = jnp.nan_to_num(d_k_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_k_ref.dtype)
+        d_v_ref[0, 0, s : s + C] = jnp.nan_to_num(d_v_c, nan=0.0, posinf=0.0, neginf=0.0).astype(d_v_ref.dtype)
+        d_beta_ref[0, 0, s : s + C, :] = jnp.nan_to_num(d_beta_c, nan=0.0, posinf=0.0, neginf=0.0).astype(
+            d_beta_ref.dtype
+        )
+        d_decay_ref[0, 0, s : s + C, :] = jnp.nan_to_num(d_decay_c, nan=0.0, posinf=0.0, neginf=0.0).astype(
+            d_decay_ref.dtype
+        )
 
-    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))
-    g_end = g_cumsum[C - 1]
-    g_end_exp = jnp.exp(jnp.clip(g_end, -20.0, 20.0))
-    g_diff_state_exp = jnp.exp(jnp.clip(g_end - g_cumsum, -20.0, 20.0))
-
-    k_beta_scaled = k_beta * g_cumsum_exp[:, None]
-    value_local = _dot(attn, v_beta)
-    value_local = jnp.nan_to_num(value_local, nan=0.0, posinf=0.0, neginf=0.0)
-    k_cumdecay = _dot(attn, k_beta_scaled)
-    k_cumdecay = jnp.nan_to_num(k_cumdecay, nan=0.0, posinf=0.0, neginf=0.0)
-
-    attn_qk_base = _dot(q, k.T)
-    attn_qk = attn_qk_base * decay_mask
-    attn_qk = jnp.where(lower_mask > 0.0, attn_qk, 0.0)
-    attn_qk = jnp.nan_to_num(attn_qk, nan=0.0, posinf=0.0, neginf=0.0)
-    q_scaled = q * g_cumsum_exp[:, None]
-    v_prime = _dot(k_cumdecay, state_pre)
-    v_prime = jnp.nan_to_num(v_prime, nan=0.0, posinf=0.0, neginf=0.0)
-    v_new = value_local - v_prime
-    v_new = jnp.nan_to_num(v_new, nan=0.0, posinf=0.0, neginf=0.0)
-    k_scaled = k * g_diff_state_exp[:, None]
-
-    d_state = d_state_next * g_end_exp
-    d_state = jnp.nan_to_num(d_state, nan=0.0, posinf=0.0, neginf=0.0)
-    d_g_end = _dot(ones_K.T, _dot(d_state_next * state_pre, ones_V))[0, 0]
-
-    d_k_scaled = _dot(v_new, d_state_next.T)
-    d_k_scaled = jnp.nan_to_num(d_k_scaled, nan=0.0, posinf=0.0, neginf=0.0)
-    d_v_new = _dot(k_scaled, d_state_next)
-    d_v_new = jnp.nan_to_num(d_v_new, nan=0.0, posinf=0.0, neginf=0.0)
-
-    d_attn_qk = _dot(d_out, v_new.T)
-    d_attn_qk = jnp.nan_to_num(d_attn_qk, nan=0.0, posinf=0.0, neginf=0.0)
-    d_v_new = d_v_new + _dot(attn_qk.T, d_out)
-    d_v_new = jnp.nan_to_num(d_v_new, nan=0.0, posinf=0.0, neginf=0.0)
-
-    d_value_local = d_v_new
-    d_v_prime = -d_v_new
-
-    d_k_cumdecay = _dot(d_v_prime, state_pre.T)
-    d_k_cumdecay = jnp.nan_to_num(d_k_cumdecay, nan=0.0, posinf=0.0, neginf=0.0)
-    d_state = d_state + _dot(k_cumdecay.T, d_v_prime)
-    d_state = jnp.nan_to_num(d_state, nan=0.0, posinf=0.0, neginf=0.0)
-
-    d_q_scaled = _dot(d_out, state_pre.T)
-    d_q_scaled = jnp.nan_to_num(d_q_scaled, nan=0.0, posinf=0.0, neginf=0.0)
-    d_state = d_state + _dot(q_scaled.T, d_out)
-    d_state = jnp.nan_to_num(d_state, nan=0.0, posinf=0.0, neginf=0.0)
-
-    d_q = d_q_scaled * g_cumsum_exp[:, None]
-    d_g_exp = _dot(d_q_scaled * q, ones_K)[:, 0]
-
-    d_k = d_k_scaled * g_diff_state_exp[:, None]
-    d_g_diff = _dot(d_k_scaled * k, ones_K)[:, 0]
-
-    d_attn_qk_base = d_attn_qk * decay_mask
-    d_attn_qk_base = jnp.where(lower_mask > 0.0, d_attn_qk_base, 0.0)
-    d_attn_qk_base = jnp.nan_to_num(d_attn_qk_base, nan=0.0, posinf=0.0, neginf=0.0)
-    d_decay_mask_from_qk = d_attn_qk * attn_qk_base
-
-    d_q = d_q + _dot(d_attn_qk_base, k)
-    d_k = d_k + _dot(d_attn_qk_base.T, q)
-
-    d_attn = _dot(d_value_local, v_beta.T) + _dot(d_k_cumdecay, k_beta_scaled.T)
-    d_attn = jnp.nan_to_num(d_attn, nan=0.0, posinf=0.0, neginf=0.0)
-    d_value_beta = _dot(attn.T, d_value_local)
-    d_value_beta = jnp.nan_to_num(d_value_beta, nan=0.0, posinf=0.0, neginf=0.0)
-    d_key_beta_scaled = _dot(attn.T, d_k_cumdecay)
-    d_key_beta_scaled = jnp.nan_to_num(d_key_beta_scaled, nan=0.0, posinf=0.0, neginf=0.0)
-
-    d_key_beta = d_key_beta_scaled * g_cumsum_exp[:, None]
-    d_g_exp = d_g_exp + _dot(d_key_beta_scaled * k_beta, ones_K)[:, 0]
-
-    tmp = _dot(attn.T, d_attn)
-    d_k_attn = -_dot(tmp, attn.T)
-    d_k_attn = d_k_attn * strict_lower
-    d_k_attn = jnp.nan_to_num(d_k_attn, nan=0.0, posinf=0.0, neginf=0.0)
-
-    kk = _dot(k_beta, k.T)
-    d_kk = d_k_attn * decay_mask
-    d_decay_mask = (d_decay_mask_from_qk + d_k_attn * kk) * lower_mask
-    d_decay_mask = jnp.nan_to_num(d_decay_mask, nan=0.0, posinf=0.0, neginf=0.0)
-
-    d_key_beta = d_key_beta + _dot(d_kk, k)
-    d_k = d_k + _dot(d_kk.T, k_beta)
-
-    d_v = d_value_beta * beta[:, None]
-    d_beta = _dot(d_value_beta * v, ones_V)[:, 0]
-
-    d_k = d_k + d_key_beta * beta[:, None]
-    d_beta = d_beta + _dot(d_key_beta * k, ones_K)[:, 0]
-
-    d_decay_f = d_decay_mask * decay_mask
-    d_decay_f = jnp.nan_to_num(d_decay_f, nan=0.0, posinf=0.0, neginf=0.0)
-    d_g_row = _dot(d_decay_f, ones_C)[:, 0]
-    d_g_col = _dot(ones_C.T, d_decay_f)[0]
-    d_g = d_g_row - d_g_col
-    d_g = d_g + d_g_exp * g_cumsum_exp
-
-    d_g_diff_term = d_g_diff * g_diff_state_exp
-    d_g_end_total = _dot(d_g_diff_term[None, :], ones_C)[0, 0] + d_g_end * g_end_exp
-    d_g = d_g - d_g_diff_term
-
-    d_decay_final = _dot(upper_mask, d_g[:, None])[:, 0] + d_g_end_total
-
-    d_state_ref[0, 0] = d_state.astype(d_state_ref.dtype)
-    d_q_ref[0, 0] = d_q.astype(d_q_ref.dtype)
-    d_k_ref[0, 0] = d_k.astype(d_k_ref.dtype)
-    d_v_ref[0, 0] = d_v.astype(d_v_ref.dtype)
-    d_beta_ref[0, 0] = d_beta[:, None].astype(d_beta_ref.dtype)
-    d_decay_ref[0, 0] = d_decay_final[:, None].astype(d_decay_ref.dtype)
+    d_state_ref[0, 0] = d_state_next.astype(d_state_ref.dtype)
 
 
 def _run_bwd_grad_step(
@@ -214,39 +224,41 @@ def _run_bwd_grad_step(
     d_out_i,
     d_state_next,
 ):
-    bsz, num_heads, C, qk_dim = q_i.shape
+    bsz, num_heads, total_rows, qk_dim = q_i.shape
     v_dim = v_i.shape[-1]
+    total_beta = beta_i.shape[-1]
+
     call = pl.pallas_call(
         _gdr_bwd_grad_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
                 _chunk_blockspec((1, 1, qk_dim, v_dim)),
-                _chunk_blockspec((1, 1, C, qk_dim)),
-                _chunk_blockspec((1, 1, C, qk_dim)),
-                _chunk_blockspec((1, 1, C, v_dim)),
-                _chunk_blockspec((1, 1, C, 1)),
-                _chunk_blockspec((1, 1, C, 1)),
-                _chunk_blockspec((1, 1, C, v_dim)),
+                _chunk_blockspec((1, 1, total_rows, qk_dim)),
+                _chunk_blockspec((1, 1, total_rows, qk_dim)),
+                _chunk_blockspec((1, 1, total_rows, v_dim)),
+                _chunk_blockspec((1, 1, 1, total_beta)),
+                _chunk_blockspec((1, 1, 1, total_beta)),
+                _chunk_blockspec((1, 1, total_rows, v_dim)),
                 _chunk_blockspec((1, 1, qk_dim, v_dim)),
             ],
             out_specs=[
                 _chunk_blockspec((1, 1, qk_dim, v_dim)),
-                _chunk_blockspec((1, 1, C, qk_dim)),
-                _chunk_blockspec((1, 1, C, qk_dim)),
-                _chunk_blockspec((1, 1, C, v_dim)),
-                _chunk_blockspec((1, 1, C, 1)),
-                _chunk_blockspec((1, 1, C, 1)),
+                _chunk_blockspec((1, 1, total_rows, qk_dim)),
+                _chunk_blockspec((1, 1, total_rows, qk_dim)),
+                _chunk_blockspec((1, 1, total_rows, v_dim)),
+                _chunk_blockspec((1, 1, total_rows, 1)),
+                _chunk_blockspec((1, 1, total_rows, 1)),
             ],
             grid=(bsz, num_heads),
         ),
         out_shape=[
             jax.ShapeDtypeStruct((bsz, num_heads, qk_dim, v_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, C, qk_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, C, qk_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, C, v_dim), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, C, 1), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, num_heads, C, 1), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, qk_dim), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, qk_dim), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, v_dim), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, 1), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, num_heads, total_rows, 1), jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
     )
@@ -289,7 +301,9 @@ def _chunk_gdr_bwd(
         pad_size,
         decay_was_none,
         initial_state_was_none,
+        effective_chunk_size,
     ) = res
+    chunk_size = effective_chunk_size  # override the nondiff_arg
     d_out, d_final_state = g
     input_dtype = query.dtype
     B, H, num_chunks, _C, K_dim = query.shape
@@ -300,8 +314,8 @@ def _chunk_gdr_bwd(
         d_out = jnp.pad(d_out, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
     d_out = d_out.reshape(B, H, num_chunks, chunk_size, V_dim)
 
-    beta_k = beta[:, :, :, :, None]
-    decay_k = decay[:, :, :, :, None]
+    beta_k = beta[:, :, :, None, :]
+    decay_k = decay[:, :, :, None, :]
 
     q_tm = query.transpose(2, 0, 1, 3, 4)
     k_tm = key.transpose(2, 0, 1, 3, 4)
@@ -339,8 +353,8 @@ def _chunk_gdr_bwd(
     d_query = d_q_tm.transpose(1, 2, 0, 3, 4).reshape(B, H, total_len, K_dim)[:, :, :seq_len, :]
     d_key = d_k_tm.transpose(1, 2, 0, 3, 4).reshape(B, H, total_len, K_dim)[:, :, :seq_len, :]
     d_value = d_v_tm.transpose(1, 2, 0, 3, 4).reshape(B, H, total_len, V_dim)[:, :, :seq_len, :]
-    d_beta = d_beta_tm.transpose(1, 2, 0, 3, 4).reshape(B, H, total_len, 1)[:, :, :seq_len, 0]
-    d_decay = d_decay_tm.transpose(1, 2, 0, 3, 4).reshape(B, H, total_len, 1)[:, :, :seq_len, 0]
+    d_beta = d_beta_tm.transpose(1, 2, 0, 3, 4).squeeze(-1).reshape(B, H, total_len)[:, :, :seq_len]
+    d_decay = d_decay_tm.transpose(1, 2, 0, 3, 4).squeeze(-1).reshape(B, H, total_len)[:, :, :seq_len]
 
     d_query = d_query * scale
     if use_qk_l2norm:
@@ -354,13 +368,21 @@ def _chunk_gdr_bwd(
     if initial_state_was_none:
         d_initial_state = None
 
+    def _safe_cast(x, dtype):
+        if x is None:
+            return None
+        x = jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        if dtype == jnp.bfloat16 or dtype == jnp.float16:
+            x = jnp.clip(x, -65000.0, 65000.0)
+        return x.astype(dtype) if x.dtype != dtype else x
+
     return (
-        _cast_grad(d_query, input_dtype),
-        _cast_grad(d_key, input_dtype),
-        _cast_grad(d_value, input_dtype),
-        _cast_grad(d_beta, input_dtype),
-        _cast_grad(d_decay, input_dtype),
-        _cast_grad(d_initial_state, input_dtype),
+        _safe_cast(d_query, input_dtype),
+        _safe_cast(d_key, input_dtype),
+        _safe_cast(d_value, input_dtype),
+        _safe_cast(d_beta, input_dtype),
+        _safe_cast(d_decay, input_dtype),
+        _safe_cast(d_initial_state, input_dtype),
     )
 
 
@@ -383,8 +405,8 @@ def _gdr_single_step_bwd_kernel(
     q_t = q_ref[0, 0, 0].astype(jnp.float32)
     k_t = k_ref[0, 0, 0].astype(jnp.float32)
     v_t = v_ref[0, 0, 0].astype(jnp.float32)
-    beta_t = beta_ref[0, 0, 0].astype(jnp.float32)[0]
-    decay_t = decay_ref[0, 0, 0].astype(jnp.float32)[0]
+    beta_t = beta_ref[0, 0].reshape(())  # already float32
+    decay_t = decay_ref[0, 0].reshape(())  # already float32
     state_prev = state_prev_ref[0, 0].astype(jnp.float32)
     d_out_t = d_out_ref[0, 0, 0].astype(jnp.float32)
     d_state_next = d_state_next_ref[0, 0].astype(jnp.float32)
@@ -411,8 +433,8 @@ def _gdr_single_step_bwd_kernel(
     d_q_ref[0, 0, 0] = d_q
     d_k_ref[0, 0, 0] = d_k
     d_v_ref[0, 0, 0] = d_v
-    d_beta_ref[0, 0, 0, 0] = d_beta
-    d_decay_ref[0, 0, 0, 0] = d_decay
+    d_beta_ref[0, 0] = d_beta.reshape(1, 1)
+    d_decay_ref[0, 0] = d_decay.reshape(1, 1)
     d_state_ref[0, 0] = d_state
 
 
@@ -428,8 +450,8 @@ def _run_single_step_backward(
 ):
     bsz, num_heads, _, qk_dim = query.shape
     v_dim = value.shape[-1]
-    beta = beta[..., None]
-    decay = decay[..., None]
+    beta = beta[..., None].astype(jnp.float32)
+    decay = decay[..., None].astype(jnp.float32)
     call = pl.pallas_call(
         _gdr_single_step_bwd_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(

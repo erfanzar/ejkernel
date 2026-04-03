@@ -242,10 +242,7 @@ def _evaluate_gate(
     if regressions:
         print(f"[quant_perf_gate] {label}: FAIL ({len(regressions)} regressions > {threshold * 100:.2f}%)")
         for key, base_ms, cur_ms, delta in regressions[:20]:
-            print(
-                f"  - {key}: baseline={base_ms:.4f}ms current={cur_ms:.4f}ms "
-                f"delta={delta * 100:.2f}%"
-            )
+            print(f"  - {key}: baseline={base_ms:.4f}ms current={cur_ms:.4f}ms delta={delta * 100:.2f}%")
         return False, regressions
 
     print(f"[quant_perf_gate] {label}: PASS (no regressions > {threshold * 100:.2f}%)")
@@ -270,7 +267,7 @@ def main() -> int:
     quant_runs: list[list[dict]] = []
     dequant_runs: list[list[dict]] = []
     for idx in range(repeats):
-        suffix = "" if repeats == 1 else f"_run{idx+1}"
+        suffix = "" if repeats == 1 else f"_run{idx + 1}"
         quant_out = args.workdir / f"quantize_current{suffix}.json"
         dequant_out = args.workdir / f"dequantize_current{suffix}.json"
 

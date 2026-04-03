@@ -10,6 +10,7 @@ env.py
 run_test.py
 benchmark_plots/*
 benchmark_outputs/
+gdr_benchmark.png
 # Distribution / packaging
 .Python
 build/

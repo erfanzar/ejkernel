@@ -16,9 +16,9 @@ import argparse
 import json
 import os
 import platform
+import statistics
 import subprocess
 import sys
-import statistics
 from pathlib import Path
 
 
@@ -181,7 +181,9 @@ def _load_payload(path: Path) -> tuple[dict, list[dict]]:
     rows = payload.get("rows")
     if not isinstance(rows, list):
         raise ValueError(f"{path}['rows'] must be a list.")
-    return payload.get("metadata", {}) if isinstance(payload.get("metadata"), dict) else {}, [r for r in rows if isinstance(r, dict)]
+    return payload.get("metadata", {}) if isinstance(payload.get("metadata"), dict) else {}, [
+        r for r in rows if isinstance(r, dict)
+    ]
 
 
 def _rows_by_key(rows: list[dict]) -> dict[str, dict]:
@@ -257,7 +259,7 @@ def main() -> int:
     payloads: list[tuple[dict, list[dict]]] = []
     repeats = max(1, int(args.repeats))
     for idx in range(repeats):
-        suffix = "" if repeats == 1 else f"_run{idx+1}"
+        suffix = "" if repeats == 1 else f"_run{idx + 1}"
         cur_out = args.workdir / f"qmm_llm_current{suffix}.json"
         _run_bench(cur_out, args)
         payloads.append(_load_payload(cur_out))
@@ -362,7 +364,10 @@ def main() -> int:
             print(f"  - {key}: {err}", flush=True)
     if dense_fallbacks:
         ok = False
-        print(f"[qmm_perf_gate] FAIL: {len(dense_fallbacks)} protected rows used dense fallback (showing up to 20)", flush=True)
+        print(
+            f"[qmm_perf_gate] FAIL: {len(dense_fallbacks)} protected rows used dense fallback (showing up to 20)",
+            flush=True,
+        )
         for key in dense_fallbacks[:20]:
             print(f"  - {key}", flush=True)
 

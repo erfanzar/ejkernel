@@ -216,6 +216,7 @@ def _run_worker(cfg: WorkerArgs) -> int:
     from ejkernel.modules.operations.quantized_matmul import QuantizedMatmulConfig, _pallas_tpu_candidate_cfgs
     from ejkernel.ops import Invocation
     from ejkernel.quantization import dequantize, prepack_quantized_weights
+
     if jax.default_backend() != "tpu":
         raise RuntimeError(f"TPU backend required, got {jax.default_backend()!r}.")
     dev = jax.devices("tpu")[0]

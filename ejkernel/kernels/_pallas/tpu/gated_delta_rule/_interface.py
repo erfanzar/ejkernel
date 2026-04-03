@@ -36,7 +36,7 @@ def gated_delta_rule(
     beta: Float[Array, "batch seq_len num_heads"],
     decay: Float[Array, "batch seq_len num_heads"] | None = None,
     *,
-    chunk_size: int = 64,
+    chunk_size: int = 256,
     initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
