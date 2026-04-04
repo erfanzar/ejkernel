@@ -208,6 +208,25 @@ def _suggest_block_sizes(workload: _RPAWorkload, aggressive: bool) -> tuple[int,
     return kv_pages, q_pref
 
 
+def _tpu_kv_candidates(workload: _RPAWorkload) -> tuple[int, ...]:
+    """Return TPU-safe KV-page candidates for the workload.
+
+    Wider Gemma4-style heads (256/512) can exceed TPU scoped VMEM when the
+    kernel autotuner starts from 16 KV pages per block. Bias those workloads
+    toward 8-page blocks first, while keeping broader candidates for narrower
+    heads.
+    """
+    if workload.head_dim >= 256:
+        seeds = (8, 4, 2, 1)
+    elif workload.head_dim >= 128:
+        seeds = (8, 16, 4, 2, 1)
+    else:
+        seeds = (16, 8, 4, 2, 1)
+    kv_limit = max(1, workload.pages_per_seq)
+    candidates = tuple(kv for kv in seeds if kv <= kv_limit)
+    return candidates or (1,)
+
+
 def _expand_axis_candidates(
     base: int | None,
     limit: int,
@@ -764,7 +783,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         """
         base_kv, base_q = base_pair
         kv_limit = max(1, workload.pages_per_seq)
-        kv_seed_tuple = (16, 32, 64) if _is_tpu() else (16, 32, 64, 128, 256)
+        kv_seed_tuple = _tpu_kv_candidates(workload) if _is_tpu() else (16, 32, 64, 128, 256)
         kv_candidates = _expand_axis_candidates(
             base_kv,
             kv_limit,
@@ -794,7 +813,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                 if len(pairs) >= max_candidates:
                     return pairs
         if _is_tpu():
-            allowed_kv = {16, 32, 64}
+            allowed_kv = set(kv_seed_tuple)
             allowed_q = {4, 8, 16, 32, 64}
             filtered = [(kv, qb) for kv, qb in pairs if kv in allowed_kv and qb in allowed_q]
             if filtered:
@@ -1143,7 +1162,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         # KV: 16, 32, 64 (bounded by pages_per_seq)
         # Q: 4, 8, 16, 32, 64 (bounded by max_num_tokens)
 
-        kv_candidates = [16, 32, 64]
+        kv_candidates = list(_tpu_kv_candidates(workload))
         q_candidates = [4, 8, 16, 32, 64]
 
         kv_limit = max(1, workload.pages_per_seq)

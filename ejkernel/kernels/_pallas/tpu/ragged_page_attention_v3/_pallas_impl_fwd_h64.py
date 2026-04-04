@@ -337,6 +337,63 @@ def get_vmem_estimate_bytes(
     return cdiv(total_bits, 8)
 
 
+DEFAULT_SCOPED_VMEM_LIMIT_BYTES = 16 << 20
+
+
+def _clamp_block_sizes_to_vmem(
+    *,
+    actual_num_kv_heads,
+    actual_num_q_heads_per_kv_head,
+    actual_head_dim,
+    page_size,
+    q_dtype,
+    kv_dtype,
+    bkv_p,
+    bq_sz,
+    vmem_limit_bytes,
+):
+    """Clamp TPU block sizes until scratch buffers fit within scoped VMEM."""
+    limit = DEFAULT_SCOPED_VMEM_LIMIT_BYTES
+    if vmem_limit_bytes is not None:
+        limit = min(int(vmem_limit_bytes), limit)
+
+    bkv_p = max(1, int(bkv_p))
+    bq_sz = max(1, int(bq_sz))
+
+    estimate = get_vmem_estimate_bytes(
+        actual_num_kv_heads=actual_num_kv_heads,
+        actual_num_q_heads_per_kv_head=actual_num_q_heads_per_kv_head,
+        actual_head_dim=actual_head_dim,
+        bq_sz=bq_sz,
+        bkv_sz=bkv_p * page_size,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+    )
+    while estimate > limit and bkv_p > 1:
+        bkv_p = max(1, bkv_p // 2)
+        estimate = get_vmem_estimate_bytes(
+            actual_num_kv_heads=actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head=actual_num_q_heads_per_kv_head,
+            actual_head_dim=actual_head_dim,
+            bq_sz=bq_sz,
+            bkv_sz=bkv_p * page_size,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+        )
+    while estimate > limit and bq_sz > 1:
+        bq_sz = max(1, bq_sz // 2)
+        estimate = get_vmem_estimate_bytes(
+            actual_num_kv_heads=actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head=actual_num_q_heads_per_kv_head,
+            actual_head_dim=actual_head_dim,
+            bq_sz=bq_sz,
+            bkv_sz=bkv_p * page_size,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+        )
+    return bkv_p, bq_sz
+
+
 def get_kv_cache_shape(
     total_num_pages,
     page_size,
@@ -1450,6 +1507,17 @@ def ragged_paged_attention(
             max_num_tokens,
             pages_per_seq,
         )
+    bkv_p, bq_sz = _clamp_block_sizes_to_vmem(
+        actual_num_kv_heads=actual_num_kv_heads,
+        actual_num_q_heads_per_kv_head=actual_num_q_heads_per_kv_head,
+        actual_head_dim=actual_head_dim,
+        page_size=page_size,
+        q_dtype=q.dtype,
+        kv_dtype=kv_cache.dtype,
+        bkv_p=bkv_p,
+        bq_sz=bq_sz,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
     bkv_sz = bkv_p * page_size
 
     grid = (distribution[2],)
