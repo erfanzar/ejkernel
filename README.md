@@ -38,7 +38,7 @@ ejKernel is a production-grade kernel library for JAX that provides highly optim
 
 ### State-of-the-Art Operations
 
-- **30+ Deep Learning Operations**: Flash Attention v2, Flash MLA, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, Quantized MatMul, State Space Models (Mamba), RWKV (v4/v6/v7), and more
+- **30+ Deep Learning Operations**: Flash Attention v2, Flash MLA, Ring Attention, Page Attention, Block Sparse, GLA, Lightning, Gated Delta Rule, Quantized MatMul, State Space Models (Mamba), RWKV (v4/v6/v7), and more
 - **Memory Efficiency**: Custom VJP implementations with O(N) memory complexity for attention
 - **Distributed Support**: Full shard_map integration for model and data parallelism
 - **Mixed Precision**: Comprehensive dtype support with automatic gradient conversion
@@ -268,6 +268,8 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 | **Ragged Page Attention v2**     | Variable-length paged attention  | O(N)   | Ragged sequences with page caching                                      |
 | **Ragged Page Attention v3**     | Enhanced ragged page attention   | O(N)   | Attention sinks support, improved handling                              |
 | **Ragged Decode Attention**      | Variable-length decoding         | O(N)   | Efficient batched inference                                             |
+| **Gated Delta Rule (GDR)**       | Gated delta-rule recurrence      | O(N)   | Chunked + recurrent + single-step, custom VJP, Qwen3Next               |
+| **Ragged GDR**                   | Packed continuous-batching GDR   | O(N)   | Variable-length sequences, Pallas TPU decode (3.6x speedup)            |
 | **Kernel Delta Attention**       | Delta-rule linear attention      | O(N)   | Linear complexity, delta updates, decay control                         |
 | **Unified Attention**            | vLLM-style paged attention       | O(N)   | Segmented 3D decode kernel                                              |
 | **Prefill Page Attention**       | Page attention prefill phase     | O(N)   | Separate prefill handling                                               |
@@ -325,6 +327,8 @@ kernel_with_custom_grad.defvjp(kernel_fwd, kernel_bwd)
 | Grouped MatMul v2            | -            | -          | -          | ✅           | -               |
 | Native Sparse Attention      | ✅           | -          | -          | -            | ✅              |
 | Quantized MatMul             | ✅           | ✅         | ✅         | ✅           | ✅              |
+| Gated Delta Rule             | -            | -          | -          | ✅           | ✅              |
+| Ragged Gated Delta Rule     | -            | -          | -          | ✅           | ✅              |
 | Kernel Delta Attention       | -            | -          | -          | -            | ✅              |
 | Unified Attention            | ✅           | ✅         | ✅         | -            | ✅              |
 | Prefill Page Attention       | -            | -          | -          | ✅           | ✅              |

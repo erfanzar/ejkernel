@@ -26,6 +26,7 @@ ejkernel.kernels._xla package
    prefill_page_attention/index
    quantized_matmul/index
    ragged_decode_attention/index
+   ragged_gated_delta_rule/index
    ragged_page_attention_v2/index
    ragged_page_attention_v2_turboquant/index
    ragged_page_attention_v3/index

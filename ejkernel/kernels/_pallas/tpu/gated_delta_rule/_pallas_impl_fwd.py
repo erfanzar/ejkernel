@@ -37,7 +37,7 @@ from jaxtyping import Array, Float
 from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_with_inv
 
 _P = lax.Precision.DEFAULT
-_N_FUSE = 1  # backward compatibility
+_N_FUSE = 1
 
 
 def _dot(a, b):
@@ -78,7 +78,6 @@ def _process_one_chunk(q, k, v, beta, decay, state, C):
     attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
     attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
     attn_inv = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
-    attn_inv = jnp.nan_to_num(attn_inv, nan=0.0, posinf=0.0, neginf=0.0)
     g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))
     g_end = g_cumsum[C - 1 : C, :]
     g_end_exp = jnp.exp(jnp.clip(g_end, -20.0, 20.0))
@@ -120,7 +119,7 @@ def _phase1_kernel_infer(
     v = v_ref[0, 0, 0].astype(jnp.float32)
     beta = beta_ref[0, 0, 0, 0]
     decay_mask = decay_mask_ref[0, 0, 0].astype(jnp.float32)
-    g_cumsum = g_cumsum_ref[0, 0, 0, 0]  # (C,) from (1,1,1,1,C)
+    g_cumsum = g_cumsum_ref[0, 0, 0, 0]
 
     lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
     strict_lower = lower_mask - jnp.eye(C, dtype=jnp.float32)
@@ -128,21 +127,18 @@ def _phase1_kernel_infer(
     v_beta = v * beta[:, None]
     k_beta = k * beta[:, None]
 
-    # Neumann — attn_neg uses precomputed decay_mask
     attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
-    attn_inv = _neumann_inv(
-        jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0), C, strict_lower=strict_lower, lower_mask=lower_mask
-    )
+    attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
+    attn_inv = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
 
-    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum[:, None], -20.0, 20.0))  # (C, 1)
-    g_end_val = g_cumsum[-1:]  # (1,) — last element
+    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum[:, None], -20.0, 20.0))
+    g_end_val = g_cumsum[-1:]
     g_end_exp = jnp.exp(jnp.clip(g_end_val, -20.0, 20.0)).reshape(1, 1)
     g_diff_state_exp = jnp.exp(jnp.clip(g_end_val[:, None] - g_cumsum[:, None], -20.0, 20.0))
 
-    # Merged matmul: attn_inv @ [v_beta | k_beta_scaled] → split
     k_beta_scaled = k_beta * g_cumsum_exp
-    combined_rhs = jnp.concatenate([v_beta, k_beta_scaled], axis=-1)  # (C, V+K)
-    combined_out = _dot(attn_inv, combined_rhs)  # (C, V+K) — one matmul instead of two
+    combined_rhs = jnp.concatenate([v_beta, k_beta_scaled], axis=-1)
+    combined_out = _dot(attn_inv, combined_rhs)
     V = v_beta.shape[-1]
     value_local = combined_out[:, :V]
     k_cumdecay = combined_out[:, V:]
@@ -192,9 +188,8 @@ def _phase1_kernel_train(
     decay_mask = jnp.exp(jnp.clip(g_diff * lower_mask, -20.0, 20.0)) * lower_mask
 
     attn_neg = -(_dot(k_beta, k.T) * decay_mask) * strict_lower
-    attn_inv = _neumann_inv(
-        jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0), C, strict_lower=strict_lower, lower_mask=lower_mask
-    )
+    attn_neg = jnp.nan_to_num(attn_neg, nan=0.0, posinf=0.0, neginf=0.0)
+    attn_inv = _neumann_inv(attn_neg, C, strict_lower=strict_lower, lower_mask=lower_mask)
 
     g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))
     g_end = g_cumsum[C - 1 : C, :]
@@ -228,10 +223,9 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
         return pl.BlockSpec((1, 1, 1, *shape), lambda b, h, c: (b, h, c, *([0] * len(shape))))
 
     if inference:
-        # Precompute g_cumsum and decay_mask in XLA (fast cumsum, no Pallas workaround)
-        decay_flat = decay_c.squeeze(-2)  # (B, H, NC, C)
-        g_cumsum = jnp.cumsum(decay_flat, axis=-1)  # (B, H, NC, C) — proper cumsum
-        g_cs = g_cumsum[..., None]  # (B, H, NC, C, 1)
+        decay_flat = decay_c.squeeze(-2)
+        g_cumsum = jnp.cumsum(decay_flat, axis=-1)
+        g_cs = g_cumsum[..., None]
         lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
         decay_mask = jnp.exp(jnp.clip((g_cs - g_cs.transpose(0, 1, 2, 4, 3)) * lower_mask, -20.0, 20.0)) * lower_mask
         g_cumsum_input = g_cumsum.reshape(B, H, NC, 1, C).astype(jnp.float32)
@@ -243,11 +237,11 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
                 in_specs=[
                     bs3((C, K)),
                     bs3((C, K)),
-                    bs3((C, V)),  # q, k, v
-                    bs3((1, C)),  # beta
-                    bs3((1, C)),  # decay (unused but kept for signature)
-                    bs3((C, C)),  # decay_mask (precomputed)
-                    bs3((1, C)),  # g_cumsum (precomputed)
+                    bs3((C, V)),
+                    bs3((1, C)),
+                    bs3((1, C)),
+                    bs3((C, C)),
+                    bs3((1, C)),
                 ],
                 out_specs=[
                     bs3((C, V)),
@@ -272,7 +266,6 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
             ),
         )
         results = call(query_c, key_c, value_c, beta_c, decay_c, decay_mask, g_cumsum_input)
-        # Return 7 values for API compat (attn_inv=None for inference)
         return (*results, None)
     else:
         call = pl.pallas_call(
@@ -293,7 +286,7 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
                     bs3((C, K)),
                     bs3((C, K)),
                     bs3((1, 1)),
-                    bs3((C, C)),  # attn_inv
+                    bs3((C, C)),
                 ],
                 grid=(B, H, NC),
             ),

@@ -800,6 +800,24 @@ class GatedDeltaRuleConfig(BaseOperationConfig):
 
 
 @dataclass
+class RaggedGatedDeltaRuleConfig(BaseOperationConfig):
+    """Configuration for Ragged Gated Delta Rule operation.
+
+    Processes variable-length sequences packed into a flat token stream
+    with chunked parallel intra-chunk computation.
+
+    Args:
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
+        backend: Backend specification (default: "any")
+        chunk_size: Chunk size for the chunked prefill path (default: 64).
+    """
+
+    chunk_size: int = 64
+
+    __hash__ = hash_fn
+
+
+@dataclass
 class RWKV4Config(BaseOperationConfig):
     """Configuration for RWKV-4 recurrence operation.
 

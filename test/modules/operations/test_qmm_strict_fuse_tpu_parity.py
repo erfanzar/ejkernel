@@ -108,7 +108,7 @@ def test_qmm_strict_fuse_tpu_parity_smoke(monkeypatch):
 
                 for platform in ("xla", "pallas"):
                     fn_fused = jax.jit(
-                        lambda xi, wi, si, zi, mode=mode, bits=bits, group_size=group_size, axis=axis, transpose=transpose, platform=platform: (
+                        lambda xi, wi, si, zi, mode=mode, bits=bits, group_size=group_size, axis=axis, transpose=transpose, platform=platform: (  # noqa
                             quantized_matmul(
                                 xi,
                                 wi,

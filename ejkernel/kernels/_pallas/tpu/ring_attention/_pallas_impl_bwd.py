@@ -143,6 +143,7 @@ def _ring_attention_forward(
     logits_soft_cap: float | None,
     ring_axis: str = RING_AXIS,
     causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
     """Forward pass for ring attention over distributed devices.
 
@@ -190,11 +191,23 @@ def _ring_attention_forward(
     if segment_ids is not None:
         splash_segment_ids = splash_kernel.SegmentIds(q=segment_ids.q, kv=segment_ids.kv)
 
-    if causal:
-        base_q_sequence = jnp.arange(q_seq_len, dtype=jnp.int32)
+    needs_position_offset = causal or sliding_window is not None or mask_function is not None
+    base_q_sequence = jnp.arange(q_seq_len, dtype=jnp.int32)
 
-        def causal_mask_fn(q_ids, kv_ids):
-            return q_ids >= kv_ids
+    if sliding_window is not None:
+        if isinstance(sliding_window, int):
+            sw_left, sw_right = sliding_window, sliding_window
+        else:
+            sw_left, sw_right = sliding_window
+
+    def ring_mask_fn(q_ids, kv_ids):
+        """Dynamic mask function for ring rotation combining causal + sliding window."""
+        mask = jnp.ones((q_ids.shape[0], kv_ids.shape[1]), dtype=jnp.bool_)
+        if causal:
+            mask = mask & (q_ids >= kv_ids)
+        if sliding_window is not None:
+            mask = mask & (q_ids - sw_left <= kv_ids) & (q_ids + sw_right >= kv_ids)
+        return mask
 
     def body(carry, iteration):
         o_prev, lse_prev, k_current, v_current, kv_source_device = carry
@@ -202,7 +215,7 @@ def _ring_attention_forward(
         v_next = shift(v_current)
         is_first_iteration = iteration == 0
 
-        if causal:
+        if needs_position_offset:
             offset = device_idx * q_seq_len - kv_source_device * kv_seq_len
             modified_q_sequence = base_q_sequence + offset
             fwd_mask_info_iter = MaskInfo(
@@ -212,7 +225,7 @@ def _ring_attention_forward(
                 partial_mask_blocks=None,
                 q_sequence=modified_q_sequence,
             )
-            mask_function_iter = causal_mask_fn
+            mask_function_iter = ring_mask_fn
         else:
             fwd_mask_info_iter = fwd_mask_info
             mask_function_iter = mask_function
@@ -394,6 +407,7 @@ def _ring_attention_fwd_rule(
     logits_soft_cap: float | None,
     ring_axis: str = RING_AXIS,
     causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
 ) -> tuple[jax.Array, tuple]:
     """Custom VJP forward rule for ring attention.
 
@@ -434,6 +448,7 @@ def _ring_attention_fwd_rule(
         logits_soft_cap=logits_soft_cap,
         ring_axis=ring_axis,
         causal=causal,
+        sliding_window=sliding_window,
     )
     residuals_for_bwd = (
         q,
@@ -494,7 +509,7 @@ def _ring_attention_bwd_rule(
 
 @partial(
     jax.custom_vjp,
-    nondiff_argnums=(8, 9, 10, 11, 12, 13, 14),
+    nondiff_argnums=(8, 9, 10, 11, 12, 13, 14, 15),
 )
 def _ring_attention_custom(
     fwd_mask_info: MaskInfo,
@@ -512,6 +527,7 @@ def _ring_attention_custom(
     logits_soft_cap: float | None,
     ring_axis: str = RING_AXIS,
     causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
 ) -> jax.Array:
     """Ring attention with custom VJP for efficient gradient computation.
 
@@ -553,6 +569,7 @@ def _ring_attention_custom(
         logits_soft_cap=logits_soft_cap,
         ring_axis=ring_axis,
         causal=causal,
+        sliding_window=sliding_window,
     )
     return out
 
@@ -573,12 +590,9 @@ def _ring_attention_custom_fwd(
     logits_soft_cap: float | None,
     ring_axis: str = RING_AXIS,
     causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
 ):
-    """VJP forward implementation for _ring_attention_custom.
-
-    Delegates to _ring_attention_fwd_rule to compute the forward pass
-    and save residuals needed for the backward pass.
-    """
+    """VJP forward implementation for _ring_attention_custom."""
     return _ring_attention_fwd_rule(
         fwd_mask_info,
         dq_mask_info,
@@ -595,6 +609,7 @@ def _ring_attention_custom_fwd(
         logits_soft_cap=logits_soft_cap,
         ring_axis=ring_axis,
         causal=causal,
+        sliding_window=sliding_window,
     )
 
 
@@ -606,6 +621,7 @@ def _ring_attention_custom_bwd(
     logits_soft_cap: float | None,
     ring_axis: str,
     causal: bool,
+    sliding_window: int | tuple[int, int] | None,
     res: tuple,
     do: jax.Array,
 ):
@@ -659,6 +675,7 @@ def _has_axis(axis_name: str) -> bool:
         "logits_soft_cap",
         "ring_axis",
         "causal",
+        "sliding_window",
     ],
 )
 def ring_splash_attention(
@@ -677,6 +694,7 @@ def ring_splash_attention(
     logits_soft_cap: float | None = None,
     ring_axis: str = RING_AXIS,
     causal: bool = False,
+    sliding_window: int | tuple[int, int] | None = None,
 ) -> jax.Array:
     """Compute ring attention using Splash Attention kernels.
 
@@ -726,6 +744,7 @@ def ring_splash_attention(
         logits_soft_cap,
         ring_axis,
         causal,
+        sliding_window,
     )
 
 

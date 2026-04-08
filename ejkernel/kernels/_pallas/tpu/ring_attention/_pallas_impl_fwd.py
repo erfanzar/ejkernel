@@ -361,10 +361,14 @@ def ring_attention(
         )
     del mask_builder, fused_backward
 
-    # Determine if this is MQA (multi-query attention)
+    input_dtype = query.dtype
+    if query.dtype != jnp.float32:
+        query = query.astype(jnp.float32)
+        key = key.astype(jnp.float32)
+        value = value.astype(jnp.float32)
+
     is_mqa = num_kv_heads == 1 and num_heads > 1
 
-    # Apply softmax scale
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
     query = query * softmax_scale
@@ -443,6 +447,7 @@ def ring_attention(
             logits_soft_cap=logits_soft_cap,
             ring_axis=ring_axis,
             causal=causal,
+            sliding_window=sliding_window,
         )
 
         out = rearrange(out, "h s d -> s h d")
@@ -450,4 +455,4 @@ def ring_attention(
 
     outputs = jax.vmap(lambda q, k, v: single_batch_attention(q, k, v, segment_ids, sinks))(query, key, value)
 
-    return outputs
+    return outputs.astype(input_dtype)

@@ -51,9 +51,9 @@ def _grouped_matmul_v3_ref(
         group_sizes,
         total_repeat_length=lhs.shape[0],
     )
-    out = jax.vmap(
-        lambda row, mat: jnp.matmul(row, mat, preferred_element_type=jnp.float32)
-    )(lhs, rhs_prepped[group_ids])
+    out = jax.vmap(lambda row, mat: jnp.matmul(row, mat, preferred_element_type=jnp.float32))(
+        lhs, rhs_prepped[group_ids]
+    )
     if rhs_bias is not None:
         out = out + rhs_bias[:, 0, :][group_ids].astype(out.dtype)
     if existing_out is not None:

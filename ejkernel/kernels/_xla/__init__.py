@@ -87,6 +87,7 @@ from .page_attention import page_attention
 from .prefill_page_attention import prefill_page_attention
 from .quantized_matmul import quantized_matmul
 from .ragged_decode_attention import ragged_decode_attention
+from .ragged_gated_delta_rule import ragged_gated_delta_rule as ragged_gated_delta_rule
 from .ragged_page_attention_v2 import ragged_page_attention_v2
 from .ragged_page_attention_v2_turboquant import ragged_page_attention_v2_turboquant
 from .ragged_page_attention_v3 import ragged_page_attention_v3
@@ -126,6 +127,7 @@ __all__ = [
     "prefill_page_attention",
     "quantized_matmul",
     "ragged_decode_attention",
+    "ragged_gated_delta_rule",
     "ragged_page_attention_v2",
     "ragged_page_attention_v2_turboquant",
     "ragged_page_attention_v3",

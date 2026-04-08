@@ -125,15 +125,19 @@ def _recurrent_gdr_fwd(
     decay: Float[Array, "batch num_heads seq_len"] | None,
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
+    chunk_size: int = 64,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Recurrent (scan) forward pass for Gated Delta Rule.
+    """Chunked forward pass for Gated Delta Rule using triangular solve.
 
-    Uses JAX's lax.scan for sequential processing with O(L) time complexity.
-    This is the most memory-efficient variant but may be slower than chunked
-    for moderate sequence lengths due to lack of parallelism.
+    Processes the sequence in chunks, computing intra-chunk attention in
+    parallel via MXU matmuls and propagating state across chunks with a
+    lightweight lax.scan (4 matmuls per chunk).
+
+    Uses ``jax.scipy.linalg.solve_triangular`` for the exact (I+S)^{-1}
+    computation instead of Neumann approximation.
 
     Args:
         query: Query tensor [batch, num_heads, seq_len, head_dim].
@@ -144,6 +148,7 @@ def _recurrent_gdr_fwd(
         initial_state: Optional initial recurrent state
             [batch, num_heads, head_dim, d_state].
         use_qk_l2norm: Whether to L2-normalize queries and keys.
+        chunk_size: Number of tokens per chunk for parallel processing.
 
     Returns:
         Tuple of (outputs, final_state).
@@ -151,49 +156,114 @@ def _recurrent_gdr_fwd(
     B, H, L, K_dim = query.shape
     V_dim = value.shape[-1]
     input_dtype = query.dtype
+    C = chunk_size
 
     if use_qk_l2norm:
         query = _l2norm(query, axis=-1, eps=1e-6)
         key = _l2norm(key, axis=-1, eps=1e-6)
 
     scale = 1.0 / (K_dim**0.5)
-    query = query * scale
-    if initial_state is None:
-        initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=input_dtype)
-    else:
-        initial_state = initial_state.astype(input_dtype)
-    if decay is None:
-        decay = jnp.zeros((B, H, L), dtype=input_dtype)
-    else:
-        decay = decay.astype(input_dtype)
-    query = query.astype(input_dtype)
+    query = (query * scale).astype(input_dtype)
     key = key.astype(input_dtype)
     value = value.astype(input_dtype)
     beta = beta.astype(input_dtype)
 
-    q_seq = query.transpose(2, 0, 1, 3)  # (L, B, H, K)
-    k_seq = key.transpose(2, 0, 1, 3)  # (L, B, H, K)
-    v_seq = value.transpose(2, 0, 1, 3)  # (L, B, H, V)
-    g_seq = decay.transpose(2, 0, 1)  # (L, B, H)
-    b_seq = beta.transpose(2, 0, 1)  # (L, B, H)
+    if initial_state is None:
+        initial_state = jnp.zeros((B, H, K_dim, V_dim), dtype=jnp.float32)
+    else:
+        initial_state = initial_state.astype(jnp.float32)
 
-    def step_fn(state, inputs):
-        q_t, k_t, v_t, g_t, beta_t = inputs
-        g_exp = jnp.exp(g_t.astype(jnp.float32)).astype(input_dtype)[:, :, None, None]
-        beta_scaled = beta_t[:, :, None]
-        state = state * g_exp
-        kv_mem = jnp.sum(state * k_t[:, :, :, None], axis=-2)
+    if decay is None:
+        decay = jnp.zeros((B, H, L), dtype=jnp.float32)
+    else:
+        decay = decay.astype(jnp.float32)
 
-        delta = (v_t - kv_mem) * beta_scaled
-        state = state + k_t[:, :, :, None] * delta[:, :, None, :]
-        output = jnp.sum(state * q_t[:, :, :, None], axis=-2)
+    pad_size = (C - L % C) % C
+    if pad_size > 0:
+        query = jnp.pad(query, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        key = jnp.pad(key, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        value = jnp.pad(value, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+        beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_size)))
+        decay = jnp.pad(decay, ((0, 0), (0, 0), (0, pad_size)))
 
-        return state, output
+    NC = (L + pad_size) // C
 
-    final_state, outputs = lax.scan(step_fn, initial_state, (q_seq, k_seq, v_seq, g_seq, b_seq))
-    outputs = outputs.transpose(1, 2, 0, 3)
+    q_c = query.reshape(B, H, NC, C, K_dim)
+    k_c = key.reshape(B, H, NC, C, K_dim)
+    v_c = value.reshape(B, H, NC, C, V_dim)
+    beta_c = beta.reshape(B, H, NC, C)
+    g_c = decay.reshape(B, H, NC, C)
 
-    return outputs, final_state
+    g_cumsum = jnp.cumsum(g_c, axis=-1)
+
+    k_beta = k_c * beta_c[..., None]
+    v_beta = v_c * beta_c[..., None]
+
+    S = jnp.einsum("bhcik,bhcjk->bhcij", k_beta, k_c, precision=_MATMUL_PRECISION).astype(jnp.float32)
+
+    g_diff = g_cumsum[..., :, None] - g_cumsum[..., None, :]
+    strict_lower = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_), k=-1)
+    lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_))
+    g_diff = jnp.where(strict_lower, g_diff, -1e30)
+    S = jnp.where(strict_lower, S * jnp.exp(g_diff), 0.0)
+
+    eye = jnp.eye(C, dtype=jnp.float32)
+    lhs = jnp.broadcast_to(eye, S.shape) + S
+
+    lhs_flat = lhs.reshape(-1, C, C)
+    jnp.broadcast_to(eye, lhs_flat.shape)
+
+    def _solve_one(m):
+        return jax.scipy.linalg.solve_triangular(m, eye, lower=True, unit_diagonal=True)
+
+    A_flat = jax.vmap(_solve_one)(lhs_flat)
+    A = A_flat.reshape(B, H, NC, C, C)
+
+    u_chunks = jnp.einsum("bhcij,bhcjv->bhciv", A, v_beta.astype(jnp.float32), precision=_MATMUL_PRECISION).astype(
+        input_dtype
+    )
+
+    k_beta_g = k_beta.astype(jnp.float32) * jnp.exp(g_cumsum)[..., None]
+    w_chunks = jnp.einsum("bhcij,bhcjk->bhcik", A, k_beta_g, precision=_MATMUL_PRECISION).astype(input_dtype)
+
+    attn_qk = jnp.einsum("bhcik,bhcjk->bhcij", q_c, k_c, precision=_MATMUL_PRECISION).astype(jnp.float32)
+    g_diff_intra = g_cumsum[..., :, None] - g_cumsum[..., None, :]
+    g_diff_intra = jnp.where(lower_mask, g_diff_intra, -1e30)
+    attn_i = jnp.where(lower_mask, attn_qk * jnp.exp(g_diff_intra), 0.0).astype(input_dtype)
+
+    q_g = (q_c.astype(jnp.float32) * jnp.exp(g_cumsum)[..., None]).astype(input_dtype)
+    g_end_exp = jnp.exp(g_cumsum[..., -1])[..., None, None]
+    g_diff_state = jnp.exp(g_cumsum[..., -1, None] - g_cumsum)[..., None]
+    k_g_diff = (k_c.astype(jnp.float32) * g_diff_state).astype(input_dtype)
+
+    xs = (
+        u_chunks.transpose(2, 0, 1, 3, 4),
+        w_chunks.transpose(2, 0, 1, 3, 4),
+        q_g.transpose(2, 0, 1, 3, 4),
+        attn_i.transpose(2, 0, 1, 3, 4),
+        g_end_exp.transpose(2, 0, 1, 3, 4),
+        k_g_diff.transpose(2, 0, 1, 3, 4),
+    )
+
+    def scan_body(state, inputs):
+        u, w, q_scaled, attn_intra, g_last_exp, k_scaled = inputs
+
+        v_prime = jnp.einsum("bhck,bhkv->bhcv", w, state, precision=_MATMUL_PRECISION)
+        attn_inter = jnp.einsum("bhck,bhkv->bhcv", q_scaled, state, precision=_MATMUL_PRECISION)
+        v_new = u.astype(jnp.float32) - v_prime
+        core_out = attn_inter + jnp.einsum("bhcr,bhrv->bhcv", attn_intra, v_new, precision=_MATMUL_PRECISION)
+
+        state_update = jnp.einsum("bhkc,bhcv->bhkv", k_scaled.transpose(0, 1, 3, 2), v_new, precision=_MATMUL_PRECISION)
+        new_state = jnp.nan_to_num(state * g_last_exp + state_update, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return new_state, core_out
+
+    final_state, core_out_tm = lax.scan(scan_body, initial_state, xs)
+
+    core_out = core_out_tm.transpose(1, 2, 0, 3, 4)
+    outputs = core_out.reshape(B, H, -1, V_dim)[:, :, :L, :].astype(input_dtype)
+
+    return outputs, final_state.astype(input_dtype)
 
 
 def _chunk_gdr_fwd_impl(
@@ -311,21 +381,10 @@ def _chunk_gdr_fwd_core(
     attn = -(attn * decay_mask).astype(jnp.float32)
     attn = jnp.where(mask_triu, 0.0, attn)
 
-    # Sanitise: the masked upper triangle and decay-weighted products can
-    # produce NaN/Inf when the decay exponents are large (exp overflows in
-    # float32).  Replacing with zero is safe here because these entries lie
-    # in the strictly upper-triangular region (already zeroed by the mask)
-    # or correspond to numerically negligible contributions.
     attn = jnp.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Compute (I - A)^{-1} via triangular solve.
-    # A is strict lower-triangular, so this is numerically safer than
-    # repeated squaring while preserving the same math.
     inv = _strict_lower_inverse(-attn)
 
-    # The triangular solve can propagate Inf/NaN from borderline entries in
-    # A.  Clamping to zero keeps downstream matmuls finite; the affected
-    # positions carry negligible weight after the decay mask.
     attn = jnp.nan_to_num(inv, nan=0.0, posinf=0.0, neginf=0.0).astype(input_dtype)
 
     g_cumsum_exp = jnp.exp(g_cumsum).astype(input_dtype)
@@ -511,8 +570,6 @@ def _single_step_gdr_fwd(
         query = _l2norm(query, axis=-1, eps=1e-6)
         key = _l2norm(key, axis=-1, eps=1e-6)
 
-    # Pure inference (single token) -- no iterative accumulation, so keep
-    # everything in the input dtype for speed. Only exp(decay) uses f32.
     query = query.squeeze(2)
     key = key.squeeze(2)
     value = value.squeeze(2)
@@ -527,7 +584,7 @@ def _single_step_gdr_fwd(
         g_exp = jnp.exp(decay.astype(jnp.float32)).astype(recurrent_state.dtype)
         recurrent_state = recurrent_state * g_exp[:, :, None, None]
 
-    kv_mem = jnp.sum(recurrent_state * key[:, :, :, None], axis=-2)  # (B, H, V)
+    kv_mem = jnp.sum(recurrent_state * key[:, :, :, None], axis=-2)
 
     beta_scaled = beta[:, :, None]
     delta = (value - kv_mem) * beta_scaled

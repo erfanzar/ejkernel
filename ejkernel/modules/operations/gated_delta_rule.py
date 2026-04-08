@@ -260,6 +260,9 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
+        if not use_chunked:
+            cfg.backend = Backend.ANY
+            cfg.platform = "xla"
 
         impl = self.get_impl(cfg)
         out, final_state = impl(
