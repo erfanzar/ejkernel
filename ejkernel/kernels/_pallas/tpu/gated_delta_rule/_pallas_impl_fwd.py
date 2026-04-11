@@ -34,7 +34,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jaxtyping import Array, Float
 
-from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_with_inv
+from ...._xla.gated_delta_rule._xla_impl_fwd import _l2norm_with_inv, _recurrent_gdr_fwd
 
 _P = lax.Precision.DEFAULT
 _N_FUSE = 1
@@ -53,7 +53,15 @@ def _chunk_blockspec(shape: tuple[int, ...]) -> pl.BlockSpec:
 def _neumann_inv(A, C, strict_lower=None, lower_mask=None):
     """Compute (I - A)^{-1} via repeated squaring. Input must be pre-sanitized."""
     _hp = lax.Precision.HIGHEST
-    num_iters = min(math.ceil(math.log2(C)), 4) if C > 1 else 0
+    # ``A`` is strict-lower triangular, so the Neumann series terminates
+    # exactly after at most ``C - 1`` powers. Repeated squaring needs
+    # ``ceil(log2(C))`` stages to materialize all terms up to ``A^(C-1)``.
+    #
+    # Clipping this to 4 only reconstructs powers through ``A^15``. That
+    # makes partially-filled chunks numerically wrong once the valid prefix
+    # exceeds ~16 tokens, which shows up most clearly on padded-heavy SFT
+    # batches where the last chunk is only partially active.
+    num_iters = math.ceil(math.log2(C)) if C > 1 else 0
     if strict_lower is None:
         strict_lower = jnp.tril(jnp.ones((C, C), dtype=jnp.float32), k=-1)
     if lower_mask is None:
@@ -509,6 +517,37 @@ def _chunk_gdr_bwd_rule(chunk_size, use_qk_l2norm, res, g):
 
 
 _chunk_gdr_fwd.defvjp(_chunk_gdr_fwd_rule, _chunk_gdr_bwd_rule)
+
+
+def _chunk_gdr_fwd(
+    query: Float[Array, "batch num_heads seq_len head_dim"],
+    key: Float[Array, "batch num_heads seq_len head_dim"],
+    value: Float[Array, "batch num_heads seq_len d_state"],
+    beta: Float[Array, "batch num_heads seq_len"],
+    decay: Float[Array, "batch num_heads seq_len"] | None,
+    chunk_size: int = 64,
+    initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
+    use_qk_l2norm: bool = True,
+) -> tuple[
+    Float[Array, "batch num_heads seq_len d_state"],
+    Float[Array, "batch num_heads head_dim d_state"],
+]:
+    """Exact multi-token chunked GDR path for TPU.
+
+    Keep the optimized Pallas single-token decode kernel, but route the
+    unstable multi-token training/prefill path through the exact chunked
+    triangular-solve implementation.
+    """
+    return _recurrent_gdr_fwd(
+        query=query,
+        key=key,
+        value=value,
+        beta=beta,
+        decay=decay,
+        initial_state=initial_state,
+        use_qk_l2norm=use_qk_l2norm,
+        chunk_size=chunk_size,
+    )
 
 
 def _gdr_single_step_fwd_kernel(q_ref, k_ref, v_ref, beta_ref, decay_ref, state_ref, out_ref, final_state_ref):

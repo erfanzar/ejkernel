@@ -174,9 +174,9 @@ def _recurrent_gdr_fwd(
         initial_state = initial_state.astype(jnp.float32)
 
     if decay is None:
-        decay = jnp.zeros((B, H, L), dtype=jnp.float32)
+        decay = jnp.zeros((B, H, L), dtype=input_dtype)
     else:
-        decay = decay.astype(jnp.float32)
+        decay = decay.astype(input_dtype)
 
     pad_size = (C - L % C) % C
     if pad_size > 0:
@@ -205,7 +205,7 @@ def _recurrent_gdr_fwd(
     strict_lower = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_), k=-1)
     lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_))
     g_diff = jnp.where(strict_lower, g_diff, -1e30)
-    S = jnp.where(strict_lower, S * jnp.exp(g_diff), 0.0)
+    S = jnp.where(strict_lower, S * jnp.exp(jnp.clip(g_diff, -20.0, 20.0)), 0.0)
 
     eye = jnp.eye(C, dtype=jnp.float32)
     lhs = jnp.broadcast_to(eye, S.shape) + S
@@ -223,17 +223,17 @@ def _recurrent_gdr_fwd(
         input_dtype
     )
 
-    k_beta_g = k_beta.astype(jnp.float32) * jnp.exp(g_cumsum)[..., None]
+    k_beta_g = k_beta.astype(jnp.float32) * jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))[..., None]
     w_chunks = jnp.einsum("bhcij,bhcjk->bhcik", A, k_beta_g, precision=_MATMUL_PRECISION).astype(input_dtype)
 
     attn_qk = jnp.einsum("bhcik,bhcjk->bhcij", q_c, k_c, precision=_MATMUL_PRECISION).astype(jnp.float32)
     g_diff_intra = g_cumsum[..., :, None] - g_cumsum[..., None, :]
     g_diff_intra = jnp.where(lower_mask, g_diff_intra, -1e30)
-    attn_i = jnp.where(lower_mask, attn_qk * jnp.exp(g_diff_intra), 0.0).astype(input_dtype)
+    attn_i = jnp.where(lower_mask, attn_qk * jnp.exp(jnp.clip(g_diff_intra, -20.0, 20.0)), 0.0).astype(input_dtype)
 
-    q_g = (q_c.astype(jnp.float32) * jnp.exp(g_cumsum)[..., None]).astype(input_dtype)
-    g_end_exp = jnp.exp(g_cumsum[..., -1])[..., None, None]
-    g_diff_state = jnp.exp(g_cumsum[..., -1, None] - g_cumsum)[..., None]
+    q_g = (q_c.astype(jnp.float32) * jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0))[..., None]).astype(input_dtype)
+    g_end_exp = jnp.exp(jnp.clip(g_cumsum[..., -1], -20.0, 20.0))[..., None, None]
+    g_diff_state = jnp.exp(jnp.clip(g_cumsum[..., -1, None] - g_cumsum, -20.0, 20.0))[..., None]
     k_g_diff = (k_c.astype(jnp.float32) * g_diff_state).astype(input_dtype)
 
     xs = (
@@ -339,9 +339,9 @@ def _chunk_gdr_fwd_core(
         key, k_inv_norm = _l2norm_with_inv(key, axis=-1, eps=1e-6)
 
     if decay is None:
-        decay = jnp.zeros((B, H, L), dtype=input_dtype)
+        decay = jnp.zeros((B, H, L), dtype=jnp.float32)
     else:
-        decay = decay.astype(input_dtype)
+        decay = decay.astype(jnp.float32)
 
     pad_size = (chunk_size - L % chunk_size) % chunk_size
     if pad_size > 0:
@@ -374,7 +374,7 @@ def _chunk_gdr_fwd_core(
 
     g_diff = g_cumsum[:, :, :, :, None] - g_cumsum[:, :, :, None, :]
     g_diff = jnp.tril(g_diff)
-    decay_mask = jnp.exp(g_diff)
+    decay_mask = jnp.exp(jnp.clip(g_diff, -20.0, 20.0))
     decay_mask = jnp.tril(decay_mask)
 
     attn = jnp.einsum("bhcik,bhcjk->bhcij", k_beta, key, precision=_MATMUL_PRECISION)
@@ -387,10 +387,10 @@ def _chunk_gdr_fwd_core(
 
     attn = jnp.nan_to_num(inv, nan=0.0, posinf=0.0, neginf=0.0).astype(input_dtype)
 
-    g_cumsum_exp = jnp.exp(g_cumsum).astype(input_dtype)
+    g_cumsum_exp = jnp.exp(jnp.clip(g_cumsum, -20.0, 20.0)).astype(input_dtype)
     g_end = g_cumsum[:, :, :, -1]
-    g_end_exp = jnp.exp(g_end).astype(input_dtype)
-    g_diff_state_exp = jnp.exp(g_end[:, :, :, None] - g_cumsum).astype(input_dtype)
+    g_end_exp = jnp.exp(jnp.clip(g_end, -20.0, 20.0)).astype(input_dtype)
+    g_diff_state_exp = jnp.exp(jnp.clip(g_end[:, :, :, None] - g_cumsum, -20.0, 20.0)).astype(input_dtype)
 
     value_local = jnp.einsum("bhcij,bhcjv->bhciv", attn, v_beta, precision=_MATMUL_PRECISION)
     k_beta_scaled = k_beta * g_cumsum_exp[:, :, :, :, None]
@@ -424,15 +424,21 @@ def _chunk_gdr_fwd_core(
         q_scaled = q_i * g_exp_i[:, :, :, None]
         qk_fused = jnp.stack([k_cumdecay_i, q_scaled], axis=0)
         both = jnp.einsum("nbhik,bhkv->nbhiv", qk_fused, state, precision=_MATMUL_PRECISION)
-        v_prime, attn_inter = both[0], both[1]
+        v_prime = jnp.nan_to_num(both[0], nan=0.0, posinf=0.0, neginf=0.0)
+        attn_inter = jnp.nan_to_num(both[1], nan=0.0, posinf=0.0, neginf=0.0)
 
-        v_new = v_i - v_prime
-        core_out = attn_inter + jnp.einsum("bhij,bhjv->bhiv", attn_qk, v_new, precision=_MATMUL_PRECISION)
+        v_new = jnp.nan_to_num(v_i - v_prime, nan=0.0, posinf=0.0, neginf=0.0)
+        core_out = jnp.nan_to_num(
+            attn_inter + jnp.einsum("bhij,bhjv->bhiv", attn_qk, v_new, precision=_MATMUL_PRECISION),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
 
         state_decayed = state * g_end_exp_i[:, :, None, None]
         k_scaled = k_i * g_diff_exp_i[:, :, :, None]
         state_update = jnp.einsum("bhik,bhiv->bhkv", k_scaled, v_new, precision=_MATMUL_PRECISION)
-        new_state = (state_decayed + state_update).astype(state.dtype)
+        new_state = jnp.nan_to_num(state_decayed + state_update, nan=0.0, posinf=0.0, neginf=0.0).astype(state.dtype)
 
         return new_state, core_out.astype(input_dtype)
 
@@ -535,6 +541,38 @@ def _chunk_gdr_bwd_rule(chunk_size, use_qk_l2norm, res, g):
 
 
 _chunk_gdr_fwd.defvjp(_chunk_gdr_fwd_rule, _chunk_gdr_bwd_rule)
+
+
+def _chunk_gdr_fwd(
+    query: Float[Array, "batch num_heads seq_len head_dim"],
+    key: Float[Array, "batch num_heads seq_len head_dim"],
+    value: Float[Array, "batch num_heads seq_len d_state"],
+    beta: Float[Array, "batch num_heads seq_len"],
+    decay: Float[Array, "batch num_heads seq_len"] | None,
+    chunk_size: int = 64,
+    initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
+    use_qk_l2norm: bool = True,
+) -> tuple[
+    Float[Array, "batch num_heads seq_len d_state"],
+    Float[Array, "batch num_heads head_dim d_state"],
+]:
+    """Exact multi-token chunked GDR path.
+
+    The previous Neumann/custom-VJP implementation diverges catastrophically on
+    real padded SFT batches even though isolated tensor probes looked small.
+    Use the exact triangular-solve chunked formulation for the production
+    multi-token path and rely on standard autodiff through it.
+    """
+    return _recurrent_gdr_fwd(
+        query=query,
+        key=key,
+        value=value,
+        beta=beta,
+        decay=decay,
+        initial_state=initial_state,
+        use_qk_l2norm=use_qk_l2norm,
+        chunk_size=chunk_size,
+    )
 
 
 def _single_step_gdr_fwd(
