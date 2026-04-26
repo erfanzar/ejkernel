@@ -673,13 +673,13 @@ def reduce_scatter_matmul(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
-                pl.BlockSpec(memory_space=pltpu.ANY),
-                pl.BlockSpec(memory_space=pltpu.ANY),
+                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pl.ANY),
             ],
             out_specs=[
-                pl.BlockSpec(memory_space=pltpu.ANY),
-                pl.BlockSpec(memory_space=pltpu.ANY),
-                pl.BlockSpec(memory_space=pltpu.ANY),
+                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pl.ANY),
             ],
             scratch_shapes=[
                 x_vmem_shape,
