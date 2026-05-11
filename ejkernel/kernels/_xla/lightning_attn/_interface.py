@@ -11,7 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kernel public interface and registration wrappers."""
+"""Registry entry point for the XLA Lightning Attention kernel.
+
+This module registers ``lightning_attn`` under the ``(Platform.XLA,
+Backend.ANY)`` key so that the kernel registry can dispatch calls on any
+XLA-compatible device (CPU, GPU, TPU) to the pure-JAX recurrent
+implementation in ``_xla_impl_fwd``.
+"""
 
 from __future__ import annotations
 
@@ -35,62 +41,63 @@ def lightning_attn(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 64,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
-    """
-    Computes Lightning Attention using a recurrent, linear-time mechanism with JAX/XLA.
-    This function implements the Lightning Attention mechanism, a form of linear
-    attention where the decay rate (`g_gamma`) is dynamically determined by the
-    layer's depth within the model. This allows for different temporal receptive
-    fields across layers.
-    The computation is performed efficiently using a recurrent formulation,
-    making it suitable for long sequences. It serves as a specialized wrapper
-    around the generic `recurrent` function and supports both standard batch
-    processing and packed variable-length inputs via `cu_seqlens`.
+    """Compute Lightning Attention via the XLA recurrent kernel.
+
+    Thin registry wrapper.  Builds the layer-specific per-head decay vector
+    ``g_gamma`` and forwards all arguments to the underlying ``recurrent``
+    implementation (see ``_xla_impl_fwd.lightning_attn`` for the full
+    algorithm description).
+
     Args:
-        query: The query tensor. Expected shape is `(batch, seq_len, num_heads, head_dim)`
-            or `(1, total_tokens, num_heads, head_dim)` if `cu_seqlens` is used.
-        key: The key tensor. Must have the same shape as `q`.
-        value: The value tensor. Must have the same shape as `q`.
-        layer_idx: The 0-indexed index of the current layer, used to compute
-            the layer-specific decay factor.
-        num_layers: The total number of layers in the model.
-        softmax_scale: A scaling factor applied to the query. If `None`, it defaults
-            to `1 / sqrt(head_dim)`.
-        initial_state: The initial hidden state for the recurrence. Useful for
-            chunked processing of long sequences.
-        reverse: If `True`, the sequence is processed in reverse order.
-        cu_seqlens: Cumulative sequence lengths for variable-length inputs.
-            This is a 1D tensor like `[0, len_seq1, len_seq1+len_seq2, ...]`.
-            If provided, the input tensors are expected to be "packed" with a
-            batch size of 1.
+        query: Query tensor of shape ``[batch, seq_len, num_heads, qk_head_dim]``.
+            When ``cu_seqlens`` is provided the batch dimension must be 1 and
+            ``seq_len`` is the total number of packed tokens.
+        key: Key tensor of shape ``[batch, seq_len, num_kv_heads, qk_head_dim]``.
+        value: Value tensor of shape ``[batch, seq_len, num_kv_heads, v_head_dim]``.
+        layer_idx: 0-based index of the current transformer layer.  Together
+            with ``num_layers`` it determines the per-head decay magnitudes:
+            larger ``layer_idx`` values produce smaller (closer to zero) decay.
+        num_layers: Total number of transformer layers in the model.
+        softmax_scale: Scaling factor applied to query vectors before the
+            recurrent update.  Defaults to ``1 / sqrt(qk_head_dim)``.
+        initial_state: Optional initial recurrent hidden state of shape
+            ``[..., num_heads, qk_head_dim, v_head_dim]``.  When
+            ``cu_seqlens`` is provided the leading dimension must equal the
+            number of packed sequences (``len(cu_seqlens) - 1``).
+        reverse: If ``True``, the sequence is scanned right-to-left.
+        cu_seqlens: Cumulative sequence lengths ``[0, l1, l1+l2, ...]`` of
+            shape ``[num_seqs + 1]``.  Enables packed variable-length inputs
+            with batch size 1.
+        block_k: Accepted for operation-level config parity with Triton; XLA
+            chooses its own tiling.
+        block_v: Accepted for operation-level config parity with Triton; XLA
+            chooses its own tiling.
+        num_warps: Accepted for operation-level config parity with Triton.
+        num_stages: Accepted for operation-level config parity with Triton.
+
     Returns:
-        A tuple containing:
-            - o (jax.Array): The output tensor, with the same shape as `q`.
-            - final_state (jax.Array): The final hidden state of the recurrence.
+        Tuple ``(output, final_state)`` where:
+            - ``output``: ``[batch, seq_len, num_heads, v_head_dim]``
+            - ``final_state``: ``[..., num_heads, qk_head_dim, v_head_dim]``
+
     Raises:
-        ValueError: If `cu_seqlens` is provided and the batch size of `q` is
-            not 1.
-        ValueError: If `cu_seqlens` is provided and the number of initial states
-            does not match the number of sequences.
-    Examples:
-        >>>
+        ValueError: If ``cu_seqlens`` is provided and ``query.shape[0] != 1``.
+        ValueError: If ``cu_seqlens`` is provided and
+            ``initial_state.shape[0] != len(cu_seqlens) - 1``.
+
+    Example:
+        >>> import jax.numpy as jnp
         >>> q = jnp.ones((2, 100, 8, 64))
         >>> k = jnp.ones((2, 100, 8, 64))
         >>> v = jnp.ones((2, 100, 8, 64))
-        >>> output, final_state = lightning_attn(query, key, value, layer_idx=5, num_layers=24)
+        >>> output, state = lightning_attn(q, k, v, layer_idx=5, num_layers=24)
         >>> output.shape
         (2, 100, 8, 64)
-        >>>
-        >>>
-        >>>
-        >>>
-        >>> q = jnp.ones((1, 150, 8, 64))
-        >>> k = jnp.ones((1, 150, 8, 64))
-        >>> v = jnp.ones((1, 150, 8, 64))
-        >>> cu_seqlens = jnp.array([0, 50, 100, 150])
-        >>> output, final_state = lightning_attn(
-        ...     query, key, value, layer_idx=10, num_layers=24, cu_seqlens=cu_seqlens
-        ... )
     """
     return _lightning_attn_impl(
         query, key, value, layer_idx, num_layers, softmax_scale, initial_state, reverse, cu_seqlens

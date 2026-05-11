@@ -75,7 +75,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -171,7 +171,7 @@ class RecurrentAttention(Kernel[RecurrentAttentionConfig, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: RecurrentAttentionConfig,
     ) -> (
@@ -184,29 +184,50 @@ class RecurrentAttention(Kernel[RecurrentAttentionConfig, Array]):
         """Execute recurrent attention with stateful computation.
 
         Args:
-            query: Query tensor [batch, seq_len, num_heads, head_dim]
-            key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
-            value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
-            g: Query-level gating tensor [batch, seq_len, num_heads, head_dim]
-            g_gamma: Layer-level gating parameter [batch, num_heads]
-            gk: Key-level gating tensor [batch, seq_len, num_heads, head_dim]
-            gv: Value-level gating tensor [batch, seq_len, num_heads, head_dim]
-            softmax_scale: Optional scaling factor for attention scores
-            initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
-            reverse: If True, process sequence in reverse order
-            cu_seqlens: Cumulative sequence lengths for variable-length sequences
-            return_state: If True, return tuple (output, final_state) instead of just output
-            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
-            cfg: Kernel configuration object
+            query: Query tensor [batch, seq_len, num_heads, qk_head_dim].
+            key: Key tensor [batch, seq_len, num_kv_heads, qk_head_dim].
+            value: Value tensor [batch, seq_len, num_kv_heads, v_head_dim].
+            g: Optional query-level gate tensor
+                [batch, seq_len, num_heads, qk_head_dim].  Applied after
+                sigmoid; if ``None``, no query gating is performed.
+            g_gamma: Optional per-layer decay parameter broadcast to heads
+                ``[..., num_heads]``.  Controls how fast the state forgets.
+            gk: Optional key-level gate tensor
+                [batch, seq_len, num_heads, qk_head_dim].
+            gv: Optional value-level gate tensor
+                [batch, seq_len, num_heads, v_head_dim].
+            softmax_scale: Optional scaling factor for attention scores.
+                Defaults to ``1 / sqrt(qk_head_dim)`` when ``None``.
+            initial_state: Optional initial hidden state
+                ``[..., num_heads, qk_head_dim, v_head_dim]``.  Used to
+                continue processing from a previous chunk.
+            reverse: If ``True``, process sequence in reverse temporal order.
+            cu_seqlens: Cumulative sequence lengths for variable-length
+                sequences [num_seqs + 1].  Enables FlashAttention-style
+                packed sequences.
+            return_state: If ``True``, return a tuple ``(output, final_state)``
+                instead of just the output.
+            platform: Optional platform override ("triton", "pallas", "cuda",
+                "xla").
+            cfg: Kernel configuration object (``block_q``, ``block_k``,
+                ``block_d``, ``num_warps``, ``num_stages``).
 
         Returns:
-            If return_state=False: Attention output [batch, seq_len, num_heads, head_dim]
-            If return_state=True: Tuple of (output, final_state) where final_state
-                is [batch, num_heads, head_dim, head_dim]
+            If ``return_state=False``:
+                Attention output [batch, seq_len, num_heads, v_head_dim].
+            If ``return_state=True``:
+                Tuple of (output, final_state) where final_state has shape
+                ``[..., num_heads, qk_head_dim, v_head_dim]``.
 
         Note:
-            All gating parameters (g, gk, gv, g_gamma) are optional. When provided,
-            they enable more sophisticated gated recurrent mechanisms.
+            When the backend implementation returns a tuple, ``return_state``
+            controls whether the state is included in the return value.  If
+            the implementation always returns a tuple (output, state), passing
+            ``return_state=False`` will discard the state silently.
+
+            All gating parameters (``g``, ``gk``, ``gv``, ``g_gamma``) are
+            optional.  When provided, they enable more sophisticated gated
+            recurrent mechanisms.
         """
 
         if platform is not None:
@@ -219,7 +240,16 @@ class RecurrentAttention(Kernel[RecurrentAttentionConfig, Array]):
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
-        impl = self.get_impl(cfg)
+        resolved_platform = detect_platform("recurrent", cfg.platform)
+        impl = kernel_registry.get("recurrent", platform=resolved_platform, backend=cfg.backend)
+        impl_kwargs = {}
+        if resolved_platform == Platform.TRITON:
+            impl_kwargs = {
+                "block_k": cfg.block_k,
+                "block_v": cfg.block_d,
+                "num_warps": cfg.num_warps,
+                "num_stages": cfg.num_stages,
+            }
         result = impl(
             query=query,
             key=key,
@@ -232,6 +262,7 @@ class RecurrentAttention(Kernel[RecurrentAttentionConfig, Array]):
             initial_state=initial_state,
             reverse=reverse,
             cu_seqlens=cu_seqlens,
+            **impl_kwargs,
         )
 
         if isinstance(result, tuple):
@@ -296,6 +327,69 @@ class RecurrentAttention(Kernel[RecurrentAttentionConfig, Array]):
 
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[RecurrentAttentionConfig, Array]):
+        """Generate GPU candidates for recurrent attention across Triton, TileLang and XLA."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        block_configs = [
+            (64, 64, 64, 4, 1),
+            (128, 64, 64, 4, 2),
+            (128, 128, 64, 8, 2),
+        ]
+        candidates: list[RecurrentAttentionConfig] = []
+        if "triton" in platforms:
+            for block_q, block_k, block_d, num_warps, num_stages in block_configs:
+                candidates.append(
+                    RecurrentAttentionConfig(
+                        block_q=block_q,
+                        block_k=block_k,
+                        block_d=block_d,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        platform="triton",
+                        backend="gpu",
+                    )
+                )
+        if "tilelang" in platforms:
+            candidates.append(
+                RecurrentAttentionConfig(
+                    block_q=64,
+                    block_k=64,
+                    block_d=64,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+            )
+        if "xla" in platforms:
+            candidates.append(
+                RecurrentAttentionConfig(
+                    block_q=64,
+                    block_k=64,
+                    block_d=64,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[RecurrentAttentionConfig, Array]):
+        """Generate TPU candidates for the XLA recurrent-attention path."""
+        return [
+            RecurrentAttentionConfig(
+                block_q=64,
+                block_k=64,
+                block_d=64,
+                num_warps=4,
+                num_stages=1,
+                platform="xla",
+                backend="any",
+            )
+        ]
+
 
 _recurrent_executor: Executor[RecurrentAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
@@ -326,7 +420,7 @@ def recurrent_attention(
     softmax_scale: float | None = None,
     reverse: bool = False,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RecurrentAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -338,35 +432,38 @@ def recurrent_attention(
     """Execute recurrent attention with automatic optimization.
 
     Recurrent attention processes sequences with stateful computation,
-    maintaining hidden states across timesteps for efficient sequential processing.
+    maintaining hidden states across timesteps for O(T) complexity.
 
     Args:
-        query: Query tensor [batch, seq_len, num_heads, head_dim]
-        key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
-        value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
-        g: Gating tensor for query [batch, seq_len, num_heads, head_dim]
-        g_gamma: Gating gamma [batch, num_heads]
-        gk: Gating tensor for keys [batch, seq_len, num_heads, head_dim]
-        gv: Gating tensor for values [batch, seq_len, num_heads, head_dim]
-        softmax_scale: Scaling factor for attention
-        initial_state: Initial hidden state
-        reverse: Whether to process sequence in reverse
-        cu_seqlens: Cumulative sequence lengths for variable-length sequences
-        return_state: If True, return tuple (output, final_state) instead of just output
-        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        query: Query tensor [batch, seq_len, num_heads, qk_head_dim].
+        key: Key tensor [batch, seq_len, num_kv_heads, qk_head_dim].
+        value: Value tensor [batch, seq_len, num_kv_heads, v_head_dim].
+        g: Optional query-level gate tensor
+            [batch, seq_len, num_heads, qk_head_dim].
+        g_gamma: Optional per-layer decay parameter ``[..., num_heads]``.
+        gk: Optional key-level gate tensor
+            [batch, seq_len, num_heads, qk_head_dim].
+        gv: Optional value-level gate tensor
+            [batch, seq_len, num_heads, v_head_dim].
+        initial_state: Optional initial hidden state
+            ``[..., num_heads, qk_head_dim, v_head_dim]``.
+        cu_seqlens: Cumulative sequence lengths [num_seqs + 1] for packed
+            variable-length sequences.
+        softmax_scale: Scaling factor for attention scores.
+        reverse: If ``True``, process sequence in reverse temporal order.
+        return_state: If ``True``, return a tuple ``(output, final_state)``.
+        platform: Platform override ("triton", "pallas", "cuda", "xla").
+        cfg: Optional :class:`~.configs.RecurrentAttentionConfig` override.
 
     Returns:
-        If return_state=False: Attention output with same shape as query
-        If return_state=True: Tuple of (output, final_state)
+        If ``return_state=False``:
+            Attention output [batch, seq_len, num_heads, v_head_dim].
+        If ``return_state=True``:
+            Tuple of (output, final_state).
 
     Example:
-        >>>
         >>> out = recurrent_attention(query, key, value)
-        >>>
-        >>>
         >>> out = recurrent_attention(query, key, value, g=gates, gk=key_gates, gv=value_gates)
-        >>>
-        >>>
         >>> out = recurrent_attention(query, key, value, platform="xla")
     """
     return _recurrent_executor(

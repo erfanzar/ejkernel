@@ -127,7 +127,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         use_qk_l2norm: bool = True,
         use_chunked: bool = True,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: GatedDeltaRuleConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec | None, ...] | None = None,
@@ -212,7 +212,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         use_qk_l2norm: bool = True,
         use_chunked: bool = True,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: GatedDeltaRuleConfig,
         **_,
     ) -> (
@@ -312,11 +312,33 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         cands = [128, 256]
         return [GatedDeltaRuleConfig(chunk_size=c, platform="auto", backend="any") for c in cands]
 
+    def candidate_cfgs_gpu(self, inv: Invocation[GatedDeltaRuleConfig, Array]):
+        """Generate GPU candidates for GDR across TileLang and XLA."""
+        requested = inv.kwargs.get("platform", None)
+        use_chunked = bool(inv.kwargs.get("use_chunked", True))
+        cands = [128, 256]
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[GatedDeltaRuleConfig] = []
+        if "tilelang" in platforms and use_chunked:
+            candidates.append(GatedDeltaRuleConfig(chunk_size=256, platform="tilelang", backend="gpu"))
+        if "xla" in platforms:
+            candidates.extend(GatedDeltaRuleConfig(chunk_size=c, platform="xla", backend="any") for c in cands)
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[GatedDeltaRuleConfig, Array]):
+        """Generate TPU candidates for the Pallas and XLA GDR paths."""
+        cands = [128, 256]
+        return [
+            GatedDeltaRuleConfig(chunk_size=c, platform=platform, backend=backend)
+            for platform, backend in (("pallas", "tpu"), ("xla", "any"))
+            for c in cands
+        ]
+
     heuristic_cfg_shard_map = heuristic_cfg
     candidate_cfgs_shard_map = candidate_cfgs
     candidate_cfgs_shard_map_xla = candidate_cfgs
-    candidate_cfgs_shard_map_gpu = candidate_cfgs
-    candidate_cfgs_shard_map_tpu = candidate_cfgs
+    candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
+    candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
 
 
 _executor: Executor[GatedDeltaRuleConfig, Array] = Executor(
@@ -346,7 +368,7 @@ def gated_delta_rule(
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: GatedDeltaRuleConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
@@ -377,18 +399,33 @@ def gated_delta_rule(
             Shape: [batch, seq_len, num_heads, v_head_dim]
         beta: Per-token gating for delta updates (typically in [0, 1])
             Shape: [batch, seq_len, num_heads]
-        decay: Per-token decay for memory retention (should be <= 0)
-            Shape: [batch, seq_len, num_heads]
-            If None, defaults to zeros (no decay, full retention)
+        decay: Per-token decay for memory retention (values should be <= 0).
+            Shape: [batch, seq_len, num_heads].
+            If None, defaults to zeros (no decay, full memory retention).
         initial_state: Optional initial memory state for incremental inference
             Shape: [batch, num_heads, qk_head_dim, v_head_dim]
-        use_qk_l2norm: If True, apply L2 normalization to queries and keys
-            before attention. Improves numerical stability (default: True)
-        use_chunked: If True, use chunked algorithm (faster for training);
-            else use recurrent scan (more memory efficient)
-        return_state: If True, return (output, final_state) tuple
-        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
-        cfg: Optional kernel configuration (controls chunk_size via autotuning)
+        autotune_chunk_candidates: Optional list/tuple of chunk sizes to
+            benchmark during autotuning, overriding ``candidate_cfgs``.
+            When None, ``GatedDeltaRule.candidate_cfgs`` provides ``[128, 256]``
+            unless the ``EASYDEL_GDR_AUTOTUNE_CHUNK_CANDIDATES`` env var is set.
+        use_qk_l2norm: If True, apply L2 normalisation to queries and keys
+            before attention (improves numerical stability; default: True).
+        use_chunked: If True, use the chunked intra-chunk parallel algorithm
+            (faster for training); if False, use the pure recurrent scan
+            (more memory efficient but sequential; forces XLA platform).
+        return_state: If True, return (output, final_state) tuple instead
+            of just output.
+        platform: Force a specific platform (``"triton"``, ``"pallas"``,
+            ``"cuda"``, ``"xla"``, or ``"auto"``).  When ``use_chunked=False``,
+            this is always overridden to ``"xla"``.
+        cfg: Optional ``GatedDeltaRuleConfig`` override; ``chunk_size`` inside
+            the config is the primary autotuned parameter.
+        mesh: JAX device mesh for ``shard_map`` distributed execution.
+        in_specs: Input partition specs for ``shard_map``; length must equal
+            the number of positional args (query, key, value, beta, decay,
+            initial_state).
+        out_specs: Output partition spec for ``shard_map``; use a tuple when
+            ``return_state=True``.
 
     Returns:
         If return_state is False:
@@ -396,8 +433,14 @@ def gated_delta_rule(
         If return_state is True:
             Tuple of:
                 - output: Attention output [batch, seq_len, num_heads, v_head_dim]
-                - final_state: Final memory state for incremental inference
+                - final_state: Final memory state
                     [batch, num_heads, qk_head_dim, v_head_dim]
+
+    Note:
+        When ``seq_len == 1`` **and** ``initial_state is not None`` the function
+        bypasses the executor entirely and calls the optimised single-step XLA
+        kernel ``_single_step_gdr_fwd`` directly.  This fast path does not go
+        through autotuning or config caching.
 
     Example:
         >>> import jax.numpy as jnp

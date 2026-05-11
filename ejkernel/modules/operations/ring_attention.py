@@ -151,7 +151,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         softmax_scale: float | None = None,
         axis_name: str | None = None,
         fused_backward: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RingAttentionConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -283,7 +283,7 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         softmax_scale: float | None = None,
         axis_name: str | None = None,
         fused_backward: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: RingAttentionConfig,
     ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
@@ -421,6 +421,40 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
 
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[RingAttentionConfig, Array]):
+        """Generate GPU candidates for Triton, TileLang, and XLA ring attention."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        block_configs = [
+            (128, 128, 4, 2),
+            (256, 256, 4, 2),
+            (512, 512, 8, 2),
+        ]
+        candidates: list[RingAttentionConfig] = []
+        for platform, backend in (("triton", "gpu"), ("tilelang", "gpu"), ("xla", "any")):
+            if platform not in platforms:
+                continue
+            for block_q, block_k, num_warps, num_stages in block_configs:
+                candidates.append(
+                    RingAttentionConfig(
+                        fwd_params=FwdParams(
+                            q_blocksize=block_q,
+                            kv_blocksize=block_k,
+                            num_stages=num_stages,
+                            num_warps=num_warps,
+                        ),
+                        bwd_params=BwdParams(
+                            q_blocksize=block_q,
+                            kv_blocksize=block_k,
+                            num_stages=num_stages,
+                            num_warps=num_warps,
+                        ),
+                        platform=platform,
+                        backend=backend,
+                    )
+                )
+        return candidates or self.candidate_cfgs(inv)
+
     def candidate_cfgs_tpu(self, inv: Invocation[RingAttentionConfig, Array]):
         """Generate TPU-optimized candidate configurations for autotuning.
 
@@ -439,17 +473,18 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         ]
 
         candidates = []
-        for block_q, block_k, num_warps, num_stages in block_configs:
-            fwd = FwdParams(q_blocksize=block_q, kv_blocksize=block_k, num_stages=num_stages, num_warps=num_warps)
-            bwd = BwdParams(q_blocksize=block_q, kv_blocksize=block_k, num_stages=num_stages, num_warps=num_warps)
-            candidates.append(
-                RingAttentionConfig(
-                    fwd_params=fwd,
-                    bwd_params=bwd,
-                    platform="pallas",
-                    backend="tpu",
+        for platform, backend in (("pallas", "tpu"), ("xla", "any")):
+            for block_q, block_k, num_warps, num_stages in block_configs:
+                fwd = FwdParams(q_blocksize=block_q, kv_blocksize=block_k, num_stages=num_stages, num_warps=num_warps)
+                bwd = BwdParams(q_blocksize=block_q, kv_blocksize=block_k, num_stages=num_stages, num_warps=num_warps)
+                candidates.append(
+                    RingAttentionConfig(
+                        fwd_params=fwd,
+                        bwd_params=bwd,
+                        platform=platform,
+                        backend=backend,
+                    )
                 )
-            )
 
         return candidates
 
@@ -487,7 +522,7 @@ def ring_attention(
     softmax_scale: float | None = None,
     axis_name: str | None = None,
     fused_backward: bool = False,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RingAttentionConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,

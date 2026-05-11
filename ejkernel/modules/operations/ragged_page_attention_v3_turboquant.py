@@ -119,6 +119,7 @@ class RaggedPageAttentionv3TurboQuant(
     version = "3"
 
     def __init__(self):
+        """Initialize the RaggedPageAttentionv3TurboQuant kernel module."""
         super().__init__(op_id="ragged_page_attention_v3_turboquant")
 
     def create_shard_map_wrapper(
@@ -147,7 +148,7 @@ class RaggedPageAttentionv3TurboQuant(
         bits: int = 4,
         qjl_dim: int = 128,
         vmem_limit_bytes: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedPageAttentionv3TurboQuantConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -273,7 +274,7 @@ class RaggedPageAttentionv3TurboQuant(
         bits: int = 4,
         qjl_dim: int = 128,
         vmem_limit_bytes: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedPageAttentionv3TurboQuantConfig,
     ) -> tuple[
         Float[Array, "total_tokens num_q_heads head_dim"],
@@ -297,8 +298,9 @@ class RaggedPageAttentionv3TurboQuant(
                 Shape: ``[total_tokens, num_kv_heads, head_dim]``
             key_indices_pages: Existing packed 4-bit key codebook indices.
                 Shape: ``[num_pages, page_size, num_kv_heads, head_dim // 2]``,
-                dtype ``uint8``.  **Updated in-place** with newly compressed
-                tokens.
+                dtype ``uint8``.  New token indices are written into this
+                tensor at the positions specified by ``block_tables``; the
+                updated tensor is returned as element 1 of the output tuple.
             key_signs_pages: Existing packed QJL key sign bits.
                 Shape: ``[num_pages, page_size, num_kv_heads, qjl_dim // 8]``,
                 dtype ``uint8``.
@@ -392,8 +394,18 @@ class RaggedPageAttentionv3TurboQuant(
         self,
         inv: Invocation[RaggedPageAttentionv3TurboQuantConfig, tuple[Array, Array, Array, Array, Array, Array]],
     ) -> RaggedPageAttentionv3TurboQuantConfig:
-        """Provide a conservative default config for first-run execution."""
-        del inv
+        """Return a conservative default config for first-run execution.
+
+        Uses ``None`` for block-size parameters so the backend can select
+        safe defaults automatically.
+
+        Args:
+            inv: Invocation object (unused; retained for interface consistency).
+
+        Returns:
+            :class:`RaggedPageAttentionv3TurboQuantConfig` with ``platform="auto"``
+            and all block-size fields set to ``None``.
+        """
         return RaggedPageAttentionv3TurboQuantConfig(
             chunk_prefill_size=None,
             num_kv_pages_per_block=None,
@@ -408,8 +420,18 @@ class RaggedPageAttentionv3TurboQuant(
         self,
         inv: Invocation[RaggedPageAttentionv3TurboQuantConfig, tuple[Array, Array, Array, Array, Array, Array]],
     ):
-        """Generate a small set of block-size candidates for autotuning."""
-        del inv
+        """Generate a small set of block-size candidates for autotuning.
+
+        Returns six configs with ``chunk_prefill_size=None`` covering the
+        default ``(None, None)`` and five common
+        ``(num_kv_pages_per_block, num_queries_per_block)`` pairs.
+
+        Args:
+            inv: Invocation object (unused; retained for interface consistency).
+
+        Returns:
+            List of :class:`RaggedPageAttentionv3TurboQuantConfig` objects.
+        """
         return [
             RaggedPageAttentionv3TurboQuantConfig(
                 chunk_prefill_size=None,
@@ -428,6 +450,61 @@ class RaggedPageAttentionv3TurboQuant(
                 (2, 32),
                 (4, 32),
             )
+        ]
+
+    def candidate_cfgs_gpu(
+        self,
+        inv: Invocation[RaggedPageAttentionv3TurboQuantConfig, tuple[Array, Array, Array, Array, Array, Array]],
+    ):
+        """Generate GPU candidates for TileLang and XLA TurboQuant RPA v3."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        pairs = ((None, None), (1, 8), (2, 16), (4, 16), (2, 32), (4, 32))
+        candidates: list[RaggedPageAttentionv3TurboQuantConfig] = []
+        if "tilelang" in platforms:
+            candidates.extend(
+                RaggedPageAttentionv3TurboQuantConfig(
+                    chunk_prefill_size=None,
+                    num_kv_pages_per_block=kv_block,
+                    num_queries_per_block=q_block,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+                for kv_block, q_block in pairs
+            )
+        if "xla" in platforms:
+            candidates.extend(
+                RaggedPageAttentionv3TurboQuantConfig(
+                    chunk_prefill_size=None,
+                    num_kv_pages_per_block=kv_block,
+                    num_queries_per_block=q_block,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="xla",
+                    backend="any",
+                )
+                for kv_block, q_block in pairs
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(
+        self,
+        inv: Invocation[RaggedPageAttentionv3TurboQuantConfig, tuple[Array, Array, Array, Array, Array, Array]],
+    ):
+        """Generate TPU candidates for the XLA TurboQuant RPA v3 path."""
+        return [
+            RaggedPageAttentionv3TurboQuantConfig(
+                chunk_prefill_size=cfg.chunk_prefill_size,
+                num_kv_pages_per_block=cfg.num_kv_pages_per_block,
+                num_queries_per_block=cfg.num_queries_per_block,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+                platform="xla",
+                backend="any",
+            )
+            for cfg in self.candidate_cfgs(inv)
         ]
 
 
@@ -474,7 +551,7 @@ def ragged_page_attention_v3_turboquant(
     bits: int = 4,
     qjl_dim: int = 128,
     vmem_limit_bytes: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RaggedPageAttentionv3TurboQuantConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,

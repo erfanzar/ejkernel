@@ -148,7 +148,7 @@ class RWKV4(Kernel[RWKV4Config, Array]):
         state: Float[Array, "batch three chans"] | None = None,
         *,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RWKV4Config,
     ) -> (
         Float[Array, "batch seq_len chans"]
@@ -205,7 +205,6 @@ class RWKV4(Kernel[RWKV4Config, Array]):
         Returns:
             Default configuration with auto platform selection
         """
-        del inv
         return RWKV4Config(platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[RWKV4Config, Array]):
@@ -221,8 +220,27 @@ class RWKV4(Kernel[RWKV4Config, Array]):
             RWKV-4's simple recurrence pattern means platform selection
             is the primary optimization lever.
         """
-        del inv
-        return []
+        return [
+            RWKV4Config(platform="auto", backend="any"),
+            RWKV4Config(platform="xla", backend="any"),
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[RWKV4Config, Array]):
+        """Generate GPU platform candidates for RWKV-4."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "triton", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[RWKV4Config] = []
+        if "tilelang" in platforms:
+            candidates.append(RWKV4Config(platform="tilelang", backend="gpu"))
+        if "triton" in platforms:
+            candidates.append(RWKV4Config(platform="triton", backend="gpu"))
+        if "xla" in platforms:
+            candidates.append(RWKV4Config(platform="xla", backend="any"))
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[RWKV4Config, Array]):
+        """Return TPU candidates for the XLA RWKV-4 path."""
+        return [RWKV4Config(platform="xla", backend="any")]
 
 
 _executor: Executor[RWKV4Config, Array] = Executor(
@@ -248,7 +266,7 @@ def rwkv4(
     /,
     *,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RWKV4Config | None = None,
 ) -> Float[Array, "batch seq_len chans"] | tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]:
     """RWKV-4 time-mix recurrence with automatic backend selection.

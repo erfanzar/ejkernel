@@ -12,7 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-Latent Ragged Page Attention v2 operation module."""
+"""Multi-Latent Ragged Page Attention v2 (MLRPA-v2) operation module.
+
+This module extends the v1 MLRPA kernel with per-case block-size tuning:
+``num_kv_pages_per_block`` and ``num_queries_per_block`` may each be an
+integer (broadcast to all three cases) or a ``(decode, prefill, mixed)``
+tuple so the Pallas grid can be specialised for each request type that
+appears in a single continuous batch.
+
+Key differences from v1:
+    - Block-size parameters accept ``(decode, prefill, mixed)`` triples.
+    - ``MultiLatentRaggedPageAttentionV2Config`` normalises list payloads
+      (from JSON de-serialisation) back into tuples.
+    - Uses operation key ``"multi_latent_ragged_page_attention_v2"`` so
+      the registry resolves to the v2-specific Pallas/XLA implementations.
+
+The paged-KV cache layout, ragged batching contract, and MLA decomposition
+(nope + pe streams) are identical to v1 — see
+``multi_latent_ragged_page_attention.py`` for the conceptual overview.
+
+Example:
+    >>> from ejkernel.modules.operations import multi_latent_ragged_page_attention_v2
+    >>>
+    >>> outputs, updated_cache = multi_latent_ragged_page_attention_v2(
+    ...     queries_nope, queries_pe,
+    ...     keys_values, keys_pe,
+    ...     kv_cache, kv_lens, block_tables,
+    ...     query_start_loc, distribution,
+    ...     softmax_scale=1.0 / head_dim**0.5,
+    ... )
+"""
 
 from __future__ import annotations
 
@@ -66,6 +95,7 @@ class MultiLatentRaggedPageAttentionV2(Kernel[MultiLatentRaggedPageAttentionV2Co
     version = "2"
 
     def __init__(self):
+        """Initialize MLRPA-v2 with its registry operation identifier."""
         super().__init__(op_id="multi_latent_ragged_page_attention_v2")
 
     def get_impl(self, cfg: MultiLatentRaggedPageAttentionV2Config):
@@ -110,7 +140,7 @@ class MultiLatentRaggedPageAttentionV2(Kernel[MultiLatentRaggedPageAttentionV2Co
         q_scale: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: MultiLatentRaggedPageAttentionV2Config,
     ) -> tuple[
         Float[Array, "total_tokens num_q_heads kv_latent_dim"],
@@ -271,6 +301,54 @@ class MultiLatentRaggedPageAttentionV2(Kernel[MultiLatentRaggedPageAttentionV2Co
             for q_block in (16, 32)
         ]
 
+    def candidate_cfgs_gpu(
+        self,
+        inv: Invocation[MultiLatentRaggedPageAttentionV2Config, tuple[Array, Array]],
+    ):
+        """Generate GPU candidates for TileLang and XLA MLRPA-v2."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        kv_pages = self._estimate_kv_pages(inv)
+        candidates: list[MultiLatentRaggedPageAttentionV2Config] = []
+        for platform, backend in (("tilelang", "gpu"), ("xla", "any")):
+            if platform not in platforms:
+                continue
+            candidates.extend(
+                MultiLatentRaggedPageAttentionV2Config(
+                    chunk_prefill_size=None,
+                    num_kv_pages_per_block=_repeat_case(kv_pages),
+                    num_queries_per_block=_repeat_case(q_block),
+                    vmem_limit_bytes=None,
+                    num_warps=4,
+                    num_stages=1,
+                    platform=platform,
+                    backend=backend,
+                )
+                for q_block in (16, 32)
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(
+        self,
+        inv: Invocation[MultiLatentRaggedPageAttentionV2Config, tuple[Array, Array]],
+    ):
+        """Generate TPU candidates for Pallas and XLA MLRPA-v2."""
+        kv_pages = self._estimate_kv_pages(inv)
+        return [
+            MultiLatentRaggedPageAttentionV2Config(
+                chunk_prefill_size=None,
+                num_kv_pages_per_block=_repeat_case(kv_pages),
+                num_queries_per_block=_repeat_case(q_block),
+                vmem_limit_bytes=None,
+                num_warps=4,
+                num_stages=1,
+                platform=platform,
+                backend=backend,
+            )
+            for platform, backend in (("pallas", "tpu"), ("xla", "any"))
+            for q_block in (16, 32)
+        ]
+
 
 _mlrpa_v2_executor: Executor[MultiLatentRaggedPageAttentionV2Config, tuple[Array, Array]] = Executor(
     ConfigSelectorChain(
@@ -305,7 +383,7 @@ def multi_latent_ragged_page_attention_v2(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: MultiLatentRaggedPageAttentionV2Config | None = None,
 ) -> tuple[
     Float[Array, "total_tokens num_q_heads kv_latent_dim"],

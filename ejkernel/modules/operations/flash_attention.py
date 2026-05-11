@@ -150,7 +150,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         normalize_output: bool = True,
         precision: lax.PrecisionLike = lax.Precision.DEFAULT,
         logits_dtype: DTypeLike = jnp.float32,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
         cfg: FlashAttentionConfig | None = None,
@@ -284,7 +284,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         normalize_output: bool = True,
         precision: lax.PrecisionLike = lax.Precision.DEFAULT,
         logits_dtype: DTypeLike = jnp.float32,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
         kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
@@ -503,6 +503,8 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
 
         sliding_window = inv.kwargs.get("sliding_window", None)
         causal = bool(inv.kwargs.get("causal", True))
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "cuda", "cute", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
 
         def window_total(sw):
             """Compute total window span from a sliding window specification."""
@@ -605,15 +607,33 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
             pairs = [(qb, kb, w, s)]
 
         configs: list[FlashAttentionConfig] = []
-        for qb, kb, w, s in pairs:
-            configs.append(
-                FlashAttentionConfig(
-                    fwd_params=FwdParams(q_blocksize=qb, kv_blocksize=kb, num_warps=w, num_stages=s),
-                    bwd_params=BwdParams(q_blocksize=bwd_block(qb), kv_blocksize=bwd_block(kb)),
-                    platform="triton",
-                    backend="gpu",
+        if "triton" in platforms:
+            for qb, kb, w, s in pairs:
+                configs.append(
+                    FlashAttentionConfig(
+                        fwd_params=FwdParams(q_blocksize=qb, kv_blocksize=kb, num_warps=w, num_stages=s),
+                        bwd_params=BwdParams(q_blocksize=bwd_block(qb), kv_blocksize=bwd_block(kb)),
+                        platform="triton",
+                        backend="gpu",
+                    )
                 )
-            )
+        for platform, backend, max_platform_candidates in (
+            ("cuda", "gpu", 4),
+            ("cute", "gpu", 2),
+            ("tilelang", "gpu", 4),
+            ("xla", "any", 4),
+        ):
+            if platform not in platforms:
+                continue
+            for qb, kb, w, s in pairs[:max_platform_candidates]:
+                configs.append(
+                    FlashAttentionConfig(
+                        fwd_params=FwdParams(q_blocksize=qb, kv_blocksize=kb, num_warps=w, num_stages=s),
+                        bwd_params=BwdParams(q_blocksize=bwd_block(qb), kv_blocksize=bwd_block(kb)),
+                        platform=platform,
+                        backend=backend,
+                    )
+                )
         return configs
 
     def candidate_cfgs_tpu(self, inv: Invocation[FlashAttentionConfig, Array]):
@@ -701,6 +721,7 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
                     backend="tpu",
                 )
             )
+        configs.extend(self.candidate_cfgs_xla(inv)[:4])
         return configs
 
     def candidate_cfgs_xla(self, inv: Invocation[FlashAttentionConfig, Array]):
@@ -830,7 +851,7 @@ def flash_attention(
     normalize_output: bool = True,
     precision: lax.PrecisionLike = lax.Precision.DEFAULT,
     logits_dtype: DTypeLike = jnp.float32,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: FlashAttentionConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,

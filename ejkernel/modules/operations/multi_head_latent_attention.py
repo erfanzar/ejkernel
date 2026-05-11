@@ -153,7 +153,7 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
         dropout_prob: float = 0.0,
         sliding_window: int | tuple[int, int] | None = None,
         softmax_dtype: DTypeLike | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: FlashMLAConfig,
     ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
@@ -248,26 +248,51 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
             MLA performance depends on the compression rank and decompression
             overhead. Candidates balance memory efficiency with compute cost.
         """
-        block_configs = [
-            (64, 64, 4, 1),
-            (128, 128, 4, 2),
-            (256, 256, 8, 2),
-        ]
+        return [self.heuristic_cfg(inv)]
 
-        candidates = []
-        for block_q, block_k, num_warps, num_stages in block_configs:
+    def candidate_cfgs_gpu(self, inv: Invocation[FlashMLAConfig, Array]):
+        """Generate GPU candidates for TileLang and XLA FlashMLA."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[FlashMLAConfig] = []
+        if "tilelang" in platforms:
             candidates.append(
                 FlashMLAConfig(
-                    block_q=block_q,
-                    block_k=block_k,
-                    num_warps=num_warps,
-                    num_stages=num_stages,
-                    platform="auto",
+                    block_q=128,
+                    block_k=128,
+                    num_warps=4,
+                    num_stages=2,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+            )
+        if "xla" in platforms:
+            candidates.append(
+                FlashMLAConfig(
+                    block_q=128,
+                    block_k=128,
+                    num_warps=4,
+                    num_stages=2,
+                    platform="xla",
                     backend="any",
                 )
             )
+        return candidates or self.candidate_cfgs(inv)
 
-        return candidates
+    def candidate_cfgs_tpu(self, inv: Invocation[FlashMLAConfig, Array]):
+        """Generate TPU candidates for Pallas and XLA FlashMLA."""
+        return [
+            FlashMLAConfig(
+                block_q=block_q,
+                block_k=block_k,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                platform=platform,
+                backend=backend,
+            )
+            for platform, backend in (("pallas", "tpu"), ("xla", "any"))
+            for block_q, block_k, num_warps, num_stages in ((64, 64, 4, 1), (128, 128, 4, 2))
+        ]
 
 
 _mla_executor: Executor[FlashMLAConfig, Array] = Executor(
@@ -305,7 +330,7 @@ def flash_mla(
     dropout_prob: float = 0.0,
     sliding_window: int | tuple[int, int] | None = None,
     softmax_dtype: DTypeLike | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: FlashMLAConfig | None = None,
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
     """Execute flash multi-head latent attention with automatic optimization.

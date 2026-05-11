@@ -345,7 +345,15 @@ def _xla_choices(hardware: str) -> tuple[tuple[int, ...], tuple[int, ...], tuple
 
 
 def _parse_positive_int_env(name: str, default: int) -> int:
-    """Parse a positive integer env var with a safe fallback."""
+    """Parse a positive integer environment variable with a safe fallback.
+
+    Args:
+        name: The environment variable name to read.
+        default: Fallback value used when the variable is unset or non-integer.
+
+    Returns:
+        The parsed integer value, clamped to at least 1.
+    """
     raw = os.getenv(name)
     if raw is None:
         return int(default)
@@ -357,7 +365,15 @@ def _parse_positive_int_env(name: str, default: int) -> int:
 
 
 def _parse_nonnegative_int_env(name: str, default: int) -> int:
-    """Parse a non-negative integer env var with a safe fallback."""
+    """Parse a non-negative integer environment variable with a safe fallback.
+
+    Args:
+        name: The environment variable name to read.
+        default: Fallback value used when the variable is unset or non-integer.
+
+    Returns:
+        The parsed integer value, clamped to at least 0.
+    """
     raw = os.getenv(name)
     if raw is None:
         return int(default)
@@ -369,21 +385,51 @@ def _parse_nonnegative_int_env(name: str, default: int) -> int:
 
 
 def _tpu_tile_working_set_bytes(*, block_m: int, block_n: int, block_k: int) -> int:
-    """Estimate per-tile bytes touched by fused TPU QMM hot loop."""
+    """Estimate the per-tile bytes touched by the fused TPU QMM hot loop.
+
+    Computes ``(block_m * block_k + block_k * block_n) * 2`` as a proxy for
+    the bfloat16 working set size of one tile iteration (activations + weights).
+
+    Args:
+        block_m: Tile size along the M (batch) dimension.
+        block_n: Tile size along the N (output) dimension.
+        block_k: Tile size along the K (reduction) dimension.
+
+    Returns:
+        Estimated working-set size in bytes.
+    """
     return int((block_m * block_k + block_k * block_n) * 2)
 
 
 def _is_tracer_value(x: object) -> bool:
-    """Return True when ``x`` is a JAX tracer."""
+    """Return ``True`` when ``x`` is an abstract JAX tracer.
+
+    Used to detect whether quantized weights are concrete (already materialised)
+    or symbolic (still traced through JIT), which determines whether the
+    predecode-once path can be used.
+
+    Args:
+        x: Any Python object to inspect.
+
+    Returns:
+        ``True`` if ``x`` is a ``jax.core.Tracer`` instance, else ``False``.
+    """
     return isinstance(x, jax.core.Tracer)
 
 
 def _env_tpu_default_strategy() -> str:
-    """Read TPU default QMM strategy.
+    """Read the TPU default QMM strategy from the environment.
+
+    Controlled by the environment variable ``EJKERNEL_QMM_TPU_DEFAULT_STRATEGY``.
 
     Supported values:
-      - ``predecode_once`` (default)
-      - ``packed``
+        - ``"predecode_once"`` (default): Attempt predecode-once dense matmul
+          first, then fall back to the fused Pallas packed path if inapplicable.
+        - ``"packed"``: Skip the predecode-once attempt and dispatch directly to
+          the fused Pallas packed path.
+
+    Returns:
+        One of ``"predecode_once"`` or ``"packed"``.
     """
     raw = os.getenv("EJKERNEL_QMM_TPU_DEFAULT_STRATEGY", "predecode_once").strip().lower()
     if raw in {"predecode_once", "packed"}:
@@ -442,6 +488,14 @@ _QMM_TPU_BESTCFG_POLICY: dict[str, dict[str, dict[str, object]]] = {
 
 
 def _qmm_bestcfg_mode_key(mode: str) -> str:
+    """Map a quantization mode string to a best-config policy table key.
+
+    Args:
+        mode: Raw quantization mode string (e.g., ``"affine"``, ``"nf4"``).
+
+    Returns:
+        One of ``"affine"``, ``"non_affine"``, or ``"default"``.
+    """
     mode_n = str(mode).strip().lower()
     if mode_n == "affine":
         return "affine"
@@ -486,10 +540,36 @@ def _should_try_tpu_predecode_once_default(
     backend_name: str,
     runtime_axis: QuantizationAxis,
     runtime_transpose: bool,
-    platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None,
+    platform: Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] | None,
     strategy_override: Literal["predecode_once", "packed"] | None = None,
 ) -> bool:
-    """Whether to attempt the TPU predecode-once default path."""
+    """Determine whether to attempt the TPU predecode-once dense matmul path.
+
+    The predecode-once path dequantizes weights to bfloat16 once outside JIT
+    and stores the result, then performs dense bfloat16 matmul on each call.
+    It is faster than the fused Pallas packed path when weights are static
+    (concrete) and the model is repeatedly called with the same weights.
+
+    Returns ``False`` whenever any guard condition is not met:
+        - ``fuse`` must be ``True``.
+        - ``backend_name`` must be ``"tpu"``.
+        - ``runtime_axis`` must be ``"row"`` (``transpose=False``).
+        - ``platform`` must not be an explicit non-Pallas selection.
+        - The resolved strategy (from ``strategy_override`` or env var) must be
+          ``"predecode_once"``.
+
+    Args:
+        fuse: Whether fused kernel dispatch is enabled.
+        backend_name: Name of the JAX default backend (e.g. ``"tpu"``).
+        runtime_axis: Resolved quantization axis (``"row"`` or ``"col"``).
+        runtime_transpose: Whether the weight layout requires transposition.
+        platform: Explicit platform override, if any.
+        strategy_override: Per-call strategy override (``"predecode_once"`` or
+            ``"packed"``), or ``None`` to read from the environment variable.
+
+    Returns:
+        ``True`` if the predecode-once path should be attempted, else ``False``.
+    """
     if not fuse:
         return False
     if backend_name != "tpu":
@@ -513,10 +593,31 @@ def _maybe_tpu_predecode_once_matmul(
     group_size: int,
     bits: int,
 ) -> Array | None:
-    """Try TPU predecode-once + dense matmul.
+    """Try the TPU predecode-once + dense matmul path.
 
-    Returns ``None`` when the path is inapplicable (e.g. traced weights, unsupported
-    bits, cache cap exceeded), allowing caller to fall back to fused dispatch.
+    Dequantizes ``w`` to a bfloat16 dense weight matrix using
+    ``get_predecoded_dense_weight`` and performs a bfloat16
+    ``dot_general`` matmul.  The dense weight is cached across calls so
+    subsequent invocations only pay the cost of the matmul.
+
+    Returns ``None`` when the path is inapplicable — e.g. when ``bits``
+    is not 4 or 8, when any of ``w``/``scales``/``zeros`` are JAX tracers
+    (indicating JIT-traced weights that cannot be pre-decoded), or when the
+    import of the predecode helper fails.  In all these cases the caller
+    should fall back to the fused kernel dispatch.
+
+    Args:
+        x: Input activation matrix ``(M, K)``.
+        w: Packed quantized weights.
+        scales: Per-group scale factors.
+        zeros: Per-group zero-points (``None`` for non-affine modes).
+        mode: Quantization mode (``"affine"`` or non-affine).
+        group_size: Elements per quantization group.
+        bits: Quantization bit-width (must be 4 or 8 for this path).
+
+    Returns:
+        Dense matmul output ``(M, N)`` in bfloat16, or ``None`` if the path
+        cannot be used.
     """
     if bits not in (4, 8):
         return None
@@ -1022,6 +1123,53 @@ def _cuda_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> Quanti
     )
 
 
+def _tilelang_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
+    """Generate a launch-safe heuristic configuration for TileLang QMM."""
+    mode = str(inv.kwargs.get("mode", "affine"))
+    group_size, _ = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
+    M, _K, N, _ = _infer_mkn(inv, group_size)
+    block_m = 128 if M >= 128 else 64 if M >= 64 else 32
+    block_m_tall = 256 if M >= 256 else block_m
+    if mode == "affine":
+        block_n = 128 if N >= 128 else 64
+        block_k = 128
+        num_warps = 4
+    elif mode == "nf4":
+        block_m = block_m_tall
+        block_n = 32
+        block_k = 64
+        num_warps = 4
+    elif mode == "mxfp4":
+        block_m = block_m_tall
+        block_n = 64 if N >= 64 else 32
+        block_k = 64
+        num_warps = 4
+    elif mode in {"nvfp4", "nvfp8"}:
+        block_m = block_m_tall
+        block_n = 64 if N >= 64 else 32
+        block_k = 64
+        num_warps = 4
+    elif mode == "mxfp8":
+        block_n = 64 if N >= 64 else 32
+        block_k = 128
+        num_warps = 4
+    else:
+        block_n = 64 if N >= 64 else 32
+        block_k = 64
+        num_warps = 4
+    return QuantizedMatmulConfig(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        num_stages=2,
+        use_bf16=_prefer_bf16(_inv_arg(inv, "x", 0)),
+        split_k=None,
+        platform="tilelang",
+        backend="gpu",
+    )
+
+
 def _cute_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
     """Generate a heuristic configuration for CuTe DSL quantized matmul.
 
@@ -1067,7 +1215,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         >>> output = kernel.run(x, w_q, scales, zeros, cfg=cfg)
     """
 
-    version = "1"
+    version = "10"
 
     def __init__(self) -> None:
         """Initialize the quantized matmul kernel."""
@@ -1124,7 +1272,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         revsplit_k_parts: int | None = None,
         allow_dense_fallback: bool = True,
         _resolved_platform: str | None = None,
-        platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] | None = None,
         *,
         cfg: QuantizedMatmulConfig,
     ) -> Float[Array, "m n"]:
@@ -1135,34 +1283,46 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
             - ``output = x @ dequantize(w, scales, zeros).T`` when ``transpose=True``
 
         Args:
-            x: Input matrix of shape (M, K) in float dtype.
-            w: Packed uint32 weights produced by quantize(). Shape depends on
-                transpose and bits settings.
-            scales: Per-group scales array. Shape is (N, K//group_size) for
-                transpose=True or (K, N//group_size) for transpose=False.
-            zeros: Per-group affine zero-points (canonical affine metadata).
-                Required for affine mode and must be ``None`` for non-affine modes.
-            transpose: If True, compute x @ w.T (weights stored in KxN layout).
-                If False, compute x @ w (weights stored in KxN transposed layout).
-            group_size: Group size used in quantization. If None, uses mode default.
-            bits: Bit-width used in quantization. Honored for affine ({4,8});
+            x: Input matrix of shape ``(M, K)`` in float dtype.
+            w: Packed uint32 weights produced by ``quantize()``. Shape depends on
+                ``transpose`` and ``bits`` settings.
+            scales: Per-group scale factors. Shape is ``(N, K//group_size)`` for
+                ``transpose=True`` or ``(K, N//group_size)`` for ``transpose=False``.
+            zeros: Per-group affine zero-points. Required for affine mode; must be
+                ``None`` for all non-affine modes.
+            transpose: If ``True``, compute ``x @ dequantize(w).T``
+                (weights stored in KxN layout). If ``False``, compute
+                ``x @ dequantize(w)`` (weights in transposed layout).
+            group_size: Quantization group size. ``None`` uses the mode default.
+            bits: Bit-width used in quantization. Honoured for affine (``{4, 8}``);
                 ignored for nf4/mxfp4/mxfp8/nvfp4/nvfp8.
-            mode: Quantization mode. One of
-                {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}.
-            axis: Optional quantization axis convenience alias. "row" maps to
-                transpose=False and "col" maps to transpose=True.
-            platform: Platform override (triton/pallas/cuda/cute/xla/auto).
+            mode: Quantization mode string. One of
+                ``{"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}``.
+            axis: Optional quantization axis alias. ``"row"`` maps to
+                ``transpose=False``; ``"col"`` maps to ``transpose=True``.
+            gemv_mode: GEMV specialisation mode (``"auto"``, ``"on"``, ``"off"``).
+                ``"auto"`` enables the GEMV kernel when M == 1 and mode supports it.
+            revsplit_k: Reverse split-K reduction mode
+                (``"auto"``, ``"on"``, ``"off"``). Splits the K reduction for
+                improved parallelism on tall-skinny outputs.
+            revsplit_k_parts: Number of parts for reverse split-K. ``None`` means
+                the mode default is used.
+            allow_dense_fallback: When dispatching to XLA or Pallas, whether the
+                implementation may fall back to a dequantize+matmul decomposition
+                when blocked-fusion preconditions are not met.
+            platform: Platform override (``triton``/``pallas``/``cuda``/``cute``/
+                ``xla``/``auto``).
             cfg: Kernel configuration with block sizes and settings.
 
         Returns:
-            Matrix multiplication result of shape (M, N). CUDA returns the same
-            dtype as ``x``; other backends return float32.
+            Matrix multiplication result of shape ``(M, N)``. The CUDA backend
+            preserves the dtype of ``x``; all other backends return float32.
 
-        Notes:
+        Note:
             For best Triton performance, prepack weights in KxN layout using
-            prepack_quantized_weights() and call with transpose=False.
+            ``prepack_quantized_weights()`` and call with ``transpose=False``.
             For affine mode, backend wrappers convert ``zeros`` to internal
-            additive offsets right before kernel launch.
+            additive offsets immediately before kernel launch.
         """
         _ = _resolved_platform
         if platform is not None:
@@ -1273,6 +1433,8 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
             return _triton_heuristic_cfg(inv)
         if resolved == Platform.CUDA:
             return _cuda_heuristic_cfg(inv)
+        if resolved == Platform.TILELANG:
+            return _tilelang_heuristic_cfg(inv)
         if resolved == Platform.CUTE:
             return _cute_heuristic_cfg(inv)
         return _xla_heuristic_cfg(inv, "gpu")
@@ -1311,9 +1473,176 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         Returns:
             List of QuantizedMatmulConfig candidates optimized for GPU.
         """
-        resolved = self._resolve_inv_platform(inv)
-        if resolved in (Platform.TRITON, Platform.CUDA, Platform.CUTE):
-            return []
+        requested = inv.kwargs.get("platform", None)
+        if requested is None and inv.override_cfg is not None:
+            requested = inv.override_cfg.platform
+        if requested in (None, "auto"):
+            candidates: list[QuantizedMatmulConfig] = []
+            for platform in (Platform.CUDA, Platform.CUTE, Platform.TRITON, Platform.TILELANG):
+                candidates.extend(self._candidate_cfgs_gpu_for_platform(inv, platform))
+            candidates.extend(_xla_candidate_cfgs(inv, "gpu")[:4])
+            return candidates
+        return self._candidate_cfgs_gpu_for_platform(inv, self._resolve_inv_platform(inv))
+
+    def _candidate_cfgs_gpu_for_platform(
+        self,
+        inv: Invocation[QuantizedMatmulConfig, Array],
+        resolved: Platform,
+    ) -> list[QuantizedMatmulConfig]:
+        """Return candidate configurations for a concrete GPU platform."""
+        if resolved == Platform.TRITON:
+            mode = str(inv.kwargs.get("mode", "affine"))
+            group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
+            M, K, N, _ = _infer_mkn(inv, group_size)
+            use_bf16 = _prefer_bf16(_inv_arg(inv, "x", 0))
+            if bits == 8:
+                bk_choices = (64, 128)
+            elif group_size >= 128:
+                bk_choices = (32, 64)
+            else:
+                bk_choices = (32, 64, 128)
+            bm_choices = _nearest_choices(M, (32, 64, 128, 256), 3)
+            bn_choices = _nearest_choices(N, (64, 128, 256, 512), 3)
+            candidates: list[QuantizedMatmulConfig] = []
+            seen: set[tuple[int, int, int, int, int, int]] = set()
+            for bm in bm_choices:
+                for bn in bn_choices:
+                    for bk in bk_choices:
+                        for stages in (1, 2) if bk >= 128 else (2, 3):
+                            smem = (bm * bk + bk * bn) * 2 * stages
+                            if smem > 96 * 1024:
+                                continue
+                            warps = 8 if (bm >= 128 and bn >= 256) else 4 if (bm >= 128 or bn >= 128) else 2
+                            split_k = _pick_split_k(M, K, bk)
+                            key = (bm, bn, bk, warps, stages, split_k)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            candidates.append(
+                                QuantizedMatmulConfig(
+                                    block_m=bm,
+                                    block_n=bn,
+                                    block_k=bk,
+                                    num_warps=warps,
+                                    num_stages=stages,
+                                    use_bf16=use_bf16,
+                                    split_k=split_k,
+                                    platform="triton",
+                                    backend="gpu",
+                                )
+                            )
+            return candidates[:16] or [_triton_heuristic_cfg(inv)]
+        if resolved == Platform.CUDA:
+            base = _cuda_heuristic_cfg(inv)
+            return [
+                QuantizedMatmulConfig(
+                    block_m=bm,
+                    block_n=bn,
+                    block_k=bk,
+                    num_warps=warps,
+                    num_stages=stages,
+                    use_bf16=base.use_bf16,
+                    split_k=None,
+                    platform="cuda",
+                    backend="gpu",
+                )
+                for bm, bn, bk, warps, stages in (
+                    (128, 128, 64, 4, 2),
+                    (128, 256, 64, 4, 2),
+                    (64, 128, 64, 4, 2),
+                    (128, 128, 128, 4, 2),
+                )
+            ]
+        if resolved == Platform.CUTE:
+            base = _cute_heuristic_cfg(inv)
+            return [
+                QuantizedMatmulConfig(
+                    block_m=bm,
+                    block_n=bn,
+                    block_k=bk,
+                    num_warps=base.num_warps,
+                    num_stages=base.num_stages,
+                    use_bf16=base.use_bf16,
+                    split_k=None,
+                    platform="cute",
+                    backend="gpu",
+                )
+                for bm, bn, bk in (
+                    (128, 128, 64),
+                    (128, 64, 64),
+                    (64, 128, 64),
+                    (64, 64, 32),
+                    (128, 128, 32),
+                )
+            ]
+        if resolved == Platform.TILELANG:
+            mode = str(inv.kwargs.get("mode", "affine"))
+            group_size, _ = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
+            M, _K, N, _ = _infer_mkn(inv, group_size)
+            block_m = 128 if M >= 128 else 64 if M >= 64 else 32
+            block_m_tall = 256 if M >= 256 else block_m
+            block_n_hi = 128 if N >= 128 else 64
+            block_n_lo = 64 if N >= 64 else 32
+            block_n_micro = 32
+            use_bf16 = _prefer_bf16(_inv_arg(inv, "x", 0))
+            if mode == "affine":
+                shapes = (
+                    (block_m, block_n_hi, 128, 4),
+                    (block_m, block_n_hi, 64, 4),
+                    (block_m, block_n_lo, 64, 4),
+                    (block_m, block_n_hi, 32, 4),
+                )
+            elif mode == "nf4":
+                shapes = (
+                    (block_m_tall, block_n_micro, 64, 4),
+                    (block_m_tall, block_n_lo, 64, 4),
+                    (64 if block_m >= 64 else block_m, block_n_lo, 64, 4),
+                    (block_m, block_n_lo, 32, 4),
+                )
+            elif mode == "mxfp4":
+                shapes = (
+                    (block_m_tall, block_n_lo, 64, 4),
+                    (block_m_tall, block_n_lo, 128, 4),
+                    (block_m, block_n_hi, 64, 4),
+                    (block_m, block_n_lo, 32, 4),
+                    (block_m, block_n_lo, 64, 4),
+                )
+            elif mode == "mxfp8":
+                shapes = (
+                    (block_m_tall, block_n_lo, 128, 4),
+                    (block_m, block_n_lo, 64, 4),
+                    (block_m, block_n_hi, 64, 4),
+                    (block_m_tall, block_n_lo, 64, 4),
+                    (block_m, block_n_lo, 32, 4),
+                )
+            elif mode == "nvfp4":
+                shapes = (
+                    (block_m_tall, block_n_lo, 64, 4),
+                    (block_m, block_n_lo, 64, 4),
+                    (block_m, block_n_lo, 32, 4),
+                    (block_m, block_n_hi, 64, 4),
+                )
+            else:
+                shapes = (
+                    (block_m_tall, block_n_lo, 64, 4),
+                    (block_m, block_n_lo, 32, 4),
+                    (block_m, block_n_hi, 64, 4),
+                    (block_m, block_n_lo, 64, 4),
+                )
+            return [
+                QuantizedMatmulConfig(
+                    block_m=bm,
+                    block_n=bn,
+                    block_k=bk,
+                    num_warps=warps,
+                    num_stages=2,
+                    use_bf16=use_bf16,
+                    split_k=None,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+                for bm, bn, bk, warps in shapes
+            ]
         return _xla_candidate_cfgs(inv, "gpu")
 
     def candidate_cfgs_cpu(self, inv: Invocation[QuantizedMatmulConfig, Array]) -> list[QuantizedMatmulConfig]:
@@ -1336,6 +1665,11 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         Returns:
             List of QuantizedMatmulConfig candidates optimized for TPU.
         """
+        requested = inv.kwargs.get("platform", None)
+        if requested is None and inv.override_cfg is not None:
+            requested = inv.override_cfg.platform
+        if requested in (None, "auto"):
+            return [*_pallas_tpu_candidate_cfgs(inv), *_xla_candidate_cfgs(inv, "tpu")]
         resolved = self._resolve_inv_platform(inv)
         if resolved == Platform.PALLAS:
             return _pallas_tpu_candidate_cfgs(inv)
@@ -1377,7 +1711,7 @@ def _quantized_matmul_impl(
     revsplit_k: RevSplitKMode = "auto",
     revsplit_k_parts: int | None = None,
     allow_dense_fallback: bool = True,
-    platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
     """Execute quantized matrix multiplication with normalized qparams.
@@ -1388,30 +1722,34 @@ def _quantized_matmul_impl(
     appropriate platform executor.
 
     Args:
-        x: Input matrix of shape (M, K) in float dtype.
+        x: Input matrix of shape ``(M, K)`` in float dtype.
         w: Packed quantized weights.
         scales: Per-group scale factors.
-        zeros: Per-group zero-points (required for affine mode, None otherwise).
-        transpose: If True, compute x @ dequantize(w).T.
+        zeros: Per-group zero-points (required for affine mode, ``None`` otherwise).
+        transpose: If ``True``, compute ``x @ dequantize(w).T``.
         group_size: Quantization group size.
         bits: Quantization bit-width.
         mode: Quantization mode string.
-        axis: Optional quantization axis convenience alias.
-        gemv_mode: GEMV kernel selection mode ("auto", "on", "off").
-        revsplit_k: Reverse split-K mode ("auto", "on", "off").
+        axis: Resolved quantization axis (must be ``"row"`` or ``"col"``; see
+            ``resolve_runtime_axis_and_transpose``). Callers must pass this
+            explicitly — passing ``None`` raises ``ValueError``.
+        gemv_mode: GEMV kernel selection mode (``"auto"``, ``"on"``, ``"off"``).
+        revsplit_k: Reverse split-K mode (``"auto"``, ``"on"``, ``"off"``).
         revsplit_k_parts: Number of parts for reverse split-K.
-        allow_dense_fallback: When dispatching to XLA, controls whether the
-            XLA implementation may fall back to dequantize+matmul when blocked
-            fusion preconditions are not met.
+        allow_dense_fallback: When dispatching to XLA or Pallas, controls
+            whether the implementation may fall back to a separate
+            dequantize+matmul when blocked-fusion preconditions are not met.
         platform: Platform override.
         cfg: Optional configuration override.
 
     Returns:
-        Matrix multiplication result of shape (M, N).
+        Matrix multiplication result of shape ``(M, N)``.
 
     Raises:
-        ValueError: If affine mode is used without zeros, or non-affine mode
-            with zeros.
+        ValueError: If ``axis`` is ``None`` or not in ``{"row", "col"}``.
+        ValueError: If ``axis``/``transpose`` are inconsistent with each other.
+        ValueError: If affine mode is used without ``zeros``.
+        ValueError: If a non-affine mode is used with a non-``None`` ``zeros``.
     """
     transpose = _static_bool(transpose, "transpose")
     if group_size is not None:
@@ -1546,7 +1884,7 @@ def quantized_matmul(
     tpu_path: Literal["packed", "hybrid", "predecode"] | None = None,
     allow_dense_fallback: bool | None = None,
     use_best_config: bool = False,
-    platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] | None = None,
     cfg: QuantizedMatmulConfig | None = None,
 ) -> Float[Array, "m n"]:
     """Quantized matrix multiplication with fused dequantization and custom VJP.
@@ -1645,7 +1983,7 @@ def quantized_matmul(
                 allow_dense_fallback = bool(policy["allow_dense_fallback"])
             if platform in (None, "auto") and "platform" in policy:
                 policy_platform = str(policy["platform"]).strip().lower()
-                if policy_platform in {"triton", "pallas", "cuda", "cute", "xla", "auto"}:
+                if policy_platform in {"triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"}:
                     platform = policy_platform
             if tpu_path is None and "tpu_path" in policy:
                 policy_tpu_path = str(policy["tpu_path"]).strip().lower()

@@ -159,7 +159,7 @@ class RWKV6(Kernel[RWKV6Config, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RWKV6Config,
     ) -> (
         Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -231,7 +231,6 @@ class RWKV6(Kernel[RWKV6Config, Array]):
         Returns:
             Default configuration with auto platform selection
         """
-        del inv
         return RWKV6Config(platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[RWKV6Config, Array]):
@@ -247,8 +246,27 @@ class RWKV6(Kernel[RWKV6Config, Array]):
             RWKV-6's recurrence pattern relies primarily on platform selection
             for optimization.
         """
-        del inv
-        return []
+        return [
+            RWKV6Config(platform="auto", backend="any"),
+            RWKV6Config(platform="xla", backend="any"),
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[RWKV6Config, Array]):
+        """Generate GPU platform candidates for RWKV-6."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "triton", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[RWKV6Config] = []
+        if "tilelang" in platforms:
+            candidates.append(RWKV6Config(platform="tilelang", backend="gpu"))
+        if "triton" in platforms:
+            candidates.append(RWKV6Config(platform="triton", backend="gpu"))
+        if "xla" in platforms:
+            candidates.append(RWKV6Config(platform="xla", backend="any"))
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[RWKV6Config, Array]):
+        """Return TPU candidates for the XLA RWKV-6 path."""
+        return [RWKV6Config(platform="xla", backend="any")]
 
 
 _executor: Executor[RWKV6Config, Array] = Executor(
@@ -278,7 +296,7 @@ def rwkv6(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RWKV6Config | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

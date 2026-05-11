@@ -71,7 +71,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -162,7 +162,7 @@ class GLAttention(Kernel[GLAttentionConfig, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: GLAttentionConfig,
     ) -> (
@@ -208,7 +208,16 @@ class GLAttention(Kernel[GLAttentionConfig, Array]):
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
-        impl = self.get_impl(cfg)
+        resolved_platform = detect_platform("gla", cfg.platform)
+        impl = kernel_registry.get("gla", platform=resolved_platform, backend=cfg.backend)
+        impl_kwargs = {}
+        if resolved_platform == Platform.TRITON:
+            impl_kwargs = {
+                "block_k": cfg.block_k,
+                "block_v": cfg.block_d,
+                "num_warps": cfg.num_warps,
+                "num_stages": cfg.num_stages,
+            }
 
         result = impl(
             query=query,
@@ -220,6 +229,7 @@ class GLAttention(Kernel[GLAttentionConfig, Array]):
             initial_state=initial_state,
             reverse=reverse,
             cu_seqlens=cu_seqlens,
+            **impl_kwargs,
         )
 
         if isinstance(result, tuple):
@@ -280,6 +290,69 @@ class GLAttention(Kernel[GLAttentionConfig, Array]):
 
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[GLAttentionConfig, Array]):
+        """Generate GPU candidates for GLA across Triton, TileLang and XLA."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        block_configs = [
+            (64, 64, 64, 4, 1),
+            (128, 64, 64, 4, 2),
+            (128, 128, 64, 8, 2),
+        ]
+        candidates: list[GLAttentionConfig] = []
+        if "triton" in platforms:
+            for block_q, block_k, block_d, num_warps, num_stages in block_configs:
+                candidates.append(
+                    GLAttentionConfig(
+                        block_q=block_q,
+                        block_k=block_k,
+                        block_d=block_d,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        platform="triton",
+                        backend="gpu",
+                    )
+                )
+        if "tilelang" in platforms:
+            candidates.append(
+                GLAttentionConfig(
+                    block_q=64,
+                    block_k=64,
+                    block_d=64,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+            )
+        if "xla" in platforms:
+            candidates.append(
+                GLAttentionConfig(
+                    block_q=64,
+                    block_k=64,
+                    block_d=64,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[GLAttentionConfig, Array]):
+        """Generate TPU candidates for the XLA GLA path."""
+        return [
+            GLAttentionConfig(
+                block_q=64,
+                block_k=64,
+                block_d=64,
+                num_warps=4,
+                num_stages=1,
+                platform="xla",
+                backend="any",
+            )
+        ]
+
 
 _gla_executor: Executor[GLAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
@@ -308,7 +381,7 @@ def gla_attention(
     softmax_scale: float | None = None,
     reverse: bool = False,
     return_state: bool = False,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: GLAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kernel public interface and registration wrappers."""
+"""Gated Linear Attention (GLA) public interface for XLA backend.
+
+This module registers ``recurrent_gla`` under the ``"gla"`` key in the ejkernel
+registry for the XLA platform and wraps the core implementation in
+``_xla_impl_fwd.recurrent_gla``.
+"""
 
 from __future__ import annotations
 
@@ -35,58 +40,79 @@ def recurrent_gla(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 64,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
-    """
-    Computes Gated Linear Attention (GLA) in a recurrent, linear-time manner using JAX/XLA.
-    This function provides a convenient wrapper around the core `recurrent`
-    implementation, tailored for GLA. It processes sequences step-by-step,
-    making it highly efficient for very long sequences and suitable for
-    autoregressive decoding.
-    It supports both standard batch processing and variable-length sequence
-    processing using cumulative sequence lengths (`cu_seqlens`).
+    """Compute Gated Linear Attention (GLA) via a recurrent, linear-time scan.
+
+    Thin wrapper around the core ``recurrent`` implementation that registers
+    the kernel under the ``"gla"`` key.  Processes the sequence step-by-step
+    using a gated linear recurrence, making it O(N) in both time and memory
+    for the recurrent state.
+
+    Both standard batch processing and variable-length (packed) sequences via
+    ``cu_seqlens`` are supported.
+
     Args:
-        query: The query tensor. Expected shape is `(batch, seq_len, num_heads, head_dim)`
-            or `(total_tokens, num_heads, head_dim)` if `cu_seqlens` is used.
-        key: The key tensor. Must have the same shape as `q`.
-        value: The value tensor. Must have the same shape as `q`.
-        g: The gate tensor, specific to Gated Linear Attention. If provided, it
-            should have the same shape as `q`.
-        g_gamma: The gate decay factor.
-        softmax_scale: A scaling factor applied to the query before the recurrent
-            computation. If `None`, it defaults to `1 / sqrt(head_dim)`.
-        initial_state: The initial hidden state for the recurrence. Useful for
-            chunked processing of long sequences.
-        reverse: If `True`, the sequence is processed in reverse order.
-        cu_seqlens: Cumulative sequence lengths for variable-length inputs.
-            This is a 1D tensor like `[0, len_seq1, len_seq1+len_seq2, ...]`.
-            If provided, the input tensors `query, key, value, g` are expected to be
-            "packed" with a shape of `(total_tokens, ...)`.
+        query: Query tensor.
+            Shape: ``[batch, seq_len, num_heads, qk_head_dim]`` (standard), or
+            ``[1, total_tokens, num_heads, qk_head_dim]`` / ``[total_tokens, num_heads, qk_head_dim]``
+            when using ``cu_seqlens``.
+        key: Key tensor, same shape as ``query``.
+        value: Value tensor.
+            Shape: ``[batch, seq_len, num_kv_heads, v_head_dim]``.
+        g: Gate tensor for GLA.  Same shape as ``query``.
+            When provided, element-wise gates the key-value outer product.
+        g_gamma: Optional per-head scalar decay factor broadcast over the
+            sequence.  Shape: ``[..., num_heads]``.
+        softmax_scale: Scaling factor applied to queries before the recurrence.
+            Defaults to ``1 / sqrt(qk_head_dim)``.
+        initial_state: Initial hidden state for the recurrence, useful for
+            incremental / chunked inference.
+            Shape: ``[..., num_heads, qk_head_dim, v_head_dim]``.
+        reverse: If True, process the sequence right-to-left.
+        cu_seqlens: Cumulative sequence lengths for variable-length packed
+            inputs.  Expected format: ``[0, len_seq1, len_seq1+len_seq2, ...]``.
+            When provided, ``query/key/value/g`` must be packed and the batch
+            dimension must be 1.
+        block_k: Accepted for operation-level config parity with Triton; XLA
+            chooses its own tiling.
+        block_v: Accepted for operation-level config parity with Triton; XLA
+            chooses its own tiling.
+        num_warps: Accepted for operation-level config parity with Triton.
+        num_stages: Accepted for operation-level config parity with Triton.
+
     Returns:
-        A tuple containing:
-            - o (jax.Array): The output tensor, with the same shape as `q`.
-            - final_state (jax.Array): The final hidden state of the recurrence,
-              which can be used as `initial_state` for a subsequent segment.
+        Tuple of:
+            - output: Attention output, same shape as ``query``.
+            - final_state: Final recurrent hidden state with shape
+              ``[..., num_heads, qk_head_dim, v_head_dim]``.
+
     Raises:
-        ValueError: If `cu_seqlens` is provided and the batch size of `q` is
-            not 1.
-        ValueError: If `cu_seqlens` is provided and the number of initial states
-            does not match the number of sequences.
-    Examples:
-        >>>
+        ValueError: If ``cu_seqlens`` is provided and the batch size is not 1.
+        ValueError: If ``cu_seqlens`` is provided and the number of initial
+            states does not match the number of sequences.
+
+    Example:
+        >>> import jax.numpy as jnp
         >>> q = jnp.ones((2, 100, 8, 64))
         >>> k = jnp.ones((2, 100, 8, 64))
         >>> v = jnp.ones((2, 100, 8, 64))
         >>> g = jnp.ones((2, 100, 8, 64))
-        >>> output, final_state = recurrent_gla(query, key, value, g=g)
+        >>> output, final_state = recurrent_gla(q, k, v, g=g)
         >>> output.shape
         (2, 100, 8, 64)
-        >>>
-        >>> q = jnp.ones((150, 8, 64))
-        >>> k = jnp.ones((150, 8, 64))
-        >>> v = jnp.ones((150, 8, 64))
-        >>> g = jnp.ones((150, 8, 64))
+
+        >>> # Packed variable-length sequences
+        >>> q_packed = jnp.ones((150, 8, 64))
+        >>> k_packed = jnp.ones((150, 8, 64))
+        >>> v_packed = jnp.ones((150, 8, 64))
+        >>> g_packed = jnp.ones((150, 8, 64))
         >>> cu_seqlens = jnp.array([0, 50, 100, 150])
-        >>> output, final_state = recurrent_gla(query, key, value, g=g, cu_seqlens=cu_seqlens)
+        >>> output, _ = recurrent_gla(q_packed, k_packed, v_packed,
+        ...                           g=g_packed, cu_seqlens=cu_seqlens)
         >>> output.shape
         (150, 8, 64)
     """

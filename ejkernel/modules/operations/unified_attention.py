@@ -194,7 +194,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
         seq_threshold_3d: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: UnifiedAttentionConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -310,7 +310,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         sliding_window: int | None = None,
         logits_soft_cap: float | None = None,
         seq_threshold_3d: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: UnifiedAttentionConfig,
     ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
         """Execute unified paged attention.
@@ -350,6 +350,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
             cfg = UnifiedAttentionConfig(
                 seq_threshold_3d=cfg.seq_threshold_3d,
                 num_par_softmax_segments=cfg.num_par_softmax_segments,
+                block_dim=cfg.block_dim,
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
@@ -360,24 +361,29 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
             seq_threshold_3d = cfg.seq_threshold_3d
 
         impl = self.get_impl(cfg)
+        impl_kwargs = {
+            "queries": queries,
+            "key_cache": key_cache,
+            "value_cache": value_cache,
+            "kv_lens": kv_lens,
+            "block_tables": block_tables,
+            "query_start_loc": query_start_loc,
+            "softmax_scale": softmax_scale,
+            "causal": causal,
+            "sliding_window": sliding_window,
+            "logits_soft_cap": logits_soft_cap,
+            "seq_threshold_3d": seq_threshold_3d,
+            "num_par_softmax_segments": cfg.num_par_softmax_segments,
+            "alibi_slopes": alibi_slopes,
+            "qq_bias": qq_bias,
+            "softmax_aux": softmax_aux,
+            "num_warps": cfg.num_warps,
+            "num_stages": cfg.num_stages,
+        }
+        if cfg.platform == "cuda":
+            impl_kwargs["block_dim"] = cfg.block_dim
         return impl(
-            queries=queries,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            kv_lens=kv_lens,
-            block_tables=block_tables,
-            query_start_loc=query_start_loc,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            sliding_window=sliding_window,
-            logits_soft_cap=logits_soft_cap,
-            seq_threshold_3d=seq_threshold_3d,
-            num_par_softmax_segments=cfg.num_par_softmax_segments,
-            alibi_slopes=alibi_slopes,
-            qq_bias=qq_bias,
-            softmax_aux=softmax_aux,
-            num_warps=cfg.num_warps,
-            num_stages=cfg.num_stages,
+            **impl_kwargs,
         )
 
     def heuristic_cfg(self, inv: Invocation[UnifiedAttentionConfig, Array]) -> UnifiedAttentionConfig:
@@ -401,6 +407,7 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         return UnifiedAttentionConfig(
             seq_threshold_3d=int(seq_threshold_3d),
             num_par_softmax_segments=int(NUM_PAR_SOFTMAX_SEGMENTS),
+            block_dim=128,
             num_warps=None,
             num_stages=None,
             platform="auto",
@@ -410,16 +417,100 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
     def candidate_cfgs(self, inv: Invocation[UnifiedAttentionConfig, Array]):
         """Return candidate configurations for autotuning.
 
-        This operation exposes the main tuning knobs directly via the config,
-        so autotuning is avoided by default to reduce overhead.
+        This operation exposes the main tuning knobs directly via the config.
 
         Args:
             inv: Invocation containing the input arguments and metadata.
 
         Returns:
-            Empty list (autotuning disabled for this kernel).
+            CUDA candidates when CUDA is explicitly requested; otherwise a
+            single heuristic configuration.
         """
-        return []
+        return [self.heuristic_cfg(inv)]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[UnifiedAttentionConfig, Array]):
+        """Return GPU candidates for every registered unified-attention backend."""
+        base = self.heuristic_cfg(inv)
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "cuda", "cute", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[UnifiedAttentionConfig] = []
+        if "triton" in platforms:
+            candidates.append(
+                UnifiedAttentionConfig(
+                    seq_threshold_3d=base.seq_threshold_3d,
+                    num_par_softmax_segments=base.num_par_softmax_segments,
+                    block_dim=base.block_dim,
+                    num_warps=None,
+                    num_stages=None,
+                    platform="triton",
+                    backend="gpu",
+                )
+            )
+        if "cuda" in platforms:
+            candidates.extend(
+                UnifiedAttentionConfig(
+                    seq_threshold_3d=base.seq_threshold_3d,
+                    num_par_softmax_segments=base.num_par_softmax_segments,
+                    block_dim=block_dim,
+                    num_warps=None,
+                    num_stages=None,
+                    platform="cuda",
+                    backend="gpu",
+                )
+                for block_dim in (64, 128, 256)
+            )
+        if "cute" in platforms:
+            candidates.append(
+                UnifiedAttentionConfig(
+                    seq_threshold_3d=base.seq_threshold_3d,
+                    num_par_softmax_segments=base.num_par_softmax_segments,
+                    block_dim=base.block_dim,
+                    num_warps=None,
+                    num_stages=None,
+                    platform="cute",
+                    backend="gpu",
+                )
+            )
+        if "tilelang" in platforms:
+            candidates.append(
+                UnifiedAttentionConfig(
+                    seq_threshold_3d=base.seq_threshold_3d,
+                    num_par_softmax_segments=base.num_par_softmax_segments,
+                    block_dim=base.block_dim,
+                    num_warps=None,
+                    num_stages=None,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+            )
+        if "xla" in platforms:
+            candidates.append(
+                UnifiedAttentionConfig(
+                    seq_threshold_3d=base.seq_threshold_3d,
+                    num_par_softmax_segments=base.num_par_softmax_segments,
+                    block_dim=base.block_dim,
+                    num_warps=None,
+                    num_stages=None,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or [base]
+
+    def candidate_cfgs_tpu(self, inv: Invocation[UnifiedAttentionConfig, Array]):
+        """Return the XLA TPU candidate for unified attention."""
+        base = self.heuristic_cfg(inv)
+        return [
+            UnifiedAttentionConfig(
+                seq_threshold_3d=base.seq_threshold_3d,
+                num_par_softmax_segments=base.num_par_softmax_segments,
+                block_dim=base.block_dim,
+                num_warps=None,
+                num_stages=None,
+                platform="xla",
+                backend="any",
+            )
+        ]
 
 
 _unified_attention_executor: Executor[UnifiedAttentionConfig, Array] = Executor(
@@ -449,7 +540,7 @@ def unified_attention(
     sliding_window: int | None = None,
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: PartitionSpec | None = None,

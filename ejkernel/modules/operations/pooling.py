@@ -65,7 +65,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -126,7 +126,7 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
         x: Float[Array, "... hidden_dim"],
         chunk_size: int = 32,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: MeanPoolingConfig,
     ) -> Float[Array, "batch hidden_dim"]:
@@ -148,29 +148,28 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
             computation, ensuring accurate pooling for variable-length sequences.
         """
 
-        # The Triton "mean_pooling" kernel is used internally for block-compression
-        # (e.g., in Native Sparse Attention) and operates on 4D inputs. The public
-        # pooling operation expects global mean pooling for 3D inputs, so default to
-        # the XLA implementation unless the user explicitly selects a platform.
-        if platform is None or platform == "auto":
-            cfg = MeanPoolingConfig(
-                block_size=cfg.block_size,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
-                platform="xla",
-                backend=Backend.ANY,
-            )
+        block_size = getattr(cfg, "block_size", chunk_size)
+        block_dim = getattr(cfg, "block_dim", 64)
+        num_warps = getattr(cfg, "num_warps", 4)
+        num_stages = getattr(cfg, "num_stages", 1)
+        cfg_backend = getattr(cfg, "backend", Backend.ANY)
+        effective_chunk_size = chunk_size if chunk_size != 32 else block_size
 
         if platform is not None:
             cfg = MeanPoolingConfig(
-                block_size=cfg.block_size,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
+                block_size=block_size,
+                block_dim=block_dim,
+                num_warps=num_warps,
+                num_stages=num_stages,
                 platform=platform,
-                backend=Backend.ANY if platform == "xla" else cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg_backend,
             )
-        impl = self.get_impl(cfg)
-        return impl(x=x, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
+        resolved_platform = detect_platform("mean_pooling", cfg.platform)
+        impl = kernel_registry.get("mean_pooling", platform=resolved_platform, backend=cfg.backend)
+        kwargs = dict(x=x, chunk_size=effective_chunk_size, cu_seqlens=cu_seqlens)
+        if resolved_platform in (Platform.TRITON, Platform.TILELANG, Platform.XLA):
+            kwargs.update(block_dim=cfg.block_dim, num_warps=cfg.num_warps, num_stages=cfg.num_stages)
+        return impl(**kwargs)
 
     def heuristic_cfg(self, inv: Invocation[MeanPoolingConfig, Array]) -> MeanPoolingConfig:
         """Provide default configuration with block sizes.
@@ -187,6 +186,7 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
         """
         return MeanPoolingConfig(
             block_size=64,
+            block_dim=64,
             num_warps=4,
             num_stages=1,
             platform="auto",
@@ -212,16 +212,17 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
             Larger block sizes (128) improve throughput for large sequences.
         """
         block_configs = [
-            (32, 4, 1),
-            (64, 4, 1),
-            (128, 8, 2),
+            (32, 32, 2, 1),
+            (64, 64, 4, 1),
+            (128, 128, 8, 2),
         ]
 
         candidates = []
-        for block_size, num_warps, num_stages in block_configs:
+        for block_size, block_dim, num_warps, num_stages in block_configs:
             candidates.append(
                 MeanPoolingConfig(
                     block_size=block_size,
+                    block_dim=block_dim,
                     num_warps=num_warps,
                     num_stages=num_stages,
                     platform="auto",
@@ -230,6 +231,66 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
             )
 
         return candidates
+
+    def candidate_cfgs_gpu(self, inv: Invocation[MeanPoolingConfig, Array]):
+        """Generate GPU candidates for mean pooling across registered GPU backends."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        block_configs = [
+            (32, 32, 2, 1),
+            (64, 64, 4, 1),
+            (128, 128, 8, 2),
+            (256, 128, 8, 2),
+        ]
+        candidates: list[MeanPoolingConfig] = []
+        if "triton" in platforms:
+            for block_size, block_dim, num_warps, num_stages in block_configs:
+                candidates.append(
+                    MeanPoolingConfig(
+                        block_size=block_size,
+                        block_dim=block_dim,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        platform="triton",
+                        backend="gpu",
+                    )
+                )
+        if "tilelang" in platforms:
+            candidates.append(
+                MeanPoolingConfig(
+                    block_size=256,
+                    block_dim=128,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+            )
+        if "xla" in platforms:
+            candidates.append(
+                MeanPoolingConfig(
+                    block_size=64,
+                    block_dim=64,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[MeanPoolingConfig, Array]):
+        """Generate TPU candidates for the XLA mean-pooling path."""
+        return [
+            MeanPoolingConfig(
+                block_size=64,
+                block_dim=64,
+                num_warps=4,
+                num_stages=1,
+                platform="xla",
+                backend="any",
+            )
+        ]
 
 
 _mean_pooling_executor: Executor[MeanPoolingConfig, Array] = Executor(
@@ -252,7 +313,7 @@ def mean_pooling(
     /,
     *,
     chunk_size: int = 32,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: MeanPoolingConfig | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
     """Execute mean pooling with automatic optimization.
@@ -260,28 +321,40 @@ def mean_pooling(
     Efficiently computes the mean of sequence elements along the sequence dimension,
     optimized for variable-length sequences and chunked processing.
 
-    Args:
-        x: Input tensor [batch, seq_len, hidden_dim]
-        chunk_size: Size of chunks for processing (default: 32)
-        cu_seqlens: Cumulative sequence lengths for variable-length sequences
+    Note:
+        The Triton ``mean_pooling`` kernel is shared with the Native Sparse Attention
+        block-compression path and operates on 4-D inputs. When ``platform`` is
+        ``None`` or ``"auto"`` this function always routes through the XLA backend,
+        which handles arbitrary-rank inputs correctly.
 
-            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+    Args:
+        x: Input tensor [batch, seq_len, hidden_dim].
+        cu_seqlens: Cumulative sequence lengths for variable-length batches
+            (shape ``[num_seqs + 1]``). When ``None``, the full ``seq_len``
+            dimension is averaged for every batch element.
+        chunk_size: Number of tokens processed per kernel tile (default: 32).
+            Smaller values reduce per-tile memory; larger values improve
+            throughput for long sequences.
+        platform: Specific platform to use (``"triton"``, ``"pallas"``,
+            ``"cuda"``, ``"xla"``, or ``"auto"``). When ``None``/``"auto"``,
+            the XLA backend is selected (see Note above).
+        cfg: Optional :class:`~.configs.MeanPoolingConfig` override. When
+            provided, its ``block_size``, ``num_warps``, and ``num_stages``
+            fields are used instead of the autotuned values.
 
     Returns:
-        Mean pooled output [batch, hidden_dim]
+        Mean-pooled output of shape [batch, hidden_dim] (or [num_seqs, hidden_dim]
+        when ``cu_seqlens`` is supplied and ``batch`` is interpreted as the token
+        dimension).
 
     Example:
-        >>>
         >>> pooled = mean_pooling(x)
-        >>>
         >>>
         >>> pooled = mean_pooling(x, chunk_size=64)
         >>>
-        >>>
         >>> pooled = mean_pooling(x, cu_seqlens=cu_seqs)
-            >>>
         >>>
-        >>> out = mean_pooling(..., platform="triton")
+        >>> out = mean_pooling(x, platform="xla")
     """
     return _mean_pooling_executor(
         MeanPooling(),

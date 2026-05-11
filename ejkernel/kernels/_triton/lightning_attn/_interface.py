@@ -35,6 +35,10 @@ def lightning_attn(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 64,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """
     Computes Lightning Attention using a recurrent, linear-time mechanism.
@@ -74,7 +78,19 @@ def lightning_attn(
             does not match the number of sequences.
     """
     return _lightning_attn_impl(
-        query, key, value, layer_idx, num_layers, softmax_scale, initial_state, reverse, cu_seqlens
+        query,
+        key,
+        value,
+        layer_idx,
+        num_layers,
+        softmax_scale,
+        initial_state,
+        reverse,
+        cu_seqlens,
+        block_k,
+        block_v,
+        num_warps,
+        num_stages,
     )
 
 

@@ -96,7 +96,7 @@ class DeepSeekAttention(Kernel[DeepSeekAttentionConfig, Array]):
         b_q: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
         b_k: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
         causal: bool = True,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: DeepSeekAttentionConfig,
     ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
@@ -161,8 +161,9 @@ class DeepSeekAttention(Kernel[DeepSeekAttentionConfig, Array]):
         Returns:
             Default ``DeepSeekAttentionConfig`` suitable for most sequence lengths.
         """
+        index_topk = int(inv.kwargs.get("index_topk", 2048))
         return DeepSeekAttentionConfig(
-            index_topk=2048,
+            index_topk=index_topk,
             block_q=128,
             block_k=128,
             num_warps=4,
@@ -174,10 +175,9 @@ class DeepSeekAttention(Kernel[DeepSeekAttentionConfig, Array]):
     def candidate_cfgs(self, inv: Invocation[DeepSeekAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
-        Explores the cross-product of ``index_topk`` (1024, 2048, 4096) and
-        query/key block sizes (64, 128, 256).  Larger ``index_topk`` retains
-        more KV tokens and increases accuracy at the cost of compute; larger
-        blocks improve MXU utilisation but increase per-tile memory.
+        Keeps ``index_topk`` fixed to the caller's requested value because it
+        changes sparsity semantics and output numerics.  Platform-specific
+        methods add concrete backend candidates for GPU and TPU.
 
         Args:
             inv: Invocation containing input tensors and metadata.
@@ -185,21 +185,55 @@ class DeepSeekAttention(Kernel[DeepSeekAttentionConfig, Array]):
         Returns:
             List of ``DeepSeekAttentionConfig`` candidates to benchmark.
         """
-        candidates = []
-        for index_topk in [1024, 2048, 4096]:
-            for block_q, block_k in [(64, 64), (128, 128), (256, 256)]:
-                candidates.append(
-                    DeepSeekAttentionConfig(
-                        index_topk=index_topk,
-                        block_q=block_q,
-                        block_k=block_k,
-                        num_warps=4,
-                        num_stages=2,
-                        platform="auto",
-                        backend="any",
-                    )
+        return [self.heuristic_cfg(inv)]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[DeepSeekAttentionConfig, Array]):
+        """Generate GPU candidates for TileLang and XLA DeepSeek attention."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        index_topk = int(inv.kwargs.get("index_topk", 2048))
+        candidates: list[DeepSeekAttentionConfig] = []
+        if "tilelang" in platforms:
+            candidates.append(
+                DeepSeekAttentionConfig(
+                    index_topk=index_topk,
+                    block_q=128,
+                    block_k=128,
+                    num_warps=4,
+                    num_stages=2,
+                    platform="tilelang",
+                    backend="gpu",
                 )
-        return candidates
+            )
+        if "xla" in platforms:
+            candidates.append(
+                DeepSeekAttentionConfig(
+                    index_topk=index_topk,
+                    block_q=128,
+                    block_k=128,
+                    num_warps=4,
+                    num_stages=2,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[DeepSeekAttentionConfig, Array]):
+        """Generate TPU candidates for Pallas and XLA DeepSeek attention."""
+        index_topk = int(inv.kwargs.get("index_topk", 2048))
+        return [
+            DeepSeekAttentionConfig(
+                index_topk=index_topk,
+                block_q=128,
+                block_k=128,
+                num_warps=4,
+                num_stages=2,
+                platform=platform,
+                backend=backend,
+            )
+            for platform, backend in (("pallas", "tpu"), ("xla", "any"))
+        ]
 
 
 _dsa_executor: Executor[DeepSeekAttentionConfig, Array] = Executor(
@@ -232,7 +266,7 @@ def deepseek_attn(
     softmax_scale: float | None = None,
     index_softmax_scale: float | None = None,
     causal: bool = True,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: DeepSeekAttentionConfig | None = None,
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
     """Execute DeepSeek Sparse Attention with automatic optimization.

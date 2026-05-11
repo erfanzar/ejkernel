@@ -12,7 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""All-gather matmul operation module."""
+"""All-gather + matmul fused operation for tensor-parallel linear layers.
+
+In a tensor-parallel setup the LHS activation matrix ``x`` is split along its
+row (M) dimension across devices.  The RHS weight matrix ``y`` is split along
+the column (N) dimension.  A standard all-gather followed by a local matmul
+gives the same result as a global matmul, but fusing the two operations allows
+overlapping the communication with computation.
+
+Operation:
+    ``result = all_gather(x, axis=0) @ y``
+
+    where ``x`` has shape ``(m_local, k)`` on each device and the gathered
+    ``x`` has shape ``(m, k)`` with ``m = m_local * tp_size``.
+
+Memory layout:
+    - ``x``:  ``(m_local, k)``   — LHS shard on the current device.
+    - ``y``:  ``(k, n_local)``   — RHS shard; or ``(n_local, k)`` when
+      ``rhs_transpose=True``.
+    - result: ``(m, n_local)``   — output shard, no further collective needed.
+
+Block-size clamping:
+    ``block_n`` and ``block_k`` from the config are silently clamped to the
+    largest divisor of ``n_local`` and ``k`` respectively that is ``<=`` the
+    requested value.  This prevents shape-mismatch errors when matrix
+    dimensions are not multiples of the requested block sizes.
+
+Platform support:
+    The XLA implementation is always available as a fallback.  An optimised
+    Pallas TPU kernel is available when ``platform="pallas"`` or ``"auto"``
+    on TPU hardware.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +65,20 @@ from .configs import AllGatherMatmulConfig
 def _largest_divisor_leq(
     x: int, upper: int, candidates: tuple[int, ...] = (512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
 ) -> int:
+    """Return the largest divisor of ``x`` that is also ``<= upper``.
+
+    Checks ``candidates`` (in descending order) first for speed, then falls
+    back to a linear search.  Always returns at least 1.
+
+    Args:
+        x: The integer whose divisors are searched.
+        upper: Maximum allowed return value.
+        candidates: Fast-path candidates to try before the exhaustive search.
+
+    Returns:
+        Largest integer ``d`` such that ``d <= upper``, ``d <= x``, and
+        ``x % d == 0``.
+    """
     x = int(max(1, x))
     upper = int(max(1, upper))
     for candidate in candidates:
@@ -47,6 +91,21 @@ def _largest_divisor_leq(
 
 
 def _inv_xy_rhs_transpose(inv: Invocation[AllGatherMatmulConfig, Array]) -> tuple[Array, Array, bool]:
+    """Extract ``x``, ``y``, and ``rhs_transpose`` from an invocation.
+
+    Supports both keyword-argument (``inv.kwargs["x"]``) and positional-
+    argument (``inv.args[0]``, ``inv.args[1]``) calling conventions.
+
+    Args:
+        inv: The ``Invocation`` object passed to heuristic/candidate methods.
+
+    Returns:
+        Tuple of ``(x, y, rhs_transpose)``.
+
+    Raises:
+        ValueError: If neither ``x``/``y`` keyword args nor two positional
+            args are present in the invocation.
+    """
     x = inv.kwargs.get("x")
     y = inv.kwargs.get("y")
     if x is None or y is None:
@@ -59,7 +118,25 @@ def _inv_xy_rhs_transpose(inv: Invocation[AllGatherMatmulConfig, Array]) -> tupl
 
 
 class AllGatherMatmul(Kernel[AllGatherMatmulConfig, Array]):
-    """Distributed all-gather + matmul operation."""
+    """Fused all-gather + matmul for tensor-parallel linear layers.
+
+    Computes ``all_gather(x, axis=0) @ y`` where ``x`` is the locally held
+    row-shard of the activation matrix and ``y`` is the locally held
+    column-shard of the weight matrix.
+
+    The kernel automatically clamps ``block_n``/``block_k`` from the config to
+    the largest divisors of the actual column/contraction dimensions so that
+    shapes are always valid regardless of the requested block sizes.
+
+    Platform support:
+        - XLA: always available; used on CPU and as a fallback on GPU.
+        - Pallas TPU: selected automatically on TPU hardware.
+
+    Typical use:
+        Wrap with ``shard_map`` (or pass ``mesh``/``in_specs``/``out_specs``
+        to the functional ``all_gather_matmul``) to run inside an existing
+        sharded execution context.
+    """
 
     def __init__(self):
         super().__init__(op_id="all_gather_matmul")
@@ -82,7 +159,7 @@ class AllGatherMatmul(Kernel[AllGatherMatmulConfig, Array]):
         collective_id: int | None = 0,
         precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         tp_size: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: AllGatherMatmulConfig,
         mesh: Mesh | None = None,
@@ -155,7 +232,7 @@ class AllGatherMatmul(Kernel[AllGatherMatmulConfig, Array]):
         collective_id: int | None = 0,
         precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         tp_size: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: AllGatherMatmulConfig,
     ) -> Float[Array, "m n_local"]:
@@ -249,6 +326,36 @@ class AllGatherMatmul(Kernel[AllGatherMatmulConfig, Array]):
             )
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[AllGatherMatmulConfig, Array]):
+        """Return GPU candidates for TileLang and XLA all-gather matmul paths."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[AllGatherMatmulConfig] = []
+        if "tilelang" in platforms:
+            candidates.append(
+                AllGatherMatmulConfig(
+                    block_n=128,
+                    block_k=128,
+                    num_warps=4,
+                    num_stages=2,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+            )
+        if "xla" in platforms:
+            for block_n, block_k in ((128, 128), (256, 128), (256, 256), (512, 256)):
+                candidates.append(
+                    AllGatherMatmulConfig(
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=4,
+                        num_stages=2,
+                        platform="xla",
+                        backend="any",
+                    )
+                )
+        return candidates or self.candidate_cfgs(inv)
+
     def candidate_cfgs_tpu(self, inv: Invocation[AllGatherMatmulConfig, Array]):
         """Return TPU/Pallas candidate configurations for autotuning."""
         x, y, rhs_transpose = _inv_xy_rhs_transpose(inv)
@@ -265,16 +372,17 @@ class AllGatherMatmul(Kernel[AllGatherMatmulConfig, Array]):
             if key in seen:
                 continue
             seen.add(key)
-            candidates.append(
-                AllGatherMatmulConfig(
-                    block_n=block_n,
-                    block_k=block_k,
-                    num_warps=4,
-                    num_stages=2,
-                    platform="pallas",
-                    backend="tpu",
+            for platform, backend in (("pallas", "tpu"), ("xla", "any")):
+                candidates.append(
+                    AllGatherMatmulConfig(
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=4,
+                        num_stages=2,
+                        platform=platform,
+                        backend=backend,
+                    )
                 )
-            )
 
         if not candidates:
             candidates.append(self.heuristic_cfg_tpu(inv))
@@ -307,7 +415,7 @@ def all_gather_matmul(
     collective_id: int | None = 0,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     tp_size: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: AllGatherMatmulConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,

@@ -13,42 +13,51 @@
 # limitations under the License.
 
 
-"""Ragged Page Attention module with automatic optimization.
+"""Ragged Page Attention v3 with fused KV-cache write and automatic optimization.
 
-This module implements ragged page attention, combining the benefits of both
-ragged (variable-length) sequence processing and paged KV cache management.
-This approach is particularly efficient for serving scenarios where sequences
-have variable lengths and KV cache is organized in fixed-size pages.
+This module implements **RPA v3**, which combines:
 
-Ragged page attention addresses key challenges in LLM inference:
-    - Variable-length sequences without padding overhead
-    - Efficient memory management through paged KV cache
-    - Dynamic batching with different sequence lengths
-    - Memory sharing for beam search and prefix caching
+* **Ragged (variable-length) query layout** -- sequences are concatenated
+  without padding; boundaries are tracked by ``query_start_loc``.
+* **Paged KV cache** -- keys and values are stored in fixed-size pages;
+  a block table maps logical page indices to physical page slots.
+* **Fused cache update** -- new ``keys``/``values`` tokens are written into
+  the KV cache *and* attention is computed against the full (updated) cache
+  in the same kernel call.  The updated ``kv_cache`` tensor is returned
+  alongside the attention output.
 
-Key Concepts:
-    Ragged Layout: Sequences are concatenated without padding, with start
-        locations tracking where each sequence begins
-    Pages: Fixed-size blocks holding portions of KV cache
-    Block Tables: Mapping from logical sequence positions to physical pages
-
-The combination provides:
-    - Zero padding overhead (ragged layout)
-    - Flexible memory allocation (paged cache)
-    - Efficient batching of variable-length sequences
-    - Support for dynamic sequence management
+Compared to v2 (``ragged_page_attention_v2``):
+    * v2 is read-only: the KV cache must be pre-populated before the call.
+    * v3 accepts raw ``keys`` and ``values``, writes them into ``kv_cache``
+      via the ``block_tables`` mapping, then computes attention -- enabling
+      single-call prefill + decode serving.
 
 Memory Layout:
-    Queries: [total_tokens, num_heads, head_dim] (ragged, no padding)
-    KV Cache: [num_pages, page_size, num_heads, head_dim] (paged)
+    Queries: [total_tokens, num_q_heads, head_dim] (ragged, no padding)
+    KV Cache: [num_pages, page_size, num_kv_heads_x2_per_kv_packing,
+               kv_packing, head_dim_padded]
+        Keys and values are interleaved in the ``kv_packing`` dimension.
+    Block Tables: [max_num_seqs * pages_per_seq] (flattened 1-D)
+    query_start_loc: [max_num_seqs + 1] (inclusive prefix sums)
+    distribution: [3] = [num_seqs, pages_per_seq, page_size]
+
+Return Value:
+    A tuple ``(attention_output, updated_kv_cache)``:
+        * ``attention_output`` has shape [total_tokens, num_q_heads, head_dim].
+        * ``updated_kv_cache`` has the same shape as the input ``kv_cache``.
 
 Mathematical Foundation:
     For token i in sequence s:
         start_idx = query_start_loc[s]
-        end_idx = query_start_loc[s + 1]
+        end_idx   = query_start_loc[s + 1]
         output[i] = attention(Q[start_idx:end_idx], K[pages[s]], V[pages[s]])
 
-This is the most memory-efficient attention variant for serving workloads.
+    where K[pages[s]] and V[pages[s]] now include the newly written tokens.
+
+Platforms:
+    GPU: Triton kernel (preferred) or XLA fallback.
+    TPU: Pallas kernel.
+    Auto: Platform selected from hardware detection.
 """
 
 from __future__ import annotations
@@ -341,30 +350,36 @@ def _lookup_tuned_pair(workload: _RPAWorkload) -> tuple[int, int] | None:
 
 
 class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Array]]):
-    """Ragged Page Attention with custom optimization logic.
+    """Ragged Page Attention v3 with fused KV-cache write.
 
-    Combines ragged (variable-length) sequence processing with paged KV cache
-    management for maximum memory efficiency in serving workloads.
+    Combines variable-length ragged query layout with paged KV cache management
+    and a *fused cache update*: new ``keys``/``values`` tokens are written into
+    the ``kv_cache`` at the correct paged positions, and attention is computed
+    against the full updated cache in the same call.
+
+    Returns a tuple ``(attention_output, updated_kv_cache)`` where:
+        * ``attention_output`` has shape [total_tokens, num_q_heads, head_dim].
+        * ``updated_kv_cache`` has the same shape as the input ``kv_cache``.
 
     Features:
-        - Zero padding overhead through ragged layout
-        - Efficient paged KV cache management
+        - Zero padding overhead through ragged query layout
+        - Fused KV-cache write and attention in a single kernel
+        - Paged KV cache with dynamic block allocation
         - Support for variable context lengths per sequence
         - Sliding window attention for long contexts
         - Logit soft capping for numerical stability
-        - Attention sink mechanism for improved long-context performance
-        - Configurable block sizes and memory limits
-        - Multiple platform support (Triton/Pallas/CUDA/XLA)
+        - Optional attention sink mechanism for long-context stability
+        - Quantization support via per-tensor q/k/v scale factors
+        - Configurable block sizes and VMEM limits (TPU)
+        - Multiple platform support (Triton/Pallas/XLA)
 
     This implementation is particularly efficient for:
-        - LLM serving with dynamic batching
+        - LLM serving with continuous batching and single-call prefill+decode
         - Variable-length inference workloads
-        - Memory-constrained deployment
-        - Scenarios requiring efficient KV cache sharing
-
-    The ragged layout eliminates padding overhead while paged cache
-    enables flexible memory management and sharing.
+        - Memory-constrained deployment requiring paged cache management
     """
+
+    version = "1"
 
     def __init__(self):
         """Initialize Ragged Page Attention module.
@@ -392,7 +407,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         k_scale: float | None = None,
         v_scale: float | None = None,
         vmem_limit_bytes: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedPageAttentionv3Config | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -556,7 +571,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         v_scale: float | None = None,
         vmem_limit_bytes: int | None = None,
         *,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedPageAttentionv3Config,
     ) -> tuple[
         Float[Array, "total_tokens num_q_heads head_dim"],
@@ -587,7 +602,8 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
             query_start_loc: Start indices for each sequence [max_num_seqs_plus_1].
                 query_start_loc[i] to query_start_loc[i+1] defines the token range
                 for sequence i in the ragged queries tensor.
-            distribution: Distribution parameters [3].
+            distribution: Three-element vector ``[num_seqs, pages_per_seq,
+                page_size]`` packed into shape ``[3]``, dtype ``int32``.
             softmax_scale: Scaling factor applied to attention scores before softmax.
                 Default is 1.0, typically set to 1/sqrt(head_dim) for stability.
             sliding_window: Optional window size for sliding window attention.
@@ -615,8 +631,11 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                 - backend: Backend specification
 
         Returns:
-            Attention output [total_tokens, num_q_heads, head_dim] in ragged format.
-            The output maintains the same ragged layout as the input queries.
+            Two-element tuple:
+                * Attention output [total_tokens, num_q_heads, head_dim]
+                  in ragged format, with the same layout as ``queries``.
+                * Updated KV cache with newly written key-value pairs,
+                  same shape as the input ``kv_cache``.
 
         Note:
             The ragged format eliminates all padding overhead by concatenating sequences
@@ -824,7 +843,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         self,
         pairs: list[tuple[int, int]],
         *,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"],
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"],
         backend: Backend | Literal["any"],
         num_warps: int | None,
         num_stages: int | None,
@@ -874,7 +893,7 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         self,
         inv: Invocation[RaggedPageAttentionv3Config, Array],
         *,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"],
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"],
         backend: Backend | Literal["any"],
         num_warps: int | None,
         num_stages: int | None,
@@ -957,174 +976,71 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         )
 
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedPageAttentionv3Config, Array]):
-        """Generate candidate configurations for autotuning on GPU.
+        """Generate GPU candidates for every registered GPU backend.
 
-        Produces a set of kernel configurations optimized for GPU execution.
-        By default ragged_page_attention_v3 prefers the Triton implementation on
-        GPU. If the user forces `platform="xla"` (via the public API), we instead
-        generate larger KV/Q blocks to reduce XLA loop overhead (e.g. pairs like
-        (1024 pages, 256 queries) when the workload/page_size permits).
-
-        Args:
-            inv: Invocation object containing the input arguments and metadata.
-                This can be inspected to create workload-specific configurations
-                based on sequence lengths, head dimensions, batch size, etc.
-
-        Returns:
-            List of RaggedPageAttentionv3Config objects to evaluate during autotuning.
-            Each configuration represents a different combination of kernel parameters
-            that may perform well on GPU hardware.
-
-        Note:
-            Candidates are intentionally biased toward power-of-2 block sizes to
-            keep compilation caching effective and reduce autotune time.
+        Automatic platform selection should benchmark Triton, CUDA, TileLang,
+        and XLA candidates at the operation level.  An explicit public
+        ``platform=...`` request narrows the list to that backend.
         """
-        platform_override = inv.kwargs.get("platform", None)
-        if platform_override in (None, "auto"):
-            try:
-                platform_override = getattr(
-                    detect_platform("ragged_page_attention_v3", platform="auto"),
-                    "value",
-                    "xla",
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("cuda", "triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[RaggedPageAttentionv3Config] = []
+        if "cuda" in platforms:
+            candidates.extend(
+                self._build_candidate_configs(
+                    inv,
+                    platform="cuda",
+                    backend="gpu",
+                    num_warps=None,
+                    num_stages=None,
+                    prefer_tuned=True,
+                    max_candidates=2,
                 )
-            except Exception:
-                platform_override = "xla"
-        workload = self._extract_workload(inv)
-
-        if workload is None:
-            return self._build_candidate_configs(
-                inv,
-                platform="xla" if platform_override == "xla" else "triton",
-                backend="any" if platform_override == "xla" else "gpu",
-                num_warps=None,
-                num_stages=None,
-                prefer_tuned=True,
-                max_candidates=6,
             )
-
-        if platform_override == "xla":
-            kv_limit = max(1, workload.pages_per_seq)
-            page_size = max(1, workload.page_size)
-            q_limit = max(1, min(workload.max_num_tokens, 1024))
-
-            # Keep KV tiles bounded by *tokens* so this scales across page sizes.
-            # These budgets are chosen to enable cases like page_size=8 -> kv_pages=1024.
-            token_budgets = (4096, 8192, 16384)
-            kv_candidates: list[int] = []
-
-            def _prev_pow2(x: int) -> int:
-                """Return the largest power of 2 <= x."""
-                x = int(x)
-                if x <= 1:
-                    return 1
-                return 1 << (x.bit_length() - 1)
-
-            def _push_kv_pages(kv_pages: int):
-                """Clamp and append a KV-pages candidate if not already present."""
-                kv_pages = int(kv_pages)
-                if kv_pages <= 0:
-                    return
-                kv_pages = min(kv_limit, kv_pages)
-                if kv_pages not in kv_candidates:
-                    kv_candidates.append(kv_pages)
-
-            # Budget-derived candidates, rounded down to power-of-2 for cache friendliness.
-            for budget in token_budgets:
-                pages = max(1, budget // page_size)
-                _push_kv_pages(_prev_pow2(pages))
-
-            # Explicit power-of-2 sweep (bounded by the largest token budget).
-            max_pages_by_budget = max(1, token_budgets[-1] // page_size)
-            for pages in (2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1):
-                if pages > kv_limit:
-                    continue
-                if pages > max_pages_by_budget:
-                    continue
-                _push_kv_pages(pages)
-
-            q_candidates = [q for q in (256, 128, 64, 32, 16, 8) if q <= q_limit]
-            if not q_candidates:
-                q_candidates = [min(8, q_limit)]
-
-            pairs: list[tuple[int, int]] = []
-
-            def _push_pair(kv_pages: int, q_tokens: int):
-                """Validate and append a (kv_pages, q_tokens) pair if within limits and unique."""
-                kv_pages = int(kv_pages)
-                q_tokens = int(q_tokens)
-                if kv_pages <= 0 or q_tokens <= 0:
-                    return
-                if kv_pages > kv_limit or q_tokens > q_limit:
-                    return
-                pair = (kv_pages, q_tokens)
-                if pair not in pairs:
-                    pairs.append(pair)
-
-            # Prefer the empirically-good large blocks first when feasible.
-            kv_8192 = _prev_pow2(max(1, 8192 // page_size))
-            _push_pair(min(kv_limit, kv_8192), 256 if q_limit >= 256 else q_candidates[0])
-            _push_pair(min(kv_limit, kv_8192), 128 if q_limit >= 128 else q_candidates[0])
-
-            for kv_pages in kv_candidates:
-                for q_tokens in q_candidates:
-                    _push_pair(kv_pages, q_tokens)
-
-            # Always include heuristic-based candidates as a fallback.
-            for kv_pages, q_tokens in self._candidate_pairs(inv, prefer_tuned=True, max_candidates=6):
-                _push_pair(kv_pages, q_tokens)
-
-            pairs = pairs[:12]
-            return self._materialize_configs(
-                pairs,
-                platform="xla",
-                backend="any",
-                num_warps=None,
-                num_stages=None,
+        if "triton" in platforms:
+            candidates.extend(
+                self._build_candidate_configs(
+                    inv,
+                    platform="triton",
+                    backend="gpu",
+                    num_warps=None,
+                    num_stages=None,
+                    prefer_tuned=True,
+                    max_candidates=10,
+                )
             )
-
-        kv_limit = max(1, workload.pages_per_seq)
-        q_limit = max(1, min(workload.max_num_tokens, 512))
-
-        # KV is expressed in *pages* (each page is `page_size` tokens). Extremely large
-        # KV blocks can create oversized (BQ x BK) tiles; keep candidates conservative
-        # and let `kv_limit` bound the search.
-        kv_candidates = [32, 16, 8, 4, 2, 1]
-        q_candidates = [256, 128, 64, 32, 16, 8]
-
-        pairs: list[tuple[int, int]] = []
-
-        def _push_pair(kv_pages: int, q_tokens: int):
-            """Validate and append a (kv_pages, q_tokens) pair if within limits and unique."""
-            if kv_pages <= 0 or q_tokens <= 0:
-                return
-            if kv_pages > kv_limit or q_tokens > q_limit:
-                return
-            pair = (int(kv_pages), int(q_tokens))
-            if pair not in pairs:
-                pairs.append(pair)
-
-        # Seed a few larger options first when the workload allows it.
-        _push_pair(min(32, kv_limit), 256)
-        _push_pair(min(32, kv_limit), 128)
-        _push_pair(min(16, kv_limit), 256)
-        _push_pair(min(16, kv_limit), 128)
-
-        for kv_pages in kv_candidates:
-            for q_tokens in q_candidates:
-                _push_pair(kv_pages, q_tokens)
-
-        # Always include heuristic-based candidates as a fallback.
-        for kv_pages, q_tokens in self._candidate_pairs(inv, prefer_tuned=True, max_candidates=6):
-            _push_pair(kv_pages, q_tokens)
-
-        # Keep autotuning time bounded.
-        pairs = pairs[:10]
-        return self._materialize_configs(
-            pairs,
-            platform="triton",
-            backend="gpu",
+        if "tilelang" in platforms:
+            candidates.extend(
+                self._build_candidate_configs(
+                    inv,
+                    platform="tilelang",
+                    backend="gpu",
+                    num_warps=4,
+                    num_stages=1,
+                    prefer_tuned=True,
+                    max_candidates=6,
+                )
+            )
+        if "xla" in platforms:
+            candidates.extend(
+                self._build_candidate_configs(
+                    inv,
+                    platform="xla",
+                    backend="any",
+                    num_warps=None,
+                    num_stages=None,
+                    prefer_tuned=True,
+                    max_candidates=6,
+                )
+            )
+        return candidates or self._build_candidate_configs(
+            inv,
+            platform="xla",
+            backend="any",
             num_warps=None,
             num_stages=None,
+            prefer_tuned=True,
+            max_candidates=1,
         )
 
     def candidate_cfgs_tpu(self, inv: Invocation[RaggedPageAttentionv3Config, Array]):
@@ -1182,13 +1098,22 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         if not pairs:
             pairs.append((16, 4))
 
-        return self._materialize_configs(
-            pairs,
-            platform="pallas",
-            backend="tpu",
-            num_warps=None,
-            num_stages=None,
-        )
+        return [
+            *self._materialize_configs(
+                pairs,
+                platform="pallas",
+                backend="tpu",
+                num_warps=None,
+                num_stages=None,
+            ),
+            *self._materialize_configs(
+                pairs[:6],
+                platform="xla",
+                backend="any",
+                num_warps=None,
+                num_stages=None,
+            ),
+        ]
 
     candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
@@ -1227,7 +1152,7 @@ def ragged_page_attention_v3(
     k_scale: float | None = None,
     v_scale: float | None = None,
     vmem_limit_bytes: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RaggedPageAttentionv3Config | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
@@ -1278,8 +1203,8 @@ def ragged_page_attention_v3(
             query_start_loc[i] to query_start_loc[i+1] defines the token range
             for sequence i in the ragged queries tensor. The last element equals
             total_tokens.
-        distribution: Distribution parameters [3] containing:
-            [num_seqs, pages_per_seq, page_size] for kernel execution.
+        distribution: Three-element vector ``[num_seqs, pages_per_seq,
+            page_size]`` packed into shape ``[3]``, dtype ``int32``.
         softmax_scale: Scaling factor applied to attention scores before softmax.
             Default is 1.0, typically set to 1/sqrt(head_dim) for numerical stability.
         sliding_window: Optional window size for sliding window attention.
@@ -1313,8 +1238,9 @@ def ragged_page_attention_v3(
             If provided along with in_specs and out_specs, executes using shard_map
             for multi-device parallelism.
         in_specs: Optional tuple of PartitionSpec objects defining input tensor sharding.
-            Must be provided if mesh is specified. Should contain specs for all 8 inputs:
-            (queries, keys, values, kv_cache, kv_lens, block_tables, query_start_loc, distribution).
+            Must be provided if mesh is specified. Should contain specs for all 9 inputs:
+            (queries, keys, values, kv_cache, kv_lens, block_tables, query_start_loc,
+            distribution, softmax_aux).
         out_specs: Optional PartitionSpec defining output tensor sharding.
             Must be provided if mesh is specified.
 

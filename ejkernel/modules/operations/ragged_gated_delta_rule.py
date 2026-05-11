@@ -39,6 +39,7 @@ Example:
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 from jax import shard_map
@@ -120,7 +121,7 @@ class RaggedGatedDeltaRule(Kernel[RaggedGatedDeltaRuleConfig, Array]):
         state_indices: Int[Array, "num_requests"],
         *,
         use_qk_l2norm: bool = True,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedGatedDeltaRuleConfig,
         **_,
     ) -> tuple[
@@ -177,7 +178,7 @@ class RaggedGatedDeltaRule(Kernel[RaggedGatedDeltaRuleConfig, Array]):
         state_indices: Int[Array, "num_requests"],
         *,
         use_qk_l2norm: bool = True,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedGatedDeltaRuleConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -280,13 +281,38 @@ class RaggedGatedDeltaRule(Kernel[RaggedGatedDeltaRuleConfig, Array]):
         """
         return [RaggedGatedDeltaRuleConfig(chunk_size=c, platform="auto", backend="any") for c in [32, 64, 128]]
 
+    def candidate_cfgs_gpu(self, inv: Invocation[RaggedGatedDeltaRuleConfig, Array]):
+        """Generate GPU candidates for ragged GDR across TileLang and XLA."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[RaggedGatedDeltaRuleConfig] = []
+        if "tilelang" in platforms:
+            candidates.append(RaggedGatedDeltaRuleConfig(chunk_size=64, platform="tilelang", backend="gpu"))
+        if "xla" in platforms:
+            candidates.extend(
+                RaggedGatedDeltaRuleConfig(chunk_size=c, platform="xla", backend="any") for c in [32, 64, 128]
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[RaggedGatedDeltaRuleConfig, Array]):
+        """Generate TPU candidates for ragged GDR across Pallas and XLA."""
+        return [
+            RaggedGatedDeltaRuleConfig(chunk_size=c, platform=platform, backend=backend)
+            for platform, backend in (("pallas", "tpu"), ("xla", "any"))
+            for c in [32, 64, 128]
+        ]
+
+    candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
+    candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
+
 
 _executor: Executor[RaggedGatedDeltaRuleConfig, Array] = Executor(
     ConfigSelectorChain(
         cache=ConfigCache(),
         policy=AutotunePolicy(
-            allow_autotune=False,
-            cache_miss_fallback="heuristic",
+            allow_autotune=True,
+            cache_miss_fallback=os.getenv("EJKERNEL_AUTOTUNE_POLICY", "heuristics"),
+            validate_backward=False,
         ),
         tuner=Tuner(warmup=3, iters=10),
         persistent=PersistentCache("ragged_gated_delta_rule"),
@@ -306,7 +332,7 @@ def ragged_gated_delta_rule(
     *,
     chunk_size: int = 64,
     use_qk_l2norm: bool = True,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RaggedGatedDeltaRuleConfig | None = None,
 ) -> tuple[
     Float[Array, "num_tokens num_heads v_head_dim"],
@@ -314,25 +340,64 @@ def ragged_gated_delta_rule(
 ]:
     """Ragged Gated Delta Rule for packed continuous-batching inference.
 
-    Processes variable-length sequences in a flat token stream. Routes
-    to decode-only or chunked prefill based on sequence lengths.
+    Processes variable-length sequences packed into a flat token stream.
+    Each request is identified by a ``[query_start_loc[i], query_start_loc[i+1])``
+    slice of the token dimension, and reads/writes recurrent state from/to slot
+    ``state_indices[i]`` in the global ``recurrent_state`` pool.
+
+    Execution paths:
+        - **Decode** (all sequences have length 1): Each token performs a
+          single-step state update. On TPU, routes to the Pallas kernel for
+          up to 3.7x speedup over XLA.
+        - **Prefill** (at least one sequence has length > 1): Chunked
+          parallel forward pass with triangular-solve inversion and
+          inter-chunk state propagation.
+
+    The gated delta rule recurrence per token t:
+        h_t = decay_t * h_{t-1} + k_t ⊗ (beta_t * (v_t - h_{t-1} @ k_t))
+        o_t = h_t @ q_t
 
     Args:
-        query: Flat queries (num_tokens, num_heads, qk_head_dim).
-        key: Flat keys (num_tokens, num_heads, qk_head_dim).
-        value: Flat values (num_tokens, num_heads, v_head_dim).
-        beta: Per-token gating (num_tokens, num_heads).
-        decay: Per-token decay (num_tokens, num_heads) or None.
-        recurrent_state: State pool (num_slots, H, d_k, d_v).
-        query_start_loc: Cumulative offsets (num_requests + 1,).
-        state_indices: Request-to-slot mapping (num_requests,).
-        chunk_size: Chunk size for prefill path.
-        use_qk_l2norm: L2-normalize queries and keys.
-        platform: Override platform selection.
-        cfg: Optional configuration override.
+        query: Flat queries, shape ``(num_tokens, num_heads, qk_head_dim)``.
+        key: Flat keys, shape ``(num_tokens, num_heads, qk_head_dim)``.
+        value: Flat values, shape ``(num_tokens, num_heads, v_head_dim)``.
+        beta: Per-token gating coefficient, shape ``(num_tokens, num_heads)``.
+            Typically in ``[0, 1]``; controls how much of the residual is
+            written into the state.
+        decay: Per-token log-space decay, shape ``(num_tokens, num_heads)``,
+            or ``None`` (interpreted as zeros, i.e., no decay). Should be
+            ``<= 0`` for stable memory retention.
+        recurrent_state: Global recurrent state pool,
+            shape ``(num_slots, num_heads, qk_head_dim, v_head_dim)``.
+            Slot assignment is specified via ``state_indices``.
+        query_start_loc: Cumulative token offsets marking sequence boundaries,
+            shape ``(num_requests + 1,)``. ``query_start_loc[0]`` must be 0
+            and ``query_start_loc[-1]`` must equal ``num_tokens``.
+        state_indices: Maps each request index to its recurrent state slot,
+            shape ``(num_requests,)``.
+        chunk_size: Chunk size used for the prefill parallel scan (default: 64).
+            Ignored for decode-only batches. Larger values increase intra-chunk
+            parallelism at the cost of higher memory for the chunk attention matrix.
+            Typical values: 32, 64, 128.
+        use_qk_l2norm: If ``True``, L2-normalise queries and keys before the
+            delta update (default: ``True``). Improves numerical stability.
+        platform: Override automatic platform selection. Useful to force XLA
+            for debugging or to force Pallas for profiling.
+        cfg: Optional :class:`~.configs.RaggedGatedDeltaRuleConfig` override.
+            When provided, its ``chunk_size`` takes precedence over the
+            ``chunk_size`` argument.
 
     Returns:
-        (output, updated_recurrent_state)
+        Tuple of:
+            - ``output``: Attention output, same flat layout as the inputs,
+              shape ``(num_tokens, num_heads, v_head_dim)``.
+            - ``updated_recurrent_state``: State pool with each request's
+              final state written back, shape identical to ``recurrent_state``.
+
+    Note:
+        Autotuning is disabled for this operation (``allow_autotune=False``).
+        The heuristic ``chunk_size=64`` is used unless a ``cfg`` is explicitly
+        supplied.
     """
     if cfg is None:
         cfg = RaggedGatedDeltaRuleConfig(

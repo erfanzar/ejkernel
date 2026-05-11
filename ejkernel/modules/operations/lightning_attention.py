@@ -74,7 +74,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -173,7 +173,7 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: LightningAttentionConfig,
     ) -> (
@@ -219,7 +219,16 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
-        impl = self.get_impl(cfg)
+        resolved_platform = detect_platform("lightning_attn", cfg.platform)
+        impl = kernel_registry.get("lightning_attn", platform=resolved_platform, backend=cfg.backend)
+        impl_kwargs = {}
+        if resolved_platform == Platform.TRITON:
+            impl_kwargs = {
+                "block_k": cfg.block_k,
+                "block_v": cfg.block_d,
+                "num_warps": cfg.num_warps,
+                "num_stages": cfg.num_stages,
+            }
         result = impl(
             query=query,
             key=key,
@@ -230,6 +239,7 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
             initial_state=initial_state,
             reverse=reverse,
             cu_seqlens=cu_seqlens,
+            **impl_kwargs,
         )
 
         if isinstance(result, tuple):
@@ -294,6 +304,69 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
 
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[LightningAttentionConfig, Array]):
+        """Generate GPU candidates for Lightning Attention across Triton, TileLang and XLA."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        block_configs = [
+            (64, 64, 64, 4, 1),
+            (128, 64, 64, 4, 2),
+            (128, 128, 64, 8, 2),
+        ]
+        candidates: list[LightningAttentionConfig] = []
+        if "triton" in platforms:
+            for block_q, block_k, block_d, num_warps, num_stages in block_configs:
+                candidates.append(
+                    LightningAttentionConfig(
+                        block_q=block_q,
+                        block_k=block_k,
+                        block_d=block_d,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        platform="triton",
+                        backend="gpu",
+                    )
+                )
+        if "tilelang" in platforms:
+            candidates.append(
+                LightningAttentionConfig(
+                    block_q=64,
+                    block_k=64,
+                    block_d=64,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+            )
+        if "xla" in platforms:
+            candidates.append(
+                LightningAttentionConfig(
+                    block_q=64,
+                    block_k=64,
+                    block_d=64,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[LightningAttentionConfig, Array]):
+        """Generate TPU candidates for the XLA Lightning Attention path."""
+        return [
+            LightningAttentionConfig(
+                block_q=64,
+                block_k=64,
+                block_d=64,
+                num_warps=4,
+                num_stages=1,
+                platform="xla",
+                backend="any",
+            )
+        ]
+
 
 _lightning_executor: Executor[LightningAttentionConfig, Array] = Executor(
     ConfigSelectorChain(
@@ -322,7 +395,7 @@ def lightning_attention(
     softmax_scale: float | None = None,
     reverse: bool = False,
     return_state: bool = False,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: LightningAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -337,34 +410,51 @@ def lightning_attention(
     layer-specific optimizations for improved performance.
 
     Args:
-        query: Query tensor [batch, seq_len, num_heads, head_dim]
-        key: Key tensor [batch, seq_len, num_kv_heads, head_dim]
-        value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
-        layer_idx: Current layer index in the model
-        num_layers: Total number of layers in the model
-        softmax_scale: Scaling factor for attention
-        initial_state: Initial state for recurrent computation
-        reverse: Whether to process sequence in reverse
-        cu_seqlens: Cumulative sequence lengths for variable-length sequences
-        return_state: If True, return tuple (output, final_state) instead of just output
-        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        query: Query tensor ``[batch, seq_len, num_heads, qk_head_dim]``.
+        key: Key tensor ``[batch, seq_len, num_kv_heads, qk_head_dim]``.
+        value: Value tensor ``[batch, seq_len, num_kv_heads, v_head_dim]``.
+        initial_state: Optional initial recurrent state
+            ``[..., num_heads, qk_head_dim, v_head_dim]``. Used for streaming
+            inference or continuation across document boundaries.
+        cu_seqlens: Cumulative sequence lengths for variable-length batches
+            ``[num_seqs + 1]``. When ``None``, the full batch dimension is
+            treated as a single sequence.
+        layer_idx: Zero-indexed layer position in the model. Passed through to
+            the backend for layer-specific optimisation strategies.
+        num_layers: Total number of layers in the model. Together with
+            ``layer_idx``, enables depth-aware tuning.
+        softmax_scale: Scaling factor applied to intra-chunk attention scores.
+            Defaults to ``1 / sqrt(qk_head_dim)`` inside the kernel.
+        reverse: If ``True``, process the sequence in reverse order (for
+            bidirectional models).
+        return_state: If ``True``, return a ``(output, final_state)`` tuple
+            instead of just the output tensor.
+        platform: Override platform selection (``"triton"``, ``"pallas"``,
+            ``"cuda"``, ``"xla"``, ``"auto"``).
+        cfg: Optional :class:`~.configs.LightningAttentionConfig` override
+            (block sizes, warp count, pipeline stages).
 
     Returns:
-        If return_state=False: Attention output with same shape as query
-        If return_state=True: Tuple of (output, final_state)
+        If ``return_state=False``: Attention output
+            ``[batch, seq_len, num_heads, v_head_dim]``.
+        If ``return_state=True``: Tuple of
+            ``(output, final_state)`` where ``final_state`` has shape
+            ``[..., num_heads, qk_head_dim, v_head_dim]``.
 
     Example:
-        >>>
         >>> out = lightning_attention(query, key, value, layer_idx=5, num_layers=32)
-        >>>
-        >>>
-        >>> out = lightning_attention(query, key, value, layer_idx=0, num_layers=24, softmax_scale=0.125)
-        >>>
-        >>>
-        >>> out = lightning_attention(query, key, value, layer_idx=10, num_layers=32, cu_seqlens=cu_seqs)
-        >>>
-        >>>
-        >>> out = lightning_attention(query, key, value, layer_idx=0, num_layers=24, platform="pallas")
+
+        >>> out = lightning_attention(
+        ...     query, key, value, layer_idx=0, num_layers=24, softmax_scale=0.125
+        ... )
+
+        >>> out = lightning_attention(
+        ...     query, key, value, layer_idx=10, num_layers=32, cu_seqlens=cu_seqs
+        ... )
+
+        >>> out = lightning_attention(
+        ...     query, key, value, layer_idx=0, num_layers=24, platform="pallas"
+        ... )
     """
     return _lightning_executor(
         LightningAttention(),

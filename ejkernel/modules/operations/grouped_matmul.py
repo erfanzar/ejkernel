@@ -169,7 +169,7 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         do_padding: bool = True,
         precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: GroupedMatmulConfig | None = None,
         mesh: Mesh | None = None,
@@ -275,32 +275,48 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         do_padding: bool = True,
         precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: GroupedMatmulConfig,
     ) -> Float[Array, "m n"]:
         """Execute grouped matrix multiplication.
 
+        Tiling is computed internally from ``cfg.block_m/block_n/block_k``
+        (clamped to the actual matrix dimensions). The ``lhs`` rows may be
+        padded before the call and the padding is stripped from the output if
+        ``do_padding=True``.
+
         Args:
-            lhs: Left-hand side matrix [m, k] (typically activations)
-            rhs: Right-hand side grouped matrices [num_groups, k, n] or [num_groups, n, k]
-            group_sizes: Size of each group [num_groups], sum(group_sizes) == m
-            preferred_element_type: Optional dtype for computation
-            tiling: Tile sizes (m_tile, n_tile, k_tile) for blocking strategy
-            group_offset: Optional offset into groups for partial computation
-            existing_out: Optional existing output to accumulate into [m, n]
-            transpose_rhs: Whether RHS matrices are transposed
-            interpret: Use interpreted mode (for debugging)
-            precision: Computation precision setting
-            platform: Optional platform override ("triton", "pallas", "cuda", "xla")
-            cfg: Kernel configuration object
+            lhs: Left-hand side matrix [m, k] (activations).
+            rhs: Right-hand side matrices [num_groups, k, n] or
+                [num_groups, n, k] when ``transpose_rhs=True``.
+            group_sizes: Number of rows per group [num_groups].
+                Must satisfy ``sum(group_sizes) == m``.
+            preferred_element_type: Accumulator/output dtype (default:
+                ``jnp.float32``).
+            group_offset: Optional scalar index of the first active group.
+            existing_out: Optional pre-allocated output [m, n] to accumulate
+                into.
+            rhs_scale: Dequantisation scale, ``grouped_matmulv3`` only
+                [num_groups, num_blocks, 1, n].
+            rhs_bias: Per-group bias, ``grouped_matmulv3`` only
+                [num_groups, 1, n].
+            transpose_rhs: RHS is stored transposed (default: False).
+            interpret: Pallas interpreted mode for debugging (default: False).
+            do_padding: Pad lhs and trim output to block_m alignment
+                (default: True).
+            precision: JAX matmul precision (default: ``Precision.DEFAULT``).
+            out_shard_callback: Callback applied to output shard inside
+                ``shard_map``.
+            platform: Optional platform override.
+            cfg: Kernel configuration providing block sizes and platform.
 
         Returns:
-            Matrix multiplication result [m, n]
+            Matrix multiplication result [m, n].
 
-        Note:
-            The group_sizes array partitions the m dimension of lhs. Each partition
-            is multiplied with the corresponding group matrix from rhs.
+        Raises:
+            ValueError: If ``rhs_scale``/``rhs_bias`` are passed to a v1/v2
+                kernel.
         """
         if preferred_element_type is None:
             preferred_element_type = jnp.float32
@@ -420,6 +436,68 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
 
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[GroupedMatmulConfig, Array]):
+        """Generate GPU candidates for grouped matmul across TileLang and XLA."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        block_configs = [
+            (128, 128, 128),
+            (256, 256, 128),
+            (512, 512, 128),
+            (512, 512, 256),
+            (1024, 1024, 256),
+        ]
+        candidates: list[GroupedMatmulConfig] = []
+        if "tilelang" in platforms:
+            candidates.append(
+                GroupedMatmulConfig(
+                    block_m=128,
+                    block_n=128,
+                    block_k=128,
+                    num_warps=4,
+                    num_stages=2,
+                    platform="tilelang",
+                    backend="gpu",
+                )
+            )
+        if "xla" in platforms:
+            for block_m, block_n, block_k in block_configs:
+                candidates.append(
+                    GroupedMatmulConfig(
+                        block_m=block_m,
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=None,
+                        num_stages=None,
+                        platform="xla",
+                        backend="any",
+                    )
+                )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[GroupedMatmulConfig, Array]):
+        """Generate TPU candidates for Pallas and XLA grouped matmul."""
+        block_configs = [
+            (128, 128, 128),
+            (256, 256, 128),
+            (512, 512, 128),
+            (512, 512, 256),
+            (1024, 1024, 256),
+        ]
+        return [
+            GroupedMatmulConfig(
+                block_m=block_m,
+                block_n=block_n,
+                block_k=block_k,
+                num_warps=None,
+                num_stages=None,
+                platform=platform,
+                backend=backend,
+            )
+            for platform, backend in (("pallas", "tpu"), ("xla", "any"))
+            for block_m, block_n, block_k in block_configs
+        ]
+
 
 _grouped_matmul_executor: Executor[GroupedMatmulConfig, Array] = Executor(
     ConfigSelectorChain(
@@ -453,7 +531,7 @@ def grouped_matmul(
     use_v2: bool = False,
     use_v3: bool = False,
     out_shard_callback: Callable[[Float[Array, "m n"]], Float[Array, "m n"]] | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: GroupedMatmulConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
@@ -462,36 +540,72 @@ def grouped_matmul(
     """Execute grouped matrix multiplication with automatic optimization.
 
     Performs efficient batched matrix multiplication with variable group sizes,
-    optimized for scenarios where different groups have different sizes.
+    optimised for Mixture-of-Experts routing where different token groups are
+    multiplied by different weight matrices.
+
+    Tiling is derived automatically from ``cfg.block_m``, ``cfg.block_n``,
+    and ``cfg.block_k`` (or the autotuned equivalent). LHS rows are optionally
+    padded to ``block_m`` alignment before calling the kernel and trimmed
+    from the output afterwards.
 
     Args:
-        lhs: Left-hand side matrix [m, k]
-        rhs: Right-hand side matrices [num_groups, k, n] or [num_groups, n, k]
-        group_sizes: Size of each group [num_groups]
-        preferred_element_type: Preferred dtype for computation
-        tiling: Tile sizes (m_tile, n_tile, k_tile) for blocking
-        group_offset: Offset into groups (for partial computation)
-        existing_out: Existing output to accumulate into
-        transpose_rhs: Whether to transpose RHS matrices
-        interpret: Use interpreted mode (slower but more debuggable)
-        precision: Computation precision setting
-
-            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        lhs: Left-hand side activation matrix [m, k], where
+            ``m = sum(group_sizes)``.
+        rhs: Right-hand side grouped weight matrices.
+            Shape ``[num_groups, k, n]`` normally, or ``[num_groups, n, k]``
+            when ``transpose_rhs=True``.
+        group_sizes: Number of rows in ``lhs`` belonging to each group.
+            Shape ``[num_groups]``.  Must sum to ``m``.
+        group_offset: Optional scalar index of the first active group.
+            Used for partial computation over a subset of groups.
+        existing_out: Optional pre-allocated output buffer [m, n] to
+            accumulate results into instead of allocating fresh storage.
+        preferred_element_type: Dtype for the accumulator/output
+            (default: ``jnp.float32``).
+        rhs_scale: Per-block dequantisation scale used by ``grouped_matmulv3``
+            only.  Shape ``[num_groups, num_blocks, 1, n]``.
+            Raises ``ValueError`` if passed to v1/v2.
+        rhs_bias: Per-group bias added after the matmul, used by
+            ``grouped_matmulv3`` only.  Shape ``[num_groups, 1, n]``.
+            Raises ``ValueError`` if passed to v1/v2.
+        transpose_rhs: If True, ``rhs`` is stored as ``[num_groups, n, k]``
+            and will be transposed before the matmul (default: False).
+        interpret: Run in Pallas interpreted mode for debugging (default: False).
+        do_padding: Pad ``lhs`` rows to ``block_m`` alignment before the
+            kernel call and strip padding from the output (default: True).
+        precision: JAX matmul precision (default: ``Precision.DEFAULT``).
+        use_v2: Use ``grouped_matmulv2`` kernel (default: False).
+        use_v3: Use ``grouped_matmulv3`` kernel with ``rhs_scale``/``rhs_bias``
+            support (default: False).  Mutually exclusive with ``use_v2``.
+        out_shard_callback: Optional function applied to the output shard
+            inside ``shard_map`` before returning.
+        platform: Force a specific platform
+            (``"triton"``, ``"pallas"``, ``"cuda"``, ``"xla"``, ``"auto"``).
+        cfg: Optional ``GroupedMatmulConfig`` override.
+        mesh: JAX device mesh for ``shard_map`` distributed execution.
+        in_specs: Input partition specs for ``shard_map``.
+        out_specs: Output partition spec for ``shard_map``.
 
     Returns:
-        Matrix multiplication result [m, n]
+        Matrix multiplication result [m, n].
+
+    Raises:
+        ValueError: If both ``use_v2`` and ``use_v3`` are True, or if
+            ``rhs_scale``/``rhs_bias`` are passed to a v1/v2 kernel.
 
     Example:
+        >>> lhs = jnp.ones((100, 64))          # 100 tokens, 64 features
+        >>> rhs = jnp.ones((4, 64, 128))        # 4 experts, 64→128
+        >>> group_sizes = jnp.array([30, 25, 25, 20])
         >>>
-        >>> out = grouped_matmul(lhs, rhs, group_sizes)
+        >>> out = grouped_matmul(lhs, rhs, group_sizes)            # [100, 128]
         >>>
-        >>> out = grouped_matmul(lhs, rhs, group_sizes)
-        >>>
-        >>> out = grouped_matmul(lhs, rhs_transposed, group_sizes, transpose_rhs=True)
+        >>> rhs_t = jnp.ones((4, 128, 64))
+        >>> out = grouped_matmul(lhs, rhs_t, group_sizes, transpose_rhs=True)
         >>>
         >>> out = grouped_matmul(lhs, rhs, group_sizes, existing_out=prev_out)
         >>>
-        >>> out = grouped_matmul(..., platform="pallas")
+        >>> out = grouped_matmul(lhs, rhs, group_sizes, platform="pallas")
     """
 
     if use_v2 and use_v3:

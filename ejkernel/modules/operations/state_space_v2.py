@@ -157,7 +157,7 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
         use_gated_rmsnorm: bool = False,
         rmsnorm_eps: float = 1e-5,
         precision: lax.Precision | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: StateSpaceV2Config,
     ) -> tuple[
@@ -237,9 +237,9 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
             Default configuration for SSM2 operation
         """
         return StateSpaceV2Config(
-            n_groups=1,
-            use_gated_rmsnorm=False,
-            rmsnorm_eps=1e-5,
+            n_groups=int(inv.kwargs.get("n_groups", 1)),
+            use_gated_rmsnorm=bool(inv.kwargs.get("use_gated_rmsnorm", False)),
+            rmsnorm_eps=float(inv.kwargs.get("rmsnorm_eps", 1e-5)),
             platform="auto",
             backend="any",
         )
@@ -257,8 +257,48 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
             SSM2 uses XLA implementation primarily, so candidates are minimal.
         """
         return [
-            StateSpaceV2Config(platform="auto", backend="any"),
-            StateSpaceV2Config(platform="xla", backend="any"),
+            self.heuristic_cfg(inv),
+            StateSpaceV2Config(
+                n_groups=int(inv.kwargs.get("n_groups", 1)),
+                use_gated_rmsnorm=bool(inv.kwargs.get("use_gated_rmsnorm", False)),
+                rmsnorm_eps=float(inv.kwargs.get("rmsnorm_eps", 1e-5)),
+                platform="xla",
+                backend="any",
+            ),
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[StateSpaceV2Config, Array]):
+        """Generate GPU candidates for TileLang and XLA SSM2."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        n_groups = int(inv.kwargs.get("n_groups", 1))
+        use_gated_rmsnorm = bool(inv.kwargs.get("use_gated_rmsnorm", False))
+        rmsnorm_eps = float(inv.kwargs.get("rmsnorm_eps", 1e-5))
+        candidates: list[StateSpaceV2Config] = []
+        for platform, backend in (("tilelang", "gpu"), ("xla", "any")):
+            if platform not in platforms:
+                continue
+            candidates.append(
+                StateSpaceV2Config(
+                    n_groups=n_groups,
+                    use_gated_rmsnorm=use_gated_rmsnorm,
+                    rmsnorm_eps=rmsnorm_eps,
+                    platform=platform,
+                    backend=backend,
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[StateSpaceV2Config, Array]):
+        """Generate TPU candidates for the XLA SSM2 path."""
+        return [
+            StateSpaceV2Config(
+                n_groups=int(inv.kwargs.get("n_groups", 1)),
+                use_gated_rmsnorm=bool(inv.kwargs.get("use_gated_rmsnorm", False)),
+                rmsnorm_eps=float(inv.kwargs.get("rmsnorm_eps", 1e-5)),
+                platform="xla",
+                backend="any",
+            )
         ]
 
 
@@ -293,7 +333,7 @@ def state_space_v2(
     use_gated_rmsnorm: bool = False,
     rmsnorm_eps: float = 1e-5,
     precision: lax.Precision | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: StateSpaceV2Config | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],

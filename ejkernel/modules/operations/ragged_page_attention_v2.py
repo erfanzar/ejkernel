@@ -183,7 +183,7 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
         softmax_aux: Float[Array, "num_sinks"] | None = None,
         mask_value: float | None = None,
         vmem_limit_bytes: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RaggedPageAttentionv2Config | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -287,7 +287,7 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
         block_tables: Int[Array, "num_seqs pages_per_seq"],
         query_start_loc: Int[Array, "num_seqs_plus_one"],
         num_seqs: Array | int,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         softmax_scale: float | None = None,
         logits_soft_cap: float | None = None,
         compute_dtype: DTypeLike = jnp.bfloat16,
@@ -454,8 +454,6 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
 
         Returns:
             List of RaggedPageAttentionv2Config objects optimized for GPU.
-            Currently returns XLA fallback configs as Triton implementation
-            is under development.
 
         Note:
             The generated configs prioritize high-value combinations first
@@ -464,6 +462,8 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
         q = inv.kwargs["queries"]
         kv = inv.kwargs["kv_pages"]
         block_tables = inv.kwargs["block_tables"]
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
 
         _total_tokens, num_q_heads, head_dim = map(int, q.shape)
         page_size = int(kv.shape[1])
@@ -557,19 +557,38 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
         max_candidates = 18
         block_configs = block_configs[:max_candidates]
 
-        candidates = [  # noqa
-            RaggedPageAttentionv2Config(
-                num_kv_pages_per_block=npages,
-                num_queries_per_block=block_m,
-                num_warps=warps,
-                num_stages=stages,
-                platform="triton",
-                backend="gpu",
-            )
-            for (block_m, npages, warps, stages) in block_configs
-        ]
+        candidates = (
+            [
+                RaggedPageAttentionv2Config(
+                    num_kv_pages_per_block=npages,
+                    num_queries_per_block=block_m,
+                    num_warps=warps,
+                    num_stages=stages,
+                    platform="triton",
+                    backend="gpu",
+                )
+                for (block_m, npages, warps, stages) in block_configs
+            ]
+            if "triton" in platforms
+            else []
+        )
 
-        return _xla_block_candidates_v2(inv) or [
+        if "tilelang" in platforms:
+            for stages in (2, 3, 4):
+                candidates.append(
+                    RaggedPageAttentionv2Config(
+                        num_kv_pages_per_block=None,
+                        num_queries_per_block=None,
+                        num_warps=4,
+                        num_stages=stages,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
+                )
+        if "xla" in platforms:
+            candidates.extend(_xla_block_candidates_v2(inv))
+
+        return candidates or [
             RaggedPageAttentionv2Config(
                 num_kv_pages_per_block=None,
                 num_queries_per_block=None,
@@ -638,6 +657,7 @@ class RaggedPageAttentionv2(Kernel[RaggedPageAttentionv2Config, Array]):
                         backend="tpu",
                     )
                 )
+        configs.extend(_xla_block_candidates_v2(inv))
 
         return configs
 
@@ -676,7 +696,7 @@ def ragged_page_attention_v2(
     sliding_window: int | None = None,
     mask_value: float | None = None,
     vmem_limit_bytes: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RaggedPageAttentionv2Config | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,

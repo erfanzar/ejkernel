@@ -63,7 +63,7 @@ from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -135,7 +135,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
         attn_scale: float | None = None,
         max_context_len: int | None = None,
         num_splits: int = 0,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: PageAttentionConfig,
         mask_value: float = -2.381976426469702e38,
@@ -193,7 +193,18 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
-        impl = self.get_impl(cfg)
+        resolved_platform = detect_platform("page_attention", cfg.platform)
+        impl = kernel_registry.get("page_attention", platform=resolved_platform, backend=cfg.backend)
+        resolved_num_splits = num_splits if num_splits != 0 else cfg.num_splits
+        resolved_pages_per_compute_block = (
+            pages_per_compute_block if pages_per_compute_block is not None else cfg.pages_per_compute_block
+        )
+        impl_kwargs = {}
+        if resolved_platform == Platform.TRITON:
+            impl_kwargs = {
+                "num_warps": cfg.num_warps,
+                "num_stages": cfg.num_stages,
+            }
         return impl(
             query=query,
             key_cache=key_cache,
@@ -202,13 +213,14 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
             block_tables=block_tables,
             attn_scale=attn_scale,
             max_context_len=max_context_len,
-            num_splits=num_splits,
+            num_splits=resolved_num_splits,
             mask_value=mask_value,
             attn_logits_soft_cap=attn_logits_soft_cap,
-            pages_per_compute_block=pages_per_compute_block,
+            pages_per_compute_block=resolved_pages_per_compute_block,
             megacore_mode=megacore_mode,
             inline_seq_dim=inline_seq_dim,
             sliding_window=sliding_window,
+            **impl_kwargs,
         )
 
     def heuristic_cfg(self, inv: Invocation[PageAttentionConfig, Array]) -> PageAttentionConfig:
@@ -246,7 +258,86 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
             Page attention doesn't have tunable block sizes in the traditional sense.
             The num_splits and pages_per_compute_block are auto-determined.
         """
-        return []
+        return [
+            PageAttentionConfig(
+                num_splits=num_splits,
+                pages_per_compute_block=None,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                platform="auto",
+                backend="any",
+            )
+            for num_splits in (0, 1, 2, 4)
+            for num_warps, num_stages in ((2, 4), (4, 3), (4, 4), (8, 2), (8, 3), (8, 4), (16, 2), (16, 3), (16, 4))
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[PageAttentionConfig, Array]):
+        """Generate GPU candidates for paged attention across Triton, TileLang and XLA."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[PageAttentionConfig] = []
+        if "triton" in platforms:
+            for num_splits in (0, 1, 2, 4):
+                for num_warps, num_stages in (
+                    (2, 4),
+                    (4, 3),
+                    (4, 4),
+                    (8, 2),
+                    (8, 3),
+                    (8, 4),
+                    (16, 2),
+                    (16, 3),
+                    (16, 4),
+                ):
+                    candidates.append(
+                        PageAttentionConfig(
+                            num_splits=num_splits,
+                            pages_per_compute_block=None,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                            platform="triton",
+                            backend="gpu",
+                        )
+                    )
+        if "tilelang" in platforms:
+            for pages_per_compute_block in (None, 1, 2, 4):
+                candidates.append(
+                    PageAttentionConfig(
+                        num_splits=0,
+                        pages_per_compute_block=pages_per_compute_block,
+                        num_warps=4,
+                        num_stages=3,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
+                )
+        if "xla" in platforms:
+            candidates.append(
+                PageAttentionConfig(
+                    num_splits=0,
+                    pages_per_compute_block=None,
+                    num_warps=4,
+                    num_stages=1,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[PageAttentionConfig, Array]):
+        """Generate TPU candidates for Pallas and XLA page attention."""
+        return [
+            PageAttentionConfig(
+                num_splits=num_splits,
+                pages_per_compute_block=None,
+                num_warps=4,
+                num_stages=1,
+                platform=platform,
+                backend=backend,
+            )
+            for platform, backend in (("pallas", "tpu"), ("xla", "any"))
+            for num_splits in (0, 1, 2)
+        ]
 
     def create_shard_map_wrapper(
         self,
@@ -258,7 +349,7 @@ class PageAttention(Kernel[PageAttentionConfig, Array]):
         attn_scale: float | None = None,
         max_context_len: int | None = None,
         num_splits: int = 0,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: PageAttentionConfig | None = None,
         mask_value: float = -2.381976426469702e38,
@@ -383,7 +474,7 @@ def page_attention(
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
     sliding_window: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: PageAttentionConfig | None = None,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
     """Execute page attention with automatic optimization.
@@ -412,23 +503,20 @@ def page_attention(
         Attention output [num_seqs, num_heads, head_dim]
 
     Example:
-        >>>
         >>> out = page_attention(query, key_cache, value_cache, context_lens, block_tables)
-        >>>
-        >>>
+
         >>> out = page_attention(
         ...     query, key_cache, value_cache, context_lens, block_tables,
         ...     num_splits=4, max_context_len=8192
         ... )
-        >>>
-        >>>
+
         >>> out = page_attention(
         ...     query, key_cache, value_cache, context_lens, block_tables,
         ...     attn_logits_soft_cap=50.0
         ... )
-            >>>
-        >>>
-        >>> out = page_attention(..., platform="triton")
+
+        >>> out = page_attention(query, key_cache, value_cache, context_lens,
+        ...                      block_tables, platform="triton")
     """
     return _page_attention_executor(
         PageAttention(),

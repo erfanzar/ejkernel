@@ -67,7 +67,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -168,7 +168,7 @@ class RWKV7(Kernel[RWKV7Config, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RWKV7Config,
     ) -> (
         Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -216,10 +216,29 @@ class RWKV7(Kernel[RWKV7Config, Array]):
             2. Low-rank correction: a @ (b^T @ h)
             3. Outer product: k @ v^T
         """
-        if platform is not None:
-            cfg = RWKV7Config(platform=platform, backend=Backend.ANY if platform == "xla" else cfg.backend)
+        block_v = getattr(cfg, "block_v", 32)
+        num_warps = getattr(cfg, "num_warps", 4)
+        num_stages = getattr(cfg, "num_stages", 3)
+        cfg_backend = getattr(cfg, "backend", Backend.ANY)
 
-        impl = self.get_impl(cfg)
+        if platform is not None:
+            cfg = RWKV7Config(
+                block_v=block_v,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                platform=platform,
+                backend=Backend.ANY if platform == "xla" else cfg_backend,
+            )
+
+        resolved_platform = detect_platform("rwkv7", cfg.platform)
+        impl = kernel_registry.get("rwkv7", platform=resolved_platform, backend=cfg.backend)
+        impl_kwargs = {}
+        if resolved_platform == Platform.TRITON:
+            impl_kwargs = {
+                "block_v": block_v,
+                "num_warps": num_warps,
+                "num_stages": num_stages,
+            }
         out, final_state = impl(
             r=r,
             w=w,
@@ -231,6 +250,7 @@ class RWKV7(Kernel[RWKV7Config, Array]):
             initial_state=initial_state,
             reverse=reverse,
             cu_seqlens=cu_seqlens,
+            **impl_kwargs,
         )
         if return_state:
             return out, final_state
@@ -245,7 +265,6 @@ class RWKV7(Kernel[RWKV7Config, Array]):
         Returns:
             Default configuration with auto platform selection
         """
-        del inv
         return RWKV7Config(platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[RWKV7Config, Array]):
@@ -261,8 +280,32 @@ class RWKV7(Kernel[RWKV7Config, Array]):
             RWKV-7's recurrence pattern relies primarily on platform selection
             for optimization.
         """
-        del inv
-        return []
+        return [
+            RWKV7Config(block_v=block_v, num_warps=num_warps, num_stages=3, platform="auto", backend="any")
+            for block_v in (16, 32, 64)
+            for num_warps in (4, 8)
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[RWKV7Config, Array]):
+        """Generate GPU platform and Triton tile candidates for RWKV-7."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[RWKV7Config] = []
+        if "triton" in platforms:
+            candidates.extend(
+                RWKV7Config(block_v=block_v, num_warps=num_warps, num_stages=3, platform="triton", backend="gpu")
+                for block_v in (16, 32, 64)
+                for num_warps in (4, 8)
+            )
+        if "tilelang" in platforms:
+            candidates.append(RWKV7Config(block_v=64, num_warps=4, num_stages=3, platform="tilelang", backend="gpu"))
+        if "xla" in platforms:
+            candidates.append(RWKV7Config(block_v=64, num_warps=4, num_stages=3, platform="xla", backend="any"))
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[RWKV7Config, Array]):
+        """Generate TPU candidates for the XLA RWKV-7 path."""
+        return [RWKV7Config(block_v=64, num_warps=4, num_stages=3, platform="xla", backend="any")]
 
 
 class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
@@ -344,7 +387,7 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
         reverse: bool = False,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: RWKV7MulConfig,
     ) -> (
         Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -393,10 +436,29 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
             This parameterization can be more numerically stable for certain
             model configurations.
         """
-        if platform is not None:
-            cfg = RWKV7MulConfig(platform=platform, backend=Backend.ANY if platform == "xla" else cfg.backend)
+        block_v = getattr(cfg, "block_v", 32)
+        num_warps = getattr(cfg, "num_warps", 4)
+        num_stages = getattr(cfg, "num_stages", 3)
+        cfg_backend = getattr(cfg, "backend", Backend.ANY)
 
-        impl = self.get_impl(cfg)
+        if platform is not None:
+            cfg = RWKV7MulConfig(
+                block_v=block_v,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                platform=platform,
+                backend=Backend.ANY if platform == "xla" else cfg_backend,
+            )
+
+        resolved_platform = detect_platform("rwkv7_mul", cfg.platform)
+        impl = kernel_registry.get("rwkv7_mul", platform=resolved_platform, backend=cfg.backend)
+        impl_kwargs = {}
+        if resolved_platform == Platform.TRITON:
+            impl_kwargs = {
+                "block_v": block_v,
+                "num_warps": num_warps,
+                "num_stages": num_stages,
+            }
         out, final_state = impl(
             r=r,
             w=w,
@@ -408,6 +470,7 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
             initial_state=initial_state,
             reverse=reverse,
             cu_seqlens=cu_seqlens,
+            **impl_kwargs,
         )
         if return_state:
             return out, final_state
@@ -422,7 +485,6 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
         Returns:
             Default configuration with auto platform selection
         """
-        del inv
         return RWKV7MulConfig(platform="auto", backend="any")
 
     def candidate_cfgs(self, inv: Invocation[RWKV7MulConfig, Array]):
@@ -438,8 +500,32 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
             RWKV-7 Mul's recurrence pattern relies primarily on platform
             selection for optimization.
         """
-        del inv
-        return []
+        return [
+            RWKV7MulConfig(block_v=block_v, num_warps=num_warps, num_stages=3, platform="auto", backend="any")
+            for block_v in (16, 32, 64)
+            for num_warps in (4, 8)
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[RWKV7MulConfig, Array]):
+        """Generate GPU platform and Triton tile candidates for RWKV-7 Mul."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[RWKV7MulConfig] = []
+        if "triton" in platforms:
+            candidates.extend(
+                RWKV7MulConfig(block_v=block_v, num_warps=num_warps, num_stages=3, platform="triton", backend="gpu")
+                for block_v in (16, 32, 64)
+                for num_warps in (4, 8)
+            )
+        if "tilelang" in platforms:
+            candidates.append(RWKV7MulConfig(block_v=64, num_warps=4, num_stages=3, platform="tilelang", backend="gpu"))
+        if "xla" in platforms:
+            candidates.append(RWKV7MulConfig(block_v=64, num_warps=4, num_stages=3, platform="xla", backend="any"))
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[RWKV7MulConfig, Array]):
+        """Generate TPU candidates for the XLA RWKV-7 Mul path."""
+        return [RWKV7MulConfig(block_v=64, num_warps=4, num_stages=3, platform="xla", backend="any")]
 
 
 _executor_rwkv7: Executor[RWKV7Config, Array] = Executor(
@@ -483,7 +569,7 @@ def rwkv7(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RWKV7Config | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -549,7 +635,7 @@ def rwkv7_mul(
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RWKV7MulConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

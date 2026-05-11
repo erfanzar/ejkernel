@@ -147,7 +147,7 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
         initial_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
         conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
         act_fn: Callable[[jax.Array], jax.Array] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: StateSpaceV1Config,
     ) -> tuple[
@@ -237,6 +237,21 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
             StateSpaceV1Config(platform="xla", backend="any"),
         ]
 
+    def candidate_cfgs_gpu(self, inv: Invocation[StateSpaceV1Config, Array]):
+        """Generate GPU candidates for TileLang and XLA SSM1."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[StateSpaceV1Config] = []
+        if "tilelang" in platforms:
+            candidates.append(StateSpaceV1Config(platform="tilelang", backend="gpu"))
+        if "xla" in platforms:
+            candidates.append(StateSpaceV1Config(platform="xla", backend="any"))
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[StateSpaceV1Config, Array]):
+        """Generate TPU candidates for the XLA SSM1 path."""
+        return [StateSpaceV1Config(platform="xla", backend="any")]
+
 
 _state_space_v1_executor: Executor[StateSpaceV1Config, Array] = Executor(
     ConfigSelectorChain(
@@ -265,7 +280,7 @@ def state_space_v1(
     conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
     *,
     act_fn: Callable[[jax.Array], jax.Array] | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: StateSpaceV1Config | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],

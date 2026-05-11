@@ -115,6 +115,35 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         platform = detect_platform("ragged_decode_attention", cfg.platform, prefer_pallas=True)
         return kernel_registry.get("ragged_decode_attention", platform=platform, backend=cfg.backend)
 
+    def _fwd_params_for_seq_len(self, seq_len: int) -> FwdParams:
+        """Build a valid deterministic launch shape for a sequence length."""
+        split_len = seq_len
+        for candidate in (128, 256, 64, 512, 32, 16):
+            if seq_len % candidate == 0:
+                split_len = candidate
+                break
+        num_key_splits = max(1, seq_len // split_len)
+
+        kv_blocksize = 16
+        for candidate in (128, 64, 32, 16):
+            if candidate <= split_len and split_len % candidate == 0:
+                kv_blocksize = candidate
+                break
+
+        return FwdParams(
+            blocksize_heads=16,
+            num_key_splits=num_key_splits,
+            kv_blocksize=kv_blocksize,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    def _default_fwd_params(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]) -> FwdParams:
+        """Build a valid deterministic launch shape for the current sequence length."""
+        key = inv.kwargs.get("key", inv.args[1] if len(inv.args) > 1 else None)
+        seq_len = key.shape[1] if key is not None and len(key.shape) >= 2 else 128
+        return self._fwd_params_for_seq_len(seq_len)
+
     def run(
         self,
         query: Float[Array, "batch num_q_heads head_dim"],
@@ -126,7 +155,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         sliding_window: tuple[int, int] | None = None,
         logits_soft_cap: float | None = None,
         softmax_aux: Float[Array, "num_sinks"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: RaggedDecodeAttentionConfig,
     ) -> Float[Array, "batch num_q_heads head_dim"]:
@@ -141,7 +170,8 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             value: Value tensor [batch, seq_len, num_kv_heads, head_dim] (full context)
             sequence_start: Start indices for valid KV range per sequence [batch]
             sequence_end: End indices (exclusive) for valid KV range per sequence [batch]
-            softmax_scale: Scaling factor for attention scores (default: 1.0)
+            softmax_scale: Scaling factor for attention scores. Defaults to
+                ``1/sqrt(head_dim)`` when ``None``.
             sliding_window: Optional (left, right) window sizes for local attention
             logits_soft_cap: Optional soft cap to bound attention logits
             softmax_aux: Optional attention sink logits for improved long-context performance
@@ -163,11 +193,23 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             >>> out = ragged_decode_attention(q, k, v, sequence_start, sequence_end)
         """
 
+        fwd_params = getattr(cfg, "fwd_params", None)
+        if fwd_params is None:
+            fwd_params = self._fwd_params_for_seq_len(key.shape[1])
+        else:
+            num_key_splits = getattr(fwd_params, "num_key_splits", 1)
+            kv_blocksize = getattr(fwd_params, "kv_blocksize", 16)
+            split_len = key.shape[1] // num_key_splits if key.shape[1] % num_key_splits == 0 else 0
+            if split_len < 16 or kv_blocksize > split_len or split_len % kv_blocksize != 0:
+                fwd_params = self._fwd_params_for_seq_len(key.shape[1])
+
+        cfg_backend = getattr(cfg, "backend", Backend.ANY)
+
         if platform is not None:
             cfg = RaggedDecodeAttentionConfig(
-                fwd_params=cfg.fwd_params,
+                fwd_params=fwd_params,
                 platform=platform,
-                backend=Backend.ANY if platform == "xla" else cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg_backend,
             )
         impl = self.get_impl(cfg)
         return impl(
@@ -180,7 +222,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             softmax_aux=softmax_aux,
             sequence_start=sequence_start,
             sequence_end=sequence_end,
-            fwd_params=cfg.fwd_params,
+            fwd_params=fwd_params,
         )
 
     def heuristic_cfg(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]) -> RaggedDecodeAttentionConfig:
@@ -193,17 +235,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             Default KernelConfig with conservative block sizes suitable for
             typical decode scenarios (small query sizes, variable KV lengths)
         """
-        return RaggedDecodeAttentionConfig(
-            fwd_params=FwdParams(
-                blocksize_heads=16,
-                num_key_splits=16,
-                kv_blocksize=128,
-                num_warps=4,
-                num_stages=2,
-            ),
-            platform="auto",
-            backend="any",
-        )
+        return RaggedDecodeAttentionConfig(fwd_params=self._default_fwd_params(inv), platform="auto", backend="any")
 
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]):
         """Generate candidate configurations for autotuning on GPU (Pallas backend).
@@ -237,6 +269,13 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         q = inv.kwargs["query"]
         k = inv.kwargs["key"]
         v = inv.kwargs["value"]
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "pallas", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        platform_backends = tuple(
+            (platform, "any" if platform == "xla" else "gpu")
+            for platform in ("triton", "pallas", "tilelang", "xla")
+            if platform in platforms
+        )
 
         seq_len = int(k.shape[1])
         num_q_heads = int(q.shape[1])
@@ -330,19 +369,20 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
                     if key in seen:
                         continue
                     seen.add(key)
-                    configs.append(
-                        RaggedDecodeAttentionConfig(
-                            fwd_params=FwdParams(
-                                blocksize_heads=H,
-                                num_key_splits=s,
-                                kv_blocksize=K,
-                                num_warps=W,
-                                num_stages=S,
-                            ),
-                            platform="pallas",
-                            backend="gpu",
+                    for platform, backend in platform_backends:
+                        configs.append(
+                            RaggedDecodeAttentionConfig(
+                                fwd_params=FwdParams(
+                                    blocksize_heads=H,
+                                    num_key_splits=s,
+                                    kv_blocksize=K,
+                                    num_warps=W,
+                                    num_stages=S,
+                                ),
+                                platform=platform,
+                                backend=backend,
+                            )
                         )
-                    )
                     if len(configs) >= max_candidates:
                         return True
             return False
@@ -389,29 +429,43 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             Decode attention typically has small query dimensions (batch size),
             so candidates focus on optimizing block sizes.
         """
-        block_configs = [
-            (128, 4, 1),
-            (256, 4, 1),
-            (512, 8, 2),
-        ]
-
+        key = inv.kwargs.get("key", inv.args[1] if len(inv.args) > 1 else None)
+        seq_len = key.shape[1] if key is not None and len(key.shape) >= 2 else 128
         candidates = []
-        for block_size, num_warps, num_stages in block_configs:
-            candidates.append(
-                RaggedDecodeAttentionConfig(
-                    fwd_params=FwdParams(
-                        blocksize_heads=16,
-                        num_key_splits=16,
-                        kv_blocksize=block_size,
-                        num_warps=num_warps,
-                        num_stages=num_stages,
-                    ),
-                    platform="auto",
-                    backend="any",
+        for split_len in (128, 256, 64, 512, 32, 16):
+            if split_len < 16 or seq_len % split_len != 0:
+                continue
+            num_key_splits = seq_len // split_len
+            for kv_blocksize, num_warps, num_stages in ((128, 4, 1), (64, 4, 1), (32, 4, 1), (16, 2, 1)):
+                if kv_blocksize > split_len or split_len % kv_blocksize != 0:
+                    continue
+                candidates.append(
+                    RaggedDecodeAttentionConfig(
+                        fwd_params=FwdParams(
+                            blocksize_heads=16,
+                            num_key_splits=num_key_splits,
+                            kv_blocksize=kv_blocksize,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        ),
+                        platform="auto",
+                        backend="any",
+                    )
                 )
-            )
 
-        return candidates
+        return candidates or [RaggedDecodeAttentionConfig(fwd_params=self._default_fwd_params(inv), platform="auto")]
+
+    def candidate_cfgs_tpu(self, inv: Invocation[RaggedDecodeAttentionConfig, Array]):
+        """Generate TPU candidates for Pallas and XLA ragged decode attention."""
+        return [
+            RaggedDecodeAttentionConfig(
+                fwd_params=cfg.fwd_params,
+                platform=platform,
+                backend=backend,
+            )
+            for cfg in self.candidate_cfgs(inv)
+            for platform, backend in (("pallas", "tpu"), ("xla", "any"))
+        ]
 
     def create_shard_map_wrapper(
         self,
@@ -424,7 +478,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
         sliding_window: tuple[int, int] | None = None,
         logits_soft_cap: float | None = None,
         softmax_aux: Float[Array, "num_sinks"] | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: RaggedDecodeAttentionConfig | None = None,
         mesh: Mesh | None = None,
@@ -443,7 +497,7 @@ class RaggedDecodeAttention(Kernel[RaggedDecodeAttentionConfig, Array]):
             value: Value tensor [batch, seq_len, num_kv_heads, head_dim]
             sequence_start: Start indices for valid KV range per sequence [batch]
             sequence_end: End indices for valid KV range per sequence [batch]
-            softmax_scale: Scaling factor for attention scores
+            softmax_scale: Scaling factor for attention scores (default: ``1/sqrt(head_dim)``)
             sliding_window: Optional (left, right) window sizes for local attention
             logits_soft_cap: Optional soft cap to bound attention logits
             softmax_aux: Optional attention sink logits
@@ -531,7 +585,7 @@ def ragged_decode_attention(
     softmax_scale: float | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: RaggedDecodeAttentionConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
@@ -548,29 +602,39 @@ def ragged_decode_attention(
         value: Full value context [batch, seq_len, num_kv_heads, head_dim]
         sequence_start: Start index of valid KV range per sequence [batch]
         sequence_end: End index (exclusive) of valid KV range per sequence [batch]
-        softmax_scale: Attention score scaling factor (default: 1.0)
+        softmax_scale: Attention score scaling factor. Defaults to ``1/sqrt(head_dim)``
+            inside the kernel when ``None``.
         sliding_window: Optional (left, right) window sizes for local attention
         logits_soft_cap: Optional soft cap for attention logits (improves stability)
         softmax_aux: Optional attention sink values for long-context handling
-        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
-        cfg: Optional config override (block_size is set via cfg)
+        platform: Specific platform to use (``"triton"``, ``"pallas"``,
+            ``"cuda"``, ``"xla"``, or ``"auto"``).
+        cfg: Optional :class:`~.configs.RaggedDecodeAttentionConfig` override.
+            Block-size tuning is exposed via ``cfg.fwd_params`` (a
+            :class:`~ejkernel.ops.FwdParams` instance with ``kv_blocksize``,
+            ``blocksize_heads``, ``num_key_splits``, etc.).
+        mesh: Optional JAX device mesh for ``shard_map`` execution.
+        in_specs: Input partition specs for ``shard_map``. Must have one
+            spec per positional argument: ``(query, key, value,
+            sequence_start, sequence_end, softmax_aux)``.
+        out_specs: Output partition spec for ``shard_map``.
 
     Returns:
         Attention output [batch, num_q_heads, head_dim] (or [batch, 1, num_q_heads, head_dim] for 4D queries)
 
     Example:
-        >>>
         >>> out = ragged_decode_attention(q, k, v, starts, ends)
         >>>
-        >>>
         >>> from ejkernel.modules.operations.configs import RaggedDecodeAttentionConfig
-        >>> cfg = RaggedDecodeAttentionConfig(block_size=128)
+        >>> from ejkernel.ops import FwdParams
+        >>> cfg = RaggedDecodeAttentionConfig(
+        ...     fwd_params=FwdParams(kv_blocksize=128, num_warps=4, num_stages=2)
+        ... )
         >>> out = ragged_decode_attention(
         ...     q, k, v, starts, ends,
         ...     sliding_window=(256, 256),
         ...     cfg=cfg
         ... )
-        >>>
         >>>
         >>> out = ragged_decode_attention(
         ...     q, k, v, starts, ends,
@@ -578,13 +642,14 @@ def ragged_decode_attention(
         ...     softmax_scale=0.125
         ... )
         >>>
-        >>>
-        >>> out = ragged_decode_attention(..., platform="triton")
+        >>> out = ragged_decode_attention(q, k, v, starts, ends, platform="pallas")
 
     Note:
         This function is optimized for decode scenarios where query size is small
-        (typically batch_size) and KV length varies per sequence. For prefill phase
-        with large queries, consider using standard flash_attention instead.
+        (typically batch_size) and KV length varies per sequence. For the prefill
+        phase with large queries, consider using standard flash_attention instead.
+        Block size tuning is exposed via ``cfg.fwd_params`` (``FwdParams``), not a
+        ``block_size`` field directly on the config.
     """
 
     method = None

@@ -162,7 +162,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         chunk_size: int | None = None,
         causal: bool = True,
         fused_backward: bool = False,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: BlockSparseAttentionConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -284,7 +284,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         chunk_size: int | None = None,
         causal: bool = True,
         fused_backward: bool = False,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
         | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
@@ -498,6 +498,8 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
 
         sliding_window = inv.kwargs.get("sliding_window", None)
         causal = bool(inv.kwargs.get("causal", True))
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "cuda", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
 
         def window_total(sw):
             """Compute total window span from a sliding window specification."""
@@ -603,25 +605,52 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
             pairs = [(qb, kb, w, s)]
 
         configs: list[BlockSparseAttentionConfig] = []
-        for qb, kb, w, s in pairs:
-            configs.append(
-                BlockSparseAttentionConfig(
-                    fwd_params=FwdParams(
-                        q_blocksize=qb,
-                        kv_blocksize=kb,
-                        num_warps=w,
-                        num_stages=s,
-                    ),
-                    bwd_params=BwdParams(
-                        q_blocksize=bwd_block(qb),
-                        kv_blocksize=bwd_block(kb),
-                        num_warps=w,
-                        num_stages=max(2, s - 0),
-                    ),
-                    platform="triton",
-                    backend="gpu",
+        if "triton" in platforms:
+            for qb, kb, w, s in pairs:
+                configs.append(
+                    BlockSparseAttentionConfig(
+                        fwd_params=FwdParams(
+                            q_blocksize=qb,
+                            kv_blocksize=kb,
+                            num_warps=w,
+                            num_stages=s,
+                        ),
+                        bwd_params=BwdParams(
+                            q_blocksize=bwd_block(qb),
+                            kv_blocksize=bwd_block(kb),
+                            num_warps=w,
+                            num_stages=max(2, s - 0),
+                        ),
+                        platform="triton",
+                        backend="gpu",
+                    )
                 )
-            )
+        for platform, backend, max_platform_candidates in (
+            ("cuda", "gpu", 4),
+            ("tilelang", "gpu", 4),
+            ("xla", "any", 4),
+        ):
+            if platform not in platforms:
+                continue
+            for qb, kb, w, s in pairs[:max_platform_candidates]:
+                configs.append(
+                    BlockSparseAttentionConfig(
+                        fwd_params=FwdParams(
+                            q_blocksize=qb,
+                            kv_blocksize=kb,
+                            num_warps=w,
+                            num_stages=s,
+                        ),
+                        bwd_params=BwdParams(
+                            q_blocksize=bwd_block(qb),
+                            kv_blocksize=bwd_block(kb),
+                            num_warps=w,
+                            num_stages=max(2, s),
+                        ),
+                        platform=platform,
+                        backend=backend,
+                    )
+                )
         return configs
 
     def candidate_cfgs_tpu(self, inv: Invocation[BlockSparseAttentionConfig, Array]):
@@ -714,6 +743,7 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
                     backend="tpu",
                 )
             )
+        configs.extend(self.candidate_cfgs_xla(inv)[:4])
         return configs
 
     def candidate_cfgs_xla(self, inv: Invocation[BlockSparseAttentionConfig, Array]):
@@ -856,7 +886,7 @@ def blocksparse_attention(
     causal: bool = True,
     fused_backward: bool = False,
     purify: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: BlockSparseAttentionConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
@@ -864,67 +894,77 @@ def blocksparse_attention(
 ) -> Float[Array, "batch num_heads seq_len vhead_dim"]:
     """Execute block-sparse attention with automatic optimization.
 
-    Performs efficient attention computation over sparse block patterns, significantly
-    reducing memory and computation compared to dense attention while maintaining
-    flexibility through custom mask builders.
+    Performs efficient attention computation over sparse block patterns,
+    significantly reducing memory and computation compared to dense attention
+    while maintaining flexibility through custom mask builders.
 
     Args:
-        query: Query tensor [batch, num_heads, seq_len, head_dim]
-        key: Key tensor [batch, kv_num_heads, kv_len, head_dim]
-        value: Value tensor [batch, kv_num_heads, kv_len, vhead_dim]
-        mask_info: Optional MaskInfo containing attention mask, segment IDs, and position indices
-        q_positions: Optional query position indices [batch, seq_len] for positional embeddings.
-            If None and mask_info is provided, will use positions from mask_info.
-        kv_positions: Optional key-value position indices [batch, kv_len] for positional embeddings.
-            If None and mask_info is provided, will use positions from mask_info.
-        softmax_aux: Optional auxiliary attention values (e.g., attention sinks)
-        logits_soft_cap: Optional soft capping for attention logits
-        query_chunk_size: Query chunk size for block tiling (default: 128)
-        key_chunk_size: Key chunk size for block tiling (default: 128)
-        softmax_scale: Attention score scaling factor (default: 1/sqrt(head_dim))
-        mask_builder: Callable defining sparse pattern. Signature:
-            (q_idx, k_idx, q_size, k_size, window) -> Mask
-        sliding_window: Window size for local attention (int or (left, right) tuple)
-        chunk_size: Alternative to separate query_chunk_size/key_chunk_size
-        causal: Apply causal masking (default: True)
-        fused_backward: Use fused backward pass (default: False)
-        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
-        cfg: Optional configuration override
-        mesh: JAX device mesh for shard_map execution (optional)
-        in_specs: Input partition specs for shard_map (optional)
-        out_specs: Output partition spec for shard_map (optional)
+        query: Query tensor [batch, num_heads, seq_len, head_dim].
+        key: Key tensor [batch, kv_num_heads, kv_len, head_dim].
+        value: Value tensor [batch, kv_num_heads, kv_len, vhead_dim].
+        softmax_aux: Optional attention-sink logits
+            [num_sinks] added before softmax.
+        bias: Optional additive bias [batch, num_heads, seq_len, kv_len].
+        mask_info: Optional ``MaskInfo`` container; segment IDs and position
+            arrays are extracted from it.  When ``mesh``/``in_specs``/
+            ``out_specs`` are all provided, ``attention_mask`` is ignored
+            (not supported in shard_map mode).
+        attention_mask: Optional dense boolean/integer attention mask
+            [batch, num_heads_or_1, seq_len, kv_len]. Not supported in
+            shard_map mode; pass ``bias``/``mask_builder`` instead.
+        sequence_parallelism_mesh_axis_name: Name of the sequence-parallel
+            mesh axis for Splash (Pallas TPU) inter-device attention.
+        logits_soft_cap: Soft cap applied to logits as
+            ``cap * tanh(logits / cap)`` (Gemma-2 style).
+        qkv_layouts: Pre-computed ``SparseMask`` layouts for the Triton
+            backend.  When None the mask is built on-the-fly from
+            ``mask_builder``.
+        softmax_scale: Scale factor for attention logits
+            (default: 1/sqrt(head_dim)).
+        mask_builder: Callable that defines the sparse block pattern.
+            On Triton: ``() -> SparseMask``.
+            On Pallas TPU: ``(q_idx, k_idx, q_size, k_size, window) -> Mask``.
+        sliding_window: Symmetric window (int) or asymmetric ``(left, right)``
+            tuple for local attention.
+        chunk_size: Unified query/key chunk size passed directly to the
+            backend; overrides block sizes from ``cfg.fwd_params``.
+        causal: Apply causal masking (default: True).
+        fused_backward: Use fused VJP kernel (default: False).
+        purify: Zero out output positions where ``q_segment_ids < 0``
+            (i.e. padding positions).  Applied after the kernel returns.
+        platform: Force a specific platform (``"triton"``, ``"pallas"``,
+            ``"cuda"``, ``"xla"``, or ``"auto"``).
+        cfg: Optional ``BlockSparseAttentionConfig`` override.
+        mesh: JAX device mesh for ``shard_map`` distributed execution.
+        in_specs: Input partition specs for ``shard_map``; must have the
+            same length as the positional call arguments (see source for
+            the exact order).
+        out_specs: Output partition spec for ``shard_map``.
 
     Returns:
-        Attention output [batch, kv_num_heads, kv_len, vhead_dim]
+        Attention output [batch, num_heads, seq_len, vhead_dim].
 
     Example:
         >>> from ejkernel.modules.operations import blocksparse_attention
         >>>
-        >>>
+        >>> # Causal attention with default dense fallback
         >>> output = blocksparse_attention(query, key, value, causal=True)
         >>>
-        >>>
-        >>> def local_plus_global(q_idx, k_idx, q_size, k_size, window):
-        ...
-        ...     return create_local_global_mask(q_idx, k_idx, window)
-        >>>
+        >>> # Sparse local + global pattern (Triton)
+        >>> from ejkernel.kernels._triton.blocksparse_attention._mask import SparseMask
+        >>> def build_mask():
+        ...     return SparseMask(...)  # your pattern here
         >>> output = blocksparse_attention(
         ...     query, key, value,
-        ...     mask_builder=local_plus_global,
-        ...     sliding_window=256
-        ... )
-        >>>
-        >>>
-        >>> output = blocksparse_attention(
-        ...     query, key, value,
-        ...     platform="triton"
+        ...     mask_builder=build_mask,
+        ...     sliding_window=256,
+        ...     platform="triton",
         ... )
 
     Note:
-        Block-sparse attention is particularly effective for:
-        - Long document processing where full attention is prohibitive
-        - Architectures with specific attention patterns (e.g., Longformer)
-        - Scenarios where custom sparsity patterns are needed
+        Block-sparse attention is particularly effective for long document
+        processing where full attention is prohibitive and attention patterns
+        have known locality structure (e.g., Longformer, BigBird).
     """
 
     method = None

@@ -12,7 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reduce-scatter matmul operation module."""
+"""Reduce-scatter matmul operation module.
+
+This module implements a fused reduce-scatter matmul collective that computes::
+
+    output = reduce_scatter(x @ y.T, scatter_dim=0)
+
+where the K dimension of both ``x`` and ``y`` is already sharded across TP
+devices (each device holds a ``k_shard``-sized slice), and the M dimension of
+the result is scattered so that each device owns ``m // tp_size`` rows.
+
+The operation is equivalent to::
+
+    # full computation on device d
+    partial = x_shard @ y_shard.T          # [m, n]
+    # all-reduce, then scatter M dim 0:
+    output_local = reduce_scatter(partial)  # [m // tp_size, n]
+
+but fused into a single communication-computation primitive.
+
+Supported Platforms:
+    - GPU (Triton/CUDA): Overlapped compute and NCCL collective via the
+      Triton ``reduce_scatter_matmul`` kernel.
+    - XLA fallback: ``lax.all_reduce`` followed by a local slice.
+
+Entry Points:
+    :class:`ReduceScatterMatmul` -- ``Kernel`` subclass for the
+    executor/autotuner framework.
+
+    :func:`reduce_scatter_matmul` -- functional entry point wrapping the
+    kernel in an :class:`~ejkernel.ops.Executor` with config caching.
+
+Distributed Execution:
+    The operation can be wrapped in ``shard_map`` by supplying ``mesh``.
+    In that case ``in_specs`` and ``out_specs`` default to sharding K along
+    ``axis_name`` for inputs and M along ``axis_name`` for the output.
+
+Note:
+    The block sizes in :class:`ReduceScatterMatmulConfig` are upper bounds;
+    the actual tiling is snapped to the largest divisor of the tensor
+    dimension that does not exceed the configured value.
+"""
 
 from __future__ import annotations
 
@@ -38,6 +78,20 @@ def _largest_divisor_leq(
     upper: int,
     candidates: tuple[int, ...] = (512, 256, 128, 64, 32, 16, 8, 4, 2, 1),
 ) -> int:
+    """Return the largest divisor of ``x`` that is also <= ``upper``.
+
+    First tries each value in ``candidates`` in decreasing order; if none
+    qualify, falls back to a linear scan from ``min(x, upper)`` downward.
+    Always returns at least 1.
+
+    Args:
+        x: Value whose divisors are enumerated (clamped to >= 1).
+        upper: Maximum allowed return value (clamped to >= 1).
+        candidates: Ordered sequence of preferred values to try first.
+
+    Returns:
+        Largest integer d such that ``d <= upper`` and ``x % d == 0``.
+    """
     x = int(max(1, x))
     upper = int(max(1, upper))
     for candidate in candidates:
@@ -50,7 +104,19 @@ def _largest_divisor_leq(
 
 
 def _infer_axis_size(axis_name: str) -> int | None:
-    """Infer collective axis size from the active mapped context when available."""
+    """Infer collective axis size from the active ``shard_map`` context.
+
+    Queries the mapped axis size by issuing a ``lax.psum`` of 1.  Must be
+    called inside a ``shard_map`` body where ``axis_name`` is in scope.
+
+    Args:
+        axis_name: The sharded axis name (must be active in the current
+            ``shard_map`` context).
+
+    Returns:
+        Integer axis size, or ``None`` if the query fails (e.g. the axis is
+        not currently mapped, or the value is not statically concrete).
+    """
     try:
         return jax.core.concrete_or_error(
             int,
@@ -62,7 +128,23 @@ def _infer_axis_size(axis_name: str) -> int | None:
 
 
 def _resolve_tp_size(tp_size: int | None, axis_name: str) -> int:
-    """Resolve tensor-parallel world size using explicit value, axis context, then global device count."""
+    """Resolve tensor-parallel world size.
+
+    Resolution order:
+    1. Use ``tp_size`` if explicitly provided and >= 1.
+    2. Attempt to infer from the active ``shard_map`` axis (``_infer_axis_size``).
+    3. Fall back to the total JAX device count (``jax.device_count()``).
+
+    Args:
+        tp_size: Explicit override, or ``None`` to auto-resolve.
+        axis_name: Name of the sharded axis (used for inference fallback).
+
+    Returns:
+        Resolved integer world size >= 1.
+
+    Raises:
+        ValueError: If the resolved value is < 1.
+    """
     resolved = int(tp_size) if tp_size is not None else (_infer_axis_size(axis_name) or int(jax.device_count()))
     if resolved < 1:
         raise ValueError(f"tp_size must be >= 1, got {resolved}.")
@@ -70,7 +152,22 @@ def _resolve_tp_size(tp_size: int | None, axis_name: str) -> int:
 
 
 class ReduceScatterMatmul(Kernel[ReduceScatterMatmulConfig, Array]):
-    """Distributed reduce-scatter matmul operation."""
+    """Fused distributed reduce-scatter matmul kernel.
+
+    Computes ``reduce_scatter(x @ y.T, scatter_dim=0)`` where the K dimension
+    of ``x`` and ``y`` is already sharded across TP devices.  Each device
+    contributes a partial result over its K shard; the reduce-scatter
+    accumulates across all ranks and returns the M-scattered slice
+    ``[m // tp_size, n]`` local to each device.
+
+    Block sizes are resolved from :class:`ReduceScatterMatmulConfig` at runtime
+    by snapping to the largest divisor of each dimension that does not exceed
+    the configured value (see :func:`_largest_divisor_leq`).
+
+    Platforms:
+        - GPU: Triton kernel with overlapped NCCL collective.
+        - Fallback: XLA all-reduce + local slice (enabled via ``platform="xla"``).
+    """
 
     def __init__(self):
         super().__init__(op_id="reduce_scatter_matmul")
@@ -80,6 +177,12 @@ class ReduceScatterMatmul(Kernel[ReduceScatterMatmulConfig, Array]):
 
         Args:
             cfg: Kernel configuration specifying platform and backend.
+
+        Returns:
+            Callable kernel implementation from the registry.
+
+        Raises:
+            ValueError: If no matching implementation is found.
         """
         platform = detect_platform(self.op_id, cfg.platform)
         return kernel_registry.get(self.op_id, platform=platform, backend=cfg.backend)
@@ -92,7 +195,7 @@ class ReduceScatterMatmul(Kernel[ReduceScatterMatmulConfig, Array]):
         collective_id: int | None = 0,
         precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         tp_size: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: ReduceScatterMatmulConfig,
         mesh: Mesh | None = None,
@@ -157,7 +260,7 @@ class ReduceScatterMatmul(Kernel[ReduceScatterMatmulConfig, Array]):
         collective_id: int | None = 0,
         precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
         tp_size: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: ReduceScatterMatmulConfig,
     ) -> Float[Array, "m_local n"]:
@@ -244,6 +347,57 @@ class ReduceScatterMatmul(Kernel[ReduceScatterMatmulConfig, Array]):
             )
         return candidates
 
+    def candidate_cfgs_gpu(self, inv: Invocation[ReduceScatterMatmulConfig, Array]):
+        """Return GPU candidates for TileLang and XLA reduce-scatter matmul paths."""
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        base_configs = ((128, 128, 128), (256, 128, 128), (256, 256, 128), (256, 256, 256))
+        candidates: list[ReduceScatterMatmulConfig] = []
+        if "tilelang" in platforms:
+            for block_m, block_n, block_k in base_configs:
+                candidates.append(
+                    ReduceScatterMatmulConfig(
+                        block_m=block_m,
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=4,
+                        num_stages=2,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
+                )
+        if "xla" in platforms:
+            for block_m, block_n, block_k in base_configs:
+                candidates.append(
+                    ReduceScatterMatmulConfig(
+                        block_m=block_m,
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=4,
+                        num_stages=2,
+                        platform="xla",
+                        backend="any",
+                    )
+                )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[ReduceScatterMatmulConfig, Array]):
+        """Return TPU candidates for Pallas and XLA reduce-scatter matmul paths."""
+        base_configs = ((128, 128, 128), (256, 128, 128), (256, 256, 128), (256, 256, 256))
+        return [
+            ReduceScatterMatmulConfig(
+                block_m=block_m,
+                block_n=block_n,
+                block_k=block_k,
+                num_warps=4,
+                num_stages=2,
+                platform=platform,
+                backend=backend,
+            )
+            for platform, backend in (("pallas", "tpu"), ("xla", "any"))
+            for block_m, block_n, block_k in base_configs
+        ]
+
 
 _reduce_scatter_matmul_executor: Executor[ReduceScatterMatmulConfig, Array] = Executor(
     ConfigSelectorChain(
@@ -268,7 +422,7 @@ def reduce_scatter_matmul(
     collective_id: int | None = 0,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
     tp_size: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: ReduceScatterMatmulConfig | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,

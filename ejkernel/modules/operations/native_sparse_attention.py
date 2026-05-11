@@ -75,7 +75,7 @@ import typing
 
 from jaxtyping import Array, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -145,7 +145,7 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         block_counts: Int[Array, "batch seq_len num_kv_heads"] | int = 16,
         softmax_scale: float | None = None,
         cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: NativeSparseAttentionConfig,
     ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
@@ -161,8 +161,11 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
             g_slc: Optional selection gate weights [batch, seq_len, num_q_heads].
                 Used for gated sparse attention to modulate the selected path.
                 When provided, scales the attention output from selected tokens.
-            block_indices: Indices of key blocks to attend to for each query block
-                [batch, num_kv_heads, num_query_blocks, num_keys_blocks]
+            block_indices: Indices of key blocks to attend to for each query block.
+                The declared jaxtyping shape is
+                ``[batch, seq_len, num_kv_heads, num_selected_blocks]``, but
+                the XLA and Triton backends interpret this as a block-indexed
+                table (see Note below).
             block_counts: Number of key blocks per query block (can be int or array)
             softmax_scale: Optional scaling factor for attention scores
             cu_seqlens: Cumulative sequence lengths for variable-length sequences
@@ -173,15 +176,20 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
             Sparse attention output [batch, seq_len, num_heads, head_dim]
 
         Note:
-            When block_indices is None, a default pattern may be used depending
-            on the implementation. Providing explicit indices gives full control
-            over the sparsity pattern.
+            When ``block_indices`` is ``None``, a default pattern may be used
+            depending on the implementation. Providing explicit indices gives
+            full control over the sparsity pattern.
+
+            The ``block_indices`` shape annotation ``[batch, seq_len,
+            num_kv_heads, num_selected_blocks]`` uses ``seq_len`` as a
+            positional dimension, but the underlying Triton kernel (NSA)
+            treats the second dimension as the number of query blocks, not
+            raw token positions. The XLA fallback is selected automatically
+            when the GQA group size is not a multiple of 16 (the Triton
+            constraint).
         """
 
-        # Triton NSA enforces a GQA group size multiple-of-16 constraint. For common
-        # non-GQA shapes (e.g., HQ == H_kv), fall back to the XLA implementation
-        # when the platform is not explicitly forced.
-        if platform is None or platform == "auto":
+        if (platform is None or platform == "auto") and cfg.platform in (None, "auto"):
             num_q_heads = int(query.shape[2])
             num_kv_heads = int(key.shape[2])
             group_size = num_q_heads // num_kv_heads if (num_kv_heads > 0 and num_q_heads % num_kv_heads == 0) else 0
@@ -208,7 +216,16 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
-        impl = self.get_impl(cfg)
+        resolved_platform = detect_platform("native_sparse_attention", cfg.platform)
+        impl = kernel_registry.get("native_sparse_attention", platform=resolved_platform, backend=cfg.backend)
+        impl_kwargs = {}
+        if resolved_platform == Platform.TRITON:
+            impl_kwargs = {
+                "block_k": cfg.block_k,
+                "block_v": cfg.block_d,
+                "num_warps": cfg.num_warps,
+                "num_stages": cfg.num_stages,
+            }
         return impl(
             query=query,
             key=key,
@@ -220,6 +237,7 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
             cu_seqlens=cu_seqlens,
             g_cmp=g_cmp,
             g_slc=g_slc,
+            **impl_kwargs,
         )
 
     def heuristic_cfg(self, inv: Invocation[NativeSparseAttentionConfig, Array]) -> NativeSparseAttentionConfig:
@@ -289,22 +307,41 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         Returns:
             List of GPU-specific configurations with varying block sizes and warps
         """
+        requested = inv.kwargs.get("platform", None)
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         configs = []
 
-        for block_size in [32, 64, 128]:
-            for num_warps in [4, 8]:
+        if "triton" in platforms:
+            for block_size in [32, 64, 128]:
+                for num_warps in [1, 2, 4]:
+                    configs.append(
+                        NativeSparseAttentionConfig(
+                            block_q=block_size,
+                            block_k=block_size,
+                            block_d=block_size,
+                            block_size=block_size,
+                            num_warps=num_warps,
+                            num_stages=1,
+                            platform="triton",
+                            backend="gpu",
+                        )
+                    )
+        if "tilelang" in platforms:
+            for block_size in [64, 128]:
                 configs.append(
                     NativeSparseAttentionConfig(
                         block_q=block_size,
                         block_k=block_size,
                         block_d=block_size,
                         block_size=block_size,
-                        num_warps=num_warps,
+                        num_warps=4,
                         num_stages=1,
-                        platform="triton",
+                        platform="tilelang",
                         backend="gpu",
                     )
                 )
+        if "xla" in platforms:
+            configs.extend(self.candidate_cfgs_xla(inv))
         return configs
 
     def candidate_cfgs_tpu(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
@@ -319,21 +356,7 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         Returns:
             List of TPU-specific configurations optimized for matrix units
         """
-        configs = []
-        for block_size in [64, 128]:
-            configs.append(
-                NativeSparseAttentionConfig(
-                    block_q=block_size,
-                    block_k=block_size,
-                    block_d=block_size,
-                    block_size=block_size,
-                    num_warps=4,
-                    num_stages=1,
-                    platform="pallas",
-                    backend="tpu",
-                )
-            )
-        return configs
+        return self.candidate_cfgs_xla(inv)
 
     def candidate_cfgs_xla(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
         """Generate XLA-optimized candidate configurations for autotuning.
@@ -395,7 +418,7 @@ def native_sparse_attention(
     /,
     *,
     softmax_scale: float | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: NativeSparseAttentionConfig | None = None,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """Execute native sparse attention with automatic optimization.
@@ -412,8 +435,10 @@ def native_sparse_attention(
             for gated sparse attention patterns
         g_slc: Optional slice gate weights [batch, seq_len, num_q_heads]
             for controlling attention slice contributions
-        block_indices: Indices of blocks to attend to for each query block
-            [batch, num_kv_heads, num_query_blocks, num_keys_blocks]
+        block_indices: Indices of key blocks to attend to for each query block.
+            Declared shape: ``[batch, seq_len, num_kv_heads, num_selected_blocks]``.
+            The Triton backend treats the ``seq_len`` dimension as the number of
+            query blocks. The XLA fallback accepts either interpretation.
         block_counts: Number of blocks per query block (default: 16)
         cu_seqlens: Cumulative sequence lengths for variable-length sequences
         softmax_scale: Scaling factor for attention (default: 1/sqrt(head_dim))
