@@ -103,6 +103,37 @@ if _has_cutlass:
 else:  # pragma: no cover
     cute = None  # type: ignore[assignment]
 
+
+def _is_optional_tilelang_dependency_error(err: ModuleNotFoundError) -> bool:
+    """Return True when a tile-lang import failed due to optional GPU deps.
+
+    tile-lang kernels require the ``tilelang`` package, ``jax_tvm_ffi``, and a
+    CUDA-enabled jaxlib. Missing any of these should not break ``import
+    ejkernel``; we simply disable the tile-lang backend.
+    """
+    name = err.name or ""
+    return (
+        name == "tilelang"
+        or name.startswith("tilelang.")
+        or name == "jax_tvm_ffi"
+        or name.startswith("jax_tvm_ffi.")
+        or name == "tvm_ffi"
+        or name.startswith("tvm_ffi.")
+    )
+
+
+_has_tilelang = _importlib_util.find_spec("tilelang") is not None
+if _has_tilelang:
+    try:
+        from . import _tilelang as tilelang
+    except ModuleNotFoundError as err:  # pragma: no cover
+        if not _is_optional_tilelang_dependency_error(err):
+            raise
+        tilelang = None  # type: ignore[assignment]
+else:  # pragma: no cover
+    tilelang = None  # type: ignore[assignment]
+
+
 __all__ = [
     "Backend",
     "Platform",
@@ -116,4 +147,6 @@ if triton is not None:
     __all__.append("triton")
 if cute is not None:
     __all__.append("cute")
+if tilelang is not None:
+    __all__.append("tilelang")
 __all__ = tuple(__all__)

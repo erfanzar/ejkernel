@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "ejkernel"
-version = "0.0.79"
+version = "0.0.80"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
@@ -66,6 +66,7 @@ cuda = [
     "triton==3.6.0", 
     "nvidia-cutlass-dsl[cu13]>=4.4.0.dev1",
     "jax-tvm-ffi==0.1.2",
+    "tilelang>=0.1.9",
 ]
 tpu = ["jax[tpu]>=0.10.0"]
 triton = ["triton==3.6.0"]
@@ -100,6 +101,7 @@ exclude = ["ejkernel/"]
 
 [tool.basedpyright]
 reportAssignmentType = "none"
+reportInvalidTypeForm = "none"
 reportUnknownVariableType = "none"
 reportPrivateUsage = "none"
 reportOptionalCall = "none"

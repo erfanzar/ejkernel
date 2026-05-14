@@ -72,6 +72,10 @@ def _cuda_available() -> bool:
     return _has_gpu_backend() and _has_nvcc()
 
 
+def _tilelang_available() -> bool:
+    return _has_module("tilelang") and _has_module("jax_tvm_ffi") and _has_gpu_backend()
+
+
 def pytest_ignore_collect(collection_path: Path, config: Any) -> bool:
     parts = set(collection_path.parts)
     is_kernel_test = "test" in parts and "kernels" in parts
@@ -80,6 +84,8 @@ def pytest_ignore_collect(collection_path: Path, config: Any) -> bool:
     if is_kernel_test and "_cute" in parts and not _cute_available():
         return True
     if is_kernel_test and "_cuda" in parts and not _cuda_available():
+        return True
+    if is_kernel_test and "_tilelang" in parts and not _tilelang_available():
         return True
 
     # Ignore standalone Triton-dependent tests outside test/kernels/_triton.

@@ -320,6 +320,7 @@ class Platform(StrEnum):
         PALLAS: JAX Pallas kernels (supports both GPU and TPU).
         CUDA: Native CUDA C/C++ kernels compiled ahead-of-time.
         CUTE: CUTLASS CuTe DSL kernels.
+        TILELANG: tile-lang DSL kernels (Microsoft/TileLang, TVM-FFI backed).
         XLA: XLA HLO-based implementations using JAX primitives.
     """
 
@@ -327,6 +328,7 @@ class Platform(StrEnum):
     PALLAS = "pallas"
     CUDA = "cuda"
     CUTE = "cute"
+    TILELANG = "tilelang"
     XLA = "xla"
 
 
@@ -413,7 +415,7 @@ class KernelRegistry:
     def register(
         self,
         algorithm: str,
-        platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla"],
+        platform: Platform | Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla"],
         backend: Backend | Literal["gpu", "mps", "tpu", "cpu", "any"],
         priority: int = 0,
     ) -> Callable[[F], F]: ...
@@ -421,7 +423,7 @@ class KernelRegistry:
     def register(
         self,
         algorithm: str,
-        platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla"],
+        platform: Platform | Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla"],
         backend: Backend | Literal["gpu", "tpu", "cpu", "any"],
         priority: int = 0,
     ) -> Callable[[F], F]:
@@ -501,7 +503,7 @@ class KernelRegistry:
     def get(
         self,
         algorithm: str,
-        platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = None,
+        platform: Platform | Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] | None = None,
         backend: Backend | Literal["gpu", "mps", "tpu", "cpu", "any"] | None = None,
     ) -> Callable:
         """Retrieve the best matching kernel implementation.

@@ -1,6 +1,6 @@
 # ejkernels Test Suite
 
-Comprehensive test suite for ejkernels XLA, Pallas, and Triton implementations.
+Comprehensive test suite for ejkernels XLA, Pallas, Triton, CUDA, CuTe, and TileLang implementations.
 
 ## Structure
 
@@ -18,6 +18,10 @@ test/kernels/
 │   └── test_page_attention.py  # Page attention (inference)
 ├── _triton/                # Triton implementation tests
 │   └── test_flash_attention.py # Flash attention
+├── _tilelang/              # TileLang GPU implementation tests
+│   ├── test_<operation>.py     # Standalone XLA parity tests per TileLang operation
+│   ├── test_registry_coverage.py # Registration and standalone coverage checks
+│   └── test_honesty.py           # Static native-kernel guardrails
 ├── comparison/             # XLA vs Triton comparison tests
 │   └── test_xla_vs_triton.py   # Numerical accuracy comparisons
 └── README.md
@@ -47,6 +51,12 @@ python test/run_tests.py --pallas
 
 ```bash
 python test/run_tests.py --triton
+```
+
+### TileLang Tests Only
+
+```bash
+pytest test/kernels/_tilelang -q
 ```
 
 ### Comparison Tests Only
