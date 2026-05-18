@@ -13,22 +13,33 @@
 # limitations under the License.
 
 
-"""Fast, minimal benchmarking system for kernel performance comparison.
+"""Fast, minimal benchmarking system for JAX kernel performance comparison.
 
 This module provides a simple API for benchmarking JAX kernels with automatic
-performance analysis and comparison metrics using rich for beautiful output.
+performance analysis and comparison metrics rendered via the ``rich`` library.
 
 Key Features:
-    - Forward and backward pass timing
-    - Statistical analysis (mean, std, min, max, median)
-    - Automatic speedup comparisons between algorithms
-    - Progress bars with ETA tracking
-    - JSON export and matplotlib plotting
-    - Support for JIT static arguments
+    - Forward and optional backward pass timing.
+    - Statistical analysis (mean, std, min, max, median) over multiple iterations.
+    - Automatic speedup comparisons between algorithms relative to a baseline
+      (defaults to the algorithm named ``"xla"`` if present, otherwise the first
+      registered algorithm).
+    - Rich-rendered progress bars and formatted analysis tables.
+    - JSON export (``Benchmark.save``) and matplotlib bar-chart generation
+      (``Benchmark.plot``).
+    - ``static_kwargs`` support: argument names forwarded to ``jax.jit`` as
+      ``static_argnames`` for the forward pass and as ``static_argnums`` for
+      the backward pass (positional index is derived from the function signature).
+
+Dependencies:
+    - ``rich`` is required for progress bars and table rendering. If not installed,
+      any attempt to use these features raises ``ImportError``.
+    - ``matplotlib`` is optional; ``Benchmark.plot`` prints an error and returns
+      early if matplotlib is unavailable.
 
 Classes:
-    BenchmarkResult: Container for single benchmark measurement
-    Benchmark: Main benchmarking harness
+    BenchmarkResult: Container for a single benchmark measurement.
+    Benchmark: Main benchmarking harness.
 
 Example:
     >>> def flash_attn(q, k, v, causal, sliding_window):
@@ -48,7 +59,7 @@ Example:
     >>>
     >>> bench = Benchmark(
     ...     algorithms, configs, input_gen,
-    ...     static_kwargs=['causal', 'sliding_window']
+    ...     static_kwargs=["causal", "sliding_window"]
     ... )
     >>> results = bench.run()
 """
@@ -148,14 +159,16 @@ class BenchmarkResult:
 
     @property
     def throughput_estimate(self) -> float:
-        """Calculate estimated GFLOPS throughput for attention-like operations.
+        """Estimate throughput in GFLOPS for attention-like configurations.
 
-        Computes approximate FLOPS based on standard attention formula:
-        4 * batch * heads * seq^2 * dim (for QK^T matmul and softmax * V).
+        Approximates compute as ``4 * batch * heads * seq^2 * dim`` FLOPs
+        (accounts for the QK^T matmul and the softmax-weighted sum over values).
+        The result is normalized by the measured forward-pass latency.
 
         Returns:
-            Estimated throughput in GFLOPS, or 0.0 if config doesn't contain
-            required keys (batch, seq, heads, dim).
+            Estimated throughput in GFLOPS, or ``0.0`` if the config dict does
+            not contain all of the required keys: ``batch``, ``seq``,
+            ``heads``, and ``dim``.
         """
         if all(k in self.config for k in ["batch", "seq", "heads", "dim"]):
             b, s, h, d = self.config["batch"], self.config["seq"], self.config["heads"], self.config["dim"]
@@ -275,18 +288,26 @@ class Benchmark:
     def benchmark_single(self, algo_name: str, algo_fn: Callable, config: dict[str, Any]) -> BenchmarkResult:
         """Execute performance measurement for a single algorithm/config pair.
 
-        Runs warmup iterations to ensure JIT compilation is complete, then
-        executes timed iterations and computes statistics. Optionally
-        benchmarks backward pass as well.
+        Generates inputs via ``self.input_generator(config)``, JIT-compiles
+        ``algo_fn``, runs ``self.warmup`` un-timed iterations to allow XLA
+        compilation to complete, then measures ``self.iterations`` timed
+        iterations using ``time.perf_counter``. Each timed call blocks via
+        ``.block_until_ready()`` where available.
+
+        For the forward pass, ``static_kwargs`` are passed to ``jax.jit`` as
+        ``static_argnames``. For the backward pass (when ``bench_bwd=True``),
+        static argument positions are resolved from the function signature and
+        passed as ``static_argnums`` to the gradient JIT.
 
         Args:
             algo_name: Name identifier for the algorithm being tested.
-            algo_fn: The function to benchmark.
-            config: Configuration dict to pass to input_generator.
+            algo_fn: The callable to benchmark. Should be compatible with
+                ``jax.jit``.
+            config: Configuration dict passed verbatim to ``self.input_generator``.
 
         Returns:
-            BenchmarkResult containing timing statistics in milliseconds
-            for forward pass and optionally backward pass.
+            BenchmarkResult with timing statistics (mean, std, min, max, median)
+            in milliseconds for the forward pass, and optionally the backward pass.
         """
 
         inputs = self.input_generator(config)
@@ -533,18 +554,41 @@ class Benchmark:
         return analysis
 
     def analyze(self) -> dict[str, Any]:
-        """Generate comprehensive performance analysis from benchmark results.
+        """Generate comprehensive performance analysis from collected benchmark results.
 
-        Processes collected results to compute aggregate statistics,
-        algorithm-to-algorithm speedup comparisons, and identifies
-        fastest algorithm for each configuration.
+        Processes ``self.results`` to compute aggregate statistics per algorithm,
+        pairwise speedup comparisons relative to a baseline, and per-configuration
+        winner information.
+
+        The baseline algorithm for speedup comparisons is ``"xla"`` if an algorithm
+        with that name was benchmarked; otherwise the first algorithm in insertion
+        order is used.
+
+        Note:
+            Internally, configuration dicts are serialised to strings with
+            ``str(sorted(config.items()))`` to use as dict keys. The
+            ``by_config`` section reconstructs the dict from this string via
+            ``eval()``; config keys and values must therefore be safe to
+            ``eval``.
 
         Returns:
-            Structured analysis dict with:
-                - summary: Mean/median/min/max times and throughput per algorithm
-                - comparisons: Speedup ratios (algo2_vs_algo1)
-                - by_config: Winner and times for each configuration
-                - raw_results: Original measurements for further processing
+            A dict with four top-level keys:
+
+            - ``"summary"`` (dict): Per-algorithm statistics over all configs:
+              ``mean_time_ms``, ``median_time_ms``, ``min_time_ms``,
+              ``max_time_ms``, ``mean_throughput_gflops``, ``success_rate``,
+              ``num_configs``.
+            - ``"comparisons"`` (dict): Speedup of each non-baseline algorithm
+              vs the baseline, keyed as ``"<algo>_vs_<baseline>"`` with
+              sub-keys ``mean_speedup``, ``median_speedup``, ``min_speedup``,
+              ``max_speedup``.
+            - ``"by_config"`` (dict): Per-configuration results, keyed by the
+              sorted-items string. Each value contains ``config``, ``results``
+              (per-algorithm mean/min/median/max/throughput), ``fastest``, and
+              ``fastest_time_ms``.
+            - ``"raw_results"`` (list): One dict per individual measurement with
+              keys ``algorithm``, ``config``, ``mean_ms``, ``std_ms``,
+              ``min_ms``, ``throughput_gflops``.
         """
 
         analysis = {

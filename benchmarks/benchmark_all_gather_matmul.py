@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility shim for the unified flash_attention benchmark."""
+"""Benchmark all_gather_matmul across all available implementations."""
 
 import os
 import sys
@@ -8,4 +8,4 @@ sys.path.append(os.path.dirname(__file__))
 from _op_benchmark_registry import run_benchmark
 
 if __name__ == "__main__":
-    raise SystemExit(run_benchmark("flash_attention"))
+    raise SystemExit(run_benchmark("all_gather_matmul"))

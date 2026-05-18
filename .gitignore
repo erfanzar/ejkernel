@@ -9,8 +9,10 @@ exp.py
 env.py
 run_test.py
 benchmark_plots/*
-benchmark_outputs/
+benchmark_outputs/*
+benchmark_results/*
 gdr_benchmark.png
+gdr_v2/*
 # Distribution / packaging
 .Python
 build/

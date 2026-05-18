@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import itertools
+import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -64,6 +65,18 @@ def _default_dtype() -> jnp.dtype:
     if backend == "cpu":
         return jnp.float32
     return jnp.float16
+
+
+def _as_jax_dtype(dtype: Any) -> jnp.dtype:
+    """Normalize string dtype names used in benchmark configs."""
+
+    if dtype in ("bf16", "bfloat16"):
+        return jnp.bfloat16
+    if dtype in ("fp16", "float16", "f16"):
+        return jnp.float16
+    if dtype in ("fp32", "float32", "f32"):
+        return jnp.float32
+    return dtype
 
 
 def _available_platforms(algorithm: str) -> list[str]:
@@ -198,11 +211,21 @@ def _wrap_attention_like(op_fn: Callable[..., Any], platform: str) -> Callable[.
     return _fn
 
 
-def _apply_native_sparse_op(*args, platform: str):
+def _attention_registry_op(q, k, v, causal, sliding_window, *, platform: str):
+    """Dispatch attention through the registry because the public wrapper has no platform argument."""
+    backend = Backend(jax.default_backend())
+    impl = kernel_registry.get("attention", platform=platform, backend=backend)
+    return impl(q, k, v, causal=causal, sliding_window=sliding_window)
+
+
+def _apply_native_sparse_op(query, key, value, block_indices, block_counts, block_size: int, *, platform: str):
     """Dispatch apply_native_sparse_attention through the kernel registry.
 
     Args:
-        *args: Positional arguments forwarded to the kernel implementation.
+        query, key, value: Attention inputs.
+        block_indices: Selected block indices.
+        block_counts: Number of selected blocks.
+        block_size: Static block size.
         platform: Platform name used to resolve the implementation.
 
     Returns:
@@ -210,7 +233,8 @@ def _apply_native_sparse_op(*args, platform: str):
     """
     backend = Backend(jax.default_backend())
     impl = kernel_registry.get("apply_native_sparse_attention", platform=platform, backend=backend)
-    return impl(*args)
+    softmax_scale = 1.0 / math.sqrt(query.shape[-1])
+    return impl(query, key, value, block_indices, block_counts, block_size=block_size, softmax_scale=softmax_scale)
 
 
 def _limit_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -281,14 +305,15 @@ def _cfgs_blocksparse():
 
 def _cfgs_native_sparse():
     """Generate benchmark configs for native sparse attention."""
-    configs = _grid(
+    configs = []
+    for base in _grid(
         batch=[1, 2, 4],
         seq=[256, 512, 1024],
-        qheads=[4, 8],
-        kvheads=[4, 8],
         dim=[64, 128],
         block_counts=[8, 16, 32],
-    )
+    ):
+        for qheads, kvheads in ((16, 1), (32, 2)):
+            configs.append({**base, "qheads": qheads, "kvheads": kvheads})
     return _limit_configs(configs)
 
 
@@ -475,10 +500,30 @@ def _cfgs_grouped_matmul():
 def _cfgs_quantized_matmul():
     """Generate benchmark configs for quantized matrix multiplication."""
     configs = _grid(
-        m=[128, 512, 2048, 4096],
-        k=[4096, 8192],
-        n=[128, 512, 1024, 4096],
-        mode=["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"],
+        m=[
+            # 128,
+            # 512,
+            # 2048,
+            4096,
+        ],
+        k=[
+            # 4096,
+            8192,
+        ],
+        n=[
+            # 128,
+            # 512,
+            # 1024,
+            4096,
+        ],
+        mode=[
+            "affine",
+            "nf4",
+            "mxfp4",
+            "mxfp8",
+            "nvfp4",
+            "nvfp8",
+        ],
         dtype=["bf16"],
     )
     return _limit_configs(configs)
@@ -561,6 +606,98 @@ def _cfgs_state_space_v2():
     return _limit_configs(configs)
 
 
+def _cfgs_deepseek():
+    """Generate benchmark configs for DeepSeek sparse attention."""
+    configs = _grid(
+        batch=[1],
+        seq=[128, 256, 512],
+        qheads=[4, 8],
+        kvheads=[2, 4],
+        dim=[64, 128],
+        latent=[128, 256],
+        index_heads=[2, 4],
+        index_dim=[64],
+        index_topk=[32, 64, 128],
+        causal=[True],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_flash_mla():
+    """Generate benchmark configs for flash MLA."""
+    configs = _grid(
+        batch=[1, 2],
+        seq=[128, 256, 512],
+        qheads=[4, 8],
+        kvheads=[2, 4],
+        dim=[64, 128],
+        latent=[128, 256],
+        causal=[False, True],
+        sliding=[None, 128],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_mla_ragged():
+    """Generate benchmark configs for MLA ragged paged attention."""
+    configs = _grid(
+        num_seqs=[2, 4],
+        pages_per_seq=[2, 4],
+        page_size=[4, 8],
+        qheads=[2, 4],
+        nope_dim=[32, 64],
+        pe_dim=[16, 32],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_rpa_turboquant():
+    """Generate benchmark configs for TurboQuant ragged paged attention."""
+    configs = _grid(
+        num_seqs=[2, 4],
+        pages_per_seq=[2, 4],
+        page_size=[4, 8],
+        qheads=[2, 4],
+        kvheads=[1, 2],
+        dim=[16, 32],
+        qjl_dim=[16, 32],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_ragged_gdr():
+    """Generate benchmark configs for ragged gated delta rule."""
+    configs = _grid(
+        num_requests=[2, 4, 8],
+        tokens_per_request=[1, 4, 16],
+        heads=[2, 4],
+        dim=[16, 32, 64],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_collective_matmul():
+    """Generate benchmark configs for collective matmul APIs."""
+    configs = _grid(
+        m=[128, 512, 1024],
+        k=[256, 512, 1024],
+        n=[128, 512, 1024],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_grouped_matmul_v3():
+    """Generate benchmark configs for grouped matrix multiplication v3."""
+    configs = _grid(
+        groups=[2, 4, 8],
+        m_per_group=[32, 64],
+        k=[64, 128],
+        n=[64, 128],
+        transpose_rhs=[False, True],
+    )
+    return _limit_configs(configs)
+
+
 def _rand_inputs(config: dict[str, Any], *shapes: tuple[int, ...], dtype: jnp.dtype | None = None):
     """Generate a list of random normal tensors with the given shapes.
 
@@ -573,7 +710,7 @@ def _rand_inputs(config: dict[str, Any], *shapes: tuple[int, ...], dtype: jnp.dt
         List of JAX arrays, one per shape.
     """
     key = jax.random.PRNGKey(config.get("seed", 0))
-    dtype = _default_dtype() if dtype is None else dtype
+    dtype = _default_dtype() if dtype is None else _as_jax_dtype(dtype)
     keys = jax.random.split(key, len(shapes))
     return [jax.random.normal(k, shape, dtype=dtype) for k, shape in zip(keys, shapes, strict=True)]
 
@@ -615,9 +752,21 @@ def _gen_native_sparse_inputs(config: dict[str, Any]):
     qh = config["qheads"]
     kvh = config.get("kvheads", qh)
     dim = config["dim"]
+    block_size = config.get("block_size", 64)
+    num_selected = min(config.get("block_counts", 16), (seq + block_size - 1) // block_size)
     dtype = config.get("dtype", _default_dtype())
     q, k, v = _rand_inputs(config, (batch, seq, qh, dim), (batch, seq, kvh, dim), (batch, seq, kvh, dim), dtype=dtype)
-    return q, k, v, config.get("block_counts", 16)
+    num_blocks = (seq + block_size - 1) // block_size
+    key = jax.random.PRNGKey(config.get("seed", 0) ^ 0x5A5A)
+    block_indices = jax.random.randint(
+        key,
+        (batch, seq, kvh, num_selected),
+        minval=0,
+        maxval=num_blocks,
+        dtype=jnp.int32,
+    )
+    block_counts = jnp.full((batch, seq, kvh), num_selected, dtype=jnp.int32)
+    return q, k, v, block_indices, block_counts
 
 
 def _gen_apply_native_sparse_inputs(config: dict[str, Any]):
@@ -629,7 +778,7 @@ def _gen_apply_native_sparse_inputs(config: dict[str, Any]):
     dim = config["dim"]
     block_size = config.get("block_size", 16)
     num_selected = config.get("num_selected_blocks", 4)
-    dtype = config.get("dtype", _default_dtype())
+    dtype = _as_jax_dtype(config.get("dtype", _default_dtype()))
     q, k, v = _rand_inputs(config, (batch, seq, qh, dim), (batch, seq, kvh, dim), (batch, seq, kvh, dim), dtype=dtype)
     num_blocks = (seq + block_size - 1) // block_size
     key = jax.random.PRNGKey(config.get("seed", 0) ^ 0xA5A5)
@@ -640,7 +789,7 @@ def _gen_apply_native_sparse_inputs(config: dict[str, Any]):
         maxval=num_blocks,
         dtype=jnp.int32,
     )
-    block_counts = num_selected
+    block_counts = jnp.full((batch, seq, kvh), num_selected, dtype=jnp.int32)
     return q, k, v, block_indices, block_counts, block_size
 
 
@@ -653,7 +802,7 @@ def _gen_decode_attention_inputs(config: dict[str, Any]):
     page_size = config.get("page_size", 4)
     max_pages = config.get("max_pages", 8)
     total_tokens = page_size * max_pages
-    dtype = config.get("dtype", _default_dtype())
+    dtype = _as_jax_dtype(config.get("dtype", _default_dtype()))
     q, k_buf, v_buf = _rand_inputs(
         config,
         (batch, heads, dim),
@@ -872,7 +1021,7 @@ def _gen_quantized_matmul_inputs(config: dict[str, Any]):
     k = config.get("k", 64)
     n = config.get("n", 64)
     mode = config.get("mode", "affine")
-    dtype = config.get("dtype", _default_dtype())
+    dtype = _as_jax_dtype(config.get("dtype", _default_dtype()))
     key = jax.random.PRNGKey(config.get("seed", 0))
     k1, k2 = jax.random.split(key, 2)
     x = jax.random.normal(k1, (m, k), dtype=dtype)
@@ -993,6 +1142,276 @@ def _gen_state_space_v2_inputs(config: dict[str, Any]):
     D = jax.random.normal(k5, (heads,), dtype=jnp.float32).astype(dtype)
     dt = jax.random.normal(jax.random.PRNGKey(config.get("seed", 6)), (batch, seq, heads), dtype=dtype)
     return x, A, B, C, D, dt
+
+
+def _gen_deepseek_inputs(config: dict[str, Any]):
+    """Generate query, compressed KV, MLA projections, and indexer tensors."""
+    batch = config.get("batch", 1)
+    seq = config.get("seq", 128)
+    qheads = config.get("qheads", 4)
+    kvheads = config.get("kvheads", qheads)
+    dim = config.get("dim", 64)
+    latent = config.get("latent", 128)
+    index_heads = config.get("index_heads", 2)
+    index_dim = config.get("index_dim", 64)
+    index_topk = min(config.get("index_topk", 64), seq)
+    causal = config.get("causal", True)
+    dtype = config.get("dtype", _default_dtype())
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 7)
+    query = jax.random.normal(keys[0], (batch, seq, qheads, dim), dtype=dtype)
+    key_value = jax.random.normal(keys[1], (batch, seq, latent), dtype=dtype)
+    w_kc = jax.random.normal(keys[2], (latent, kvheads, dim), dtype=dtype)
+    w_vc = jax.random.normal(keys[3], (latent, kvheads, dim), dtype=dtype)
+    query_index = jax.random.normal(keys[4], (batch, seq, index_heads, index_dim), dtype=dtype)
+    key_index = jax.random.normal(keys[5], (batch, seq, index_dim), dtype=dtype)
+    index_weights = jax.random.normal(keys[6], (batch, seq, index_heads), dtype=dtype)
+    return query, key_value, w_kc, w_vc, query_index, key_index, index_weights, index_topk, causal
+
+
+def _gen_flash_mla_inputs(config: dict[str, Any]):
+    """Generate query, compressed KV, and MLA projection tensors."""
+    batch = config.get("batch", 1)
+    seq = config.get("seq", 128)
+    qheads = config.get("qheads", 4)
+    kvheads = config.get("kvheads", qheads)
+    dim = config.get("dim", 64)
+    latent = config.get("latent", 128)
+    causal = config.get("causal", False)
+    sliding = config.get("sliding", None)
+    dtype = config.get("dtype", _default_dtype())
+    query, key_value, w_kc, w_vc = _rand_inputs(
+        config,
+        (batch, seq, qheads, dim),
+        (batch, seq, latent),
+        (latent, kvheads, dim),
+        (latent, kvheads, dim),
+        dtype=dtype,
+    )
+    return query, key_value, w_kc, w_vc, causal, sliding
+
+
+def _gen_mla_ragged_inputs(config: dict[str, Any]):
+    """Generate packed MLA ragged paged-attention tensors."""
+    num_seqs = config.get("num_seqs", 2)
+    pages_per_seq = config.get("pages_per_seq", 2)
+    page_size = config.get("page_size", 4)
+    qheads = config.get("qheads", 2)
+    nope_dim = config.get("nope_dim", 32)
+    pe_dim = config.get("pe_dim", 16)
+    total_tokens = num_seqs * page_size
+    num_pages = num_seqs * pages_per_seq
+    page_size_per_pack = max(page_size // 2, 1)
+    kv_packing = 2
+    cache_dim = 256
+    dtype = config.get("dtype", _default_dtype())
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 5)
+    queries_nope = jax.random.normal(keys[0], (total_tokens, qheads, nope_dim), dtype=dtype)
+    queries_pe = jax.random.normal(keys[1], (total_tokens, qheads, pe_dim), dtype=dtype)
+    keys_values = jax.random.normal(keys[2], (total_tokens, nope_dim), dtype=dtype)
+    keys_pe = jax.random.normal(keys[3], (total_tokens, pe_dim), dtype=dtype)
+    kv_cache = jax.random.normal(keys[4], (num_pages, page_size_per_pack, kv_packing, cache_dim), dtype=dtype)
+    kv_lens = jnp.full((num_seqs,), page_size * pages_per_seq, dtype=jnp.int32)
+    block_tables = jnp.arange(num_pages, dtype=jnp.int32)
+    query_start_loc = jnp.arange(0, total_tokens + 1, page_size, dtype=jnp.int32)
+    distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
+    softmax_scale = 1.0 / math.sqrt(nope_dim + pe_dim)
+    sliding_window = min(page_size * pages_per_seq, 64)
+    logits_soft_cap = 8.0
+    return (
+        queries_nope,
+        queries_pe,
+        keys_values,
+        keys_pe,
+        kv_cache,
+        kv_lens,
+        block_tables,
+        query_start_loc,
+        distribution,
+        softmax_scale,
+        sliding_window,
+        logits_soft_cap,
+    )
+
+
+def _gen_rpa_v2_turboquant_inputs(config: dict[str, Any]):
+    """Generate read-only TurboQuant RPA v2 inputs."""
+    num_seqs = config.get("num_seqs", 2)
+    pages_per_seq = config.get("pages_per_seq", 2)
+    page_size = config.get("page_size", 4)
+    qheads = config.get("qheads", 2)
+    kvheads = config.get("kvheads", 1)
+    dim = config.get("dim", 16)
+    qjl_dim = config.get("qjl_dim", 16)
+    num_pages = num_seqs * pages_per_seq
+    total_tokens = num_seqs * max(page_size // 2, 1)
+    packed_idx_dim = dim // 2
+    packed_sign_dim = max(qjl_dim // 8, 1)
+    dtype = config.get("dtype", _default_dtype())
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 6)
+    queries = jax.random.normal(keys[0], (total_tokens, qheads, dim), dtype=dtype)
+    key_indices = jax.random.randint(keys[1], (num_pages, page_size, kvheads, packed_idx_dim), 0, 256, dtype=jnp.uint8)
+    key_signs = jax.random.randint(keys[2], (num_pages, page_size, kvheads, packed_sign_dim), 0, 256, dtype=jnp.uint8)
+    value_indices = jax.random.randint(keys[3], (num_pages, page_size, kvheads, packed_idx_dim), 0, 256, dtype=jnp.uint8)
+    key_norms = jnp.abs(jax.random.normal(keys[4], (num_pages, page_size, kvheads, 2), dtype=jnp.float32)).astype(dtype)
+    key_norms = key_norms + jnp.asarray(0.1, dtype=dtype)
+    value_norms = jnp.abs(jax.random.normal(keys[5], (num_pages, page_size, kvheads), dtype=jnp.float32)).astype(dtype)
+    value_norms = value_norms + jnp.asarray(0.1, dtype=dtype)
+    context_lens = jnp.full((num_seqs,), page_size * pages_per_seq, dtype=jnp.int32)
+    block_tables = jnp.arange(num_pages, dtype=jnp.int32).reshape(num_seqs, pages_per_seq)
+    tokens_per_seq = total_tokens // num_seqs
+    query_start_loc = jnp.arange(0, total_tokens + 1, tokens_per_seq, dtype=jnp.int32)
+    rotation = jnp.eye(dim, dtype=jnp.float32)
+    qjl_projection = jax.random.normal(keys[0], (qjl_dim, dim), dtype=jnp.float32)
+    key_codebook = jnp.linspace(-0.25, 0.25, 16, dtype=jnp.float32)
+    value_codebook = jnp.linspace(-0.2, 0.2, 16, dtype=jnp.float32)
+    softmax_aux = jnp.zeros((qheads,), dtype=jnp.float32)
+    return (
+        queries,
+        key_indices,
+        key_signs,
+        key_norms,
+        value_indices,
+        value_norms,
+        context_lens,
+        block_tables,
+        query_start_loc,
+        jnp.array([num_seqs], dtype=jnp.int32),
+        rotation,
+        qjl_projection,
+        key_codebook,
+        value_codebook,
+        softmax_aux,
+        qjl_dim,
+    )
+
+
+def _gen_rpa_v3_turboquant_inputs(config: dict[str, Any]):
+    """Generate fused-update TurboQuant RPA v3 inputs."""
+    (
+        queries,
+        key_indices,
+        key_signs,
+        key_norms,
+        value_indices,
+        value_norms,
+        context_lens,
+        block_tables_matrix,
+        query_start_loc,
+        _num_seqs,
+        rotation,
+        qjl_projection,
+        key_codebook,
+        value_codebook,
+        softmax_aux,
+        qjl_dim,
+    ) = _gen_rpa_v2_turboquant_inputs(config)
+    kvheads = config.get("kvheads", 1)
+    dim = config.get("dim", 16)
+    dtype = config.get("dtype", _default_dtype())
+    total_tokens = queries.shape[0]
+    keys, values = _rand_inputs(config, (total_tokens, kvheads, dim), (total_tokens, kvheads, dim), dtype=dtype)
+    distribution = jnp.array([0, 0, context_lens.shape[0]], dtype=jnp.int32)
+    return (
+        queries,
+        keys,
+        values,
+        key_indices,
+        key_signs,
+        key_norms,
+        value_indices,
+        value_norms,
+        context_lens,
+        block_tables_matrix.reshape(-1),
+        query_start_loc,
+        distribution,
+        rotation,
+        qjl_projection,
+        key_codebook,
+        value_codebook,
+        softmax_aux,
+        qjl_dim,
+    )
+
+
+def _gen_ragged_gdr_inputs(config: dict[str, Any]):
+    """Generate flat ragged gated-delta-rule inputs."""
+    num_requests = config.get("num_requests", 2)
+    tokens_per_request = config.get("tokens_per_request", 1)
+    heads = config.get("heads", 2)
+    dim = config.get("dim", 16)
+    total_tokens = num_requests * tokens_per_request
+    num_slots = num_requests + 2
+    dtype = config.get("dtype", _default_dtype())
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 6)
+    query = jax.random.normal(keys[0], (total_tokens, heads, dim), dtype=dtype)
+    key_tensor = jax.random.normal(keys[1], (total_tokens, heads, dim), dtype=dtype)
+    value = jax.random.normal(keys[2], (total_tokens, heads, dim), dtype=dtype)
+    beta = jax.random.uniform(keys[3], (total_tokens, heads), minval=0.05, maxval=0.95, dtype=jnp.float32).astype(dtype)
+    decay = (jax.random.normal(keys[4], (total_tokens, heads), dtype=jnp.float32) * 0.05 - 0.5).astype(dtype)
+    recurrent_state = (jax.random.normal(keys[5], (num_slots, heads, dim, dim), dtype=jnp.float32) * 0.1).astype(
+        jnp.float32
+    )
+    query_start_loc = jnp.arange(0, total_tokens + 1, tokens_per_request, dtype=jnp.int32)
+    state_indices = jnp.arange(num_requests, dtype=jnp.int32)
+    chunk_size = max(1, min(tokens_per_request, 64))
+    use_qk_l2norm = True
+    return (
+        query,
+        key_tensor,
+        value,
+        beta,
+        decay,
+        recurrent_state,
+        query_start_loc,
+        state_indices,
+        chunk_size,
+        use_qk_l2norm,
+    )
+
+
+def _gen_all_gather_matmul_inputs(config: dict[str, Any]):
+    """Generate inputs for all-gather matmul."""
+    m = config.get("m", 128)
+    k = config.get("k", 256)
+    n = config.get("n", 128)
+    dtype = config.get("dtype", _default_dtype())
+    x, y = _rand_inputs(config, (m, k), (k, n), dtype=dtype)
+    return x, y, "__tp_dummy__"
+
+
+def _gen_reduce_scatter_matmul_inputs(config: dict[str, Any]):
+    """Generate inputs for reduce-scatter matmul."""
+    m = config.get("m", 128)
+    k = config.get("k", 256)
+    n = config.get("n", 128)
+    dtype = config.get("dtype", _default_dtype())
+    x, y = _rand_inputs(config, (m, k), (n, k), dtype=dtype)
+    return x, y, "__tp_dummy__"
+
+
+def _gen_grouped_matmul_v3_inputs(config: dict[str, Any]):
+    """Generate grouped matmul v3 inputs with scale, bias, and residual output."""
+    groups = config.get("groups", 2)
+    m_per = config.get("m_per_group", 32)
+    k = config.get("k", 64)
+    n = config.get("n", 64)
+    transpose_rhs = config.get("transpose_rhs", False)
+    dtype = config.get("dtype", _default_dtype())
+    m = groups * m_per
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    keys = jax.random.split(key, 5)
+    lhs = jax.random.normal(keys[0], (m, k), dtype=dtype)
+    rhs_kn = jax.random.normal(keys[1], (groups, k, n), dtype=dtype)
+    rhs = jnp.swapaxes(rhs_kn, 1, 2) if transpose_rhs else rhs_kn
+    group_sizes = jnp.full((groups,), m_per, dtype=jnp.int32)
+    rhs_scale = (jax.random.uniform(keys[2], (groups, 4, 1, n), dtype=jnp.float32) * 0.5 + 0.5).astype(dtype)
+    rhs_bias = jax.random.normal(keys[3], (groups, 1, n), dtype=dtype) * jnp.asarray(0.05, dtype=dtype)
+    existing_out = jax.random.normal(keys[4], (m, n), dtype=dtype) * jnp.asarray(0.05, dtype=dtype)
+    return lhs, rhs, group_sizes, existing_out, rhs_scale, rhs_bias, transpose_rhs
 
 
 def _gen_simple_seq_inputs(config: dict[str, Any]):
@@ -1166,11 +1585,323 @@ def _grouped_matmul_v2_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _apply_native_sparse_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap selected-block sparse attention with a static block size."""
+
+    def _fn(query, key, value, block_indices, block_counts, block_size):
+        out = op_fn(query, key, value, block_indices, block_counts, block_size, platform=platform)
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _native_sparse_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap native sparse attention with explicit block indices and platform."""
+
+    def _fn(query, key, value, block_indices, block_counts):
+        softmax_scale = 1.0 / math.sqrt(query.shape[-1])
+        block_counts_arg = int(block_indices.shape[-1]) if platform == "triton" else block_counts
+        out = op_fn(
+            query,
+            key,
+            value,
+            None,
+            None,
+            block_indices,
+            block_counts_arg,
+            softmax_scale=softmax_scale,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _page_attention_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap page attention with a static maximum context length."""
+
+    def _fn(query, key_cache, value_cache, context_lens, block_tables):
+        kwargs = {"platform": platform}
+        if platform == "triton":
+            kwargs["max_context_len"] = key_cache.shape[2] * block_tables.shape[1]
+        out = op_fn(query, key_cache, value_cache, context_lens, block_tables, **kwargs)
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _registry_wrapper(algorithm: str):
+    """Build a wrapper factory that dispatches directly through the registry."""
+
+    def _factory(_op_fn: Callable[..., Any], platform: str):
+        def _fn(*args):
+            backend = Backend(jax.default_backend())
+            impl = kernel_registry.get(algorithm, platform=platform, backend=backend)
+            out = impl(*args)
+            return out[0] if isinstance(out, tuple) else out
+
+        return _fn
+
+    return _factory
+
+
+def _deepseek_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap DeepSeek attention with static top-k and causal arguments."""
+
+    def _fn(query, key_value, w_kc, w_vc, query_index, key_index, index_weights, index_topk, causal):
+        out = op_fn(
+            query,
+            key_value,
+            w_kc,
+            w_vc,
+            query_index,
+            key_index,
+            index_weights,
+            index_topk=index_topk,
+            causal=causal,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _flash_mla_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap flash MLA with static causal and sliding-window knobs."""
+
+    def _fn(query, key_value, w_kc, w_vc, causal, sliding_window):
+        out = op_fn(
+            query,
+            key_value,
+            w_kc,
+            w_vc,
+            causal=causal,
+            sliding_window=sliding_window,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _mla_ragged_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap MLA ragged paged attention with public static knobs."""
+
+    def _fn(
+        queries_nope,
+        queries_pe,
+        keys_values,
+        keys_pe,
+        kv_cache,
+        kv_lens,
+        block_tables,
+        query_start_loc,
+        distribution,
+        softmax_scale,
+        sliding_window,
+        logits_soft_cap,
+    ):
+        out = op_fn(
+            queries_nope,
+            queries_pe,
+            keys_values,
+            keys_pe,
+            kv_cache,
+            kv_lens,
+            block_tables,
+            query_start_loc,
+            distribution,
+            softmax_scale=softmax_scale,
+            sliding_window=sliding_window,
+            logits_soft_cap=logits_soft_cap,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _rpa_v2_turboquant_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap TurboQuant RPA v2 with static QJL dimension."""
+
+    def _fn(
+        queries,
+        key_indices,
+        key_signs,
+        key_norms,
+        value_indices,
+        value_norms,
+        context_lens,
+        block_tables,
+        query_start_loc,
+        num_seqs,
+        rotation,
+        qjl_projection,
+        key_codebook,
+        value_codebook,
+        softmax_aux,
+        qjl_dim,
+    ):
+        out = op_fn(
+            queries,
+            key_indices,
+            key_signs,
+            key_norms,
+            value_indices,
+            value_norms,
+            context_lens,
+            block_tables,
+            query_start_loc,
+            num_seqs,
+            rotation,
+            qjl_projection,
+            key_codebook,
+            value_codebook,
+            softmax_aux,
+            qjl_dim=qjl_dim,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _rpa_v3_turboquant_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap TurboQuant RPA v3 with static QJL dimension."""
+
+    def _fn(
+        queries,
+        keys,
+        values,
+        key_indices,
+        key_signs,
+        key_norms,
+        value_indices,
+        value_norms,
+        kv_lens,
+        block_tables,
+        query_start_loc,
+        distribution,
+        rotation,
+        qjl_projection,
+        key_codebook,
+        value_codebook,
+        softmax_aux,
+        qjl_dim,
+    ):
+        out = op_fn(
+            queries,
+            keys,
+            values,
+            key_indices,
+            key_signs,
+            key_norms,
+            value_indices,
+            value_norms,
+            kv_lens,
+            block_tables,
+            query_start_loc,
+            distribution,
+            rotation,
+            qjl_projection,
+            key_codebook,
+            value_codebook,
+            softmax_aux,
+            qjl_dim=qjl_dim,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _ragged_gdr_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap ragged gated delta rule with static execution knobs."""
+
+    def _fn(
+        query,
+        key,
+        value,
+        beta,
+        decay,
+        recurrent_state,
+        query_start_loc,
+        state_indices,
+        chunk_size,
+        use_qk_l2norm,
+    ):
+        out = op_fn(
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            recurrent_state,
+            query_start_loc,
+            state_indices,
+            chunk_size=chunk_size,
+            use_qk_l2norm=use_qk_l2norm,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _all_gather_matmul_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap all-gather matmul with a static dummy axis."""
+
+    def _fn(x, y, axis_name):
+        out = op_fn(x, y, axis_name, platform=platform)
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _reduce_scatter_matmul_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap reduce-scatter matmul with a static dummy axis."""
+
+    def _fn(x, y, axis_name):
+        out = op_fn(x, y, axis_name, platform=platform)
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
+def _grouped_matmul_v3_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap grouped matmul v3 with scale, bias, residual, and transpose inputs."""
+
+    def _fn(lhs, rhs, group_sizes, existing_out, rhs_scale, rhs_bias, transpose_rhs):
+        out = op_fn(
+            lhs,
+            rhs,
+            group_sizes,
+            existing_out=existing_out,
+            rhs_scale=rhs_scale,
+            rhs_bias=rhs_bias,
+            transpose_rhs=transpose_rhs,
+            use_v3=True,
+            platform=platform,
+        )
+        return out[0] if isinstance(out, tuple) else out
+
+    return _fn
+
+
 SPECS: dict[str, OpBenchmarkSpec] = {
+    "all_gather_matmul": OpBenchmarkSpec(
+        op_name="all_gather_matmul",
+        algorithm="all_gather_matmul",
+        op_fn=ops.all_gather_matmul,
+        input_generator=_gen_all_gather_matmul_inputs,
+        configs=_cfgs_collective_matmul(),
+        wrapper_factory=_all_gather_matmul_wrapper,
+        static_kwargs=["axis_name"],
+    ),
     "attention": OpBenchmarkSpec(
         op_name="attention",
         algorithm="attention",
-        op_fn=ops.attention,
+        op_fn=_attention_registry_op,
         input_generator=_gen_mha_inputs,
         configs=_cfgs_mha(),
         static_kwargs=["causal", "sliding_window"],
@@ -1209,6 +1940,7 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         op_fn=ops.native_sparse_attention,
         input_generator=_gen_native_sparse_inputs,
         configs=_cfgs_native_sparse(),
+        wrapper_factory=_native_sparse_wrapper,
     ),
     "apply_native_sparse_attention": OpBenchmarkSpec(
         op_name="apply_native_sparse_attention",
@@ -1216,6 +1948,8 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         op_fn=_apply_native_sparse_op,
         input_generator=_gen_apply_native_sparse_inputs,
         configs=_cfgs_apply_native_sparse(),
+        wrapper_factory=_apply_native_sparse_wrapper,
+        static_kwargs=["block_size"],
     ),
     "decode_attention": OpBenchmarkSpec(
         op_name="decode_attention",
@@ -1223,6 +1957,26 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         op_fn=ops.decode_attention,
         input_generator=_gen_decode_attention_inputs,
         configs=_cfgs_decode_attention(),
+    ),
+    "deepseek_attn": OpBenchmarkSpec(
+        op_name="deepseek_attn",
+        algorithm="deepseek_attn",
+        op_fn=ops.deepseek_attn,
+        input_generator=_gen_deepseek_inputs,
+        configs=_cfgs_deepseek(),
+        wrapper_factory=_deepseek_wrapper,
+        static_kwargs=["index_topk", "causal"],
+        bench_bwd=True,
+    ),
+    "flash_mla": OpBenchmarkSpec(
+        op_name="flash_mla",
+        algorithm="flash_mla",
+        op_fn=ops.flash_mla,
+        input_generator=_gen_flash_mla_inputs,
+        configs=_cfgs_flash_mla(),
+        wrapper_factory=_flash_mla_wrapper,
+        static_kwargs=["causal", "sliding_window"],
+        bench_bwd=True,
     ),
     "ragged_decode_attention": OpBenchmarkSpec(
         op_name="ragged_decode_attention",
@@ -1237,6 +1991,7 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         op_fn=ops.page_attention,
         input_generator=_gen_page_attention_inputs,
         configs=_cfgs_page_attention(),
+        wrapper_factory=_page_attention_wrapper,
     ),
     "prefill_page_attention": OpBenchmarkSpec(
         op_name="prefill_page_attention",
@@ -1266,6 +2021,24 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         input_generator=_gen_rpa_v3_inputs,
         configs=_cfgs_rpa_v3(),
     ),
+    "ragged_page_attention_v2_turboquant": OpBenchmarkSpec(
+        op_name="ragged_page_attention_v2_turboquant",
+        algorithm="ragged_page_attention_v2_turboquant",
+        op_fn=ops.ragged_page_attention_v2_turboquant,
+        input_generator=_gen_rpa_v2_turboquant_inputs,
+        configs=_cfgs_rpa_turboquant(),
+        wrapper_factory=_rpa_v2_turboquant_wrapper,
+        static_kwargs=["qjl_dim"],
+    ),
+    "ragged_page_attention_v3_turboquant": OpBenchmarkSpec(
+        op_name="ragged_page_attention_v3_turboquant",
+        algorithm="ragged_page_attention_v3_turboquant",
+        op_fn=ops.ragged_page_attention_v3_turboquant,
+        input_generator=_gen_rpa_v3_turboquant_inputs,
+        configs=_cfgs_rpa_turboquant(),
+        wrapper_factory=_rpa_v3_turboquant_wrapper,
+        static_kwargs=["qjl_dim"],
+    ),
     "unified_attention": OpBenchmarkSpec(
         op_name="unified_attention",
         algorithm="unified_attention",
@@ -1273,12 +2046,38 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         input_generator=_gen_unified_inputs,
         configs=_cfgs_unified(),
     ),
+    "multi_latent_ragged_page_attention": OpBenchmarkSpec(
+        op_name="multi_latent_ragged_page_attention",
+        algorithm="multi_latent_ragged_page_attention",
+        op_fn=ops.multi_latent_ragged_page_attention,
+        input_generator=_gen_mla_ragged_inputs,
+        configs=_cfgs_mla_ragged(),
+        wrapper_factory=_mla_ragged_wrapper,
+        static_kwargs=["softmax_scale", "sliding_window", "logits_soft_cap"],
+    ),
+    "multi_latent_ragged_page_attention_v2": OpBenchmarkSpec(
+        op_name="multi_latent_ragged_page_attention_v2",
+        algorithm="multi_latent_ragged_page_attention_v2",
+        op_fn=ops.multi_latent_ragged_page_attention_v2,
+        input_generator=_gen_mla_ragged_inputs,
+        configs=_cfgs_mla_ragged(),
+        wrapper_factory=_mla_ragged_wrapper,
+        static_kwargs=["softmax_scale", "sliding_window", "logits_soft_cap"],
+    ),
     "gla_attention": OpBenchmarkSpec(
         op_name="gla_attention",
         algorithm="gla",
         op_fn=ops.gla_attention,
         input_generator=_gen_gla_inputs,
         configs=_cfgs_mha(),
+    ),
+    "kda": OpBenchmarkSpec(
+        op_name="kda",
+        algorithm="kda",
+        op_fn=ops.kernel_delta_attention,
+        input_generator=_gen_kernel_delta_inputs,
+        configs=_cfgs_kernel_delta(),
+        wrapper_factory=_registry_wrapper("kda"),
     ),
     "recurrent_attention": OpBenchmarkSpec(
         op_name="recurrent_attention",
@@ -1335,6 +2134,15 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         configs=_cfgs_grouped_matmul(),
         wrapper_factory=_grouped_matmul_v2_wrapper,
     ),
+    "grouped_matmulv3": OpBenchmarkSpec(
+        op_name="grouped_matmulv3",
+        algorithm="grouped_matmulv3",
+        op_fn=ops.grouped_matmul,
+        input_generator=_gen_grouped_matmul_v3_inputs,
+        configs=_cfgs_grouped_matmul_v3(),
+        wrapper_factory=_grouped_matmul_v3_wrapper,
+        static_kwargs=["transpose_rhs"],
+    ),
     "quantized_matmul": OpBenchmarkSpec(
         op_name="quantized_matmul",
         algorithm="quantized_matmul",
@@ -1380,6 +2188,25 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         input_generator=_gen_rwkv7_mul_inputs,
         configs=_cfgs_rwkv7_mul(),
     ),
+    "ragged_gated_delta_rule": OpBenchmarkSpec(
+        op_name="ragged_gated_delta_rule",
+        algorithm="ragged_gated_delta_rule",
+        op_fn=ops.ragged_gated_delta_rule,
+        input_generator=_gen_ragged_gdr_inputs,
+        configs=_cfgs_ragged_gdr(),
+        wrapper_factory=_ragged_gdr_wrapper,
+        static_kwargs=["chunk_size", "use_qk_l2norm"],
+        bench_bwd=True,
+    ),
+    "reduce_scatter_matmul": OpBenchmarkSpec(
+        op_name="reduce_scatter_matmul",
+        algorithm="reduce_scatter_matmul",
+        op_fn=ops.reduce_scatter_matmul,
+        input_generator=_gen_reduce_scatter_matmul_inputs,
+        configs=_cfgs_collective_matmul(),
+        wrapper_factory=_reduce_scatter_matmul_wrapper,
+        static_kwargs=["axis_name"],
+    ),
     "state_space_v1": OpBenchmarkSpec(
         op_name="state_space_v1",
         algorithm="state_space_v1",
@@ -1387,11 +2214,43 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         input_generator=_gen_state_space_v1_inputs,
         configs=_cfgs_state_space_v1(),
     ),
+    "mamba1": OpBenchmarkSpec(
+        op_name="mamba1",
+        algorithm="mamba1",
+        op_fn=ops.state_space_v1,
+        input_generator=_gen_state_space_v1_inputs,
+        configs=_cfgs_state_space_v1(),
+        wrapper_factory=_registry_wrapper("mamba1"),
+    ),
+    "ssm1": OpBenchmarkSpec(
+        op_name="ssm1",
+        algorithm="ssm1",
+        op_fn=ops.state_space_v1,
+        input_generator=_gen_state_space_v1_inputs,
+        configs=_cfgs_state_space_v1(),
+        wrapper_factory=_registry_wrapper("ssm1"),
+    ),
     "state_space_v2": OpBenchmarkSpec(
         op_name="state_space_v2",
         algorithm="state_space_v2",
         op_fn=ops.state_space_v2,
         input_generator=_gen_state_space_v2_inputs,
         configs=_cfgs_state_space_v2(),
+    ),
+    "mamba2": OpBenchmarkSpec(
+        op_name="mamba2",
+        algorithm="mamba2",
+        op_fn=ops.state_space_v2,
+        input_generator=_gen_state_space_v2_inputs,
+        configs=_cfgs_state_space_v2(),
+        wrapper_factory=_registry_wrapper("mamba2"),
+    ),
+    "ssm2": OpBenchmarkSpec(
+        op_name="ssm2",
+        algorithm="ssm2",
+        op_fn=ops.state_space_v2,
+        input_generator=_gen_state_space_v2_inputs,
+        configs=_cfgs_state_space_v2(),
+        wrapper_factory=_registry_wrapper("ssm2"),
     ),
 }
