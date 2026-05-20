@@ -12,7 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Chunked prefill + paged decode attention implemented in CuTe (GPU)."""
+"""Chunked prefill + paged decode attention public interface for the CuTe backend.
+
+This module exposes :func:`chunked_prefill_paged_decode`, registered under
+``("chunked_prefill_paged_decode", Platform.CUTE, Backend.GPU)`` in the
+kernel registry.
+
+The function implements a two-phase pipeline on GPU:
+1. **KV cache update** (CuTe DSL kernel): scatter-writes packed key/value
+   tokens into the correct physical slots of the block-tabled paged KV cache.
+2. **Attention** (Triton ``unified_attention`` kernel): computes paged causal
+   attention on the freshly updated cache.
+
+Only causal attention is supported; non-causal calls raise
+:class:`NotImplementedError`.  All three index arrays (``kv_lens``,
+``block_tables``, ``query_start_loc``) must have ``int32`` dtype.
+"""
 
 from __future__ import annotations
 
@@ -55,31 +70,51 @@ def chunked_prefill_paged_decode(
 ]:
     """CuTe GPU implementation of chunked prefill + paged decode attention.
 
-    This implementation updates the block-tabled KV cache using a CuTe DSL
-    kernel and computes the attention output on top of the updated cache.
+    Updates the block-tabled KV cache with the supplied packed keys/values
+    (via a CuTe DSL scatter kernel) and then computes causal paged attention
+    on the updated cache (via the Triton ``unified_attention`` kernel).
 
     Args:
-        queries: Packed query vectors [total_tokens, num_q_heads, head_dim]
-        keys: Packed keys to insert into cache [total_tokens, num_kv_heads, head_dim]
-        values: Packed values to insert into cache [total_tokens, num_kv_heads, head_dim]
-        key_cache: Block-tabled key cache [num_blocks, block_size, num_kv_heads, head_dim]
-        value_cache: Block-tabled value cache [num_blocks, block_size, num_kv_heads, head_dim]
-        kv_lens: KV lengths per sequence [num_seqs]
-        block_tables: Logical-to-physical block mapping [num_seqs, max_blocks_per_seq]
-        query_start_loc: Cumulative query positions [num_seqs + 1]
-        alibi_slopes: Optional ALiBi slopes [num_q_heads]
-        softmax_aux: Optional auxiliary softmax parameters [num_q_heads]
-        softmax_scale: Attention scaling factor (default: 1/sqrt(head_dim))
-        causal: Whether to apply causal masking (must be True)
-        sliding_window: Optional local attention window size
-        logits_soft_cap: Optional logit soft-capping value
-        seq_threshold_3d: Optional Triton attention tuning hint
-        num_par_softmax_segments: Optional Triton attention tuning hint
-        num_warps: Optional Triton attention tuning hint
-        num_stages: Optional Triton attention tuning hint
+        queries: Packed query tokens, shape
+            ``(total_tokens, num_q_heads, head_dim)``.
+        keys: Packed key tokens to insert into the KV cache, shape
+            ``(total_tokens, num_kv_heads, head_dim)``.
+        values: Packed value tokens to insert into the KV cache, same shape
+            as *keys*.
+        key_cache: Existing block-tabled key cache, shape
+            ``(num_blocks, block_size, num_kv_heads, head_dim)``.
+        value_cache: Existing block-tabled value cache, same shape as
+            *key_cache*.
+        kv_lens: Total KV length (including context) per sequence,
+            shape ``(num_seqs,)``, dtype ``int32``.
+        block_tables: Logical-to-physical block mapping, shape
+            ``(num_seqs, max_blocks_per_seq)``, dtype ``int32``.
+        query_start_loc: Cumulative packed-query start offsets, shape
+            ``(num_seqs + 1,)``, dtype ``int32``.
+        alibi_slopes: Optional ALiBi position bias slopes, shape
+            ``(num_q_heads,)``.
+        softmax_aux: Optional attention-sink auxiliary logits, shape
+            ``(num_q_heads,)``.
+        softmax_scale: Attention score scale. Defaults to
+            ``1 / sqrt(head_dim)`` when ``None``.
+        causal: Whether to apply causal masking. Must be ``True``.
+        sliding_window: Optional local-attention window size.
+        logits_soft_cap: Optional tanh soft-capping value for logits.
+        seq_threshold_3d: Optional Triton decode-kernel threshold hint.
+        num_par_softmax_segments: Optional Triton segmented-softmax hint.
+        num_warps: Optional Triton warp-count override.
+        num_stages: Optional Triton pipeline-stage override.
 
     Returns:
-        Tuple of (attention_output, updated_key_cache, updated_value_cache).
+        A 3-tuple ``(attention_output, updated_key_cache, updated_value_cache)``
+        where ``attention_output`` has shape
+        ``(total_tokens, num_q_heads, head_dim)`` and the updated caches
+        have the same shape as the input caches.
+
+    Raises:
+        NotImplementedError: If *causal* is ``False``.
+        ValueError: If tensor dtypes or shapes are invalid.
+        EjkernelRuntimeError: If Triton unified attention is not available.
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(queries.shape[-1])

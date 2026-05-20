@@ -124,10 +124,23 @@ def _shape_dtype_key(shaped: Any) -> tuple[int, jnp.dtype]:
 def _fake_tensor_from_shaped(shaped: Any):
     """Create a fake compact tensor from shape/dtype metadata.
 
-    Uses ``assumed_align=16`` (16 bytes = 128 bits) so that CuTe DSL
-    kernels using ``CopyG2SOp`` with 128-bit cp.async copies can pass
-    MLIR alignment verification.  JAX/XLA guarantees at least 128-byte
-    alignment for device buffers, so this is always safe.
+    Builds a symbolic fake tensor via ``cute.runtime.make_fake_compact_tensor``
+    suitable for passing to ``cute.compile`` at kernel-compilation time.  Uses
+    ``assumed_align=16`` (16 bytes = 128 bits) so that CuTe DSL kernels using
+    ``CopyG2SOp`` with 128-bit cp.async copies can pass MLIR alignment
+    verification.  JAX/XLA guarantees at least 128-byte alignment for device
+    buffers, so this is always safe in practice.
+
+    Args:
+        shaped: An object with ``shape`` and ``dtype`` attributes.
+
+    Returns:
+        A fake compact tensor with symbolic shape and stride, suitable for
+        passing to ``cute.compile`` as a placeholder.
+
+    Raises:
+        TypeError: If ``shaped.dtype`` is not in the supported dtype map
+            (float16, bfloat16, float32, int8, uint8, int32, uint32).
     """
     dtype = jnp.dtype(shaped.dtype)
     cutlass_dtype = _DTYPE_TO_CUTLASS.get(dtype)
@@ -446,16 +459,34 @@ def build_cute_ffi_call(
 ):
     """Create a callable that dispatches a CuTe kernel through a JAX primitive.
 
+    Wraps a ``@cute.jit`` launcher so that it can be called from within
+    JAX-traced computations (``jax.jit``, ``jax.grad``, etc.).  Compilation
+    is deferred until the first call and is keyed on input/output shapes and
+    dtypes, so the same callable works for dynamically sized inputs as long as
+    the rank and dtype stay fixed.
+
     Args:
-        fn: ``@cute.jit`` launcher callable.
-        output_shape_dtype: Output shape/dtype descriptor pytree.
-        input_output_aliases: Optional alias map from flattened input index
-            to flattened output index.
-        compile_options: Optional options passed to ``cute.compile``.
-        **static_kwargs: Static keyword arguments forwarded at compile time.
+        fn: A ``@cute.jit`` launcher callable whose positional arguments are
+            (optionally) a stream, followed by input tensors, followed by output
+            tensors.  The function signature is inspected at compile time to
+            detect whether a stream argument is expected.
+        output_shape_dtype: A pytree of objects with ``shape`` and ``dtype``
+            attributes (e.g. ``jax.ShapeDtypeStruct``, ``jax.Array``,
+            ``jax.eval_shape`` outputs) describing the output tensors.
+        input_output_aliases: Optional ``{input_idx: output_idx}`` alias map
+            (using flattened indices) for in-place operations.  Passed through
+            to ``jax.ffi.ffi_call``.
+        compile_options: Optional options string forwarded to ``cute.compile``.
+            Defaults to ``'--enable-tvm-ffi'`` which is required for TVM-FFI
+            kernel registration.  Pass ``None`` to omit the flag entirely.
+        **static_kwargs: Additional keyword arguments forwarded to
+            ``cute.compile`` at compilation time (not at call time).  They are
+            included in the compilation cache key.
 
     Returns:
-        A callable that accepts runtime input arrays and returns output arrays.
+        A callable ``call(*inputs) -> outputs`` that traces through the
+        ``ejkernel_cute_kernel_call`` JAX primitive and lowers to
+        ``jax.ffi.ffi_call`` backed by the compiled CuTe kernel.
     """
     out_shape = _to_shape_dtype_struct(output_shape_dtype)
     flat_out_shape, out_tree = tree_util.tree_flatten(out_shape)
@@ -487,7 +518,12 @@ def build_cute_ffi_call(
 
 
 def has_cute_ffi_support() -> bool:
-    """Return whether the CuTe TVM-FFI primitive path can be used."""
+    """Return whether the CuTe TVM-FFI primitive path can be used.
+
+    Returns:
+        ``True`` if both ``cutlass`` (with ``cutlass.cute``) and
+        ``jax_tvm_ffi`` are importable, ``False`` otherwise.
+    """
     if not CAN_USE_CUTE_PRIMITIVE or not _HAS_JAX_TVM_FFI:
         return False
     return True

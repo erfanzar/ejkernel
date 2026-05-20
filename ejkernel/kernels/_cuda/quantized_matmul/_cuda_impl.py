@@ -189,45 +189,67 @@ def quantized_matmul_cuda(
     Performs ``x @ dequantize(w, scales, zeros)`` entirely on the GPU
     using a custom CUDA kernel registered through JAX's FFI mechanism.
     Weights are stored in a packed ``uint32`` format and dequantized
-    on-the-fly during the kernel execution.
+    on-the-fly during kernel execution.
 
-    The function validates all inputs, infers default values for
-    *bits* and *group_size* based on the selected *mode*, registers
-    the CUDA kernel (on the first call), and dispatches the FFI call.
+    The function validates all inputs, resolves default values for
+    *bits* and *group_size* via :func:`resolve_qparams`, selects the
+    appropriate kernel family (GEMV or GEMM with optional reverse split-K),
+    registers the CUDA kernel (on the first call), and dispatches the
+    FFI call.
 
     Args:
-        x: Input activation matrix of shape ``(M, K)`` with a float dtype.
-        w: Packed quantized weight matrix (uint32). Shape depends on *transpose*:
-            - transpose=False: ``(K, ceil(N * bits / 32))``
-            - transpose=True: ``(N, ceil(K * bits / 32))``
-        scales: Per-group scale factors. Shape depends on *transpose*:
-            - transpose=False: ``(K, N / group_size)``
-            - transpose=True: ``(N, K / group_size)``
-        biases: Internal additive affine offsets with the same shape as
-            *scales* (derived from canonical affine ``zeros`` metadata).
-            Required only when *mode* is ``"affine"``.
+        x: Input activation matrix of shape ``(M, K)`` with dtype
+            ``float16``, ``bfloat16``, or ``float32``.
+        w: Packed quantized weight matrix (``uint32``). Shape depends on
+            *transpose*:
+
+            * ``transpose=False``: ``(K, ceil(N * bits / 32))``
+            * ``transpose=True``:  ``(N, ceil(K * bits / 32))``
+        scales: Per-group scale factors of rank 2. Shape depends on
+            *transpose*:
+
+            * ``transpose=False``: ``(K, N // group_size)``
+            * ``transpose=True``:  ``(N, K // group_size)``
+        biases: Internal additive offsets derived from affine ``zeros``
+            metadata, with the same shape as *scales*. Must be ``None``
+            for non-affine modes; for affine mode it may also be ``None``
+            if no zero-point correction is needed.
         transpose: Whether the weight matrix is stored in ``(N, K)``
-            layout. When ``True``, CUDA dequantizes ``w`` into a ``(K, N)``
-            buffer and runs GEMM (x @ w.T) via cuBLASLt.
-        group_size: Number of output features per quantization group.
-            Defaults depend on *mode*: 64 for ``affine``/``nf4``,
-            32 for ``mxfp4``/``mxfp8``, and 16 for ``nvfp4``/``nvfp8``.
-        bits: Bit-width per quantized element. Honored only for ``affine``
-            (supported values {4,8}); ignored for explicit non-affine modes.
-        mode: Quantization scheme. One of ``"affine"``, ``"nf4"``,
-            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, or ``"nvfp8"``.
+            transposed layout. When ``True``, the kernel dequantizes *w*
+            into a ``(K, N)`` buffer before running GEMM.
+        group_size: Number of weight elements per quantization group.
+            Defaults: 64 for ``affine``/``nf4``; 32 for
+            ``mxfp4``/``mxfp8``; 16 for ``nvfp4``/``nvfp8``.
+        bits: Bit-width per quantized element. Meaningful only for
+            ``affine`` (supported values: 4 or 8). Ignored for other modes
+            which have fixed bit-widths.
+        mode: Backend quantization mode string, already resolved to a
+            backend-specific form (e.g., ``"affine4b"``). See
+            :func:`to_backend_mode` for the mapping from canonical names.
+        gemv_mode: GEMV dispatch strategy:
+            ``"auto"`` -- kernel chooses based on *M*; ``"on"`` -- force
+            GEMV path; ``"off"`` -- force GEMM path.
+        revsplit_k: Reverse split-K strategy:
+            ``"auto"`` -- kernel decides; ``"on"`` -- force split-K;
+            ``"off"`` -- disable split-K.
+        revsplit_k_parts: Number of split-K partitions when *revsplit_k*
+            is ``"on"`` or the GEMV+split-K family is selected. ``None``
+            defers the choice to the kernel selector.
 
     Returns:
-        Result matrix of shape ``(M, N)`` with the same dtype as ``x``.
+        Result matrix of shape ``(M, N)`` with the same dtype as *x*.
 
     Raises:
-        ValueError: If *bits* is not in {4, 8} or incompatible
-            with the chosen *mode*.
+        ValueError: If *bits* is not in {4, 8} or incompatible with the
+            chosen *mode*.
         ValueError: If *scales* is not rank-2 or its shape is inconsistent
             with *x* and *w*.
         ValueError: If the packed weight width does not match the expected
-            number of ``uint32`` words for the given *N* and *bits*.
+            number of ``uint32`` words for the given *N* (or *K*) and
+            *bits*.
         ValueError: If the K dimensions of *x* and *w* disagree.
+        ValueError: If *x* dtype is not ``float16``, ``bfloat16``, or
+            ``float32``.
     """
     # Avoid device queries on tracers; runtime will error if no GPU backend.
 

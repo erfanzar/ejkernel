@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe platform unified attention implementation."""
+"""CuTe platform unified attention implementation.
+
+Exposes :func:`unified_attention`, the registry entry point for the CuTe
+platform.  Internally this delegates to the Triton unified-attention kernel
+when Triton is available; it raises :class:`~ejkernel.errors.EjkernelRuntimeError`
+if the Triton fast path is absent and no other CuTe fallback exists.
+Only causal attention is supported; non-causal calls raise
+:class:`NotImplementedError`.
+"""
 
 from ._interface import unified_attention
 

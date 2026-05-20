@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe DSL quantized matmul implementation."""
+"""CuTe DSL quantized matrix multiplication implementation.
+
+Exposes :func:`quantized_matmul`, the registry entry point for the CuTe
+platform.  The implementation fuses bit-unpacking, dequantization, and GEMM
+inside a single CuTe DSL GPU kernel.  Multiple kernel families are available
+(naive scalar, tiled SMEM, single-stage MMA, pipelined MMA) and are selected
+automatically based on tile dimensions and optional environment-variable
+overrides.  See ``_cute_impl.py`` for the full dispatch logic.
+"""
 
 from ._interface import quantized_matmul
 

@@ -118,9 +118,12 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                   // &flash_fwd_kernel<Kernel_traits, false, Is_causal, false,
                   // true, true, false>;
                   if (smem_size >= 48 * 1024) {
-                    C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    cudaError_t attr_status = cudaFuncSetAttribute(
                         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                        smem_size));
+                        smem_size);
+                    if (attr_status != cudaSuccess) {
+                      cudaGetLastError();
+                    }
                   }
                   // int ctas_per_sm;
                   // cudaError status_ =
@@ -131,7 +134,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                   // int(smem_size), ctas_per_sm);
                   kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(
                       params);
-                  C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
               });
             });

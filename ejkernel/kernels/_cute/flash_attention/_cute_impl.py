@@ -45,7 +45,21 @@ _MAX_Q_BLOCK = 256
 
 
 def _dtype_to_cutlass(dtype: Any) -> type[cutlass.Numeric]:
-    """Map a JAX dtype to the corresponding CUTLASS numeric type."""
+    """Map a JAX/NumPy dtype to the corresponding CUTLASS scalar type.
+
+    Supported mappings: ``float16`` → ``Float16``, ``bfloat16`` → ``BFloat16``,
+    ``float32`` → ``Float32``, ``int32`` → ``Int32``.
+
+    Args:
+        dtype: Any value accepted by ``jnp.dtype()`` (e.g. a NumPy dtype,
+            a JAX dtype, or a string like ``"float16"``).
+
+    Returns:
+        The matching CUTLASS numeric type class.
+
+    Raises:
+        TypeError: If *dtype* has no CUTLASS equivalent in this module.
+    """
     dt = jnp.dtype(dtype)
     if dt == jnp.float16:
         return cutlass.Float16
@@ -59,7 +73,20 @@ def _dtype_to_cutlass(dtype: Any) -> type[cutlass.Numeric]:
 
 
 def _fake_tensor(dtype: type[cutlass.Numeric], shape: tuple[int, ...]):
-    """Create a fake compact tensor for CuTe compilation signatures."""
+    """Create a fake compact tensor descriptor for CuTe kernel compilation.
+
+    Used exclusively to provide type-annotated placeholder tensors when
+    tracing/compiling a CuTe DSL kernel.  The resulting object is not
+    a real device buffer.
+
+    Args:
+        dtype: CUTLASS element type for the tensor.
+        shape: Logical shape of the tensor.
+
+    Returns:
+        A :func:`cute.runtime.make_fake_compact_tensor` object with
+        C-order (row-major) strides.
+    """
     stride_order = tuple(range(len(shape) - 1, -1, -1))
     return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=stride_order)
 
@@ -69,7 +96,28 @@ def _normalize_window(
     causal: bool,
     sliding_window: int | tuple[int, int] | None,
 ) -> tuple[int, int] | None:
-    """Normalize sliding-window arguments to explicit ``(left, right)`` bounds."""
+    """Normalize sliding-window arguments to explicit ``(left, right)`` bounds.
+
+    When *sliding_window* is an ``int``, interprets it as the number of
+    tokens to the left.  The right bound defaults to ``0`` for causal
+    attention (no future tokens) or equals *sliding_window* for
+    bidirectional attention.  When *sliding_window* is a 2-tuple it is
+    used directly.
+
+    Args:
+        causal: Whether causal masking is applied (affects the default
+            right bound when *sliding_window* is a scalar).
+        sliding_window: Sliding-window specification:
+            - ``None``: no window restriction.
+            - ``int``: left bound; right is 0 (causal) or equal (bidirectional).
+            - ``(left, right)``: explicit bounds.
+
+    Returns:
+        ``(left, right)`` integer bounds, or ``None`` if no window.
+
+    Raises:
+        ValueError: If either bound is negative.
+    """
     if sliding_window is None:
         return None
     if isinstance(sliding_window, int):
@@ -83,7 +131,20 @@ def _normalize_window(
 
 
 def _resolve_q_block(fwd_params: FwdParams | None, q_len: int) -> int:
-    """Choose a practical query tile size from forward params."""
+    """Choose a practical query tile size from forward parameters.
+
+    Uses ``fwd_params.q_blocksize`` when provided, otherwise falls back to
+    ``_DEFAULT_Q_BLOCK`` (64).  The result is clamped to
+    ``[1, min(q_len, _MAX_Q_BLOCK)]``.
+
+    Args:
+        fwd_params: Optional forward-pass tuning parameters.  Only
+            ``q_blocksize`` is used; all other fields are ignored.
+        q_len: Number of query positions (used as the upper clamp).
+
+    Returns:
+        Query tile size (number of positions processed per CUDA thread block).
+    """
     q_block = _DEFAULT_Q_BLOCK
     if fwd_params is not None and fwd_params.q_blocksize is not None:
         q_block = int(fwd_params.q_blocksize)
@@ -100,7 +161,27 @@ def _normalize_attention_mask(
     q_len: int,
     k_len: int,
 ) -> jax.Array | None:
-    """Validate and normalize attention mask to int32 with rank-4 shape."""
+    """Validate and normalize an attention mask to int32 with rank-4 shape.
+
+    Accepts boolean or integer masks and converts them to int32 (0/1 values).
+    The head dimension must be either 1 (broadcast) or *q_heads*.
+
+    Args:
+        attention_mask: Input mask of shape
+            ``(batch, 1|q_heads, seq_len_q, seq_len_k)``, or ``None``.
+        batch: Expected batch size.
+        q_heads: Number of query heads.
+        q_len: Query sequence length.
+        k_len: Key sequence length.
+
+    Returns:
+        Rank-4 int32 mask with shape
+        ``(batch, 1|q_heads, seq_len_q, seq_len_k)``, or ``None``.
+
+    Raises:
+        ValueError: If *attention_mask* has wrong rank, incompatible shape,
+            or an unsupported head dimension.
+    """
     if attention_mask is None:
         return None
 
@@ -135,7 +216,28 @@ def _flash_call_name(
     logits_soft_cap: float | None,
     q_block: int | None = None,
 ) -> str:
-    """Build a stable cache/name scope identifier for CuTe flash call sites."""
+    """Build a stable human-readable identifier for a CuTe flash-attention call site.
+
+    The returned string encodes all compile-time-specialised parameters so
+    it can serve simultaneously as a profiling scope name (passed to
+    :func:`cute_call`) and as part of the FFI primitive cache key.
+
+    Args:
+        prefix: Prefix string distinguishing forward from backward (e.g.
+            ``"cute_flash_attention_fwd"``).
+        causal: Whether causal masking is compiled in.
+        has_mask: Whether an explicit mask is compiled in.
+        has_bias: Whether an additive bias is compiled in.
+        has_sinks: Whether attention-sink logits are compiled in.
+        window: Compiled sliding-window bounds ``(left, right)``, or ``None``.
+        softmax_scale: Compiled softmax scale value.
+        logits_soft_cap: Compiled logit soft-cap value, or ``None``.
+        q_block: Query tile size, or ``None`` (omitted from the name for
+            backward calls).
+
+    Returns:
+        A ``_``-separated ASCII string uniquely identifying the kernel variant.
+    """
     window_key = "none" if window is None else f"{window[0]}x{window[1]}"
     soft_cap_key = "none" if logits_soft_cap is None else f"{float(logits_soft_cap):.8g}"
     parts = [

@@ -12,4 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe backend for ragged paged attention v3 (stub)."""
+"""CuTe backend for ragged paged attention v3 (stub).
+
+This package is a placeholder for a future CuTe DSL implementation of
+ragged paged attention v3.  Neither the interface nor the forward
+implementation has been written yet; the package exports nothing.
+"""

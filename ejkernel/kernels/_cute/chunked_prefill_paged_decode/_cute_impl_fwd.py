@@ -47,7 +47,14 @@ except ValueError:
 
 
 def _dtype_to_cutlass(dtype) -> type[cutlass.Numeric]:
-    """Map JAX dtype to a CUTLASS numeric type."""
+    """Map a JAX/NumPy dtype to the corresponding CUTLASS scalar type.
+
+    Supported mappings: ``float16`` → ``Float16``, ``bfloat16`` → ``BFloat16``,
+    ``float32`` → ``Float32``, ``int32`` → ``Int32``, ``uint32`` → ``Uint32``.
+
+    Raises:
+        TypeError: If *dtype* has no CUTLASS equivalent in this module.
+    """
     dt = jnp.dtype(dtype)
     if dt == jnp.float16:
         return cutlass.Float16
@@ -63,7 +70,16 @@ def _dtype_to_cutlass(dtype) -> type[cutlass.Numeric]:
 
 
 def _fake_tensor(dtype: type[cutlass.Numeric], shape: tuple[int, ...]):
-    """Create a fake compact tensor descriptor for CuTe compilation."""
+    """Create a compact fake tensor descriptor for CuTe kernel compilation.
+
+    Args:
+        dtype: CUTLASS element type.
+        shape: Logical tensor shape.
+
+    Returns:
+        A :func:`cute.runtime.make_fake_compact_tensor` object with
+        C-order (row-major) strides; not a real device buffer.
+    """
     stride_order = tuple(range(len(shape) - 1, -1, -1))
     return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=stride_order)
 
@@ -397,33 +413,51 @@ def chunked_prefill_paged_decode_cute(
     num_warps: int | None,
     num_stages: int | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """CuTe implementation of chunked prefill + paged decode attention.
+    """Execute the CuTe chunked prefill + paged decode attention pipeline.
+
+    Implements a two-phase pipeline:
+    1. CuTe DSL KV cache update: computes per-token linear cache destinations
+       via :func:`_compute_token_linear_indices`, then scatter-writes all
+       packed keys and values into the paged KV cache in a single GPU kernel.
+    2. Triton unified attention: runs causal paged attention on the updated
+       cache.
 
     Args:
-        queries: Packed queries [total_tokens, num_q_heads, head_dim].
-        keys: Packed keys to insert [total_tokens, num_kv_heads, head_dim].
-        values: Packed values to insert [total_tokens, num_kv_heads, head_dim].
-        key_cache: Existing key cache [num_blocks, block_size, num_kv_heads, head_dim].
-        value_cache: Existing value cache with same shape as ``key_cache``.
-        kv_lens: Total KV length per sequence, shape [num_seqs], int32.
-        block_tables: Sequence block table mapping, shape [num_seqs, max_blocks], int32.
-        query_start_loc: Cumulative query starts, shape [num_seqs + 1], int32.
-        alibi_slopes: Optional ALiBi slopes, shape [num_q_heads].
-        softmax_aux: Optional attention-sink logits, shape [num_q_heads].
-        softmax_scale: Attention scale factor.
-        causal: Whether causal masking is enabled. Must be True.
+        queries: Packed query tokens, shape
+            ``(total_tokens, num_q_heads, head_dim)``.
+        keys: Packed key tokens to insert, shape
+            ``(total_tokens, num_kv_heads, head_dim)``.
+        values: Packed value tokens to insert, same shape as *keys*.
+        key_cache: Existing paged key cache, shape
+            ``(num_blocks, block_size, num_kv_heads, head_dim)``.
+        value_cache: Existing paged value cache, same shape as *key_cache*.
+        kv_lens: Total KV length per sequence, shape ``(num_seqs,)``, int32.
+        block_tables: Block table mapping, shape
+            ``(num_seqs, max_blocks_per_seq)``, int32.
+        query_start_loc: Cumulative query starts, shape ``(num_seqs + 1,)``,
+            int32.
+        alibi_slopes: Optional ALiBi slopes, shape ``(num_q_heads,)``.
+        softmax_aux: Optional attention-sink logits, shape ``(num_q_heads,)``.
+        softmax_scale: Attention scale factor (pre-computed; not ``None``
+            here — the interface layer resolves the default).
+        causal: Whether causal masking is enabled. Must be ``True``.
         sliding_window: Optional sliding-window size.
         logits_soft_cap: Optional logit soft-capping value.
-        seq_threshold_3d: Optional Triton attention tuning hint.
-        num_par_softmax_segments: Optional Triton attention tuning hint.
-        num_warps: Optional Triton attention tuning hint.
-        num_stages: Optional Triton attention tuning hint.
+        seq_threshold_3d: Optional Triton decode-kernel threshold hint.
+        num_par_softmax_segments: Optional Triton segmented-softmax hint.
+        num_warps: Optional Triton warp-count override.
+        num_stages: Optional Triton pipeline-stage override.
 
     Returns:
-        Tuple of:
-            - output attention tensor [total_tokens, num_q_heads, head_dim]
-            - updated key cache
-            - updated value cache
+        A 3-tuple ``(attention_output, updated_key_cache, updated_value_cache)``
+        where ``attention_output`` has shape
+        ``(total_tokens, num_q_heads, head_dim)``.
+
+    Raises:
+        NotImplementedError: If *causal* is ``False``.
+        ValueError: If tensor ranks, shapes, or dtypes are invalid, or if the
+            input arrays are not on a GPU device.
+        EjkernelRuntimeError: If Triton unified attention is not available.
     """
     if not causal:
         raise NotImplementedError("chunked_prefill_paged_decode only supports causal attention.")

@@ -70,6 +70,17 @@ except ModuleNotFoundError as _triton_mask_import_error:  # pragma: no cover
 
 
 def _build_fwd_params(q_blocksize: int, kv_blocksize: int, num_stages: int | None, num_warps: int | None) -> FwdParams:
+    """Construct a :class:`FwdParams` instance from individual block-size arguments.
+
+    Args:
+        q_blocksize: Query block size for the CUDA kernel tiling.
+        kv_blocksize: Key/value block size for the CUDA kernel tiling.
+        num_stages: Number of pipeline stages, or ``None`` to leave unset.
+        num_warps: Number of GPU warps per thread block, or ``None`` to leave unset.
+
+    Returns:
+        A :class:`~ejkernel.ops.FwdParams` populated with the given values.
+    """
     return FwdParams(
         q_blocksize=int(q_blocksize),
         kv_blocksize=int(kv_blocksize),
@@ -79,6 +90,17 @@ def _build_fwd_params(q_blocksize: int, kv_blocksize: int, num_stages: int | Non
 
 
 def _build_bwd_params(q_blocksize: int, kv_blocksize: int, num_stages: int | None, num_warps: int | None) -> BwdParams:
+    """Construct a :class:`BwdParams` instance from individual block-size arguments.
+
+    Args:
+        q_blocksize: Query block size for the backward kernel tiling.
+        kv_blocksize: Key/value block size for the backward kernel tiling.
+        num_stages: Number of pipeline stages, or ``None`` to leave unset.
+        num_warps: Number of GPU warps per thread block, or ``None`` to leave unset.
+
+    Returns:
+        A :class:`~ejkernel.ops.BwdParams` populated with the given values.
+    """
     return BwdParams(
         q_blocksize=int(q_blocksize),
         kv_blocksize=int(kv_blocksize),
@@ -93,6 +115,36 @@ def _normalize_softmax_aux(
     num_heads: int,
     num_kv_heads: int,
 ) -> Float[Array, "num_heads num_sinks"] | None:
+    """Normalize and broadcast softmax auxiliary (attention-sink) weights.
+
+    Converts *softmax_aux* into a ``float32`` array of shape
+    ``(num_heads, num_sinks)`` suitable for the backward dense-attention path.
+    The conversion rules mirror those of
+    :func:`._cuda_impl._normalize_softmax_aux`:
+
+    * **1-D** ``(num_heads,)`` -- reshaped to ``(num_heads, 1)``.
+    * **1-D** ``(num_kv_heads,)`` -- repeated by the GQA group factor
+      ``num_heads // num_kv_heads``, then reshaped to ``(num_heads, 1)``.
+    * **1-D** ``(num_sinks,)`` -- broadcast to ``(num_heads, num_sinks)``.
+    * **2-D** ``(num_heads, num_sinks)`` -- returned unchanged.
+    * **2-D** ``(num_kv_heads, num_sinks)`` -- repeated to
+      ``(num_heads, num_sinks)`` via the GQA group factor.
+
+    Args:
+        softmax_aux: Optional auxiliary weights. ``None`` disables
+            attention-sink logic.
+        num_heads: Total number of query heads.
+        num_kv_heads: Number of key/value heads (may differ under GQA).
+
+    Returns:
+        A ``float32`` array of shape ``(num_heads, num_sinks)``, or
+        ``None`` if *softmax_aux* is ``None``.
+
+    Raises:
+        ValueError: If the first dimension of a 2-D input does not match
+            either *num_heads* or *num_kv_heads*.
+        ValueError: If the input has more than two dimensions.
+    """
     if softmax_aux is None:
         return None
 
@@ -128,6 +180,44 @@ def _build_token_mask(
     window_left: int,
     window_right: int,
 ) -> Bool[Array, "batch q_len kv_len"]:
+    """Build a dense boolean attention mask for the backward pass.
+
+    Constructs a ``(batch, q_len, kv_len)`` boolean mask that encodes which
+    query-key token pairs may attend to each other, replicating the masking
+    semantics of the CUDA forward kernel. The mask is the intersection of:
+
+    1. **Block sparsity** (if *qkv_layouts* is provided): a token pair is
+       allowed if the KV block index falls within the ``[lower_bound,
+       upper_bound)`` range for the corresponding query block.
+    2. **Segment IDs**: query and key tokens must share the same segment ID.
+    3. **Causal mask** (if *causal*): ``q_position >= kv_position``.
+    4. **Sliding window** (if ``window_left >= 0`` or ``window_right >= 0``):
+       token distance is bounded by the window limits.
+
+    Args:
+        q_positions: Integer position indices for queries, shape
+            ``(batch, q_len)``.
+        q_segment_ids: Segment IDs for queries, shape ``(batch, q_len)``.
+        kv_positions: Integer position indices for keys/values, shape
+            ``(batch, kv_len)``.
+        kv_segment_ids: Segment IDs for keys/values, shape
+            ``(batch, kv_len)``.
+        qkv_layouts: Block-level sparsity layout; only the first element's
+            ``lower_bounds`` and ``upper_bounds`` are used. ``None`` skips
+            block-sparsity masking.
+        q_blocksize: Query block size used to map token indices to block
+            indices.
+        kv_blocksize: Key/value block size for the same purpose.
+        causal: Whether causal masking is applied.
+        window_left: Maximum allowed left distance (``q_pos - kv_pos``).
+            ``-1`` disables the left window constraint.
+        window_right: Maximum allowed right distance. ``-1`` disables the
+            right window constraint.
+
+    Returns:
+        Boolean mask of shape ``(batch, q_len, kv_len)`` where ``True``
+        means the token pair is allowed to attend.
+    """
     batch_size, q_len = q_positions.shape
     _, kv_len = kv_positions.shape
 
@@ -185,6 +275,61 @@ def _blocksparse_dense_backward(
     kv_blocksize: int,
     dout: ArrayLike,
 ) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
+    """Compute dense gradients for block-sparse attention.
+
+    Implements the full analytical backward pass in JAX (no custom CUDA kernel).
+    Dequantizes/replicates KV heads for GQA, reconstructs the attention
+    probability matrix with block-sparse masking and optional soft-capping,
+    then applies the standard softmax VJP to yield ``dq``, ``dk``, and ``dv``.
+
+    All computations are performed in ``float32`` regardless of the input
+    dtypes; the output gradients are cast back to the original dtypes before
+    returning.
+
+    Note:
+        When *softmax_aux* is provided (attention-sink mode), a small set of
+        learned sink-token logits is appended to the standard logits before
+        the softmax and their gradients are discarded (not returned).
+
+    Args:
+        query: Query tensor of shape ``(batch, num_heads, q_len, head_dim)``.
+        key: Key tensor of shape ``(batch, num_kv_heads, kv_len, head_dim)``.
+        value: Value tensor of shape
+            ``(batch, num_kv_heads, kv_len, v_head_dim)``.
+        q_positions: Integer position indices for queries, shape
+            ``(batch, q_len)``.
+        q_segment_ids: Segment IDs for queries, shape ``(batch, q_len)``.
+        kv_positions: Integer position indices for keys/values, shape
+            ``(batch, kv_len)``.
+        kv_segment_ids: Segment IDs for keys/values, shape
+            ``(batch, kv_len)``.
+        qkv_layouts: Block-level sparsity layouts or ``None``.
+        softmax_scale: Scaling factor applied to raw dot-product logits.
+        softmax_aux: Optional attention-sink auxiliary weights; passed to
+            :func:`_normalize_softmax_aux`.
+        window_left: Left sliding-window size (``-1`` to disable).
+        window_right: Right sliding-window size (``-1`` to disable).
+        causal: Whether causal masking is applied.
+        logits_soft_cap: Optional soft-cap for logits (``tanh``-based).
+            ``None`` disables capping.
+        q_blocksize: Query block size for mask reconstruction.
+        kv_blocksize: Key/value block size for mask reconstruction.
+        dout: Upstream gradient of the attention output, shape
+            ``(batch, num_heads, q_len, v_head_dim)``.
+
+    Returns:
+        A 3-tuple ``(dq, dk, dv)`` of gradients:
+
+        * **dq** -- shape ``(batch, num_heads, q_len, head_dim)``,
+          same dtype as *query*.
+        * **dk** -- shape ``(batch, num_kv_heads, kv_len, head_dim)``,
+          same dtype as *key*.
+        * **dv** -- shape ``(batch, num_kv_heads, kv_len, v_head_dim)``,
+          same dtype as *value*.
+
+    Raises:
+        ValueError: If *num_heads* is not divisible by *num_kv_heads*.
+    """
     q_f = jnp.asarray(query, dtype=jnp.float32)
     k_f = jnp.asarray(key, dtype=jnp.float32)
     v_f = jnp.asarray(value, dtype=jnp.float32)
@@ -525,28 +670,52 @@ def _blocksparse_attention_bhtd_bwd(
 ):
     """Backward pass for the custom VJP of block-sparse attention.
 
+    Unpacks the residual tuple produced by
+    :func:`_blocksparse_attention_bhtd_fwd` and delegates gradient
+    computation to :func:`_blocksparse_dense_backward`. Returns gradients
+    only for *query*, *key*, and *value*; all other differentiable inputs
+    receive ``None``.
+
+    Note:
+        ``bwd_q_blocksize``, ``bwd_kv_blocksize``, ``bwd_num_stages``,
+        ``bwd_num_warps``, ``fwd_num_stages``, ``fwd_num_warps``,
+        ``apply_load_balance``, and
+        ``sequence_parallelism_mesh_axis_name`` are all silently discarded
+        in the backward path. The backward uses *fwd_q_blocksize* and
+        *fwd_kv_blocksize* for block-sparsity mask reconstruction.
+
     Args:
-        softmax_scale: Logit scaling factor (non-differentiable).
+        softmax_scale: Logit scaling factor (received as a non-differentiable
+            argument via ``nondiff_argnums``).
         apply_load_balance: Unused; reserved for API compatibility.
         sequence_parallelism_mesh_axis_name: Unused; reserved for API
             compatibility.
         window_left: Left sliding-window size (non-differentiable).
         window_right: Right sliding-window size (non-differentiable).
         causal: Whether causal masking is applied (non-differentiable).
-        fwd_q_blocksize: Forward query block size.
+        fwd_q_blocksize: Forward query block size (used for mask
+            reconstruction in the dense backward).
         fwd_kv_blocksize: Forward key/value block size.
-        fwd_num_stages: Forward kernel stages.
-        fwd_num_warps: Forward kernel warps.
-        bwd_q_blocksize: Backward query block size.
-        bwd_kv_blocksize: Backward key/value block size.
-        bwd_num_stages: Backward kernel stages.
-        bwd_num_warps: Backward kernel warps.
+        fwd_num_stages: Unused; forward pipeline stages.
+        fwd_num_warps: Unused; forward warp count.
+        bwd_q_blocksize: Unused in the backward path.
+        bwd_kv_blocksize: Unused in the backward path.
+        bwd_num_stages: Unused in the backward path.
+        bwd_num_warps: Unused in the backward path.
         logits_soft_cap: Optional soft-cap for attention logits
             (non-differentiable).
         res: Residuals tuple saved by
-            :func:`_blocksparse_attention_bhtd_fwd`.
+            :func:`_blocksparse_attention_bhtd_fwd`. Elements at indices
+            0--9 are: query, key, value, q_positions, q_segment_ids,
+            kv_positions, kv_segment_ids, qkv_layouts, softmax_scale
+            (float), softmax_aux.
         dout: Upstream gradient tensor of the same shape as the forward
-            output.
+            output ``(batch, num_heads, q_len, v_head_dim)``.
+
+    Returns:
+        A 10-tuple ``(dq, dk, dv, None, None, None, None, None, None, None)``
+        where only the first three elements are non-``None`` gradients for
+        *query*, *key*, and *value*.
     """
     del (
         apply_load_balance,

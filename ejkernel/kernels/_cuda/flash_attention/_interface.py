@@ -26,16 +26,21 @@ kernel. The implementation supports:
 * CUDA kernel dispatch with optional paged KV cache support.
 
 When the input configuration falls outside the capabilities of the CUDA
-path (e.g., unsupported dtype, explicit attention masks, segment IDs, or
-non-default precision), the function transparently falls back to the
-Triton backend and, if that also fails, to the XLA backend.
+kernel (e.g., unsupported dtype, explicit attention masks, segment IDs,
+or non-default precision), :func:`flash_attention` raises
+:class:`~ejkernel.errors.EjkernelRuntimeError`. The higher-level dispatch
+layer in the kernel registry can then route the call to the Triton or XLA
+backend instead.
 
-Module-Level Constants:
-    _PREC_TO_CODE: Mapping from :class:`jax.lax.Precision` enum members to
-        integer codes understood by the kernel.
-    _DTYPE_TO_CODE: Mapping from :class:`jnp.dtype` objects to integer
-        codes for the kernel's logits computation dtype.
-    PagedKVCache: Type alias for a paged KV-cache triple.
+Module-Level Type Aliases:
+    PagedKV: Shape annotation for a paged KV cache array
+        ``(num_blocks, block_size, num_kv_heads, head_dim)``.
+    DenseKV: Shape annotation for a standard dense KV array
+        ``(batch, seq_len_k, num_kv_heads, head_dim)``.
+    BlockTables: Shape annotation for the block-table index array
+        ``(batch, max_blocks)``.
+    PagedKVCache: Type alias for a ``(PagedKV, PagedKV, BlockTables)``
+        triple.
 """
 
 from __future__ import annotations
@@ -428,25 +433,37 @@ def _jax_bwd_attention_call(
     gradients with respect to query, key, and value. Gradients for all
     other arguments are returned as ``None``.
 
+    All non-differentiable scalar arguments (indices 0--9 of the VJP
+    signature) are received via ``nondiff_argnums`` but are superseded by
+    the values captured inside *residual*; they are therefore deleted at
+    the start of the function body and play no role in gradient computation.
+
     Args:
-        softmax_scale: Ignored (already captured in residual).
-        dropout_prob: Ignored (already captured in residual).
-        causal: Ignored (already captured in residual).
-        fwd_params: Ignored.
-        bwd_params: Ignored.
-        sliding_window: Ignored (already captured in residual).
-        logits_soft_cap: Ignored (already captured in residual).
-        normalize_output: Ignored (already captured in residual).
-        precision: Ignored.
-        logits_dtype: Ignored.
+        softmax_scale: Non-differentiable; superseded by residual value.
+        dropout_prob: Non-differentiable; superseded by residual value.
+        causal: Non-differentiable; superseded by residual value.
+        fwd_params: Non-differentiable; unused in the backward path.
+        bwd_params: Non-differentiable; unused in the backward path.
+        sliding_window: Non-differentiable; superseded by residual value.
+        logits_soft_cap: Non-differentiable; superseded by residual value.
+        normalize_output: Non-differentiable; superseded by residual value.
+        precision: Non-differentiable; unused in the backward path.
+        logits_dtype: Non-differentiable; unused in the backward path.
         residual: Tuple of tensors and scalars saved during the forward
-            pass.
-        dO: Upstream gradient of the attention output.
+            pass by :func:`_jax_fwd_attention_call`. Contains: query, key,
+            value, out, softmax_lse, rng_state, alibi_slopes, cu_seqlens_q,
+            cu_seqlens_k, cuda_window, cuda_causal, scale_val,
+            logits_soft_cap, dropout_prob, normalize_output, max_seqlen_q,
+            max_seqlen_k, is_varlen, block_tables.
+        dO: Upstream gradient of the attention output, shape
+            ``(batch, seq_len_q, num_heads, head_dim)``.
 
     Returns:
-        An 11-tuple where the first three elements are ``dq``, ``dk``,
+        A 12-tuple where the first three elements are ``dq``, ``dk``,
         ``dv`` (gradients w.r.t. query, key, value) and the remaining
-        eight are ``None`` (no gradient for the corresponding inputs).
+        nine are ``None`` (no gradient for attention_mask, bias,
+        dropout_seed, cum_seqlens_q, cum_seqlens_k, softmax_aux,
+        q_segment_ids, kv_segment_ids, and block_tables respectively).
     """
     del softmax_scale, fwd_params, bwd_params, sliding_window, logits_soft_cap, normalize_output, precision, logits_dtype
 
@@ -655,13 +672,24 @@ def flash_attention(
     This is the top-level public entry point registered with the ejKernel
     kernel registry under ``("flash_attention", Platform.CUDA, Backend.GPU)``.
     It validates inputs, converts unsupported attention masks to additive
-    biases where possible, and either dispatches to the native CUDA path
-    or transparently falls back to the Triton / XLA backends.
+    biases where possible, and dispatches to the native CUDA kernel.
 
-    The CUDA path requires ``float16`` or ``bfloat16`` inputs with
-    matching dtypes, no explicit mask or segment IDs, ``DEFAULT``
-    precision, and ``float32`` logits dtype. Any deviation triggers the
-    fallback.
+    When input configurations fall outside what the CUDA kernel supports,
+    an :class:`~ejkernel.errors.EjkernelRuntimeError` is raised describing
+    the unsupported condition. The kernel registry may then route the call
+    to a compatible backend (Triton or XLA) if the caller goes through the
+    higher-level dispatch layer; calling this function directly will raise.
+
+    The CUDA path requires:
+
+    * ``float16`` or ``bfloat16`` inputs with matching dtypes.
+    * No explicit ``attention_mask``, ``softmax_aux``, or segment IDs.
+    * Either both or neither of *cum_seqlens_q* / *cum_seqlens_k*.
+    * ``float16``/``bfloat16`` rank-3 tensors when using variable-length mode.
+    * Bias, if set, must be an ALiBi slopes vector (1-D ``(num_heads,)``
+      or 2-D ``(batch, num_heads)``).
+    * ``normalize_output=True``, ``precision=DEFAULT``,
+      ``logits_dtype=float32``.
 
     Args:
         query: Query tensor of shape

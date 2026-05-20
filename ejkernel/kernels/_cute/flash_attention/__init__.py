@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe DSL Flash Attention implementation."""
+"""CuTe DSL Flash Attention implementation.
+
+Exposes :func:`flash_attention`, the registry entry point for the CuTe
+platform.  Both forward and backward passes are supported through a
+``jax.custom_vjp`` rule backed by CuTe DSL GPU kernels.  Supports
+dense and paged-KV inputs, GQA/MQA, causal masking, sliding-window
+attention, explicit attention masks, additive bias, logit soft-capping,
+and attention-sink auxiliary logits.
+"""
 
 from ._interface import flash_attention
 

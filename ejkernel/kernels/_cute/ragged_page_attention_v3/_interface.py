@@ -12,4 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe kernel interface for ragged paged attention v3 (stub)."""
+"""CuTe kernel interface for ragged paged attention v3 (stub).
+
+This module is a placeholder.  No kernel has been registered for the
+``("ragged_page_attention_v3", Platform.CUTE, Backend.GPU)`` key yet.
+When implemented, the interface should follow the same pattern as the
+flash-attention and chunked-prefill interfaces: validate inputs, dispatch
+to a CuTe DSL forward function, and register with :data:`kernel_registry`.
+"""

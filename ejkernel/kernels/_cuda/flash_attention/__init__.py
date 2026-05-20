@@ -17,9 +17,14 @@
 Provides a native CUDA implementation of the Flash Attention algorithm via
 the JAX Foreign Function Interface (FFI). The kernel leverages CUTLASS and
 CUDA C++ to deliver high-throughput forward and backward passes on NVIDIA
-GPUs. When input configurations are outside the supported CUDA path
-(e.g., non-standard dtypes, attention masks, or segment IDs), the
-implementation transparently falls back to the Triton or XLA backends.
+GPUs.
+
+When input configurations are outside the supported CUDA path (e.g.,
+non-standard dtypes, explicit attention masks, segment IDs, or non-default
+precision), :func:`flash_attention` raises
+:class:`~ejkernel.errors.EjkernelRuntimeError`. The higher-level kernel
+registry dispatch layer may then route the call to the Triton or XLA
+backend.
 
 This package re-exports the public :func:`flash_attention` entry point
 from :mod:`._interface`.

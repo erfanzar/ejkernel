@@ -30,11 +30,13 @@ Environment Variables:
         single SM version (e.g., ``"90"`` for SM 9.0).
     EJKERNEL_CUDA_ARCHS: Semicolon- or comma-separated list of SM
         versions to build for (e.g., ``"80;86;90"``).
+    EJKERNEL_CUTLASS_INCLUDE: Override the CUTLASS C++ header include path.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -130,6 +132,28 @@ def _latest_mtime(paths: list[Path]) -> float:
     return latest
 
 
+def _find_cutlass_include(repo_root: Path) -> Path:
+    """Find a CUTLASS C++ header include directory."""
+    candidates: list[Path] = []
+    override = os.getenv("EJKERNEL_CUTLASS_INCLUDE")
+    if override:
+        candidates.append(Path(override))
+    candidates.append(repo_root / "csrc" / "cutlass" / "include")
+
+    for candidate in candidates:
+        if (candidate / "cutlass" / "cutlass.h").exists():
+            return candidate
+
+    formatted = "\n".join(f"  - {candidate}" for candidate in candidates)
+    raise RuntimeError(
+        "CUTLASS C++ headers were not found for the CUDA flash_attention backend. "
+        "Run `git submodule update --init csrc/cutlass`, or set "
+        "EJKERNEL_CUTLASS_INCLUDE to a CUDA CUTLASS include directory containing "
+        "cutlass/cutlass.h.\n"
+        f"Checked:\n{formatted}"
+    )
+
+
 def build_cuda_lib() -> Path:
     """Build (or locate an up-to-date) CUDA Flash Attention shared library.
 
@@ -179,6 +203,8 @@ def build_cuda_lib() -> Path:
             return lib_path
 
     include_dir = Path(ffi.include_dir())
+    cutlass_include = _find_cutlass_include(repo_root)
+    cuda_compiler = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
 
     cmake_cmd = [
         "cmake",
@@ -188,8 +214,12 @@ def build_cuda_lib() -> Path:
         str(build_dir),
         f"-DEJKERNEL_CUDA_ARCHS={';'.join(archs)}" if archs else f"-DEJKERNEL_CUDA_ARCH={arch}",
         f"-DEJKERNEL_JAX_FFI_INCLUDE={include_dir}",
+        f"-DEJKERNEL_CUTLASS_INCLUDE={cutlass_include}",
     ]
-    build_cmd = ["cmake", "--build", str(build_dir)]
+    if Path(cuda_compiler).exists():
+        cmake_cmd.append(f"-DCMAKE_CUDA_COMPILER={cuda_compiler}")
+    build_jobs = os.getenv("EJKERNEL_CUDA_BUILD_JOBS") or str(max(1, min(os.cpu_count() or 1, 16)))
+    build_cmd = ["cmake", "--build", str(build_dir), "--parallel", build_jobs]
     if not archs:
         build_cmd.extend(["--target", f"ejkernel_flash_attention_cuda_sm{arch}"])
 

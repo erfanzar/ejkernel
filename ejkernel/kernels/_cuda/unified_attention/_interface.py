@@ -65,6 +65,7 @@ def unified_attention(
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
     num_par_softmax_segments: int | None = None,
+    block_dim: int = 128,
     num_warps: int | None = None,
     num_stages: int | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
@@ -114,6 +115,8 @@ def unified_attention(
         seq_threshold_3d: Ignored by this backend. Accepted for
             interface compatibility with Triton kernels.
         num_par_softmax_segments: Ignored by this backend.
+        block_dim: CUDA thread-block dimension selected by the operation
+            executor.
         num_warps: Ignored by this backend.
         num_stages: Ignored by this backend.
 
@@ -128,7 +131,7 @@ def unified_attention(
 
     Note:
         The parameters *seq_threshold_3d*, *num_par_softmax_segments*,
-        *num_warps*, and *num_stages* are silently discarded. They exist
+        *num_warps*, and *num_stages* are discarded. They exist
         in the signature solely to maintain a uniform interface across
         all registered attention kernel backends.
     """
@@ -163,5 +166,5 @@ def unified_attention(
         causal=causal,
         sliding_window=sliding_window,
         logits_soft_cap=logits_soft_cap,
-        block_dim=128,
+        block_dim=block_dim,
     )

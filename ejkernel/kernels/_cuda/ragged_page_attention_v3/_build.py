@@ -34,6 +34,7 @@ The build process can be configured through environment variables:
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -178,6 +179,7 @@ def build_cuda_lib() -> Path:
             return lib_path
 
     include_dir = Path(ffi.include_dir())
+    cuda_compiler = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
 
     cmake_cmd = [
         "cmake",
@@ -188,7 +190,10 @@ def build_cuda_lib() -> Path:
         f"-DEJKERNEL_CUDA_ARCHS={';'.join(archs)}" if archs else f"-DEJKERNEL_CUDA_ARCH={arch}",
         f"-DEJKERNEL_JAX_FFI_INCLUDE={include_dir}",
     ]
-    build_cmd = ["cmake", "--build", str(build_dir)]
+    if Path(cuda_compiler).exists():
+        cmake_cmd.append(f"-DCMAKE_CUDA_COMPILER={cuda_compiler}")
+    build_jobs = os.getenv("EJKERNEL_CUDA_BUILD_JOBS") or str(max(1, min(os.cpu_count() or 1, 16)))
+    build_cmd = ["cmake", "--build", str(build_dir), "--parallel", build_jobs]
     if not archs:
         build_cmd.extend(["--target", f"ejkernel_ragged_page_attention_v3_cuda_sm{arch}"])
 

@@ -10,6 +10,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(EJKERNEL_CUDA_ARCH "" CACHE STRING "CUDA SM architecture (e.g. 80, 90, 100, 110, 120)")
 set(EJKERNEL_CUDA_ARCHS "" CACHE STRING "CUDA SM architectures (e.g. 80;90;100;110;120)")
 set(EJKERNEL_JAX_FFI_INCLUDE "" CACHE STRING "Path to JAX FFI include dir")
+set(EJKERNEL_CUTLASS_INCLUDE "" CACHE STRING "Path to CUTLASS C++ include dir")
 
 if(NOT EJKERNEL_CUDA_ARCHS AND NOT EJKERNEL_CUDA_ARCH)
   message(FATAL_ERROR "Set EJKERNEL_CUDA_ARCHS or EJKERNEL_CUDA_ARCH (e.g. -DEJKERNEL_CUDA_ARCH=80)")
@@ -22,7 +23,9 @@ endif()
 set(QMM_SRC_DIR "${CMAKE_CURRENT_LIST_DIR}/src")
 set(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
 set(CUTLASS_ROOT "${REPO_ROOT}/csrc/cutlass")
-set(CUTLASS_INCLUDE "${CUTLASS_ROOT}/include")
+if(NOT EJKERNEL_CUTLASS_INCLUDE)
+  set(EJKERNEL_CUTLASS_INCLUDE "${CUTLASS_ROOT}/include")
+endif()
 file(GLOB QMM_DEQUANT_SOURCES "${QMM_SRC_DIR}/qmm_dequant_*.cu")
 list(FILTER QMM_DEQUANT_SOURCES EXCLUDE REGEX "qmm_dequant_affine_bits(2|3|5|6|7)_.*\\.cu$")
 set(QMM_SOURCES
@@ -54,7 +57,7 @@ foreach(arch IN LISTS _arch_list)
   target_include_directories(${target_name} PRIVATE
     "${QMM_SRC_DIR}"
     "${EJKERNEL_JAX_FFI_INCLUDE}"
-    "${CUTLASS_INCLUDE}"
+    "${EJKERNEL_CUTLASS_INCLUDE}"
   )
 
   target_link_libraries(${target_name} PRIVATE CUDA::cudart CUDA::cublas

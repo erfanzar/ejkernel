@@ -55,7 +55,17 @@ _SUPPORTED_DTYPES = {jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16), jnp.dtype(
 
 
 def _precision_is_default(precision: lax.PrecisionLike) -> bool:
-    """Return whether precision corresponds to ``lax.Precision.DEFAULT``."""
+    """Return ``True`` when *precision* is equivalent to ``lax.Precision.DEFAULT``.
+
+    Handles both integer (raw enum value ``0``) and enum representations
+    of the default precision.
+
+    Args:
+        precision: Any value accepted by ``lax.PrecisionLike``.
+
+    Returns:
+        ``True`` if *precision* encodes the default (least-strict) mode.
+    """
     if isinstance(precision, int):
         return int(precision) == 0
     return precision == lax.Precision.DEFAULT
@@ -68,7 +78,24 @@ def _validate_qkv_shapes(
     *,
     block_tables: jax.Array | None,
 ) -> None:
-    """Validate dense or paged Q/K/V shapes for the CuTe implementation."""
+    """Validate Q/K/V shapes for the CuTe implementation (dense or paged modes).
+
+    For **dense** mode (``block_tables=None``):
+        - *query*, *key*, *value* must all be rank-4.
+        - *key* and *value* must share the same batch and sequence dimensions.
+        - GQA constraint: ``query_heads % kv_heads == 0``.
+        - Head dimension must match across Q, K, V.
+
+    For **paged** mode (``block_tables`` provided):
+        - *query* must be rank-4 ``(batch, seq_len_q, num_heads, head_dim)``.
+        - *key* and *value* must be rank-4 paged caches
+          ``(num_blocks, block_size, num_kv_heads, head_dim)``.
+        - *block_tables* must be rank-2 ``(batch, max_blocks)``.
+        - GQA and head dimension constraints still apply.
+
+    Raises:
+        ValueError: On any shape violation.
+    """
     if query.ndim != 4:
         raise ValueError("query must be rank-4 [batch, seq_len_q, num_heads, head_dim].")
 
@@ -116,7 +143,19 @@ def _unsupported_reason(
     q_segment_ids: Int[Array, "batch seq_len_q"] | None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None,
 ) -> str | None:
-    """Return a reason string when requested CuTe configuration is unsupported."""
+    """Collect all reasons the requested configuration is unsupported by the CuTe path.
+
+    Checks the following constraints:
+        - ``dropout_prob`` must be 0.0.
+        - ``q_segment_ids`` and ``kv_segment_ids`` must both be ``None``.
+        - ``normalize_output`` must be ``True``.
+        - ``precision`` must be ``lax.Precision.DEFAULT``.
+        - ``logits_dtype`` must be ``float32``.
+
+    Returns:
+        A semicolon-separated string of violated constraints, or ``None``
+        when all constraints are satisfied.
+    """
     reasons: list[str] = []
     if float(dropout_prob) != 0.0:
         reasons.append("dropout_prob must be 0.0")
@@ -140,7 +179,26 @@ def _lengths_from_cum_seqlens(
     max_len: int,
     name: str,
 ) -> jax.Array:
-    """Validate cumulative lengths and return per-example lengths."""
+    """Validate cumulative sequence lengths and return per-example lengths.
+
+    Checks that *cum_seqlens* is rank-1 with shape ``(batch + 1,)``,
+    has an integer dtype, starts at 0, is non-decreasing, and that no
+    per-example length exceeds *max_len*.  The check for ``cum[0] == 0``
+    and monotonicity is best-effort (skipped when the value is not
+    statically available, e.g. under ``jax.jit``).
+
+    Args:
+        cum_seqlens: Cumulative sequence lengths, shape ``(batch + 1,)``.
+        batch: Expected batch size.
+        max_len: Maximum allowed per-example length.
+        name: Variable name used in error messages (e.g. ``"cum_seqlens_q"``).
+
+    Returns:
+        Int32 tensor of shape ``(batch,)`` with per-example lengths.
+
+    Raises:
+        ValueError: On shape, dtype, ordering, or range violations.
+    """
     cum = jnp.asarray(cum_seqlens)
     if cum.ndim != 1:
         raise ValueError(f"{name} must be rank-1 [batch + 1], got shape {cum.shape}.")
@@ -184,7 +242,31 @@ def _merge_varlen_with_attention_mask(
     k_len: int,
     causal: bool,
 ) -> jax.Array:
-    """Merge explicit mask with a var-len mask derived from cumulative lengths."""
+    """Build a combined boolean mask from cumulative lengths and an optional explicit mask.
+
+    Derives a valid-token mask from *cum_seqlens_q* and *cum_seqlens_k* and
+    intersects it with *attention_mask* (if provided).  When *causal* is
+    ``True``, the per-example causal relation ``k_pos <= q_pos + offset``
+    (where ``offset = k_len - q_len``) is also applied so that sequences with
+    different prefill lengths are handled correctly.
+
+    Args:
+        attention_mask: Optional boolean/integer mask with rank 4
+            ``(batch, num_heads_or_1, seq_len_q, seq_len_k)``.
+            If ``None``, only the var-len validity mask is returned.
+        cum_seqlens_q: Cumulative query lengths, shape ``(batch + 1,)``.
+        cum_seqlens_k: Cumulative key lengths, shape ``(batch + 1,)``.
+        batch: Batch size.
+        q_len: Maximum query sequence length (padded dimension).
+        k_len: Maximum key sequence length (padded dimension).
+        causal: Whether to apply per-example causal masking.
+
+    Returns:
+        Boolean mask tensor of shape ``(batch, 1, seq_len_q, seq_len_k)``.
+
+    Raises:
+        ValueError: If *attention_mask* has rank other than 4.
+    """
     q_lengths = _lengths_from_cum_seqlens(
         cum_seqlens_q,
         batch=batch,

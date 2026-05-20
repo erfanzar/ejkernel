@@ -28,7 +28,12 @@ from ._cute_impl import unified_attention_cute
 
 
 def _is_gpu_array_or_unknown(arr: Array) -> bool:
-    """Return True when placement is on GPU or cannot be inferred (e.g. tracer)."""
+    """Return ``True`` when *arr* is on a GPU device or the placement cannot be determined.
+
+    Placement is considered unknown when *arr* is a JAX tracer (inside
+    ``jax.jit``), when ``arr.device`` is absent, or when the call raises.
+    In those cases the default backend is inspected instead.
+    """
     device_attr = getattr(arr, "device", None)
     if device_attr is None:
         return jax.default_backend() in {"gpu", "cuda"}
@@ -60,43 +65,57 @@ def unified_attention(
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
     num_par_softmax_segments: int | None = None,
+    block_dim: int = 128,
     num_warps: int | None = None,
     num_stages: int | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
-    """Compute unified paged attention for the CuTe platform entry point.
+    """Compute unified paged attention via the CuTe platform entry point.
 
-    This function keeps the same signature and feature semantics as the Triton
-    and XLA registrations so operation-level dispatch remains fully compatible.
-    Internally it executes the Triton unified-attention implementation and
-    raises when that implementation is unavailable.
+    This is the registry-facing wrapper registered under
+    ``("unified_attention", Platform.CUTE, Backend.GPU)``.  It preserves the
+    same signature and semantics as the Triton and XLA registrations.
+
+    There is no native CuTe DSL implementation of unified attention.
+    The function delegates to the Triton ``unified_attention`` kernel when
+    Triton is available (optionally disabled via
+    ``EJKERNEL_CUTE_UNIFIED_ATTENTION_DISABLE_TRITON=1``), and raises
+    :class:`~ejkernel.errors.EjkernelRuntimeError` otherwise.
 
     Args:
-        queries: Packed query tensor, shape ``(total_tokens, num_q_heads, head_dim)``.
+        queries: Packed query tensor, shape
+            ``(total_tokens, num_q_heads, head_dim)``.
         key_cache: Paged key cache, shape
             ``(num_blocks, block_size, num_kv_heads, head_dim)``.
-        value_cache: Paged value cache with the same shape as ``key_cache``.
-        kv_lens: Sequence KV lengths, shape ``(num_seqs,)``, dtype ``int32``.
+        value_cache: Paged value cache, same shape as *key_cache*.
+        kv_lens: Per-sequence KV lengths, shape ``(num_seqs,)``, dtype ``int32``.
         block_tables: Page table mapping, shape
             ``(num_seqs, max_blocks_per_seq)``, dtype ``int32``.
-        query_start_loc: Prefix offsets of packed queries, shape
-            ``(num_seqs + 1,)``, dtype ``int32``.
-        alibi_slopes: Optional ALiBi slopes, shape ``(num_q_heads,)``.
-        qq_bias: Optional query-query bias matrix.
-        softmax_aux: Optional sink logits, shape ``(num_q_heads,)``.
-        softmax_scale: Optional score scale. Defaults to ``1 / sqrt(head_dim)``.
-        causal: Whether attention is causal. Must be ``True``.
-        sliding_window: Optional local-attention window.
-        logits_soft_cap: Optional tanh soft-capping value.
-        seq_threshold_3d: Optional Triton decode-kernel threshold.
+        query_start_loc: Cumulative query offsets, shape ``(num_seqs + 1,)``,
+            dtype ``int32``.
+        alibi_slopes: Optional ALiBi position bias slopes, shape
+            ``(num_q_heads,)``.
+        qq_bias: Optional query-query additive bias matrix.
+        softmax_aux: Optional attention-sink logits, shape ``(num_q_heads,)``.
+        softmax_scale: Score scaling factor. Defaults to
+            ``1 / sqrt(head_dim)`` when ``None``.
+        causal: Whether attention is causal. Must be ``True``; non-causal
+            calls raise :class:`NotImplementedError` inside the implementation.
+        sliding_window: Optional local-attention window size.
+        logits_soft_cap: Optional tanh soft-capping value for logits.
+        seq_threshold_3d: Optional Triton decode-kernel 3-D grid threshold.
         num_par_softmax_segments: Optional Triton segmented-softmax factor.
-        num_warps: Optional Triton kernel override.
-        num_stages: Optional Triton kernel override.
+        block_dim: Accepted for API compatibility with CUDA; ignored by CuTe.
+        num_warps: Optional Triton warp-count override.
+        num_stages: Optional Triton pipeline-stage override.
 
     Returns:
-        Attention output tensor with shape ``(total_tokens, num_q_heads, head_dim)``.
+        Attention output tensor with shape
+        ``(total_tokens, num_q_heads, head_dim)``.
 
     Raises:
-        EjkernelRuntimeError: If inputs are not placed on a GPU device.
+        EjkernelRuntimeError: If inputs are not on a GPU device, or if
+            Triton unified attention is unavailable.
+        NotImplementedError: If *causal* is ``False``.
     """
     if not _is_gpu_array_or_unknown(queries):
         raise EjkernelRuntimeError("unified_attention (platform=cute) requires GPU-resident inputs.")

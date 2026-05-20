@@ -47,16 +47,25 @@ def _normalize_softmax_aux(
     """Normalize and broadcast the softmax auxiliary (attention-sink) weights.
 
     Converts *softmax_aux* into a 2-D array of shape ``(num_heads, num_sinks)``
-    suitable for the CUDA kernel.  The function handles three input shapes:
+    suitable for the CUDA kernel.  The function handles the following input
+    shapes (checked in order):
 
-    * **1-D** ``(num_heads,)`` -- interpreted as one sink weight per head;
+    **1-D inputs:**
+
+    * ``(num_heads,)`` -- interpreted as one sink weight per head;
       reshaped to ``(num_heads, 1)``.
-    * **1-D** ``(num_kv_heads,)`` -- repeated along the head dimension by the
-      GQA group factor ``num_heads // num_kv_heads``, then reshaped.
-    * **1-D** ``(num_sinks,)`` -- broadcast to all heads giving shape
-      ``(num_heads, num_sinks)``.
-    * **2-D** ``(num_heads, num_sinks)`` or ``(num_kv_heads, num_sinks)`` --
-      returned directly or repeated for GQA.
+    * ``(num_kv_heads,)`` -- repeated along the head dimension by the
+      GQA group factor ``num_heads // num_kv_heads``, then reshaped to
+      ``(num_heads, 1)``.
+    * ``(num_sinks,)`` -- any other length is treated as a set of sink
+      weights shared across all heads; broadcast to ``(num_heads, num_sinks)``.
+
+    **2-D inputs:**
+
+    * ``(num_heads, num_sinks)`` -- returned directly after casting.
+    * ``(num_kv_heads, num_sinks)`` -- repeated by the GQA group factor to
+      produce shape ``(num_heads, num_sinks)``.
+    * Any other first dimension raises :class:`ValueError`.
 
     Args:
         softmax_aux: Optional auxiliary softmax weights. ``None`` disables

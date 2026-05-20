@@ -39,7 +39,7 @@ _TRUTHY = {"1", "true", "yes", "on"}
 
 
 def _device_platform(x: jax.Array) -> str | None:
-    """Best-effort platform detection for a concrete JAX array."""
+    """Return the device platform string for *x* (e.g. ``"gpu"``), or ``None`` on failure."""
     device_attr = getattr(x, "device", None)
     if device_attr is None:
         return None
@@ -51,7 +51,12 @@ def _device_platform(x: jax.Array) -> str | None:
 
 
 def _should_prefer_triton(queries: jax.Array) -> bool:
-    """Decide whether the Triton fast path should be used for this call."""
+    """Return ``True`` when the Triton fast path should be used for this call.
+
+    Returns ``False`` when Triton unified attention is not imported, when
+    the environment variable ``EJKERNEL_CUTE_UNIFIED_ATTENTION_DISABLE_TRITON``
+    is set to a truthy value, or when the device platform is not GPU/CUDA.
+    """
     if not _HAS_TRITON_UNIFIED:
         return False
 

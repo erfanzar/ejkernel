@@ -20,10 +20,10 @@ This module handles two responsibilities:
    necessary) and registering the ``ejk_unified_attention_cuda`` FFI
    target with JAX so that it can be called from XLA computations.
 
-2. **Autotuned dispatch** -- Providing :func:`unified_attention_cuda`,
-   an ``@autotune``-decorated wrapper that prepares the FFI call
-   attributes (softmax scale, causal flag, sliding window, etc.) and
-   invokes the registered CUDA target via ``jax.ffi.ffi_call``.
+2. **Deterministic dispatch** -- Providing :func:`unified_attention_cuda`,
+   a launcher that consumes the explicit ``block_dim`` selected by the
+   operation executor, prepares the FFI call attributes, and invokes the
+   registered CUDA target via ``jax.ffi.ffi_call``.
 
 This module is not intended to be imported directly by end users.
 Use :func:`ejkernel.kernels._cuda.unified_attention.unified_attention`
@@ -39,8 +39,6 @@ import jax
 import jax.ffi as ffi
 import jax.numpy as jnp
 from jax.core import Tracer
-
-from ejkernel.ops.execution import autotune
 
 from ._build import build_cuda_lib
 
@@ -67,10 +65,6 @@ def _register_cuda_unified_attention() -> None:
     )
 
 
-@autotune(
-    hyperparams={"block_dim": [32, 64, 128, 256]},
-    cache_key="cuda_unified_attention",
-)
 def unified_attention_cuda(
     queries: jax.Array,
     key_cache: jax.Array,
@@ -89,11 +83,6 @@ def unified_attention_cuda(
     block_dim: int = 128,
 ) -> jax.Array:
     """Invoke the CUDA unified attention kernel via JAX FFI.
-
-    This function is decorated with ``@autotune`` over the ``block_dim``
-    hyperparameter (candidates: 32, 64, 128, 256). On the first call
-    with a given input signature the autotuner benchmarks each candidate
-    and caches the fastest configuration.
 
     The function validates inputs, ensures the FFI target is registered,
     constructs the scalar attribute dictionary expected by the C/CUDA
@@ -125,8 +114,8 @@ def unified_attention_cuda(
             the sliding window (passed as ``-1`` to the kernel).
         logits_soft_cap: Optional soft-capping value for logits.
             ``None`` disables soft-capping (passed as ``0.0``).
-        block_dim: CUDA thread-block dimension (autotuned). One of
-            ``{32, 64, 128, 256}``.
+        block_dim: CUDA thread-block dimension selected by the operation
+            configuration. Typical values are ``{32, 64, 128, 256}``.
 
     Returns:
         Output tensor of the same shape and dtype as *queries*

@@ -26,7 +26,6 @@ from __future__ import annotations
 import math
 import os
 import threading
-import time
 from collections.abc import Callable
 from typing import Any
 
@@ -37,7 +36,6 @@ import jax
 import jax.numpy as jnp
 from cutlass.cutlass_dsl import dsl_user_op
 from jax import custom_batching
-from jax._src import core
 
 from ejkernel.callib._cute_call import cute_call
 from ejkernel.callib._cute_ffi import build_cute_ffi_call, has_cute_ffi_support
@@ -78,8 +76,6 @@ _NF4_LUT_VALUES: tuple[float, ...] = (
     1.0,
 )
 
-_AUTOTUNE_CACHE: dict[tuple[Any, ...], tuple[int, int, int]] = {}
-_AUTOTUNE_CACHE_LOCK = threading.Lock()
 _QMM_CALL_CACHE: dict[tuple[Any, ...], tuple[Callable[..., jax.Array], str]] = {}
 _QMM_CALL_CACHE_LOCK = threading.Lock()
 
@@ -147,7 +143,24 @@ def _unpack_bits(
     *,
     loc=None,
 ):
-    """Decode one packed quantized value from a packed weight row."""
+    """Decode one quantized element from a packed uint32 weight row.
+
+    Handles cross-word bit fields: when the *bits*-wide field starting at
+    ``elem_idx * bits`` straddles a 32-bit word boundary, the function reads
+    the low portion from ``packed[row, word0]`` and the high portion from
+    ``packed[row, word0 + 1]``, then assembles the full value.
+
+    Args:
+        packed: 2-D CuTe tensor of ``uint32`` words, shape
+            ``(num_rows, words_per_row)``.
+        row: Row index into *packed*.
+        elem_idx: Element index within the row (not the word index).
+        bits: Bit-width of each quantized element (e.g. 4 or 8).
+        loc: CuTe DSL source-location metadata (do not pass explicitly).
+
+    Returns:
+        Decoded quantized code as ``cutlass.Int32``.
+    """
     bits_i = cutlass.Int32(bits)
     bit_offset = elem_idx * bits_i
     word_idx = bit_offset // cutlass.Int32(32)
@@ -178,7 +191,19 @@ def _unpack_bits(
 
 @dsl_user_op
 def _e2m1_value(code: cutlass.Int32, *, loc=None):
-    """Decode an E2M1 4-bit float code into fp32."""
+    """Decode an E2M1 4-bit float code into a float32 value.
+
+    E2M1 is the MX-FP4 element format: 1 sign bit, 2 exponent bits,
+    1 mantissa bit, with an exponent bias of 1.  Subnormals (exp == 0)
+    are represented as ``sign * mantissa * 0.5``.
+
+    Args:
+        code: 4-bit integer code in the range ``[0, 15]``.
+        loc: CuTe DSL source-location metadata (do not pass explicitly).
+
+    Returns:
+        Decoded value as ``cutlass.Float32``.
+    """
     code_u = cutlass.Uint32(code)
     sign = (code_u >> cutlass.Uint32(3)) & cutlass.Uint32(1)
     exp = (code_u >> cutlass.Uint32(1)) & cutlass.Uint32(0x3)
@@ -196,7 +221,20 @@ def _e2m1_value(code: cutlass.Int32, *, loc=None):
 
 @dsl_user_op
 def _e4m3_value(code: cutlass.Int32, *, loc=None):
-    """Decode an E4M3 8-bit float code into fp32."""
+    """Decode an E4M3 8-bit float code into a float32 value.
+
+    E4M3 is the FP8 element format: 1 sign bit, 4 exponent bits, 3 mantissa
+    bits, with an exponent bias of 7.  Subnormals (exp == 0) use
+    ``sign * mantissa * 2^(1 - 7)``.  The special pattern ``exp = 0xF,
+    mant = 0x7`` is decoded as ``NaN``.
+
+    Args:
+        code: 8-bit integer code in the range ``[0, 255]``.
+        loc: CuTe DSL source-location metadata (do not pass explicitly).
+
+    Returns:
+        Decoded value as ``cutlass.Float32``.
+    """
     code_u = cutlass.Uint32(code)
     sign = (code_u >> cutlass.Uint32(7)) & cutlass.Uint32(1)
     exp = (code_u >> cutlass.Uint32(3)) & cutlass.Uint32(0xF)
@@ -219,7 +257,20 @@ def _e4m3_value(code: cutlass.Int32, *, loc=None):
 
 @dsl_user_op
 def _nf4_value(code: cutlass.Int32, *, loc=None):
-    """Decode NF4 code using the canonical 16-value lookup table."""
+    """Decode an NF4 code into a float32 value using the canonical 16-entry LUT.
+
+    NF4 (Normal Float 4) is the QLoRA quantization format; the 16 values are
+    chosen to match the quantiles of a standard normal distribution, stored in
+    :data:`_NF4_LUT_VALUES`.  This function implements the LUT as a chain of
+    ``cutlass.select_`` calls, which the CuTe DSL lowers to predicated moves.
+
+    Args:
+        code: 4-bit integer code in the range ``[0, 15]``.
+        loc: CuTe DSL source-location metadata (do not pass explicitly).
+
+    Returns:
+        Decoded NF4 value as ``cutlass.Float32``.
+    """
     val = cutlass.Float32(0.0)
     val = cutlass.select_(code == cutlass.Int32(0), cutlass.Float32(-1.0), val)
     val = cutlass.select_(code == cutlass.Int32(1), cutlass.Float32(-0.6961928009986877), val)
@@ -242,7 +293,21 @@ def _nf4_value(code: cutlass.Int32, *, loc=None):
 
 @dsl_user_op
 def _exp2_from_e8m0(exp_code: cutlass.Uint32, *, loc=None):
-    """Decode E8M0 exponent and return ``2**exp`` in fp32."""
+    """Decode an E8M0 scale exponent and return ``2 ** (exp_code - bias)`` in fp32.
+
+    E8M0 is the MX-series block-scale format: an 8-bit signed integer with no
+    mantissa bits and no sign bit, interpreted as a biased exponent.  The value
+    is converted to ``int8`` first so that signed arithmetic applies, yielding
+    a power-of-two scale factor in float32.
+
+    Args:
+        exp_code: 8-bit unsigned exponent code.
+        loc: CuTe DSL source-location metadata (do not pass explicitly).
+
+    Returns:
+        ``2 ** exp`` as ``cutlass.Float32``, where ``exp`` is the signed
+        interpretation of *exp_code*.
+    """
     exp_i8 = cutlass.Int8(exp_code)
     exp_f = cutlass.Float32(exp_i8)
     return cute.math.exp2(exp_f)
@@ -320,7 +385,15 @@ def _build_dequant_fn(*, mode: str, with_bias: bool):
 
 
 def _normalize_block(value: int | None, default: int) -> int:
-    """Normalize a positive block size integer."""
+    """Normalize a positive block size integer, falling back to *default* on error.
+
+    Args:
+        value: Requested block size, or ``None`` to use *default*.
+        default: Value to use when *value* is ``None`` or cannot be converted.
+
+    Returns:
+        Positive integer block size, always at least 1.
+    """
     try:
         block = int(default if value is None else value)
     except Exception:
@@ -329,23 +402,48 @@ def _normalize_block(value: int | None, default: int) -> int:
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
-    """Round an integer up to the next multiple."""
+    """Round *value* up to the nearest multiple of *multiple*."""
     return ((value + multiple - 1) // multiple) * multiple
 
 
 def _smem_bytes(tile_m: int, tile_n: int, tile_k: int, dtype_bytes: int = 2) -> int:
-    """Estimate shared-memory bytes for one tiled-kernel tile pair."""
+    """Estimate peak shared-memory usage in bytes for a single tile pair.
+
+    Uses the formula ``(tile_m * tile_k + tile_k * tile_n) * dtype_bytes + 1024``
+    with a 1 KiB overhead for kernel bookkeeping and alignment padding.
+
+    Args:
+        tile_m: Tile height (output rows).
+        tile_n: Tile width (output columns).
+        tile_k: K-dimension tile depth.
+        dtype_bytes: Bytes per element (default 2 for fp16/bf16).
+
+    Returns:
+        Estimated shared-memory requirement in bytes.
+    """
     return (tile_m * tile_k + tile_k * tile_n) * dtype_bytes + 1024
 
 
 def _use_naive_kernel() -> bool:
-    """Return True if the naive kernel path is explicitly requested."""
+    """Return ``True`` when ``EJKERNEL_CUTE_QMM_USE_NAIVE=1`` is set in the environment."""
     raw = os.getenv("EJKERNEL_CUTE_QMM_USE_NAIVE", "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def _threads_for_tile(tile_m: int, tile_n: int) -> int:
-    """Choose a practical CUDA thread count for a tile."""
+    """Choose a practical CUDA thread count for the naive scalar kernel tile.
+
+    Targets ``min(tile_m * tile_n, 512)`` threads, then clamps to
+    ``[_MIN_THREADS_PER_BLOCK, _MAX_THREADS_PER_BLOCK]`` and rounds up
+    to the nearest warp (multiple of 32).
+
+    Args:
+        tile_m: Tile height.
+        tile_n: Tile width.
+
+    Returns:
+        Number of CUDA threads per thread block.
+    """
     tile_area = max(1, int(tile_m) * int(tile_n))
     target = min(tile_area, 512)
     target = max(_MIN_THREADS_PER_BLOCK, target)
@@ -360,7 +458,21 @@ def _infer_output_shape(
     group_size: int,
     transpose: bool,
 ) -> tuple[int, int]:
-    """Infer the ``(M, N)`` output shape of the fused QMM from input metadata."""
+    """Infer the ``(M, N)`` output shape of the fused QMM from input metadata.
+
+    When the weight is not transposed the scales tensor has shape
+    ``(K, num_groups)`` so ``N = scales.shape[1] * group_size``.
+    When transposed the weight is ``(N, ...)`` so ``N = scales.shape[0]``.
+
+    Args:
+        x: Input activation, shape ``(M, K)``.
+        scales: Per-group scale tensor.
+        group_size: Number of weight elements per quantization group.
+        transpose: Whether the weight matrix is transposed.
+
+    Returns:
+        Output shape ``(M, N)``.
+    """
     m = int(x.shape[0])
     if transpose:
         n = int(scales.shape[0])
@@ -370,76 +482,8 @@ def _infer_output_shape(
 
 
 def _shape_key(shape: tuple[int, ...]) -> tuple[int, ...]:
-    """Create a hashable key for array shape metadata."""
+    """Convert an array shape to a hashable ``tuple[int, ...]`` cache key."""
     return tuple(int(d) for d in shape)
-
-
-def _autotune_enabled() -> bool:
-    """Return whether CuTe QMM autotuning is enabled."""
-    raw = os.getenv("EJKERNEL_CUTE_QMM_AUTOTUNE", "1").strip().lower()
-    return raw not in ("0", "false", "off", "no")
-
-
-def _candidate_tiles(block_m: int, block_n: int, block_k: int) -> list[tuple[int, int, int]]:
-    """Generate candidate tile triplets for fused QMM autotuning.
-
-    Produces a deduplicated list of ``(tile_m, tile_n, tile_k)`` candidates
-    that fit within the shared-memory budget and are compatible with the
-    4x4 register tile used by the tiled SMEM kernel.  The list is capped
-    by ``EJKERNEL_CUTE_QMM_AUTOTUNE_MAX_CANDIDATES`` (default 6).
-
-    Args:
-        block_m: Requested M tile size.
-        block_n: Requested N tile size.
-        block_k: Requested K tile size.
-
-    Returns:
-        List of valid ``(tile_m, tile_n, tile_k)`` tuples.
-    """
-    ttm, ttn = _THREAD_TILE_M, _THREAD_TILE_N
-    candidates = [
-        (block_m, block_n, block_k),
-        (64, 64, 32),
-        (64, 64, 64),
-        (64, 128, 32),
-        (128, 64, 32),
-        (128, 128, 32),
-        (128, 128, 64),
-        (32, 128, 32),
-        (128, 32, 32),
-        (block_m // 2, block_n // 2, max(16, block_k // 2)),
-    ]
-
-    try:
-        max_smem = max(1024, int(os.getenv("EJKERNEL_CUTE_QMM_MAX_SMEM", "49152")))
-    except ValueError:
-        max_smem = 49152
-
-    deduped: list[tuple[int, int, int]] = []
-    seen: set[tuple[int, int, int]] = set()
-    for bm, bn, bk in candidates:
-        bm = _normalize_block(bm, _DEFAULT_BLOCK_M)
-        bn = _normalize_block(bn, _DEFAULT_BLOCK_N)
-        bk = _normalize_block(bk, _DEFAULT_BLOCK_K)
-        key = (bm, bn, bk)
-        if key in seen:
-            continue
-        # Skip tiles that exceed SMEM budget or have incompatible dims.
-        if _smem_bytes(bm, bn, bk) > max_smem:
-            continue
-        if bm % ttm != 0 or bn % ttn != 0:
-            continue
-        nt = (bm // ttm) * (bn // ttn)
-        if nt > _MAX_THREADS_PER_BLOCK or nt < 32:
-            continue
-        seen.add(key)
-        deduped.append(key)
-
-    try:
-        max_candidates = max(1, int(os.getenv("EJKERNEL_CUTE_QMM_AUTOTUNE_MAX_CANDIDATES", "6")))
-    except ValueError:
-        max_candidates = 6
-    return deduped[:max_candidates]
 
 
 def _build_naive_qmm_host_fns(
@@ -1142,7 +1186,25 @@ def _make_mma_smem_layout(
     row_major: bool = True,
     copy_bits: int = 128,
 ):
-    """Create a swizzled SMEM layout for MMA tiles, following the CUTLASS ``tensorop_gemm.py`` pattern."""
+    """Create a bank-conflict-free swizzled SMEM layout for MMA A/B tiles.
+
+    Follows the CUTLASS ``tensorop_gemm.py`` pattern: computes the number of
+    swizzle bits from the major dimension and element width, caps at 3 bits
+    (8-way XOR swizzle), then uses :func:`cute.make_composed_layout` to compose
+    the swizzle with the base row/col-major atom, tiled to the full tile shape.
+
+    Args:
+        tile_row: Number of rows in the SMEM tile.
+        tile_col: Number of columns in the SMEM tile.
+        dtype: CUTLASS element dtype (used to compute swizzle bits from element width).
+        row_major: If ``True``, the inner atom is row-major (stride=(major, 1)).
+            If ``False``, the inner atom is column-major (stride=(1, major)).
+        copy_bits: Bit width of the load atom (default 128 for cp.async).
+
+    Returns:
+        A CuTe ``ComposedLayout`` of shape ``(tile_row, tile_col)`` with
+        XOR swizzling to avoid shared-memory bank conflicts.
+    """
     major_size = tile_col if row_major else tile_row
     major_size = 64 if major_size >= 64 else major_size
     swizzle_bits = int(math.log2(major_size * dtype.width // copy_bits))
@@ -1189,7 +1251,13 @@ _MMA_TILED_K = _MMA_ATOM_LAYOUT_K * _MMA_ATOM_K  # 16
 
 
 def _validate_mma_tile(tile_m: int, tile_n: int, tile_k: int) -> bool:
-    """Check whether tile dimensions are compatible with the MMA configuration."""
+    """Return ``True`` when tile dimensions are compatible with the MMA atom configuration.
+
+    Requirements (derived from the ``MmaF16BF16Op`` atom and tiling layout):
+        - ``tile_m >= _MMA_TILED_M`` (32) and divisible by it.
+        - ``tile_n >= _MMA_TILED_N`` (32) and divisible by it.
+        - ``tile_k`` divisible by ``_MMA_ATOM_K`` (16).
+    """
     if tile_m < _MMA_TILED_M or tile_n < _MMA_TILED_N:
         return False
     if tile_m % _MMA_TILED_M != 0:
@@ -1202,13 +1270,13 @@ def _validate_mma_tile(tile_m: int, tile_n: int, tile_k: int) -> bool:
 
 
 def _use_tiled_scalar_kernel() -> bool:
-    """Return True if the tiled scalar kernel path is explicitly requested."""
+    """Return ``True`` when ``EJKERNEL_CUTE_QMM_USE_TILED=1`` is set in the environment."""
     raw = os.getenv("EJKERNEL_CUTE_QMM_USE_TILED", "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
 def _use_mma_single_stage() -> bool:
-    """Return True if single-stage (non-pipelined) MMA is explicitly requested."""
+    """Return ``True`` when ``EJKERNEL_CUTE_QMM_USE_MMA_SINGLE=1`` is set in the environment."""
     raw = os.getenv("EJKERNEL_CUTE_QMM_USE_MMA_SINGLE", "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
@@ -1224,7 +1292,23 @@ def _make_staged_smem_layout(
     row_major: bool = True,
     copy_bits: int = 128,
 ):
-    """Extend a 2-D swizzled SMEM layout to 3-D ``(row, col, stages)`` for pipelining."""
+    """Extend a 2-D swizzled SMEM layout to 3-D ``(row, col, stages)`` for software pipelining.
+
+    The 2-D base is built by :func:`_make_mma_smem_layout` and then tiled
+    to include a pipeline-stage dimension, producing a
+    ``ComposedLayout`` of shape ``(tile_row, tile_col, num_stages)``.
+
+    Args:
+        tile_row: Tile row count (M or N dimension).
+        tile_col: Tile column count (K dimension).
+        num_stages: Number of pipeline stages (SMEM circular buffer depth).
+        dtype: CUTLASS element dtype for swizzle calculation.
+        row_major: Whether the inner layout is row-major.
+        copy_bits: Bit width of the cp.async copy atom (default 128).
+
+    Returns:
+        A 3-D CuTe ``ComposedLayout`` suitable for staged cp.async operations.
+    """
     atom_2d = _make_mma_smem_layout(tile_row, tile_col, dtype, row_major, copy_bits)
     return cute.tile_to_shape(atom_2d, (tile_row, tile_col, num_stages), (0, 1, 2))
 
@@ -2726,11 +2810,19 @@ def _build_fused_qmm_host_fns(
 
 
 def _wrap_vmap_compatible_jax_call(call: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
-    """Wrap a JAX call with an explicit batching rule via ``jax.lax.map``.
+    """Wrap a JAX call with an explicit ``custom_vmap`` batching rule.
 
-    CuTe primitive calls may not provide a native batching rule. This
-    wrapper keeps eager/JIT behavior unchanged while making ``jax.vmap`` work
-    by mapping the unbatched call across the leading batch axis.
+    CuTe primitive calls compiled through ``build_cute_ffi_call`` do not
+    automatically provide a batching rule, so ``jax.vmap`` would fail.
+    This wrapper keeps eager/JIT behavior unchanged (the inner ``call`` is
+    invoked directly) while registering a ``def_vmap`` rule that maps the
+    unbatched primitive across the leading batch axis via ``jax.lax.map``.
+
+    Args:
+        call: An unbatched JAX callable produced by :func:`_build_primitive_qmm_call`.
+
+    Returns:
+        A new callable with identical semantics but ``jax.vmap``-compatible.
     """
 
     @custom_batching.custom_vmap
@@ -2814,7 +2906,12 @@ def _qmm_call_name(
     tile_n: int,
     tile_k: int,
 ) -> str:
-    """Build a stable name for CuTe fused QMM call scope/cache."""
+    """Build a stable human-readable name for a CuTe fused-QMM call site/cache key.
+
+    The name encodes all kernel-specialisation parameters so that the same
+    string can be used as both the ``cute_call`` scope name for profiling and
+    as part of the ``_QMM_CALL_CACHE`` key.
+    """
     return (
         "cute_quantized_matmul_fused_"
         f"{mode.lower()}_b{int(bits)}_g{int(group_size)}_"
@@ -2826,7 +2923,15 @@ def _qmm_call_name(
 
 
 def _array_device_key(arr: Any) -> tuple[str | None, int | None, str] | None:
-    """Build a stable key for an array's device placement."""
+    """Return a hashable device descriptor for *arr*, or ``None`` if unavailable.
+
+    Used to make the QMM primitive cache device-aware so that the same
+    compiled kernel is not reused across distinct physical devices.
+
+    Returns:
+        A ``(platform, device_id, str_repr)`` tuple, or ``None`` if *arr* is
+        not a concrete ``jax.Array`` or its device cannot be determined.
+    """
     if not isinstance(arr, jax.Array):
         return None
     try:
@@ -2857,7 +2962,16 @@ def _qmm_primitive_cache_key(
     tile_k: int,
     out_shape: tuple[int, int],
 ) -> tuple[Any, ...]:
-    """Build a cache key for fused CuTe QMM primitive callables."""
+    """Build a hashable cache key for a compiled CuTe fused-QMM primitive.
+
+    Encodes every axis of specialisation — quantization parameters, tile
+    configuration, dtypes, tensor shapes, kernel family, and device
+    placement — so that cached primitives are never reused for a different
+    kernel variant or input configuration.
+
+    Returns:
+        A flat tuple of primitives suitable as a ``dict`` key.
+    """
     return (
         mode.lower(),
         int(bits),
@@ -2883,258 +2997,6 @@ def _qmm_primitive_cache_key(
     )
 
 
-def _can_autotune_runtime(
-    x: Any,
-    w_q: Any,
-    scales: Any,
-    biases: Any | None,
-) -> bool:
-    """Return whether inputs are concrete arrays suitable for runtime tuning."""
-    if isinstance(x, core.Tracer):
-        return False
-    if isinstance(w_q, core.Tracer):
-        return False
-    if isinstance(scales, core.Tracer):
-        return False
-    if isinstance(biases, core.Tracer):
-        return False
-    if not isinstance(x, jax.Array):
-        return False
-    if not isinstance(w_q, jax.Array):
-        return False
-    if not isinstance(scales, jax.Array):
-        return False
-    if biases is not None and not isinstance(biases, jax.Array):
-        return False
-    return True
-
-
-def _benchmark_tile(
-    *,
-    x: jax.Array,
-    w_q: jax.Array,
-    scales: jax.Array,
-    biases: jax.Array | None,
-    mode: str,
-    bits: int,
-    group_size: int,
-    transpose: bool,
-    out_dtype: type[cutlass.Numeric],
-    out_jax_dtype: jnp.dtype,
-    with_bias: bool,
-    tile: tuple[int, int, int],
-    out_struct: jax.ShapeDtypeStruct,
-) -> float:
-    """Benchmark one fused-QMM tile candidate and return mean wall-clock runtime.
-
-    Compiles and runs the kernel for the given tile configuration, performs
-    warmup iterations, then measures average execution time over multiple
-    iterations.  Tuning parameters are controlled via environment variables:
-    ``EJKERNEL_CUTE_QMM_AUTOTUNE_WARMUP`` (default 1) and
-    ``EJKERNEL_CUTE_QMM_AUTOTUNE_ITERS`` (default 3).
-
-    Args:
-        x: Input activation tensor.
-        w_q: Packed quantized weight tensor.
-        scales: Quantization scale tensor.
-        biases: Optional quantization bias tensor.
-        mode: Quantization mode.
-        bits: Bit-width of quantized weights.
-        group_size: Quantization group size.
-        transpose: Whether weights are transposed.
-        out_dtype: CUTLASS output dtype.
-        out_jax_dtype: JAX output dtype.
-        with_bias: Whether bias is present.
-        tile: ``(tile_m, tile_n, tile_k)`` candidate.
-        out_struct: Output shape/dtype descriptor.
-
-    Returns:
-        Mean execution time in milliseconds.
-    """
-    bm, bn, bk = tile
-    _, host_jax_fn = _build_fused_qmm_host_fns(
-        mode=mode,
-        bits=bits,
-        group_size=group_size,
-        out_dtype=out_dtype,
-        with_bias=with_bias,
-        transpose=transpose,
-        tile_m=bm,
-        tile_n=bn,
-        tile_k=bk,
-    )
-    primitive_call = _build_primitive_qmm_call(
-        jax_host_fn=host_jax_fn,
-        out_shape=out_struct,
-        use_vmap_wrapper=False,
-    )
-    call_name = _qmm_call_name(
-        mode=mode,
-        bits=bits,
-        group_size=group_size,
-        out_dtype=out_jax_dtype,
-        transpose=transpose,
-        with_bias=with_bias,
-        tile_m=bm,
-        tile_n=bn,
-        tile_k=bk,
-    )
-
-    x_cast = x.astype(out_jax_dtype)
-
-    def _run_once():
-        if with_bias:
-            return cute_call(
-                x_cast,
-                w_q,
-                scales,
-                biases,
-                call=primitive_call,
-                out_shape=out_struct,
-                name=call_name,
-            )
-        return cute_call(
-            x_cast,
-            w_q,
-            scales,
-            call=primitive_call,
-            out_shape=out_struct,
-            name=call_name,
-        )
-
-    y = _run_once()
-    y.block_until_ready()
-
-    try:
-        warmup = max(0, int(os.getenv("EJKERNEL_CUTE_QMM_AUTOTUNE_WARMUP", "1")))
-    except ValueError:
-        warmup = 1
-    try:
-        iters = max(1, int(os.getenv("EJKERNEL_CUTE_QMM_AUTOTUNE_ITERS", "3")))
-    except ValueError:
-        iters = 3
-
-    for _ in range(warmup):
-        y = _run_once()
-        y.block_until_ready()
-
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        y = _run_once()
-        y.block_until_ready()
-    t1 = time.perf_counter()
-    return ((t1 - t0) * 1000.0) / iters
-
-
-def _select_tile_config(
-    *,
-    x: jax.Array,
-    w_q: jax.Array,
-    scales: jax.Array,
-    biases: jax.Array | None,
-    mode: str,
-    bits: int,
-    group_size: int,
-    transpose: bool,
-    out_dtype: type[cutlass.Numeric],
-    out_jax_dtype: jnp.dtype,
-    with_bias: bool,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    out_struct: jax.ShapeDtypeStruct,
-) -> tuple[int, int, int]:
-    """Choose the best fused-QMM tile configuration, optionally via runtime autotuning.
-
-    If autotuning is enabled (``EJKERNEL_CUTE_QMM_AUTOTUNE != 0``, the default)
-    and the inputs are concrete JAX arrays (not tracers), benchmarks several
-    candidate tile sizes and caches the fastest.  Otherwise returns the
-    requested tile configuration directly.  Results are cached per unique
-    combination of mode, shapes, dtypes, and requested tile.
-
-    Args:
-        x: Input activation tensor (used for shape/dtype and benchmarking).
-        w_q: Packed quantized weight tensor.
-        scales: Quantization scale tensor.
-        biases: Optional quantization bias tensor.
-        mode: Quantization mode.
-        bits: Bit-width of quantized weights.
-        group_size: Quantization group size.
-        transpose: Whether weights are transposed.
-        out_dtype: CUTLASS output dtype.
-        out_jax_dtype: JAX output dtype.
-        with_bias: Whether bias is present.
-        block_m: Requested M tile size.
-        block_n: Requested N tile size.
-        block_k: Requested K tile size.
-        out_struct: Output shape/dtype descriptor.
-
-    Returns:
-        Best ``(tile_m, tile_n, tile_k)`` configuration.
-    """
-    requested = (
-        _normalize_block(block_m, _DEFAULT_BLOCK_M),
-        _normalize_block(block_n, _DEFAULT_BLOCK_N),
-        _normalize_block(block_k, _DEFAULT_BLOCK_K),
-    )
-
-    key = (
-        mode.lower(),
-        int(bits),
-        int(group_size),
-        bool(transpose),
-        bool(with_bias),
-        str(jnp.dtype(out_jax_dtype)),
-        _shape_key(tuple(x.shape)),
-        _shape_key(tuple(w_q.shape)),
-        _shape_key(tuple(scales.shape)),
-        _shape_key(tuple(biases.shape)) if biases is not None else None,
-        str(jnp.dtype(x.dtype)),
-        str(jnp.dtype(w_q.dtype)),
-        str(jnp.dtype(scales.dtype)),
-        str(jnp.dtype(biases.dtype)) if biases is not None else None,
-        requested,
-    )
-    with _AUTOTUNE_CACHE_LOCK:
-        cached = _AUTOTUNE_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    if not _autotune_enabled() or not _can_autotune_runtime(x, w_q, scales, biases):
-        with _AUTOTUNE_CACHE_LOCK:
-            _AUTOTUNE_CACHE[key] = requested
-        return requested
-
-    best_tile = requested
-    best_ms = float("inf")
-    for tile in _candidate_tiles(*requested):
-        try:
-            ms = _benchmark_tile(
-                x=x,
-                w_q=w_q,
-                scales=scales,
-                biases=biases,
-                mode=mode,
-                bits=bits,
-                group_size=group_size,
-                transpose=transpose,
-                out_dtype=out_dtype,
-                out_jax_dtype=out_jax_dtype,
-                with_bias=with_bias,
-                tile=tile,
-                out_struct=out_struct,
-            )
-        except Exception:
-            continue
-        if ms < best_ms:
-            best_ms = ms
-            best_tile = tile
-
-    with _AUTOTUNE_CACHE_LOCK:
-        _AUTOTUNE_CACHE[key] = best_tile
-    return best_tile
-
-
 def get_cute_qmm_call(
     *,
     x: jax.Array,
@@ -3157,9 +3019,10 @@ def get_cute_qmm_call(
 
     This is the main entry point for CuTe-backed quantized matrix
     multiplication.  It selects the kernel family (fused GEMM or
-    GEMV with reverse split-K), chooses tile dimensions via autotuning,
-    compiles the appropriate CuTe DSL kernel, and returns a callable
-    that performs ``out = x @ dequant(w_q, scales[, biases])``.
+    GEMV with reverse split-K), normalizes the explicit tile dimensions
+    supplied by the operation executor, compiles the appropriate CuTe DSL
+    kernel, and returns a callable that performs
+    ``out = x @ dequant(w_q, scales[, biases])``.
 
     The compiled kernel and its CuTe FFI primitive are cached so that
     repeated calls with the same configuration reuse the compiled artefact.
@@ -3212,22 +3075,10 @@ def get_cute_qmm_call(
         transpose=transpose,
     )
     out_struct = jax.ShapeDtypeStruct(out_shape, out_dtype)
-    tile_m, tile_n, tile_k = _select_tile_config(
-        x=x,
-        w_q=w_q,
-        scales=scales,
-        biases=biases,
-        mode=mode,
-        bits=bits,
-        group_size=group_size,
-        transpose=transpose,
-        out_dtype=out_cute_dtype,
-        out_jax_dtype=jnp.dtype(out_dtype),
-        with_bias=with_bias,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        out_struct=out_struct,
+    tile_m, tile_n, tile_k = (
+        _normalize_block(block_m, _DEFAULT_BLOCK_M),
+        _normalize_block(block_n, _DEFAULT_BLOCK_N),
+        _normalize_block(block_k, _DEFAULT_BLOCK_K),
     )
     call_name = _qmm_call_name(
         mode=mode,

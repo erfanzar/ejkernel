@@ -12,4 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTe forward implementation for ragged paged attention v3 (stub)."""
+"""CuTe forward implementation for ragged paged attention v3 (stub).
+
+This module is a placeholder for a future CuTe DSL forward kernel
+implementing ragged paged attention v3.  When implemented, it should
+export a function analogous to ``flash_attention_cute_forward`` that
+accepts ragged query sequences and a paged KV cache.
+"""
