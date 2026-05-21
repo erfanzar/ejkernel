@@ -21,17 +21,13 @@ large context windows across multiple partitions for improved parallelism.
 Kernel Components:
 -----------------
 _paged_attn_kernel:
-    Main attention kernel with autotune configurations. Computes attention
+    Main attention kernel with explicit launch configuration. Computes attention
     over block-tabled KV cache with optional partitioning for long contexts.
     Uses log2-based softmax for numerical stability.
 
 _paged_attn_v2_reduce_kernel:
     Reduction kernel for partitioned attention. Combines partial results
     from multiple partitions using log-sum-exp weighted averaging.
-
-get_autotune_configs:
-    Generates Triton autotune configurations optimized for different
-    GPU architectures and workload sizes.
 
 Memory Layout:
 -------------
@@ -48,7 +44,7 @@ For contexts exceeding PARTITION_SIZE tokens:
 3. Reduce kernel combines partitions using numerically stable reduction
 
 Key Features:
-- Autotuned for various GPU configurations
+- Deterministic launch configuration supplied by the caller
 - Supports GQA/MQA with flexible query group sizes
 - Efficient block-tabled memory access
 - Optional partitioning for very long sequences
@@ -56,37 +52,6 @@ Key Features:
 
 import triton
 import triton.language as tl
-
-
-def get_autotune_configs():
-    """Generate dimension-aware autotune configurations for paged attention."""
-    configs = []
-
-    configs.extend(
-        [
-            triton.Config({}, num_warps=2, num_stages=4),
-            triton.Config({}, num_warps=4, num_stages=3),
-            triton.Config({}, num_warps=4, num_stages=4),
-        ]
-    )
-
-    configs.extend(
-        [
-            triton.Config({}, num_warps=8, num_stages=2),
-            triton.Config({}, num_warps=8, num_stages=3),
-            triton.Config({}, num_warps=8, num_stages=4),
-        ]
-    )
-
-    configs.extend(
-        [
-            triton.Config({}, num_warps=16, num_stages=2),
-            triton.Config({}, num_warps=16, num_stages=3),
-            triton.Config({}, num_warps=16, num_stages=4),
-        ]
-    )
-
-    return configs
 
 
 @triton.jit
@@ -247,15 +212,6 @@ def _paged_attn_kernel(
 
     group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
     tl.store(out_ptr + out_offset, acc, mask=group_mask)
-
-
-try:
-    _paged_attn_kernel = triton.autotune(
-        configs=get_autotune_configs(),
-        key=["HEAD_SIZE", "QUERY_GROUP_SIZE", "KV_BLOCK_SIZE", "PARTITION_SIZE"],
-    )(_paged_attn_kernel)
-except Exception:
-    pass
 
 
 @triton.jit

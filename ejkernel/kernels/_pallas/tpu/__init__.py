@@ -13,26 +13,37 @@
 # limitations under the License.
 
 
-"""Pallas TPU kernel implementations.
+"""Pallas TPU kernel implementations (Mosaic backend).
 
-This module provides TPU-optimized kernels using Pallas with Mosaic backend.
-Kernels are designed to leverage TPU's Matrix Multiply Units (MXUs) and
-High Bandwidth Memory (HBM) for efficient execution.
+Provides TPU-optimized kernels compiled through JAX Pallas with the Mosaic
+(XLA extension) backend.  Kernels exploit the TPU Matrix Multiply Unit (MXU),
+the VMEM (on-chip vector memory) / HBM hierarchy, and the TPU's DMA engine for
+asynchronous data movement.
 
-Available Kernels:
-    - flash_attention: Memory-efficient exact attention
-    - flash_mla: Multi-head latent attention forward pass
-    - deepseek_attn: DeepSeek Sparse Attention (MLA + Lightning Indexer)
-    - gated_delta_rule: Gated delta rule linear attention
-    - multi_latent_ragged_page_attention: MLA ragged paged attention
-    - multi_latent_ragged_page_attention_v2: MLA ragged paged attention v2
-    - blocksparse_attention: Block-sparse attention patterns
-    - ring_attention: Distributed attention across devices
-    - page_attention: Paged KV cache attention
-    - quantized_matmul: Packed-weights quantized matrix multiplication
-    - ragged_page_attention_v2/v3: Variable-length paged attention
-    - ragged_decode_attention: Decode-phase attention
-    - grouped_matmul/v2: Grouped matrix multiplication
+Available kernels:
+    all_gather_matmul: Bidirectional ring all-gather fused with matmul; uses
+        TPU DMA for peer-to-peer data movement across devices.
+    blocksparse_attention: Block-sparse (Splash) attention with support for
+        causal, local, chunked-causal, and fully-custom sparsity patterns.
+    deepseek_attn: DeepSeek-style sparse attention combining MLA with a
+        lightning indexer for KV cache selection.
+    flash_attention: Memory-efficient exact attention (FlashAttention-TPU).
+    flash_mla: Multi-head latent attention forward pass.
+    gated_delta_rule: Gated delta-rule linear attention recurrence.
+    grouped_matmul: Grouped (expert) matrix multiplication (v1).
+    grouped_matmulv2: Grouped matmul v2 with improved tiling.
+    grouped_matmulv3: Grouped matmul v3 with further optimizations.
+    multi_latent_ragged_page_attention: MLA ragged paged attention (v1).
+    multi_latent_ragged_page_attention_v2: MLA ragged paged attention v2.
+    page_attention: Standard paged KV-cache attention.
+    prefill_page_attention: Prefill-phase paged attention.
+    quantized_matmul: Packed-weight quantized matrix multiplication.
+    ragged_decode_attention: Decode-phase attention for ragged batches.
+    ragged_gated_delta_rule: Ragged-batch gated delta-rule recurrence.
+    ragged_page_attention_v2: Variable-length paged attention v2.
+    ragged_page_attention_v3: Variable-length paged attention v3 (VMEM-safe).
+    reduce_scatter_matmul: Matmul fused with reduce-scatter collective.
+    ring_attention: Distributed attention using ring all-reduce collectives.
 """
 
 from .all_gather_matmul import all_gather_matmul

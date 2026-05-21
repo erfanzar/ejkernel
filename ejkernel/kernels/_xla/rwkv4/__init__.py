@@ -14,20 +14,24 @@
 
 """XLA backend for RWKV-4 time-mix recurrence.
 
-This submodule provides XLA-optimized implementation of RWKV-4's
-time-mix mechanism, a linear-complexity attention alternative.
+This submodule provides a pure JAX/XLA implementation of the RWKV-4
+time-mix mechanism — a linear-complexity alternative to self-attention.
 
 Key Features:
-    - O(N) complexity through channel-wise recurrence
-    - Time-mixing with learnable decay and receptance gates
-    - Efficient token mixing without attention matrices
+    - O(N) complexity through per-channel recurrence
+    - Numerically stable via log-sum-exp (eps) state tracking
+    - Global learned decay w and current-token bonus u
     - State caching for autoregressive generation
 
 Algorithm:
-    RWKV-4 computes per-channel recurrence:
-        wkv_t = exp(w + k_t) * v_t + exp(u + k_t) * v_t
-        y_t = sigmoid(r_t) * wkv_t
-    where w is the learned decay and u provides bonus for current token.
+    RWKV-4 maintains per-channel (alpha, beta, eps) state and computes:
+        tau_t   = max(u + k_t, eps_{t-1})
+        wkv_t   = (exp(eps_{t-1} - tau_t) * alpha_{t-1} + exp(u + k_t - tau_t) * v_t)
+                / (exp(eps_{t-1} - tau_t) * beta_{t-1}  + exp(u + k_t - tau_t))
+        eps_t   = max(w + eps_{t-1}, k_t)
+        alpha_t = exp(w + eps_{t-1} - eps_t) * alpha_{t-1} + exp(k_t - eps_t) * v_t
+        beta_t  = exp(w + eps_{t-1} - eps_t) * beta_{t-1}  + exp(k_t - eps_t)
+    where w = -exp(w_param) is the channel-wise learned decay.
 
 Reference:
     RWKV: Reinventing RNNs for the Transformer Era

@@ -35,7 +35,7 @@ Key Features:
 ------------
 - Efficient gradient broadcasting with chunked writes
 - Variable-length sequence support matching forward pass
-- Autotuned configurations for optimal performance
+- Explicit launch configuration supplied by the caller
 - Memory-coalesced access patterns
 
 Functions:
@@ -54,14 +54,6 @@ from ejkernel.xla_utils.utils import prepare_chunk_indices
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] != 1})
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_DIM": BLOCK_DIM}, num_warps=num_warps)
-        for BLOCK_DIM in [16, 32, 64, 128]
-        for num_warps in [1, 2, 4, 8]
-    ],
-    key=["BLOCK_SEQ"],
-)
 @triton.jit
 def bwd_kernel(
     do,
@@ -119,12 +111,62 @@ def bwd_kernel(
     tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit
+def bwd_global_kernel(
+    do,
+    dx,
+    SEQUENCE: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Triton kernel for fixed-length global mean-pooling gradients."""
+    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    o_d = i_d * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    o_t = i_t * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    b_do = tl.load(do + i_b * DIM + o_d, mask=o_d < DIM, other=0.0).to(tl.float32) / SEQUENCE
+    tl.store(
+        dx + (i_b * SEQUENCE + o_t[:, None]) * DIM + o_d[None, :],
+        b_do[None, :].to(dx.dtype.element_ty),
+        mask=(o_t[:, None] < SEQUENCE) & (o_d[None, :] < DIM),
+    )
+
+
+@triton.jit
+def bwd_global_varlen_kernel(
+    do,
+    cu_seqlens,
+    dx,
+    TOTAL_TOKENS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Triton kernel for packed variable-length global mean-pooling gradients."""
+    i_d, i_t, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    o_d = i_d * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    o_t = i_t * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    length = eos - bos
+    denom = tl.maximum(length, 1).to(tl.float32)
+    b_do = tl.load(do + i_n * DIM + o_d, mask=o_d < DIM, other=0.0).to(tl.float32) / denom
+    tl.store(
+        dx + (bos + o_t[:, None]) * DIM + o_d[None, :],
+        b_do[None, :].to(dx.dtype.element_ty),
+        mask=(o_t[:, None] < length) & (o_d[None, :] < DIM),
+    )
+
+
 def bwd_triton_impl(
     do: Float[Array, "batch hidden_dim"],
     batch_size: int,
     seq_len: int,
     chunk_size: int,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_dim: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> Float[Array, "batch seq_len hidden_dim"]:
     """Execute mean pooling backward pass using Triton kernel.
 
@@ -141,12 +183,48 @@ def bwd_triton_impl(
     Returns:
         jax.Array: Gradient with respect to input tensor
     """
+    if cu_seqlens is None and do.ndim == 2:
+        Z, SEQUENCE, DIM = batch_size, seq_len, do.shape[-1]
+        BLOCK_SEQ = chunk_size
+        metaparams = dict(SEQUENCE=SEQUENCE, DIM=DIM, BLOCK_SEQ=BLOCK_SEQ, BLOCK_DIM=block_dim)
+        NT = cdiv(SEQUENCE, BLOCK_SEQ)
+        (dx,) = triton_call(
+            do,
+            kernel=bwd_global_kernel,
+            grid=lambda META: (cdiv(DIM, META["BLOCK_DIM"]), NT, Z),
+            out_shape=[jax.ShapeDtypeStruct((Z, SEQUENCE, DIM), dtype=do.dtype)],
+            name="ejkernel::triton::mean_pooling_global_bwd",
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **metaparams,
+        )
+        return dx
+
+    if cu_seqlens is not None and do.ndim == 2:
+        TOTAL_TOKENS, DIM = batch_size, seq_len
+        NUM_SEQS = len(cu_seqlens) - 1
+        BLOCK_SEQ = chunk_size
+        metaparams = dict(TOTAL_TOKENS=TOTAL_TOKENS, DIM=DIM, BLOCK_SEQ=BLOCK_SEQ, BLOCK_DIM=block_dim)
+        NT = cdiv(TOTAL_TOKENS, BLOCK_SEQ)
+        (dx,) = triton_call(
+            do,
+            cu_seqlens,
+            kernel=bwd_global_varlen_kernel,
+            grid=lambda META: (cdiv(DIM, META["BLOCK_DIM"]), NT, NUM_SEQS),
+            out_shape=[jax.ShapeDtypeStruct((TOTAL_TOKENS, DIM), dtype=do.dtype)],
+            name="ejkernel::triton::mean_pooling_global_varlen_bwd",
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **metaparams,
+        )
+        return dx
+
     Z, SEQUENCE, HEAD, DIM = batch_size, seq_len, *do.shape[-2:]
     BLOCK_SEQ = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
     NT = cdiv(SEQUENCE, BLOCK_SEQ) if cu_seqlens is None else len(chunk_indices)
 
-    metaparams = dict(SEQUENCE=SEQUENCE, HEAD=HEAD, DIM=DIM, BLOCK_SEQ=BLOCK_SEQ)
+    metaparams = dict(SEQUENCE=SEQUENCE, HEAD=HEAD, DIM=DIM, BLOCK_SEQ=BLOCK_SEQ, BLOCK_DIM=block_dim)
     (dx,) = triton_call(
         do,
         cu_seqlens if cu_seqlens is not None else 1,
@@ -155,6 +233,8 @@ def bwd_triton_impl(
         grid=lambda META: (cdiv(DIM, META["BLOCK_DIM"]), NT, Z * HEAD),
         out_shape=[jax.ShapeDtypeStruct((Z, SEQUENCE, HEAD, DIM), dtype=do.dtype)],
         name="ejkernel::triton::mean_pooling_bwd",
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
 

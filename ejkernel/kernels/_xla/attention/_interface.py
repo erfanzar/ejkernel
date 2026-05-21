@@ -11,12 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kernel public interface and registration wrappers."""
+"""Public interface and kernel-registry wrapper for XLA standard attention.
+
+Registers ``attention`` under ``Platform.XLA / Backend.ANY``.  All
+computation is delegated to ``_xla_impl_fwd.attention``; the backward pass
+uses JAX's automatic differentiation (no custom VJP).
+"""
 
 from __future__ import annotations
 
 import jaxtyping
 from beartype import beartype
+
+from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_fwd import Array, Bool, Callable, DTypeLike, Float, PRNGKeyArray, jnp
@@ -42,6 +49,8 @@ def attention(
     dropout_prob: float = 0.0,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
 ) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
     """Compute multi-head attention using standard JAX operations.
     This function implements scaled dot-product attention with support for
@@ -87,6 +96,8 @@ def attention(
             - tuple[int, int]: Asymmetric window (left_window, right_window)
             - None: No window constraint (full attention)
             When specified, each query position can only attend to keys within the window.
+        fwd_params: Operation-level tuning hint accepted for API parity; ignored by XLA.
+        bwd_params: Operation-level tuning hint accepted for API parity; ignored by XLA.
     Returns:
         A tuple containing:
             - attention_output: Float[Array, "batch seq_len num_q_heads head_dim"]
@@ -111,6 +122,7 @@ def attention(
         >>> output.shape
         (2, 512, 8, 64)
     """
+    _ = fwd_params, bwd_params
     return _attention_impl(
         query,
         key,

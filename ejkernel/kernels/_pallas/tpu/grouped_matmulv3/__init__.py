@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pallas TPU backend for Grouped Matrix Multiplication v3."""
+"""Pallas TPU backend for Grouped Matrix Multiplication v3.
+
+This submodule provides the v3 grouped matrix multiplication kernel for TPU,
+adapted from the upstream ``gmm_v2`` kernel.  It replaces the v2
+``buffered_pallas_call`` dispatch with JAX's ``emit_pipeline`` and supports
+optional fused activations (SiLU, GeLU, SwiGLUoai) and per-group RHS
+scale/bias for quantised weight formats.
+"""
 
 from ._interface import grouped_matmulv3
 

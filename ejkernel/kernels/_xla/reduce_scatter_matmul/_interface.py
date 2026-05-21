@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kernel public interface and registration wrappers."""
+"""Public interface and kernel-registry entry for reduce-scatter matmul."""
 
 from __future__ import annotations
 
@@ -38,7 +38,38 @@ def reduce_scatter_matmul(
     collective_id: int | None = 0,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
 ) -> Float[Array, "m_local n"]:
-    """XLA reduce-scatter matmul."""
+    """Compute ``reduce_scatter(x @ y.T, scatter_dim=0)`` over a device mesh.
+
+    Each device holds a shard of ``k`` (the contraction dimension).  The
+    kernel first computes the partial outer product ``x @ y.T`` locally, then
+    applies ``psum_scatter`` along ``axis_name`` to sum partial results across
+    devices and distribute row shards of the output.
+
+    Registered under ``"reduce_scatter_matmul"`` for ``Platform.XLA``,
+    ``Backend.ANY``.  Must be called inside a ``jax.pmap`` / ``jax.shard_map``
+    context so that ``axis_name`` is defined.
+
+    Note:
+        ``bm``, ``bn``, ``bk``, and ``collective_id`` are accepted for API
+        parity with hardware-specific backends (e.g., CUDA) but are ignored
+        here.
+
+    Args:
+        x: Left operand, shape ``[m, k_shard]`` on each device.
+        y: Right operand, shape ``[n, k_shard]`` on each device.
+        axis_name: JAX device-mesh axis name for the collective operation.
+        bm: Block size for M dimension.  Ignored in this backend.
+        bn: Block size for N dimension.  Ignored in this backend.
+        bk: Block size for K dimension.  Ignored in this backend.
+        tp_size: Optional tensor-parallel degree used for validation only.
+            Must be >= 1 when provided.
+        collective_id: Ignored in this backend.
+        precision: JAX ``lax.Precision`` for the matrix multiply.
+
+    Returns:
+        Output shard of shape ``[m_local, n]`` where
+        ``m_local = m / num_devices_along_axis_name``.
+    """
     return _reduce_scatter_matmul_impl(
         x,
         y,

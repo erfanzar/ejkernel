@@ -150,7 +150,24 @@ def ref_paged_attention(
 
 
 class MultiPageAsyncCopyDescriptor:
-    """Descriptor for async copy of multiple K/V pages from HBM."""
+    """Descriptor for async DMA copies of one compute block of K/V pages from HBM to VMEM.
+
+    Manages ``num_pages_to_load`` individual ``pltpu.AsyncCopy`` objects, one
+    per KV page in the compute block.  Pages are looked up via
+    ``block_tables[page_indices_start_offset + i]`` and written into
+    consecutive slots of ``vmem_buffer``.
+
+    Attributes:
+        _vmem_buffer: VMEM destination buffer for the loaded pages.
+        _num_pages_to_load: Number of pages in this compute block.
+        _pages_hbm_ref: Sliced HBM reference (indexed by ``head_index`` if
+            provided, or the full reference otherwise).
+        _sem: Pallas semaphore used to synchronise this set of copies.
+        _page_indices: The full block-tables array passed as a Pallas ref.
+        _page_indices_start_offset: Offset into ``_page_indices`` where this
+            compute block's page indices begin.
+        _async_copies: Pre-built list of ``AsyncCopy`` descriptors.
+    """
 
     def __init__(
         self,
@@ -175,6 +192,7 @@ class MultiPageAsyncCopyDescriptor:
         self._async_copies = [self._make_async_copy(i) for i in range(self._num_pages_to_load)]
 
     def _make_async_copy(self, i):
+        """Build an ``AsyncCopy`` descriptor for the i-th page in this block."""
         page_index = self._page_indices[self._page_indices_start_offset + i]
         return pltpu.make_async_copy(self._pages_hbm_ref.at[page_index], self._vmem_buffer.at[i], self._sem)
 
@@ -217,7 +235,56 @@ def paged_flash_attention_kernel(
     sliding_window: int | None = None,
     program_ids=(),
 ):
-    """Pallas kernel for paged attention."""
+    """Pallas kernel body for one tile of paged flash attention.
+
+    Processes a single ``(batch, kv_head, compute_block)`` tile of the paged
+    KV cache.  Async DMA prefetching hides HBM latency by double-buffering:
+    while the current block's attention scores are computed the next block's
+    pages are already being fetched.
+
+    Online softmax is maintained via running ``m`` (row-max) and ``l``
+    (sum-of-exponentials) statistics stored in ``m_ref`` and ``l_ref`` VMEM
+    scratch buffers, updating them in-place across calls.  The output
+    accumulator ``o_ref`` is also updated in-place.
+
+    Args:
+        lengths_ref: SMEM ref ``[batch_size]`` int32 context lengths.
+        page_indices_ref: SMEM ref ``[batch_size * pages_per_sequence]`` int32
+            page table.
+        buffer_index_ref: SMEM ref ``[1]`` holding the current double-buffer
+            index (0 or 1).
+        init_flag_ref: SMEM ref ``[1]``; non-zero on the very first tile to
+            trigger the initial prefetch.
+        q_ref: VMEM ref ``[num_groups, head_dim]`` query block.
+        k_pages_hbm_ref: HBM ref
+            ``[num_kv_heads, total_pages, page_size, head_dim]`` key cache.
+        v_pages_hbm_ref: HBM ref
+            ``[num_kv_heads, total_pages, page_size, head_dim]`` value cache.
+        o_ref: VMEM output ref ``[num_groups, head_dim]`` (updated in-place).
+        m_ref: VMEM running row-max ref ``[num_groups, 1]`` (updated in-place).
+        l_ref: VMEM running sum-of-exp ref ``[num_groups, 1]``
+            (updated in-place).
+        k_vmem_buffer: Double-buffered VMEM scratch
+            ``[2, pages_per_compute_block, page_size, head_dim]`` for K pages.
+        v_vmem_buffer: Double-buffered VMEM scratch
+            ``[2, pages_per_compute_block, page_size, head_dim]`` for V pages.
+        k_sems: Pallas semaphores ``[2]`` for K DMA synchronisation.
+        v_sems: Pallas semaphores ``[2]`` for V DMA synchronisation.
+        batch_size: Total number of sequences.
+        pages_per_compute_block: Number of KV pages processed per kernel tile.
+        pages_per_sequence: Maximum number of pages allocated per sequence.
+        mask_value: Fill value for out-of-range attention logit positions.
+        attn_logits_soft_cap: If not ``None``, apply ``soft_cap * tanh(x /
+            soft_cap)`` to logits before masking.
+        megacore_mode: One of ``"batch"``, ``"kv_head"``, or ``None``.  When
+            set, multiple TPU cores share the work: ``"batch"`` partitions
+            across the batch dimension and ``"kv_head"`` across KV heads.
+        sliding_window: If not ``None``, only attend within the last
+            ``sliding_window`` tokens.
+        program_ids: Optional 4-tuple ``(core, b, h, i)`` used when called
+            from ``paged_flash_attention_kernel_inline_seq_dim`` to supply
+            custom program IDs instead of reading them from ``pl.program_id``.
+    """
     if program_ids:
         core_index, b, h, i = program_ids
     else:
@@ -383,6 +450,46 @@ def paged_flash_attention_kernel_inline_seq_dim(
     megacore_mode: str | None,
     sliding_window: int | None = None,
 ):
+    """Variant of ``paged_flash_attention_kernel`` that loops over the sequence dimension inline.
+
+    Rather than using the KV sequence index as a Pallas grid dimension, this
+    kernel uses a 3-D grid ``(core, batch, kv_head)`` and runs a
+    ``lax.fori_loop`` over the sequence tiles.  This avoids the grid overhead
+    of having a fourth grid dimension and can be more efficient when the
+    number of sequence tiles is small.
+
+    The kernel resets ``m_ref``, ``l_ref``, and ``o_ref`` to initial values
+    before the loop begins.  All other semantics (online softmax, double-
+    buffered prefetch, megacore modes, sliding window) are inherited from
+    ``paged_flash_attention_kernel``, which is called on each loop iteration
+    with explicit ``program_ids``.
+
+    Args:
+        lengths_ref: SMEM ref ``[batch_size]`` int32 context lengths.
+        page_indices_ref: SMEM ref ``[batch_size * pages_per_sequence]`` int32
+            page table.
+        buffer_index_ref: SMEM ref ``[1]`` double-buffer index.
+        init_flag_ref: SMEM ref ``[1]`` initial-prefetch trigger.
+        q_ref: VMEM ref ``[num_groups, head_dim]`` query block.
+        k_pages_hbm_ref: HBM key cache
+            ``[num_kv_heads, total_pages, page_size, head_dim]``.
+        v_pages_hbm_ref: HBM value cache
+            ``[num_kv_heads, total_pages, page_size, head_dim]``.
+        o_ref: VMEM output ref ``[num_groups, head_dim]``.
+        m_ref: VMEM running row-max scratch ``[num_groups, 1]``.
+        l_ref: VMEM running sum-of-exp scratch ``[num_groups, 1]``.
+        k_vmem_buffer: Double-buffered VMEM K-page scratch.
+        v_vmem_buffer: Double-buffered VMEM V-page scratch.
+        k_sems: DMA semaphores ``[2]`` for K pages.
+        v_sems: DMA semaphores ``[2]`` for V pages.
+        batch_size: Total number of sequences.
+        pages_per_compute_block: Number of KV pages per kernel tile.
+        pages_per_sequence: Maximum pages per sequence.
+        mask_value: Fill value for out-of-range logit positions.
+        attn_logits_soft_cap: Optional soft cap for attention logits.
+        megacore_mode: ``"batch"``, ``"kv_head"``, or ``None``.
+        sliding_window: Optional sliding-window attention size.
+    """
     core_index, b, h = pl.program_id(0), pl.program_id(1), pl.program_id(2)
 
     m_ref[...] = jnp.full_like(m_ref, -jnp.inf)

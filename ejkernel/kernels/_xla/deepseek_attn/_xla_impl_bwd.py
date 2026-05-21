@@ -12,7 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backward utilities for XLA DeepSeek attention."""
+"""Backward pass for the XLA DeepSeek Sparse Attention kernel.
+
+The gradient computation re-runs the forward pass inside ``jax.vjp`` with
+``lax.stop_gradient`` applied to the three Lightning Indexer inputs
+(``query_index``, ``key_index``, ``index_weights``).  This means:
+
+- ``query``, ``key_value``, ``w_kc``, ``w_vc``, ``b_q``, ``b_k`` receive
+  meaningful gradients via JAX's autodiff.
+- ``query_index``, ``key_index``, ``index_weights`` receive **zero** gradients
+  because the top-k selection in the indexer is non-differentiable.
+"""
 
 from __future__ import annotations
 

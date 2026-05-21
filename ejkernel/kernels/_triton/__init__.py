@@ -20,17 +20,28 @@ attention mechanisms and neural network operations. All kernels are designed
 for efficient GPU execution using JAX and Triton.
 
 Available kernels:
+- blocksparse_attention: Block-sparse attention with custom sparsity patterns
+- chunked_prefill_paged_decode: Hybrid prefill + paged decode for KV-cache inference
+- decode_attention: Paged decode-time attention (vLLM-style)
 - flash_attention: Memory-efficient exact attention with O(N) memory complexity
+- flash_mla: Flash Multi-head Latent Attention stub (not yet implemented)
 - recurrent: Linear-time recurrent attention mechanisms
 - recurrent_gla: Gated Linear Attention implementation
 - lightning_attn: Lightning Attention with layer-adaptive decay
 - mean_pooling: Efficient mean pooling over sequence dimension
 - native_sparse_attention: Sparse attention with dynamic block selection
+- page_attention: Standard paged attention
 - quantized_matmul: Packed uint32 quantized matmul
+- ragged_decode_attention: Ragged-batch decode attention
+- ragged_page_attention_v2: Ragged paged attention (v2)
+- ragged_page_attention_v3: Ragged paged attention (v3)
+- ring_attention: Ring-buffer attention for long contexts
+- rwkv4, rwkv6, rwkv7: RWKV recurrent model kernels
+- unified_attention: Unified paged attention supporting mixed prefill/decode
 
 All implementations support:
 - Variable-length sequences via cumulative sequence lengths
-- Custom backward passes for gradient computation
+- Custom backward passes for gradient computation where applicable
 - Automatic kernel tuning for optimal performance
 """
 

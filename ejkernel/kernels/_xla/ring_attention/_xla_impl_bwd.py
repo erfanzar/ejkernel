@@ -90,36 +90,53 @@ def _blockwise_attention_bwd(
     attention_sink_size: int = 0,
     causal: bool = False,
 ):
-    """Backward pass for blockwise attention.
+    """Backward pass for blockwise attention over one KV shard.
+
+    Re-computes attention weights from the forward inputs and uses them (along
+    with the saved denominator and max_score) to compute dQ, dK, and dV for
+    the current KV shard.  The function iterates over all query-chunk ×
+    KV-chunk pairs using ``lax.scan``, which mirrors the forward structure.
 
     Args:
-            query: Query array of shape (batch, q_len, num_heads, dim_per_head).
-            key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
-            value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-            g: Gradient of the output.
-            carry: Tuple of intermediate values from the forward pass.
-            q_chunk_idx_start: Start index of the query chunk.
-            k_chunk_idx_start: Start index of the key chunk.
-            bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
-            q_segment_ids: tp.Optional query segment ids array of shape (batch, q_len).
-            kv_segment_ids: tp.Optional key/value segment ids array of shape (batch, kv_len).
-            softmax_scale: softmax_scale for softmax or depth ** -0.5.
-            causal_block_size: Size of causal blocks.
-            query_chunk_size: Size of query chunks.
-            key_chunk_size: Size of key chunks.
-            deterministic: Whether to apply dropout.
-            dropout_rng: PRNG key for dropout.
-            pdrop: Dropout probability.
-            dtype: dtype of the computation.
-            policy: Checkpoint policy.
-            precision: Precision of the computation.
-            prevent_cse: Whether to prevent common subexpression elimination.
-            sliding_window: Size of sliding window for local attention.
-            logits_soft_cap: Soft cap value for logits to prevent overflow.
-            causal: If True, applies causal masking.
+        query: Query array (batch, q_len, num_heads, dim_per_head).
+        key: Key array (batch, kv_len, num_heads, dim_per_head).
+        value: Value array (batch, kv_len, num_heads, dim_per_head).
+        g: Gradient of the forward output
+            (batch, q_len, num_heads, dim_per_head).
+        carry: Tuple (dq, dk, dv, output, denominator, max_score) from the
+            previous ring backward step.
+        q_chunk_idx_start: Absolute chunk offset for query, used to replicate
+            forward masking offsets exactly.
+        k_chunk_idx_start: Absolute chunk offset for key/value.
+        bias: Optional additive bias (batch, num_heads, q_len, kv_len).
+        q_segment_ids: Optional query segment IDs (batch, q_len).
+        kv_segment_ids: Optional key/value segment IDs (batch, kv_len).
+        q_position_ids: Optional query position IDs (batch, q_len).
+        kv_position_ids: Optional key/value position IDs (batch, kv_len).
+        softmax_aux: Unused in the backward (pass None; kept for signature
+            symmetry with the forward).
+        softmax_scale: Scale multiplier for QK^T logits (same convention as
+            in the forward).  If None, defaults to
+            ``sqrt(head_dim)``.
+        causal_block_size: Block size for causal diagonal check.
+        query_chunk_size: Query tokens per chunk.
+        key_chunk_size: Key tokens per chunk.
+        deterministic: If True, disables dropout.
+        dropout_rng: PRNG key for dropout.
+        pdrop: Dropout probability.
+        dtype: Dtype for chunk biases.
+        policy: JAX checkpoint policy for remat.
+        precision: JAX matmul precision.
+        prevent_cse: CSE suppression flag for ``jax.checkpoint``.
+        sliding_window: Local attention window (int or (left, right) tuple).
+        logits_soft_cap: Applies ``cap * tanh(logits/cap)`` when not None;
+            the backward applies the corresponding sech² correction.
+        attention_sink_size: Number of leading KV positions always attended to.
+        causal: If True, enables causal masking using causal_block_size.
 
     Returns:
-            A tuple containing the gradients of the query, key, and value arrays.
+        Tuple of (dq, dk, dv) gradient arrays, each with the same shape as the
+        corresponding primal input.
     """
     batch, q_len, num_heads, dim_per_head = query.shape
     batch, kv_len, num_heads, dim_per_head = key.shape
@@ -337,29 +354,46 @@ def _ring_attention_bwd(
     res,
     g: chex.Array,
 ):
-    """Backward pass for ring attention.
+    """Backward pass for ring attention (XLA custom-VJP backward rule).
+
+    Performs a distributed ring-attention backward scan mirroring the forward:
+    ``axis_size`` ring steps, each calling ``_blockwise_attention_bwd`` on the
+    local KV shard and then rotating key, value, dk, dv (and optional
+    segment/position metadata) to the next device via ``lax.ppermute``.
+
+    The non-differentiable static arguments (axis_name through causal) are
+    bound by ``jax.custom_vjp`` and appear as leading positional arguments
+    before the residuals and output gradient.
 
     Args:
-            axis_name: Name of the axis to ppermute over.
-            float32_logits: Whether to compute logits in float32.
-            softmax_scale: softmax_scale for softmax or depth ** -0.5.
-            query_chunk_size: Size of query chunks.
-            key_chunk_size: Size of key chunks.
-            causal_block_size: Size of causal blocks.
-            deterministic: Whether to apply dropout.
-            dropout_rng: PRNG key for dropout.
-            pdrop: Dropout probability.
-            dtype: dtype of the computation.
-            policy: Checkpoint policy.
-            precision: Precision of the computation.
-            prevent_cse: Whether to prevent common subexpression elimination.
-            sliding_window: Size of sliding window for local attention.
-            logits_soft_cap: Soft cap value for logits to prevent overflow.
-            res: Tuple of intermediate values from the forward pass.
-            g: Gradient of the output.
+        axis_name: JAX collective axis name (None = single device).
+        float32_logits: Whether logits were computed in float32 in the forward.
+        softmax_scale: Scale multiplier used in the forward pass.
+        query_chunk_size: Query tokens per chunk used in the forward.
+        key_chunk_size: Key tokens per chunk used in the forward.
+        causal_block_size: Block size for causal diagonal check.
+        deterministic: If True, dropout was disabled in the forward.
+        dropout_rng: PRNG key used for dropout in the forward.
+        pdrop: Dropout probability used in the forward.
+        dtype: Dtype used in the forward.
+        policy: JAX checkpoint policy.
+        precision: JAX matmul precision.
+        prevent_cse: CSE suppression flag.
+        sliding_window: Local attention window specification.
+        logits_soft_cap: Soft cap value; backward applies sech² correction.
+        attention_sink_size: Number of leading KV sink positions used in fwd.
+        causal: Whether causal masking was applied in the forward.
+        res: Residuals tuple saved by ``_ring_attention_fwd``, containing
+            (output, query, key, value, bias, q_segment_ids, kv_segment_ids,
+            q_position_ids, kv_position_ids, denominator, max_score).
+        g: Gradient of the forward output
+            (batch, q_len, num_heads, dim_per_head).
 
     Returns:
-            A tuple containing the gradients of the inputs.
+        Tuple of 9 elements: (dq, dk, dv, d_bias, d_q_segment_ids,
+        d_kv_segment_ids, d_q_position_ids, d_kv_position_ids,
+        d_softmax_aux) where the last 6 are None (no gradients for those
+        inputs).
     """
     del float32_logits
     (

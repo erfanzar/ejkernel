@@ -50,6 +50,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax._src.pallas import primitives as pallas_primitives
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as ptriton
 from jaxtyping import Array, Float, Int
@@ -78,22 +79,66 @@ def forward_kernel(
     block_size_heads: int,
     total_num_heads: int,
 ):
-    """
-    Forward kernel for multi-head attention computation.
+    """Pallas forward kernel for one (head-group, key-split) tile of decode attention.
+
+    Executed on a 2-D grid: ``(num_head_splits, num_key_splits)``.  Each
+    invocation processes ``block_size_heads`` query heads against one contiguous
+    slice of the key/value sequence (``split_key_seq_len`` tokens), accumulating
+    an online-softmax running state.
+
+    Tensor layout (inputs, per grid cell):
+        query_ref:  [block_size_heads, head_dim]
+        key_ref:    [split_key_seq_len, head_dim]  (one key-split slice)
+        value_ref:  [split_key_seq_len, head_dim]  (matching value slice)
+        sequence_start_ref: scalar int32 — global start of valid tokens (or None)
+        sequence_end_ref:   scalar int32 — global end of valid tokens (or None)
+
+    Outputs, per grid cell:
+        output_ref:      [block_size_heads, head_dim] — partial weighted sum
+        log_sum_exp_ref: [block_size_heads] — running log-sum-exp denominator
+        max_logit_ref:   [block_size_heads] — running max logit (for correction)
+
+    The kernel iterates over ``split_key_seq_len // block_size_k`` key blocks
+    using ``lax.fori_loop``.  For each block it:
+      1. Loads the key slice and computes raw dot-product scores.
+      2. Applies ``softmax_scale``.
+      3. Masks positions outside ``[sequence_start, sequence_end)`` with
+         ``finfo.min`` (only when either ref is not None).
+      4. Updates the running online-softmax state (max, log-sum-exp, output).
+
+    When ``sequence_start_ref`` and ``sequence_end_ref`` are both None the
+    masking branch is skipped entirely and a ``lax.cond`` guard is omitted.
 
     Args:
-        query_ref: Reference to query tensor
-        key_ref: Reference to key tensor
-        value_ref: Reference to value tensor
-        sequence_start_ref: Reference to sequence start positions (optional)
-        sequence_end_ref: Reference to sequence end positions (optional)
-        output_ref: Reference to output tensor
-        log_sum_exp_ref: Reference to log-sum-exp values
-        max_logit_ref: Reference to maximum logits
-        softmax_scale: Scaling factor for softmax
-        block_size_k: Block size for key dimension
-        block_size_heads: Block size for heads dimension
-        total_num_heads: Total number of attention heads
+        query_ref: VMEM reference to the query tile, shape
+            [block_size_heads, head_dim].
+        key_ref: VMEM reference to the key split, shape
+            [split_key_seq_len, head_dim].
+        value_ref: VMEM reference to the value split, shape
+            [split_key_seq_len, head_dim].
+        sequence_start_ref: Scalar SMEM reference containing the global
+            sequence start index, or None for no lower-bound masking.
+        sequence_end_ref: Scalar SMEM reference containing the global sequence
+            end index (exclusive), or None for no upper-bound masking.
+        output_ref: VMEM output reference for the partial attention output,
+            shape [block_size_heads, head_dim].
+        log_sum_exp_ref: VMEM reference for the log-sum-exp accumulator,
+            shape [block_size_heads].
+        max_logit_ref: VMEM reference for the running maximum logit,
+            shape [block_size_heads].
+        softmax_scale: Scalar float multiplied into attention logits before
+            the online-softmax step (typically ``1/sqrt(head_dim)``).
+        block_size_k: Number of key tokens processed per inner loop iteration.
+            Must evenly divide ``split_key_seq_len`` and be >= 16.
+        block_size_heads: Number of query heads processed by this kernel
+            invocation.  May be larger than the remaining heads; a mask guards
+            the out-of-bounds rows.
+        total_num_heads: Total number of query heads across all head-splits.
+            Used to compute the valid-head mask for the last head tile.
+
+    Raises:
+        RuntimeError: Wraps any exception raised during kernel body execution
+            with context about the failure site.
     """
     try:
         _, head_dimension = query_ref.shape
@@ -105,7 +150,7 @@ def forward_kernel(
 
         def _compute_attention(seq_start, seq_end, output_accumulator, max_logits_prev, log_sum_prev):
             """Inner computation function for attention mechanism."""
-            current_query = pl.load(query_ref, (query_slice, pl.ds(None)), mask=query_mask)
+            current_query = pallas_primitives.load(query_ref, (query_slice, pl.ds(None)), mask=query_mask)
             block_indices = jnp.arange(block_size_k)
 
             def attention_body(key_block_start, carry_state):
@@ -113,7 +158,10 @@ def forward_kernel(
                 output_prev, max_prev, logsum_prev = carry_state
                 current_key_slice = pl.ds(key_block_start * block_size_k, block_size_k)
 
-                attention_scores = pl.dot(current_query, pl.load(key_ref, (current_key_slice, slice(None))).T)
+                attention_scores = pl.dot(
+                    current_query,
+                    pallas_primitives.load(key_ref, (current_key_slice, slice(None))).T,
+                )
 
                 if softmax_scale != 1.0:
                     attention_scores *= softmax_scale
@@ -133,7 +181,7 @@ def forward_kernel(
                 logsum_current = softmax_scores.sum(axis=-1)
                 logsum_next = logsum_prev_corrected + logsum_current
 
-                current_values = pl.load(value_ref, (current_key_slice, slice(None)))
+                current_values = pallas_primitives.load(value_ref, (current_key_slice, slice(None)))
                 output_current = pl.dot(softmax_scores.astype(current_values.dtype), current_values)
                 output_next = correction_factor[:, None] * output_prev + output_current
 
@@ -156,11 +204,11 @@ def forward_kernel(
 
         sequence_start = split_key_seq_len * program_id_splits
         if sequence_start_ref is not None:
-            sequence_start = jnp.maximum(sequence_start, pl.load(sequence_start_ref, ()))
+            sequence_start = jnp.maximum(sequence_start, pallas_primitives.load(sequence_start_ref, ()))
 
         sequence_end = (program_id_splits + 1) * split_key_seq_len
         if sequence_end_ref is not None:
-            sequence_end = jnp.minimum(sequence_end, pl.load(sequence_end_ref, ()))
+            sequence_end = jnp.minimum(sequence_end, pallas_primitives.load(sequence_end_ref, ()))
 
         if sequence_start_ref is None and sequence_end_ref is None:
             final_output, final_max_logits, final_log_sum = _compute_attention(
@@ -174,11 +222,11 @@ def forward_kernel(
             )
 
         vector_query_mask = query_mask.reshape(-1) if query_mask is not None else None
-        pl.store(log_sum_exp_ref, query_slice, final_log_sum, mask=vector_query_mask)
-        pl.store(max_logit_ref, query_slice, final_max_logits, mask=vector_query_mask)
+        pallas_primitives.store(log_sum_exp_ref, query_slice, final_log_sum, mask=vector_query_mask)
+        pallas_primitives.store(max_logit_ref, query_slice, final_max_logits, mask=vector_query_mask)
 
         final_output = final_output.astype(output_ref.dtype)
-        pl.store(output_ref, (query_slice, pl.ds(None)), final_output, mask=query_mask)
+        pallas_primitives.store(output_ref, (query_slice, pl.ds(None)), final_output, mask=query_mask)
 
     except Exception as e:
         raise RuntimeError(f"Error in forward_kernel execution: {e!s}") from e
@@ -197,28 +245,59 @@ def decode_attn_sequence(
     num_warps: int | None,
     num_stages: int,
 ) -> jnp.ndarray:
-    """
-    Decode attention for sequence processing with improved error handling.
+    """Orchestrate a single-sequence ragged decode attention call via Pallas.
+
+    Reshapes the flat key/value tensors into ``num_key_splits`` splits, builds
+    the ``pallas_call`` grid, launches ``forward_kernel`` in parallel across
+    head-tiles and key-splits, then reduces the per-split results with a final
+    online-softmax correction to produce the single-sequence output.
+
+    Grid layout:
+        Axis 0 — head splits: ``ceil(num_heads / block_size_heads)``
+        Axis 1 — key splits: ``num_key_splits``
+
+    Output reduction:
+        Each split produces a partial weighted sum, a log-sum-exp denominator,
+        and a running max.  After the kernel, the per-split max values are
+        globally reduced, correction factors are applied, and the partial sums
+        are combined and normalized.
 
     Args:
-        query_tensor: Query tensor of shape (num_heads, head_dim)
-        key_tensor: Key tensor of shape (seq_len, head_dim)
-        value_tensor: Value tensor of shape (seq_len, head_dim)
-        sequence_start: Optional start positions for sequences
-        sequence_end: Optional end positions for sequences
-        softmax_scale: Scaling factor for attention scores
-        block_size_heads: Block size for processing heads
-        block_size_keys: Block size for processing keys
-        num_key_splits: Number of splits for key tensor
-        num_warps: Number of warps for GPU execution (optional)
-        num_stages: Number of pipeline stages
+        query_tensor: Query array of shape ``(num_heads, head_dim)``.
+            Must be 2-D.
+        key_tensor: Key array of shape ``(seq_len, head_dim)``.  Must be 2-D
+            and have the same ``head_dim`` as ``query_tensor``.
+        value_tensor: Value array of shape ``(seq_len, head_dim)``.  Must
+            have the same shape as ``key_tensor``.
+        sequence_start: Optional scalar-shaped array with the global start
+            index of the valid token range for this sequence.  When None,
+            no lower-bound masking is applied.
+        sequence_end: Optional scalar-shaped array with the global end index
+            (exclusive) of the valid token range.  When None, no upper-bound
+            masking is applied.
+        softmax_scale: Scalar multiplied into attention logits before softmax
+            (typically ``1/sqrt(head_dim)``).
+        block_size_heads: Number of heads per Pallas head-tile.  Must be >= 1.
+        block_size_keys: Number of key tokens per inner kernel loop iteration.
+            Must be >= 16 and evenly divide the per-split key length.
+        num_key_splits: Number of groups to split the key sequence into.
+            ``seq_len`` must be divisible by ``num_key_splits`` and each split
+            must be >= 16 tokens.
+        num_warps: Number of Triton warps for the GPU kernel.  Defaults to 4
+            when None.
+        num_stages: Number of software pipeline stages for memory prefetching.
 
     Returns:
-        Output tensor from attention computation
+        Attention output array of shape ``(num_heads, head_dim)`` with the
+        same dtype as ``query_tensor``.
 
     Raises:
-        AttentionConfigError: If configuration parameters are invalid
-        ValueError: If tensor shapes are incompatible
+        ValueError: If any tensor is not 2-D, head dimensions do not match,
+            or key/value shapes differ.
+        AttentionConfigError: If ``seq_len`` is not divisible by
+            ``num_key_splits``, the per-split length is < 16, or
+            ``block_size_keys`` is < 16 or does not divide the per-split
+            sequence length.
     """
     try:
         if query_tensor.ndim != 2:
@@ -335,31 +414,51 @@ def _ragged_decode_attention_call(
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "num_sinks"] | None = None,
 ) -> Float[Array, "batch num_q_heads head_dim"]:
-    """Internal JIT-compiled wrapper that executes the ragged decode kernel.
+    """JIT-compiled entry point that dispatches the batched ragged decode kernel.
 
-    This function reshapes and validates input tensors, sets up head grouping for MHA/MQA/GQA,
-    applies broadcasting for sequence ranges, and dispatches the GPU attention kernel using `jax.vmap`.
+    Validates tensor shapes, computes the default ``softmax_scale``, groups
+    query heads per KV head for MHA/MQA/GQA, broadcasts the per-batch
+    ``sequence_start``/``sequence_end`` indices to ``(batch, kv_heads)``, and
+    applies ``jax.vmap`` twice (over batch and KV-head dimensions) to
+    ``decode_attn_sequence``.
+
+    Kernel parameters (``block_size_heads``, ``kv_blocksize``,
+    ``num_key_splits``, ``num_warps``, ``num_stages``) are taken from
+    ``fwd_params`` (a :class:`ejkernel.ops.FwdParams` instance).  When
+    ``fwd_params`` is ``None`` a ``FwdParams()`` with all defaults is used,
+    which may raise ``AttributeError`` because the defaults are ``None``.
+    Callers should always pass an explicit ``FwdParams``.
 
     Args:
-        query (chex.Array): Query tensor of shape (batch_size, num_query_heads, head_dim).
-        key (chex.Array): Key tensor of shape (batch_size, sequence_length, num_kv_heads, head_dim).
-        value (chex.Array): Value tensor of shape (batch_size, sequence_length, num_kv_heads, head_dim).
-        sequence_start (chex.Array): Start positions of sequences for ragged decoding.
-        sequence_end (chex.Array): End positions of sequences for ragged decoding.
-        softmax_scale (float | None): Optional softmax scaling factor.
-        block_size_heads (int): Block size along head dimension.
-        block_size_keys (int): Block size along key dimension.
-        num_key_splits (int): Number of splits for key processing.
-        num_warps (int | None): Number of warps for the GPU kernel.
-        num_stages (int): Number of pipeline stages.
+        query: Query tensor of shape ``[batch, num_q_heads, head_dim]``.
+        key: Key tensor of shape ``[batch, seq_len, num_kv_heads, head_dim]``.
+        value: Value tensor of shape ``[batch, seq_len, num_kv_heads, head_dim]``.
+        sequence_start: Per-batch start index of valid tokens, shape
+            ``[batch]``.  Broadcast internally to ``[batch, kv_heads]``.
+        sequence_end: Per-batch end index (exclusive) of valid tokens, shape
+            ``[batch]``.  Broadcast internally to ``[batch, kv_heads]``.
+        softmax_scale: Scaling factor for attention logits.  Defaults to
+            ``1/sqrt(head_dim)`` when None.
+        fwd_params: Forward kernel parameters.  Relevant fields:
+            ``blocksize_heads`` — head tile size for the GPU kernel;
+            ``kv_blocksize``    — key tile size per inner loop iteration;
+            ``num_key_splits``  — number of key-sequence splits;
+            ``num_warps``       — number of Triton warps (None → 4);
+            ``num_stages``      — Triton software-pipeline stages.
+        sliding_window: Accepted but currently unused.  Reserved for future
+            sliding-window attention support.
+        logits_soft_cap: Accepted but currently unused.  Reserved for future
+            logit-capping support.
+        softmax_aux: Accepted but currently unused.  Reserved for future
+            attention-sink support.
 
     Returns:
-        chex.Array: Output tensor of shape (batch_size, num_query_heads, head_dim).
+        Attention output of shape ``[batch, num_q_heads, head_dim]``.
 
     Raises:
-        ValueError: If key and value heads mismatch.
-        ValueError: If query heads are not divisible by key/value heads.
-
+        ValueError: If ``key.shape[2] != value.shape[2]`` (KV head count
+            mismatch) or if ``num_q_heads % num_kv_heads != 0`` (query heads
+            not divisible by KV heads).
     """
     softmax_scale = softmax_scale if softmax_scale is not None else (query.shape[-1] ** -0.5)
     batch_size, q_heads, head_dim = query.shape

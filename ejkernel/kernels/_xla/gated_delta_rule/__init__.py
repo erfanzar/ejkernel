@@ -15,16 +15,17 @@
 
 """XLA backend for Gated Delta Rule (GDR) linear attention.
 
-This submodule provides XLA-optimized implementation of the Gated Delta Rule,
-a linear attention mechanism used in hybrid transformer architectures.
+This submodule provides the XLA/JAX implementation of the Gated Delta Rule, a
+linear attention mechanism used in hybrid transformer architectures such as
+Qwen3Next.
 
 Key Features:
     - O(N) complexity through recurrent state updates
     - Gated delta rule for selective memory management
-    - Neumann series for parallel intra-chunk computation
-    - Learnable decay for temporal weighting
-    - Support for chunked, recurrent, and single-step modes
-    - Custom VJP with analytical backward for numerical stability
+    - Exact intra-chunk computation via triangular solve (replaces earlier
+      Neumann-series approximation which diverged on padded batches)
+    - Learnable per-token decay for temporal weighting
+    - Support for chunked, recurrent, and single-step computation modes
 
 Reference:
     Qwen3Next: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/

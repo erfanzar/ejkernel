@@ -15,14 +15,18 @@
 
 """XLA backend for Ragged Page Attention V3.
 
-This submodule provides the latest XLA-optimized implementation of ragged
-page attention with improved performance and additional features.
+Fused update-and-attend paged attention for mixed prefill/decode batches.
 
-Key Features:
-    - Enhanced variable-length sequence support
-    - Improved paging algorithm for better memory efficiency
-    - Sliding window attention support
-    - Optimized tiling for different hardware configurations
+Key advances over V2:
+    - **In-place KV cache writes**: new key/value tokens are written into the
+      paged cache before attention, enabling self-attention within prefill.
+    - **Merged K/V storage**: keys and values are interleaved in a packed
+      layout for cache-friendly access.
+    - **Distribution-based dispatch**: a 3-element ``distribution`` array
+      describes the prefill/decode breakdown; only ``distribution[2]``
+      (total sequences) is used by the XLA backend.
+    - **Quantisation scales**: optional ``q_scale``, ``k_scale``, ``v_scale``
+      for FP8 / INT8 inference modes.
 """
 
 from ._interface import ragged_page_attention_v3

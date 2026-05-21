@@ -516,46 +516,32 @@ def create_sparsity_mask(
     window_left: int = -1,
     window_right: int = -1,
 ) -> tuple[SparseMask, ...]:
-    """
-    Creates attention masks for forward and (optionally) backward block-sparse attention
-    kernels.
+    """Create sparse attention masks for forward and backward block-sparse attention passes.
 
-    This function generates the required attention masks based on the query and
-    key-value (KV) positions and segment ids. The masks are used for both
-    the forward and backward passes in flash attention to improve computational
-    efficiency while respecting segment boundaries.
+    Generates three ``SparseMask`` objects needed for training:
+
+    - Index 0 / 1 (``fwd_bwd_q_mask``): forward pass query mask, also reused for dQ
+      in the backward pass.
+    - Index 2 (``dkdv_mask``): backward pass dK/dV mask (transposed sparsity, each KV
+      block sees which query blocks attend to it).
 
     Args:
-        q_positions (ArrayLike): The positions of the query tokens of shape:
-            (batch_size, query_seq_length).
-        q_segment_ids (ArrayLike): Segment ids for query tokens of shape:
-            (batch_size, query_seq_length).
-        kv_positions (ArrayLike): The positions of the key and value tokens of shape:
-            (batch_size, kv_seq_length).
-        kv_segment_ids (ArrayLike): Segment ids for key abd value tokens of shape:
-            (batch_size, kv_seq_length).
-        fwd_params (FlashAttentionParamsConfig | None, optional): Parameters for the
-            forward pass of the flash attention kernel. Defaults to parameters defined
-            via `get_default_flash_attention_params(backward=False)`.
-        bwd_params (FlashAttentionParamsConfig | None, optional): Parameters for the
-            backward pass of the flash attention kernel. Defaults to parameters defined
-            via `get_default_flash_attention_params(backward=True)`.
-        mesh (Mesh | None, optional): Device mesh configuration for distributed
-            execution. If None, it takes the mesh from the global context.
-            Defaults is None.
+        q_positions: Query token positions, shape (batch_size, query_seq_length).
+        q_segment_ids: Segment IDs for query tokens, shape (batch_size, query_seq_length).
+        kv_positions: Key/value token positions, shape (batch_size, kv_seq_length).
+        kv_segment_ids: Segment IDs for key/value tokens, shape (batch_size, kv_seq_length).
+        mesh: Optional JAX device mesh for distributed execution. Currently accepted but
+            forwarded to ``SparseMask.from_inputs`` without effect on sharding.
+        kv_blocksize: Block size for the KV sequence dimension (default: 64).
+        q_blocksize: Block size for the query sequence dimension (default: 64).
+        causal: If True, apply causal (lower-triangular) masking (default: True).
+        window_left: Left window size for sliding-window attention (-1 = unlimited).
+        window_right: Right window size for sliding-window attention (-1 = unlimited).
 
     Returns:
-        tuple[SparseMask, ...]: A tuple containing:
-            - The forward attention mask.
-            - (Optional) The backward mask for dquery (if `calc_bwd_mask` is True).
-            - (Optional) The backward mask for dkey and dvalue
-                (if `calc_bwd_mask` is True).
-
-    Notes:
-        - If `calc_bwd_mask` is True, masks for dquery, dkey, and dvalue are computed.
-        - Defaults for `fwd_params` and `bwd_params` are set using
-            `get_default_flash_attention_params`.
-
+        A 3-tuple ``(fwd_bwd_q_mask, fwd_bwd_q_mask, dkdv_mask)`` of ``SparseMask``
+        instances. The first two elements are identical (the forward/dQ mask) and the
+        third is the transposed dK/dV mask.
     """
     fwd_bwd_q_mask = SparseMask.from_inputs(
         q_positions,

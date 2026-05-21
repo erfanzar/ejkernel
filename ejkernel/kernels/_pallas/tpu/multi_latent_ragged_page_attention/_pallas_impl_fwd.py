@@ -43,6 +43,26 @@ def get_kv_cache_shape(
     kv_dim,
     kv_dtype,
 ):
+    """Compute the canonical 4-D MLA paged KV cache tensor shape.
+
+    The cache stores combined latent KV (``lkv_dim``) and RoPE key
+    (``r_dim``) in a single packed layout:
+
+    ``(total_num_pages, ceil(page_size / packing), packing, align(kv_dim, 128))``
+
+    Sub-word dtypes (e.g. bfloat16) are packed into 32-bit words along the
+    ``kv_packing`` axis so that each DMA transfer is a multiple of 32 bits.
+
+    Args:
+        total_num_pages: Total number of pages in the cache.
+        page_size: Number of tokens per page.
+        kv_dim: Combined ``lkv_dim + r_dim`` (unpadded).
+        kv_dtype: Data type of the KV cache entries.
+
+    Returns:
+        4-tuple ``(total_num_pages, page_size // packing, packing,
+        align_to(kv_dim, 128))``.
+    """
     kv_packing = get_dtype_packing(kv_dtype)
     return (
         total_num_pages,
@@ -123,6 +143,40 @@ def ref_mla_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
 ):
+    """Reference (non-Pallas) implementation of MLA ragged paged attention.
+
+    Provides an unoptimised but numerically correct reference for testing the
+    Pallas kernel.  It first writes new tokens into the KV cache via
+    ``update_kv_cache``, then iterates over sequences performing MQA-style
+    attention where K and V are gathered from the paged cache.
+
+    The attention computation uses split Q (nope + pe) and K (lkv + r_pe),
+    then values are taken from the latent KV component only (``lkv_dim``).
+
+    Args:
+        ql_nope: Non-positional query component
+            ``[num_tokens, num_q_heads, actual_lkv_dim]``.
+        q_pe: Positional query component
+            ``[num_tokens, num_q_heads, actual_r_dim]``.
+        new_kv_c: New token KV-compressed vectors ``[num_tokens, actual_lkv_dim]``.
+        new_k_pe: New token key positional vectors ``[num_tokens, actual_r_dim]``.
+        cache_kv: Paged KV cache (packed layout from ``get_kv_cache_shape``).
+        kv_lens: Per-sequence KV lengths before new tokens ``[max_num_seqs]``.
+        page_indices: Flat page table ``[max_num_seqs * pages_per_seq]``.
+        cu_q_lens: Cumulative query offsets ``[max_num_seqs + 1]``.
+        distribution: ``[decode_end, prefill_end, total_seqs]``.
+        sm_scale: Softmax temperature scale applied to QK^T logits.
+        sliding_window: Optional local-attention window size.
+        soft_cap: Optional Gemma-2-style logit soft cap.
+        mask_value: Large negative fill value for masked positions.
+        q_scale: Optional query dequantisation scale.
+        k_scale: Optional key dequantisation scale.
+        v_scale: Optional value dequantisation scale.
+
+    Returns:
+        ``(outputs, updated_cache_kv)`` where ``outputs`` has shape
+        ``[num_tokens, num_q_heads, actual_lkv_dim]``.
+    """
 
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -1017,6 +1071,19 @@ def _mla_ragged_paged_attention_kernel(
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
+    """Re-shape and pad a query tensor into the packed layout expected by the kernel.
+
+    Pads ``num_q_heads`` to the next multiple of ``q_packing`` (32 // bits),
+    pads ``head_dim`` to the next multiple of 128, then reshapes to
+    ``[max_num_tokens, num_q_heads // q_packing, q_packing, head_dim]``.
+
+    Args:
+        q: Query array ``[max_num_tokens, actual_num_q_heads, actual_head_dim]``.
+
+    Returns:
+        Padded and repacked query array
+        ``[max_num_tokens, num_q_heads // q_packing, q_packing, head_dim]``.
+    """
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads = align_to(actual_num_q_heads, q_packing)
@@ -1045,6 +1112,19 @@ def prepare_q_inputs(
 def prepare_kv_inputs(
     kv: jax.Array,  # [max_num_tokens, actual_head_dim],
 ):
+    """Re-shape and pad a KV vector tensor into the packed layout expected by the kernel.
+
+    Packs ``kv_packing`` tokens along a new dimension (so sub-word dtypes
+    fill 32-bit words) and pads ``head_dim`` to the next multiple of 128.
+
+    ``max_num_tokens`` must be divisible by ``kv_packing``.
+
+    Args:
+        kv: Flat KV tensor ``[max_num_tokens, actual_head_dim]``.
+
+    Returns:
+        Packed KV tensor ``[max_num_tokens // kv_packing, kv_packing, head_dim]``.
+    """
     max_num_tokens, actual_head_dim = kv.shape
     kv_packing = get_dtype_packing(kv.dtype)
     assert max_num_tokens % kv_packing == 0
@@ -1061,6 +1141,21 @@ def prepare_outputs(
     actual_num_q_heads: int,
     actual_head_dim: int,
 ):
+    """Unpack the kernel output back to the canonical ``[tokens, heads, dim]`` layout.
+
+    Reverses the packing applied by ``prepare_q_inputs``: reshapes to
+    ``[max_num_tokens, num_q_heads, head_dim]`` then slices to the original
+    unpadded ``actual_num_q_heads`` and ``actual_head_dim``.
+
+    Args:
+        out: Packed kernel output
+            ``[max_num_tokens, num_q_heads // q_packing, q_packing, head_dim]``.
+        actual_num_q_heads: Original (unpadded) number of query heads.
+        actual_head_dim: Original (unpadded) head dimension.
+
+    Returns:
+        Attention output ``[max_num_tokens, actual_num_q_heads, actual_head_dim]``.
+    """
     (
         max_num_tokens,
         num_q_heads_per_q_packing,

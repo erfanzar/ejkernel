@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Grouped matrix multiplication interface using XLA ragged_dot.
+"""Grouped matrix multiplication core implementation using XLA ragged_dot.
 
-This module provides the public API for grouped matrix multiplication
-where different row slices of a matrix are multiplied with different
-weight matrices. Uses JAX's ragged_dot_general for efficient computation.
+This module provides the core XLA implementation of grouped matrix
+multiplication using ``jax.lax.ragged_dot_general``.  Different row slices
+of ``lhs`` are multiplied against their corresponding group matrix in ``rhs``
+according to the ``group_sizes`` partition vector.
+
+The ``set_xla_metadata`` context manager is used to forward optional ``tiling``
+hints to the XLA compiler, enabling tile-size optimisation without altering
+numerical behaviour.
 """
 
 from __future__ import annotations
@@ -47,76 +52,50 @@ def grouped_matmul(
     interpret: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
 ) -> Float[Array, "m n"]:
-    """Grouped Matrix Multiplication: Compute separate matrix products for each group.
+    """Grouped Matrix Multiplication via ``jax.lax.ragged_dot_general``.
 
-    This function performs grouped matrix multiplication where different row slices of
-    the left-hand side matrix are multiplied with different matrices from the right-hand
-    side tensor. Mathematically, for each group i:
-        out[start_i:end_i, :] = lhs[start_i:end_i, :] @ rhs[i, :, :]
-    where start_i and end_i are determined by group_sizes.
+    Computes per-group matrix products: for each group ``i``,
+        ``out[start_i:end_i, :] = lhs[start_i:end_i, :] @ rhs[i, :, :]``
+    where ``start_i`` / ``end_i`` are determined by prefix sums of
+    ``group_sizes``.
 
-    The implementation uses Pallas to generate efficient TPU kernels that:
-    - Process multiple groups in a single kernel launch
-    - Handle groups that don't align with tile boundaries
-    - Support incremental accumulation for memory efficiency
-    - Optimize memory access patterns for TPU's memory hierarchy
+    Tiling metadata is forwarded to the XLA compiler via
+    ``set_xla_metadata(ragged_dot_tiling=...)`` but does not affect numerical
+    results.  If ``precision is None``, it is overridden to
+    ``lax.Precision.HIGHEST`` before the call.
 
     Args:
-        lhs: Left-hand side matrix of shape [m, k] where m is the total number
-            of rows across all groups and k is the inner dimension.
-        rhs: Right-hand side tensor of shape [num_groups, k, n] containing a
-            separate matrix for each group. Can be transposed if transpose_rhs=True.
-        group_sizes: 1D array of shape [num_groups] with int32 dtype. Each element
-            specifies the number of rows in lhs belonging to that group.
-            Must sum to m (first dimension of lhs).
-        preferred_element_type: Output dtype. Defaults to float32. The kernel uses
-            float32 for accumulation regardless, then casts to this type.
-        tiling: Tile sizes as (tm, tk, tn) tuple, or a callable that returns tile
-            sizes based on problem dimensions. Typical TPU tiles are 128x128.
-            The callable signature is (m, k, n) -> (tm, tk, tn) | None.
-        group_offset: Starting group index for sharded execution. Defaults to 0.
-            Useful when distributing groups across multiple devices.
-        existing_out: Optional pre-existing output tensor to accumulate into.
-            Must have shape [m, n] and dtype matching preferred_element_type.
-            Enables incremental computation and memory reuse.
-        transpose_rhs: If True, expects rhs shape [num_groups, n, k] and transposes
-            during multiplication. Useful for certain memory layouts.
-        interpret: Run kernel in interpret mode for debugging. Slower but provides
-            better error messages and doesn't require compilation.
+        lhs: Left-hand side matrix. Shape: [m, k].
+        rhs: Per-group right-hand side matrices.
+            Shape: [num_groups, k, n] (or [num_groups, n, k] when
+            ``transpose_rhs=True``).
+        group_sizes: Number of ``lhs`` rows per group.
+            Shape: [num_groups].  Must sum to ``m``.
+        preferred_element_type: Accumulation / output dtype.  Defaults to
+            ``float32``.
+        tiling: Optional ``(tm, tk, tn)`` tile-size hint forwarded as XLA
+            metadata, a ``LutFn``, or ``None`` (no hint).  Does not change
+            correctness.
+        group_offset: Starting group index for sharded execution.  Defaults to
+            ``0``.
+        existing_out: Optional tensor to add to the result.
+            If provided, ``output = ragged_dot_result + existing_out``.
+            Shape: [m, n].
+        transpose_rhs: If True, ``rhs`` is treated as [num_groups, n, k].
+        interpret: Accepted for API compatibility; silently ignored.
+        precision: JAX ``lax.Precision`` for the matmul.  Defaults to
+            ``DEFAULT``; ``None`` is coerced to ``HIGHEST``.
 
     Returns:
-        Output matrix of shape [m, n] containing the concatenated results of all
-        group matrix multiplications.
-
-    Algorithm Overview:
-        1. Validate inputs and determine computation parameters
-        2. Create group metadata for efficient tile-to-group mapping
-        3. Define Pallas kernel that:
-           - Loads tiles from lhs and group-specific slices from rhs
-           - Accumulates partial products in on-chip memory
-           - Masks and stores results respecting group boundaries
-        4. Launch kernel with appropriate grid dimensions
-        5. Zero unprocessed regions if doing partial computation
-
-    TPU Optimizations:
-        - Tiles sized to match TPU's Matrix Multiply Units (typically 128x128)
-        - Prefetch scheduling for hiding memory latency
-        - VMEM scratch space for accumulation to minimize HBM traffic
-        - Efficient masking for partial tiles using TPU's predication
-        - Dimension semantics hints for XLA compiler optimization
+        Output matrix of shape [m, n].
 
     Example:
-        >>>
-        >>> lhs = jnp.randn(300, 64)
-        >>> rhs = jnp.randn(3, 64, 32)
+        >>> lhs = jnp.ones((300, 64))
+        >>> rhs = jnp.ones((3, 64, 32))
         >>> group_sizes = jnp.array([100, 150, 50], dtype=jnp.int32)
         >>> result = grouped_matmul(lhs, rhs, group_sizes)
-
-    Notes:
-        - The k dimension can have partial tiles (handled via masking)
-        - The m dimension must be divisible by tm for correctness
-        - Empty groups (size 0) are skipped for efficiency
-        - Cost estimation helps XLA make scheduling decisions
+        >>> result.shape
+        (300, 32)
     """
     if precision is None:
         precision = jax.lax.Precision.HIGHEST

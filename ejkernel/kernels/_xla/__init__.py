@@ -15,54 +15,68 @@
 
 """XLA-based kernel implementations for attention and related operations.
 
-This module provides pure XLA/JAX implementations of attention mechanisms
-and other kernels. XLA implementations are hardware-agnostic and work
-across GPU, TPU, and CPU backends through JAX's XLA compiler.
+Pure JAX/XLA implementations of attention mechanisms and related kernels.
+These kernels compile to XLA and run on any XLA-supported backend (GPU, TPU,
+CPU) without platform-specific dependencies.  They serve as the canonical
+numerical reference that all other backends (Triton, Pallas, CUDA) must match.
 
 XLA kernels provide:
     - Cross-platform compatibility (GPU/TPU/CPU)
-    - Automatic gradient computation
-    - XLA compilation optimizations
+    - Automatic gradient computation via JAX autodiff (or custom VJP)
+    - XLA compilation and device-placement optimisations
     - No platform-specific dependencies
 
 Available Operations:
-    Attention Mechanisms:
-        - attention: Standard multi-head attention
-        - flash_attention: Memory-efficient attention with tiling
+    Dense Attention:
+        - attention: Standard multi-head / GQA / MQA attention (BSHD layout)
+        - flash_attention: Memory-efficient chunked attention (O(N) memory)
         - flash_mla: Multi-head Latent Attention (MLA)
         - deepseek_attn: DeepSeek Sparse Attention (MLA + Lightning Indexer)
-        - blocksparse_attention: Block-sparse attention patterns
+        - blocksparse_attention: Block-sparse / packed-sequence attention
         - native_sparse_attention: Sparse attention with flexible patterns
         - ring_attention: Distributed ring attention for long sequences
         - scaled_dot_product_attention: Basic scaled dot-product attention
-        - unified_attention: Unified API for multiple attention variants
+        - unified_attention: Unified paged-decode attention API
 
-    Page/Serving Attention:
-        - page_attention: Paged KV-cache attention
+    Serving / Paged Attention:
+        - page_attention: Single-batch paged KV-cache attention
+        - prefill_page_attention: Paged attention for prefill phase
+        - decode_attention: Single-token decode over a paged KV buffer
+        - chunked_prefill_paged_decode: Mixed prefill+decode with paged cache
+        - ragged_decode_attention: Ragged-batch decode attention
+        - ragged_page_attention_v2/v3: Variable-length paged attention
+        - ragged_page_attention_v2_turboquant: v2 with turboquant KV cache
+        - ragged_page_attention_v3_turboquant: v3 with turboquant KV cache
         - multi_latent_ragged_page_attention: MLA ragged paged attention
         - multi_latent_ragged_page_attention_v2: MLA ragged paged attention v2
-        - ragged_page_attention_v2/v3: Variable-length page attention
-        - ragged_decode_attention: Decode-phase attention
 
-    Linear/Recurrent Attention:
+    Linear / Recurrent Attention:
         - recurrent_gla: Gated linear attention (recurrent form)
         - gated_delta_rule: Gated delta rule linear attention
-        - lightning_attn: Lightning attention with decay
-        - recurrent: General recurrent attention mechanism
-        - kernel_delta_attention: Delta-rule linear attention
+        - ragged_gated_delta_rule: Ragged-batch gated delta rule
+        - lightning_attn: Lightning attention with exponential decay
+        - recurrent: General recurrent state-space attention
+        - kernel_delta_attention (kda / kda_decay): Delta-rule linear attention
 
     State Space Models:
         - state_space_v1: Mamba1-style SSM
         - state_space_v2: Mamba2-style SSM
+        - rwkv4 / rwkv6 / rwkv7 / rwkv7_mul: RWKV recurrent architectures
+
+    Matrix Operations:
+        - all_gather_matmul: All-gather + matmul across a device mesh
+        - reduce_scatter_matmul: Matmul + reduce-scatter across a device mesh
+        - grouped_matmul: Grouped (MoE-style) matrix multiplication
+        - grouped_matmulv3: Grouped matmul v3
+        - quantized_matmul: Packed-uint32 quantized matmul
 
     Utilities:
-        - grouped_matmul: Efficient grouped matrix multiplication
-        - mean_pooling: Sequence mean pooling
-        - quantized_matmul: Packed uint32 quantized matmul
+        - mean_pooling: Masked sequence mean pooling
 
 Note:
     XLA implementations are the fallback when platform-specific kernels
-    (Triton, Pallas, CUDA) are not available for the current hardware.
+    (Triton, Pallas, CUDA) are unavailable for the current hardware.  They
+    are also used as the numerical gold standard in test suites.
 """
 
 from .all_gather_matmul import all_gather_matmul

@@ -14,21 +14,23 @@
 
 """XLA backend for chunked prefill + paged decode attention.
 
-This submodule provides XLA-optimized implementation for combined
-prefill and decode operations with paged KV cache management.
+Exposes ``chunked_prefill_paged_decode``, which handles a packed batch of
+sequences where each sequence may be in either the prefill phase (multiple
+query tokens) or the decode phase (a single query token).
 
-Key Features:
-    - Mixed prefill/decode batching for throughput optimization
-    - Chunked prefill for memory-efficient processing
-    - Paged KV cache with block table management
-    - In-place cache updates during prefill phase
-    - Variable chunk sizes for flexible scheduling
+Algorithm (XLA reference):
+    1. Insert the incoming ``keys`` / ``values`` for every sequence into
+       the block-tabled KV cache via ``lax.fori_loop`` scatter operations.
+    2. Call ``unified_attention`` over the updated cache to produce the
+       attention output for all query tokens.
 
-Algorithm:
-    Combines prefill and decode in a single kernel invocation:
-    1. Prefill sequences process multiple query tokens
-    2. Decode sequences process single query token each
-    3. KV cache is updated with new tokens via block tables
+The XLA implementation is correct but slow: the ``fori_loop`` cache-update
+and the dense attention materialize O(seq_len²) work.  It exists as the
+numerical reference for the Triton GPU implementation.
+
+Note:
+    Only causal attention is supported (``causal=False`` raises
+    ``NotImplementedError``).
 """
 
 from ._interface import chunked_prefill_paged_decode

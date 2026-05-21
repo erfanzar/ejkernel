@@ -1059,8 +1059,17 @@ def _slice_mask_info(
     return block_mask, data_next, mask_next
 
 
+# Public aliases: fix ``is_dkv`` to the appropriate boolean so callers do not
+# need to pass it explicitly.
+
+# Process a static ``MultiHeadMask`` for the forward / dQ Splash kernel.
 process_mask = functools.partial(_process_mask, is_dkv=False)
+
+# Process a static ``MultiHeadMask`` for the dKV Splash backward kernel.
 process_mask_dkv = functools.partial(_process_mask, is_dkv=True)
 
+# Process a dynamic (JAX array) mask for the forward / dQ Splash kernel.
 process_dynamic_mask = functools.partial(_process_dynamic_mask, is_dkv=False)
+
+# Process a dynamic (JAX array) mask for the dKV Splash backward kernel.
 process_dynamic_mask_dkv = functools.partial(_process_dynamic_mask, is_dkv=True)

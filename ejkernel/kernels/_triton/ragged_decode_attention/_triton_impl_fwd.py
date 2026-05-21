@@ -61,10 +61,6 @@ from ejkernel.callib import next_power_of_2, triton_call
 from ejkernel.ops import FwdParams
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)],
-    key=["BLOCK_SIZE", "BLOCK_D"],
-)
 @triton.jit
 def ragged_decode_mqa_fwd_kernel(
     q_ptr,
@@ -226,6 +222,8 @@ def ragged_decode_mqa_triton(
     sliding_window: tuple[int, int] | None,
     logits_soft_cap: float,
     aux: Array | None,
+    num_warps: int,
+    num_stages: int,
 ) -> Array:
     """Launch the ragged decode MQA Triton kernel.
 
@@ -290,6 +288,8 @@ def ragged_decode_mqa_triton(
         BLOCK_D=BLOCK_D,
         NBLOCKS=NBLOCKS,
         NS_PAD=NS_PAD,
+        num_warps=num_warps,
+        num_stages=num_stages,
         name="ejkernel::triton::ragged_decode_mqa_fwd",
     )[0]
     return out
@@ -385,6 +385,8 @@ def inner_decode_triton(
             sliding_window=sliding_window,
             logits_soft_cap=(0.0 if logits_soft_cap is None else float(logits_soft_cap)),
             aux=aux_h,
+            num_warps=int(fwd_params.num_warps or 4),
+            num_stages=int(fwd_params.num_stages or 2),
         )
         outs.append(out_h)
 

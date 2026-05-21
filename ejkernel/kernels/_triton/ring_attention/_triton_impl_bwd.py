@@ -45,7 +45,22 @@ LN2 = 0.6931471805599453
 
 
 class RingFlashResiduals(NamedTuple):
-    """Residuals saved from forward pass for backward computation."""
+    """Residuals saved from the forward pass for the ring flash attention backward pass.
+
+    Used by the deprecated ``ring_flash_attention_call`` path (flash-attn inner kernel).
+    The preferred path is ``ring_blocksparse_attention_call`` / ``RingBlocksparseResiduals``.
+
+    Attributes:
+        q: Query tensor, shape ``(batch, seq_len_q, num_heads, head_dim)``.
+        k: Key tensor (local shard), shape ``(batch, seq_len_k, num_kv_heads, head_dim)``.
+        v: Value tensor (local shard), same shape as ``k``.
+        bias: Optional attention bias tensor.
+        attention_mask: Optional attention mask tensor.
+        o: Output tensor from forward pass, same shape as ``q``.
+        lse: Log-sum-exp in **natural log** space, shape ``(batch, num_heads, seq_len_q)``.
+            Converted from log2 output of the flash-attn kernel via ``* LN2``.
+        dropout_seed: Optional random seed used for dropout during forward pass.
+    """
 
     q: jax.Array
     k: jax.Array
@@ -130,9 +145,38 @@ def _ring_flash_attention_fwd(
     logits_soft_cap: float | None,
     axis_name: str | None,
 ) -> tuple[jax.Array, RingFlashResiduals]:
-    """Forward pass of ring flash attention.
+    """Forward pass of ring flash attention (deprecated path using flash attn kernel).
 
-    Uses online softmax to combine attention outputs from different ring positions.
+    Runs a ``lax.scan`` over ``axis_size`` ring steps. In each step:
+    1. Calls ``_fwd_attention_kernel_call`` to compute a local attention chunk
+       between the fixed local queries and the currently held KV block.
+    2. Converts the log2-space LSE from the flash attention kernel to natural log.
+    3. Merges the chunk output into a running accumulator using online softmax.
+    4. Rotates KV blocks to the next device via ``lax.ppermute``.
+
+    Note: This path does not support correct distributed causal/sliding-window
+    masking because the flash attention kernel cannot see global positions.
+    Use ``_ring_blocksparse_attention_fwd`` instead for distributed masked attention.
+
+    Args:
+        query: Query tensor, shape ``(batch, seq_len_q, num_heads, head_dim)``.
+        key: Key tensor (local shard), shape ``(batch, seq_len_k, num_kv_heads, head_dim)``.
+        value: Value tensor (local shard), same shape as key.
+        attention_mask: Optional attention mask (passed through to inner kernel).
+        bias: Optional attention bias (passed through to inner kernel).
+        softmax_scale: Attention scaling factor.
+        dropout_prob: Dropout probability.
+        causal: Whether to apply causal masking inside each chunk.
+        dropout_seed: Random seed for dropout.
+        fwd_params: Forward kernel block-size parameters.
+        bwd_params: Backward kernel block-size parameters.
+        sliding_window: Sliding window size (passed to inner kernel).
+        logits_soft_cap: Soft capping value.
+        axis_name: Ring communication axis name.
+
+    Returns:
+        Tuple ``(output, residuals)`` where residuals contain saved tensors for
+        the backward pass.
     """
     batch = query.shape[0]
     q_seq_len = query.shape[1]
@@ -236,7 +280,22 @@ def _ring_flash_attention_bwd(
     res: RingFlashResiduals,
     do: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, None, None]:
-    """Backward pass of ring flash attention."""
+    """Backward pass of ring flash attention (deprecated path).
+
+    Mirrors the forward ring scan but calls ``_bwd_attention_kernel_call``
+    at each step and rotates both KV blocks and their accumulated gradients.
+    The LSE stored in residuals is converted from natural log back to log2
+    before passing to the flash attention backward kernel.
+
+    Args:
+        softmax_scale..axis_name: Non-differentiable arguments (nondiff_argnums).
+        res: ``RingFlashResiduals`` saved during the forward pass.
+        do: Output gradient tensor, same shape as queries.
+
+    Returns:
+        Tuple ``(dq, dk, dv, None, None)`` — gradients for query, key, value;
+        ``None`` for attention_mask and bias which are non-differentiable.
+    """
     q, k, v, bias, attention_mask, o, lse, dropout_seed_res = res
     del dropout_seed_res  # Use the one from nondiff_argnums
 
@@ -308,7 +367,25 @@ ring_flash_attention_call.defvjp(_ring_flash_attention_fwd, _ring_flash_attentio
 
 
 class RingBlocksparseResiduals(NamedTuple):
-    """Residuals saved from forward pass for backward computation."""
+    """Residuals saved from the forward pass for the ring block-sparse attention backward.
+
+    Tensors are stored in the **head-first** layout used internally by the
+    block-sparse kernel: ``[B, H, T, D]`` rather than the user-facing
+    ``[B, T, H, D]``. The backward pass transposes them back before returning.
+
+    Attributes:
+        q: Query tensor, shape ``(B, Hq, Tq, D)``.
+        k: Key tensor (initial local shard), shape ``(B, Hkv, Tk, D)``.
+        v: Value tensor (initial local shard), shape ``(B, Hkv, Tk, D)``.
+        q_positions: Global query positions, shape ``(B, Tq)``, int32.
+        q_segment_ids: Query segment IDs (0-padded), shape ``(B, Tq)``, int32.
+        kv_positions: Initial KV positions (before ring rotation), shape ``(B, Tk)``,
+            int32.
+        kv_segment_ids: Initial KV segment IDs, shape ``(B, Tk)``, int32.
+        o: Attention output (head-first), shape ``(B, Hq, Tq, D)``.
+        lse: Log-sum-exp in **natural log** space, shape ``(B, Hq, Tq)``.
+            Converted from log2 output of the block-sparse kernel via ``* LN2``.
+    """
 
     q: jax.Array  # [B, Hq, Tq, D]
     k: jax.Array  # [B, Hkv, Tk, D]
@@ -346,7 +423,32 @@ def _build_positions(
     pad_value: int,
     axis_name: str | None,
 ) -> jax.Array:
-    """Build per-token positions (optionally globalized across a ring axis)."""
+    """Build per-token positions, optionally globalised across a ring axis.
+
+    Derives within-segment positions from ``segment_ids`` using
+    ``_positions_from_segments_2d``, then adds a per-device offset if
+    ``axis_name`` is provided, so that tokens on device ``i`` receive
+    positions in ``[i * seq_len, (i+1) * seq_len)``.
+
+    Padding positions are left unchanged:
+    - Query padding (``pad_value == -1``): positions are already -1; kept as-is.
+    - KV padding (``pad_value == int32_max``): positions that correspond to
+      ``segment_ids < 0`` are not shifted.
+
+    Args:
+        segment_ids: Integer segment IDs, shape ``(batch, seq_len)``, rank-2.
+        seq_len: Number of tokens on this device's shard.
+        pad_value: Sentinel value used for padding positions (-1 for queries,
+            ``jnp.iinfo(jnp.int32).max`` for keys/values).
+        axis_name: Mesh axis name for ring parallelism. If ``None``, the local
+            positions are returned without any offset.
+
+    Returns:
+        Position array of shape ``(batch, seq_len)``, int32.
+
+    Raises:
+        ValueError: If ``segment_ids`` is not rank-2.
+    """
     segment_ids = jnp.asarray(segment_ids, jnp.int32)
     if segment_ids.ndim != 2:
         raise ValueError(f"segment_ids must be rank-2 (batch, seq_len), got shape {segment_ids.shape}")

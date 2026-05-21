@@ -13,16 +13,20 @@
 # limitations under the License.
 
 
-"""Pallas GPU backend for Ragged Decode Attention.
+"""Pallas/Triton GPU backend for ragged decode attention.
 
-This submodule provides GPU-optimized attention for decoding with
-variable-length KV caches using Pallas with Triton backend.
+Provides a single-token decode attention kernel for variable-length (ragged)
+KV caches.  Each batch element may have a different valid key/value range
+specified by per-element ``sequence_start`` / ``sequence_end`` indices.
 
-Key Features:
-    - Optimized for single-token decoding on GPU
-    - Variable-length KV cache support
-    - Efficient handling of ragged batch shapes
-    - Low-latency implementation for serving
+The kernel tiles computation over both heads (``block_size_heads``) and keys
+(``block_size_keys``) and can split the key sequence across multiple GPU
+thread-block groups (``num_key_splits``) for additional parallelism.
+Supports MHA, MQA, and GQA via query-head grouping.
+
+Public API:
+    ragged_decode_attention: Registered under
+        ``Platform.PALLAS / Backend.GPU`` in the kernel registry.
 """
 
 from ._interface import ragged_decode_attention

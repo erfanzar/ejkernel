@@ -61,7 +61,10 @@ def _fwd_call(
     x: Float[Array, "... hidden_dim"],
     chunk_size: int,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
-) -> tuple[Float[Array, "batch hidden_dim"], tuple[int, int, Int[Array, "num_seqs_plus_one"] | None]]:
+    block_dim: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
+) -> tuple[Float[Array, "batch hidden_dim"], tuple[tuple[int, ...], Int[Array, "num_seqs_plus_one"] | None]]:
     """
     Forward pass for mean pooling with custom VJP.
 
@@ -74,14 +77,24 @@ def _fwd_call(
         A tuple containing the output of the forward pass and the residuals
         needed for the backward pass.
     """
-    o = fwd_triton_impl(x=x, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
-    residual = x.shape[0], x.shape[1], cu_seqlens
+    o = fwd_triton_impl(
+        x=x,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        block_dim=block_dim,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    residual = x.shape, cu_seqlens
     return o, residual
 
 
 def _bwd_call(
     chunk_size: int,
-    residual: tuple[int, int, Int[Array, "num_seqs_plus_one"] | None],
+    block_dim: int,
+    num_warps: int,
+    num_stages: int,
+    residual: tuple[tuple[int, ...], Int[Array, "num_seqs_plus_one"] | None],
     do: Float[Array, "batch hidden_dim"],
 ) -> tuple[Float[Array, "batch seq_len hidden_dim"], None]:
     """
@@ -95,18 +108,30 @@ def _bwd_call(
     Returns:
         The gradient with respect to the input tensor `x`.
     """
-    A, B, cu_seqlens = residual
-    dEo = bwd_triton_impl(do=do, batch_size=A, seq_len=B, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
+    x_shape, cu_seqlens = residual
+    dEo = bwd_triton_impl(
+        do=do,
+        batch_size=x_shape[0],
+        seq_len=x_shape[1],
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        block_dim=block_dim,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
     # `cu_seqlens` is an integer index tensor (non-differentiable).
     return dEo, None
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(1,))
-@partial(jax.jit, static_argnums=(1,))
+@partial(jax.custom_vjp, nondiff_argnums=(1, 3, 4, 5))
+@partial(jax.jit, static_argnums=(1, 3, 4, 5))
 def _mean_pooling(
     x: Float[Array, "... hidden_dim"],
     chunk_size: int,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_dim: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> Float[Array, "batch hidden_dim"]:
     """
     Core JIT-compiled mean pooling function with a custom VJP.
@@ -123,7 +148,14 @@ def _mean_pooling(
     Returns:
         The mean-pooled output tensor.
     """
-    return fwd_triton_impl(x=x, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
+    return fwd_triton_impl(
+        x=x,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        block_dim=block_dim,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
 
 
 _mean_pooling.defvjp(_fwd_call, _bwd_call)
@@ -135,6 +167,10 @@ def mean_pooling(
     x: Float[Array, "... hidden_dim"],
     chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    *,
+    block_dim: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> Float[Array, "... hidden_dim"]:
     """
     Performs mean pooling over the sequence dimension using a Triton kernel.
@@ -161,4 +197,11 @@ def mean_pooling(
         the output shape will correspond to the number of sequences defined by
         `cu_seqlens` (i.e., `len(cu_seqlens) - 1`).
     """
-    return _mean_pooling(x=x, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
+    return _mean_pooling(
+        x=x,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        block_dim=block_dim,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )

@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backward utilities for XLA reduce-scatter matmul."""
+"""Backward-pass utilities for XLA reduce-scatter matmul.
+
+The backward pass inverts ``psum_scatter`` with ``all_gather`` to reconstruct
+the full output gradient before computing ``grad_x`` and ``grad_y`` via local
+dot products.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +35,28 @@ def reduce_scatter_matmul_backward(
     axis_name: str,
     precision: jax.lax.PrecisionLike,
 ) -> tuple[Float[Array, "m k_shard"], Float[Array, "n k_shard"]]:
-    """Compute gradients for reduce_scatter_matmul."""
+    """Compute gradients for ``reduce_scatter(x @ y.T, scatter_dim=0)``.
+
+    Inverts the forward ``psum_scatter`` with ``all_gather`` so that both
+    ``grad_x`` and ``grad_y`` can be computed from a standard dot product:
+
+    .. code-block:: text
+
+        dy_full = all_gather(dy, axis=0)   # [m, n]
+        grad_x  = dy_full @ y              # [m, k_shard]
+        grad_y  = dy_full.T @ x            # [n, k_shard]
+
+    Args:
+        dy: Gradient w.r.t. the scattered output, shape ``[m_local, n]``.
+        x: Saved forward input ``x``, shape ``[m, k_shard]``.
+        y: Saved forward input ``y``, shape ``[n, k_shard]``.
+        axis_name: JAX device-mesh axis name (same as forward pass).
+        precision: Matmul precision (same as forward pass).
+
+    Returns:
+        Tuple ``(grad_x, grad_y)`` with shapes ``[m, k_shard]`` and
+        ``[n, k_shard]`` respectively.
+    """
     dy_full = lax.all_gather(dy, axis_name=axis_name, axis=0, tiled=True)
     grad_x = jnp.dot(dy_full, y, precision=precision)
     grad_y = jnp.dot(dy_full.T, x, precision=precision)

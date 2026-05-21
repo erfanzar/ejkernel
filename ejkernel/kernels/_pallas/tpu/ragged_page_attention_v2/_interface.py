@@ -142,7 +142,7 @@ def _ragged_page_attention(
       mask_value: mask value for causal mask.
       num_kv_pages_per_block: number of kv pages to be processed in one flash
         attention block in the pallas kernel.
-      num_queries_per_block: number of kv pages to be processed in one flash
+      num_queries_per_block: number of queries to be processed in one flash
         attention block in the pallas kernel.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
 

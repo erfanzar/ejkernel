@@ -33,14 +33,12 @@ capping, attention sinks, and segment-based masking.
 """
 
 import math
-from typing import Any
 
 import jax
 import triton
 import triton.language as tl
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
-from triton import Config
 
 from ejkernel.callib import triton_call
 from ejkernel.ops import BwdParams, FwdParams
@@ -49,85 +47,6 @@ from ejkernel.utils import dtype_index, get_sharding, get_strides
 from ._utilities import attention_pack_with_static_shape, calc_bias_strides, padded_load
 
 
-def config_prune_kernel(
-    configs: list[Config],
-    named_args: dict[str, Any],
-    **kwargs: Any,
-) -> list[Config]:
-    """Prune autotuning configurations for backward pass kernel.
-
-    Filters out configurations where block dimensions exceed sequence lengths.
-    Falls back to small default configs if all configs are pruned.
-
-    Args:
-        configs: List of triton autotuning configurations
-        named_args: Dictionary with kernel arguments including QSeq and KSeq
-        **kwargs: Additional unused arguments
-
-    Returns:
-        list[Config]: Valid configurations for the given problem size
-    """
-    # Triton kernels require dot M/N/K >= 16 on recent versions. For very small
-    # sequences we still need to allow block sizes >= 16, relying on padding
-    # masks for correctness.
-    effective_q = max(int(named_args["QSeq"]), 16)
-    effective_k = max(int(named_args["KSeq"]), 16)
-
-    kept_configs = []
-    for config in configs:
-        largest_m = (
-            max(
-                config.kwargs["BLOCK_M1"],
-                config.kwargs["BLOCK_M2"],
-            )
-            > effective_q
-        )
-        largest_n = (
-            max(
-                config.kwargs["BLOCK_N1"],
-                config.kwargs["BLOCK_N2"],
-            )
-            > effective_k
-        )
-        if largest_m or largest_n:
-            pass
-        else:
-            kept_configs.append(config)
-    if kept_configs:
-        return kept_configs
-    return [
-        Config(
-            {
-                "BLOCK_M1": 32,
-                "BLOCK_N1": 32,
-                "BLOCK_M2": 32,
-                "BLOCK_N2": 32,
-            },
-            num_warps=4,
-            num_stages=0,
-        ),
-        Config(
-            {
-                "BLOCK_M1": 32,
-                "BLOCK_N1": 32,
-                "BLOCK_M2": 32,
-                "BLOCK_N2": 32,
-            },
-            num_warps=2,
-            num_stages=0,
-        ),
-    ]
-
-
-@triton.autotune(
-    configs=[
-        Config({"BLOCK_M": 16}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M": 32}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M": 64}, num_warps=4, num_stages=0),
-        Config({"BLOCK_M": 128}, num_warps=4, num_stages=0),
-    ],
-    key=["CQSeq", "DRuntime"],
-)
 @triton.jit
 def _attn_bwd_preprocess(
     Po,
@@ -999,62 +918,6 @@ def _attn_bwd_block_dq(
             tl.store(dq_ptrs, dq)
 
 
-@triton.autotune(
-    configs=[
-        Config(
-            {"BLOCK_M1": 16, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 16},
-            num_warps=2,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 32, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 32},
-            num_warps=2,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32},
-            num_warps=2,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 64, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 64},
-            num_warps=2,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 16, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 16},
-            num_warps=4,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 32, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 32},
-            num_warps=4,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32},
-            num_warps=4,
-            num_stages=0,
-        ),
-        Config(
-            {"BLOCK_M1": 64, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 64},
-            num_warps=4,
-            num_stages=0,
-        ),
-    ],
-    key=[
-        "CQSeq",
-        "CKSeq",
-        "DRuntime",
-        "VARLEN",
-        "USE_DROPOUT",
-        "IS_CAUSAL",
-        "BIAS_ON",
-        "BLOCK_HEADDIM",
-        "SLIDING",
-    ],
-    prune_configs_by={"early_config_prune": config_prune_kernel},
-)
 @triton.heuristics(
     {
         "EVEN_M1": lambda args: args["QSeq"] % args["BLOCK_M1"] == 0,
@@ -1349,6 +1212,12 @@ def _bwd_attention_kernel_call(
     Returns:
         tuple: Gradients (dq, dk, dv) for query, key, and value tensors
     """
+    if bwd_params is None:
+        bwd_params = BwdParams(q_blocksize=32, kv_blocksize=32, num_warps=4, num_stages=0)
+    block_m = int(bwd_params.q_blocksize or 32)
+    block_n = int(bwd_params.kv_blocksize or 32)
+    num_warps = int(bwd_params.num_warps or 4)
+    num_stages = int(bwd_params.num_stages or 0)
 
     if sliding_window is None:
         window_left = 0
@@ -1469,6 +1338,9 @@ def _bwd_attention_kernel_call(
             grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch_size * nheads_q),
             kernel=_attn_bwd_preprocess,
             name="ejkernel::triton::flash_attn_bwd_preprocess",
+            BLOCK_M=block_m,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
 
         bz = bm = bh = 0
@@ -1540,6 +1412,10 @@ def _bwd_attention_kernel_call(
             SLIDING=sliding_flag,
             SOFTCAP=softcap_flag,
             USE_SINKS=use_sinks,
+            BLOCK_M1=block_m,
+            BLOCK_N1=block_n,
+            BLOCK_M2=block_m,
+            BLOCK_N2=block_n,
             kernel=_attn_bwd,
             grid=lambda META: (
                 triton.cdiv(max_seqlen_k, META["BLOCK_N1"]) + triton.cdiv(max_seqlen_q, META["BLOCK_M2"]),
@@ -1551,6 +1427,8 @@ def _bwd_attention_kernel_call(
                 jax.ShapeDtypeStruct(shape=(*v_p.shape[:2], q_p.shape[2], v_p.shape[3]), dtype="f4"),
             ],
             name="ejkernel::triton::flash_attn_bwd",
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
 
         if num_repeats > 1:
@@ -1644,6 +1522,9 @@ def _bwd_attention_kernel_call(
         grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch_size * nheads_q),
         kernel=_attn_bwd_preprocess,
         name="ejkernel::triton::flash_attn_bwd_preprocess",
+        BLOCK_M=block_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     dq, dk, dv = triton_call(
@@ -1713,6 +1594,10 @@ def _bwd_attention_kernel_call(
         SLIDING=sliding_flag,
         SOFTCAP=softcap_flag,
         USE_SINKS=use_sinks,
+        BLOCK_M1=block_m,
+        BLOCK_N1=block_n,
+        BLOCK_M2=block_m,
+        BLOCK_N2=block_n,
         kernel=_attn_bwd,
         grid=lambda META: (
             triton.cdiv(KSeq, META["BLOCK_N1"]) + triton.cdiv(QSeq, META["BLOCK_M2"]),
@@ -1724,6 +1609,8 @@ def _bwd_attention_kernel_call(
             jax.ShapeDtypeStruct(shape=(v.shape[0], v.shape[1], q.shape[2], v.shape[3]), dtype="f4"),
         ],
         name="ejkernel::triton::flash_attn_bwd",
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     if num_repeats > 1:

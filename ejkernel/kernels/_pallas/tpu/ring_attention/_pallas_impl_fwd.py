@@ -273,30 +273,61 @@ def ring_attention(
     This implementation uses JAX's splash attention with ring communication
     topology for distributed attention computation across devices.
 
+    When ``axis_name`` is ``None`` and no ring-specific features are requested,
+    the call is delegated to the XLA single-device attention path. When ring
+    features (segment IDs, position IDs, custom masks, chunk_size) are
+    requested without a named axis, the XLA ring-attention fallback is used.
+    When ``axis_name`` is provided, the distributed Pallas Splash Attention
+    kernel is used and each batch element is processed independently via
+    ``jax.vmap``.
+
     Args:
         query: Query tensor [batch, q_len, num_heads, head_dim].
         key: Key tensor [batch, kv_len, num_kv_heads, head_dim].
         value: Value tensor [batch, kv_len, num_kv_heads, head_dim].
-        q_segment_ids: Optional query segment IDs [batch, q_len].
+        q_segment_ids: Optional query segment IDs [batch, q_len] for
+            cross-document masking. When set, the first batch element's
+            segment IDs are passed to the Splash kernel.
         kv_segment_ids: Optional KV segment IDs [batch, kv_len].
-        softmax_aux: Optional attention sink logits (maps to sinks parameter).
-        bias: Optional attention bias (not supported in splash attention).
-        mask_builder: Optional custom mask builder function.
-        sliding_window: Sliding window size for local attention.
-        chunk_size: Chunk size for chunked causal attention.
-        causal: Whether to use causal masking.
-        logits_soft_cap: Soft cap for attention logits.
-        softmax_scale: Scaling factor for attention scores.
-        axis_name: Name of the ring communication axis.
-        fwd_params: Forward pass block size parameters.
-        bwd_params: Backward pass block size parameters.
-        fused_backward: Whether to use fused backward kernel.
+        q_position_ids: Optional query position IDs [batch, q_len]. Forwarded
+            to the XLA ring-attention fallback; not consumed by the Pallas
+            splash path when ``axis_name`` is set.
+        kv_position_ids: Optional KV position IDs [batch, kv_len]. Forwarded
+            to the XLA ring-attention fallback; not consumed by the Pallas
+            splash path when ``axis_name`` is set.
+        softmax_aux: Optional attention sink logits [num_sinks] (1-D float32).
+            Reduced to a per-head scalar via ``logsumexp`` and passed to
+            ``ring_splash_attention`` as ``sinks``.
+        bias: Optional attention bias [batch, num_heads, q_len, kv_len].
+            Not supported by the Pallas splash path; raises
+            ``NotImplementedError`` when ``axis_name`` is set.
+        mask_builder: Optional callable ``(q_len, kv_len, num_heads, ...)``
+            that returns a :class:`Mask`. Forces the XLA ring-attention
+            fallback when ``axis_name`` is ``None``.
+        sliding_window: Sliding window size as int (symmetric) or
+            ``(left, right)`` tuple for local attention.
+        chunk_size: Chunk size for chunked causal attention (Llama4-style).
+        causal: Whether to apply causal masking.
+        logits_soft_cap: Optional soft cap for attention logits.
+        softmax_scale: Scaling factor for QK^T. Defaults to
+            ``head_dim ** -0.5`` when ``None``.
+        axis_name: Named JAX collective axis for ring communication. ``None``
+            routes to the XLA single-device or XLA ring fallback.
+        fwd_params: Forward-pass block size parameters with fields
+            ``q_blocksize`` and ``kv_blocksize``. Defaults to
+            ``min(512, seq_len)`` for both when ``None``.
+        bwd_params: Backward-pass block size parameters with fields
+            ``q_blocksize`` and ``kv_blocksize``. Mirrors ``fwd_params``
+            when ``None``.
+        fused_backward: Whether to use fused backward kernel. Forwarded to
+            the XLA fallback only.
 
     Returns:
-        Attention output [batch, q_len, num_heads, head_dim].
+        Attention output [batch, q_len, num_heads, head_dim] cast to the
+        input dtype.
 
     Raises:
-        NotImplementedError: If bias is provided (not supported).
+        NotImplementedError: If ``bias`` is provided when ``axis_name`` is set.
     """
     # Get dimensions
     _, q_len, num_heads, head_dim = query.shape

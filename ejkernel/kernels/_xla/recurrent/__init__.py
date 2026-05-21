@@ -13,16 +13,18 @@
 # limitations under the License.
 
 
-"""XLA backend for Recurrent Attention mechanisms.
+"""XLA backend for recurrent linear attention.
 
-This submodule provides XLA-optimized implementation of recurrent attention
-with linear-time complexity through sequential state updates.
+Implements O(N) linear attention through sequential state updates.  Supports
+multiple gating variants (GLA, Lightning attention, key/value gating) and
+variable-length packed sequences.
 
-Key Features:
-    - O(N) complexity through state recurrence
-    - Chunked processing for parallel training
-    - State caching for incremental inference
-    - Custom VJP for gradient computation
+Exports:
+    - ``recurrent``: Public API registered in the kernel registry.
+    - ``recurrent_xla_fwd`` (``_recurrent_fwd``): VJP forward rule; saves
+      residuals for the backward pass.
+    - ``recurrent_xla_bwd`` (``_recurrent_bwd``): VJP backward rule;
+      computes gradients for Q, K, V, gates, and the initial hidden state.
 """
 
 from ._interface import (

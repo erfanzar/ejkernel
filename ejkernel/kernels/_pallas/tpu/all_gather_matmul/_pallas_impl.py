@@ -12,7 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""All-gather matmul kernel."""
+"""Low-level Pallas TPU kernel for bidirectional ring all-gather matmul.
+
+Implements ``all_gather(x, axis=0) @ y`` fused with bidirectional ring
+communication, overlapping TPU DMA peer-to-peer transfers with MXU matrix
+multiply operations.
+
+Algorithm overview (for ``tp_size`` devices, bidirectional ring):
+  1. Each device simultaneously sends the left half of its ``x`` shard
+     leftward and the right half rightward.
+  2. While waiting for the first remote slice, the device computes the MXU
+     result for its own shard.
+  3. For each subsequent step the freshly received slice is computed while
+     the next ring-hop is in flight (pipeline overlap).
+  4. Partial results are written to the output HBM buffer via async DMA.
+
+Grid layout (``PrefetchScalarGridSpec``):
+    Axis 0: ``tp_size + 2`` outer steps (``tp_size - 1`` ring hops + 2
+        pipeline drain steps).
+    Axis 1: ``n_per_device // bn`` blocks in the N dimension.
+    Axis 2: ``k // bk`` blocks in the K dimension (1 when ``bk = k``).
+
+VMEM scratch buffers:
+    x_vmem_scratch: ``[2, m_per_device, k]`` — double-buffered x tiles.
+    y_vmem_scratch: ``[k, n_per_device]`` or ``[n_per_device, k]`` (full RHS).
+    o_vmem_scratch: ``[2, m_per_device, bn]`` — double-buffered output tile.
+    acc_vmem_scratch: ``[m_per_device, bn]`` float32 — accumulator for k>bk.
+
+Constraints:
+    - ``k`` divisible by 128; ``n = n_per_device * tp_size`` divisible by 128.
+    - ``m_per_device`` divisible by 2; ``m_per_device // 2`` divisible by 8.
+    - ``n_per_device`` divisible by ``bn``; ``k`` divisible by ``bk``.
+
+Public entry point:
+    all_gather_matmul: Validates inputs, sets VMEM budgets, and launches the
+        Pallas kernel via ``pallas_call``.
+"""
 
 import functools
 
@@ -433,7 +468,29 @@ def get_vmem_estimate_bytes(
     y_dtype,
     out_dtype,
 ):
-    """Returns the total vmem bytes used by the kernel."""
+    """Estimate total VMEM bytes consumed by the all-gather matmul kernel.
+
+    Accounts for all three scratch buffers (x double-buffer, y, o double-buffer)
+    and the accumulator, using element sizes derived from the dtype bit-widths.
+
+    Args:
+        m: Global M dimension (``m_per_device * tp_size``).
+        n: Global N dimension (``n_per_device * tp_size``).
+        k: Contracting K dimension.
+        bn: N-dimension block size (output tile columns).
+        acc_bytes: Size in bytes of the float32 accumulator scratch.
+        tp_size: Tensor-parallel world size.
+        x_dtype: Dtype of the LHS tensor (used for x scratch byte count).
+        y_dtype: Dtype of the RHS tensor (used for y scratch byte count).
+        out_dtype: Dtype of the output tensor (used for o scratch byte count).
+
+    Returns:
+        Estimated total VMEM usage in bytes:
+        ``2 * m_per_device * k * sizeof(x_dtype)``
+        ``+ n_per_device * k * sizeof(y_dtype)``
+        ``+ 2 * m_total * bn * sizeof(out_dtype)``
+        ``+ acc_bytes``.
+    """
     m_per_device = m // tp_size
     n_per_device = n // tp_size
     y_vmem_bytes = (
@@ -460,7 +517,27 @@ def get_vmem_estimate_bytes(
 
 
 def validate_inputs(x, y, tp_size, rhs_transpose=False):
-    """Validates the inputs to the all_gather_matmul kernel."""
+    """Validate inputs to the all-gather matmul kernel and raise on constraint violations.
+
+    Checks:
+        - Both ``x`` and ``y`` are 2-D with matching dtypes.
+        - The contracting dimension of ``x`` (axis 1) matches that of ``y``
+          (axis 0 when ``rhs_transpose=False``, axis 1 otherwise).
+        - ``k`` and ``n = n_per_device * tp_size`` are each divisible by 128
+          (required by the TPU MXU tiling constraints).
+        - ``m_per_device`` is divisible by 2 and ``m_per_device // 2`` is
+          divisible by 8 (needed for the bidirectional ring split).
+
+    Args:
+        x: LHS shard array of shape ``[m_per_device, k]``.
+        y: RHS shard array of shape ``[k, n_per_device]`` or
+           ``[n_per_device, k]`` (when ``rhs_transpose=True``).
+        tp_size: Tensor-parallel world size (used to compute global ``n``).
+        rhs_transpose: Whether ``y`` is stored transposed.
+
+    Raises:
+        ValueError: On any constraint violation with a descriptive message.
+    """
     if x.ndim != 2 or y.ndim != 2:
         raise ValueError(f"Inputs must be 2D, got shapes {x.shape} and {y.shape}.")
     if x.dtype != y.dtype:
@@ -501,20 +578,32 @@ def all_gather_matmul(
     bk: int | None = None,
     rhs_transpose: bool = False,
 ):
-    """Performs all-gather on the input tensor and then a matmul.
+    """Low-level Pallas kernel launcher: all-gather ``x`` then compute ``x_full @ y``.
+
+    Validates inputs, resolves block sizes and VMEM budgets, then launches the
+    ``_all_gather_kernel`` via ``pallas_call``.  When ``tp_size == 1`` skips
+    the Pallas path and computes a plain ``jnp.dot``.
 
     Args:
-      x: Local LHS shard of shape [m_per_device, k].
-      y: Local RHS shard of shape [k, n_per_device] or [n_per_device, k].
-      axis_name: Name of the axis used by the surrounding shard_map/pmap.
-      tp_size: Tensor-parallel world size for axis_name.
-      collective_id: An integer used for barrier semaphore allocation.
-      bn: Number of blocks in the n dimension.
-      bk: Number of blocks in the k dimension.
-      rhs_transpose: If True, y is transposed.
+        x: Local LHS shard of shape ``[m_per_device, k]``.
+        y: Local RHS shard of shape ``[k, n_per_device]``, or
+            ``[n_per_device, k]`` when ``rhs_transpose=True``.
+        axis_name: pmap / shard_map axis name used for the collective.
+        tp_size: Tensor-parallel world size.  Inferred when ``None``.
+        collective_id: Integer barrier-semaphore allocation ID.
+        bn: Block size in the N dimension (columns per output tile).
+            Defaults to full ``n_per_device`` when ``None``.
+        bk: Block size in the K dimension (contracting tiles per MXU step).
+            Defaults to full ``k`` when ``None``.
+        rhs_transpose: Whether ``y`` is in ``[n_per_device, k]`` layout.
 
     Returns:
-      all-gather(x, axis=0) @ y_shard
+        Output of shape ``[m, n_per_device]`` where ``m = m_per_device * tp_size``.
+
+    Raises:
+        ValueError: If any input constraint (dtype, shape divisibility) is
+            violated or if ``bn`` / ``bk`` do not evenly divide their
+            respective dimensions.
     """
     tp_size = _resolve_tp_size(tp_size, axis_name)
     if tp_size == 1:

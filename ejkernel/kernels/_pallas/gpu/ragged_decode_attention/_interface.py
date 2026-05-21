@@ -43,7 +43,7 @@ def ragged_decode_attention(
     fwd_params: FwdParams | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
 ) -> Float[Array, "batch num_q_heads head_dim"]:
     """Perform attention decoding over ragged sequences using a GPU-optimized kernel.
 

@@ -107,6 +107,8 @@ else:
         "megacore_mode",
         "inline_seq_dim",
         "sliding_window",
+        "num_warps",
+        "num_stages",
     ],
 )
 @jaxtyping.jaxtyped(typechecker=beartype)
@@ -126,6 +128,8 @@ def page_attention(
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
     sliding_window: int | None = None,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
     """Paged grouped query attention.
 
@@ -158,6 +162,8 @@ def page_attention(
         one kernel.
       sliding_window: if set, only attend to the last `sliding_window` tokens.
         This is useful for models with sliding window attention like Mistral.
+      num_warps: Accepted for API compatibility with Triton; ignored by Pallas.
+      num_stages: Accepted for API compatibility with Triton; ignored by Pallas.
 
     Returns:
       The output of attention([batch_size, num_q_heads, head_dim]).

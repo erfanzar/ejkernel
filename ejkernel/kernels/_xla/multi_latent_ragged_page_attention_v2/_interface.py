@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kernel registry interface for XLA multi-latent ragged paged attention v2."""
+"""Registry entry point for the XLA MLA ragged paged-attention v2 kernel.
+
+Registers ``multi_latent_ragged_page_attention_v2`` under
+``(Platform.XLA, Backend.ANY)`` and normalises per-case block-size tuples
+before forwarding to the v1 XLA implementation.
+"""
 
 from __future__ import annotations
 

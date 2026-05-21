@@ -69,6 +69,10 @@ def _fwd_call(
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 64,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[
     tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]],
     tuple[Float[Array, "..."], ...],
@@ -88,15 +92,19 @@ def _fwd_call(
         initial_state: Initial hidden state for the recurrence.
         reverse: If True, process sequence in reverse.
         cu_seqlens: Cumulative sequence lengths for variable-length sequences.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         A tuple containing the output and final state, and another tuple of
         residuals for the backward pass.
     """
     o, ht = fwd_triton_impl(
-        query=query,
-        key=key,
-        value=value,
+        q=query,
+        k=key,
+        v=value,
         g=g,
         g_gamma=g_gamma,
         gk=gk,
@@ -105,6 +113,10 @@ def _fwd_call(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     residual = query, key, value, g, gk, gv, o, initial_state
     return (o, ht), residual
@@ -115,6 +127,10 @@ def _bwd_call(
     softmax_scale: float | None,
     reverse: bool,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
+    block_k: int,
+    block_v: int,
+    num_warps: int,
+    num_stages: int,
     residual: tuple[Float[Array, "..."], ...],
     dout: tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]],
 ) -> tuple[
@@ -134,6 +150,10 @@ def _bwd_call(
         softmax_scale: Non-differentiable scaling factor.
         reverse: Non-differentiable reverse flag.
         cu_seqlens: Non-differentiable cumulative sequence lengths.
+        block_k: Non-differentiable key tile size.
+        block_v: Non-differentiable value tile size.
+        num_warps: Non-differentiable Triton warp count.
+        num_stages: Non-differentiable Triton pipeline stage count.
         residual: Tensors saved from the forward pass.
         dout: A tuple containing the gradients of the output (`do`) and the
             final hidden state (`dht`).
@@ -145,9 +165,9 @@ def _bwd_call(
     do, dht = dout
     query, key, value, g, gk, gv, o, initial_state = residual
     dq, dk, dv, dg, dgk, dgv, dh0 = bwd_triton_impl(
-        query=query,
-        key=key,
-        value=value,
+        q=query,
+        k=key,
+        v=value,
         g=g,
         g_gamma=g_gamma,
         gk=gk,
@@ -159,12 +179,16 @@ def _bwd_call(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return dq, dk, dv, dg, dgk, dgv, dh0
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 7, 9, 10))
-@partial(jax.jit, static_argnums=(7, 9))
+@partial(jax.custom_vjp, nondiff_argnums=(4, 7, 9, 10, 11, 12, 13, 14))
+@partial(jax.jit, static_argnums=(7, 9, 11, 12, 13, 14))
 def _recurrent(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
@@ -177,6 +201,10 @@ def _recurrent(
     initial_state: Float[Array, "... num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 64,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "... num_heads head_dim head_dim"]]:
     """
     Core JIT-compiled recurrent function with a custom VJP.
@@ -196,6 +224,10 @@ def _recurrent(
         initial_state: Initial hidden state for the recurrence.
         reverse: If True, process sequence in reverse (static argument).
         cu_seqlens: Cumulative sequence lengths for variable-length sequences.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         A tuple containing:
@@ -216,6 +248,10 @@ def _recurrent(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
 
@@ -236,6 +272,10 @@ def recurrent(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 64,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """
     Computes a general recurrent linear attention using a custom Triton kernel.
@@ -269,6 +309,10 @@ def recurrent(
             This is a 1D tensor like `[0, len_seq1, len_seq1+len_seq2, ...]`.
             If provided, the input tensors are expected to be "packed" with a
             batch size of 1.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         A tuple containing:
@@ -288,4 +332,8 @@ def recurrent(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )

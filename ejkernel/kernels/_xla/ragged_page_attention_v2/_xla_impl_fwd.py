@@ -14,35 +14,41 @@
 
 """Ragged Paged Attention V2 forward pass using XLA/JAX.
 
-This module provides the forward pass for ragged paged attention V2,
-combining variable-length sequence support with paged KV cache management.
+This module implements the XLA reference forward pass for ragged paged
+attention V2.  It is a read-only cache kernel: KV pages are pre-populated
+and this kernel only reads from them.
 
-Key Components:
-    - _ragged_paged_attention: Main forward function
+KV cache layout:
+    ``kv_pages[page_id, token_in_page, combined_kv_head, head_dim]``
+    where the combined-kv-head axis interleaves keys at even indices
+    (``0, 2, 4, ...``) and values at odd indices (``1, 3, 5, ...``).
 
 Algorithm:
-    Ragged paged attention for variable-length sequences:
-    1. Handle batches with variable query lengths (ragged)
-    2. Use block_tables to look up KV cache pages
-    3. Apply attention with proper masking for sequence boundaries
-    4. Accumulate output using online softmax
+    Three nested ``fori_loop`` / ``cond`` calls:
 
-Features:
-    - Ragged batch support with cumulative query lengths
-    - Paged KV cache with indirect addressing
-    - Interleaved K/V storage for memory efficiency
-    - Optional sliding window attention
-    - Logit soft capping for numerical stability
+    1. **Sequence loop** (``num_seqs`` iterations): skip sequences with no
+       queries via ``lax.cond``.
+    2. **Query-block loop** (``num_query_blocks`` per sequence): tile the
+       query tokens into blocks of ``qblocks`` (default 8).
+    3. **KV-block loop** (``num_kv_blocks`` per query block): tile pages into
+       blocks of ``kvblocks * page_size`` tokens; accumulate online-softmax.
 
-Memory Layout:
-    - kv_pages: [num_pages, page_size, num_kv_heads * 2, head_dim]
-      where K and V are interleaved
-    - block_tables: [num_seqs, max_pages] for page lookup
-    - cu_q_lens: [num_seqs + 1] cumulative query lengths
+    KV position ``kv_pos`` is attended to by query at position ``q_pos`` iff:
+
+    * ``kv_pos < context_len`` (bounds), AND
+    * ``kv_pos <= q_pos`` (causal), AND
+    * (if ``sliding_window`` set) ``kv_pos > q_pos - sliding_window``.
+
+    Query position is
+    ``q_pos = context_len - num_queries + q_block_offset + token_in_block``.
+
+    If ``softmax_aux`` is provided, the online-softmax running max is
+    seeded with ``softmax_aux[h]`` and the normaliser with ``1.0`` per head,
+    providing virtual sink-token probability mass.
 
 Note:
-    This is a correctness-focused XLA fallback. For TPU-optimized
-    implementation with async DMA, see the Pallas version.
+    This is a correctness-focused XLA fallback.  For TPU production
+    workloads prefer the Pallas implementation with async DMA.
 """
 
 import jax
@@ -70,36 +76,39 @@ def _ragged_paged_attention(
 ) -> jnp.ndarray:
     """Compute ragged paged attention V2 forward pass.
 
-    Processes variable-length sequences packed together, where each
-    sequence's KV cache is stored in non-contiguous pages. Uses online
-    softmax for memory-efficient attention computation over blocked
-    query and KV tiles.
+    Processes variable-length sequences packed into a flat query tensor.
+    KV data is read from a paged cache addressed via ``block_tables``; no
+    cache writes are performed (read-only variant).
 
-    The algorithm processes sequences one at a time, with each sequence's
-    queries divided into blocks of size ``qblocks`` and KV pages grouped
-    into blocks of size ``kvblocks``. Attention is accumulated using the
-    online softmax trick (maintaining running max and sum-of-exp) to avoid
-    materializing the full attention matrix.
+    Query block size ``qblocks`` is 8 if ``total_query_tokens >= 8`` else
+    ``max(1, total_query_tokens)``.  KV block size ``kvblocks`` is 64 if
+    ``max_pages_per_sequence >= 64`` else ``max(1, max_pages_per_sequence)``.
+    Both query and KV arrays are padded to multiples of these block sizes so
+    that ``lax.dynamic_slice`` calls remain in-bounds.
 
     Args:
-        queries: Packed query tokens [total_query_tokens, num_q_heads, head_size].
-        kv_pages: Interleaved KV cache pages
-            [num_pages, page_size, num_kv_heads * 2, head_dim] where K and V
-            are interleaved along the head dimension.
-        context_lens: Context length for each sequence [num_seqs].
-        block_tables: Page table mapping [num_seqs, max_pages].
-            Maps logical pages to physical pages for each sequence.
-        query_start_loc: Cumulative query token counts [num_seqs + 1].
-        num_seqs: Number of sequences in the batch (scalar or 1-element array).
-        softmax_scale: Scaling factor for QK^T dot products.
-        logits_soft_cap: Optional soft cap for attention logits via tanh.
-        compute_dtype: Data type for intermediate computations.
-        sliding_window: Optional sliding window size for local attention.
-        softmax_aux: Optional per-head attention sink logits [num_q_heads].
-            Initializes the online softmax with sink contributions.
+        queries: Packed query tokens, shape
+            ``[total_query_tokens, num_q_heads, head_size]``.
+        kv_pages: Interleaved paged KV cache, shape
+            ``[num_pages, page_size, num_kv_heads * 2, head_dim]``.
+            Axis-2 even indices are keys; odd indices are values.
+        context_lens: Total KV context length per sequence, shape ``[num_seqs]``.
+        block_tables: Physical-page lookup table, shape
+            ``[num_seqs, max_pages_per_seq]``.
+        query_start_loc: Cumulative query token offsets, shape ``[num_seqs+1]``.
+        num_seqs: Number of active sequences (scalar or shape ``[1]``).
+            Static at trace time via ``static_argnums``.
+        softmax_scale: Multiplicative scale for QK^T logits.
+        logits_soft_cap: Optional tanh capping radius.  Static at trace time.
+        compute_dtype: Dtype for intermediate matmul and accumulation.
+            Static at trace time.
+        sliding_window: Optional left-only sliding window size.  Static.
+        softmax_aux: Optional per-head sink logits, shape ``[num_q_heads]``.
+            Initialises the online-softmax running max/normaliser.
 
     Returns:
-        Attention output [total_query_tokens, num_q_heads, head_size].
+        Attention output, shape ``[total_query_tokens, num_q_heads, head_size]``,
+        same dtype as ``queries``.
     """
     total_query_tokens, num_q_heads, head_size = queries.shape
     page_size = kv_pages.shape[1]

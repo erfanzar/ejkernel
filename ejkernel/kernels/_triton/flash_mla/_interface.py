@@ -81,10 +81,7 @@ import jaxtyping
 from beartype import beartype
 from jaxtyping import Array, Bool, DTypeLike, Float, Int, PRNGKeyArray
 
-from ..._registry import Backend, Platform, kernel_registry
 
-
-@kernel_registry.register("flash_mla", Platform.TRITON, Backend.GPU)
 @jaxtyping.jaxtyped(typechecker=beartype)
 def flash_mla(
     query: Float[Array, "batch seq_len q_heads q_head_dim"],

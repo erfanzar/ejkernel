@@ -554,24 +554,27 @@ def _operate(
     falls back to a two-step dequantize+matmul approach.
 
     Args:
-        x: Input activation matrix of shape (M, K).
+        x: Activation matrix ``[M, K]``.
         w: Packed uint32 weights.
         scales: Per-group scale parameters.
-        biases: Per-group affine additive bias parameters (derived from
-            canonical ``zeros`` metadata), or None.
-        transpose: Whether weights are in NxK (transposed) layout.
+        biases: Per-group affine additive biases (``-zero * scale``), or
+            ``None`` for non-affine modes.
+        transpose: ``True`` → NxK weight layout; ``False`` → KxN.
         group_size: Elements per quantization group.
         bits: Bit-width per quantized element.
-        mode: Quantization mode string.
-        block_m: Tile size for M dimension.
-        block_n: Tile size for N dimension.
-        block_k: Tile size for K dimension.
-        use_bf16: Whether to use BF16 for intermediate computations.
-        allow_dense_fallback: If False, disallow the dequantize+matmul fallback
-            path when the blocked fused path is illegal, and raise instead.
+        mode: Backend quantization key (already normalised by ``_resolve_qparams``).
+        block_m: M-dimension tile size.
+        block_n: N-dimension tile size.
+        block_k: K-dimension tile size.
+        use_bf16: If ``True``, intermediate tiles use BF16; otherwise FP16.
+        allow_dense_fallback: If ``False``, raises instead of falling through to
+            the dense dequantize+matmul path.
+        gemv_mode: Accepted for API compatibility; ignored (deleted on entry).
+        revsplit_k: Accepted for API compatibility; ignored (deleted on entry).
+        revsplit_k_parts: Accepted for API compatibility; ignored (deleted on entry).
 
     Returns:
-        Matrix multiplication result of shape (M, N) in float32.
+        Result matrix ``[M, N]`` in float32.
     """
     del gemv_mode, revsplit_k, revsplit_k_parts
 
@@ -641,62 +644,62 @@ def quantized_matmul(
     num_stages: int | None = None,
     split_k: int | None = None,
 ) -> Float[Array, "m n"]:
-    """Quantized matrix multiplication using XLA.
+    """Compute quantized matrix multiplication using JAX/XLA.
 
-    This function provides a portable XLA implementation of quantized matmul
-    for explicit modes ``affine``, ``nf4``, ``mxfp4``, ``mxfp8``, ``nvfp4``,
-    and ``nvfp8``.
-    When possible, it uses a blocked algorithm with fused dequantization for
-    better performance. For incompatible shapes or bit-widths, it falls back
-    to a simple dequantize+matmul approach.
+    Attempts a blocked fused dequantize-and-matmul path for 4-bit and 8-bit
+    modes, then falls back to a two-step ``dequantize + x @ w`` approach when
+    the fused path's preconditions are not met (or when ``allow_dense_fallback``
+    is ``True`` and the fused path raises ``ValueError``).
+
+    For ``transpose=True`` the ``block_k`` tile is automatically rounded up to
+    the nearest multiple of both ``values_per_word`` and ``group_size`` before
+    JIT compilation if the default value is not already compatible.
 
     Args:
-        x: Input activation matrix of shape (M, K) in float dtype.
-        w: Packed uint32 weights produced by quantize() or prepack_quantized_weights().
-            For transpose=True, shape is (N, ceil(K/values_per_word)).
-            For transpose=False, shape is (K, ceil(N/values_per_word)).
-        scales: Per-group scales array. Shape depends on mode:
-            - affine/nf4: float scales, shape (N, K//group_size) or (K, N//group_size)
-            - mxfp4/mxfp8: uint8 E8M0 exponents
-            - nvfp4/nvfp8: uint8 E4M3 scale codes
-        zeros: Per-group affine zero-points (canonical affine metadata). Must
-            have the same shape as scales. Must be None for non-affine modes.
-            Internally converted to additive offsets for blocked fused kernels.
-        transpose: If True, weights are in NxK layout (transposed) and the
-            computation is x @ w.T. If False, weights are in KxN layout and
-            the computation is x @ w. Default is False.
-        group_size: Number of elements per quantization group. If None, uses
-            mode default (64 for affine/nf4, 32 for mxfp4/mxfp8, 16 for nvfp4/nvfp8).
-        bits: Bit-width per quantized element. Honored for affine only
-            (supported values {4,8}); ignored for explicit non-affine modes.
-        mode: Quantization mode determining the dequantization formula:
-            - "affine": ``(q - zero) * scale``
-            - "nf4": 4-bit NormalFloat codebook
-            - "mxfp4"/"mxfp8": Microscaling FP4/FP8
-            - "nvfp4"/"nvfp8": NVIDIA microscaling FP4/FP8
-        block_m: Tile size for M dimension in blocked algorithm. Default 128.
-        block_n: Tile size for N dimension in blocked algorithm. Default 128.
-        block_k: Tile size for K dimension in blocked algorithm. Default 64.
-        use_bf16: If True, use BF16 for intermediate dot products.
-            If False, use FP16. Default is True.
-        num_warps: Ignored in XLA path (Triton-only).
-        num_stages: Ignored in XLA path (Triton-only).
-        split_k: Ignored in XLA path (Triton-only).
+        x: Activation matrix ``[M, K]`` in a float dtype.
+        w: Packed uint32 weights.  Shape:
+            ``[N, ceil(K / values_per_word)]`` when ``transpose=True``, or
+            ``[K, ceil(N / values_per_word)]`` when ``transpose=False``.
+        scales: Per-group scales.  Shape and dtype depend on mode:
+
+            - ``affine``/``nf4``: float, shape ``[N, K//gs]`` (T) or ``[K, N//gs]``.
+            - ``mxfp4``/``mxfp8``: ``uint8`` E8M0 shared exponents.
+            - ``nvfp4``/``nvfp8``: ``uint8`` E4M3 per-group scales.
+        zeros: Per-group affine zero-points (canonical ``(q - zero) * scale``
+            form).  Must match ``scales`` shape.  ``None`` for non-affine modes.
+            Internally converted to additive bias ``-zero * scale``.
+        transpose: If ``True``, weights are in NxK layout (compute ``x @ w.T``).
+            If ``False``, weights are in KxN layout (compute ``x @ w``).
+        group_size: Quantization group size.  Mode defaults:
+            64 (affine/nf4), 32 (mxfp4/mxfp8), 16 (nvfp4/nvfp8).
+        bits: Bit-width per element.  Honoured for affine (``{4, 8}``);
+            ignored for other explicit modes.
+        mode: User-facing quantization mode string (see ``_resolve_qparams`` for
+            normalisation).
+        axis: Optional ``QuantizationAxis``; overrides the effective
+            ``transpose`` direction via ``resolve_runtime_axis_and_transpose``.
+        gemv_mode: ``GemvMode`` hint.  Accepted but ignored on this path.
+        revsplit_k: ``RevSplitKMode`` hint.  Accepted but ignored on this path.
+        revsplit_k_parts: Split-K partition count.  Accepted but ignored.
+        block_m: M-dimension tile size (default 128).
+        block_n: N-dimension tile size (default 128).
+        block_k: K-dimension tile size (default 64; auto-adjusted for
+            ``transpose=True`` to satisfy packing/group-size constraints).
+        use_bf16: ``True`` → intermediate tiles in BF16; ``False`` → FP16.
+        allow_dense_fallback: If ``False``, raises instead of falling back to
+            the dense dequantize+matmul path.
+        num_warps: Triton-only; accepted for API compat, ignored here.
+        num_stages: Triton-only; accepted for API compat, ignored here.
+        split_k: Triton-only; accepted for API compat, ignored here.
 
     Returns:
-        Matrix multiplication result of shape (M, N) in float32.
+        Result matrix ``[M, N]`` in float32.
 
     Raises:
-        ValueError: If mode is "affine" and zeros is not provided.
-        ValueError: If mode is not "affine" but zeros is provided.
-        ValueError: If parameters are invalid for the selected mode.
-
-    Notes:
-        - The blocked algorithm is used when bits is 4 or 8 and block sizes
-          are compatible with group_size. Otherwise, falls back to
-          dequantize+matmul.
-        - This implementation serves as the fallback for other backends
-          when shapes or runtime constraints are unsupported.
+        ValueError: If ``mode == "affine"`` and ``zeros`` is ``None``.
+        ValueError: If ``mode != "affine"`` and ``zeros`` is not ``None``.
+        ValueError: If ``allow_dense_fallback=False`` and the blocked fused
+            path cannot be executed.
     """
     mode, group_size, bits = _resolve_qparams(mode, group_size, bits)
     _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)

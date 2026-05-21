@@ -55,10 +55,6 @@ from jaxtyping import Array, Float, Int
 from ejkernel.callib import cdiv, triton_call
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [4, 8]],
-    key=["key_chunk_size", "blocksize_v", "USE_G", "USE_G_GAMMA", "USE_GK", "USE_GV"],
-)
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] != 1,
@@ -201,6 +197,10 @@ def fwd_triton_impl(
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 64,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
     """Execute recurrent linear attention forward pass using Triton kernel.
 
@@ -212,7 +212,11 @@ def fwd_triton_impl(
         q: Query tensor [batch, seq_len, num_heads, head_dim]
         k: Key tensor [batch, seq_len, num_heads, head_dim]
         v: Value tensor [batch, seq_len, num_heads, head_dim]
-        g: Optional GLA-style gate [batch, seq_len, num_heads, 1]
+        g: Optional GLA-style scalar gate per head. The kernel accesses this tensor
+            with stride H per timestep (layout ``[batch, seq_len, num_heads]``), so the
+            effective shape is ``[batch, seq_len, num_heads]``. The type annotation
+            ``[batch, seq_len, num_heads, head_dim]`` in the signature is broader than
+            what the kernel uses; only the first element per head is read.
         g_gamma: Optional Lightning-style decay factor [batch, num_heads]
         gk: Optional per-key gate [batch, seq_len, num_heads, head_dim]
         gv: Optional per-value gate [batch, seq_len, num_heads, head_dim]
@@ -220,6 +224,10 @@ def fwd_triton_impl(
         initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
         reverse: Process sequence in reverse order
         cu_seqlens: Cumulative sequence lengths for variable-length mode
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         tuple: (output, final_state) where output is attention result and
@@ -227,7 +235,7 @@ def fwd_triton_impl(
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    key_chunk_size, blocksize_v = min(K, 64), min(V, 64)
+    key_chunk_size, blocksize_v = min(K, int(block_k)), min(V, int(block_v))
     NumKBlocks, NumVBlocks = cdiv(K, key_chunk_size), cdiv(V, blocksize_v)
 
     h0 = initial_state
@@ -266,6 +274,8 @@ def fwd_triton_impl(
         ],
         name="ejkernel::triton::recurrent_fwd",
         grid=grid,
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
     out = jnp.sum(out, axis=0)

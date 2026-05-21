@@ -70,6 +70,34 @@ def nsa_kernel_mask(
     NUM_SEQS: tl.constexpr,
     USE_BLOCK_COUNTS: tl.constexpr,
 ):
+    """Convert sparse block indices to a dense boolean block mask.
+
+    Grid: ``(SEQUENCE, batch, HEAD * SIZE)``
+
+    For each (query-token, batch, kv_head, selected-block-slot) tuple,
+    the kernel writes ``True`` into the output mask at position
+    ``block_mask[b, t, h, block_index]`` if:
+
+    * ``block_index * BLOCKSIZE <= i_t`` (causal constraint), **and**
+    * ``i_s < block_counts[b, t, h]`` when ``USE_BLOCK_COUNTS=True``.
+
+    Out-of-bounds block indices (< 0 or >= NUM_SEQS) are silently skipped.
+
+    Args:
+        block_indices: Sparse block index tensor, shape
+            (batch, SEQUENCE, HEAD, SIZE).
+        block_counts: Number of valid blocks per query position, shape
+            (batch, SEQUENCE, HEAD) or scalar int.  Only read when
+            ``USE_BLOCK_COUNTS=True``.
+        block_mask: Boolean output mask, shape
+            (batch, SEQUENCE, HEAD, NUM_SEQS).
+        SEQUENCE: Sequence length.
+        HEAD: Number of KV attention heads.
+        SIZE: Number of selected blocks per query position (``IndicesSize``).
+        BLOCKSIZE: Number of tokens per KV block.
+        NUM_SEQS: Total number of compressed KV blocks (mask width).
+        USE_BLOCK_COUNTS: Whether to use ``block_counts`` for masking.
+    """
     i_t, i_b, i_hs = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_h, i_s = i_hs // SIZE, i_hs % SIZE
 
@@ -92,6 +120,29 @@ def nsa_block_mask(
     cu_seqlens: jax.Array,
     block_size: int,
 ):
+    """Build a dense boolean block mask from sparse NSA block indices.
+
+    The mask is required by the backward pass kernels to determine which
+    query tokens attend to each KV block, enabling efficient dK/dV gradient
+    accumulation.
+
+    Args:
+        block_indices: Sparse block index tensor, shape
+            (batch, seq_len, num_kv_heads, num_selected_blocks).
+        block_counts: Number of valid blocks per query position.  Can be:
+            - A ``jax.Array`` of shape (batch, seq_len, num_kv_heads):
+              enables ``USE_BLOCK_COUNTS`` in the kernel.
+            - An integer: all positions use the same number of blocks;
+              ``USE_BLOCK_COUNTS`` is disabled.
+        cu_seqlens: Cumulative sequence lengths for variable-length mode.
+            When not ``None``, ``NUM_SEQS`` is computed from the maximum
+            sequence length rather than the uniform ``SEQUENCE``.
+        block_size: Number of tokens per KV block (``BLOCKSIZE``).
+
+    Returns:
+        Boolean mask of shape (batch, seq_len, num_kv_heads, NUM_SEQS),
+        where ``NUM_SEQS = ceil(max_seq_len / block_size)``.
+    """
     B, SEQUENCE, HEAD, SIZE = block_indices.shape
     BLOCKSIZE = block_size
     if cu_seqlens is not None:

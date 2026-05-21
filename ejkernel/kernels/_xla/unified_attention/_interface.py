@@ -101,6 +101,7 @@ def unified_attention(
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
     num_par_softmax_segments: int | None = None,
+    block_dim: int = 128,
     num_warps: int | None = None,
     num_stages: int | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
@@ -139,6 +140,7 @@ def unified_attention(
         logits_soft_cap: Optional soft cap for attention logits via tanh.
         seq_threshold_3d: Unused in XLA backend (Triton-specific optimization).
         num_par_softmax_segments: Unused in XLA backend (Triton-specific).
+        block_dim: Unused in XLA backend (CUDA-specific).
         num_warps: Unused in XLA backend (Triton-specific).
         num_stages: Unused in XLA backend (Triton-specific).
 

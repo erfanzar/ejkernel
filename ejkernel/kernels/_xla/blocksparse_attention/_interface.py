@@ -11,7 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kernel public interface and registration wrappers."""
+"""Public interface and kernel-registry wrapper for XLA block-sparse attention.
+
+Registers ``blocksparse_attention`` under ``Platform.XLA / Backend.ANY``.
+This backend materialises the full token-level attention mask and delegates to
+the dense XLA attention kernel, serving as the correctness reference for the
+Pallas (TPU) and Triton (GPU) sparse implementations.
+"""
 
 from __future__ import annotations
 

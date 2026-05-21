@@ -107,6 +107,41 @@ def _rwkv7_bwd_sequence(
     Float[Array, "seq_len num_heads qk_head_dim"],
     Float[Array, "num_heads qk_head_dim v_head_dim"],
 ]:
+    """Compute RWKV-7 DPLR backward gradients for a single sequence using JAX scan.
+
+    Implements the backward pass in pure JAX (no Triton kernel) for a single
+    sequence with initial state ``h0``. Used by the custom VJP via ``jax.vmap``
+    (batched mode) or sequential iteration (varlen mode).
+
+    Two scans are performed:
+    1. **Forward scan** (``_hist_step``): replays the DPLR recurrence to collect
+       ``h_prev_hist[t]`` (the hidden state *before* token ``t`` is processed).
+    2. **Backward scan** (``_bwd_step``): sweeps the sequence in reverse to
+       accumulate gradients for each timestep.
+
+    The RWKV-7 DPLR recurrence used in the forward scan:
+        ``hb_t = sum(b_t[:, :, None] * h, axis=1)``  (project state via b)
+        ``h_mid = exp(w_t)[:, :, None] * h + a_t[:, :, None] * hb_t[:, None, :]``
+        ``h_t = h_mid + k_t[:, :, None] * v_t[:, None, :]``
+
+    Args:
+        r_ord: Receptance tensor for this sequence, shape ``(T, H, K)``.
+        w_ord: Log-decay tensor, shape ``(T, H, K)``.
+        k_ord: Key tensor, shape ``(T, H, K)``.
+        v_ord: Value tensor, shape ``(T, H, V)``.
+        a_ord: Low-rank update vector, shape ``(T, H, K)``.
+        b_ord: Low-rank projection vector, shape ``(T, H, K)``.
+        do_ord: Output gradient for this sequence, shape ``(T, H, V)``.
+        dht: Gradient of the final hidden state, shape ``(H, K, V)``.
+        h0: Initial hidden state, shape ``(H, K, V)``.
+        softmax_scale: Scaling factor applied to receptance during the forward pass.
+
+    Returns:
+        Tuple ``(dr, dw, dk, dv, da, db, dh0)`` gradients for each input:
+            - ``dr``, ``dw``, ``dk``, ``da``, ``db``: shape ``(T, H, K)``
+            - ``dv``: shape ``(T, H, V)``
+            - ``dh0``: shape ``(H, K, V)``
+    """
     r_f = r_ord.astype(jnp.float32)
     w_f = w_ord.astype(jnp.float32)
     k_f = k_ord.astype(jnp.float32)
@@ -199,6 +234,31 @@ def _normalize_rwkv7_varlen_state(
     qk_dim: int,
     v_dim: int,
 ) -> tuple[Float[Array, "num_seqs num_heads qk_head_dim v_head_dim"], bool]:
+    """Normalise an optional initial state for RWKV-7 variable-length mode.
+
+    Validates and reshapes ``initial_state`` into a ``(num_seqs, H, K, V)`` float32
+    array required by the RWKV-7 varlen forward/backward paths. Mirrors
+    ``_normalize_rwkv6_varlen_state`` for the RWKV-7 kernel.
+
+    Args:
+        initial_state: Optional initial hidden state. Accepted shapes:
+            - ``None``: initialises to zeros.
+            - ``(num_seqs, H, K, V)``: used directly.
+            - ``(1, num_seqs, H, K, V)``: squeezed along the leading dim.
+        num_seqs: Number of sequences in the packed batch.
+        num_heads: Number of attention heads (``H``).
+        qk_dim: Key/query head dimension (``K``).
+        v_dim: Value head dimension (``V``).
+
+    Returns:
+        Tuple ``(state, state_was_none)`` where:
+            - ``state``: float32 array of shape ``(num_seqs, H, K, V)``.
+            - ``state_was_none``: True if the caller passed ``None``.
+
+    Raises:
+        ValueError: If the state shape is not rank-4 or rank-5 with
+            leading size 1, or if ``state.shape[0] != num_seqs``.
+    """
     if initial_state is None:
         return jnp.zeros((num_seqs, num_heads, qk_dim, v_dim), dtype=jnp.float32), True
 
@@ -227,6 +287,9 @@ def _fwd_call(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None,
     reverse: bool,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ):
     """Forward pass for RWKV-7 DPLR recurrence in a custom VJP.
 
@@ -244,6 +307,9 @@ def _fwd_call(
         initial_state: Optional initial hidden state `[B, H, K, V]`.
         reverse: If True, process sequence in reverse.
         cu_seqlens: Cumulative sequence lengths for variable-length sequences.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         A tuple containing (output, final_state) and residuals for backward.
@@ -261,6 +327,9 @@ def _fwd_call(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     residual = (r, w, k, v, a, b, softmax_scale, initial_state, reverse, cu_seqlens)
     return (out, final_state), residual
@@ -270,6 +339,9 @@ def _bwd_call(
     softmax_scale: float | None,
     reverse: bool,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
+    block_v: int,
+    num_warps: int,
+    num_stages: int,
     residual,
     grads,
 ):
@@ -279,6 +351,9 @@ def _bwd_call(
         softmax_scale: Non-differentiable scaling factor.
         reverse: Non-differentiable reverse flag.
         cu_seqlens: Non-differentiable cumulative sequence lengths.
+        block_v: Forward value tile size.
+        num_warps: Forward Triton warp count.
+        num_stages: Forward Triton pipeline stage count.
         residual: Tensors saved from the forward pass.
         grads: A tuple containing gradients (do, dht) of output and final state.
     """
@@ -441,8 +516,8 @@ def _bwd_call(
     )
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(6, 8, 9))
-@partial(jax.jit, static_argnums=(6, 8))
+@partial(jax.custom_vjp, nondiff_argnums=(6, 8, 9, 10, 11, 12))
+@partial(jax.jit, static_argnums=(6, 8, 10, 11, 12))
 def _rwkv7(
     r: Float[Array, "batch seq_len num_heads qk_head_dim"],
     w: Float[Array, "batch seq_len num_heads qk_head_dim"],
@@ -454,6 +529,9 @@ def _rwkv7(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """Core JIT-compiled RWKV-7 function with a custom VJP.
 
@@ -471,6 +549,9 @@ def _rwkv7(
         initial_state: Optional initial hidden state `[B, H, K, V]`.
         reverse: If True, process sequence in reverse (static argument).
         cu_seqlens: Cumulative sequence lengths for variable-length sequences.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         A tuple containing:
@@ -490,6 +571,9 @@ def _rwkv7(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
 
@@ -510,6 +594,9 @@ def rwkv7(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads v_head_dim"],
     Float[Array, "... num_heads qk_head_dim v_head_dim"],
@@ -527,11 +614,14 @@ def rwkv7(
         initial_state: Optional initial state `[B, H, K, V]`.
         reverse: Process sequence in reverse order.
         cu_seqlens: Cumulative sequence lengths for packed mode.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         Tuple of (output `[B, T, H, V]`, final_state `[B, H, K, V]`).
     """
-    return _rwkv7(r, w, k, v, a, b, softmax_scale, initial_state, reverse, cu_seqlens)
+    return _rwkv7(r, w, k, v, a, b, softmax_scale, initial_state, reverse, cu_seqlens, block_v, num_warps, num_stages)
 
 
 @kernel_registry.register("rwkv7_mul", Platform.TRITON, Backend.GPU)
@@ -548,6 +638,9 @@ def rwkv7_mul(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads v_head_dim"],
     Float[Array, "... num_heads qk_head_dim v_head_dim"],
@@ -567,6 +660,9 @@ def rwkv7_mul(
         initial_state: Optional initial state `[B, H, K, V]`.
         reverse: Process sequence in reverse order.
         cu_seqlens: Cumulative sequence lengths for packed mode.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         Tuple of (output `[B, T, H, V]`, final_state `[B, H, K, V]`).
@@ -582,4 +678,7 @@ def rwkv7_mul(
         initial_state=initial_state,
         reverse=reverse,
         cu_seqlens=cu_seqlens,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )

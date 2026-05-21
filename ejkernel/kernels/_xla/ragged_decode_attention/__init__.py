@@ -15,14 +15,13 @@
 
 """XLA backend for Ragged Decode Attention.
 
-This submodule provides XLA-optimized implementation of attention
-specifically optimized for the decode phase with ragged batches.
+Provides the XLA/JAX reference implementation of decode-phase attention for
+ragged batches (sequences with different KV range lengths).  Supports GQA/MQA
+and optionally sliding-window local attention, logit soft-capping, and
+attention sinks.
 
-Key Features:
-    - Optimized for single-token decoding
-    - Variable-length KV cache support
-    - Efficient handling of ragged batch shapes
-    - Low-latency implementation for serving
+Key exports:
+    - ``ragged_decode_attention``: Registered public API.
 """
 
 from ._interface import ragged_decode_attention

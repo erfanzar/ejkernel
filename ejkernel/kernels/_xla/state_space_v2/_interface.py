@@ -64,21 +64,37 @@ def _ssm2_core(
     Float[Array, "batch seq_len num_heads head_dim"],
     Float[Array, "batch num_heads head_dim ssm_state_size"],
 ]:
-    """Core SSM2 computation with custom VJP.
+    """Core SSM2 computation entry-point with a custom VJP registered.
+
+    Dispatches to either the full-sequence scan (``_ssm2_fwd``) or the
+    single-step path (``_ssm2_single_step_fwd``) depending on
+    ``use_single_step``.  ``n_groups`` and ``use_single_step`` are static
+    (nondiff_argnums) so they do not receive gradients.
+
+    Note: ``B`` and ``C`` passed to this function are *already expanded* from
+    [batch, seq_len, n_groups, ssm_state_size] to
+    [batch, seq_len, num_heads, ssm_state_size] by the caller
+    (``state_space_v2``).
 
     Args:
-        x: Input tensor [batch, seq_len, num_heads, head_dim]
-        A: A vector (real form, typically negative) [num_heads]
-        B: B parameter [batch, seq_len, num_heads, ssm_state_size]
-        C: C parameter [batch, seq_len, num_heads, ssm_state_size]
-        D: Skip connection [num_heads]
-        dt: Time step (after softplus) [batch, seq_len, num_heads]
-        initial_state: Initial hidden state [batch, num_heads, head_dim, ssm_state_size]
-        n_groups: Number of groups for B, C (nondiff)
-        use_single_step: If True and seq_len=1, use optimized single step (nondiff)
+        x: Input tensor [batch, seq_len, num_heads, head_dim].
+        A: Per-head A scalar (real form, typically negative) [num_heads].
+        B: Expanded B projection [batch, seq_len, num_heads, ssm_state_size].
+        C: Expanded C projection [batch, seq_len, num_heads, ssm_state_size].
+        D: Per-head skip-connection weight [num_heads].
+        dt: Time step after softplus [batch, seq_len, num_heads].
+        initial_state: Optional initial SSM hidden state
+            [batch, num_heads, head_dim, ssm_state_size].  If None, zeros are used.
+        n_groups: Static number of groups for B, C (nondiff).  Not used
+            inside this function; retained for signature symmetry.
+        use_single_step: Static flag (nondiff).  If True and seq_len=1 and
+            initial_state is not None, uses the single-step path.
 
     Returns:
-        Tuple of (output, final_state)
+        Tuple of:
+            - output: SSM output [batch, seq_len, num_heads, head_dim].
+            - final_state: Final hidden state
+              [batch, num_heads, head_dim, ssm_state_size].
     """
     _batch_size, seq_len, _num_heads, _head_dim = x.shape
 

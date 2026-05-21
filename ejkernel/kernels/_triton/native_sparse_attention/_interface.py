@@ -114,6 +114,10 @@ def _fwd_call(
     softmax_scale: float,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     token_indices: Int[Array, "total_tokens"] | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads head_dim"],
     tuple[Float[Array, "..."], ...],
@@ -131,6 +135,10 @@ def _fwd_call(
         softmax_scale: Attention scaling factor.
         cu_seqlens: Cumulative sequence lengths for variable-length sequences.
         token_indices: Token indices for variable-length sequences.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         A tuple containing the attention output and residuals for the backward pass.
@@ -145,18 +153,25 @@ def _fwd_call(
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
-    residual = query, key, value, o, lse
+    residual = query, key, value, block_indices, o, lse
     return o, residual
 
 
 def _bwd_call(
-    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"],
     block_counts: Int[Array, "batch seq_len num_kv_heads"] | int,
     block_size: int,
     softmax_scale: float,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
     token_indices: Int[Array, "total_tokens"] | None,
+    block_k: int,
+    block_v: int,
+    num_warps: int,
+    num_stages: int,
     residual: tuple[Float[Array, "..."], ...],
     do: Float[Array, "batch seq_len num_heads head_dim"],
 ):
@@ -170,13 +185,17 @@ def _bwd_call(
         softmax_scale: Attention scaling factor.
         cu_seqlens: Cumulative sequence lengths for variable-length sequences.
         token_indices: Token indices for variable-length sequences.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
         residual: Tensors saved from the forward pass.
         do: Gradient of the output tensor.
 
     Returns:
         A tuple of gradients (dq, dk, dv).
     """
-    query, key, value, o, lse = residual
+    query, key, value, block_indices, o, lse = residual
     dq, dk, dv = bwd_triton_impl(
         q=query,
         k=key,
@@ -190,12 +209,16 @@ def _bwd_call(
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
-    return dq, dk, dv
+    return dq, dk, dv, None
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8))
-@partial(jax.jit, static_argnums=(5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12))
+@partial(jax.jit, static_argnums=(5, 6, 9, 10, 11, 12))
 def _apply_nsa(
     query: Float[Array, "batch seq_len num_heads head_dim"],
     key: Float[Array, "batch seq_len num_heads head_dim"],
@@ -206,6 +229,10 @@ def _apply_nsa(
     softmax_scale: float,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     token_indices: Int[Array, "total_tokens"] | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> Float[Array, "batch seq_len num_heads head_dim"]:
     """
     Core JIT-compiled NSA function with a custom VJP.
@@ -223,6 +250,10 @@ def _apply_nsa(
         softmax_scale: Attention scaling factor (static argument).
         cu_seqlens: Cumulative sequence lengths for variable-length sequences.
         token_indices: Token indices for variable-length sequences.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         The sparse attention output tensor.
@@ -237,6 +268,10 @@ def _apply_nsa(
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )[0]
 
 
@@ -256,6 +291,10 @@ def apply_native_sparse_attention(
     softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     token_indices: Int[Array, "total_tokens"] | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """
     Applies NativeSparseAttention using a pre-computed sparse block pattern.
@@ -279,6 +318,10 @@ def apply_native_sparse_attention(
         token_indices: Optional pre-computed token indices for variable-length
             sequences. If `None` and `cu_seqlens` is provided, they are computed
             internally.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         The output tensor from the sparse attention computation.
@@ -298,6 +341,10 @@ def apply_native_sparse_attention(
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
 
@@ -314,6 +361,10 @@ def native_sparse_attention(
     block_size: int = 64,
     softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """
     NSA is a sparse attention mechanism that combines two components:
@@ -345,6 +396,10 @@ def native_sparse_attention(
         softmax_scale: Scale factor for attention scores. Defaults to `1 / sqrt(dimk)` or `dimk**-0.5`.
         cu_seqlens: Cumulative sequence lengths of shape `(N+1)` for
             variable-length training. If provided, batch size batch_size must be 1.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         The output tensor of shape `(batch_size, sequence, query_heads, dimv)`.
@@ -368,6 +423,10 @@ def native_sparse_attention(
             block_size=block_size,
             softmax_scale=softmax_scale,
             cu_seqlens=cu_seqlens,
+            block_k=block_k,
+            block_v=block_v,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
         if block_indices is not None:
             warnings.warn("`block_indices` will be ignored when `g_cmp` is provided", stacklevel=1)
@@ -392,6 +451,10 @@ def native_sparse_attention(
         block_size=block_size,
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     o = o_slc

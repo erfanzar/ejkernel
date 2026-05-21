@@ -94,6 +94,42 @@ def _rwkv6_bwd_sequence(
     Float[Array, "num_heads qk_head_dim"],
     Float[Array, "num_heads qk_head_dim v_head_dim"],
 ]:
+    """Compute RWKV-6 backward pass gradients for a single sequence using JAX scan.
+
+    Implements the backward pass in pure JAX (no Triton kernel) for a single
+    sequence of length ``seq_len`` with a given initial state ``h0``. Used
+    by the custom VJP to compute gradients over batches via ``jax.vmap`` or
+    sequentially over varlen segments.
+
+    The function performs two scans:
+    1. **Forward scan** (``_hist_step``): replays the recurrence to collect the
+       pre-update hidden states ``h_prev_hist[t]`` needed for the backward pass.
+    2. **Backward scan** (``_bwd_step``): sweeps the sequence in reverse to
+       accumulate gradients for each timestep.
+
+    The RWKV-6 recurrence used in the forward scan:
+        ``h_t = exp(w_t)[:, :, None] * h_{t-1} + k_t^T * v_t``
+
+    Args:
+        r_ord: Receptance tensor for this sequence, shape ``(T, H, K)``.
+        k_ord: Key tensor, shape ``(T, H, K)``.
+        v_ord: Value tensor, shape ``(T, H, V)``.
+        w_ord: Log-decay tensor, shape ``(T, H, K)``.
+        u: Bonus tensor shared across the sequence, shape ``(H, K)``.
+        do_ord: Output gradient for this sequence, shape ``(T, H, V)``.
+        dht: Gradient of the final hidden state, shape ``(H, K, V)``.
+        h0: Initial hidden state, shape ``(H, K, V)``.
+        softmax_scale: Scaling factor applied to receptance during the forward pass.
+
+    Returns:
+        Tuple ``(dr, dk, dv, dw, du, dh0)`` gradients for each input:
+            - ``dr``: shape ``(T, H, K)``
+            - ``dk``: shape ``(T, H, K)``
+            - ``dv``: shape ``(T, H, V)``
+            - ``dw``: shape ``(T, H, K)``
+            - ``du``: shape ``(H, K)`` (summed over sequence)
+            - ``dh0``: shape ``(H, K, V)``
+    """
     r_f = r_ord.astype(jnp.float32)
     k_f = k_ord.astype(jnp.float32)
     v_f = v_ord.astype(jnp.float32)
@@ -175,6 +211,33 @@ def _normalize_rwkv6_varlen_state(
     qk_dim: int,
     v_dim: int,
 ) -> tuple[Float[Array, "num_seqs num_heads qk_head_dim v_head_dim"], bool]:
+    """Normalise an optional initial state for RWKV-6 variable-length mode.
+
+    Validates and reshapes the ``initial_state`` argument into a contiguous
+    ``(num_seqs, H, K, V)`` float32 array required by the varlen forward/backward
+    paths. Supports rank-4 ``[N, H, K, V]`` and rank-5 ``[1, N, H, K, V]`` inputs
+    (the latter arising when a batched model wraps the state with a leading
+    batch-size-1 dimension).
+
+    Args:
+        initial_state: Optional initial hidden state. Accepted shapes:
+            - ``None``: initialises to zeros.
+            - ``(num_seqs, H, K, V)``: used directly.
+            - ``(1, num_seqs, H, K, V)``: squeezed along the leading dim.
+        num_seqs: Number of sequences in the packed batch.
+        num_heads: Number of attention heads (``H``).
+        qk_dim: Key/query head dimension (``K``).
+        v_dim: Value head dimension (``V``).
+
+    Returns:
+        Tuple ``(state, state_was_none)`` where:
+            - ``state``: float32 array of shape ``(num_seqs, H, K, V)``.
+            - ``state_was_none``: True if the caller passed ``None``.
+
+    Raises:
+        ValueError: If the state shape is not rank-4 or rank-5 with
+            leading size 1, or if ``state.shape[0] != num_seqs``.
+    """
     if initial_state is None:
         return jnp.zeros((num_seqs, num_heads, qk_dim, v_dim), dtype=jnp.float32), True
 

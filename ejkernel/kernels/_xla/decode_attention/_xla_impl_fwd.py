@@ -36,8 +36,9 @@ Features:
 
 Memory Layout:
     - query: [batch, num_q_heads, head_dim] (single token per sequence)
-    - key_buffer/value_buffer: [total_pages, page_size, num_kv_heads, head_dim]
-    - req_to_tokens: [batch, max_seq_len] indirect addressing
+    - key_buffer/value_buffer: [total_tokens, num_kv_heads, head_dim]
+      (internally reshaped to [total_tokens // page_size, page_size, ...])
+    - req_to_tokens: [batch, max_pages] indirect page addressing
 
 Note:
     This kernel is optimized for the decode phase where each sequence

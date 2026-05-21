@@ -62,38 +62,72 @@ def ragged_page_attention_v2_turboquant(
     num_warps: int | None = None,
     num_stages: int | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
-    """Compute ragged paged attention v2 with TurboQuant-compressed KV cache (read-only).
+    """Ragged paged attention v2 with TurboQuant-compressed KV cache (read-only).
 
-    This function handles mixed prefill and decode workloads, computing attention
-    asymmetrically from the pre-populated compressed cache. No cache writes are
-    performed -- pages are assumed to already contain the compressed KV data.
+    Read-only cache variant: pages must be pre-populated with compressed KV
+    data before this call.  No cache writes are performed.
+
+    Attention is computed asymmetrically via the TurboQuant unbiased
+    inner-product estimator:
+
+    .. math::
+        \\langle q, k \\rangle \\approx
+        \\langle q_{\\text{rot}},\\, c[\\text{idx}] \\rangle \\cdot \\|k\\|
+        + \\frac{\\sqrt{\\pi/2}}{m} \\,
+        \\langle q_{\\text{proj}},\\, \\text{signs} \\rangle \\cdot \\|r_k\\|
+
+    Registered under ``"ragged_page_attention_v2_turboquant"`` for
+    ``Platform.XLA``, ``Backend.ANY``.
+
+    Note:
+        ``mask_value``, ``vmem_limit_bytes``, ``num_warps``, and ``num_stages``
+        are accepted for API compatibility but are ignored by this backend.
 
     Args:
-        queries: Packed query tokens [total_tokens, num_q_heads, head_dim].
-        key_indices_pages: Packed 4-bit codebook indices for keys.
-        key_signs_pages: Packed QJL sign bits for keys.
-        key_norms_pages: Key norms [original_norm, residual_norm].
-        value_indices_pages: Packed 4-bit codebook indices for values.
-        value_norms_pages: Value original norms.
-        context_lens: Context length per sequence [num_seqs].
-        block_tables: Page table mapping [num_seqs, pages_per_seq].
-        query_start_loc: Cumulative query counts [num_seqs + 1].
-        num_seqs: Number of sequences (scalar or shape[1] int32).
-        rotation_matrix: Orthogonal rotation Pi [head_dim, head_dim].
-        qjl_projection: QJL projection S [qjl_dim, head_dim].
-        key_codebook: Lloyd-Max centroids for keys [2^(bits-1)].
-        value_codebook: Lloyd-Max centroids for values [2^bits].
-        softmax_aux: Optional attention sink logits [num_q_heads].
-        softmax_scale: QK^T scaling factor.
-        logits_soft_cap: Optional logit soft capping.
+        queries: Packed query tokens, shape
+            ``[total_tokens, num_q_heads, head_dim]``.
+        key_indices_pages: Packed 4-bit Lloyd-Max codebook indices for cached
+            keys, shape ``[num_pages, page_size, num_kv_heads, head_dim // 2]``,
+            dtype ``uint8``.
+        key_signs_pages: Packed 1-bit QJL residual signs for cached keys,
+            shape ``[num_pages, page_size, num_kv_heads, qjl_dim // 8]``,
+            dtype ``uint8``.
+        key_norms_pages: Per-token key norms.  Column 0 is ``||k||``; column 1
+            is the quantisation residual norm ``||r_k||``.
+            Shape ``[num_pages, page_size, num_kv_heads, 2]``.
+        value_indices_pages: Packed 4-bit codebook indices for cached values,
+            shape ``[num_pages, page_size, num_kv_heads, head_dim // 2]``,
+            dtype ``uint8``.
+        value_norms_pages: Per-token original value norms,
+            shape ``[num_pages, page_size, num_kv_heads]``.
+        context_lens: KV context length per sequence, shape ``[num_seqs]``.
+        block_tables: Page table, shape ``[num_seqs, pages_per_seq]``.
+        query_start_loc: Cumulative query counts, shape ``[num_seqs + 1]``.
+        num_seqs: Number of active sequences (scalar or shape ``[1]`` int32).
+        rotation_matrix: Haar-distributed orthogonal matrix *Pi*,
+            shape ``[head_dim, head_dim]``.
+        qjl_projection: Random Gaussian QJL projection *S*,
+            shape ``[qjl_dim, head_dim]``.
+        key_codebook: Lloyd-Max centroids for keys, shape ``[2^bits]``.
+        value_codebook: Lloyd-Max centroids for values, shape ``[2^bits]``.
+        softmax_aux: Optional per-head attention-sink logits,
+            shape ``[num_q_heads]``.
+        softmax_scale: QK^T scaling factor.  Defaults to ``head_dim ** -0.5``.
+        logits_soft_cap: Optional tanh capping radius.
+        compute_dtype: Dtype for intermediate computation (accepted but
+            forwarded to implementation).
         sliding_window: Optional sliding window size.
-        bits: Total bits per coordinate (default 4).
+        mask_value: Accepted for API compatibility; ignored.
+        bits: Quantisation bits per coordinate (default 4).
         qjl_dim: QJL projection dimension (default 128).
         num_kv_pages_per_block: Pages per KV processing block.
         num_queries_per_block: Queries per processing block.
+        vmem_limit_bytes: Accepted for API compatibility; ignored.
+        num_warps: Accepted for API compatibility; ignored.
+        num_stages: Accepted for API compatibility; ignored.
 
     Returns:
-        Attention output [total_tokens, num_q_heads, head_dim].
+        Attention output, shape ``[total_tokens, num_q_heads, head_dim]``.
     """
     if softmax_scale is None:
         softmax_scale = queries.shape[-1] ** -0.5

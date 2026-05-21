@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""XLA backend for multi-latent ragged paged attention v2."""
+"""XLA backend for Multi-Latent Attention (MLA) ragged paged attention v2.
+
+Version 2 extends the v1 API with per-case (decode / prefill / mixed) block-size
+tuning: ``num_kv_pages_per_block`` and ``num_queries_per_block`` may now be
+supplied as either a scalar or a 3-tuple ``(decode_size, prefill_size,
+mixed_size)``.  The XLA fallback normalises these to a scalar (taking the
+mixed-case value at index 2) and delegates to the v1 XLA kernel.
+
+This submodule's public interface is otherwise identical to v1.
+"""
 
 from ._interface import multi_latent_ragged_page_attention_v2
 

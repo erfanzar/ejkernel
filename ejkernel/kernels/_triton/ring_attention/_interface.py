@@ -11,7 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kernel public interface and registration wrappers."""
+"""Kernel registration wrapper for ring attention (Triton GPU backend).
+
+Exposes ``ring_attention`` via the ejkernel registry under
+``Platform.TRITON / Backend.GPU``.  The implementation delegates to
+``ring_blocksparse_attention_call`` in ``_triton_impl_bwd``, which uses
+Triton block-sparse attention with explicit position/segment-ID masking
+distributed across devices in a ring topology.
+
+Public symbols:
+    ring_attention: Registered kernel entry point.
+"""
 
 from __future__ import annotations
 

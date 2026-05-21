@@ -12,11 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Mean pooling interface for sequence embedding aggregation.
+"""XLA implementation of mean pooling with custom VJP.
 
-This module provides the public API for mean pooling operations over
-sequence dimensions. Supports both fixed-length and variable-length
-(packed) sequences with custom VJP for efficient gradient computation.
+This module provides the forward implementation of mean pooling over
+sequence dimensions.  Two paths are supported:
+
+- **Fixed-length** (``cu_seqlens=None``): ``jnp.mean(x, axis=1)`` over
+  a ``[batch, seq_len, hidden_dim]`` tensor.
+- **Variable-length / packed** (``cu_seqlens`` provided): per-sequence
+  ``dynamic_slice`` + mask + sum / seq_len over a 2-D
+  ``[total_tokens, hidden_dim]`` tensor.
+
+A ``jax.custom_vjp`` wrapper (``_mean_pooling_core``) enables an analytic
+backward pass (broadcast of upstream gradient / seq_len) without the
+overhead of automatic differentiation through the vmap / dynamic_slice.
+
+Late-binding pattern:
+    ``_xla_impl_bwd`` is imported first by this module.  After
+    ``_mean_pooling_core`` is defined here, it is injected into the backward
+    module via ``_mean_pooling_bwd_mod._mean_pooling_core = _mean_pooling_core``
+    so that ``_mean_pooling_fwd`` can call it.
 """
 
 from functools import partial
@@ -36,19 +51,28 @@ def _mean_pooling_varlen(
     """Mean pooling for variable-length (packed) sequences.
 
     Computes the mean of token embeddings for each variable-length sequence
-    in a packed tensor. Sequences are identified by cumulative sequence
-    lengths, avoiding the need for padding.
+    in a packed tensor.  Sequences are identified by their cumulative lengths,
+    avoiding the need for padding.
+
+    The implementation uses ``jax.vmap`` over sequence indices and
+    ``jax.lax.dynamic_slice`` to extract each sequence's tokens.  Because
+    ``dynamic_slice`` requires a static slice size, all slices are padded to
+    ``max_seq_len`` tokens and a boolean mask is applied before summing.
+
+    Note:
+        ``num_seqs`` and ``max_seq_len`` are computed from ``cu_seqlens`` at
+        trace time using Python-level ``len`` and ``jnp.max``.  This means the
+        output shape is static and the function must be re-traced whenever the
+        number of sequences or the maximum sequence length changes.
 
     Args:
-        x: Input tensor of shape [total_tokens, hidden_dim] containing
-            concatenated token embeddings for all sequences.
-        cu_seqlens: Cumulative sequence lengths of shape [num_seqs + 1].
-            For example, [0, 10, 25] indicates two sequences: tokens 0-9
-            and tokens 10-24.
+        x: Packed token embeddings ``[total_tokens, hidden_dim]``.
+        cu_seqlens: Cumulative sequence lengths ``[num_seqs + 1]``.
+            Example: ``[0, 10, 25]`` → two sequences of lengths 10 and 15.
 
     Returns:
-        Mean-pooled tensor of shape [num_seqs, hidden_dim] where each row
-        is the average of the token embeddings for the corresponding sequence.
+        Mean-pooled embeddings ``[num_seqs, hidden_dim]``, one row per
+        sequence.
     """
     num_seqs = len(cu_seqlens) - 1
     max_seq_len = jnp.max(cu_seqlens[1:] - cu_seqlens[:-1])
@@ -131,37 +155,32 @@ def mean_pooling(
     chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
 ) -> Float[Array, "batch hidden_dim"]:
-    """
-    Performs mean pooling over the sequence dimension using JAX/XLA.
+    """Perform mean pooling over the sequence dimension using JAX/XLA.
 
-    This function calculates the mean of token embeddings for each sequence in a
-    batch. It supports both standard (padded) and variable-length sequences.
+    Computes the mean of token embeddings.  Dispatches to the fixed-length or
+    variable-length path depending on whether ``cu_seqlens`` is provided.
+    Gradients are computed via the custom VJP defined in ``_mean_pooling_core``.
 
     Args:
-        x: The input tensor of shape `(batch_size, sequence_length, hidden_dim)`.
-            If `cu_seqlens` is provided for variable-length inputs, the shape
-            should be `(total_tokens, hidden_dim)`.
-        chunk_size: Performance tuning parameter (ignored in XLA, only used by Triton).
-        cu_seqlens: An optional 1D tensor of cumulative sequence lengths for
-            handling variable-length sequences in a packed format.
-            Example: `[0, len_seq1, len_seq1+len_seq2, ...]`. If provided, the
-            function will compute the mean pooling for each of the packed
-            sequences.
+        x: Input tensor.  Shape ``[batch, seq_len, hidden_dim]`` for
+            fixed-length batches, or ``[total_tokens, hidden_dim]`` when
+            ``cu_seqlens`` is provided.
+        chunk_size: Accepted for API compatibility with the Triton backend;
+            ignored on this XLA path.
+        cu_seqlens: Optional cumulative sequence lengths ``[num_seqs + 1]``.
+            When provided, ``x`` must be 2-D (packed tokens).
 
     Returns:
-        A tensor of shape `(batch_size, hidden_dim)` containing the mean-pooled
-        embeddings for each sequence. If `cu_seqlens` is used, the batch size in
-        the output shape will correspond to the number of sequences defined by
-        `cu_seqlens` (i.e., `len(cu_seqlens) - 1`).
+        Mean-pooled tensor ``[batch_or_num_seqs, hidden_dim]``.  The leading
+        dimension equals ``len(cu_seqlens) - 1`` when ``cu_seqlens`` is used.
 
     Examples:
-        >>>
+        >>> import jax.numpy as jnp
         >>> x = jnp.ones((2, 10, 128))
         >>> out = mean_pooling(x)
         >>> out.shape
         (2, 128)
 
-        >>>
         >>> x = jnp.ones((25, 128))
         >>> cu_seqlens = jnp.array([0, 10, 25])
         >>> out = mean_pooling(x, cu_seqlens=cu_seqlens)

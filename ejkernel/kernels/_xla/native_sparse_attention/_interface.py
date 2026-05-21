@@ -283,37 +283,68 @@ def apply_native_sparse_attention(
     softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     token_indices: Int[Array, "total_tokens"] | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
-    """
-    Applies block-sparse attention using a pre-computed sparsity pattern with JAX/XLA.
+    """Apply block-sparse attention with a pre-computed sparsity pattern using JAX/XLA.
 
-    This function implements sparse attention where each query block attends to a
-    subset of key blocks specified by the sparsity pattern. This reduces computational
-    complexity from O(N²) to O(N·S) where S is the sparsity (number of blocks attended).
+    Computes sparse attention where each query token attends only to the subset
+    of K/V blocks prescribed by ``block_indices``.  This reduces the cost from
+    O(seq_len²) to O(seq_len * num_selected_blocks * block_size).
+
+    Internally, both K and V are padded to the next multiple of ``block_size``
+    and reshaped into blocks.  Attention is then computed per-token by gathering
+    the selected blocks and applying causal masking followed by softmax.
+
+    The custom VJP (``_sparse_attention_with_vjp``) is used so that gradients
+    flow only through the differentiable inputs (Q, K, V); ``block_indices`` and
+    ``block_counts`` receive ``None`` gradients.
 
     Args:
-        query: Query tensor of shape `(batch, seq_len, num_heads, head_dim)`.
-        key: Key tensor of shape `(batch, seq_len, num_heads, head_dim)`.
-        value: Value tensor of shape `(batch, seq_len, num_heads, head_dim)`.
-        block_indices: Block sparsity pattern. Supported layouts:
-            - per-token indices: `(batch, seq_len, num_kv_heads, num_selected_blocks)`
-            - per-query-block indices: `(batch, num_kv_heads, num_blocks, num_selected_blocks)`
-              where `num_blocks = ceil(seq_len / block_size)`.
-        block_counts: Number of blocks attended per query. Can be:
-            - int: uniform sparsity for all tokens
-            - per-token counts: `(batch, seq_len, num_kv_heads)`
-            - per-query-block counts: `(batch, num_kv_heads, num_blocks)`
-        block_size: Size of each block (both query and key blocks).
-        softmax_scale: Attention scaling factor. If None, defaults to 1/sqrt(head_dim).
+        query: Query tensor ``[batch, seq_len, num_q_heads, head_dim]``.
+        key: Key tensor ``[batch, seq_len, num_kv_heads, head_dim]``.  GQA is
+            supported: ``num_q_heads`` must be a multiple of ``num_kv_heads``.
+        value: Value tensor ``[batch, seq_len, num_kv_heads, head_dim]``.
+        block_indices: Block selection indices.  Two layouts are accepted:
+
+            - Per-token: ``[batch, seq_len, num_kv_heads, num_selected_blocks]``
+            - Per-query-block: ``[batch, num_kv_heads, num_blocks, num_selected_blocks]``
+              (automatically expanded to per-token with ``num_blocks =
+              ceil(seq_len / block_size)``).
+
+            Values of ``-1`` are treated as sentinel (invalid) entries and are
+            masked out regardless of ``block_counts``.
+        block_counts: Number of valid blocks per query position.  Can be:
+
+            - ``int``: uniform count for all positions and heads.
+            - ``[batch, seq_len, num_kv_heads]``: per-token counts.
+            - ``[batch, num_kv_heads, num_blocks]``: per-query-block counts
+              (expanded to per-token).
+        block_size: Size of each block in tokens (static; determines tiling).
+        softmax_scale: QK scaling factor.  Defaults to ``1 / sqrt(head_dim)``.
+        cu_seqlens: Not supported on this XLA path; raises ``NotImplementedError``
+            if provided.
+        token_indices: Not supported on this XLA path; raises ``NotImplementedError``
+            if provided.
+        block_k: Accepted for API compatibility with Triton; ignored by XLA.
+        block_v: Accepted for API compatibility with Triton; ignored by XLA.
+        num_warps: Accepted for API compatibility with Triton; ignored by XLA.
+        num_stages: Accepted for API compatibility with Triton; ignored by XLA.
 
     Returns:
-        Attention output of shape `(batch, seq_len, num_heads, head_dim)`.
+        Attention output ``[batch, seq_len, num_q_heads, head_dim]``.
 
-    Notes:
-        - The sequence is divided into blocks of size `block_size`
-        - Each query block computes attention over selected key blocks only
-        - Sparsity is determined by `block_indices` and `block_counts`
-        - Useful for long-range attention with reduced computation
+    Raises:
+        NotImplementedError: If ``cu_seqlens`` is not None.
+        NotImplementedError: If ``token_indices`` is not None.
+        ValueError: If ``block_indices`` is not a 4-D array.
+        ValueError: If the shape of ``block_indices`` does not match either
+            accepted layout for the given ``seq_len``, ``num_kv_heads``, and
+            ``block_size``.
+        ValueError: If ``block_counts`` is not an int or a 3-D array matching
+            one of the accepted layouts.
 
     Examples:
         >>> batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64
@@ -424,54 +455,77 @@ def native_sparse_attention(
     block_size: int = 64,
     softmax_scale: float | None = None,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
-    """
-    Native Sparse Attention (NSA) with XLA/JAX implementation.
+    """Compute Native Sparse Attention (NSA) using JAX/XLA.
 
-    NSA is a sparse attention mechanism that combines two components:
-    1.  **Compressed Attention**: A coarse-grained attention over mean-pooled
-        (compressed) key-value blocks. This provides a global context summary.
-    2.  **Selected Attention**: A fine-grained, sparse attention where each
-        query attends to a small subset of the original key-value blocks.
+    NSA combines two attention components:
 
-    The key idea is that the selection of blocks for the second component can be
-    determined efficiently using the compressed representations from the first.
-    The final output is a gated combination of these two components.
+    1. **Compressed attention** (only when ``g_cmp`` is provided): queries
+       attend to mean-pooled (block-compressed) key-value representations,
+       providing coarse global context.  The log-sum-exp from this step is
+       also used to select the most relevant blocks for step 2.
+
+    2. **Selected sparse attention**: queries attend to a small set of
+       full-resolution K/V blocks chosen either by top-k block selection
+       (when ``g_cmp`` is given) or by the caller-supplied ``block_indices``.
+
+    The final output is computed as::
+
+        o = o_slc * g_slc  (if g_slc provided, else o = o_slc)
+        o = o + o_cmp * g_cmp  (only when g_cmp provided)
+
+    where ``g_cmp`` and ``g_slc`` are element-wise gate scalars broadcast over
+    ``head_dim``.
+
+    Note:
+        On the GPU path, top-k block selection temporarily moves data to CPU to
+        work around an XLA:GPU cache-reuse crash in some JAX builds.
 
     Args:
-        query: Query tensor of shape `(batch_size, sequence, num_heads, head_dim)`.
-        key: Key tensor of shape `(batch_size, sequence, num_heads, head_dim)`.
-        value: Value tensor of shape `(batch_size, sequence, num_heads, head_dim)`.
-        g_cmp: Optional gate tensor for compressed attention, shape `(batch_size, sequence, hidden_dim)`.
-            If provided, the compressed attention component is computed.
-        g_slc: Optional gate tensor for selected attention, shape `(batch_size, sequence, hidden_dim)`.
-        block_indices: Optional tensor of pre-computed block indices for selected attention.
-            Supported layouts:
-            - per-token indices: `(batch, seq_len, num_kv_heads, num_selected_blocks)`
-            - per-query-block indices: `(batch, num_kv_heads, num_blocks, num_selected_blocks)`
-              where `num_blocks = ceil(seq_len / block_size)`.
-            If `g_cmp` is provided, this argument is ignored, and block indices are
-            computed dynamically via top-k selection over the compressed keys.
-            If `g_cmp` is NOT provided, this argument is required.
-        block_counts: Number of blocks to select for each query. Can be:
-            - int: uniform sparsity for all query blocks
-            - per-token counts: `(batch, seq_len, num_kv_heads)`
-            - per-query-block counts: `(batch, num_kv_heads, num_blocks)`
-            Defaults to 16.
-        block_size: The size of each attention block. Defaults to 64.
-        softmax_scale: Scale factor for attention scores. Defaults to `1 / sqrt(head_dim)`.
-        cu_seqlens: Cumulative sequence lengths of shape `(N+1)` for
-            variable-length training. If provided, batch size must be 1.
-            Note: Variable-length sequences are not yet fully supported in XLA version.
+        query: Query tensor ``[batch, seq_len, num_q_heads, head_dim]``.
+        key: Key tensor ``[batch, seq_len, num_kv_heads, head_dim]``.  GQA is
+            supported: ``num_q_heads`` must be a multiple of ``num_kv_heads``.
+        value: Value tensor ``[batch, seq_len, num_kv_heads, head_dim]``.
+        g_cmp: Gate for the compressed attention output.  Shape
+            ``[batch, seq_len, num_q_heads]``.  When provided the compressed
+            attention path is active and ``block_indices`` is ignored (a
+            warning is emitted if it is also passed).  When None, the
+            compressed path is skipped entirely and ``block_indices`` is
+            required.
+        g_slc: Gate for the selected sparse attention output.  Shape
+            ``[batch, seq_len, num_q_heads]``.  When None the selected
+            output is used unscaled.
+        block_indices: Pre-computed block selection indices.  Required when
+            ``g_cmp`` is None.  Two layouts accepted:
+
+            - Per-token: ``[batch, seq_len, num_kv_heads, num_selected_blocks]``
+            - Per-query-block: ``[batch, num_kv_heads, num_blocks, num_selected_blocks]``
+
+        block_counts: Number of K/V blocks each query attends to.  Can be:
+
+            - ``int``: uniform for all positions (default ``16``).
+            - ``[batch, seq_len, num_kv_heads]``: per-token counts.
+            - ``[batch, num_kv_heads, num_blocks]``: per-query-block counts.
+        block_size: Tokens per K/V block.  Defaults to ``64``.
+        softmax_scale: QK scaling factor.  Defaults to ``1 / sqrt(head_dim)``.
+        cu_seqlens: Cumulative sequence lengths ``[num_seqs + 1]`` for packed
+            variable-length inputs.  When provided a warning is issued if
+            ``batch != 1``.  Variable-length support is incomplete in the XLA
+            implementation.
+        block_k: Accepted for API compatibility with Triton; ignored by XLA.
+        block_v: Accepted for API compatibility with Triton; ignored by XLA.
+        num_warps: Accepted for API compatibility with Triton; ignored by XLA.
+        num_stages: Accepted for API compatibility with Triton; ignored by XLA.
 
     Returns:
-        The output tensor of shape `(batch_size, sequence, num_heads, head_dim)`.
+        Attention output ``[batch, seq_len, num_q_heads, head_dim]``.
 
-    Notes:
-        - The XLA implementation uses pure JAX operations without custom kernels
-        - For variable-length sequences (cu_seqlens), this uses the mean_pooling function
-        - The compressed attention component uses mean-pooled key/value blocks
-        - Top-k block selection is based on attention scores from compressed keys
+    Raises:
+        ValueError: If neither ``g_cmp`` nor ``block_indices`` is provided.
 
     Examples:
         >>> batch, seq_len, num_heads, head_dim = 2, 1024, 8, 64

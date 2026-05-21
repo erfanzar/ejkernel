@@ -62,7 +62,12 @@ ROPE_DECOUPLED = 2
 
 
 def _flash_mla_kernel(q_tile_ref, *args, save_residuals=False, **kwargs):
-    """Dispatcher - iterates over the batch dimension within the tile."""
+    """Pallas kernel entry-point: iterates over ``block_b`` batch elements.
+
+    Called once per grid cell ``(batch_block, q_head, q_block, kv_block)``.
+    Delegates to ``_flash_mla_kernel_single_batch`` for each batch element
+    within the tile.
+    """
     block_b = q_tile_ref.shape[0]
     for bi in range(block_b):
         _flash_mla_kernel_single_batch(bi, q_tile_ref, *args, save_residuals=save_residuals, **kwargs)
@@ -95,11 +100,51 @@ def _flash_mla_kernel_single_batch(
     kv_seq_len,
     mask_value,
 ):
-    """MLA attention kernel for a single batch element.
+    """MLA attention kernel for a single batch element within a tile.
 
-    Processes one (batch, head, q_block, kv_block) grid cell.  The KV
-    projection from the latent representation happens inline so the full
-    K/V tensors are never materialised in HBM.
+    Processes one ``(batch, head, q_block, kv_block)`` grid cell.  K_nope
+    and V are projected from the KV latent *inside* the kernel (one matmul
+    each) so the expanded tensors are never written to HBM.
+
+    Online softmax accumulation:
+        On the first KV block (``kv_seq_idx == 0``) the VMEM scratch buffers
+        are zeroed.  Each block updates ``(m_next, l_next, acc)`` using the
+        standard Flash Attention correction factor ``alpha = exp(m_prev - m_next)``.
+        The final normalised output and optional ``l/m`` residuals are written
+        on the last KV block.
+
+    RoPE modes:
+        * ``ROPE_NONE``: Logits = ``q @ k_nope.T``.
+        * ``ROPE_FUSED``: Query carries ``[d_nope | rope_dim]``; logits are
+          ``q_nope @ k_nope.T + q_rope @ b_k.T``.
+        * ``ROPE_DECOUPLED``: Query is nope-only; ``b_q @ b_k.T`` is added
+          separately.
+
+    Args:
+        bi: Batch index within the current block (0 … block_b-1).
+        q_tile_ref: [block_b, 1, block_q, q_head_dim].
+        kv_tile_ref: [block_b, block_k, kv_lora_rank].
+        w_kc_tile_ref: [1, kv_lora_rank, d_nope].
+        w_vc_tile_ref: [1, kv_lora_rank, v_head_dim].
+        bq_tile_ref: Optional [block_b, block_q, rope_dim].
+        bk_tile_ref: Optional [block_b, block_k, rope_dim].
+        bias_tile_ref: Optional [block_b, 1, block_q, block_k].
+        o_tile_ref: [block_b, 1, block_q, v_head_dim] — output.
+        l_out_tile_ref: Optional l residual output.
+        m_out_tile_ref: Optional m residual output.
+        m_scratch_ref: VMEM [block_b, 1, block_q, MIN_BLOCK_SIZE].
+        l_scratch_ref: VMEM [block_b, 1, block_q, MIN_BLOCK_SIZE].
+        acc_scratch_ref: VMEM [block_b, 1, block_q, v_head_dim].
+        save_residuals: Write l/m outputs when True.
+        rope_mode: ROPE_NONE / ROPE_FUSED / ROPE_DECOUPLED.
+        d_nope: Nope key dimension.
+        causal: Apply causal masking.
+        softmax_scale: Attention scale factor.
+        sliding_window: Optional (left, right) window tuple.
+        logits_soft_cap: Optional tanh soft-cap value.
+        block_k: KV block size (must be a multiple of MIN_BLOCK_SIZE).
+        kv_seq_len: Total KV length.
+        mask_value: Large negative value for masked positions.
     """
     block_q = q_tile_ref.shape[2]
     v_head_dim = w_vc_tile_ref.shape[2]

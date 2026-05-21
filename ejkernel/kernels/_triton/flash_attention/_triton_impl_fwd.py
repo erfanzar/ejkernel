@@ -416,37 +416,62 @@ def _attn_fwd(
     """Triton kernel for flash attention forward pass.
 
     Main kernel that orchestrates tiled computation of attention across blocks.
-    Processes queries in blocks and iterates through all key/value blocks,
-    maintaining running statistics for numerical stability.
+    Processes queries in blocks (axis 0 of the grid) and iterates through all
+    key/value blocks, maintaining running softmax statistics (m, l) for
+    numerical stability (online softmax).
+
+    Grid shape: ``(ceil(QSeq / BLOCK_M), batch * nheads_q)``.
 
     Args:
-        q, k, v: Pointers to query, key, value tensors
-        B: Pointer to bias tensor (optional)
-        softmax_scale: Attention score scaling factor
-        dropout_prob: Dropout probability
-        dropout_seed: Random seed for dropout
-        stride_*: Tensor strides for each dimension
-        nheads_q: Number of query heads
-        num_repeats: Head repeat factor for multi-query attention
-        window_left/right: Sliding window boundaries
-        QSeq, KSeq: Sequence lengths for queries and keys
-        cum_seqlens_q/k: Cumulative sequence lengths for variable-length mode
-        max_seqlen_q_rounded: Padded max sequence length
-        headdim: Head dimension
-        CQSeq, CKSeq: Compile-time sequence lengths
-        DRuntime: Runtime head dimension
-        Po: Output tensor pointer
-        M: Log-sum-exp output pointer
-        VARLEN: Variable-length sequence mode
-        USE_DROPOUT: Enable dropout
-        IS_CAUSAL: Apply causal masking
-        BIAS_ON: Use bias tensor
-        SLIDING: Apply sliding window
-        BOOL_BIAS: Bias is boolean mask
-        BLOCK_HEADDIM: Compile-time head dimension
-        PADDED_HEADS: Head dimension needs padding
-        EVEN_M/N: Sequence lengths are divisible by block sizes
-        BLOCK_M/N: Block sizes for tiling
+        q: Query tensor pointer [batch, seq_q, nheads_q, head_dim]
+        k: Key tensor pointer [batch, seq_k, nheads_kv, head_dim]
+        v: Value tensor pointer [batch, seq_k, nheads_kv, head_dim]
+        QSeg: Query segment IDs pointer [batch, seq_q] (or None)
+        KSeg: Key segment IDs pointer [batch, seq_k] (or None)
+        B: Bias tensor pointer [batch, nheads_q, seq_q, seq_k] (or None)
+        softmax_scale: QK^T scaling factor (multiplied by log2(e) internally)
+        dropout_prob: Dropout probability for attention weights
+        dropout_seed: Integer seed for reproducible dropout
+        logits_soft_cap: Tanh soft-cap value. 0.0 disables capping.
+        softmax_aux: Attention sink logit pointer [nheads_q, num_sinks]
+        num_sinks: Number of attention sink tokens
+        stride_qz, stride_qm, stride_qh: Query strides (batch, seq, head)
+        stride_kz, stride_kn, stride_kh: Key strides
+        stride_vz, stride_vn, stride_vh: Value strides
+        stride_qsz, stride_qsm: Query segment-ID strides
+        stride_ksz, stride_ksn: Key segment-ID strides
+        stride_oz, stride_om, stride_oh: Output strides
+        stride_bz, stride_bm, stride_bh: Bias strides
+        nheads_q: Number of query attention heads
+        num_repeats: GQA/MQA ratio: nheads_q // nheads_kv
+        window_left: Left sliding-window bound (-1 = disabled)
+        window_right: Right sliding-window bound (-1 = disabled)
+        QSeq: Runtime query sequence length
+        cum_seqlens_q: Pointer to cumulative query lengths (variable-length mode)
+        KSeq: Runtime key/value sequence length
+        cum_seqlens_k: Pointer to cumulative key lengths (variable-length mode)
+        max_seqlen_q_rounded: Query seq length rounded to BLOCK_M multiple
+        headdim: Actual (unpadded) head dimension
+        CQSeq: Compile-time query sequence length (constexpr)
+        CKSeq: Compile-time key sequence length (constexpr)
+        DRuntime: Runtime head dimension (same as headdim, passed as scalar)
+        Po: Output tensor pointer [batch, seq_q, nheads_q, head_dim]
+        M: Log-sum-exp output pointer [batch, nheads_q, seq_q] (float32)
+        VARLEN: Enable variable-length mode (constexpr)
+        USE_DROPOUT: Enable attention dropout (constexpr)
+        IS_CAUSAL: Enable causal (lower-triangular) masking (constexpr)
+        BIAS_ON: Enable bias addition (constexpr)
+        SLIDING: Enable sliding-window attention (constexpr)
+        SOFTCAP: Enable logit tanh soft-capping (constexpr)
+        USE_SINKS: Enable attention sinks (constexpr)
+        BOOL_BIAS: Treat bias as a boolean mask rather than float addend (constexpr)
+        USE_SEGMENTS: Enable segment-based cross-sequence masking (constexpr)
+        BLOCK_HEADDIM: Compile-time head dimension rounded to power of 2 (constexpr)
+        PADDED_HEADS: True when head_dim is not a power of 2 (constexpr)
+        EVEN_M: True when QSeq % BLOCK_M == 0 (heuristic, constexpr)
+        EVEN_N: True when KSeq % BLOCK_N == 0 (heuristic, constexpr)
+        BLOCK_M: Query tile size (constexpr)
+        BLOCK_N: Key/value tile size (constexpr)
     """
     i_start_m = tl.program_id(0)
     off_zh = tl.program_id(1)

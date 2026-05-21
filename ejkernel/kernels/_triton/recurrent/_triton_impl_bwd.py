@@ -53,10 +53,6 @@ from ejkernel.callib import cdiv, triton_call
 from ejkernel.xla_utils.cumsum import chunk_global_cumsum
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=4)],
-    key=["BLOCKSIZE_K", "BLOCKSIZE_V", "USE_G", "USE_G_GAMMA", "USE_GK", "USE_GV"],
-)
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] != 1,
@@ -276,6 +272,10 @@ def bwd_triton_impl(
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 64,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads head_dim"] | None,
     Float[Array, "batch seq_len num_heads head_dim"] | None,
@@ -295,7 +295,9 @@ def bwd_triton_impl(
         q: Query tensor [batch, seq_len, num_heads, head_dim]
         k: Key tensor [batch, seq_len, num_heads, head_dim]
         v: Value tensor [batch, seq_len, num_heads, head_dim]
-        g: Optional GLA-style gate [batch, seq_len, num_heads, 1]
+        g: Optional GLA-style scalar gate per head. The kernel accesses this as
+            ``[batch, seq_len, num_heads]`` (stride H per timestep). See note in
+            ``fwd_triton_impl`` regarding the type-annotation discrepancy.
         g_gamma: Optional Lightning-style decay factor [batch, num_heads]
         gk: Optional per-key gate [batch, seq_len, num_heads, head_dim]
         gv: Optional per-value gate [batch, seq_len, num_heads, head_dim]
@@ -306,6 +308,10 @@ def bwd_triton_impl(
         initial_state: Initial hidden state from forward pass
         reverse: Whether forward pass was reversed
         cu_seqlens: Cumulative sequence lengths for variable-length mode
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         tuple: (dq, dk, dv, dg, dgk, dgv, dh0) gradients for each input.
@@ -315,7 +321,7 @@ def bwd_triton_impl(
     Z, SEQUENCE, HEAD, DIM_K, DIM_V = *k.shape, v.shape[-1]
     N = Z if cu_seqlens is None else len(cu_seqlens) - 1
 
-    BLOCKSIZE_K, BLOCKSIZE_V = min(DIM_K, 64), min(DIM_V, 64)
+    BLOCKSIZE_K, BLOCKSIZE_V = min(DIM_K, int(block_k)), min(DIM_V, int(block_v))
     NumKBlocks, NumVBlocks = cdiv(DIM_K, BLOCKSIZE_K), cdiv(DIM_V, BLOCKSIZE_V)
 
     h0 = initial_state
@@ -378,6 +384,8 @@ def bwd_triton_impl(
         ],
         name="ejkernel::triton::recurrent_bwd",
         grid=grid,
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
 

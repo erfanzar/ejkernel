@@ -41,7 +41,7 @@ _N_FUSE = 1
 
 
 def _dot(a, b):
-    """Matrix multiply with the module-level precision setting."""
+    """2-D matrix multiply with the module-level ``_P`` precision setting."""
     return lax.dot(a, b, precision=_P)
 
 
@@ -51,7 +51,29 @@ def _chunk_blockspec(shape: tuple[int, ...]) -> pl.BlockSpec:
 
 
 def _neumann_inv(A, C, strict_lower=None, lower_mask=None):
-    """Compute (I - A)^{-1} via repeated squaring. Input must be pre-sanitized."""
+    """Compute ``(I - A)^{-1}`` via repeated squaring (Neumann series).
+
+    ``A`` must be strictly lower-triangular so the series terminates exactly
+    after ``C - 1`` terms.  Repeated squaring needs ``ceil(log2(C))``
+    iterations to accumulate all terms up to ``A^{C-1}``.
+
+    The computation runs at ``HIGHEST`` precision to minimise rounding error
+    in the inverse.  Both ``A`` and the output are clamped with
+    ``nan_to_num`` to guard against overflow in extreme inputs.
+
+    Args:
+        A: Strict lower-triangular matrix [C, C], float32. Must already be
+            sanitized (NaN/Inf replaced with 0).
+        C: Chunk size — determines the number of Neumann iterations needed.
+        strict_lower: Optional precomputed strict-lower mask [C, C] (1 below
+            diagonal, 0 on/above). Computed internally if not provided.
+        lower_mask: Optional precomputed lower-triangular mask [C, C]
+            (1 on diagonal and below). Computed internally if not provided.
+
+    Returns:
+        Approximation to ``(I - A)^{-1}`` as a float32 [C, C] matrix, with
+        NaN/Inf entries replaced by 0.
+    """
     _hp = lax.Precision.HIGHEST
     # ``A`` is strict-lower triangular, so the Neumann series terminates
     # exactly after at most ``C - 1`` powers. Repeated squaring needs
@@ -75,7 +97,26 @@ def _neumann_inv(A, C, strict_lower=None, lower_mask=None):
 
 
 def _process_one_chunk(q, k, v, beta, decay, state, C):
-    """Process a single chunk: returns (output, new_state). Used by backward."""
+    """Run the GDR recurrence on a single chunk of length C.
+
+    Used by the backward kernel to re-materialise intermediate states for
+    chunks that precede the current one being differentiated.  All
+    intermediate values are guarded with ``nan_to_num``.
+
+    Args:
+        q: Query slice [C, qk_dim], float32.
+        k: Key slice [C, qk_dim], float32.
+        v: Value slice [C, v_dim], float32.
+        beta: Per-token gate [C], float32.
+        decay: Per-token log decay [C], float32.
+        state: Recurrent state at the start of this chunk [qk_dim, v_dim].
+        C: Chunk size (must match ``q.shape[0]``).
+
+    Returns:
+        Tuple ``(core_out, new_state)`` where:
+        * ``core_out`` is the attention output for this chunk [C, v_dim].
+        * ``new_state`` is the updated recurrent state [qk_dim, v_dim].
+    """
     lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
     strict_lower = lower_mask - jnp.eye(C, dtype=jnp.float32)
     v_beta = v * beta[:, None]
@@ -120,7 +161,35 @@ def _phase1_kernel_infer(
     k_scaled_ref,
     g_end_exp_ref,
 ):
-    """Fast inference Phase 1: uses precomputed decay_mask + g_cumsum. No attn_inv output."""
+    """Phase 1 Pallas kernel — inference mode (precomputed decay masks).
+
+    Accepts precomputed ``decay_mask`` and ``g_cumsum`` as inputs to avoid
+    recomputing them per-chunk.  Does **not** save ``attn_inv`` in the output
+    (not needed at inference time).
+
+    Grid: ``(batch, num_heads, num_chunks)``; all axes are "arbitrary"
+    (processed sequentially by the scan in Phase 2).
+
+    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array.
+
+    Inputs:
+        q_ref: [1,1,1,C,K] query block.
+        k_ref: [1,1,1,C,K] key block.
+        v_ref: [1,1,1,C,V] value block.
+        beta_ref: [1,1,1,1,C] gate vector.
+        decay_ref: [1,1,1,1,C] log decay vector (unused — only decay_mask/
+            g_cumsum are read).
+        decay_mask_ref: [1,1,1,C,C] precomputed decay mask.
+        g_cumsum_ref: [1,1,1,1,C] cumulative log decay.
+
+    Outputs written:
+        value_local_ref: [1,1,1,C,V] intra-chunk corrected value.
+        k_cumdecay_ref: [1,1,1,C,K] decay-weighted key accumulation.
+        attn_qk_ref: [1,1,1,C,C] query-key attention matrix.
+        q_scaled_ref: [1,1,1,C,K] query scaled by cumulative decay.
+        k_scaled_ref: [1,1,1,C,K] key scaled by state-to-end decay.
+        g_end_exp_ref: [1,1,1,1,1] exp of the last cumulative decay value.
+    """
     C = q_ref.shape[3]
     q = q_ref[0, 0, 0].astype(jnp.float32)
     k = k_ref[0, 0, 0].astype(jnp.float32)
@@ -177,7 +246,32 @@ def _phase1_kernel_train(
     g_end_exp_ref,
     attn_inv_ref,
 ):
-    """Training Phase 1: full computation + saves attn_inv for backward."""
+    """Phase 1 Pallas kernel — training mode (computes and saves attn_inv).
+
+    Computes all chunk-local intermediates from scratch and writes
+    ``attn_inv`` to an output ref so the backward pass can use it without
+    re-running the Neumann series.
+
+    Grid: ``(batch, num_heads, num_chunks)``; the chunk axis is "arbitrary".
+
+    BlockSpec shape convention: ``(1, 1, 1, chunk_dim)`` for every array.
+
+    Inputs:
+        q_ref: [1,1,1,C,K] query block.
+        k_ref: [1,1,1,C,K] key block.
+        v_ref: [1,1,1,C,V] value block.
+        beta_ref: [1,1,1,1,C] gate vector.
+        decay_ref: [1,1,1,1,C] log decay vector.
+
+    Outputs written (same layout as inference kernel plus):
+        value_local_ref: [1,1,1,C,V].
+        k_cumdecay_ref: [1,1,1,C,K].
+        attn_qk_ref: [1,1,1,C,C].
+        q_scaled_ref: [1,1,1,C,K].
+        k_scaled_ref: [1,1,1,C,K].
+        g_end_exp_ref: [1,1,1,1,1].
+        attn_inv_ref: [1,1,1,C,C] — ``(I - A)^{-1}`` saved for backward.
+    """
     C = q_ref.shape[3]
     q = q_ref[0, 0, 0].astype(jnp.float32)
     k = k_ref[0, 0, 0].astype(jnp.float32)
@@ -223,7 +317,26 @@ def _phase1_kernel_train(
 
 
 def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
-    """Launch Phase 1 parallel kernel for ALL chunks."""
+    """Launch the Phase 1 Pallas kernel over ALL chunks simultaneously.
+
+    Dispatches to either ``_phase1_kernel_infer`` (faster, no ``attn_inv``
+    saved) or ``_phase1_kernel_train`` (saves ``attn_inv`` for backward).
+
+    Args:
+        query_c: Reshaped query [B, H, NC, C, K].
+        key_c: Reshaped key [B, H, NC, C, K].
+        value_c: Reshaped value [B, H, NC, C, V].
+        beta_c: Reshaped gate [B, H, NC, 1, C].
+        decay_c: Reshaped log decay [B, H, NC, 1, C].
+        inference: If True, precomputes decay masks in XLA before the Pallas
+            call and uses the faster inference kernel.
+
+    Returns:
+        Seven-element tuple:
+        ``(value_local, k_cumdecay, attn_qk, q_scaled, k_scaled, g_end_exp,
+        attn_inv)`` each of shape ``[B, H, NC, ...]``.  ``attn_inv`` is
+        ``None`` in inference mode.
+    """
     B, H, NC, C, K = query_c.shape
     V = value_c.shape[-1]
 
@@ -315,7 +428,23 @@ def _run_phase1(query_c, key_c, value_c, beta_c, decay_c, *, inference=False):
 
 
 def _phase2_scan_body(state, inputs):
-    """Lightweight scan body: 4 matmuls + element-wise ops. No Neumann."""
+    """Phase 2 scan body (training mode): 4 matmuls + element-wise ops.
+
+    Consumes the precomputed Phase-1 intermediates for one chunk and
+    updates the recurrent state.  All intermediate results are sanitized
+    with ``nan_to_num`` to ensure stable gradients in training.
+
+    Args:
+        state: Recurrent state [B, H, K, V], float32.
+        inputs: Six-element tuple per chunk step:
+            ``(value_local, k_cumdecay, attn_qk, q_scaled, k_scaled,
+            g_end_exp)``.
+
+    Returns:
+        Tuple ``(new_state, (core_out, state))`` compatible with
+        ``jax.lax.scan``.  ``state`` is the state *before* the update
+        (needed by the backward scan).
+    """
     value_local, k_cumdecay, attn_qk, q_scaled, k_scaled, g_end_exp = inputs
 
     def _s(x):
@@ -333,7 +462,20 @@ def _phase2_scan_body(state, inputs):
 
 
 def _phase2_scan_body_infer(state, inputs):
-    """Inference scan body: no nan_to_num on intermediates (only state carry)."""
+    """Phase 2 scan body (inference mode): faster variant without nan-guards.
+
+    Identical computation to ``_phase2_scan_body`` but skips
+    ``nan_to_num`` on intermediate tensors for better throughput.
+    Only the new state carry is sanitized to prevent NaN propagation.
+
+    Args:
+        state: Recurrent state [B, H, K, V], float32.
+        inputs: Six-element tuple ``(value_local, k_cumdecay, attn_qk,
+            q_scaled, k_scaled, g_end_exp)`` for the current chunk.
+
+    Returns:
+        Tuple ``(new_state, (core_out, state))`` for ``jax.lax.scan``.
+    """
     value_local, k_cumdecay, attn_qk, q_scaled, k_scaled, g_end_exp = inputs
 
     v_prime = jnp.einsum("bhck,bhkv->bhcv", k_cumdecay, state)
@@ -360,11 +502,39 @@ def _chunk_gdr_fwd_core(
     save_residual: bool,
     inference: bool = False,
 ):
-    """Two-phase chunked GDR forward.
+    """Two-phase chunked GDR forward pass (shared by training and inference).
+
+    Phase 1 (parallel Pallas):
+        Runs all chunks in parallel to compute intra-chunk intermediates
+        (``value_local``, ``k_cumdecay``, ``attn_qk``, ``q_scaled``,
+        ``k_scaled``, ``g_end_exp``, and optionally ``attn_inv``).
+
+    Phase 2 (sequential lax.scan):
+        Applies a lightweight 4-matmul scan that consumes the Phase-1
+        outputs and threads the recurrent state through all chunks.
+
+    Tensor layout (internally): ``[B, H, L, dim]`` where
+    ``B=batch, H=num_heads``.
 
     Args:
-        inference: If True, uses faster kernels (precomputed decay_mask,
-                   no attn_inv output, no intermediate nan_to_num).
+        query: [B, H, L, K] float.
+        key: [B, H, L, K] float.
+        value: [B, H, L, V] float.
+        beta: [B, H, L] float — per-token gate.
+        decay: [B, H, L] float or None — per-token log decay.
+        chunk_size: Number of tokens per chunk. Padded up to a multiple of
+            ``chunk_size`` if ``L % chunk_size != 0``.
+        initial_state: [B, H, K, V] float or None.
+        use_qk_l2norm: Apply L2 normalisation to Q and K before computation.
+        save_residual: If True, package and return the residual tuple needed
+            by the backward pass.
+        inference: If True, use the faster inference kernel (precomputed
+            decay masks, no ``attn_inv`` saved, fewer NaN guards).
+
+    Returns:
+        Three-element tuple ``(output, final_state, residual)`` where
+        ``residual`` is the backward-residual tuple when ``save_residual``
+        is True, otherwise ``None``.
     """
     B, H, L, K_dim = query.shape
     V_dim = value.shape[-1]
@@ -458,7 +628,7 @@ def _chunk_gdr_fwd_core(
 
 
 def _chunk_gdr_fwd_impl(query, key, value, beta, decay, chunk_size, initial_state, use_qk_l2norm):
-    """Inference-only chunked GDR forward (no residuals saved)."""
+    """Inference-only wrapper: calls ``_chunk_gdr_fwd_core`` without saving residuals."""
     output, final_state, _ = _chunk_gdr_fwd_core(
         query,
         key,
@@ -475,7 +645,7 @@ def _chunk_gdr_fwd_impl(query, key, value, beta, decay, chunk_size, initial_stat
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 7))
-def _chunk_gdr_fwd(
+def _chunk_gdr_fwd_pallas_chunk(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch num_heads seq_len head_dim"],
     value: Float[Array, "batch num_heads seq_len d_state"],
@@ -493,7 +663,12 @@ def _chunk_gdr_fwd(
 
 
 def _chunk_gdr_fwd_rule(query, key, value, beta, decay, chunk_size, initial_state, use_qk_l2norm):
-    """Forward rule: training mode (saves residuals for backward)."""
+    """Custom-VJP forward rule: training mode — runs Phase 1+2 and saves residuals.
+
+    Returns:
+        Tuple ``((output, final_state), residual)`` as required by
+        ``jax.custom_vjp``.
+    """
     output, final_state, residual = _chunk_gdr_fwd_core(
         query,
         key,
@@ -510,13 +685,13 @@ def _chunk_gdr_fwd_rule(query, key, value, beta, decay, chunk_size, initial_stat
 
 
 def _chunk_gdr_bwd_rule(chunk_size, use_qk_l2norm, res, g):
-    """Backward rule for ``custom_vjp``."""
+    """Custom-VJP backward rule: delegates to ``_chunk_gdr_bwd`` in ``_pallas_impl_bwd``."""
     from ._pallas_impl_bwd import _chunk_gdr_bwd
 
     return _chunk_gdr_bwd(chunk_size, use_qk_l2norm, res, g)
 
 
-_chunk_gdr_fwd.defvjp(_chunk_gdr_fwd_rule, _chunk_gdr_bwd_rule)
+_chunk_gdr_fwd_pallas_chunk.defvjp(_chunk_gdr_fwd_rule, _chunk_gdr_bwd_rule)
 
 
 def _chunk_gdr_fwd(
@@ -532,11 +707,25 @@ def _chunk_gdr_fwd(
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Exact multi-token chunked GDR path for TPU.
+    """Exact multi-token chunked GDR forward path.
 
-    Keep the optimized Pallas single-token decode kernel, but route the
-    unstable multi-token training/prefill path through the exact chunked
-    triangular-solve implementation.
+    Multi-token training/prefill is routed through the XLA recurrent
+    implementation (``_recurrent_gdr_fwd``) for numerical stability, while
+    the optimised Pallas single-token decode kernel remains active for
+    ``seq_len == 1`` decoding.
+
+    Args:
+        query: [B, H, L, K].
+        key: [B, H, L, K].
+        value: [B, H, L, V].
+        beta: [B, H, L].
+        decay: [B, H, L] or None.
+        chunk_size: Passed through to ``_recurrent_gdr_fwd``.
+        initial_state: [B, H, K, V] or None.
+        use_qk_l2norm: Apply L2 normalisation to Q/K.
+
+    Returns:
+        ``(output [B, H, L, V], final_state [B, H, K, V])``.
     """
     return _recurrent_gdr_fwd(
         query=query,
@@ -551,6 +740,29 @@ def _chunk_gdr_fwd(
 
 
 def _gdr_single_step_fwd_kernel(q_ref, k_ref, v_ref, beta_ref, decay_ref, state_ref, out_ref, final_state_ref):
+    """Pallas kernel for one GDR decode step (seq_len == 1).
+
+    Grid: ``(batch, num_heads)``; both axes are "parallel".
+
+    Inputs (all with BlockSpec ``(1, 1, ..., dim)``):
+        q_ref: [B, H, 1, 1, K] — query for the current token.
+        k_ref: [B, H, 1, 1, K] — key for the current token.
+        v_ref: [B, H, 1, 1, V] — value for the current token.
+        beta_ref: [B, H, 1, 1] — gate scalar.
+        decay_ref: [B, H, 1, 1] — log decay scalar.
+        state_ref: [B, H, 1, K, V] — previous recurrent state.
+
+    Outputs written:
+        out_ref: [B, H, 1, 1, V] — attention output for the token.
+        final_state_ref: [B, H, 1, K, V] — updated recurrent state.
+
+    Computation:
+        state_decayed = state_prev * exp(decay_t)
+        kv_mem        = state_decayed @ k_t         (K -> V projection)
+        delta         = (v_t - kv_mem) * beta_t
+        state_new     = state_decayed + k_t[:, None] * delta[None, :]
+        out_t         = state_new @ q_t
+    """
     q_t = q_ref[0, 0, 0].astype(jnp.float32)
     k_t = k_ref[0, 0, 0].astype(jnp.float32)
     v_t = v_ref[0, 0, 0].astype(jnp.float32)
@@ -567,6 +779,19 @@ def _gdr_single_step_fwd_kernel(q_ref, k_ref, v_ref, beta_ref, decay_ref, state_
 
 
 def _run_single_step_forward(query, key, value, beta, decay, recurrent_state):
+    """Launch the single-step GDR Pallas kernel and return (output, new_state).
+
+    Args:
+        query: [B, H, 1, K], already L2-normalised and scaled.
+        key: [B, H, 1, K], already L2-normalised.
+        value: [B, H, 1, V].
+        beta: [B, H, 1, 1] float32 gate.
+        decay: [B, H, 1, 1] float32 log decay.
+        recurrent_state: [B, H, K, V].
+
+    Returns:
+        Tuple ``(output [B, H, 1, V], new_state [B, H, K, V])``.
+    """
     bsz, num_heads, _, qk_dim = query.shape
     v_dim = value.shape[-1]
     beta = beta[..., None].astype(jnp.float32)
@@ -596,6 +821,24 @@ def _run_single_step_forward(query, key, value, beta, decay, recurrent_state):
 
 
 def _single_step_gdr_fwd_impl(query, key, value, beta, decay, recurrent_state, use_qk_l2norm):
+    """Shared forward computation for the single-step GDR path (forward + backward rule).
+
+    Applies optional L2-normalisation, query scaling, and zero-decay fill-in,
+    then calls the Pallas kernel.  Packages a residual tuple for the backward rule.
+
+    Args:
+        query: [B, H, 1, K].
+        key: [B, H, 1, K].
+        value: [B, H, 1, V].
+        beta: [B, H, 1] gate.
+        decay: [B, H, 1] log decay, or None (treated as zeros).
+        recurrent_state: [B, H, K, V].
+        use_qk_l2norm: Apply L2 normalisation to Q/K.
+
+    Returns:
+        Tuple ``(output, final_state, residual)`` where ``residual`` contains
+        all tensors needed by the backward rule.
+    """
     input_dtype = query.dtype
     decay_was_none = decay is None
     q_inv_norm = k_inv_norm = None
@@ -620,11 +863,28 @@ def _single_step_gdr_fwd_impl(query, key, value, beta, decay, recurrent_state, u
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(6,))
 def _single_step_gdr_fwd(query, key, value, beta, decay, recurrent_state, use_qk_l2norm=True):
+    """Single-step GDR forward with custom VJP for gradient support.
+
+    Non-diff arg: ``use_qk_l2norm`` (index 6).
+
+    Args:
+        query: [B, H, 1, K].
+        key: [B, H, 1, K].
+        value: [B, H, 1, V].
+        beta: [B, H, 1].
+        decay: [B, H, 1] or None.
+        recurrent_state: [B, H, K, V].
+        use_qk_l2norm: Apply L2-normalisation to Q/K.
+
+    Returns:
+        ``(output [B, H, 1, V], final_state [B, H, K, V])``.
+    """
     output, final_state, _ = _single_step_gdr_fwd_impl(query, key, value, beta, decay, recurrent_state, use_qk_l2norm)
     return output, final_state
 
 
 def _single_step_gdr_fwd_rule(query, key, value, beta, decay, recurrent_state, use_qk_l2norm):
+    """Custom-VJP forward rule for single-step GDR: runs and saves residuals."""
     output, final_state, residual = _single_step_gdr_fwd_impl(
         query, key, value, beta, decay, recurrent_state, use_qk_l2norm
     )
@@ -632,6 +892,7 @@ def _single_step_gdr_fwd_rule(query, key, value, beta, decay, recurrent_state, u
 
 
 def _single_step_gdr_bwd_rule(use_qk_l2norm, res, g):
+    """Custom-VJP backward rule for single-step GDR: delegates to Pallas bwd kernel."""
     from ._pallas_impl_bwd import _single_step_gdr_bwd
 
     return _single_step_gdr_bwd(use_qk_l2norm, res, g)

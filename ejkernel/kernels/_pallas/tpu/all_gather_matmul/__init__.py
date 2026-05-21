@@ -12,7 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pallas TPU all-gather matmul kernel."""
+"""Pallas TPU all-gather matmul kernel.
+
+Performs a bidirectional ring all-gather on the LHS shard ``x`` across a
+TPU device mesh and then computes ``all_gather(x) @ y`` entirely on-device,
+overlapping communication with MXU computation.
+
+Public API:
+    all_gather_matmul: Registered under ``Platform.PALLAS / Backend.TPU``.
+        Custom VJP uses a fused reduce-scatter matmul for the LHS gradient
+        and a standard ``lax.all_gather`` + dot for the RHS gradient.
+"""
 
 from ._interface import all_gather_matmul
 

@@ -15,37 +15,49 @@
 
 """Ragged Paged Attention V3 XLA kernel implementation.
 
-This module provides the XLA/JAX reference kernel for ragged paged attention
-V3, which extends V2 with in-place KV cache updates and merged K/V storage.
+XLA/JAX reference kernel for ragged paged attention V3, which adds in-place
+KV cache writes and a merged K/V storage layout on top of the V2 base.
 
-Key Features:
-    - In-place KV cache writes: New query tokens are written into the
-      paged cache before attention, enabling self-attention within prefill.
-    - Merged K/V storage: Keys and values are interleaved in memory for
-      improved cache locality ([num_pages, page_size, num_kv_heads*2, head_dim]).
-    - Distribution-based dispatch: Uses a 3-element distribution array
-      to determine the number of sequences to process.
-    - Optional attention sinks via softmax_aux for probability absorption.
-    - Sliding window support for long-context efficiency.
+KV cache layout:
+    ``kv_cache[page_id, token_in_page, kv_head_pair // pack, pack, head_dim_padded]``
 
-Algorithm:
-    For each sequence in the ragged batch:
-    1. Write new query-phase K/V tokens into the paged cache
-    2. Iterate over query blocks with online softmax:
-       a. For each KV block, gather pages, unpack interleaved K/V
-       b. Compute QK^T scores with masking and optional soft cap
-       c. Update running max, sum-of-exp, and weighted value accumulator
-    3. Normalize and write output
+    Packing is determined by the cache dtype bit-width:
+    ``pack = 32 // dtype.itemsize * 8``.  ``head_dim_padded`` is the
+    smallest multiple of 128 that is >= the true ``head_dim``.  Keys are
+    at KV-pair index 0 and values at index 1 within the innermost 2-position
+    dimension after unpacking.
 
-Memory Layout:
-    - kv_cache: [num_pages, page_size, (num_kv_heads*2)//pack, pack, head_dim_padded]
-      where K and V are interleaved and packed for alignment.
-    - block_tables: [num_seqs * max_pages_per_seq] flattened page mapping.
-    - distribution: [3] int32 array with [num_prefill, num_decode, num_seqs].
+    Use ``merge_kv(k, v)`` to convert separate key/value tensors into this
+    format before inserting into the cache.
 
-Note:
-    This is a correctness-focused XLA fallback. For production TPU workloads
-    with async DMA and high-bandwidth memory transfers, use the Pallas version.
+Algorithm (per sequence):
+    **Phase 1 — KV cache update**:
+        Iterate over ``num_q_blocks`` query blocks; for each block, compute
+        the destination ``write_start + q_off`` in the flat cache view and
+        copy the merged K/V slice there (masked to valid tokens).
+
+    **Phase 2 — Online-softmax attention**:
+        Iterate over ``num_kv_blocks`` KV blocks; for each block:
+
+        1. Gather ``kvblocks`` pages from the updated cache.
+        2. Unpack the merged K/V layout to get separate ``k_block`` /
+           ``v_block`` arrays.
+        3. Compute ``logits = softmax_scale * einsum("bihd,kid->bihk", q, k)``
+           with optional FP8 scales and soft capping.
+        4. Build causal + validity + sliding-window mask.
+        5. Update online-softmax state ``(acc, l, m)`` and normalise output.
+
+    ``distribution[2]`` (total sequences) controls the outer ``fori_loop``
+    iteration count.  ``distribution[0]`` and ``distribution[1]`` are accepted
+    but not used by this backend.
+
+Notes:
+    - ``kv_cache`` is donated (``donate_argnums=(3,)``) so the compiler can
+      update it in-place without extra copies.
+    - ``chunk_prefill_size`` and ``vmem_limit_bytes`` are accepted for API
+      parity with the Pallas backend but are ignored.
+    - This is a correctness-focused reference.  For production TPU workloads
+      prefer the Pallas implementation.
 """
 
 from __future__ import annotations
@@ -111,22 +123,33 @@ def align_to(x, a):
 
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
-    """Interleave and pack key and value tensors into the merged KV format.
+    """Interleave and pack key and value tensors into the merged paged-cache format.
 
-    Concatenates K and V along the head dimension, pads to alignment
-    boundaries, and reshapes into the packed layout expected by the
-    paged KV cache.
+    Concatenates K and V along the per-head axis, pads the combined-head
+    count to ``align_to(num_kv_heads * 2, pack)`` and ``head_dim`` to
+    ``align_to(head_dim, 128)``, then reshapes into the 4-D packed layout
+    expected by the paged KV cache.
+
+    The packing factor ``pack = 32 // (dtype.itemsize * 8)`` is derived from
+    the dtype bit-width so that the innermost two axes form aligned 32-bit
+    words.
 
     Args:
-        k: Key tensor [max_num_tokens, num_kv_heads, head_dim].
-        v: Value tensor [max_num_tokens, num_kv_heads, head_dim].
-            Must have the same shape and dtype as k.
+        k: Key tensor, shape ``[max_num_tokens, num_kv_heads, head_dim]``.
+        v: Value tensor, same shape and dtype as ``k``.
 
     Returns:
         Merged KV tensor of shape
-        [max_num_tokens, num_kv_heads_x2 // packing, packing, head_dim_padded]
-        where packing is determined by the dtype bit-width and head_dim_padded
-        is aligned to 128.
+        ``[max_num_tokens, num_kv_heads_x2_aligned // pack, pack, head_dim_padded]``
+        where ``num_kv_heads_x2_aligned = align_to(num_kv_heads * 2, pack)``
+        and ``head_dim_padded = align_to(head_dim, 128)``.
+        Padding elements are zero.
+
+    Note:
+        Keys are at KV-pair slot 0 along the original axis-2 before packing;
+        values are at slot 1.  After packing, individual K/V entries are
+        recovered by reshaping axis-1 back to ``[num_kv_heads_x2, ...]`` and
+        slicing at ``[:, :, 0, :]`` / ``[:, :, 1, :]``.
     """
     with jax.named_scope("rpa_v3_xla.merge_kv"):
         assert k.shape == v.shape

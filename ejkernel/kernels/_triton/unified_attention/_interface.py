@@ -62,6 +62,7 @@ def unified_attention(
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
     num_par_softmax_segments: int | None = None,
+    block_dim: int = 128,
     num_warps: int | None = None,
     num_stages: int | None = None,
 ) -> Float[Array, "total_tokens num_q_heads head_dim"]:
@@ -106,6 +107,7 @@ def unified_attention(
             when to use 3D grid parallelization.
         num_par_softmax_segments: Optional number of parallel softmax segments for
             improved parallelization on long sequences.
+        block_dim: Accepted for API compatibility with CUDA; ignored by Triton.
         num_warps: Number of Triton warps for kernel execution. If None, uses default.
         num_stages: Number of Triton pipeline stages. If None, uses default.
 

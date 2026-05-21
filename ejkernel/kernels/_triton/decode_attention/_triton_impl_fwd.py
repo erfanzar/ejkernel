@@ -128,9 +128,36 @@ def _decode_stage1(
 
     Each thread block processes one (batch, head, kv_split) combination. It loads
     the query, iterates over the assigned portion of the KV context using paged
-    addressing, and writes partial attention output and log-sum-exp values.
+    addressing via ``req_to_tokens``, and writes partial attention output and
+    log-sum-exp values.
 
-    The grid shape is (batch, num_q_heads, num_kv_splits).
+    Grid shape: ``(batch, num_q_heads, NUM_KV_SPLITS)``.
+
+    Args:
+        q_ptr: Query tensor pointer [batch, num_q_heads, head_dim]
+        k_ptr: Key buffer pointer [total_tokens, num_kv_heads, head_dim]
+        v_ptr: Value buffer pointer [total_tokens, num_kv_heads, head_dim]
+        req_to_tokens_ptr: Page table pointer [batch, max_pages]
+        seq_lens_ptr: Context lengths pointer [batch]
+        partial_out_ptr: Output pointer for partial results
+            [batch, num_q_heads, NUM_KV_SPLITS, head_dim]
+        partial_lse_ptr: Output pointer for partial LSE values
+            [batch, num_q_heads, NUM_KV_SPLITS]
+        softmax_scale: Attention logit scaling factor
+        stride_q0..q2: Query tensor strides (batch, head, head_dim)
+        stride_k0..k2: Key buffer strides (token, head, head_dim)
+        stride_v0..v2: Value buffer strides (token, head, head_dim)
+        stride_req0..req1: Page table strides (batch, page)
+        stride_po0..po3: Partial output strides
+        stride_pl0..pl2: Partial LSE strides
+        kv_group_num: Number of query heads per KV head (GQA ratio) (constexpr)
+        BLOCK_DMODEL: Padded head dim (next power of 2 >= HEAD_DIM) (constexpr)
+        BLOCK_N: KV tokens processed per inner loop iteration (constexpr)
+        NUM_KV_SPLITS: Number of KV splits per sequence (constexpr)
+        PAGE_SIZE: Tokens per memory page (constexpr)
+        HEAD_DIM: Actual head dimension (constexpr)
+        LOGIT_CAP: If > 0, applies tanh soft-cap: ``LOGIT_CAP * tanh(qk / LOGIT_CAP)``
+            (constexpr)
     """
     b = tl.program_id(0)
     h = tl.program_id(1)
@@ -231,10 +258,24 @@ def _decode_stage2(
     """Stage 2 Triton kernel: combine partial results from all KV splits.
 
     Each thread block processes one (batch, head) combination. It loads the partial
-    outputs and LSE values from all KV splits, performs numerically stable log-sum-exp
-    reduction, and writes the final attention output and combined LSE.
+    outputs and LSE values produced by Stage 1, performs numerically stable
+    log-sum-exp reduction across all KV splits, and writes the final attention
+    output and combined LSE.
 
-    The grid shape is (batch, num_q_heads).
+    Grid shape: ``(batch, num_q_heads)``.
+
+    Args:
+        partial_out_ptr: Partial output pointer [batch, num_q_heads, NUM_KV_SPLITS, head_dim]
+        partial_lse_ptr: Partial LSE pointer [batch, num_q_heads, NUM_KV_SPLITS]
+        out_ptr: Final output pointer [batch, num_q_heads, head_dim]
+        lse_ptr: Final LSE pointer [batch, num_q_heads]
+        stride_po0..po3: Partial output strides (batch, head, split, head_dim)
+        stride_pl0..pl2: Partial LSE strides (batch, head, split)
+        stride_o0..o2: Output strides (batch, head, head_dim)
+        stride_lse0..lse1: LSE strides (batch, head)
+        BLOCK_DMODEL: Padded head dim (next power of 2 >= HEAD_DIM) (constexpr)
+        NUM_KV_SPLITS: Number of KV splits to combine (constexpr)
+        HEAD_DIM: Actual head dimension (constexpr)
     """
     b = tl.program_id(0)
     h = tl.program_id(1)

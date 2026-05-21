@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Quantized matmul interface using Triton kernels."""
+"""Public interface for the Triton quantized matmul backend.
+
+This module wires together the Triton kernel implementations, custom VJP
+plumbing, and ``jax.custom_batching.custom_vmap`` so that
+``quantized_matmul`` works correctly under ``jax.grad``, ``jax.vmap``, and
+``jax.jit``.
+
+Gradient flow:
+    Only the gradient with respect to ``x`` (the activation) is supported.
+    Gradients w.r.t. ``w``, ``scales``, and ``zeros``/``biases`` are always
+    ``None`` because quantized weights are treated as fixed constants during
+    training.
+"""
 
 from __future__ import annotations
 
@@ -43,6 +55,7 @@ from ._triton_impl_fwd import quantized_matmul_forward
 
 
 def _kernel_fwd(x, w, scales, biases, static_args):
+    """Thin forward-pass wrapper that unpacks ``static_args`` into keyword args."""
     return quantized_matmul_forward(
         x,
         w,
@@ -66,6 +79,7 @@ def _kernel_fwd(x, w, scales, biases, static_args):
 
 
 def _kernel_bwd(grad_out, w, scales, biases, static_args):
+    """Thin backward-pass wrapper that unpacks ``static_args`` into keyword args."""
     return quantized_matmul_input_grad(
         grad_out,
         w,
@@ -90,6 +104,17 @@ def _kernel_bwd(grad_out, w, scales, biases, static_args):
 
 @functools.lru_cache(maxsize=64)
 def _get_vmap_wrapper(static_args: tuple):
+    """Build and cache a ``custom_vmap``-wrapped forward call for given static args.
+
+    The wrapper handles three batching scenarios:
+
+    * **No batched inputs** – falls through to a non-vmapped call.
+    * **Only ``x`` is batched** – flattens the leading batch dims into the M
+      axis, calls the kernel once, and reshapes the result.
+    * **Any other combination** – broadcasts unbatched args to ``axis_size``
+      and uses ``jax.lax.map`` for sequential per-sample dispatch.
+    """
+
     @jax.custom_batching.custom_vmap
     def _call(x, w, scales, biases):
         return _kernel_fwd(x, w, scales, biases, static_args)
@@ -134,6 +159,12 @@ def _get_vmap_wrapper(static_args: tuple):
 
 @functools.lru_cache(maxsize=64)
 def _get_bwd_vmap_wrapper(static_args: tuple):
+    """Build and cache a ``custom_vmap``-wrapped backward call for given static args.
+
+    Mirrors ``_get_vmap_wrapper`` but operates on the upstream gradient
+    ``grad_out`` instead of the activation ``x``.
+    """
+
     @jax.custom_batching.custom_vmap
     def _call(grad_out, w, scales, biases):
         return _kernel_bwd(grad_out, w, scales, biases, static_args)
@@ -197,6 +228,29 @@ def _operate(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ):
+    """Inner JIT-compiled quantized matmul with custom VJP and vmap support.
+
+    Args:
+        x: Activation matrix of shape (M, K).
+        w: Quantized weight tensor.
+        scales: Per-group scale factors.
+        biases: Per-group additive biases (for affine mode); ``None`` otherwise.
+        transpose: If ``True``, treat w as (N, K) and compute x @ w.T.
+        group_size: Quantization group size.
+        bits: Bits per quantized value.
+        mode: Backend quantization mode string (e.g. ``"affine4"``, ``"nf4"``).
+        block_m, block_n, block_k: Triton tile sizes.
+        use_bf16: Use BF16 accumulation tiles instead of FP16.
+        num_warps: Triton warps per program (``None`` = autotuned).
+        num_stages: Triton pipeline stages (``None`` = autotuned).
+        split_k: Split-K factor (``None`` = autotuned).
+        gemv_mode: GEMV kernel selection mode.
+        revsplit_k: Reverse split-K mode.
+        revsplit_k_parts: Reverse split-K parts.
+
+    Returns:
+        Output of shape (M, N) in bfloat16.
+    """
     static_args = (
         transpose,
         group_size,
@@ -236,6 +290,7 @@ def _operate_fwd(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ):
+    """Custom VJP forward pass: runs the kernel and saves (w, scales, biases)."""
     static_args = (
         transpose,
         group_size,
@@ -274,6 +329,10 @@ def _operate_bwd(
     residual,
     grad_out,
 ):
+    """Custom VJP backward pass: computes gradient w.r.t. x only.
+
+    Gradients for w, scales, and biases are always ``None``.
+    """
     w, scales, biases = residual
     static_args = (
         transpose,
@@ -326,8 +385,61 @@ def quantized_matmul(
 ) -> Float[Array, "m n"]:
     """Quantized matrix multiplication using Triton GPU kernels.
 
-    ``zeros`` is used only for affine mode and is converted to per-group
-    additive offsets right before launching Triton kernels.
+    Computes ``x @ dequant(w)`` (or ``x @ dequant(w).T`` when
+    ``transpose=True``), where the dequantization is fused into the matmul
+    kernel.  The output is always returned in **bfloat16** regardless of
+    ``x``'s dtype.
+
+    Args:
+        x: Activation matrix of shape (M, K). Must be a 2-D float array.
+        w: Packed quantized weight tensor. Layout depends on ``bits`` and
+            ``transpose``:
+            - ``transpose=False`` (default): shape (K, N // values_per_word)
+              i.e. the weight columns are packed.
+            - ``transpose=True``: shape (N, K // values_per_word).
+        scales: Per-group scale factors. Shape matches the weight layout with
+            the packed dimension replaced by the number of groups.
+        zeros: Zero-point offsets for affine quantization.  Required when
+            ``mode="affine"``; must be ``None`` for all other modes.
+            Internally converted to per-group biases via
+            ``biases = -zeros * scales``.
+        transpose: If ``True``, treat ``w`` as stored in (N, K) logical layout
+            so that ``x @ w.T`` is computed.  Default ``False``.
+        group_size: Number of elements per quantization group along the K (or N
+            for ``transpose=True``) axis.  ``None`` defers to
+            ``resolve_qparams``.
+        bits: Bits per quantized element (e.g. 4 or 8).  ``None`` defers to
+            ``resolve_qparams``.
+        mode: Quantization scheme.  One of ``"affine"``, ``"nf4"``,
+            ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``.
+        axis: Quantization axis / layout hint.  Passed through
+            ``resolve_runtime_axis_and_transpose`` to possibly flip
+            ``transpose``.  ``None`` uses the default axis.
+        gemv_mode: Whether to use the dedicated M==1 GEMV kernels.
+            ``"auto"`` (default) selects automatically based on M.
+        revsplit_k: Whether to use the reverse split-K strategy in the GEMV
+            path.  ``"auto"`` (default) chooses based on ``bits``.
+        revsplit_k_parts: Number of reverse-split-K parts (must be in
+            {2, 4, 8, 16}).  ``None`` uses the default.
+        tpu_path: Accepted but ignored in the Triton backend.
+        allow_dense_fallback: Accepted but ignored in the Triton backend.
+        block_m: Triton GEMM tile size along M.  Default 128.
+        block_n: Triton GEMM tile size along N.  Default 128.
+        block_k: Triton GEMM tile size along K.  Default 64.
+        use_bf16: Use BF16 accumulation tiles inside the kernel.  Default True.
+        num_warps: Triton warps per program.  ``None`` lets the autotuner
+            decide.
+        num_stages: Triton pipeline stages.  ``None`` lets the autotuner
+            decide.
+        split_k: Split-K parallelism factor.  ``None`` lets the autotuner
+            decide.
+
+    Returns:
+        Output tensor of shape (M, N) in bfloat16.
+
+    Raises:
+        ValueError: If ``mode="affine"`` and ``zeros`` is ``None``, or if
+            ``zeros`` is provided for a non-affine mode.
     """
     del tpu_path, allow_dense_fallback
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)

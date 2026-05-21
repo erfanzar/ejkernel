@@ -102,6 +102,40 @@ def qmm_dequant_nf4_kernel(
     TRANSPOSE: tl.constexpr,
     OUT_BF16: tl.constexpr,
 ):
+    """Dequantize a packed NF4-quantized weight tile to fp16/bf16.
+
+    Grid: ``(cdiv(rows, BR), cdiv(cols, BC))``
+
+    Unpacks ``VALUES_PER_WORD = 8`` 4-bit NF4 codes from each int32 word and
+    converts them to float32 via ``NF4_TABLE`` lookup, then multiplies by the
+    per-group scale ``Wscale``.  The output is cast to bfloat16 if
+    ``OUT_BF16=True``, otherwise float16.
+
+    Args:
+        Wq: Packed quantized weight pointer.  When ``TRANSPOSE=False`` the
+            shape is ``(K // VALUES_PER_WORD, N)`` (rows are K, cols are N);
+            when ``TRANSPOSE=True`` the shape is ``(N // VALUES_PER_WORD, K)``.
+        Wscale: Per-group scale pointer, shape ``(rows, groups)`` where
+            ``groups = cols // GROUP_SIZE``.
+        NF4_TABLE: Lookup table pointer for 16-entry NF4 float32 values.
+        N: Output column count (output feature dimension).
+        K: Output row count (input feature / reduction dimension).
+        O: Output buffer pointer, shape ``(rows, cols)`` in dequantised layout.
+        stride_wq0: Row stride of ``Wq``.
+        stride_wq1: Column stride of ``Wq``.
+        stride_ws0: Row stride of ``Wscale``.
+        stride_ws1: Column stride of ``Wscale``.
+        stride_or: Row stride of ``O``.
+        stride_oc: Column stride of ``O``.
+        GROUP_SIZE: Number of values sharing one scale (constexpr).
+        VALUES_PER_WORD: Packed values per int32 storage word; equals 8 for
+            4-bit NF4 (constexpr).
+        BR: Tile rows per CTA (constexpr).
+        BC: Tile columns per CTA (constexpr).
+        TRANSPOSE: Whether weight is stored transposed (NxK layout)
+            vs non-transposed (KxN layout) (constexpr).
+        OUT_BF16: Output in bfloat16 when True, float16 when False (constexpr).
+    """
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -185,6 +219,40 @@ def qmm_dequant_affine4_kernel(
     TRANSPOSE: tl.constexpr,
     OUT_BF16: tl.constexpr,
 ):
+    """Dequantize a packed 4-bit affine-quantized weight tile to fp16/bf16.
+
+    Grid: ``(cdiv(rows, BR), cdiv(cols, BC))``
+
+    Unpacks ``VALUES_PER_WORD = 8`` 4-bit codes from each int32 word and
+    applies the per-group affine transform ``out = code * scale + bias``.
+    The output is cast to bfloat16 if ``OUT_BF16=True``, otherwise float16.
+
+    Args:
+        Wq: Packed quantized weight pointer.  When ``TRANSPOSE=False`` the
+            shape is ``(K // VALUES_PER_WORD, N)``; when ``TRANSPOSE=True``
+            the shape is ``(N // VALUES_PER_WORD, K)``.
+        Wscale: Per-group scale pointer, shape ``(rows, groups)`` where
+            ``groups = cols // GROUP_SIZE``.
+        Wbias: Per-group zero-point / bias pointer, same shape as ``Wscale``.
+        N: Output column count (output feature dimension).
+        K: Output row count (input feature / reduction dimension).
+        O: Output buffer pointer in dequantised layout.
+        stride_wq0: Row stride of ``Wq``.
+        stride_wq1: Column stride of ``Wq``.
+        stride_ws0: Row stride of ``Wscale``.
+        stride_ws1: Column stride of ``Wscale``.
+        stride_wb0: Row stride of ``Wbias``.
+        stride_wb1: Column stride of ``Wbias``.
+        stride_or: Row stride of ``O``.
+        stride_oc: Column stride of ``O``.
+        GROUP_SIZE: Number of values sharing one (scale, bias) pair (constexpr).
+        VALUES_PER_WORD: Packed values per int32 word; equals 8 for 4-bit
+            codes (constexpr).
+        BR: Tile rows per CTA (constexpr).
+        BC: Tile columns per CTA (constexpr).
+        TRANSPOSE: Whether weight is stored transposed (NxK) vs (KxN) (constexpr).
+        OUT_BF16: Output in bfloat16 when True, float16 when False (constexpr).
+    """
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -278,6 +346,41 @@ def qmm_dequant_affine8_kernel(
     TRANSPOSE: tl.constexpr,
     OUT_BF16: tl.constexpr,
 ):
+    """Dequantize a packed 8-bit affine-quantized weight tile to fp16/bf16.
+
+    Grid: ``(cdiv(rows, BR), cdiv(cols, BC))``
+
+    Unpacks ``VALUES_PER_WORD = 4`` 8-bit codes from each int32 word using an
+    8-bit right-shift-and-mask pattern, then applies the per-group affine
+    transform ``out = code * scale + bias``.  The output is cast to bfloat16
+    if ``OUT_BF16=True``, otherwise float16.
+
+    Args:
+        Wq: Packed quantized weight pointer.  When ``TRANSPOSE=False`` the
+            shape is ``(K // VALUES_PER_WORD, N)``; when ``TRANSPOSE=True``
+            the shape is ``(N // VALUES_PER_WORD, K)``.
+        Wscale: Per-group scale pointer, shape ``(rows, groups)`` where
+            ``groups = cols // GROUP_SIZE``.
+        Wbias: Per-group zero-point / bias pointer, same shape as ``Wscale``.
+        N: Output column count (output feature dimension).
+        K: Output row count (input feature / reduction dimension).
+        O: Output buffer pointer in dequantised layout.
+        stride_wq0: Row stride of ``Wq``.
+        stride_wq1: Column stride of ``Wq``.
+        stride_ws0: Row stride of ``Wscale``.
+        stride_ws1: Column stride of ``Wscale``.
+        stride_wb0: Row stride of ``Wbias``.
+        stride_wb1: Column stride of ``Wbias``.
+        stride_or: Row stride of ``O``.
+        stride_oc: Column stride of ``O``.
+        GROUP_SIZE: Number of values sharing one (scale, bias) pair (constexpr).
+        VALUES_PER_WORD: Packed values per int32 word; equals 4 for 8-bit
+            codes (constexpr).
+        BR: Tile rows per CTA (constexpr).
+        BC: Tile columns per CTA (constexpr).
+        TRANSPOSE: Whether weight is stored transposed (NxK) vs (KxN) (constexpr).
+        OUT_BF16: Output in bfloat16 when True, float16 when False (constexpr).
+    """
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -370,6 +473,41 @@ def qmm_dequant_mxfp4_kernel(
     TRANSPOSE: tl.constexpr,
     OUT_BF16: tl.constexpr,
 ):
+    """Dequantize a packed MX-FP4 (E2M1) weight tile to fp16/bf16.
+
+    Grid: ``(cdiv(rows, BR), cdiv(cols, BC))``
+
+    Unpacks ``VALUES_PER_WORD = 8`` 4-bit E2M1 codes from each int32 word,
+    then converts each code to float32 via ``E2M1_TABLE`` lookup and multiplies
+    by the block-floating-point scale ``E8M0_TABLE[Wscale[...]]`` (an 8-bit
+    exponent stored as a uint8 index into a precomputed exp2 table).
+
+    Args:
+        Wq: Packed quantized weight pointer.  When ``TRANSPOSE=False`` the
+            shape is ``(K // VALUES_PER_WORD, N)``; when ``TRANSPOSE=True``
+            the shape is ``(N // VALUES_PER_WORD, K)``.
+        Wscale: Per-group E8M0 exponent code pointer, shape
+            ``(rows, groups)`` where ``groups = cols // GROUP_SIZE``.
+        E2M1_TABLE: Lookup table pointer for 16-entry E2M1 float32 values.
+        E8M0_TABLE: Lookup table pointer mapping uint8 exponent codes to
+            ``pow(2, exponent)`` float32 values (256 entries).
+        N: Output column count (output feature dimension).
+        K: Output row count (input feature / reduction dimension).
+        O: Output buffer pointer in dequantised layout.
+        stride_wq0: Row stride of ``Wq``.
+        stride_wq1: Column stride of ``Wq``.
+        stride_ws0: Row stride of ``Wscale``.
+        stride_ws1: Column stride of ``Wscale``.
+        stride_or: Row stride of ``O``.
+        stride_oc: Column stride of ``O``.
+        GROUP_SIZE: Number of values sharing one scale (constexpr).
+        VALUES_PER_WORD: Packed values per int32 word; equals 8 for 4-bit
+            codes (constexpr).
+        BR: Tile rows per CTA (constexpr).
+        BC: Tile columns per CTA (constexpr).
+        TRANSPOSE: Whether weight is stored transposed (NxK) vs (KxN) (constexpr).
+        OUT_BF16: Output in bfloat16 when True, float16 when False (constexpr).
+    """
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -454,6 +592,40 @@ def qmm_dequant_mxfp8_kernel(
     TRANSPOSE: tl.constexpr,
     OUT_BF16: tl.constexpr,
 ):
+    """Dequantize a packed MX-FP8 (E4M3) weight tile to fp16/bf16.
+
+    Grid: ``(cdiv(rows, BR), cdiv(cols, BC))``
+
+    Unpacks ``VALUES_PER_WORD = 4`` 8-bit E4M3 codes from each int32 word,
+    converts each code to float32 via ``E4M3_TABLE`` lookup, and multiplies
+    by the block-floating-point scale ``E8M0_TABLE[Wscale[...]]``.
+
+    Args:
+        Wq: Packed quantized weight pointer.  When ``TRANSPOSE=False`` the
+            shape is ``(K // VALUES_PER_WORD, N)``; when ``TRANSPOSE=True``
+            the shape is ``(N // VALUES_PER_WORD, K)``.
+        Wscale: Per-group E8M0 exponent code pointer, shape
+            ``(rows, groups)`` where ``groups = cols // GROUP_SIZE``.
+        E4M3_TABLE: Lookup table pointer for 256-entry E4M3 float32 values.
+        E8M0_TABLE: Lookup table pointer mapping uint8 exponent codes to
+            ``pow(2, exponent)`` float32 values (256 entries).
+        N: Output column count (output feature dimension).
+        K: Output row count (input feature / reduction dimension).
+        O: Output buffer pointer in dequantised layout.
+        stride_wq0: Row stride of ``Wq``.
+        stride_wq1: Column stride of ``Wq``.
+        stride_ws0: Row stride of ``Wscale``.
+        stride_ws1: Column stride of ``Wscale``.
+        stride_or: Row stride of ``O``.
+        stride_oc: Column stride of ``O``.
+        GROUP_SIZE: Number of values sharing one scale (constexpr).
+        VALUES_PER_WORD: Packed values per int32 word; equals 4 for 8-bit
+            codes (constexpr).
+        BR: Tile rows per CTA (constexpr).
+        BC: Tile columns per CTA (constexpr).
+        TRANSPOSE: Whether weight is stored transposed (NxK) vs (KxN) (constexpr).
+        OUT_BF16: Output in bfloat16 when True, float16 when False (constexpr).
+    """
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -538,6 +710,44 @@ def qmm_dequant_nvfp4_kernel(
     TRANSPOSE: tl.constexpr,
     OUT_BF16: tl.constexpr,
 ):
+    """Dequantize a packed NV-FP4 (E2M1) weight tile to fp16/bf16.
+
+    Grid: ``(cdiv(rows, BR), cdiv(cols, BC))``
+
+    This is the NVIDIA FP4 variant (distinct from MX-FP4): the per-group
+    scale is stored as an E4M3 floating-point code rather than a raw E8M0
+    exponent, enabling finer-grained scale representation.
+
+    Unpacks ``VALUES_PER_WORD = 8`` 4-bit E2M1 codes from each int32 word,
+    converts each code to float32 via ``E2M1_TABLE`` lookup, and multiplies
+    by the per-group scale ``E4M3_TABLE[Wscale[...]]``.
+
+    Args:
+        Wq: Packed quantized weight pointer.  When ``TRANSPOSE=False`` the
+            shape is ``(K // VALUES_PER_WORD, N)``; when ``TRANSPOSE=True``
+            the shape is ``(N // VALUES_PER_WORD, K)``.
+        Wscale: Per-group E4M3 scale code pointer, shape
+            ``(rows, groups)`` where ``groups = cols // GROUP_SIZE``.
+        E2M1_TABLE: Lookup table pointer for 16-entry E2M1 float32 values.
+        E4M3_TABLE: Lookup table pointer for 256-entry E4M3 float32 values
+            used to decode the per-group scales.
+        N: Output column count (output feature dimension).
+        K: Output row count (input feature / reduction dimension).
+        O: Output buffer pointer in dequantised layout.
+        stride_wq0: Row stride of ``Wq``.
+        stride_wq1: Column stride of ``Wq``.
+        stride_ws0: Row stride of ``Wscale``.
+        stride_ws1: Column stride of ``Wscale``.
+        stride_or: Row stride of ``O``.
+        stride_oc: Column stride of ``O``.
+        GROUP_SIZE: Number of values sharing one scale (constexpr).
+        VALUES_PER_WORD: Packed values per int32 word; equals 8 for 4-bit
+            codes (constexpr).
+        BR: Tile rows per CTA (constexpr).
+        BC: Tile columns per CTA (constexpr).
+        TRANSPOSE: Whether weight is stored transposed (NxK) vs (KxN) (constexpr).
+        OUT_BF16: Output in bfloat16 when True, float16 when False (constexpr).
+    """
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -621,6 +831,42 @@ def qmm_dequant_nvfp8_kernel(
     TRANSPOSE: tl.constexpr,
     OUT_BF16: tl.constexpr,
 ):
+    """Dequantize a packed NV-FP8 (E4M3) weight tile to fp16/bf16.
+
+    Grid: ``(cdiv(rows, BR), cdiv(cols, BC))``
+
+    This is the NVIDIA FP8 variant: the per-group scale is a single E4M3
+    floating-point value decoded via ``E4M3_TABLE``.
+
+    Unpacks ``VALUES_PER_WORD = 4`` 8-bit E4M3 codes from each int32 word,
+    converts each code to float32 via ``E4M3_TABLE`` lookup, and multiplies
+    by the per-group scale ``E4M3_TABLE[Wscale[...]]``.
+
+    Args:
+        Wq: Packed quantized weight pointer.  When ``TRANSPOSE=False`` the
+            shape is ``(K // VALUES_PER_WORD, N)``; when ``TRANSPOSE=True``
+            the shape is ``(N // VALUES_PER_WORD, K)``.
+        Wscale: Per-group E4M3 scale code pointer, shape
+            ``(rows, groups)`` where ``groups = cols // GROUP_SIZE``.
+        E4M3_TABLE: Lookup table pointer for 256-entry E4M3 float32 values,
+            used for both weight values and scale decoding.
+        N: Output column count (output feature dimension).
+        K: Output row count (input feature / reduction dimension).
+        O: Output buffer pointer in dequantised layout.
+        stride_wq0: Row stride of ``Wq``.
+        stride_wq1: Column stride of ``Wq``.
+        stride_ws0: Row stride of ``Wscale``.
+        stride_ws1: Column stride of ``Wscale``.
+        stride_or: Row stride of ``O``.
+        stride_oc: Column stride of ``O``.
+        GROUP_SIZE: Number of values sharing one scale (constexpr).
+        VALUES_PER_WORD: Packed values per int32 word; equals 4 for 8-bit
+            codes (constexpr).
+        BR: Tile rows per CTA (constexpr).
+        BC: Tile columns per CTA (constexpr).
+        TRANSPOSE: Whether weight is stored transposed (NxK) vs (KxN) (constexpr).
+        OUT_BF16: Output in bfloat16 when True, float16 when False (constexpr).
+    """
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
 
@@ -699,6 +945,7 @@ def _zeroed_outputs_for_splitk(meta: dict) -> tuple[int, ...]:
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
+    """Return ``True`` if the named environment variable is a truthy string."""
     value = os.getenv(name, default)
     return value.lower() in {"1", "true", "yes", "y"}
 
@@ -728,6 +975,11 @@ def _parse_nonnegative_int_env(name: str, default: int) -> int:
 
 
 def _parse_matmul_precision(value: str):
+    """Map an ``EJKERNEL_QMM_MATMUL_PRECISION`` string to a ``jax.lax.Precision``.
+
+    Accepted values (case-insensitive): ``"highest"``, ``"high"``,
+    ``"fastest"``.  Falls back to ``Precision.DEFAULT`` for unknown strings.
+    """
     value = value.lower()
     if value == "highest":
         return jax.lax.Precision.HIGHEST
@@ -739,6 +991,11 @@ def _parse_matmul_precision(value: str):
 
 
 def _parse_output_dtype(value: str):
+    """Map a dtype string to a ``jnp`` dtype, or ``None`` for unrecognised values.
+
+    Accepted strings (case-insensitive): ``"bf16"``/``"bfloat16"``,
+    ``"fp16"``/``"float16"``, ``"fp32"``/``"float32"``.
+    """
     value = value.lower()
     if value in {"bf16", "bfloat16"}:
         return jnp.bfloat16
@@ -833,282 +1090,6 @@ def _qmm_estimated_smem_bytes(*, bm: int, bn: int, bk: int, num_stages: int) -> 
     return int((bm * bk + bk * bn) * 2 * num_stages)
 
 
-def _qmm_autotune_configs(mode: str, *, bits: int | None = None) -> list[triton.Config]:
-    """Generate autotune configurations for quantized matmul kernels.
-
-    Produces a curated set of Triton configurations tuned per mode, while
-    keeping compile time bounded. Configurations that exceed the shared
-    memory limit are filtered out.
-    """
-    mode = mode.lower()
-    configs: list[triton.Config] = []
-    smem_limit = _qmm_smem_limit_bytes()
-    # Minifloat decode modes tend to be more register/smem heavy; keep the
-    # search space limited to configs that reliably launch on common GPUs.
-    if mode in {"mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
-        smem_limit = min(smem_limit, 64 * 1024)
-
-    if mode == "nf4":
-        bm_choices = (32, 64, 128)
-        bn_choices = (32, 64, 128, 256)
-        bk_choices = (32, 64)
-        split_ks = (1, 2, 4, 8, 16)
-        extra = ()
-    elif mode in {"affine", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
-        bm_choices = (32, 64, 128, 256)
-        bn_choices = (64, 128, 256, 512)
-        if bits == 8:
-            bk_choices = (64, 128)
-        else:
-            bk_choices = (32, 64, 128)
-        split_ks = (1, 2, 4, 8, 16)
-        extra = (
-            (64, 512, 64, 8, 1, 1),
-            (64, 512, 128, 8, 1, 1),
-            (128, 512, 64, 8, 1, 1),
-            (128, 512, 128, 8, 1, 1),
-            (128, 256, 64, 4, 1, 1),
-            (128, 256, 128, 4, 1, 1),
-            (64, 256, 64, 4, 1, 1),
-            (128, 128, 128, 8, 2, 1),
-        )
-    else:
-        raise ValueError(f"Unsupported mode for autotune configs: {mode}")
-
-    for bm in bm_choices:
-        for bn in bn_choices:
-            for bk in bk_choices:
-                if bk >= 128:
-                    stages_choices = (1, 2)
-                elif bk >= 64:
-                    stages_choices = (1, 2, 3)
-                else:
-                    stages_choices = (1, 2, 3, 4)
-
-                for num_stages in stages_choices:
-                    # Empirically, some nf4 configs (notably BN=256, BK=64 with
-                    # pipelining) can fail to launch on common NVIDIA GPUs,
-                    # spamming "Unable to launch autotune config" warnings.
-                    if mode == "nf4" and bn >= 256 and bk == 64 and num_stages > 1:
-                        continue
-                    smem = _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages)
-                    if smem > smem_limit:
-                        continue
-
-                    if bm >= 256 or bn >= 256:
-                        warps = (4, 8)
-                    elif bm >= 128 or bn >= 128:
-                        warps = (4, 8)
-                    else:
-                        warps = (2, 4)
-
-                    for num_warps in warps:
-                        for split_k in split_ks:
-                            if bk >= 128 and (bm >= 256 or bn >= 256) and num_stages > 1:
-                                continue
-                            configs.append(
-                                triton.Config(
-                                    {"BM": bm, "BN": bn, "BK": bk, "SPLIT_K": split_k},
-                                    num_warps=num_warps,
-                                    num_stages=num_stages,
-                                )
-                            )
-
-    for bm, bn, bk, num_warps, num_stages, split_k in extra:
-        smem = _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages)
-        if smem > smem_limit:
-            continue
-        configs.append(
-            triton.Config(
-                {"BM": bm, "BN": bn, "BK": bk, "SPLIT_K": split_k},
-                num_warps=num_warps,
-                num_stages=num_stages,
-            )
-        )
-
-    return configs
-
-
-def _qmm_autotune_configs_large(mode: str, *, bits: int | None = None) -> list[triton.Config]:
-    """Generate a compact config set specialized for large square-ish shapes."""
-    mode = mode.lower()
-    configs: list[triton.Config] = []
-    smem_limit = _qmm_smem_limit_bytes()
-    if mode in {"mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
-        smem_limit = min(smem_limit, 64 * 1024)
-
-    if mode == "nf4":
-        bm_choices = (128, 256)
-        bn_choices = (128, 256)
-        bk_choices = (64, 128)
-    elif mode in {"affine", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}:
-        bm_choices = (128, 256)
-        bn_choices = (128, 256)
-        bk_choices = (64, 128)
-    else:
-        raise ValueError(f"Unsupported mode for autotune configs: {mode}")
-
-    split_ks = (1, 2)
-    num_warps_choices = (4, 8)
-    # Include stage=1 for nf4 so BN=256 cells have a valid candidate without
-    # tripping launch constraints on some GPUs.
-    num_stages_choices = (1, 2, 3) if mode == "nf4" else (2, 3, 4)
-
-    for bm in bm_choices:
-        for bn in bn_choices:
-            for bk in bk_choices:
-                for num_warps in num_warps_choices:
-                    for num_stages in num_stages_choices:
-                        if mode == "nf4" and bn >= 256 and bk == 64 and num_stages > 1:
-                            continue
-                        smem = _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages)
-                        if smem > smem_limit:
-                            continue
-                        for split_k in split_ks:
-                            configs.append(
-                                triton.Config(
-                                    {"BM": bm, "BN": bn, "BK": bk, "SPLIT_K": split_k},
-                                    num_warps=num_warps,
-                                    num_stages=num_stages,
-                                )
-                            )
-
-    return configs
-
-
-_QMM_AUTOTUNE_CONFIGS_NF4 = _qmm_autotune_configs("nf4")
-_QMM_AUTOTUNE_CONFIGS_AFFINE4 = _qmm_autotune_configs("affine", bits=4)
-_QMM_AUTOTUNE_CONFIGS_AFFINE8 = _qmm_autotune_configs("affine", bits=8)
-_QMM_AUTOTUNE_CONFIGS_MXFP4 = _qmm_autotune_configs("mxfp4", bits=4)
-_QMM_AUTOTUNE_CONFIGS_MXFP8 = _qmm_autotune_configs("mxfp8", bits=8)
-_QMM_AUTOTUNE_CONFIGS_NVFP4 = _qmm_autotune_configs("nvfp4", bits=4)
-_QMM_AUTOTUNE_CONFIGS_NVFP8 = _qmm_autotune_configs("nvfp8", bits=8)
-
-_QMM_AUTOTUNE_CONFIGS_NF4_LARGE = _qmm_autotune_configs_large("nf4")
-_QMM_AUTOTUNE_CONFIGS_AFFINE4_LARGE = _qmm_autotune_configs_large("affine", bits=4)
-_QMM_AUTOTUNE_CONFIGS_AFFINE8_LARGE = _qmm_autotune_configs_large("affine", bits=8)
-_QMM_AUTOTUNE_CONFIGS_MXFP4_LARGE = _qmm_autotune_configs_large("mxfp4", bits=4)
-_QMM_AUTOTUNE_CONFIGS_MXFP8_LARGE = _qmm_autotune_configs_large("mxfp8", bits=8)
-_QMM_AUTOTUNE_CONFIGS_NVFP4_LARGE = _qmm_autotune_configs_large("nvfp4", bits=4)
-_QMM_AUTOTUNE_CONFIGS_NVFP8_LARGE = _qmm_autotune_configs_large("nvfp8", bits=8)
-
-
-def _qmm_config_pruner(configs, nargs, **_kwargs):
-    """Lightweight config pruning based on problem shape.
-
-    Reduces autotune compile time by skipping configs that are
-    clearly mismatched with the input dimensions and by capping
-    the candidate set size after scoring.
-    """
-    m = int(nargs["M"])
-    n = int(nargs["N"])
-    k = int(nargs["K"])
-    group_size = int(nargs.get("GROUP_SIZE", 0))
-    requested_split_k = int(nargs.get("SPLIT_K", 1))
-    smem_limit = _qmm_smem_limit_bytes()
-    max_candidates_default = _parse_positive_int_env("EJKERNEL_TRITON_QMM_AUTOTUNE_MAX_CANDIDATES", 12)
-    max_candidates_large_default = _parse_positive_int_env("EJKERNEL_TRITON_QMM_AUTOTUNE_MAX_CANDIDATES_LARGE", 8)
-    min_smem_large_default = _parse_nonnegative_int_env("EJKERNEL_TRITON_QMM_AUTOTUNE_MIN_SMEM_BYTES_LARGE", 24 * 1024)
-
-    def _nearest_choices(value: int, choices: tuple[int, ...], count: int) -> set[int]:
-        ranked = sorted(choices, key=lambda x: abs(x - value))
-        return set(ranked[:count])
-
-    bm_keep = _nearest_choices(m, (32, 64, 128, 256), count=2)
-    bn_keep = _nearest_choices(n, (32, 64, 128, 256, 512), count=2)
-    bk_keep = _nearest_choices(k, (32, 64, 128), count=2)
-
-    pruned = []
-    large_mn = m >= 2048 and n >= 2048
-    large_k = k >= 4096
-    min_smem_bytes = min_smem_large_default if (large_mn and large_k) else 0
-    if large_mn and large_k:
-        bm_keep = {128}
-        bn_keep = {128, 256}
-        bk_keep = {64, 128}
-    for cfg in configs:
-        bm = cfg.kwargs["BM"]
-        bn = cfg.kwargs["BN"]
-        bk = cfg.kwargs["BK"]
-        split_k = cfg.kwargs["SPLIT_K"]
-        num_stages = int(getattr(cfg, "num_stages", 1))
-        smem = _qmm_estimated_smem_bytes(bm=bm, bn=bn, bk=bk, num_stages=num_stages)
-
-        # Avoid configs that will never launch due to shared memory limits.
-        if smem > smem_limit:
-            continue
-        # For large GEMM shapes, drop tiny-SMEM tiles that are almost always
-        # throughput-poor but still expensive to autotune.
-        if min_smem_bytes > 0 and smem < min_smem_bytes:
-            continue
-
-        if bm not in bm_keep or bn not in bn_keep or bk not in bk_keep:
-            continue
-        if m <= 64 and bm > 128:
-            continue
-        if n <= 64 and bn > 128:
-            continue
-        if k <= 64 and bk > 64:
-            continue
-        if large_mn:
-            if bm < 128 or bn < 128:
-                continue
-            if split_k > 1:
-                continue
-        if large_k and bk < 64:
-            continue
-        if group_size and group_size >= 64 and bk < group_size:
-            continue
-        if split_k > 1 and k < bk * split_k:
-            continue
-
-        pruned.append(cfg)
-    if pruned:
-
-        def _score(cfg) -> tuple[int, int, int, int, int]:
-            bm = int(cfg.kwargs["BM"])
-            bn = int(cfg.kwargs["BN"])
-            bk = int(cfg.kwargs["BK"])
-            split_k = int(cfg.kwargs.get("SPLIT_K", 1))
-            split_penalty = 0 if split_k == requested_split_k else 1
-            distance = abs(bm - m) + abs(bn - n) + abs(bk - k)
-            tile_volume = bm * bn * bk
-            smem = _qmm_estimated_smem_bytes(
-                bm=bm,
-                bn=bn,
-                bk=bk,
-                num_stages=int(getattr(cfg, "num_stages", 1)),
-            )
-            return (
-                split_penalty,
-                distance,
-                -tile_volume,
-                -smem,
-                -int(getattr(cfg, "num_warps", 1)),
-            )
-
-        pruned.sort(key=_score)
-        max_candidates = max_candidates_large_default if (large_mn and large_k) else max_candidates_default
-        return pruned[:max_candidates]
-
-    # Keep autotune alive for legal-but-narrow shapes (notably M==1 overrides).
-    fallback = [cfg for cfg in configs if int(cfg.kwargs.get("SPLIT_K", 1)) == requested_split_k]
-    if fallback:
-        return fallback[:1]
-    return configs[:1]
-
-
-def _unwrap_triton_fn(kernel):
-    """Return the original Python function for a Triton kernel wrapper."""
-    fn = getattr(kernel, "fn", kernel)
-    return getattr(fn, "fn", fn)
-
-
-@triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_NF4,
-    key=["M", "N", "K", "GROUP_SIZE", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)
 @triton.jit
 def qmm_nf4_kernel(
     X,
@@ -1238,18 +1219,9 @@ def qmm_nf4_kernel(
         )
 
 
-qmm_nf4_kernel_large = triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_NF4_LARGE,
-    key=["M", "N", "K", "GROUP_SIZE", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)(triton.jit(_unwrap_triton_fn(qmm_nf4_kernel)))
+qmm_nf4_kernel_large = qmm_nf4_kernel
 
 
-@triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_AFFINE8,
-    key=["M", "N", "K", "GROUP_SIZE", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)
 @triton.jit
 def qmm_affine8_kernel(
     X,
@@ -1375,18 +1347,9 @@ def qmm_affine8_kernel(
         )
 
 
-qmm_affine8_kernel_large = triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_AFFINE8_LARGE,
-    key=["M", "N", "K", "GROUP_SIZE", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)(triton.jit(_unwrap_triton_fn(qmm_affine8_kernel)))
+qmm_affine8_kernel_large = qmm_affine8_kernel
 
 
-@triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_AFFINE4,
-    key=["M", "N", "K", "GROUP_SIZE", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)
 @triton.jit
 def qmm_affine4_kernel(
     X,
@@ -1538,18 +1501,9 @@ def qmm_affine4_kernel(
         )
 
 
-qmm_affine4_kernel_large = triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_AFFINE4_LARGE,
-    key=["M", "N", "K", "GROUP_SIZE", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)(triton.jit(_unwrap_triton_fn(qmm_affine4_kernel)))
+qmm_affine4_kernel_large = qmm_affine4_kernel
 
 
-@triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_MXFP4,
-    key=["M", "N", "K", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)
 @triton.jit
 def qmm_mxfp4_kernel(
     X,
@@ -1660,18 +1614,9 @@ def qmm_mxfp4_kernel(
         )
 
 
-qmm_mxfp4_kernel_large = triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_MXFP4_LARGE,
-    key=["M", "N", "K", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)(triton.jit(_unwrap_triton_fn(qmm_mxfp4_kernel)))
+qmm_mxfp4_kernel_large = qmm_mxfp4_kernel
 
 
-@triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_MXFP8,
-    key=["M", "N", "K", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)
 @triton.jit
 def qmm_mxfp8_kernel(
     X,
@@ -1782,18 +1727,9 @@ def qmm_mxfp8_kernel(
         )
 
 
-qmm_mxfp8_kernel_large = triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_MXFP8_LARGE,
-    key=["M", "N", "K", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)(triton.jit(_unwrap_triton_fn(qmm_mxfp8_kernel)))
+qmm_mxfp8_kernel_large = qmm_mxfp8_kernel
 
 
-@triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_NVFP4,
-    key=["M", "N", "K", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)
 @triton.jit
 def qmm_nvfp4_kernel(
     X,
@@ -1904,18 +1840,9 @@ def qmm_nvfp4_kernel(
         )
 
 
-qmm_nvfp4_kernel_large = triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_NVFP4_LARGE,
-    key=["M", "N", "K", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)(triton.jit(_unwrap_triton_fn(qmm_nvfp4_kernel)))
+qmm_nvfp4_kernel_large = qmm_nvfp4_kernel
 
 
-@triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_NVFP8,
-    key=["M", "N", "K", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)
 @triton.jit
 def qmm_nvfp8_kernel(
     X,
@@ -2025,11 +1952,7 @@ def qmm_nvfp8_kernel(
         )
 
 
-qmm_nvfp8_kernel_large = triton.autotune(
-    configs=_QMM_AUTOTUNE_CONFIGS_NVFP8_LARGE,
-    key=["M", "N", "K", "TRANSPOSE", "USE_BF16"],
-    prune_configs_by={"early_config_prune": _qmm_config_pruner},
-)(triton.jit(_unwrap_triton_fn(qmm_nvfp8_kernel)))
+qmm_nvfp8_kernel_large = qmm_nvfp8_kernel
 
 
 def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tuple[int, int]:
@@ -2767,6 +2690,9 @@ def quantized_matmul_triton(
             VALUES_PER_WORD=8,
             USE_BF16=use_bf16,
             TRANSPOSE=transpose,
+            BM=block_m,
+            BN=block_n,
+            BK=block_k,
             SPLIT_K=split_k_selected,
         )
         return out.astype(jnp.bfloat16)
@@ -2807,6 +2733,9 @@ def quantized_matmul_triton(
             USE_BF16=use_bf16,
             TRANSPOSE=transpose,
             HAS_BIAS=biases is not None,
+            BM=block_m,
+            BN=block_n,
+            BK=block_k,
             SPLIT_K=split_k_selected,
         )
         return out.astype(jnp.bfloat16)
@@ -2840,6 +2769,9 @@ def quantized_matmul_triton(
             VALUES_PER_WORD=8,
             USE_BF16=use_bf16,
             TRANSPOSE=transpose,
+            BM=block_m,
+            BN=block_n,
+            BK=block_k,
             SPLIT_K=split_k_selected,
         )
         return out.astype(jnp.bfloat16)
@@ -2873,6 +2805,9 @@ def quantized_matmul_triton(
             VALUES_PER_WORD=4,
             USE_BF16=use_bf16,
             TRANSPOSE=transpose,
+            BM=block_m,
+            BN=block_n,
+            BK=block_k,
             SPLIT_K=split_k_selected,
         )
         return out.astype(jnp.bfloat16)
@@ -2906,6 +2841,9 @@ def quantized_matmul_triton(
             VALUES_PER_WORD=8,
             USE_BF16=use_bf16,
             TRANSPOSE=transpose,
+            BM=block_m,
+            BN=block_n,
+            BK=block_k,
             SPLIT_K=split_k_selected,
         )
         return out.astype(jnp.bfloat16)
@@ -2938,6 +2876,9 @@ def quantized_matmul_triton(
             VALUES_PER_WORD=4,
             USE_BF16=use_bf16,
             TRANSPOSE=transpose,
+            BM=block_m,
+            BN=block_n,
+            BK=block_k,
             SPLIT_K=split_k_selected,
         )
         return out.astype(jnp.bfloat16)

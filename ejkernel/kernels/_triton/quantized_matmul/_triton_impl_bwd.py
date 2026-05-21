@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backward Triton implementation for quantized matrix multiplication."""
+"""Backward pass (input gradient) for Triton quantized matmul.
+
+Only the gradient with respect to the activation ``x`` is computed.
+Gradients for the quantized weights ``w``, ``scales``, and ``biases`` are
+intentionally not supported (quantized parameters are treated as constants).
+
+The gradient ``dX = dY @ dequant(W).T`` (or ``dX = dY @ dequant(W)`` when
+``transpose=True``) is computed by re-using the forward kernel with the
+transpose flag flipped.  If that fails (e.g. unsupported shape), the
+function falls back to an explicit dequantization followed by
+``jax.lax.dot_general``.
+"""
 
 from __future__ import annotations
 

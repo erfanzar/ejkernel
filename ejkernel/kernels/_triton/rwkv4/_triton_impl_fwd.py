@@ -232,7 +232,32 @@ def fwd_triton_impl_with_history(
     Float[Array, "batch three chans"],
     Float[Array, "batch seq_plus_one three chans"],
 ]:
-    """Execute RWKV-4 forward pass and return per-step state history."""
+    """Execute RWKV-4 forward pass and return the per-step state history.
+
+    Identical to ``fwd_triton_impl`` but also records the recurrent state
+    ``(alpha, beta, eps)`` at every timestep (including the initial state) into
+    a history tensor of shape ``(B, T+1, 3, C)``. The history is required by the
+    backward pass (``bwd_triton_impl``) to avoid recomputation of intermediate
+    states during gradient computation.
+
+    Launches ``_rwkv4_fwd_kernel_with_hist`` on a ``(B, ceil(C / BLOCK_C))`` grid.
+
+    Args:
+        w: Negated exponentiated time-decay ``-exp(w_raw)``, shape ``(C,)``.
+        u: Time-mix bias, shape ``(C,)``.
+        k: Key tensor, shape ``(B, T, C)``.
+        v: Value tensor, shape ``(B, T, C)``.
+        state: Initial recurrent state ``(alpha, beta, eps)``, shape ``(B, 3, C)``.
+            Must be float32.
+
+    Returns:
+        Tuple ``(output, final_state, state_hist)`` where:
+            - ``output``: WKV result, shape ``(B, T, C)``.
+            - ``final_state``: State after the last token, shape ``(B, 3, C)``, float32.
+            - ``state_hist``: Per-step state snapshot, shape ``(B, T+1, 3, C)``, float32.
+              ``state_hist[:, 0]`` is the initial state; ``state_hist[:, t+1]`` is the
+              state after processing token ``t``.
+    """
     B, T, C = k.shape
     out_shape = jax.ShapeDtypeStruct(k.shape, v.dtype)
     state_shape = jax.ShapeDtypeStruct((B, 3, C), jnp.float32)

@@ -126,7 +126,45 @@ def static_validate_inputs(
     vmem_limit_bytes: int | None = None,
     debug_mode: bool = False,
 ):
-    """Validate inputs to the MLA RPA kernel statically."""
+    """Validate inputs to the MLA RPA v2 kernel statically at trace time.
+
+    Checks tensor ranks, shape compatibility, dtype constraints, and
+    scalar-parameter values. Raises ``ValueError`` for any violation so that
+    shape errors are caught before entering JAX tracing.
+
+    Args:
+        ql_nope: Query nope tensor, shape ``(max_tokens, num_q_heads, lkv_dim)``.
+        q_pe: Query rope tensor, shape ``(max_tokens, num_q_heads, r_dim)``.
+        new_kv_c: New KV latent tensor, shape ``(max_tokens, lkv_dim)``.
+        new_k_pe: New key rope tensor, shape ``(max_tokens, r_dim)``.
+        cache_kv: Paged KV cache, shape
+            ``(total_pages, page_size // packing, packing, lkv_dim + r_dim)``.
+        kv_lens: Per-sequence KV lengths, int32 shape ``(max_num_seqs,)``.
+        page_indices: Flattened page table, int32 shape
+            ``(max_num_seqs * pages_per_seq,)``.
+        cu_q_lens: Cumulative query lengths, int32 shape
+            ``(max_num_seqs + 1,)``.
+        distribution: Three-element int32 array ``[decode_end, prefill_end,
+            mixed_end]`` partitioning the batch into scheduling regions.
+        sm_scale: Softmax scaling factor (not validated, only consumed).
+        sliding_window: If not ``None``, must be positive.
+        soft_cap: If not ``None``, must not be 0.0.
+        mask_value: Padding value for attention logits (not validated).
+        q_scale: Optional per-sequence query scale (not validated).
+        k_scale: Optional per-sequence key scale (not validated).
+        v_scale: Optional per-sequence value scale (not validated).
+        chunk_prefill_size: If not ``None``, must be positive.
+        num_kv_pages_per_blocks: Three-tuple of block tile page counts; each
+            entry must be positive.
+        num_queries_per_blocks: Three-tuple of query-block sizes; each entry
+            must be positive.
+        vmem_limit_bytes: If not ``None``, must be positive.
+        debug_mode: Flag passed through without validation.
+
+    Raises:
+        ValueError: If any shape, dtype, or scalar-parameter constraint
+            is violated.
+    """
     if len(ql_nope.shape) != 3:
         raise ValueError(f"Expected 3D array for {ql_nope.shape=}")
     if len(q_pe.shape) != 3:
@@ -1103,7 +1141,60 @@ def _mla_ragged_paged_attention_v2_impl(
     vmem_limit_bytes: int | None = None,
     debug_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """MLA ragged paged attention that supports mixed prefill and decode."""
+    """JIT-compiled orchestrator for MLA ragged paged attention v2 on TPU.
+
+    Validates inputs, packs tensors into the sub-word layout, then dispatches
+    up to three separate ``pl.pallas_call`` invocations — one each for the
+    decode region, the prefill region, and the mixed region — as determined by
+    ``distribution``.  Only the decode and mixed passes are actually invoked
+    in the current implementation; the prefill region (indices
+    ``[distribution[0], distribution[1])``) is not separately dispatched.
+
+    The function is JIT-compiled via ``@functools.partial(jax.jit, ...)`` with
+    a set of static argnames so that each unique combination of block-tiling
+    parameters, scaling constants, and mode flags produces a distinct XLA
+    computation.  The ``cache_kv`` argument is donated to avoid a copy.
+
+    Args:
+        ql_nope: Query nope tensor ``[max_tokens, num_q_heads, lkv_dim]``.
+        q_pe: Query rope tensor ``[max_tokens, num_q_heads, r_dim]``.
+        new_kv_c: New KV latent ``[max_tokens, lkv_dim]``; appended to cache.
+        new_k_pe: New key rope ``[max_tokens, r_dim]``; appended to cache.
+        cache_kv: Donated paged KV cache
+            ``[total_pages, page_size // packing, packing, lkv_dim + r_dim]``.
+        kv_lens: int32 ``[max_num_seqs]`` per-sequence KV lengths.
+        page_indices: int32 ``[max_num_seqs * pages_per_seq]`` page table.
+        cu_q_lens: int32 ``[max_num_seqs + 1]`` cumulative query lengths.
+        distribution: int32 ``[3]`` array ``[decode_end, prefill_end,
+            mixed_end]``.
+        sm_scale: Softmax scaling factor (static).
+        sliding_window: Optional sliding-window size (static).
+        soft_cap: Optional logits soft-cap (static).
+        mask_value: Padding value for masked attention logits (static).
+        q_scale: Optional query scale multiplier (static).
+        k_scale: Optional key scale multiplier (static).
+        v_scale: Optional value scale multiplier (static).
+        chunk_prefill_size: Reserved; not used in the current implementation
+            (static).
+        num_kv_pages_per_block: Number of KV pages per block tile.  May be a
+            single int (broadcast to all three regions) or a three-tuple
+            ``(decode, prefill, mixed)`` (static).
+        num_queries_per_block: Number of query tokens per block tile.  Same
+            broadcast semantics as ``num_kv_pages_per_block`` (static).
+        vmem_limit_bytes: Optional VMEM budget passed to the Pallas compiler
+            (static).
+        debug_mode: Skip DMA calls and run in pure Python for debugging
+            (static).
+
+    Returns:
+        A ``(output, updated_cache_kv)`` tuple where ``output`` has shape
+        ``[max_tokens, actual_num_q_heads, actual_lkv_dim]`` and
+        ``updated_cache_kv`` is the modified paged cache.
+
+    Raises:
+        ValueError: If ``num_kv_pages_per_block`` or ``num_queries_per_block``
+            are ``None``, or if any shape/dtype constraint is violated.
+    """
     if num_kv_pages_per_block is None or num_queries_per_block is None:
         raise ValueError("num_kv_pages_per_block and num_queries_per_block must be specified.")
 
@@ -1373,7 +1464,42 @@ def mla_ragged_paged_attention_v2(
     vmem_limit_bytes: int | None = None,
     debug_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    """Repo-style wrapper around the upstream MLA v2 TPU kernel."""
+    """Public entry point for MLA ragged paged attention v2 on TPU.
+
+    Thin adapter that renames arguments from ejkernel's naming conventions
+    (``queries_nope``, ``softmax_scale``, ``logits_soft_cap``,
+    ``block_tables``, ``query_start_loc``) to the upstream internal names
+    used by ``_mla_ragged_paged_attention_v2_impl``.  All behaviour is
+    delegated without modification.
+
+    Args:
+        queries_nope: Query nope tensor ``[max_tokens, num_q_heads, lkv_dim]``.
+        queries_pe: Query rope tensor ``[max_tokens, num_q_heads, r_dim]``.
+        keys_values: New KV latent ``[max_tokens, lkv_dim]``.
+        keys_pe: New key rope ``[max_tokens, r_dim]``.
+        kv_cache: Donated paged KV cache
+            ``[total_pages, page_size // packing, packing, lkv_dim + r_dim]``.
+        kv_lens: int32 ``[max_num_seqs]`` per-sequence KV lengths.
+        block_tables: int32 ``[max_num_seqs * pages_per_seq]`` page table.
+        query_start_loc: int32 ``[max_num_seqs + 1]`` cumulative query lengths.
+        distribution: int32 ``[3]`` array ``[decode_end, prefill_end,
+            mixed_end]``.
+        softmax_scale: Softmax scaling factor.
+        sliding_window: Optional sliding-window attention size.
+        logits_soft_cap: Optional soft cap for attention logits.
+        mask_value: Padding value for masked attention logits.
+        q_scale: Optional query scale multiplier.
+        k_scale: Optional key scale multiplier.
+        v_scale: Optional value scale multiplier.
+        chunk_prefill_size: Reserved; not used in the current implementation.
+        num_kv_pages_per_block: Number of KV pages per block tile.
+        num_queries_per_block: Number of query tokens per block tile.
+        vmem_limit_bytes: Optional VMEM budget for the Pallas compiler.
+        debug_mode: Skip DMA calls for debugging.
+
+    Returns:
+        A ``(output, updated_cache_kv)`` tuple.
+    """
     return _mla_ragged_paged_attention_v2_impl(
         ql_nope=queries_nope,
         q_pe=queries_pe,

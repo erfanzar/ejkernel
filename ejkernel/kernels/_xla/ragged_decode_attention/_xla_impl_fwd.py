@@ -14,35 +14,39 @@
 
 """Ragged Decode Attention forward pass using XLA/JAX.
 
-This module provides the forward pass for decode attention with variable-length
-(ragged) sequences packed into a single batch for efficient processing.
+This module provides the forward implementations for decode-phase attention with
+variable-length (ragged) sequences.  Each sequence in the batch can have a
+different KV range described by ``sequence_start`` / ``sequence_end`` integer
+arrays.
 
 Key Components:
-    - create_attention_mask: Generate masks for variable-length sequences
-    - _ragged_decode_attention_fwd: Main forward function
-
-Algorithm:
-    Ragged decode attention for packed sequences:
-    1. Pack multiple variable-length sequences into contiguous memory
-    2. Use sequence_start/sequence_end to track boundaries
-    3. Create attention masks that respect sequence boundaries
-    4. Compute attention efficiently over packed representation
-
-Features:
-    - Packed sequence representation for batch efficiency
-    - Dynamic sequence lengths within a batch
-    - Proper masking to prevent cross-sequence attention
-    - GQA/MQA support with head broadcasting
-    - Optional logit soft capping
+    - ``create_attention_mask``: Build a boolean causal/validity mask per sequence.
+    - ``apply_logits_soft_cap``: Apply tanh soft capping to attention logits.
+    - ``apply_attention_sinks_block``: Add per-block sink biases to scores.
+    - ``flash_attention_block``: One iteration of the online-softmax flash loop.
+    - ``ragged_flash_attention_xla``: Multi-head flash attention for a ragged batch.
+    - ``ragged_decode_mqa_xla``: MQA/GQA decode wrapper (public entry point).
+    - ``inner_decode_xla``: JIT-compiled dispatcher; handles both single-token
+      (``q_len=1``) and multi-query (``q_len>1``) inputs.
 
 Memory Layout:
-    - Queries/Keys/Values packed as [total_tokens, num_heads, head_dim]
-    - sequence_start: [batch] start indices in packed representation
-    - sequence_end: [batch] end indices in packed representation
+    - ``query``: ``[batch, q_len, num_q_heads, head_dim]`` (or 3-D for single step)
+    - ``key``/``value``: ``[batch, kv_len, num_kv_heads, head_dim]``
+    - ``sequence_start``/``sequence_end``: ``[batch]`` int32 boundary arrays.
+
+Algorithm (``ragged_flash_attention_xla``):
+    1. Build a boolean mask from ``sequence_start``/``sequence_end`` and an
+       optional sliding window.
+    2. Pad ``key``/``value``/``mask`` to a multiple of ``block_size``.
+    3. Run a ``lax.scan`` over KV blocks, accumulating output with the
+       online-softmax (running max + normaliser) algorithm.
+    4. If ``softmax_aux`` is provided, seed the running max and normaliser with
+       the sink logits before entering the KV scan.
 
 Note:
-    Ragged batching improves GPU/TPU utilization by eliminating
-    padding waste when sequences have varying lengths.
+    Ragged batching (distinct ``sequence_start``/``sequence_end`` per element)
+    avoids padding waste when sequences have varying KV lengths.  All
+    computation is XLA-compatible and runs on CPU/GPU/TPU.
 """
 
 import chex
@@ -63,18 +67,29 @@ def create_attention_mask(
     sequence_end: Int[Array, "batch"],
     sliding_window: tuple[int, int] | None = None,
 ) -> Float[Array, "batch q_len 1 kv_len"]:
-    """Creates an attention mask with ragged sequences and an optional sliding window.
+    """Create a boolean attention mask for ragged sequences with an optional sliding window.
+
+    Position ``kv_pos`` is attended to by query at position ``q_pos`` iff:
+
+    * ``kv_pos >= sequence_start[b]`` and ``kv_pos < sequence_end[b]``, AND
+    * (if ``sliding_window`` is set) ``q_pos - window_left <= kv_pos <= q_pos + window_right``.
+
+    For single-token decode (``q_len=1``), the query position is inferred as
+    ``sequence_end[b] - 1``.  For multi-token queries each query token is placed
+    at ``sequence_start[b] + q_token_idx``.
 
     Args:
-        batch_size: Batch size
-        q_len: Query sequence length
-        kv_len: Key/value sequence length
-        sequence_start: Start indices for each sequence
-        sequence_end: End indices for each sequence
-        sliding_window: Optional (left, right) window size for local attention
+        batch_size: Number of sequences in the batch.
+        q_len: Number of query tokens.
+        kv_len: Number of key/value tokens (static axis size of the KV cache).
+        sequence_start: First valid KV position per sequence, shape ``[batch]``.
+        sequence_end: One-past-last valid KV position per sequence, shape ``[batch]``.
+        sliding_window: Optional ``(left, right)`` window sizes.  When provided,
+            only keys within ``[q_pos - left, q_pos + right]`` are attended to.
 
     Returns:
-        Boolean mask of shape [batch, q_len, 1, kv_len]
+        Boolean mask of shape ``[batch, q_len, 1, kv_len]``.
+        ``True`` means the corresponding key/value position is *attended to*.
     """
 
     kv_positions = jnp.arange(kv_len, dtype=jnp.int32)[None, None, :]  # (1,1,K)
@@ -100,14 +115,18 @@ def create_attention_mask(
 
 
 def apply_logits_soft_cap(scores: Float[Array, "... seq_len"], logits_soft_cap: float) -> Float[Array, "... seq_len"]:
-    """Applies soft capping to attention logits.
+    """Apply tanh soft capping to attention logits.
+
+    Computes ``logits_soft_cap * tanh(scores / logits_soft_cap)``, which smoothly
+    limits the magnitude of logits to roughly ``[-logits_soft_cap, +logits_soft_cap]``
+    while remaining differentiable everywhere.
 
     Args:
-        scores: Attention scores
-        logits_soft_cap: Soft capping value
+        scores: Attention logits, arbitrary shape ``[..., seq_len]``.
+        logits_soft_cap: The capping radius (must be > 0).
 
     Returns:
-        Soft-capped scores
+        Soft-capped scores, same shape and dtype as ``scores``.
     """
     return jnp.tanh(scores / logits_soft_cap) * logits_soft_cap
 
@@ -118,16 +137,30 @@ def apply_attention_sinks_block(
     num_sinks: int = 0,
     block_offset: int = 0,
 ) -> Float[Array, "batch q_len heads block_size"]:
-    """Applies attention sink biases to scores for a specific block.
+    """Add attention-sink bias values to the scores for a single KV block.
+
+    For each KV position ``p = block_offset + i`` that falls within
+    ``[0, num_sinks)``, the corresponding score is increased by
+    ``sink_scores[h, p]`` (or ``sink_scores[p]`` if 1-D).  Positions
+    at or beyond ``num_sinks`` receive no bias.
+
+    Note:
+        This function is used by the non-scan attention path.  The main
+        ``ragged_flash_attention_xla`` uses a different sink-seeding strategy
+        (initialising the running max/normaliser from ``softmax_aux`` before
+        the KV scan) and does not call this function.
 
     Args:
-        scores: Attention scores for this block [B, Q, H, block_size]
-        sink_scores: Optional learned biases for sink tokens [H, num_sinks] or [num_sinks]
-        num_sinks: Number of sink tokens
-        block_offset: Offset of this block in the full sequence
+        scores: Attention logits for this block, shape ``[B, Q, H, block_size]``.
+        sink_scores: Learned sink biases, shape ``[H, num_sinks]`` or
+            ``[num_sinks]``.  If ``None`` or ``num_sinks == 0``, scores are
+            returned unchanged.
+        num_sinks: Number of leading KV positions that are sink positions.
+        block_offset: Token offset of the first element of this block within
+            the full KV sequence.
 
     Returns:
-        Scores with sink biases applied if this block contains sinks
+        Scores with sink biases applied, same shape as input ``scores``.
     """
     if num_sinks == 0 or sink_scores is None:
         return scores
@@ -157,16 +190,34 @@ def flash_attention_block(
     softmax_scale: float,
     logits_soft_cap: float | None = None,
 ) -> tuple[tuple[Array, Array, Array], None]:
-    """Enhanced flash attention block with soft cap.
+    """Process one KV block with the online-softmax flash attention algorithm.
+
+    Performs a single iteration of the blockwise online-softmax accumulation:
+
+    * Computes scaled dot-product scores ``q * scale @ k_block.T``.
+    * Applies optional tanh soft capping.
+    * Masks invalid positions with ``finfo.min`` (avoids ``-inf`` NaNs in
+      all-masked blocks).
+    * Updates the running maximum ``m_new = max(m_prev, max(scores))``.
+    * Rescales the previous accumulator and normaliser by ``exp(m_prev - m_new)``.
+    * Accumulates ``exp(scores - m_new) @ v_block`` into the output.
+
+    GQA support: if ``kv_heads < q_heads``, ``k_block`` and ``v_block`` are
+    broadcast-repeated along the head axis (``repeat_factor = q_heads // kv_heads``).
 
     Args:
-        carry: Tuple of (output, max_logits, normalizer)
-        block_inputs: Tuple of (queries, keys_block, values_block, mask_block)
-        softmax_scale: Scaling factor for attention
-        logits_soft_cap: Optional soft capping value
+        carry: Running online-softmax state ``(output, max_logits, normalizer)``
+            where shapes are ``[B, Q, H, D]``, ``[B, Q, H, 1]``, ``[B, Q, H, 1]``.
+        block_inputs: Tuple of
+            ``(queries, keys_block, values_block, mask_block)`` with shapes
+            ``[B, Q, H_q, D]``, ``[B, block, H_kv, D]``, ``[B, block, H_kv, D]``,
+            ``[B, Q, 1, block]`` (mask is ``True`` for valid positions).
+        softmax_scale: Multiplicative scale for QK^T logits.
+        logits_soft_cap: Optional tanh soft-capping radius.
 
     Returns:
-        Updated carry tuple
+        Updated ``(output, max_logits, normalizer)`` carry and ``None`` as the
+        per-step output (no per-block outputs are needed).
     """
     o_prev, m_prev, l_prev = carry
     q, k_block, v_block, mask_block = block_inputs
@@ -229,23 +280,42 @@ def ragged_flash_attention_xla(
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "..."] | None = None,
 ) -> Float[Array, "batch q_len num_heads head_dim"]:
-    """Enhanced XLA-compatible ragged flash attention with sliding window, soft cap, and sinks.
+    """XLA-compatible ragged flash attention over arbitrary-length query and KV sequences.
+
+    Implements the online-softmax (flash attention) algorithm over blocked KV
+    tiles for a ragged batch where each sequence has a distinct valid KV range.
+    Supports multi-query (Q > 1), sliding-window local attention, tanh logit
+    soft-capping, and attention-sink initialisation.
+
+    The attention mask is built from ``sequence_start``/``sequence_end`` per
+    sequence, with an optional per-sequence sliding window applied on top.
+
+    If ``softmax_aux`` is provided, the running maximum and normaliser of the
+    online-softmax are seeded from the sink logits before the KV scan begins.
+    This ensures sink tokens always receive some probability mass.
 
     Args:
-        query: Query tensor [B, Q, H, D]
-        key: Key tensor [B, K, H, D]
-        value: Value tensor [B, K, H, D]
-        sequence_start: Start indices for each sequence
-        sequence_end: End indices for each sequence
-        softmax_scale: Optional scaling factor for attention
-        block_size: Size of blocks for chunked computation
-        sliding_window: Optional (left, right) window for local attention
-        logits_soft_cap: Optional soft capping for logits
-        softmax_aux: Optional attention sink logits of shape [num_sinks] or [num_heads, num_sinks].
-            These logits participate in softmax normalization but do not contribute to the output values.
+        query: Query tensor, shape ``[B, Q, H_q, D]``.
+        key: Key tensor, shape ``[B, K, H_kv, D]``.  GQA is supported:
+            ``H_kv`` can be less than ``H_q`` as long as ``H_q % H_kv == 0``.
+        value: Value tensor, shape ``[B, K, H_kv, D]``.
+        sequence_start: First valid KV position per sequence, shape ``[B]``.
+        sequence_end: One-past-last valid KV position per sequence, shape ``[B]``.
+        softmax_scale: Scale for QK^T logits.  Defaults to ``1/sqrt(D)``.
+        block_size: Number of KV tokens per scan step.  Default 256.
+        sliding_window: Optional ``(left, right)`` local-attention window sizes.
+        logits_soft_cap: Optional tanh capping radius for logits.
+        softmax_aux: Optional sink logits.  Accepted shapes:
+
+            * 1-D ``[num_sinks]``: broadcast over all heads.
+            * 2-D ``[1, num_sinks]``: broadcast over all heads.
+            * 2-D ``[H_q, num_sinks]``: per-query-head sink values.
+
+            These values are used only to seed the online-softmax state; they
+            do not produce corresponding output values.
 
     Returns:
-        Attention output [B, Q, H, D]
+        Attention output, shape ``[B, Q, H_q, D]``, same dtype as ``query``.
     """
     batch_size, q_len, num_heads, head_dim = query.shape
     _, kv_len, kv_heads, _ = key.shape
@@ -342,22 +412,33 @@ def ragged_decode_mqa_xla(
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "..."] | None = None,
 ) -> Float[Array, "batch num_q_heads head_dim"]:
-    """Enhanced XLA-compatible ragged MQA decoding.
+    """Single-token MQA/GQA decode attention for a ragged batch (XLA).
+
+    Splits the ``num_q_heads`` query heads into ``num_kv_heads`` groups of
+    size ``group_size = num_q_heads // num_kv_heads``, then runs
+    ``ragged_flash_attention_xla`` over each KV-head group via ``jax.vmap``.
+    The block size is taken from ``fwd_params.kv_blocksize`` (or defaults to
+    256) and is clamped to ``[1, kv_len]``.
 
     Args:
-        query: Query tensor [B, H_q, D]
-        key: Key tensor [B, S, H_kv, D]
-        value: Value tensor [B, S, H_kv, D]
-        sequence_start: Start indices for each sequence
-        sequence_end: End indices for each sequence
-        softmax_scale: Optional scaling factor
-        block_size: Block size for computation
-        sliding_window: Optional sliding window parameters
-        logits_soft_cap: Optional soft capping for logits
-        softmax_aux: Optional attention sink biases
+        query: Single decode-step query, shape ``[B, H_q, D]``.
+        key: Full KV cache keys, shape ``[B, S, H_kv, D]``.
+        value: Full KV cache values, shape ``[B, S, H_kv, D]``.
+        sequence_start: First valid KV position per sequence, shape ``[B]``.
+        sequence_end: One-past-last valid KV position, shape ``[B]``.
+        softmax_scale: Scale for QK^T logits.  Defaults to ``1/sqrt(D)``.
+        fwd_params: Optional ``FwdParams``; only ``kv_blocksize`` is used.
+        sliding_window: Optional ``(left, right)`` local-attention window.
+        logits_soft_cap: Optional tanh capping radius for logits.
+        softmax_aux: Optional sink logits.  Accepted shapes:
+
+            * 1-D ``[num_sinks]``: broadcast over all heads.
+            * 2-D ``[H_kv, num_sinks]``: per-KV-head sinks.
+            * 2-D ``[H_q, num_sinks]``: per-query-head sinks; reshaped to
+              ``[H_kv, group_size, num_sinks]`` for per-group dispatch.
 
     Returns:
-        Output tensor [B, H_q, D]
+        Attention output, shape ``[B, H_q, D]``.
     """
     batch_size, num_heads_q, head_dim = query.shape
     _, kv_len, num_heads_kv, _ = key.shape
@@ -447,46 +528,36 @@ def inner_decode_xla(
     logits_soft_cap: float | None = None,
     softmax_aux: Float[Array, "..."] | None = None,
 ) -> chex.Array:
-    """Enhanced JIT-compiled XLA implementation of ragged MQA Flash Attention.
+    """JIT-compiled dispatch for ragged MQA/GQA flash attention.
+
+    Handles both 3-D (single decode step, ``query.shape=[B, H_q, D]``) and
+    4-D (multi-token, ``query.shape=[B, q_len, H_q, D]``) query layouts:
+
+    * 3-D input: expand to ``[B, 1, H_q, D]``, then collapse back after.
+    * ``q_len == 1``: use the efficient single-step ``ragged_decode_mqa_xla``.
+    * ``q_len > 1``: broadcast KV heads if needed (GQA), then call
+      ``ragged_flash_attention_xla`` directly.
+
+    Static args (cached across calls): ``block_size``, ``softmax_scale``,
+    ``logits_soft_cap``, ``sliding_window``.
 
     Args:
-        query: Query tensor, optionally with leading singleton dimension
-        key: Key tensor [B, S, H_kv, D]
-        value: Value tensor [B, S, H_kv, D]
-        sequence_start: Sequence start indices
-        sequence_end: Sequence end indices
-        softmax_scale: Scaling factor for attention logits
-        block_size: Block size for attention computation
-        sliding_window: Optional (left, right) window for local attention
-        logits_soft_cap: Optional soft capping for logits (e.g., 50.0)
-        softmax_aux: Optional attention sink biases [H, num_sinks] or [num_sinks]
-                     First few tokens become "attention sinks" with learnable biases
+        query: Query tensor.  Either ``[B, H_q, D]`` or ``[B, q_len, H_q, D]``.
+        key: Key cache, shape ``[B, S, H_kv, D]``.
+        value: Value cache, shape ``[B, S, H_kv, D]``.
+        sequence_start: First valid KV position per sequence, shape ``[B]``.
+        sequence_end: One-past-last valid KV position, shape ``[B]``.
+        softmax_scale: Scale for QK^T logits.  Defaults to ``1/sqrt(D)`` when
+            ``None``.  Treated as a static argument for JIT specialisation.
+        block_size: KV block size for flash iteration.  Static for JIT.
+        sliding_window: Optional ``(left, right)`` local-attention window.
+            Static for JIT.
+        logits_soft_cap: Optional tanh capping radius.  Static for JIT.
+        softmax_aux: Optional attention-sink logits.  Shape ``[H, num_sinks]``
+            or ``[num_sinks]``.
 
     Returns:
-        Output tensor with same batch/head structure as query
-
-    Examples:
-
-        output = inner_decode_xla(query, key, value, start, end)
-
-
-        output = inner_decode_xla(
-            query, key, value, start, end,
-            sliding_window=(128, 0)
-        )
-
-
-        output = inner_decode_xla(
-            query, key, value, start, end,
-            logits_soft_cap=50.0
-        )
-
-
-        sink_biases = jnp.ones(4) * 0.1
-        output = inner_decode_xla(
-            query, key, value, start, end,
-            softmax_aux=sink_biases
-        )
+        Output tensor matching the input query shape (3-D or 4-D).
     """
     batch_size = query.shape[0]
     num_heads_q = query.shape[-2]

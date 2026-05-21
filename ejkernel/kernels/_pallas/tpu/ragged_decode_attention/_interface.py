@@ -86,7 +86,7 @@ def ragged_decode_attention(
     fwd_params: FwdParams | None = None,
     sliding_window: tuple[int, int] | None = None,
     logits_soft_cap: float | None = None,
-    softmax_aux: Float[Array, "num_sinks"] | None = None,
+    softmax_aux: Float[Array, "..."] | None = None,
 ) -> Float[Array, "batch num_q_heads head_dim"]:
     """Ragged MQA decoding entry point with TPU-accelerated Flash Attention.
 
@@ -95,16 +95,29 @@ def ragged_decode_attention(
         key: Key tensor of shape [batch, seq_len, num_kv_heads, head_dim].
         value: Value tensor of shape [batch, seq_len, num_kv_heads, head_dim].
         sequence_start: int32 array of shape [batch], start indices of sequences.
-        sequence_end: int32 array of shape [batch], end indices of sequences.
-        softmax_scale: Optional scale for attention logits. Default is 1.
-        block_size: Block size used for kernel tiling. Default is 256.
-        sliding_window: Optional (left, right) sliding window sizes.
-            If specified, limits attention to tokens within the window. None means full attention.
+            Positions before sequence_start[i] are masked for sequence i.
+        sequence_end: int32 array of shape [batch], end indices (exclusive) of sequences.
+            Positions at or after sequence_end[i] are masked for sequence i.
+        softmax_scale: Scale applied to QK^T before softmax. Defaults to
+            ``query.shape[-1] ** -0.5`` when ``None``.
+        fwd_params: Optional forward-pass tiling parameters. When provided, controls
+            the Pallas kernel block sizes:
+
+            - ``q_blocksize``: query block size (number of query tokens per tile).
+            - ``kv_blocksize``: KV block size (number of KV tokens per Flash Attention tile).
+
+            When ``None``, the implementation selects block sizes automatically.
+        sliding_window: Optional ``(left, right)`` sliding window sizes. When set,
+            each query position only attends to keys within
+            ``[pos - left, pos + right]``. ``None`` means full attention.
         logits_soft_cap: Optional soft capping value for attention logits.
-            Applies tanh-based soft capping: logits_soft_cap * tanh(logits / logits_soft_cap).
-        softmax_aux: Optional auxiliary logits for attention sinks.
-            Shape [num_heads, num_sinks] or [num_sinks]. Concatenated to attention logits
-            before softmax to create attention sink behavior.
+            Applies tanh-based soft capping:
+            ``logits = logits_soft_cap * tanh(logits / logits_soft_cap)``.
+        softmax_aux: Optional auxiliary logits for attention sinks used in
+            streaming / infinite-context patterns. Expected shape is
+            ``[num_heads, num_sinks]`` or broadcastable to it. These logits are
+            concatenated to the attention scores before softmax to create fixed
+            context anchors.
 
     Returns:
         Output tensor of shape [batch, num_heads, head_dim] after attention decoding.

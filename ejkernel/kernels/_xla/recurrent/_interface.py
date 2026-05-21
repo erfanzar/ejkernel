@@ -41,10 +41,30 @@ def _pack_varlen_inputs(
     gk: Array | None,
     gv: Array | None,
 ) -> tuple[Array, Array, Array, Array | None, Array | None, Array | None, bool]:
-    """Normalize packed varlen inputs to token-major layout.
+    """Normalise packed varlen inputs to 3-D token-major layout.
 
-    Public varlen calls commonly use `[1, total_tokens, H, D]`; the varlen
-    core expects `[total_tokens, H, D]`.
+    Callers may pass rank-4 tensors ``[1, total_tokens, H, D]`` (batch=1
+    wrapping a packed token stream) or rank-3 tensors ``[total_tokens, H, D]``.
+    This function strips the leading batch dimension when present and returns
+    a flag indicating whether it was added.
+
+    Args:
+        query: Query tensor, rank 3 or 4 with batch size 1 if rank 4.
+        key: Key tensor, same rank as ``query``.
+        value: Value tensor, same rank as ``query``.
+        g: Optional GLA gate, same rank as ``query`` (or ``None``).
+        gk: Optional key gate, same rank as ``query`` (or ``None``).
+        gv: Optional value gate, same rank as ``value`` (or ``None``).
+
+    Returns:
+        A 7-tuple ``(query_tok, key_tok, value_tok, g_tok, gk_tok, gv_tok,
+        add_batch_dim)`` where the tensors are 3-D token-major and
+        ``add_batch_dim`` is ``True`` if a leading batch dim was removed
+        (the caller must re-add it to the output).
+
+    Raises:
+        ValueError: If ranks mismatch, or if batch size > 1 is encountered
+            for rank-4 inputs.
     """
     if query.ndim != key.ndim or query.ndim != value.ndim:
         raise ValueError(f"query/key/value must share rank in varlen mode, got {query.ndim}, {key.ndim}, {value.ndim}.")
@@ -85,7 +105,27 @@ def _normalize_varlen_initial_state(
     key_dim: int,
     value_dim: int,
 ) -> tuple[Array, bool]:
-    """Build/validate varlen initial state in `[num_seqs, H, K, V]` format."""
+    """Build or validate the per-sequence initial hidden state.
+
+    Accepts ``None`` (allocate zeros), a 4-D ``[num_seqs, H, K, V]`` array,
+    or a 5-D ``[1, num_seqs, H, K, V]`` array (strips the leading batch dim).
+
+    Args:
+        initial_state: Optional initial hidden state.  ``None`` creates a
+            zero-initialised state.
+        num_seqs: Number of sequences; must match ``initial_state.shape[0]``.
+        num_heads: Number of attention heads.
+        key_dim: Key/query head dimension.
+        value_dim: Value head dimension.
+
+    Returns:
+        Tuple ``(state, state_was_none)`` where ``state`` has shape
+        ``[num_seqs, H, key_dim, value_dim]`` and ``state_was_none`` is
+        ``True`` if the input was ``None``.
+
+    Raises:
+        ValueError: On shape mismatches.
+    """
     if initial_state is None:
         return jnp.zeros((num_seqs, num_heads, key_dim, value_dim), dtype=jnp.float32), True
 
@@ -107,6 +147,16 @@ def _varlen_sequence_ids(
     cu_seqlens: Int[Array, "num_seqs_plus_one"],
     total_tokens: int,
 ) -> Int[Array, "total_tokens"]:
+    """Map each token position to its sequence index.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths, shape ``[num_seqs + 1]``.
+        total_tokens: Total number of tokens in the packed stream.
+
+    Returns:
+        Integer array of shape ``[total_tokens]`` where element ``i`` is the
+        0-based index of the sequence that token ``i`` belongs to.
+    """
     if cu_seqlens.shape[0] <= 1:
         return jnp.zeros((total_tokens,), dtype=jnp.int32)
     token_idx = jnp.arange(total_tokens, dtype=jnp.int32)
@@ -118,6 +168,19 @@ def _varlen_reverse_permutation(
     cu_seqlens: Int[Array, "num_seqs_plus_one"],
     total_tokens: int,
 ) -> Int[Array, "total_tokens"]:
+    """Build a permutation that reverses each sequence independently.
+
+    For each sequence ``[start, end)``, token at position ``i`` is mapped to
+    ``start + end - 1 - i``.  Tokens from different sequences are not
+    interleaved.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths, shape ``[num_seqs + 1]``.
+        total_tokens: Total number of tokens.
+
+    Returns:
+        Integer permutation array of shape ``[total_tokens]``.
+    """
     idx = jnp.arange(total_tokens, dtype=jnp.int32)
     num_seqs = int(cu_seqlens.shape[0] - 1)
 
@@ -137,6 +200,26 @@ def _normalize_g_gamma_per_seq(
     num_seqs: int,
     num_heads: int,
 ) -> Float[Array, "num_seqs num_heads"]:
+    """Broadcast ``g_gamma`` to shape ``[num_seqs, num_heads]``.
+
+    Accepted input shapes:
+
+    * ``None``: returns zeros ``[num_seqs, num_heads]``.
+    * 1-D ``[num_heads]``: broadcast over sequences.
+    * 2-D ``[1, num_heads]``: broadcast over sequences.
+    * 2-D ``[num_seqs, num_heads]``: returned as-is.
+
+    Args:
+        g_gamma: Per-head decay factor (or ``None``).
+        num_seqs: Number of sequences.
+        num_heads: Number of attention heads.
+
+    Returns:
+        Float array of shape ``[num_seqs, num_heads]``.
+
+    Raises:
+        ValueError: On incompatible shapes.
+    """
     if g_gamma is None:
         return jnp.zeros((num_seqs, num_heads), dtype=jnp.float32)
 
@@ -169,7 +252,32 @@ def _recurrent_varlen_forward(
     initial_state: Array | None,
     reverse: bool,
 ) -> tuple[Array, Array, Array, bool]:
-    """Run varlen recurrent forward with public packed-input adaptation."""
+    """Run the varlen recurrent forward pass.
+
+    Adapts public packed-input tensors to the internal token-major layout
+    (via ``_pack_varlen_inputs``), builds per-sequence initial states, and
+    runs a single ``lax.scan`` over all tokens in the packed stream.
+    Sequence state updates are scattered back via indexed assignment at
+    ``h_all[seq_t]``.
+
+    Args:
+        query: Query tensor (rank 3 or 4).
+        key: Key tensor (same rank as ``query``).
+        value: Value tensor (same rank as ``query``).
+        cu_seqlens: Cumulative sequence lengths, shape ``[num_seqs + 1]``.
+        g: Optional GLA gate (same shape as ``query``).
+        g_gamma: Optional per-head decay.
+        gk: Optional key gate.
+        gv: Optional value gate.
+        softmax_scale: Query scaling factor.
+        initial_state: Optional per-sequence initial hidden state.
+        reverse: If ``True``, process each sequence in reverse token order.
+
+    Returns:
+        A 4-tuple ``(output, final_state, initial_state, state_was_none)``
+        where ``output`` and ``final_state`` match the layout expected by
+        the public ``recurrent`` API.
+    """
     query_tok, key_tok, value_tok, g_tok, gk_tok, gv_tok, add_batch_dim = _pack_varlen_inputs(
         query, key, value, g, gk, gv
     )
@@ -576,63 +684,97 @@ def recurrent(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_k: int = 64,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
-    """
-    Recurrent linear attention with O(N) complexity using JAX/XLA.
+    """Recurrent linear attention with O(N) complexity using JAX/XLA.
 
-    This implements linear attention as a recurrent process, maintaining a hidden
-    state that accumulates key-value information sequentially. Unlike standard
-    O(N²) attention, this achieves O(N) complexity by processing tokens one at a time.
+    Implements linear attention as a recurrent process that maintains a hidden
+    state ``h`` of shape ``[num_heads, qk_head_dim, v_head_dim]`` per sequence.
+    Each step applies optional gated decay before accumulating a new key-value
+    outer product:
 
-    The core update is:
-        h_t = decay_t * h_{t-1} + k_t^T ⊗ v_t
-        o_t = h_t @ q_t
+    .. code-block:: text
 
-    Supports various gating mechanisms for different attention variants.
+        h_t = decay_t * h_{t-1} + k_t[:, :, None] * v_t[:, None, :]
+        o_t = sum(h_t * (q_t * scale)[:, :, None], axis=1)
+
+    The decay is the product of any active gating exponentials:
+    ``exp(g) * exp(g_gamma) * exp(gk) (applied per key-dim) * exp(gv)
+    (applied per value-dim)``.
+
+    Registered under ``"recurrent"`` for ``Platform.XLA``, ``Backend.ANY``.
+    Uses a custom VJP (``_recurrent_core``) for gradient computation.
+
+    Normal (padded-batch) mode:
+        Inputs have shape ``[batch, seq_len, num_heads, head_dim]``.
+        Each batch element is processed independently via ``jax.vmap``.
+
+    Varlen (packed-stream) mode:
+        When ``cu_seqlens`` is provided, inputs should have shape
+        ``[total_tokens, num_heads, head_dim]`` (rank 3) or
+        ``[1, total_tokens, num_heads, head_dim]`` (rank 4, batch=1).
+        A single ``lax.scan`` processes all tokens; ``final_state`` has shape
+        ``[num_seqs, num_heads, qk_head_dim, v_head_dim]``.
 
     Args:
-        query: Query tensor [batch, seq_len, num_heads, head_dim]
-        key: Key tensor [batch, seq_len, num_heads, head_dim]
-        value: Value tensor [batch, seq_len, num_heads, head_dim]
-        g: Optional gate tensor for GLA-style gating [batch, seq_len, num_heads, head_dim]
-        g_gamma: Optional per-head decay factor [num_heads] for Lightning attention
-        gk: Optional gate applied to keys [batch, seq_len, num_heads, head_dim]
-        gv: Optional gate applied to values [batch, seq_len, num_heads, head_dim]
-        softmax_scale: Query scaling factor. If None, defaults to 1/sqrt(head_dim)
-        initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
-        reverse: If True, process sequence in reverse order
-        cu_seqlens: Cumulative sequence lengths for variable-length inputs [num_seqs+1]
+        query: Shape ``[batch, seq_len, num_heads, qk_head_dim]``.
+        key: Shape ``[batch, seq_len, num_kv_heads, qk_head_dim]``.
+            GQA is not supported: ``num_kv_heads`` must equal ``num_heads``.
+        value: Shape ``[batch, seq_len, num_kv_heads, v_head_dim]``.
+        g: Optional GLA-style element-wise gate applied to the full state,
+            shape ``[batch, seq_len, num_heads, qk_head_dim]``.
+        g_gamma: Optional scalar per-head decay for Lightning-attention style.
+            Shape ``[num_heads]`` or ``[batch, num_heads]`` or
+            ``[1, num_heads]``.
+        gk: Optional gate applied per key dimension (left index of state),
+            shape ``[batch, seq_len, num_heads, qk_head_dim]``.
+        gv: Optional gate applied per value dimension (right index of state),
+            shape ``[batch, seq_len, num_heads, v_head_dim]``.
+        softmax_scale: Multiplicative scale for query vectors.
+            Defaults to ``1 / sqrt(qk_head_dim)``.
+        initial_state: Optional starting hidden state.
+            Shape ``[batch, num_heads, qk_head_dim, v_head_dim]``.
+            Defaults to zeros.
+        reverse: If ``True``, process the sequence in reverse temporal order.
+            Useful for bidirectional models.
+        cu_seqlens: Cumulative sequence lengths for packed-stream mode,
+            shape ``[num_seqs + 1]``.  When ``None``, uses padded-batch mode.
+        block_k: Accepted for API compatibility with Triton; ignored by XLA.
+        block_v: Accepted for API compatibility with Triton; ignored by XLA.
+        num_warps: Accepted for API compatibility with Triton; ignored by XLA.
+        num_stages: Accepted for API compatibility with Triton; ignored by XLA.
 
     Returns:
-        Tuple of:
-            - output: Attention output [batch, seq_len, num_heads, head_dim]
-            - final_state: Final hidden state [batch, num_heads, head_dim, head_dim]
+        A tuple ``(output, final_state)`` where:
 
-    Examples:
-        >>>
+        * ``output`` has the same shape as ``query`` (batch or packed-stream).
+        * ``final_state`` has shape ``[batch, num_heads, qk_head_dim,
+          v_head_dim]`` (batch mode) or ``[num_seqs, num_heads, qk_head_dim,
+          v_head_dim]`` (varlen mode).
+
+    Note:
+        In padded-batch mode all hidden states at every timestep are
+        materialised in memory during the forward pass for use by the custom
+        backward rule.  For long sequences this can be memory-intensive.
+
+    Example:
         >>> query = jnp.ones((2, 100, 8, 64))
         >>> key = jnp.ones((2, 100, 8, 64))
         >>> value = jnp.ones((2, 100, 8, 64))
         >>> output, final_state = recurrent(query, key, value)
         >>> output.shape
         (2, 100, 8, 64)
+        >>> final_state.shape
+        (2, 8, 64, 64)
 
-        >>>
-        >>> g = jnp.ones((2, 100, 8, 64))
-        >>> output, final_state = recurrent(query, key, value, g=g)
-
-        >>>
-        >>> g_gamma = -jnp.arange(8, dtype=jnp.float32) * 0.1
-        >>> output, final_state = recurrent(query, key, value, g_gamma=g_gamma)
-
-        >>>
+        >>> # Varlen packed-stream mode
         >>> query = jnp.ones((1, 150, 8, 64))
-        >>> key = jnp.ones((1, 150, 8, 64))
-        >>> value = jnp.ones((1, 150, 8, 64))
         >>> cu_seqlens = jnp.array([0, 50, 100, 150])
-        >>> output, final_state = recurrent(query, key, value, cu_seqlens=cu_seqlens)
-        >>> output.shape
-        (1, 150, 8, 64)
+        >>> output, final_state = recurrent(query, query, query,
+        ...                                 cu_seqlens=cu_seqlens)
         >>> final_state.shape
         (3, 8, 64, 64)
     """

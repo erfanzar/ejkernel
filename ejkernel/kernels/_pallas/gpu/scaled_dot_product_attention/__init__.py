@@ -13,11 +13,21 @@
 # limitations under the License.
 
 
-"""GPU-optimized Pallas/Triton backend for scaled dot-product attention.
+"""GPU backend for scaled dot-product attention (cuDNN implementation).
 
-This submodule provides high-performance GPU implementations of scaled
-dot-product attention using NVIDIA cuDNN via JAX's Pallas/Triton framework.
-Optimized for NVIDIA GPUs with support for advanced attention patterns.
+Provides a thin wrapper around ``jax.nn.dot_product_attention`` with
+``implementation="cudnn"``.  Registered under both ``Platform.PALLAS`` and
+``Platform.TRITON`` in the kernel registry so that either platform selector
+resolves to this cuDNN-backed implementation.
+
+Despite the module path placing it under ``_pallas``, the actual compute
+kernel is cuDNN — JAX's Pallas/Triton layer is only used for registration
+routing, not for lowering the attention computation itself.
+
+Public API:
+    scaled_dot_product_attention: Supports causal masking, sliding-window
+        local attention, GQA/MQA, bias tensors, and variable-length
+        packed sequences via cumulative sequence-length arrays.
 """
 
 from ._interface import scaled_dot_product_attention

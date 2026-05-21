@@ -35,7 +35,29 @@ from ._pallas_impl_fwd import _N_FUSE, _chunk_blockspec, _dot, _neumann_inv
 
 
 def _bwd_one_chunk(q, k, v, beta, decay, d_out, state_pre, d_state_next, C):
-    """Backward for a single chunk. Returns (d_state, d_q, d_k, d_v, d_beta, d_decay)."""
+    """Compute gradients for a single GDR chunk via full re-materialisation.
+
+    Recomputes all forward intermediates (Neumann inverse, decay masks,
+    scaled keys/queries, etc.) from the raw inputs and the saved pre-chunk
+    state, then applies the chain rule to obtain per-token gradients.
+    All intermediate tensors are sanitized with ``nan_to_num``.
+
+    Args:
+        q: Query slice [C, K], float32.
+        k: Key slice [C, K], float32.
+        v: Value slice [C, V], float32.
+        beta: Gate slice [C], float32.
+        decay: Log-decay slice [C], float32.
+        d_out: Gradient of output w.r.t. this chunk [C, V], float32.
+        state_pre: Recurrent state before this chunk [K, V], float32.
+        d_state_next: Gradient of state arriving from the next chunk [K, V].
+        C: Chunk size.
+
+    Returns:
+        Six-element tuple:
+        ``(d_state_prev [K, V], d_q [C, K], d_k [C, K], d_v [C, V],
+        d_beta [C, 1], d_decay [C, 1])``.
+    """
     lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.float32))
     strict_lower = lower_mask - jnp.eye(C, dtype=jnp.float32)
     upper_mask = jnp.triu(jnp.ones((C, C), dtype=jnp.float32))
@@ -150,7 +172,35 @@ def _gdr_bwd_grad_kernel(
     d_beta_ref,
     d_decay_ref,
 ):
-    """Reverse gradient scan step processing N_FUSE chunks per kernel call."""
+    """Pallas kernel for one reverse-scan step, processing ``_N_FUSE`` chunks.
+
+    Iterates ``_N_FUSE`` chunks in reverse order.  For chunk ``i > 0`` it
+    re-runs the forward pass for chunks ``0 … i-1`` to recover the
+    intermediate state (since only the state *before* the fused group is
+    saved).
+
+    Grid: ``(batch, num_heads)``; both axes are "parallel".
+
+    BlockSpec shape: ``(1, 1, total_rows, dim)`` for Q/K/V/dO;
+    ``(1, 1, K, V)`` for states; ``(1, 1, 1, total_beta)`` for beta/decay.
+
+    Args:
+        state_pre_ref: [1,1,K,V] — recurrent state before the fused group.
+        q_ref: [1,1,N_FUSE*C,K].
+        k_ref: [1,1,N_FUSE*C,K].
+        v_ref: [1,1,N_FUSE*C,V].
+        beta_ref: [1,1,1,N_FUSE*C].
+        decay_ref: [1,1,1,N_FUSE*C].
+        d_out_ref: [1,1,N_FUSE*C,V] — upstream gradient.
+        d_state_next_ref: [1,1,K,V] — gradient arriving from the next group.
+
+    Outputs written:
+        d_state_ref: [1,1,K,V] — gradient for state before this group.
+        d_q_ref, d_k_ref: [1,1,N_FUSE*C,K].
+        d_v_ref: [1,1,N_FUSE*C,V].
+        d_beta_ref: [1,1,N_FUSE*C,1].
+        d_decay_ref: [1,1,N_FUSE*C,1].
+    """
     total_rows = q_ref.shape[2]
     C = total_rows // _N_FUSE
 
@@ -224,6 +274,22 @@ def _run_bwd_grad_step(
     d_out_i,
     d_state_next,
 ):
+    """Launch the backward gradient Pallas kernel for one fused chunk group.
+
+    Args:
+        state_pre: [B, H, K, V] — recurrent state before this fused group.
+        q_i: [B, H, N_FUSE*C, K].
+        k_i: [B, H, N_FUSE*C, K].
+        v_i: [B, H, N_FUSE*C, V].
+        beta_i: [B, H, 1, N_FUSE*C] float32.
+        decay_i: [B, H, 1, N_FUSE*C] float32.
+        d_out_i: [B, H, N_FUSE*C, V] — upstream gradient.
+        d_state_next: [B, H, K, V] — gradient from the following group.
+
+    Returns:
+        Six-element tuple: ``(d_state_prev, d_q, d_k, d_v, d_beta, d_decay)``
+        all as float32 arrays with matching leading dimensions.
+    """
     bsz, num_heads, total_rows, qk_dim = q_i.shape
     v_dim = v_i.shape[-1]
     total_beta = beta_i.shape[-1]
@@ -275,6 +341,7 @@ def _run_bwd_grad_step(
 
 
 def _cast_grad(x, dtype):
+    """Cast a gradient array to ``dtype``, passing ``None`` through unchanged."""
     if x is None:
         return None
     return x.astype(dtype) if x.dtype != dtype else x
@@ -286,7 +353,32 @@ def _chunk_gdr_bwd(
     res: tuple,
     g: tuple[Float[Array, "..."], Float[Array, "..."]],
 ) -> tuple:
-    """Pure Pallas backward for chunked GDR."""
+    """Compute gradients for the chunked GDR forward pass via reverse scan.
+
+    Runs a ``lax.scan`` in reverse order over all chunk groups, calling
+    ``_run_bwd_grad_step`` (which launches a Pallas kernel) for each group.
+
+    Residual tuple layout (14 elements as packed by ``_chunk_gdr_fwd_core``)::
+
+        (query_c, key_c, value_c, beta, decay, state_pre_all,
+         initial_state, q_inv_norm, k_inv_norm,
+         seq_len, pad_size, decay_was_none, initial_state_was_none,
+         effective_chunk_size)
+
+    Args:
+        chunk_size: Non-diff arg from custom_vjp (overridden by
+            ``effective_chunk_size`` stored in ``res``).
+        use_qk_l2norm: Whether Q/K were L2-normalised in the forward pass.
+        res: Residual tuple saved by ``_chunk_gdr_fwd_rule``.
+        g: Upstream gradients ``(d_output, d_final_state)``.
+
+    Returns:
+        Six-element gradient tuple:
+        ``(d_query, d_key, d_value, d_beta, d_decay, d_initial_state)``
+        cast to the input dtype.  ``d_decay`` is ``None`` if ``decay`` was
+        ``None`` in the forward call; ``d_initial_state`` is ``None`` if no
+        initial state was provided.
+    """
     (
         query,
         key,
@@ -402,6 +494,29 @@ def _gdr_single_step_bwd_kernel(
     d_decay_ref,
     d_state_ref,
 ):
+    """Pallas kernel for single-step GDR backward pass.
+
+    Recomputes the forward pass inline to recover ``state_decayed``,
+    ``kv_mem``, ``delta``, and ``state_new``, then applies the chain rule.
+
+    Grid: ``(batch, num_heads)``; both axes are "parallel".
+
+    Inputs (BlockSpec ``(1, 1, 1, dim)`` or ``(1, 1, K, V)``):
+        q_ref, k_ref: [B, H, 1, 1, K].
+        v_ref: [B, H, 1, 1, V].
+        beta_ref: [B, H, 1, 1] — scalar gate.
+        decay_ref: [B, H, 1, 1] — scalar log decay.
+        state_prev_ref: [B, H, 1, K, V] — state before the step.
+        d_out_ref: [B, H, 1, 1, V] — output gradient.
+        d_state_next_ref: [B, H, 1, K, V] — state gradient from downstream.
+
+    Outputs written:
+        d_q_ref, d_k_ref: [B, H, 1, 1, K].
+        d_v_ref: [B, H, 1, 1, V].
+        d_beta_ref: [B, H, 1, 1] scalar.
+        d_decay_ref: [B, H, 1, 1] scalar.
+        d_state_ref: [B, H, 1, K, V] — gradient w.r.t. ``state_prev``.
+    """
     q_t = q_ref[0, 0, 0].astype(jnp.float32)
     k_t = k_ref[0, 0, 0].astype(jnp.float32)
     v_t = v_ref[0, 0, 0].astype(jnp.float32)
@@ -448,6 +563,22 @@ def _run_single_step_backward(
     d_out,
     d_state_next,
 ):
+    """Launch the single-step backward Pallas kernel.
+
+    Args:
+        query: [B, H, 1, K] already normalised/scaled (same as forward input).
+        key: [B, H, 1, K].
+        value: [B, H, 1, V].
+        beta: [B, H, 1, 1] float32 gate.
+        decay: [B, H, 1, 1] float32 log decay.
+        recurrent_state: [B, H, K, V] state before the step.
+        d_out: [B, H, 1, V] output gradient, float32.
+        d_state_next: [B, H, K, V] state gradient from downstream, float32.
+
+    Returns:
+        Six-element tuple ``(d_q, d_k, d_v, d_beta, d_decay, d_state)``
+        all as float32 arrays.
+    """
     bsz, num_heads, _, qk_dim = query.shape
     v_dim = value.shape[-1]
     beta = beta[..., None].astype(jnp.float32)
@@ -494,6 +625,24 @@ def _single_step_gdr_bwd(
     res: tuple,
     g: tuple[Float[Array, "..."], Float[Array, "..."]],
 ) -> tuple:
+    """Custom-VJP backward for the single-step GDR path.
+
+    Calls the Pallas backward kernel and applies the inverse of L2
+    normalisation if ``use_qk_l2norm`` is True.
+
+    Args:
+        use_qk_l2norm: Non-diff arg — whether Q/K were normalised forward.
+        res: Residual tuple ``(query, key, value, beta, decay,
+            recurrent_state, q_inv_norm, k_inv_norm, decay_was_none)``
+            saved by the forward rule.
+        g: Upstream gradients ``(d_output, d_final_state)``.
+
+    Returns:
+        Six-element gradient tuple:
+        ``(d_query, d_key, d_value, d_beta, d_decay, d_recurrent_state)``
+        cast to the input dtype.  ``d_decay`` is ``None`` if ``decay`` was
+        ``None`` in the forward call.
+    """
     query, key, value, beta, decay, recurrent_state, q_inv_norm, k_inv_norm, decay_was_none = res
     d_out, d_final_state = g
     input_dtype = query.dtype

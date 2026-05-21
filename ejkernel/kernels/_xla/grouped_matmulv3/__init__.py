@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""XLA backend for Grouped Matrix Multiplication v3."""
+"""XLA backend for Grouped Matrix Multiplication v3 (GMM v3).
+
+This submodule provides the XLA implementation of grouped GEMM v3, which
+extends the base ``grouped_matmul`` with support for optional per-group
+block-float scale (``rhs_scale``) and bias (``rhs_bias``) tensors.
+
+When ``rhs_scale`` or ``rhs_bias`` is provided, the computation falls back to
+a vmap-based pure-JAX reference to keep all parameters differentiable.
+Otherwise, ``jax.lax.ragged_dot_general`` is used for efficiency.
+
+Registered keys: ``"grouped_matmulv3"`` (XLA platform, any backend).
+"""
 
 from ._interface import grouped_matmulv3
 

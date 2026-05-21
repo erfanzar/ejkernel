@@ -67,39 +67,63 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
 
 
 def align_to(x, a):
+    """Round ``x`` up to the nearest multiple of ``a``."""
     return pl.cdiv(x, a) * a
 
 
 class RhsRef(ABC):
-    """Abstract class that defines interfaces for rhs values."""
+    """Abstract base for RHS tile references inside the Pallas kernel.
+
+    Concrete subclasses (``WeightsRef``, ``FusedWeightsRef``) expose a
+    uniform interface that the inner kernel uses regardless of whether the
+    weight is plain, scaled, biased, or fused with a gated activation.
+    """
 
     @abstractmethod
-    def get_weight(self) -> jax.Array: ...
+    def get_weight(self) -> jax.Array:
+        """Return the raw weight tile (possibly bitcast from a packed dtype)."""
+        ...
 
     @abstractmethod
-    def get_scale(self) -> jax.Array: ...
+    def get_scale(self) -> jax.Array:
+        """Return the per-block quantisation scale tile."""
+        ...
 
     @abstractmethod
-    def get_bias(self) -> jax.Array: ...
+    def get_bias(self) -> jax.Array:
+        """Return the per-group bias tile."""
+        ...
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class WeightsRef(RhsRef):
-    """Dataclass for a single weights bundle."""
+    """Concrete RHS tile reference for a single (non-fused) weight.
+
+    Registered as a JAX pytree node so it can be passed through
+    ``pallas_call`` ``in_specs`` / ``out_specs``.
+
+    Attributes:
+        weight: Weight tile reference (a Pallas ``BlockRef`` or plain array).
+        scale: Optional quantisation scale tile reference.
+        bias: Optional additive bias tile reference.
+    """
 
     weight: Any
     scale: Any | None
     bias: Any | None
 
     def get_weight(self) -> jax.Array:
+        """Load and return the weight tile from VMEM."""
         return self.weight[...]
 
     def get_scale(self) -> jax.Array:
+        """Load and return the scale tile; asserts scale is not None."""
         assert self.scale is not None
         return self.scale[...]
 
     def get_bias(self) -> jax.Array:
+        """Load and return the bias tile; asserts bias is not None."""
         assert self.bias is not None
         return self.bias[...]
 
@@ -107,22 +131,33 @@ class WeightsRef(RhsRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class FusedWeightsRef(RhsRef):
-    """Dataclass for gate and up weights used in fused activation."""
+    """RHS tile reference for fused gate+up projections (e.g. SwiGLU / SiLU).
+
+    Concatenates the ``gate`` and ``up`` tiles along the last axis so that
+    ``inner_kernel`` can apply the activation across the combined slice.
+
+    Attributes:
+        gate: ``WeightsRef`` for the gate projection.
+        up: ``WeightsRef`` for the up projection.
+    """
 
     gate: WeightsRef
     up: WeightsRef
 
     def get_weight(self) -> jax.Array:
+        """Concatenate gate and up weight tiles along axis -1."""
         w_gate = self.gate.get_weight()
         w_up = self.up.get_weight()
         return jnp.concatenate([w_gate, w_up], axis=-1)
 
     def get_scale(self) -> jax.Array:
+        """Concatenate gate and up scale tiles along axis -1."""
         s_gate = self.gate.get_scale()
         s_up = self.up.get_scale()
         return jnp.concatenate([s_gate, s_up], axis=-1)
 
     def get_bias(self) -> jax.Array:
+        """Concatenate gate and up bias tiles along axis -1."""
         b_gate = self.gate.get_bias()
         b_up = self.up.get_bias()
         return jnp.concatenate([b_gate, b_up], axis=-1)
@@ -131,12 +166,33 @@ class FusedWeightsRef(RhsRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class MetadataRef:
+    """SMEM scratch holding the per-grid-step group and row-offset mappings.
+
+    Built at kernel entry by ``fill_metadata`` and read by ``inner_kernel``
+    and ``IndexMaps`` to navigate the ragged group structure.
+
+    Attributes:
+        gm_id_to_group_id: ``SMEM[(max_num_gm,), int32]`` mapping each
+            grid step (gm_id) to the owning group index within the current shard.
+        gm_id_to_m_offset: ``SMEM[(max_num_gm + 1,), int32]`` cumulative
+            row offsets; ``gm_id_to_m_offset[gm_id]`` is the first row of
+            that step, ``gm_id_to_m_offset[gm_id + 1]`` the exclusive end.
+    """
+
     gm_id_to_group_id: jax.Array
     gm_id_to_m_offset: jax.Array
 
 
 @dataclasses.dataclass(frozen=True)
 class TileSizes:
+    """Static tile dimensions for the v3 grouped matmul kernel.
+
+    Attributes:
+        tile_m: Tile size along the M (token / row) dimension.
+        tile_k: Tile size along the K (contraction) dimension.
+        tile_n: Tile size along the N (output feature) dimension.
+    """
+
     tile_m: int
     tile_k: int
     tile_n: int
@@ -144,6 +200,20 @@ class TileSizes:
 
 @dataclasses.dataclass(frozen=True)
 class Dimensions:
+    """Problem dimensions for the v3 grouped matmul kernel.
+
+    Attributes:
+        size_m: Total number of token rows across all groups.
+        size_k: Contraction dimension (input feature width).
+        size_n: Output dimension (output feature width; doubled when
+            ``fuse_act`` is not None and the combined gate+up weight is passed).
+        size_group: Number of groups processed by this shard (``rhs.shape[0]``).
+        size_lhs_group: Total number of groups in ``group_sizes``
+            (may be larger than ``size_group`` for sharded runs).
+        size_lhs_sublane: TPU sublane tiling for the LHS dtype, capped to
+            ``size_m``.  Used to align row slices to HBM DMA boundaries.
+    """
+
     size_m: int
     size_k: int
     size_n: int
@@ -154,6 +224,19 @@ class Dimensions:
 
 @dataclasses.dataclass(frozen=True)
 class InputConfigs:
+    """Per-operand (LHS or RHS) quantisation and dtype configuration.
+
+    Attributes:
+        quant_dtype: The quantised storage dtype (e.g. ``jnp.float8_e4m3fn``
+            for FP8 LHS quantisation, or ``rhs.dtype`` for quantised weights).
+            None for unquantised operands.
+        quant_block_size: Number of elements per quantisation block along K.
+            None for unquantised operands.
+        dtype: Storage dtype of the operand in HBM.
+        has_bias: Whether this operand has an additive per-group bias tensor.
+        has_scale: Whether this operand has a per-block scale tensor.
+    """
+
     quant_dtype: jnp.dtype | None
     quant_block_size: int | None
     dtype: jnp.dtype
@@ -162,12 +245,28 @@ class InputConfigs:
 
     @property
     def should_bitcast(self) -> bool:
+        """Return True when the dtype requires a bitcast (sub-byte elements)."""
         bits = jax.dtypes.itemsize_bits(self.dtype)
         return bits < 8
 
 
 @dataclasses.dataclass(frozen=True)
 class GmmConfigs:
+    """Full configuration bundle for one grouped matmul v3 kernel launch.
+
+    Attributes:
+        tiles: Static tile dimensions ``(tile_m, tile_k, tile_n)``.
+        dims: Problem dimensions ``(size_m, size_k, size_n, ...)``.
+        lhs_cfgs: LHS quantisation and dtype settings.
+        rhs_cfgs: RHS quantisation and dtype settings.
+        out_dtype: Dtype of the output tensor written to HBM.
+        acc_dtype: Dtype of the VMEM accumulator (float32 or bfloat16).
+        zero_init: If True the kernel zeroes output rows outside the active
+            compute range via async DMA before beginning the pipeline.
+        fuse_act: Optional fused activation identifier: ``"silu"``,
+            ``"gelu"``, or ``"swigluoai"``.  None for no activation.
+    """
+
     tiles: TileSizes
     dims: Dimensions
     lhs_cfgs: InputConfigs
@@ -179,10 +278,12 @@ class GmmConfigs:
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
+        """Number of quantisation blocks per tile along the K dimension."""
         return pl.cdiv(self.tiles.tile_k, self.rhs_cfgs.quant_block_size)
 
     @property
     def out_size_n(self) -> int:
+        """Actual output N dimension (halved when a fused activation is active)."""
         if self.fuse_act is None:
             return self.dims.size_n
         return self.dims.size_n // 2
@@ -192,13 +293,29 @@ TileFn = Callable[[Dimensions, InputConfigs, InputConfigs, int, str | None], Til
 
 
 class IndexMaps:
-    """Index maps for GMM kernel."""
+    """Pallas ``BlockSpec`` index-map callables for the v3 GMM kernel.
+
+    Each method returns a tuple of array indices that selects the correct
+    HBM tile for a given ``(n_id, gm_id, k_id)`` grid point.  The mapping
+    is computed from ``MetadataRef`` which is populated at kernel entry by
+    ``fill_metadata``.
+
+    Args:
+        metadata_ref: SMEM metadata populated by ``fill_metadata``.
+        cfgs: Full kernel configuration bundle.
+    """
 
     def __init__(self, metadata_ref: MetadataRef, cfgs: GmmConfigs):
         self.metadata_ref = metadata_ref
         self.cfgs = cfgs
 
     def lhs_index_map(self, _: jax.Array, gm_id: jax.Array, k_id: jax.Array):
+        """Return the LHS ``BoundedSlice`` tile index for grid step ``gm_id``.
+
+        Returns a ``(pl.ds(row_start, row_size), 0, k_id)`` tuple selecting
+        the rows belonging to the current group-step, aligned to
+        ``size_lhs_sublane`` boundaries.
+        """
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
         m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
 
@@ -208,14 +325,17 @@ class IndexMaps:
         return (pl.ds(row_start, row_size), 0, k_id)
 
     def rhs_weight_index_map(self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array):
+        """Return the RHS weight tile index ``(group_id, k_id, n_id)``."""
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, k_id, n_id)
 
     def rhs_bias_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
+        """Return the RHS bias tile index ``(group_id, 0, n_id)``."""
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, 0, n_id)
 
     def rhs_scale_index_map(self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array):
+        """Return the RHS scale tile index ``(group_id, b_tile_id, 0, n_id)``."""
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         k_row = k_id * self.cfgs.tiles.tile_k
         b_row = k_row // self.cfgs.rhs_cfgs.quant_block_size
@@ -223,6 +343,12 @@ class IndexMaps:
         return (group_id, b_tile_id, 0, n_id)
 
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
+        """Return the output ``BoundedSlice`` tile index for grid step ``gm_id``.
+
+        For intermediate grid steps the row slice is capped to the sublane
+        boundary so partial rows are not written prematurely.  For the last
+        step the full ceil-aligned slice is used.
+        """
         is_last_gm = gm_id == (pl.num_programs(1) - 1)
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
         m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
@@ -239,7 +365,25 @@ def generate_block_specs(
     metadata_ref: MetadataRef,
     cfgs: GmmConfigs,
 ) -> tuple[tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
-    """Generate block specs for the given lhs, rhs, and out refs."""
+    """Build Pallas ``BlockSpec`` descriptors for LHS, RHS, and output tensors.
+
+    Called inside ``kernel_main`` after ``fill_metadata`` has populated
+    ``metadata_ref``.  The returned specs are passed to ``emit_pipeline``.
+
+    LHS block shape: ``(BoundedSlice(tile_m // size_lhs_sublane), size_lhs_sublane, tile_k)``
+    RHS weight block shape: ``(None, tile_k_rhs, tile_n)`` where ``tile_k_rhs``
+        may be smaller than ``tile_k`` for packed sub-byte dtypes.
+    Output block shape: mirrors the LHS block shape for matching row slices.
+
+    Args:
+        metadata_ref: Populated SMEM metadata (group/row mappings).
+        cfgs: Full kernel configuration bundle.
+
+    Returns:
+        ``((lhs_block_spec, rhs_block_spec), out_block_spec)`` where
+        ``rhs_block_spec`` is a ``WeightsRef`` pytree of ``BlockSpec`` nodes
+        (weight, optional scale, optional bias).
+    """
     index_map = IndexMaps(metadata_ref, cfgs)
     bounded_slice_gm = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
 
@@ -294,7 +438,33 @@ def inner_kernel(
     *,
     cfgs: GmmConfigs,
 ):
-    """Inner kernel invoked by emit_pipeline to perform matmul."""
+    """Inner pipeline body invoked by ``emit_pipeline`` for each tile.
+
+    Called with the current LHS and RHS tiles already resident in VMEM.
+    Dispatches to one of four specialised ``_matmul`` variants depending on
+    whether this is the first K-step, the last K-step, both, or neither.
+
+    On the last K-step:
+    - Optionally dequantises the RHS weight tile using per-block scales.
+    - Adds an optional per-group bias.
+    - Applies a fused activation (SiLU / GeLU / SwiGLUoai) if configured.
+    - Applies a causal row mask derived from the group's ``m_start``/``m_end``
+      offsets, zeroing rows outside the active group slice.
+    - Accumulates partial output rows that straddle sublane boundaries into
+      ``partial_out_ref`` for the next grid step.
+
+    On intermediate K-steps the partial result is accumulated in ``acc_ref``
+    (VMEM) without writing to HBM.
+
+    Args:
+        tiled_lhs_ref: Current LHS tile in VMEM.
+        tiled_rhs_ref: Current RHS tile bundle (weight + optional scale/bias).
+        tiled_out_ref: Output tile in VMEM (written on the last K-step).
+        partial_out_ref: VMEM scratch for sub-sublane partial rows.
+        acc_ref: VMEM float32 accumulator ``[tile_m, tile_n]``.
+        metadata_ref: Populated group/row metadata.
+        cfgs: Full kernel configuration bundle.
+    """
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
@@ -447,7 +617,28 @@ def fill_metadata(
     *,
     cfgs: GmmConfigs,
 ) -> jax.Array:
-    """Fill the metadata for the given lhs group sizes and group offset."""
+    """Populate SMEM metadata for the grouped matmul grid.
+
+    Runs once per kernel invocation (called from ``kernel_main``) to build
+    the ``gm_id_to_group_id`` and ``gm_id_to_m_offset`` mappings that
+    ``inner_kernel`` and ``IndexMaps`` use to look up the correct HBM tiles.
+
+    The logic iterates over groups ``[group_offset, group_offset + size_group)``
+    and, for each non-empty group, subdivides its token range into
+    ``tile_m``-sized steps.  Steps that start mid-sublane are given a smaller
+    ``tm_size`` so that the first step covers only up to the next aligned
+    sublane boundary.
+
+    Args:
+        lhs_group_sizes_ref: Scalar-prefetch ref ``[size_lhs_group]`` int32.
+        group_offset_ref: Scalar-prefetch ref ``[1]`` int32.
+        metadata_ref: SMEM struct to write ``gm_id_to_group_id`` and
+            ``gm_id_to_m_offset`` into.
+        cfgs: Full kernel configuration bundle.
+
+    Returns:
+        ``num_gm``: the total number of grid steps written into ``metadata_ref``.
+    """
     group_offset = group_offset_ref[0]
     max_num_group = group_offset + cfgs.dims.size_group
     metadata_ref.gm_id_to_m_offset[0] = 0
@@ -496,7 +687,31 @@ def zero_out_start(
     *,
     dims: Dimensions,
 ):
-    """Zero out output rows that are not used in the computation."""
+    """Asynchronously zero output rows outside the active compute range.
+
+    Issues DMA copies from a pre-zeroed VMEM buffer (``zero_ref``) to the
+    HBM rows that will not be touched by the pipeline.  This covers two
+    regions:
+
+    - Left region: rows 0 .. ``compute_start // size_lhs_sublane``
+    - Right region: rows ``ceil(compute_end / size_lhs_sublane)`` .. end
+
+    Copies are issued with ``priority=1`` to run concurrently with the
+    pipeline compute.  ``zero_out_end`` must be called after the pipeline
+    to wait for all outstanding DMAs.
+
+    Args:
+        out_ref: HBM output tensor ``[size_m, aligned_n]``.
+        zero_ref: VMEM zero buffer ``[tile_zero_m, num_lanes]``.
+        semaphore_ref: DMA semaphore ``[1]``.
+        metadata_ref: Populated metadata (provides ``compute_start/end``).
+        num_gm: Total number of active grid steps.
+        dims: Problem dimensions.
+
+    Returns:
+        ``zero_size``: number of rows (in sublane units) actually zeroed,
+        forwarded to ``zero_out_end`` as the wait bound.
+    """
     num_lanes = pltpu.get_tpu_info().num_lanes
     assert num_lanes == zero_ref.shape[-1]
     zero_ref[...] = jnp.zeros_like(zero_ref)
@@ -553,7 +768,18 @@ def zero_out_end(
     *,
     dims: Dimensions,
 ):
-    """Wait for zero-fill DMAs to complete."""
+    """Wait for the zero-fill DMA copies initiated by ``zero_out_start``.
+
+    Issues a self-copy (src == dst) of ``zero_size`` rows as a barrier
+    that the DMA engine resolves only after all preceding DMA ops on the
+    same semaphore have completed.
+
+    Args:
+        out_ref: HBM output tensor (same reference passed to ``zero_out_start``).
+        semaphore_ref: DMA semaphore ``[1]``.
+        zero_size: Number of sublane-aligned rows to wait on.
+        dims: Problem dimensions.
+    """
     out_dma = out_ref.reshape(-1, dims.size_lhs_sublane, out_ref.shape[-1])
     pltpu.make_async_copy(
         src_ref=out_dma.at[pl.ds(0, zero_size)],
@@ -576,7 +802,39 @@ def kernel_main(
     *,
     cfgs: GmmConfigs,
 ):
-    """Entry point for the grouped matmul v3 kernel."""
+    """Top-level Pallas kernel body for grouped matmul v3.
+
+    Orchestrates the full kernel execution:
+
+    1. Optionally bitcasts the RHS weight to ``uint32`` for packed dtypes.
+    2. Calls ``fill_metadata`` to build the SMEM group/row mappings.
+    3. If ``cfgs.zero_init``: starts async DMA zero-fill of uncomputed rows.
+    4. Calls ``generate_block_specs`` to get tile index maps.
+    5. If ``cfgs.fuse_act`` is set: wraps RHS in a ``FusedWeightsRef``.
+    6. Calls ``pltpu.emit_pipeline`` with ``inner_kernel`` as the body.
+    7. If ``cfgs.zero_init``: waits for the zero-fill DMAs to complete.
+
+    Scalar prefetch refs ``lhs_group_sizes_ref`` and ``group_offset_ref``
+    are read by ``fill_metadata`` and are *not* passed through
+    ``emit_pipeline``.  All other refs (``lhs_ref``, ``rhs_ref``,
+    ``out_ref``, ``partial_out_ref``, ``acc_ref``, ``metadata_ref``,
+    ``zero_ref``, ``semaphore_ref``) are either VMEM scratch shapes or HBM
+    tensors.
+
+    Args:
+        lhs_group_sizes_ref: Scalar-prefetch int32 array ``[size_lhs_group]``.
+        group_offset_ref: Scalar-prefetch int32 array ``[1]``.
+        lhs_ref: HBM LHS tensor ``[size_m, size_k]``.
+        rhs_ref: HBM RHS bundle (weight + optional scale/bias).
+        out_ref: HBM output tensor ``[size_m, aligned_n]``.
+        partial_out_ref: VMEM scratch for partial sublane rows
+            ``[size_lhs_sublane, tile_n]``.
+        acc_ref: VMEM float32 accumulator ``[tile_m, acc_cols]``.
+        metadata_ref: SMEM metadata scratch.
+        zero_ref: VMEM zero buffer (or None when ``zero_init=False``).
+        semaphore_ref: DMA semaphore (or None when ``zero_init=False``).
+        cfgs: Full kernel configuration bundle.
+    """
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
 
@@ -626,7 +884,34 @@ def calculate_tiling(
     vmem_limit_bytes: int,
     fuse_act: str | None = None,
 ) -> TileSizes:
-    """Calculate tile sizes for grouped matmul v3."""
+    """Automatically choose tile sizes for the v3 grouped matmul kernel.
+
+    Selects ``tile_m``, ``tile_k``, and ``tile_n`` to fit the RHS weight,
+    scale, and bias tiles within ``vmem_limit_bytes / num_rhs_buffers``
+    (currently 3 RHS pipeline buffers).  The N dimension is first reduced
+    by increasing ``num_n_tiles``, and if still over budget the K dimension
+    is reduced by increasing ``num_k_tiles``.  Both ``tile_n`` and ``tile_k``
+    are kept as multiples of ``num_lanes`` for TPU alignment.
+
+    ``tile_m`` is chosen based on LHS and RHS dtypes relative to the
+    bf16/bf16 baseline of 128.
+
+    Args:
+        dims: Problem dimensions.
+        lhs_cfgs: LHS dtype / quantisation settings.
+        rhs_cfgs: RHS dtype / quantisation settings.
+        vmem_limit_bytes: Available VMEM budget in bytes (from
+            ``pltpu.get_tpu_info().vmem_capacity_bytes * 0.9`` by default).
+        fuse_act: Optional activation name; halves the effective N dimension
+            when not None so that the combined gate+up tile still fits.
+
+    Returns:
+        ``TileSizes(tile_m, tile_k, tile_n)``.
+
+    Raises:
+        ValueError: If no valid tile sizes can be found for the given
+            dimensions and VMEM budget.
+    """
     lhs_dtype = lhs_cfgs.quant_dtype or lhs_cfgs.dtype
     rhs_dtype = rhs_cfgs.dtype
 
@@ -690,7 +975,35 @@ def validate_inputs(
     group_offset: jax.Array,
     fuse_act: str | None = None,
 ) -> Dimensions:
-    """Validate the inputs for the grouped matmul v3 kernel."""
+    """Validate inputs and return problem ``Dimensions`` for the v3 kernel.
+
+    Checks that shapes are mutually consistent:
+    - ``lhs.shape == (size_m, size_k)``
+    - ``rhs.shape == (size_group, size_k, size_n)``
+    - ``rhs_bias.shape == (size_group, 1, size_n)`` if provided
+    - ``rhs_scale.shape == (size_group, num_blocks, 1, size_n)`` if provided
+      and ``size_k % num_blocks == 0``
+    - ``group_offset.shape == (1,)``
+    - When ``fuse_act`` is enabled, ``size_n`` must be divisible by
+      ``2 * num_lanes``.
+
+    Args:
+        lhs: Token features ``[size_m, size_k]``.
+        rhs: Per-group weights ``[size_group, size_k, size_n]``.
+        rhs_scale: Optional quantisation scale.
+        rhs_bias: Optional per-group bias.
+        group_sizes: Token counts per group ``[size_lhs_group]``, int32.
+        group_offset: Shard offset ``[1]``, int32.
+        fuse_act: Optional activation name; triggers additional N-divisibility
+            check.
+
+    Returns:
+        Populated ``Dimensions`` dataclass.
+
+    Raises:
+        AssertionError: On any shape mismatch.
+        ValueError: When ``fuse_act`` N-divisibility constraint is not met.
+    """
     size_m = lhs.shape[0]
     size_group, size_k, size_n = rhs.shape
     size_lhs_group = group_sizes.shape[0]
@@ -725,7 +1038,19 @@ def validate_inputs(
 
 
 def get_cost_estimate(cfgs: GmmConfigs):
-    """Return the cost estimate for the grouped matmul v3 kernel."""
+    """Build a ``pl.CostEstimate`` for the given v3 kernel configuration.
+
+    Reports the theoretical FLOP count (``2 * M * K * N``) and the total
+    bytes accessed by LHS, RHS weight + optional scale/bias, and output
+    tensors.  The estimate is consumed by the XLA cost model for scheduling
+    and performance analysis.
+
+    Args:
+        cfgs: Full kernel configuration bundle.
+
+    Returns:
+        ``pl.CostEstimate(flops=..., bytes_accessed=..., transcendentals=0)``.
+    """
     dims = cfgs.dims
     lhs_dtype = cfgs.lhs_cfgs.quant_dtype or cfgs.lhs_cfgs.dtype
     rhs_dtype = cfgs.rhs_cfgs.dtype
@@ -755,7 +1080,7 @@ def get_cost_estimate(cfgs: GmmConfigs):
 
 
 def get_scope_name(cfgs: GmmConfigs) -> str:
-    """Return a scope name for grouped matmul v3."""
+    """Return a human-readable XProf scope name for the v3 kernel launch."""
     dims = cfgs.dims
     tiles = cfgs.tiles
     return (
@@ -780,7 +1105,37 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
 ):
-    """Build the grouped matmul v3 config bundle."""
+    """Validate inputs and build the full ``GmmConfigs`` bundle.
+
+    Derives ``InputConfigs`` for both LHS and RHS (including optional LHS
+    on-the-fly quantisation for FP8/INT8 when the hardware supports it),
+    resolves tiling (``TileSizes`` or ``TileFn``), and packages everything
+    into a ``GmmConfigs`` dataclass consumed by ``grouped_matmulv3_pallas_impl``.
+
+    Args:
+        lhs: Token features ``[size_m, size_k]``.
+        rhs: Per-group weights ``[size_group, size_k, size_n]``.
+        rhs_scale: Optional quantisation scale tensor.
+        rhs_bias: Optional per-group additive bias tensor.
+        group_sizes: Token counts per group ``[size_lhs_group]``, int32.
+        group_offset: Shard offset ``[1]``, int32.
+        tile_info: Pre-computed ``TileSizes`` or a ``TileFn`` callable.
+        vmem_limit_bytes: VMEM budget; passed to ``TileFn`` if ``tile_info``
+            is callable.  None means the budget is not passed to the tiling
+            function.
+        out_dtype: Desired output dtype; defaults to ``lhs.dtype``.
+        acc_dtype: Accumulator dtype; defaults to float32 (or bfloat16 when
+            LHS quantisation is enabled).
+        maybe_quantize_lhs: If True and RHS is quantised (has ``rhs_scale``),
+            attempt LHS on-the-fly quantisation to FP8 or INT8.
+        zero_initialize: If True the kernel will zero rows outside the active
+            group range via async DMA.
+        fuse_act: Optional fused activation (``"silu"``, ``"gelu"``,
+            ``"swigluoai"``).
+
+    Returns:
+        ``GmmConfigs`` dataclass ready to pass to ``kernel_main``.
+    """
     dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, fuse_act)
 
     if rhs_scale is not None:
@@ -847,7 +1202,18 @@ def make_gmm_configs(
 
 
 def get_metadata(cfgs: GmmConfigs):
-    """Return structured metadata for the kernel launch."""
+    """Flatten ``GmmConfigs`` into a dict of scalar values for XProf metadata.
+
+    Uses ``jax.tree_util.tree_leaves_with_path`` to walk the dataclass tree
+    and converts ``jnp.dtype`` values to their string names.
+
+    Args:
+        cfgs: Full kernel configuration bundle.
+
+    Returns:
+        A flat ``dict[str, Any]`` suitable for passing as ``metadata`` to
+        ``pl.pallas_call``.
+    """
     cfgs_dict = dataclasses.asdict(cfgs)
     ret = {}
     for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
@@ -889,7 +1255,64 @@ def grouped_matmulv3_pallas_impl(
     fuse_act: str | None = None,
     interpret: bool = False,
 ) -> jax.Array:
-    """Grouped matmul v3 kernel implemented with emit_pipeline."""
+    """Core TPU Pallas grouped matmul v3 using ``pltpu.emit_pipeline``.
+
+    Computes ``out[s_i:s_i+g_i, :] = lhs[s_i:s_i+g_i, :] @ rhs[i, :, :]``
+    for each group ``i``, using an upstream-style metadata-driven pipeline
+    that issues DMA zero-fills, grid metadata, and tiled matmul all in a
+    single kernel launch.
+
+    Grid layout:
+        ``(num_n, num_gm, num_k)`` where ``num_gm`` is the total number of
+        active grid steps derived from ``group_sizes`` and tile sizes.
+        ``num_n`` and ``num_k`` tile the output N and contraction K dimensions
+        respectively.  The N dimension is marked ``"parallel"`` in
+        ``CompilerParams``.
+
+    VMEM usage (scratch shapes):
+        - ``partial_out_ref``: ``(size_lhs_sublane, tile_n)`` -- partial rows
+          straddling sublane boundaries.
+        - ``acc_ref``: ``(tile_m, acc_cols)`` -- fp32 or bf16 accumulator.
+        - ``metadata_ref``: ``MetadataRef`` in SMEM -- group/row mappings.
+        - ``zero_ref`` (optional): ``(tile_zero_m, num_lanes)`` -- DMA source
+          for zeroing output rows.
+        - ``semaphore_ref`` (optional): ``SemaphoreType.DMA((1,))`` for
+          zero-fill DMA synchronisation.
+
+    All inputs (``lhs``, ``rhs``, and optional ``rhs_scale`` / ``rhs_bias``)
+    and the output are in HBM (``pltpu.HBM`` memory space).
+
+    Args:
+        lhs: Token features ``[size_m, size_k]``.
+        rhs: Per-group weights ``[size_group, size_k, size_n]``.
+        group_sizes: Token counts per group ``[size_lhs_group]``, int32.
+        rhs_scale: Optional quantisation scale
+            ``[size_group, num_blocks, 1, size_n]`` in float32 (cast
+            internally).
+        rhs_bias: Optional per-group bias ``[size_group, 1, size_n]`` in
+            float32 (cast internally).
+        group_offset: Shard offset scalar array ``[1]`` int32, or None
+            (defaults to 0).
+        tile_info: ``TileSizes`` or a ``TileFn`` callable.  Defaults to the
+            automatic ``calculate_tiling`` heuristic.
+        vmem_limit_bytes: VMEM budget override.  Defaults to 90 % of the
+            device's ``vmem_capacity_bytes``.
+        precision: Ignored (present for API compatibility).
+        preferred_element_type: Output dtype; defaults to ``lhs.dtype``.
+        acc_dtype: Accumulator dtype; defaults to float32 for unquantised
+            inputs and bfloat16 for LHS-quantised paths.
+        maybe_quantize_lhs: Attempt on-the-fly LHS quantisation when the RHS
+            is already quantised and the hardware supports FP8/INT8.
+        zero_initialize: Zero output rows outside the active group range.
+        fuse_act: Optional fused activation: ``"silu"``, ``"gelu"``, or
+            ``"swigluoai"``.  When set, ``rhs`` must have
+            ``size_n == 2 * actual_output_n`` (gate + up concatenated).
+        interpret: Run in Pallas interpreter mode (for debugging only).
+
+    Returns:
+        Output tensor ``[size_m, out_size_n]`` where ``out_size_n == size_n``
+        (or ``size_n // 2`` when ``fuse_act`` is not None).
+    """
     del precision
 
     if group_offset is None:

@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kernel public interface and registration wrappers."""
+"""Public interface for RWKV-7 XLA kernels.
+
+Registers ``rwkv7`` and ``rwkv7_mul`` in the kernel registry under
+``Platform.XLA``/``Backend.ANY`` and re-exports them with jaxtyping/beartype
+runtime shape checks.
+"""
 
 from __future__ import annotations
 
@@ -38,6 +43,9 @@ def rwkv7(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """RWKV-7 DPLR recurrent attention using XLA backend.
     Implements the RWKV-7 Diagonal + Low-Rank state update with O(N) complexity.
@@ -67,6 +75,9 @@ def rwkv7(
         reverse: If True, process sequence in reverse order.
         cu_seqlens: Optional cumulative sequence lengths for packed variable-length
             sequences. Shape: [num_seqs + 1]
+        block_v: Accepted for API compatibility with Triton; ignored by XLA.
+        num_warps: Accepted for API compatibility with Triton; ignored by XLA.
+        num_stages: Accepted for API compatibility with Triton; ignored by XLA.
     Returns:
         Tuple of:
             - output: Attention output matching input dtype.
@@ -117,6 +128,9 @@ def rwkv7_mul(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None = None,
     reverse: bool = False,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> tuple[Float[Array, "batch seq_len num_heads v_head_dim"], Float[Array, "... num_heads qk_head_dim v_head_dim"]]:
     """RWKV-7 multiplicative parameterization using XLA backend.
     Alternative parameterization of RWKV-7 DPLR that uses a multiplicative
@@ -144,6 +158,9 @@ def rwkv7_mul(
         initial_state: Optional initial hidden state.
         reverse: If True, process sequence in reverse.
         cu_seqlens: Optional cumulative sequence lengths for packed sequences.
+        block_v: Accepted for API compatibility with Triton; ignored by XLA.
+        num_warps: Accepted for API compatibility with Triton; ignored by XLA.
+        num_stages: Accepted for API compatibility with Triton; ignored by XLA.
     Returns:
         Tuple of:
             - output: Attention output [batch, seq_len, num_heads, v_head_dim]

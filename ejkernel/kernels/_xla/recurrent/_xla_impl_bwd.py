@@ -14,36 +14,33 @@
 
 """Recurrent linear attention backward pass implementation using XLA/JAX.
 
-This module provides the backward pass (gradient computation) for recurrent
-linear attention. Computes gradients for Q, K, V, and all gating parameters.
+Custom backward rule for ``_recurrent_core`` (via ``jax.custom_vjp``).
+Avoids re-running the forward pass by using the hidden states materialised
+during ``_recurrent_attention_fwd``.
 
-Key Components:
-    - _recurrent_attention_bwd: Main backward function
+Algorithm (per batch element, run via ``jax.vmap``):
+    Reverse-time ``lax.scan`` over ``(q, k, v, g, gk, gv, h, do)``:
 
-Algorithm:
-    The backward pass processes the sequence in reverse order:
-    1. Initialize gradient accumulator for hidden state (dh)
-    2. For each timestep t (in reverse):
-       - Compute dq, dk, dv from do and saved hidden states
-       - Compute dg, dgk, dgv for gating parameters
-       - Propagate dh backward through decay operation
-    3. Aggregate gradients for all parameters
+    1. ``dq_t = sum(h_t * do_t[:, None, :], axis=-1) * scale``
+    2. ``dh_t  = dh_next + (q_t * scale)[:, :, None] * do_t[:, None, :]``
+    3. ``dk_t  = einsum("nhd, nd -> nh", dh_t^T, v_t)``
+    4. ``dv_t  = einsum("nhd, nh -> nd", dh_t, k_t)``
+    5. Backward through each active gate in reverse application order:
+       ``gv → gk → g_gamma → g``.
+    6. ``dh_prev = dh_current * product_of_decay_gradients``
 
-Gradient Equations:
-    - dq: dL/dq_t = h_t^T @ do_t * softmax_scale
-    - dk: dL/dk_t = dh_t @ v_t^T
-    - dv: dL/dv_t = k_t^T @ dh_t
-    - dg: dL/dg_t = dh_t * h_{t-1} * exp(g_t)
-    - d_initial_state: dL/dh_0 = dh after reverse scan
-
-Features:
-    - Supports all gating mechanisms from forward pass
-    - Uses saved hidden states for efficiency
-    - Returns gradients for initial_state if provided
+Gradient equations:
+    - ``dL/dq_t = softmax_scale * h_t @ do_t``
+    - ``dL/dk_t = dh_t @ v_t``
+    - ``dL/dv_t = k_t^T @ dh_t``
+    - ``dL/dg_t = dh_t * h_{t-1} * exp(g_t)``  (GLA gate)
+    - ``d_initial_state = dh after all reverse steps``
 
 Note:
-    This uses a custom backward implementation rather than JAX autodiff
-    for better memory efficiency with the recurrent structure.
+    Gate gradients (``dg``, ``dgk``, ``dgv``) are only non-zero when the
+    corresponding gate was active (``use_g``, ``use_gk``, ``use_gv``).
+    ``g_gamma`` gradient is not produced (it is a nondiff argument handled
+    in ``_recurrent_bwd`` in ``_interface.py``).
 """
 
 import jax
@@ -66,31 +63,42 @@ def _recurrent_attention_bwd(
     initial_state: Float[Array, "batch num_heads head_dim head_dim"],
     reverse: bool,
 ) -> tuple:
-    """
-    Backward pass for recurrent linear attention.
+    """Backward pass for recurrent linear attention.
 
-    The recurrent formulation is:
-        h_t = decay_t * h_{t-1} + k_t^T ⊗ v_t
-        o_t = h_t @ q_t
+    Uses hidden states saved during the forward pass to avoid re-running the
+    recurrence, then runs a reverse-time scan to accumulate gradients.
 
-    Gradients:
-        dL/dq_t = softmax_scale * (dL/do_t @ h_t^T)
-        dL/dh_t = q_t @ dL/do_t^T + decay_{t+1} * dL/dh_{t+1}
-        dL/dk_t = dL/dh_t^T @ v_t
-        dL/dv_t = k_t^T @ dL/dh_t
+    Note:
+        ``use_g``, ``use_gk``, ``use_gv`` are determined dynamically by
+        checking whether the gate tensors are all-zero.  This means a gate
+        that was conceptually absent but passed as a zero tensor will be
+        detected as inactive and the corresponding gradient will be zero.
 
     Args:
-        q, k, v: Forward pass tensors [batch, seq_len, num_heads, head_dim]
-        g, g_gamma, gk, gv: Gating tensors
-        hidden_states: Hidden states from forward [batch, seq_len, num_heads, head_dim, head_dim]
-        do: Gradient of output [batch, seq_len, num_heads, head_dim]
-        dfinal_state: Gradient of final hidden state [batch, num_heads, head_dim, head_dim]
-        softmax_scale: Query scaling factor
-        initial_state: Initial hidden state
-        reverse: Whether forward was reversed
+        q: Query tensor, shape ``[batch, seq_len, num_heads, head_dim]``.
+        k: Key tensor, same shape as ``q``.
+        v: Value tensor, same shape as ``q``.
+        g: GLA gate, shape ``[batch, seq_len, num_heads, head_dim]``.
+            May be all-zero if GLA gating was inactive.
+        g_gamma: Per-head decay, shape ``[num_heads]`` or
+            ``[batch, num_heads]``.
+        gk: Key gate, same shape as ``q``.
+        gv: Value gate, same shape as ``q``.
+        hidden_states: All hidden states from the forward pass,
+            shape ``[batch, seq_len, num_heads, head_dim, head_dim]``.
+            ``hidden_states[:, t, ...]`` is ``h_t`` (the state *after* step ``t``).
+        do: Gradient of the output, shape ``[batch, seq_len, num_heads, head_dim]``.
+        dfinal_state: Gradient of the final hidden state,
+            shape ``[batch, num_heads, head_dim, head_dim]``.
+        softmax_scale: Query scaling factor used in forward pass.
+        initial_state: Initial hidden state used in forward pass,
+            shape ``[batch, num_heads, head_dim, head_dim]``.
+        reverse: Whether the forward pass processed the sequence in reverse.
+            If ``True``, inputs/outputs are flipped before/after the scan.
 
     Returns:
-        Tuple of (dq, dk, dv, dg, dgk, dgv, dinitial_state)
+        Tuple of ``(dq, dk, dv, dg, dgk, dgv, dinitial_state)`` with the
+        same shapes as the corresponding forward inputs.
     """
     batch, seq_len, num_heads, _head_dim = q.shape
 

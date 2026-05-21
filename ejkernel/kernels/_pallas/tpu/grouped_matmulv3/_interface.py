@@ -38,7 +38,24 @@ def _normalize_tiling(
     lhs: jax.Array,
     rhs: jax.Array,
 ) -> TileSizes | Callable:
-    """Normalize repo-style tiling into the upstream tile-info format."""
+    """Normalize ejkernel-style tiling spec into the v3 ``TileSizes | TileFn`` format.
+
+    The ejkernel public API accepts ``(tm, tk, tn)`` tuples or ``LutFn``
+    callables with signature ``(m, k, n) -> (tm, tk, tn) | None``.  The v3
+    implementation expects either a ``TileSizes`` dataclass or a ``TileFn``
+    with signature ``(dims, lhs_cfgs, rhs_cfgs, vmem_limit, fuse_act)``.
+    ``None`` maps to the automatic ``calculate_tiling`` heuristic.
+
+    Args:
+        tiling: Tile spec in ejkernel format: a ``(tm, tk, tn)`` tuple, a
+            ``LutFn`` callable, or ``None`` to use automatic tiling.
+        lhs: LHS array (used only for type annotations; not inspected here).
+        rhs: RHS array (used only for type annotations; not inspected here).
+
+    Returns:
+        A ``TileSizes`` instance or a ``TileFn`` callable compatible with
+        ``grouped_matmulv3_pallas_impl``.
+    """
     if tiling is None:
         return calculate_tiling
     if isinstance(tiling, tuple):
@@ -66,7 +83,28 @@ def _call_grouped_matmulv3(
     interpret: bool,
     precision: jax.lax.PrecisionLike,
 ) -> tuple[jax.Array, jax.Array]:
-    """Run the v3 kernel and return the prepared rhs used for backward."""
+    """Run the v3 Pallas kernel and return the output and the pre-processed RHS.
+
+    Applies ``transpose_rhs`` by swapping axes 1 and 2 of ``rhs``, then
+    delegates to ``grouped_matmulv3_pallas_impl``.
+
+    Args:
+        lhs: Token features ``[m, k]``.
+        rhs: Per-group weights in ejkernel layout (before axis swap).
+        group_sizes: Per-group token counts, int32 ``[num_groups]``.
+        preferred_element_type: Output dtype.
+        tiling: Tile spec (see ``_normalize_tiling``).
+        group_offset: Scalar shard offset array or None.
+        rhs_scale: Optional quantisation scale ``[num_groups, num_blocks, 1, n]``.
+        rhs_bias: Optional per-group bias ``[num_groups, 1, n]``.
+        transpose_rhs: Whether to swap axes 1/2 of ``rhs`` before the kernel.
+        interpret: Run in Pallas interpreter mode.
+        precision: Ignored; present for API consistency.
+
+    Returns:
+        ``(out, rhs_prepped)`` where ``rhs_prepped`` is the axis-swapped RHS
+        stored for use in the backward pass.
+    """
     del precision
     rhs_prepped = rhs.swapaxes(1, 2) if transpose_rhs else rhs
     out = grouped_matmulv3_pallas_impl(
@@ -98,6 +136,31 @@ def _grouped_matmulv3_core(
     interpret: bool,
     precision: jax.lax.PrecisionLike,
 ) -> jax.Array:
+    """Custom-VJP wrapper for the v3 grouped matmul.
+
+    This function is decorated with ``jax.custom_vjp`` so that
+    ``_grouped_matmulv3_fwd`` / ``_grouped_matmulv3_bwd`` are used during
+    automatic differentiation instead of JAX's default AD rules.
+    Non-differentiable static configuration is captured via
+    ``nondiff_argnums=(3, 4, 9, 10, 11)``.
+
+    Args:
+        lhs: Token features ``[m, k]``.
+        rhs: Per-group weights (ejkernel layout).
+        group_sizes: Token counts per group, int32 ``[num_groups]``.
+        preferred_element_type: Output dtype (non-differentiable).
+        tiling: Tile spec (non-differentiable).
+        group_offset: Shard offset, or None.
+        existing_out: Optional array to add to the output.
+        rhs_scale: Optional quantisation scale.
+        rhs_bias: Optional per-group bias.
+        transpose_rhs: Whether to transpose RHS (non-differentiable).
+        interpret: Interpreter mode flag (non-differentiable).
+        precision: Precision hint (non-differentiable).
+
+    Returns:
+        Output tensor ``[m, n]``.
+    """
     out, _ = _call_grouped_matmulv3(
         lhs,
         rhs,
@@ -128,6 +191,16 @@ def _grouped_matmulv3_fwd(
     interpret: bool,
     precision: jax.lax.PrecisionLike,
 ):
+    """Forward rule for the v3 grouped matmul custom VJP.
+
+    Executes the v3 kernel and stashes residuals required by the backward pass.
+    Residuals stored: ``(lhs, rhs, rhs_prepped, group_sizes, group_offset,
+    rhs_scale, rhs_bias, rhs.shape[0], has_existing_out)`` where
+    ``rhs_prepped`` is the potentially axis-swapped weight used by the kernel.
+
+    Returns:
+        ``(out, residuals)`` compatible with ``jax.custom_vjp`` protocol.
+    """
     out, rhs_prepped = _call_grouped_matmulv3(
         lhs,
         rhs,
@@ -165,6 +238,29 @@ def _grouped_matmulv3_bwd(
     residual,
     grad: jax.Array,
 ):
+    """Backward rule for the v3 grouped matmul custom VJP.
+
+    Computes gradients for all differentiable arguments:
+    - ``grad_lhs``: uses the v2 ``back_grouped_matmul`` kernel with
+      ``transpose_rhs=not transpose_rhs``.
+    - ``grad_rhs``: uses the v2 ``back_tgrouped_matmul`` kernel.  If
+      ``rhs_scale`` was provided the raw gradient is further multiplied by
+      the expanded scale.
+    - ``grad_rhs_scale`` and ``grad_rhs_bias``: computed via a full
+      reference re-run through ``grouped_matmulv3_reference`` and JAX VJP.
+      This path is slower but ensures numerical correctness.
+    - ``grad_existing_out``: equal to ``grad`` when ``existing_out`` was
+      provided (additive accumulation), or None otherwise.
+
+    Non-differentiable static args ``(preferred_element_type, tiling,
+    transpose_rhs, interpret, precision)`` are captured via
+    ``nondiff_argnums``.
+
+    Returns:
+        7-tuple ``(grad_lhs, grad_rhs, None, None, grad_existing_out,
+        grad_rhs_scale, grad_rhs_bias)`` matching the differentiable
+        arguments of ``_grouped_matmulv3_core``.
+    """
     (
         lhs,
         rhs,
@@ -275,7 +371,59 @@ def grouped_matmulv3(
     interpret: bool = False,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.DEFAULT,
 ) -> Float[Array, "m n"]:
-    """Grouped Matrix Multiplication v3 on TPU using the vendored upstream kernel."""
+    """Grouped Matrix Multiplication v3 on TPU using the upstream emit_pipeline kernel.
+
+    Performs the same per-group batched matmul as v1/v2 but with the v3 kernel
+    that uses ``pltpu.emit_pipeline`` for pipelined execution, metadata-driven
+    tile scheduling, and optional fused per-group RHS scale / bias for
+    quantised weight formats.
+
+    For each group ``i`` with token slice ``[s_i, s_i + g_i)``:
+
+    .. code-block::
+
+        out[s_i:s_i+g_i, :] = lhs[s_i:s_i+g_i, :] @ rhs_effective[i, :, :]
+
+    where ``rhs_effective`` is derived from ``rhs``, ``rhs_scale``, and
+    ``rhs_bias`` via ``_apply_rhs_scale_bias``.
+
+    Args:
+        lhs: Token features ``[m, k]``.
+        rhs: Per-group weight tensor ``[num_groups, k, n]``, or
+            ``[num_groups, n, k]`` when ``transpose_rhs=True``.
+        group_sizes: Number of tokens per group, shape ``[num_groups_or_shards]``,
+            dtype int32.
+        preferred_element_type: Output dtype.  Defaults to float32.
+        tiling: ``(tm, tk, tn)`` tile sizes, or a ``LutFn`` callable with
+            signature ``(m, k, n) -> (tm, tk, tn) | None``.  ``None`` falls
+            back to the v3 automatic tiling heuristic (``calculate_tiling``).
+        group_offset: Scalar array giving the first active group index for
+            sharded execution.  Defaults to 0.
+        existing_out: If provided, the kernel output is added to this array
+            element-wise before returning.  Shape ``[m, n]``.
+        rhs_scale: Optional per-group block-wise scale tensor
+            ``[num_groups, num_blocks, 1, n]``.  Used for quantised weights.
+        rhs_bias: Optional per-group additive bias ``[num_groups, 1, n]``.
+            Applied after scaling on the last k-step.
+        transpose_rhs: If True, ``rhs`` has shape ``[num_groups, n, k]`` and
+            the last two dimensions are swapped before the kernel runs.
+        interpret: Run the Pallas kernel in interpreter mode for debugging.
+            Significantly slower; do not use in production.
+        precision: JAX precision hint.  Currently ignored by the v3 kernel
+            (the kernel always computes in the dtype implied by the inputs and
+            ``preferred_element_type``).
+
+    Returns:
+        Output tensor ``[m, n]`` of dtype ``preferred_element_type``.
+
+    Note:
+        - The backward pass falls back to the v2 Pallas kernel for ``grad_lhs``
+          and ``grad_rhs``.  Gradients for ``rhs_scale`` and ``rhs_bias`` are
+          computed via a full reference re-run through ``grouped_matmulv3_reference``
+          which is slower.
+        - ``precision`` is accepted but has no effect; pass it for API
+          compatibility only.
+    """
     preferred_element_type = jnp.dtype(preferred_element_type) if preferred_element_type is not None else None
     return _grouped_matmulv3_core(
         lhs,

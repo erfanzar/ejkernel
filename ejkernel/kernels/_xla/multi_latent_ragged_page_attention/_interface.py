@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kernel registry interface for XLA multi-latent ragged paged attention."""
+"""Registry entry point for the XLA MLA ragged paged-attention kernel.
+
+Registers ``multi_latent_ragged_page_attention`` under
+``(Platform.XLA, Backend.ANY)`` and computes the default softmax scale before
+forwarding to the jit-compiled implementation in ``_xla_impl_fwd``.
+"""
 
 from __future__ import annotations
 
@@ -53,11 +58,61 @@ def multi_latent_ragged_page_attention(
     Float[Array, "total_tokens num_q_heads kv_latent_dim"],
     Float[Array, "num_pages page_size_per_kv_packing kv_packing kv_dim_padded"],
 ]:
-    """Compute MLA ragged paged attention using XLA.
+    """Compute MLA ragged paged attention using XLA (registry entry point).
 
-    This wrapper is the public registry entrypoint. It validates and dispatches
-    to a fully-jittable XLA implementation that updates the cache in-place and
-    returns attention outputs for the ragged token batch.
+    Fused operation that:
+
+    1. Writes incoming ``keys_values`` / ``keys_pe`` tokens into the paged KV
+       cache at positions derived from ``kv_lens`` and ``block_tables``.
+    2. Computes causal ragged paged attention over the updated cache with
+       online softmax (Flash-Attention-style numerically stable accumulation).
+
+    This is the XLA reference implementation.  It is numerically equivalent to
+    the Pallas TPU/GPU kernels and is used as the correctness baseline.
+
+    Args:
+        queries_nope: Query non-positional (compressed latent) component
+            ``[total_tokens, num_q_heads, kv_latent_dim]``.
+        queries_pe: Query positional component
+            ``[total_tokens, num_q_heads, qk_pe_dim]``.
+        keys_values: Incoming latent KV component (merged K and V in the MLA
+            sense) ``[total_tokens, kv_latent_dim]``.
+        keys_pe: Incoming key positional component ``[total_tokens, qk_pe_dim]``.
+        kv_cache: Paged KV cache to be updated in-place (donated).
+            Shape: ``[num_pages, page_size/kv_packing, kv_packing, kv_dim_padded]``
+            where ``kv_dim_padded = align128(kv_latent_dim) + align128(qk_pe_dim)``.
+        kv_lens: Total context length for each sequence before this step
+            ``[max_num_seqs]``.  int32.
+        block_tables: Flat page table ``[max_num_seqs * pages_per_seq]``.  int32.
+        query_start_loc: Ragged token start offsets ``[max_num_seqs + 1]``.  int32.
+        distribution: Workload descriptor ``[decode_end, prefill_end, total_seqs]``.
+            Only ``distribution[2]`` (total number of active sequences) is used by
+            this XLA implementation.
+        softmax_scale: QK scaling factor.  Defaults to
+            ``(kv_latent_dim + qk_pe_dim) ** -0.5`` when None.
+        sliding_window: If set, restricts each query to attend only to the most
+            recent ``sliding_window`` cached tokens.
+        logits_soft_cap: If set, applies ``cap * tanh(logits / cap)`` before
+            softmax.  Must be non-zero when provided.
+        mask_value: Additive fill value for masked (invalid / future) positions.
+            Defaults to ``-0.7 * finfo(float32).max``.
+        q_scale: Optional FP8 query dequantization scale (multiplied into logits).
+        k_scale: Optional FP8 key dequantization scale (multiplied into logits).
+        v_scale: Optional FP8 value dequantization scale (multiplied into output).
+        chunk_prefill_size: Accepted for API compatibility; ignored on this path.
+        num_kv_pages_per_block: Number of KV cache pages per inner attention
+            loop block.  Heuristically chosen when None.
+        num_queries_per_block: Number of query tokens per outer loop block.
+            Heuristically chosen when None.
+        vmem_limit_bytes: Accepted for API compatibility; ignored on this path.
+        debug_mode: Accepted for API compatibility; ignored on this path.
+
+    Returns:
+        Tuple ``(outputs, updated_kv_cache)`` where:
+            - ``outputs``: ``[total_tokens, num_q_heads, kv_latent_dim]``,
+              same dtype as ``queries_nope``.
+            - ``updated_kv_cache``: same shape and dtype as the input
+              ``kv_cache``.
     """
     if softmax_scale is None:
         softmax_scale = (queries_nope.shape[-1] + queries_pe.shape[-1]) ** -0.5

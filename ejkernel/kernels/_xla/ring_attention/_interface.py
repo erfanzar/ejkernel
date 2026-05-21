@@ -129,44 +129,62 @@ def _ring_attention(
     attention_sink_size: int = 0,
     causal: bool = False,
 ):
-    """
-    Computes ring attention with blockwise transformers.
+    """Compute ring attention with blockwise transformers (internal, with custom VJP).
+
+    This is the workhorse called by ``ring_attention`` after argument
+    normalization. Non-differentiable arguments (indices 9–25) are treated
+    as static by ``jax.custom_vjp``.
 
     Args:
-            query: Query array of shape (batch, q_len, num_heads, dim_per_head).
-            key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
-            value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-            bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
-            q_segment_ids: tp.Optional query segment ids array of shape (batch, q_len).
-                If both q_segment_ids and kv_segment_ids are None, no segment masking is applied.
-            kv_segment_ids: tp.Optional key/value segment ids array of shape (batch, kv_len).
-                If only one of q_segment_ids or kv_segment_ids is provided, it will be used for both.
-            softmax_aux: Optional attention sink logits of shape [num_sinks].
-                These are auxiliary logits that participate in softmax normalization but don't
-                contribute to output, allowing the model to absorb probability mass.
-            axis_name: Name of the axis to ppermute over.
-            float32_logits: Whether to compute logits in float32.
-            softmax_scale: softmax_scale for softmax or depth ** -0.5.
-            query_chunk_size: Size of query chunks.
-            key_chunk_size: Size of key chunks.
-            causal_block_size: Size of causal blocks for efficient causal masking. If None and causal=True,
-                defaults to query_chunk_size for block-level causal attention.
-            deterministic: Whether to apply dropout.
-            dropout_rng: PRNG key for dropout.
-            pdrop: Dropout probability.
-            dtype: dtype of the computation.
-            policy: Checkpoint policy.
-            precision: Precision of the computation.
-            prevent_cse: Whether to prevent common subexpression elimination.
-            sliding_window: Size of sliding window for local attention. Can be int for symmetric window
-                or tuple (left_window, right_window) for asymmetric window.
-            logits_soft_cap: Soft cap value for logits to prevent overflow.
-            attention_sink_size: Number of initial tokens to always attend to (StreamingLLM-style attention sink).
-            causal: If True, applies causal masking where each position can only attend to previous positions.
-                Uses causal_block_size for efficient blockwise causal computation.
+        query: Query array of shape (batch, q_len, num_heads, dim_per_head).
+        key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
+        value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
+        bias: Optional additive bias of shape (batch, num_heads, q_len, kv_len).
+        q_segment_ids: Optional query segment IDs of shape (batch, q_len).
+            If both q_segment_ids and kv_segment_ids are None, no segment masking
+            is applied.  If only one is provided, it is broadcast to both sides.
+        kv_segment_ids: Optional key/value segment IDs of shape (batch, kv_len).
+        q_position_ids: Optional query position IDs of shape (batch, q_len).
+            When provided together with kv_position_ids, causal and sliding-window
+            masking use these explicit positions instead of chunk offsets.
+        kv_position_ids: Optional key/value position IDs of shape (batch, kv_len).
+        softmax_aux: Optional attention-sink logits of shape [num_sinks] (1-D) or
+            [num_heads, num_sinks] (2-D).  These values participate in softmax
+            normalization but do not contribute to the output, allowing the model
+            to absorb surplus probability mass.
+        axis_name: Name of the JAX collective axis for ring communication.
+            If None, runs in single-device (blockwise) mode.
+        float32_logits: If True, cast query and key to float32 before computing
+            logits for improved numerical stability.
+        softmax_scale: Multiplicative scale applied to QK^T logits.  Defaults
+            to ``1/sqrt(head_dim)`` (standard attention scaling).  Note: the
+            forward implementation stores this as a divisor internally
+            (``1/softmax_scale``), so passing ``1/sqrt(head_dim)`` correctly
+            produces ``logits * (1/sqrt(head_dim))``.
+        query_chunk_size: Number of query tokens processed per chunk.
+        key_chunk_size: Number of key tokens processed per chunk.
+        causal_block_size: Block size used for efficient causal masking.  If None
+            and causal=True, defaults to query_chunk_size.
+        deterministic: If True, disables dropout.
+        dropout_rng: PRNG key for dropout; required when deterministic=False and
+            pdrop > 0.
+        pdrop: Dropout probability.
+        dtype: Output and accumulation dtype.
+        policy: JAX checkpoint policy for remat (controls what is saved vs
+            recomputed during backprop).
+        precision: JAX matmul precision.
+        prevent_cse: Passed to jax.checkpoint; prevents common-subexpression
+            elimination across checkpointed blocks.
+        sliding_window: Local attention window.  An int applies a symmetric window;
+            a tuple (left, right) applies an asymmetric window.  None = full attention.
+        logits_soft_cap: If set, applies ``cap * tanh(logits / cap)`` before
+            softmax to prevent logit explosion.
+        attention_sink_size: Number of leading KV positions that every query
+            always attends to (StreamingLLM-style sink).  0 = disabled.
+        causal: If True, applies causal masking using causal_block_size.
 
     Returns:
-            Output array of shape (batch, q_len, num_heads, dim_per_head).
+        Output array of shape (batch, q_len, num_heads, dim_per_head).
     """
 
     if q_segment_ids is None and kv_segment_ids is not None:

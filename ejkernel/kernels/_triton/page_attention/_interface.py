@@ -106,6 +106,8 @@ def page_attention(
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
     sliding_window: int | None = None,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
     """Compute paged attention with key-value caches stored in memory pages.
 
@@ -138,6 +140,8 @@ def page_attention(
         pages_per_compute_block: Not supported in Triton implementation (raises error).
         megacore_mode: Not supported in Triton implementation (raises error).
         inline_seq_dim: Must be True for Triton implementation (raises error if False).
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         Attention output of shape (num_seqs, num_heads, head_dim).
@@ -282,6 +286,8 @@ def page_attention(
             kernel=_paged_attn_kernel,
             out_shape=(dummy_m_shape, dummy_l_shape, out_shape),
             name="ejkernel::triton::page_attn_fwd",
+            num_warps=num_warps,
+            num_stages=num_stages,
             **metaparams,
         )
 
@@ -342,6 +348,8 @@ def page_attention(
             kernel=_paged_attn_kernel,
             out_shape=(m_i_shape, l_i_shape, tmp_out_shape),
             name="ejkernel::triton::page_attn_fwd_split",
+            num_warps=num_warps,
+            num_stages=num_stages,
             **metaparams,
         )
 

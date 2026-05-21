@@ -16,12 +16,35 @@
 """XLA reference implementation of chunked prefill paged attention.
 
 This module contains the core implementation of paged attention for the
-prefill phase. It uses standard JAX operations (gather, einsum, softmax)
+prefill phase.  It uses standard JAX operations (gather, einsum, softmax)
 to compute attention over a paged KV cache.
 
-The implementation is designed for correctness and portability across
-all XLA backends (CPU, GPU, TPU), serving as a reference for optimized
+Algorithm:
+
+1. **Page gather**: gather the physical pages belonging to this sequence
+   from ``key_cache`` / ``value_cache`` using ``page_indices``.
+2. **GQA expansion**: repeat K/V along the head axis so that every query
+   head has a corresponding K/V head.
+3. **Masked scaled dot-product attention**: compute
+   ``softmax(QK^T * scale + mask) @ V`` where the mask enforces
+   causality (``q_pos >= kv_pos``), padding (``kv_pos < context_len``),
+   and optionally a sliding window.
+4. **Logit soft-capping**: if ``attn_logits_soft_cap`` is set, applies
+   ``cap * tanh(qk / cap)`` before softmax.
+
+Query positions are defined as the last ``chunk_size`` positions of the
+context, i.e. ``q_positions[i] = context_len - chunk_size + i``.
+
+The implementation targets correctness and cross-platform portability
+(CPU, GPU, TPU) and serves as the numerical reference for optimised
 platform-specific implementations.
+
+Note:
+    This file contains a dead expression
+    ``(length + page_size - 1) // page_size`` inside the function body
+    (in the "Calculate number of pages needed" comment block) whose
+    result is computed but never assigned or used.  This is a likely
+    latent bug — the number of required pages is silently discarded.
 """
 
 import jax

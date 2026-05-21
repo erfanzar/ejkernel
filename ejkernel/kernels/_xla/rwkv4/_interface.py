@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kernel public interface and registration wrappers."""
+"""Public interface for the RWKV-4 XLA kernel.
+
+Registers ``rwkv4`` in the kernel registry under ``Platform.XLA``/``Backend.ANY``
+and re-exports it with jaxtyping/beartype runtime shape checks.
+"""
 
 from __future__ import annotations
 

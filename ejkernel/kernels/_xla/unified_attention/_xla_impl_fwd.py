@@ -15,35 +15,39 @@
 """Unified Attention forward pass using XLA/JAX.
 
 This module provides the forward pass for unified attention, a flexible
-attention implementation that supports various use cases including
-prefill, decode, and mixed operations with paged KV cache.
+attention implementation for inference with paged KV caches and ragged
+(variable-length) batches.
 
 Key Components:
     - _unified_attention_fwd: Main forward function
 
 Algorithm:
-    Unified attention combines multiple attention patterns:
-    1. Support both contiguous and paged KV cache layouts
-    2. Handle variable-length sequences with proper masking
-    3. Apply sliding window attention when configured
-    4. Optionally apply logit soft capping
+    1. Iterate over sequences in the ragged batch.
+    2. For each sequence, iterate over query blocks of size ``qblocks`` (16).
+    3. For each query block, iterate over KV cache blocks and accumulate
+       attention using the online softmax algorithm.
+    4. Normalise each query block's accumulator and write to the output buffer.
 
 Features:
-    - Flexible query/key/value shapes for different use cases
-    - Paged KV cache with req_to_tokens indirection
-    - Sliding window support for long sequences
+    - Paged KV cache with block-table indirection
+    - Ragged batches: variable-length sequences packed in a single tensor
+    - GQA/MQA support with automatic head grouping
+    - ALiBi positional encoding
+    - Query-query attention bias (prefill self-attention)
+    - Attention sinks via softmax_aux
+    - Sliding window local attention
     - Logit soft capping for numerical stability
-    - GQA/MQA support with automatic head broadcasting
 
 Memory Layout:
-    - queries: [batch, seq_len_q, num_q_heads, head_dim]
-    - key_cache/value_cache: [total_tokens, num_kv_heads, head_dim]
-    - req_to_tokens: [batch, max_seq_len] token index mapping
-    - seq_lens: [batch] sequence lengths
+    - queries: [total_tokens, num_q_heads, head_dim]  (all sequences packed)
+    - key_cache / value_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+    - block_tables: [num_seqs, max_blocks_per_seq]  (logical → physical mapping)
+    - query_start_loc: [num_seqs + 1]  (cumulative query token counts)
+    - kv_lens: [num_seqs]  (total KV context length per sequence)
 
 Note:
-    This unified kernel reduces code duplication by handling
-    multiple attention patterns in a single implementation.
+    This is a pure-JAX/XLA reference implementation intended for correctness
+    verification.  For GPU production workloads, prefer the Triton backend.
 """
 
 from __future__ import annotations

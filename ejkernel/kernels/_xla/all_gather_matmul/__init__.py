@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""XLA all-gather matmul kernel."""
+"""XLA all-gather matmul kernel.
+
+Exposes ``all_gather_matmul``, which gathers a row-sharded LHS across a JAX
+device mesh and multiplies by a local column-sharded RHS.  The backward pass
+uses ``lax.psum_scatter`` so gradients match the input shard shapes.
+"""
 
 from ._interface import all_gather_matmul
 

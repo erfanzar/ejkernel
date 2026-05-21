@@ -11,7 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kernel public interface and registration wrappers."""
+"""Public interface and kernel-registry registration for TPU block-sparse attention.
+
+Registers ``blocksparse_attention`` under ``Platform.PALLAS / Backend.TPU``
+and delegates to ``_kernel.blocksparse_attention`` (the Splash Attention
+implementation).
+
+Runtime type-checking is applied via ``beartype`` + ``jaxtyping``.
+"""
 
 from __future__ import annotations
 
@@ -50,37 +57,76 @@ def blocksparse_attention(
     causal: bool = True,
     fused_backward: bool = False,
 ) -> Float[Array, "batch num_heads seq_len vhead_dim"]:
-    """Pallas TPU block-sparse attention kernel implementation.
-    Computes attention over sparse block patterns using Pallas kernels optimized for TPU execution.
+    """Pallas TPU block-sparse (Splash) attention.
+
+    Computes multi-head attention with block-level sparsity using JAX Pallas
+    kernels on TPU.  The sparsity pattern can be derived automatically from
+    ``causal``, ``sliding_window``, and ``chunk_size``, or supplied explicitly
+    via ``qkv_layouts`` / ``mask_builder``.
+
+    Supports MHA and GQA (``kv_num_heads < num_heads``).
+
     Args:
-        query: Query tensor [batch num_heads seq_len head_dim]
-        key: Key tensor [batch kv_num_heads kv_len head_dim]
-        value: Value tensor [batch kv_num_heads kv_len vhead_dim]
-        q_segment_ids: Optional query segment ids [batch, seq_len]
-        kv_segment_ids: Optional KV segment ids [batch, kv_len]
-        q_positions: Optional query position indices [batch, seq_len] (not implemented for TPU)
-        kv_positions: Optional KV position indices [batch, kv_len] (not implemented for TPU)
-        softmax_aux: Optional auxiliary softmax values for attention sinks
-        bias: Optional attention bias [batch num_heads seq_len head_dim]
-        sequence_parallelism_mesh_axis_name: Optional mesh axis name for sequence parallelism
-        logits_soft_cap: Optional soft capping value for attention logits. When specified,
-            applies tanh-based soft capping: logits_soft_cap * tanh(logits / logits_soft_cap).
-            This prevents attention scores from becoming too large, improving numerical
-            stability (Gemma-2 style). Gradients are computed with proper Jacobian.
-        qkv_layouts: Optional pre-computed attention mask layouts
-        softmax_scale: Attention score scaling factor (default: 1/sqrt(head_dim))
-        mask_builder: Custom mask builder function
-        sliding_window: Sliding window size. Can be:
-            - int: symmetric window (same size left and right)
-            - tuple[int, int]: (left_window, right_window) for asymmetric
-            - None: no sliding window
-        chunk_size: Size of chunks for chunked causal attention (like Llama4)
-            - int: enable chunked causal mask with specified chunk size
-            - None: no chunking
-        causal: Whether to use causal masking (default True)
-        fused_backward: Whether to use fused backward kernel
+        query: ``[batch, num_heads, seq_len, head_dim]`` — query tensor.
+        key: ``[batch, kv_num_heads, kv_len, head_dim]`` — key tensor.
+        value: ``[batch, kv_num_heads, kv_len, vhead_dim]`` — value tensor.
+            ``vhead_dim`` may differ from ``head_dim``.
+        q_segment_ids: Optional ``[batch, seq_len]`` integer segment IDs.
+            Tokens with different IDs are prevented from attending to each
+            other (cross-segment masking is ANDed with the sparsity mask).
+        kv_segment_ids: Optional ``[batch, kv_len]`` integer segment IDs.
+        q_positions: Optional ``[batch, seq_len]`` position indices.
+            Accepted but currently unused on TPU.
+        kv_positions: Optional ``[batch, kv_len]`` position indices.
+            Accepted but currently unused on TPU.
+        softmax_aux: Optional ``[num_sinks]`` float array of attention-sink
+            log-values (StreamingLLM-style).  When provided, these values are
+            incorporated into the running online-softmax max and denominator.
+        bias: Optional additive bias of shape
+            ``[batch, num_heads, seq_len, kv_len]``.  Added to attention
+            logits before softmax.
+        attention_mask: Optional boolean or integer mask of shape
+            ``[batch, num_heads_or_1, seq_len, kv_len]``.
+        sequence_parallelism_mesh_axis_name: Optional mesh axis name for
+            sequence-parallel sharding of the attention computation.
+        logits_soft_cap: Optional logit soft-cap scalar.  When not None,
+            applies ``logits_soft_cap * tanh(logits / logits_soft_cap)``
+            to attention scores before the mask (Gemma-2 style).  Gradients
+            are computed with the correct tanh Jacobian.
+        qkv_layouts: Optional pre-built ``SparseMask`` layouts (from the
+            Triton blocksparse backend) used directly as the block-sparsity
+            pattern.  When provided, ``mask_builder``, ``causal``,
+            ``sliding_window``, and ``chunk_size`` are ignored.
+        softmax_scale: Scaling factor for attention logits.  Defaults to
+            ``1/sqrt(head_dim)`` when ``None``.
+        fwd_params: Forward-kernel tiling parameters (:class:`FwdParams`).
+            Relevant fields: ``blocksize_m`` (query block), ``blocksize_n``
+            (KV block).  Defaults are chosen by the kernel when ``None``.
+        bwd_params: Backward-kernel tiling parameters (:class:`BwdParams`).
+            Used only when ``fused_backward=True`` or when computing
+            gradients.
+        mask_builder: Optional callable for generating the sparsity mask.
+            Accepts two forms:
+            - ``(batch, heads, seq_len, kv_len, head_dim) -> SparseMask``
+            - ``() -> SparseMask``
+            Takes precedence over ``causal`` / ``sliding_window`` /
+            ``chunk_size`` when provided.
+        sliding_window: Local attention window size.  Options:
+            - ``int``: symmetric window (same left and right size).
+            - ``tuple[int, int]``: ``(left_window, right_window)`` for
+              asymmetric windows.
+            - ``None``: disabled.
+        chunk_size: Chunk size for chunked-causal attention (Llama4-style).
+            When not None, uses a ``ChunkedCausalMask`` where each token
+            attends causally within its chunk but not across chunks.
+        causal: If ``True`` (default), applies a causal (lower-triangular)
+            mask.  Combined with ``sliding_window`` / ``chunk_size`` when
+            those are also specified.
+        fused_backward: If ``True``, uses the fused dQ/dKV backward kernel
+            (requires appropriate ``BlockSizes.use_fused_bwd_kernel``).
+
     Returns:
-        Attention output [batch num_heads seq_len vhead_dim]
+        Attention output of shape ``[batch, num_heads, seq_len, vhead_dim]``.
     """
     return _blocksparse_attention_impl(
         query,

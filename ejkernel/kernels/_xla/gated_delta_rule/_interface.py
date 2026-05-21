@@ -12,11 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gated Delta Rule interface for linear-time attention with gated delta updates.
+"""Gated Delta Rule (GDR) public interface for XLA backend.
 
-This module provides the public API for GDR (Gated Delta Rule), a linear
-attention mechanism used in hybrid transformer architectures. Supports
-chunked, recurrent, and single-step computation modes.
+This module provides the public API for GDR, a linear attention mechanism used
+in hybrid transformer architectures (e.g., Qwen3Next). It registers the kernel
+under the ``"gated_delta_rule"`` key in the ejkernel registry for the XLA
+platform.
+
+GDR maintains a [head_dim, d_state] memory matrix per head that is updated via
+a *gated delta rule*:
+    h_t = exp(decay_t) * h_{t-1} + k_t ⊗ (beta_t * (v_t - h_{t-1} @ k_t))
+    o_t = h_t @ q_t
+
+The public tensor convention is [batch, seq_len, num_heads, dim]; internally
+tensors are transposed to [batch, num_heads, seq_len, dim] before dispatching
+to the implementation functions.
+
+Supported computation modes (dispatched by ``gated_delta_rule``):
+    - Single-step (seq_len=1 + initial_state): fast path for autoregressive decoding.
+    - Chunked (use_chunked=True, default): exact triangular-solve per chunk,
+      sequential state propagation across chunks.
+    - Recurrent (use_chunked=False): pure sequential scan, lowest memory.
 """
 
 from __future__ import annotations
@@ -80,7 +96,7 @@ def gated_delta_rule(
         decay: Per-token decay for memory retention (should be <= 0)
             Shape: [batch, seq_len, num_heads]
             If None, defaults to zeros (no decay, full retention)
-        chunk_size: Block size for chunked algorithm (default: 64)
+        chunk_size: Block size for chunked algorithm (default: 256)
         initial_state: Optional initial memory state for incremental inference
             Shape: [batch, num_heads, qk_head_dim, v_head_dim]
         use_qk_l2norm: If True, apply L2 normalization to queries and keys

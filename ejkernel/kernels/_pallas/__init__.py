@@ -13,15 +13,23 @@
 # limitations under the License.
 
 
-"""Pallas kernel implementations for TPU and GPU.
+"""Pallas kernel implementations for TPU and GPU backends.
 
-This module provides Pallas-based kernel implementations organized by
-target hardware (TPU and GPU). Pallas kernels compile to hardware-specific
-optimized code through JAX's lower-level APIs.
+This package groups JAX Pallas kernel implementations by target hardware.
+Pallas is JAX's low-level kernel authoring framework; it compiles to
+hardware-specific code via Mosaic (TPU) or Triton (GPU).
 
 Submodules:
-    tpu: TPU-optimized kernels using Pallas with Mosaic
-    gpu: GPU-optimized kernels using Pallas with Triton backend
+    tpu: TPU-optimized kernels compiled through Pallas/Mosaic. Kernels exploit
+        the TPU Matrix Multiply Unit (MXU), VMEM/HBM hierarchy, and TPU DMA
+        engines.
+    gpu: GPU-optimized kernels compiled through Pallas/Triton. Kernels target
+        NVIDIA GPUs and may delegate to cuDNN for some attention operations.
+
+Note:
+    The ``gpu`` submodule is imported lazily and silently set to ``None`` if
+    Triton is not installed, so callers must guard ``_pallas.gpu is not None``
+    before use on CPU/TPU-only environments.
 """
 
 from . import tpu

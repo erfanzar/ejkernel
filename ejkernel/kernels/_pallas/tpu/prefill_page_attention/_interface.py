@@ -113,6 +113,9 @@ def prefill_page_attention(
     mask_value: float = DEFAULT_MASK_VALUE,
     attn_logits_soft_cap: float | None = None,
     sliding_window: int | None = None,
+    block_k: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> Float[Array, "chunk_size num_heads head_dim"]:
     """Chunked prefill attention with paged KV cache for TPU.
 
@@ -129,6 +132,12 @@ def prefill_page_attention(
         mask_value: Value used for masked positions in attention.
         attn_logits_soft_cap: Optional soft cap for attention logits.
         sliding_window: If set, only attend to the last `sliding_window` tokens.
+        block_k: Backend tuning hint accepted for operation-level autotune;
+            ignored by this Pallas kernel.
+        num_warps: Backend tuning hint accepted for operation-level autotune;
+            ignored by this Pallas kernel.
+        num_stages: Backend tuning hint accepted for operation-level autotune;
+            ignored by this Pallas kernel.
 
     Returns:
         Attention output [chunk_size, num_q_heads, head_dim].
@@ -139,6 +148,7 @@ def prefill_page_attention(
         - The KV cache should already contain the keys/values for this sequence
         - chunk_size must be divisible by page_size
     """
+    _ = block_k, num_warps, num_stages
     chunk_size, num_q_heads, head_dim = query.shape
     num_kv_heads, _total_num_pages, page_size, head_dim_k = key_cache.shape
 

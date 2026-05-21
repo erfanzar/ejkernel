@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""XLA reduce-scatter matmul kernel."""
+"""XLA backend for fused reduce-scatter matrix multiplication.
+
+Computes ``reduce_scatter(x @ y.T, scatter_dim=0)`` over a device mesh using
+XLA ``psum_scatter``.  Provides a custom VJP so gradients flow correctly
+through the collective operation.
+
+Key exports:
+    - ``reduce_scatter_matmul``: Public entry point registered in the kernel
+      registry.
+"""
 
 from ._interface import reduce_scatter_matmul
 

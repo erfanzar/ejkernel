@@ -99,26 +99,51 @@ def _deepseek_attention_fwd(
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
     """DeepSeek Sparse Attention forward pass with MLA-style inputs.
 
-    Computes MLA attention (on-the-fly KV reconstruction from compressed
-    latent) with a Lightning Indexer sparse mask applied before softmax.
+    Computes MLA attention (on-the-fly KV reconstruction from a compressed
+    latent vector) with a Lightning Indexer sparse mask applied before softmax.
+
+    Scoring modes (selected by presence of ``b_q`` / ``b_k``):
+
+    1. **Both present** (``b_q`` and ``b_k``): The full ``query`` is treated
+       as the nope component; RoPE contributions are computed separately::
+
+           scores = (q_nope @ k_nope.T + b_q @ b_k.T) * softmax_scale
+
+    2. **``b_k`` only**: ``query`` is split into nope ``[..., :d_nope]`` and
+       rope ``[..., d_nope:]`` portions::
+
+           scores = (q_nope @ k_nope.T + q_rope @ b_k.T) * softmax_scale
+
+    3. **Neither** (pure nope): ``query`` is used directly::
+
+           scores = query @ k_nope.T * softmax_scale
+
+    After scoring, a ``[seq_len, seq_len]`` sparse mask is built from the
+    Lightning Indexer top-k indices.  Non-selected positions are set to
+    ``finfo.min`` (effectively −∞), while self-attention positions are
+    always forced to 0 so every token can attend to itself.
 
     Args:
-        query: Query tensor [batch, seq_len, q_heads, q_head_dim].
-        key_value: Compressed KV latent [batch, seq_len, kv_lora_rank].
-        w_kc: Key projection [kv_lora_rank, kv_heads, qk_nope_head_dim].
-        w_vc: Value projection [kv_lora_rank, kv_heads, v_head_dim].
-        query_index: Indexer query projections [batch, seq_len, index_heads, index_head_dim].
-        key_index: Indexer key projections [batch, seq_len, index_head_dim].
-        index_weights: Learned per-head indexer weights [batch, seq_len, index_heads].
-        index_topk: Number of tokens to select per query.
+        query: Query tensor ``[batch, seq_len, q_heads, q_head_dim]``.
+        key_value: Compressed KV latent ``[batch, seq_len, kv_lora_rank]``.
+        w_kc: Key projection ``[kv_lora_rank, kv_heads, qk_nope_head_dim]``.
+        w_vc: Value projection ``[kv_lora_rank, kv_heads, v_head_dim]``.
+        query_index: Indexer query projections
+            ``[batch, seq_len, index_heads, index_head_dim]``.
+        key_index: Indexer key projections
+            ``[batch, seq_len, index_head_dim]``.
+        index_weights: Learned per-head indexer weights
+            ``[batch, seq_len, index_heads]``.
+        index_topk: Number of KV tokens to select per query position.
         softmax_scale: Attention softmax scaling factor.
-        index_softmax_scale: Indexer scoring scale (defaults to index_head_dim^-0.5).
-        b_q: Optional query RoPE bias [batch, seq_len, qk_rope_head_dim].
-        b_k: Optional key RoPE bias [batch, seq_len, qk_rope_head_dim].
-        causal: Whether to apply causal masking (default: True).
+        index_softmax_scale: Indexer scoring scale.  Defaults to
+            ``index_head_dim ** -0.5`` when ``None``.
+        b_q: Optional query RoPE bias ``[batch, seq_len, qk_rope_head_dim]``.
+        b_k: Optional key RoPE bias ``[batch, seq_len, qk_rope_head_dim]``.
+        causal: Whether to apply causal masking. Default True.
 
     Returns:
-        Attention output [batch, seq_len, q_heads, v_head_dim].
+        Attention output ``[batch, seq_len, q_heads, v_head_dim]``.
     """
     B, T, H_Q, _D_Q = query.shape
     H_KV = w_kc.shape[1]

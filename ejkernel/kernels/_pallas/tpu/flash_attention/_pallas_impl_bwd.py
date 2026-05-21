@@ -835,7 +835,32 @@ def _flash_attention_bwd(
     residuals,
     do,
 ):
-    """VJP rule for FlashAttention."""
+    """VJP backward rule for Flash Attention.
+
+    Computes ``di = sum(O * dO)``, then delegates to
+    ``_flash_attention_bwd_dkv`` (for dK/dV) and ``_flash_attention_bwd_dq``
+    (for dQ/dAB).  Returns gradients w.r.t. (q, k, v, ab, segment_ids).
+
+    Args:
+        save_residuals: Must be False — higher-order AD is not supported.
+        causal: Whether causal masking was applied in the forward pass.
+        softmax_scale: Scaling factor used in the forward pass.
+        block_sizes: BlockSizes with backward-pass tile fields populated.
+        sliding_window: Sliding-window config passed to backward kernels.
+        logits_soft_cap: Soft-cap value used in the forward pass.
+        residuals: Tuple ``(q, k, v, ab, segment_ids, o, l, m)`` saved by
+            the forward rule.
+        do: Upstream gradient of the attention output.
+
+    Returns:
+        Five-element tuple ``(dq, dk, dv, ds, None)`` where ``ds`` is the
+        attention-bias gradient (or ``None`` if no bias was given) and the
+        last element is the ``None`` gradient for ``segment_ids``.
+
+    Raises:
+        NotImplementedError: If ``save_residuals`` is True.
+        ValueError: If ``block_sizes.has_backward_blocks`` is False.
+    """
     if save_residuals:
         raise NotImplementedError("Higher-order AD not supported")
     (q, k, v, ab, segment_ids, o, l, m) = residuals

@@ -12,11 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kernel Delta Attention interface for linear-time attention with delta updates.
+"""Kernel Delta Attention (KDA) public interface for XLA backend.
 
-This module provides the public API for KDA (Kernel Delta Attention), a linear
-attention variant using delta rule updates for memory management. Supports
-chunked, recurrent, and single-step computation modes.
+This module provides the public API for KDA, a linear attention mechanism that
+maintains a [head_dim, v_head_dim] memory matrix per head and uses a delta-rule
+update to selectively store and overwrite information.
+
+Registered kernel keys (both map to the same implementation):
+    - ``"kda"``
+    - ``"kernel_delta_attention"``
+
+The module also exports ``kda_decay``, a utility that computes Mamba-style
+per-token decay values from learnable ``A_log`` and ``dt_bias`` parameters.
+
+Public tensor convention: [batch, seq_len, num_heads, dim].  Internally,
+tensors are transposed to [batch, num_heads, seq_len, dim] before dispatching
+to the implementation functions.
+
+Supported computation modes (dispatched by ``kernel_delta_attention``):
+    - Single-step (seq_len=1 + initial_state): fast path for autoregressive decoding.
+    - Chunked (use_chunked=True, default): parallel intra-chunk with sequential
+      inter-chunk state propagation.
+    - Recurrent (use_chunked=False): pure sequential scan, lowest memory.
 """
 
 from __future__ import annotations

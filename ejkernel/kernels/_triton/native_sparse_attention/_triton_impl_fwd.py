@@ -135,10 +135,6 @@ def argsort(
     return x, ids
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4]],
-    key=["BLOCKSIZE", "BLOCKSIZE_K"],
-)
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] != 1})
 @triton.jit
 def nsa_kernel_topk(
@@ -160,6 +156,55 @@ def nsa_kernel_topk(
     BLOCKSIZE_K: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Select the top-``IndSize`` KV blocks for one query token.
+
+    Grid: ``(SEQUENCE, Z * KV_HEADS)``
+
+    - Axis 0 (``i_t``): query token position within the sequence.
+    - Axis 1 (``i_bh``): packed batch-head index; decoded as
+      ``i_b = i_bh // KV_HEADS``, ``i_h = i_bh % KV_HEADS``.
+
+    **Algorithm:**
+
+    1. Load the query vector for token ``i_t`` and scale it.
+    2. If ``lse`` is provided, load the pre-computed log-sum-exp values to
+       convert raw dot-product scores to normalised probabilities.
+       Otherwise, compute the LSE inline with an online softmax pass.
+    3. Iterate over compressed KV blocks in tiles of ``BLOCKSIZE``, computing
+       a per-block importance score (mean of per-group softmax probabilities).
+    4. Maintain a running top-``IndSize`` buffer using the ``_bitonic_merge``
+       primitive.  The buffer is merged after every tile and sorted at the end.
+    5. Write the resulting top-``IndSize`` block indices (1-indexed, then
+       offset by -1 on load) to ``block_indices``.
+
+    The causal constraint is applied by masking scores for blocks whose index
+    equals the current block (``i_t // BLOCKSIZE``).  Blocks strictly beyond
+    ``i_t // BLOCKSIZE`` are also excluded.
+
+    Args:
+        q: Query pointer, shape (batch * SEQUENCE, QHeads, BLOCK_DIMK).
+        k: Compressed key pointer, shape (TC_total, KV_HEADS, BLOCK_DIMK).
+        lse: Optional log-sum-exp pointer, shape (batch * SEQUENCE, QHeads).
+            Pass a JAX ``None``-equivalent sentinel to skip (will be recomputed).
+        softmax_scale: Scalar attention scale factor.
+        cu_seqlens: Cumulative sequence lengths for variable-length mode;
+            pass ``1`` when ``IS_VARLEN=False``.
+        token_indices: Per-token (seq, offset) lookup table (varlen mode);
+            pass ``1`` when ``IS_VARLEN=False``.
+        chunk_offsets: Per-sequence compressed-block start offsets (varlen);
+            pass ``1`` when ``IS_VARLEN=False``.
+        block_indices: Output tensor for top-K block indices, shape
+            (batch * SEQUENCE, KV_HEADS, IndSize), dtype int32.
+        SEQUENCE: Uniform sequence length (constexpr).
+        KV_HEADS: Number of KV attention heads (constexpr).
+        QHeads: Total number of query heads (constexpr).
+        NumGroups: GQA group size ``QHeads // KV_HEADS`` (constexpr).
+        BLOCK_DIMK: Key head dimension (constexpr).
+        IndSize: Power-of-2 number of blocks to select per query (constexpr).
+        BLOCKSIZE: Tokens per compressed block (constexpr).
+        BLOCKSIZE_K: Tile size along the key dimension (constexpr).
+        IS_VARLEN: Heuristic flag; True when ``cu_seqlens`` is a real array.
+    """
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // KV_HEADS, i_bh % KV_HEADS
     if IS_VARLEN:
@@ -246,10 +291,6 @@ def nsa_kernel_topk(
     tl.store(p_b, b_top.to(p_b.dtype.element_ty))
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4]],
-    key=["BLOCKSIZE", "BLOCKSIZE_K", "BLOCKSIZE_V"],
-)
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] != 1,
@@ -281,6 +322,58 @@ def nsa_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     USE_BLOCK_COUNTS: tl.constexpr,
 ):
+    """Compute NSA sparse attention output for one query token.
+
+    Grid: ``(SEQUENCE, NumVBlocks, Z * KV_HEADS)``
+
+    - Axis 0 (``i_t``): query token position within the sequence.
+    - Axis 1 (``i_v``): V-dimension tile index (0 .. NumVBlocks-1).
+    - Axis 2 (``i_bh``): packed batch-head index; decoded as
+      ``i_b = i_bh // KV_HEADS``, ``i_h = i_bh % KV_HEADS``.
+
+    Each CTA iterates over the ``NS`` pre-selected KV blocks listed in
+    ``block_indices`` for query ``i_t``, applying the causal constraint
+    ``block_start <= i_t``.  Attention is accumulated with an online softmax
+    (running max ``b_m``, sum ``b_acc``) for numerical stability.
+
+    Queries with no valid attending blocks produce zero output and zero LSE.
+
+    The KV layout uses a GQA-interleaved format: consecutive tokens share
+    KV heads, i.e. stride along the sequence dimension is ``KV_HEADS * dim``.
+
+    Args:
+        q: Query pointer, shape (batch * SEQUENCE, Q_HEADS, BLOCK_DIMK).
+        k: Key pointer, layout (batch * SEQUENCE, KV_HEADS, BLOCK_DIMK)
+            with row stride ``KV_HEADS * BLOCK_DIMK``.
+        v: Value pointer, layout (batch * SEQUENCE, KV_HEADS, BLOCK_DIMV)
+            with row stride ``KV_HEADS * BLOCK_DIMV``.
+        softmax_scale: Scalar attention scale factor (typically ``1/sqrt(head_dim)``).
+        block_indices: Sparse KV block indices, shape
+            (batch * SEQUENCE, KV_HEADS, IndicesSize), dtype int32.
+        block_counts: Valid block count per query position; a ``jax.Array``
+            enables ``USE_BLOCK_COUNTS``, an int disables per-position count.
+        cu_seqlens: Cumulative sequence lengths for variable-length mode;
+            pass ``1`` when ``IS_VARLEN=False``.
+        token_indices: Per-token (seq, offset) lookup table (varlen mode);
+            pass ``1`` when ``IS_VARLEN=False``.
+        o: Output pointer, shape (batch * SEQUENCE, Q_HEADS, BLOCK_DIMV).
+        lse: Log-sum-exp output pointer, shape (batch * SEQUENCE, Q_HEADS);
+            written only from the first V-tile (``i_v == 0`` is implicit via
+            a shared pointer offset, so all tiles write to the same location).
+        SEQUENCE: Uniform sequence length (constexpr).
+        KV_HEADS: Number of KV attention heads (constexpr).
+        Q_HEADS: Total number of query heads (constexpr).
+        QK_GROUPS: GQA group size ``Q_HEADS // KV_HEADS`` (constexpr).
+        BLOCK_DIMK: Key head dimension (constexpr).
+        BLOCK_DIMV: Value head dimension (constexpr).
+        IndicesSize: Maximum number of selected KV blocks per query (constexpr).
+        BLOCKSIZE: Tokens per KV block (constexpr).
+        BLOCKSIZE_K: Tile size along the key dimension (constexpr).
+        BLOCKSIZE_V: Tile size along the value dimension (constexpr).
+        IS_VARLEN: Heuristic flag; True when ``cu_seqlens`` is a real array.
+        USE_BLOCK_COUNTS: Heuristic flag; True when ``block_counts`` is a
+            ``jax.Array`` (per-position valid block count).
+    """
     i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // KV_HEADS, i_bh % KV_HEADS
 
@@ -372,6 +465,34 @@ def nsa_topk(
     softmax_scale: float | None = None,
     cu_seqlens: jax.Array | None = None,
 ) -> jax.Array:
+    """Select the top-K KV blocks for each query using compressed attention scores.
+
+    Launches ``nsa_kernel_topk`` to compute per-query block importance scores
+    and return the indices of the ``block_counts`` most-attended blocks.
+
+    Args:
+        q: Query tensor, shape (batch, seq_len, Q_HEADS, BLOCK_DIMK).
+        k: Compressed key tensor, shape (batch, TC, KV_HEADS, BLOCK_DIMK),
+           where ``TC = seq_len // block_size``.
+        lse: Log-sum-exp from the compressed attention forward pass, shape
+             (batch, seq_len, Q_HEADS).  Used to convert raw scores to
+             normalised probabilities for ranking.  If ``lse`` were recomputed
+             inside this kernel the results would differ from the forward pass
+             LSE used in gradient computation.
+        block_counts: Number of blocks to select per query.  Can be:
+            - An integer (uniform for all positions).
+            - A ``jax.Array`` of shape (batch, seq_len, KV_HEADS): per-token
+              counts; the maximum is used to size the output tensor.
+        block_size: Compression block size (tokens per compressed KV entry).
+        softmax_scale: Attention score scaling factor.  Defaults to
+            ``1 / sqrt(BLOCK_DIMK)``.
+        cu_seqlens: Optional cumulative sequence lengths for variable-length
+            mode.
+
+    Returns:
+        Block index tensor of shape (batch, seq_len, KV_HEADS, IndSize) in
+        int32, where ``IndSize = next_power_of_2(max(block_counts))``.
+    """
     Z, SEQUENCE, QHeads, BLOCK_DIMK = q.shape
     KV_HEADS = k.shape[2]
     NumGroups = QHeads // KV_HEADS
@@ -420,15 +541,46 @@ def fwd_triton_impl(
     softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ):
+    """Launch the NSA sparse-attention forward kernel.
+
+    Args:
+        q: Query tensor, shape (batch, seq_len, num_q_heads, head_dim).
+        k: Key tensor, shape (batch, seq_len, num_kv_heads, head_dim).
+        v: Value tensor, shape (batch, seq_len, num_kv_heads, head_dim_v).
+        block_indices: Pre-selected KV block indices, shape
+            (batch, seq_len, num_kv_heads, max_attn_blocks).
+        block_counts: Number of valid blocks per position.  Integer or
+            per-position tensor of shape (batch, seq_len, num_kv_heads).
+        block_size: Tokens per KV block.
+        softmax_scale: Attention score scaling factor.
+        cu_seqlens: Optional cumulative sequence lengths (variable-length mode).
+        token_indices: Optional per-token (seq, offset) index pairs.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
+
+    Returns:
+        Tuple (attn_output, lse):
+            - attn_output: shape (batch, seq_len, num_q_heads, head_dim_v).
+            - lse: Log-sum-exp, shape (batch, seq_len, num_q_heads).
+
+    Raises:
+        AssertionError: If ``head_dim > 128`` (``num_k_blocks > 1``).
+    """
     batch_size, seq_len, num_q_heads, head_dim = q.shape
     _, _, num_kv_heads, _ = k.shape
     head_dim_v = v.shape[-1]
     max_attn_blocks = block_indices.shape[-1]
     num_gqa_groups = num_q_heads // num_kv_heads
 
-    triton_block_size_k = min(128, next_power_of_2(head_dim))
-    triton_block_size_v = min(128, next_power_of_2(head_dim_v))
+    triton_block_size_k = min(128, max(int(block_k), next_power_of_2(head_dim)))
+    triton_block_size_v = min(128, int(block_v), next_power_of_2(head_dim_v))
 
     num_k_blocks = cdiv(head_dim, triton_block_size_k)
     num_v_blocks = cdiv(head_dim_v, triton_block_size_v)
@@ -467,6 +619,8 @@ def fwd_triton_impl(
         grid=lambda META: (META["SEQUENCE"], num_v_blocks, batch_size * META["KV_HEADS"]),
         out_shape=output_shapes,
         name="ejkernel::triton::sparse_attn_fwd",
+        num_warps=num_warps,
+        num_stages=num_stages,
         **kernel_metaparams,
     )
 

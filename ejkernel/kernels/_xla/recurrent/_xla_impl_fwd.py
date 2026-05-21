@@ -14,38 +14,38 @@
 
 """Recurrent linear attention forward pass implementation using XLA/JAX.
 
-This module provides the forward pass for recurrent linear attention using
-JAX scan operations. It implements O(N) linear attention with various
-gating mechanisms for GLA, Lightning, and other linear attention variants.
+Implements O(N) linear attention through ``jax.lax.scan``.  The recurrent
+state ``h`` has shape ``[num_heads, key_dim, value_dim]`` per sequence; at
+each timestep:
 
-Key Components:
-    - _recurrent_attention_step: Single timestep update
-    - _recurrent_attention_fwd: Full sequence forward pass
-    - _recurrent_attention_varlen_fwd: Variable-length sequence support
+.. code-block:: text
 
-Algorithm:
-    The recurrent formulation maintains a hidden state matrix h:
-    1. For each timestep t:
-       - Apply decay: h = decay * h (from g, g_gamma, or gk/gv gates)
-       - Outer product update: h = h + k_t^T @ v_t
-       - Query output: o_t = h @ (q_t * scale)
-    2. Return outputs and final state
+    h ← decay * h + k[:, :, None] * v[:, None, :]
+    o ← sum(h * (q * scale)[:, :, None], axis=1)   # sum over key_dim
 
-Gating Mechanisms:
-    - g: GLA-style gating with learned per-element decay
-    - g_gamma: Lightning attention with per-head scalar decay
-    - gk/gv: Separate key and value gating
+where ``decay`` is the product of activated gating exponentials.
 
-Features:
-    - O(N) complexity via recurrent formulation
-    - Multiple gating variants (GLA, Lightning, etc.)
-    - Variable-length sequence support via cu_seqlens
-    - Bidirectional support via reverse flag
-    - Hidden state tracking for chunked inference
+Key components:
+    - ``_recurrent_attention_step``: Single-step update for one token.
+    - ``_recurrent_attention_fwd``: Full padded-batch forward pass via
+      ``jax.vmap`` + ``lax.scan``; collects all hidden states for the
+      custom backward pass.
+    - ``_recurrent_attention_varlen_fwd``: Variable-length fallback that
+      loops over sequences in pure Python; used before the scan-based
+      varlen path in ``_interface.py`` was added.  Kept for reference.
+
+Gating Mechanisms (applied in order if active):
+    - ``g``: GLA-style element-wise decay ``exp(g)[:, :, None]`` over
+      ``(H, K)`` of state.
+    - ``g_gamma``: Lightning-style per-head scalar decay
+      ``exp(g_gamma)[:, None, None]``.
+    - ``gk``: Per-key-dim decay ``exp(gk)[:, :, None]``.
+    - ``gv``: Per-value-dim decay ``exp(gv)[:, None, :]``.
 
 Note:
-    This uses jax.lax.scan for efficient sequential computation.
-    The hidden state h has shape [batch, heads, key_dim, value_dim].
+    ``_recurrent_attention_fwd`` collects every intermediate hidden state
+    during the forward scan for use by the backward rule.  For long
+    sequences this requires O(N * H * K * V) additional memory.
 """
 
 import jax
@@ -116,23 +116,37 @@ def _recurrent_attention_fwd(
     initial_state: Float[Array, "batch num_heads head_dim head_dim"] | None = None,
     reverse: bool = False,
 ) -> tuple[Float[Array, "batch seq_len num_heads head_dim"], Float[Array, "batch num_heads head_dim head_dim"]]:
-    """
-    Forward pass for recurrent linear attention.
+    """Forward pass for recurrent linear attention with padded batch inputs.
 
-    Processes sequences sequentially with O(N) complexity by maintaining
-    a hidden state h that accumulates key-value information.
+    Processes sequences sequentially with O(N) complexity by maintaining a
+    hidden state ``h`` of shape ``[num_heads, head_dim, head_dim]`` per batch
+    element.  All hidden states across time are collected and returned for
+    use by the backward pass.
 
     Args:
-        q, k, v: Query, key, value tensors [batch, seq_len, num_heads, head_dim]
-        g: Optional gate for GLA-style gating [batch, seq_len, num_heads, head_dim]
-        g_gamma: Optional per-head decay factor [num_heads] or [batch, num_heads]
-        gk, gv: Optional gates for keys/values [batch, seq_len, num_heads, head_dim]
-        softmax_scale: Query scaling factor
-        initial_state: Initial hidden state [batch, num_heads, head_dim, head_dim]
-        reverse: If True, process sequence in reverse
+        q: Query tensor, shape ``[batch, seq_len, num_heads, head_dim]``.
+        k: Key tensor, shape ``[batch, seq_len, num_heads, head_dim]``.
+        v: Value tensor, shape ``[batch, seq_len, num_heads, head_dim]``.
+        g: Optional GLA gate, same shape as ``q``.
+        g_gamma: Optional per-head decay, shape ``[num_heads]`` or
+            ``[batch, num_heads]`` or ``[1, num_heads]``.
+        gk: Optional key gate, same shape as ``q``.
+        gv: Optional value gate, same shape as ``v``.
+        softmax_scale: Query scaling factor.  Defaults to ``1/sqrt(head_dim)``.
+        initial_state: Optional starting hidden state,
+            shape ``[batch, num_heads, head_dim, head_dim]``.
+            Defaults to zeros.
+        reverse: If ``True``, flip inputs along the sequence axis before
+            scanning, then flip outputs back.
 
     Returns:
-        Tuple of (output, final_state)
+        A 3-tuple ``(outputs, hidden_states, final_states)`` where:
+
+        * ``outputs``: ``[batch, seq_len, num_heads, head_dim]``
+        * ``hidden_states``: ``[batch, seq_len, num_heads, head_dim, head_dim]``
+          — all intermediate hidden states (used by the backward pass).
+        * ``final_states``: ``[batch, num_heads, head_dim, head_dim]``
+          — final hidden state after the last token.
     """
     batch, seq_len, num_heads, head_dim = q.shape
 

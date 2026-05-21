@@ -61,20 +61,30 @@ def _ssm1_core(
     Float[Array, "batch seq_len intermediate_size"],
     Float[Array, "batch intermediate_size ssm_state_size"],
 ]:
-    """Core SSM1 computation with custom VJP.
+    """Core SSM1 computation entry-point with a custom VJP registered.
+
+    Dispatches to either the full-sequence scan (``_ssm1_fwd``) or the
+    optimized single-step path (``_ssm1_single_step_fwd``) depending on
+    ``use_single_step``.  Gradients flow through ``_ssm1_fwd_rule`` and
+    ``_ssm1_bwd_rule``.
 
     Args:
-        hidden_states: Input tensor [batch, seq_len, intermediate_size]
-        A: A matrix (real form, typically negative) [intermediate_size, ssm_state_size]
-        B: B parameter [batch, seq_len, ssm_state_size]
-        C: C parameter [batch, seq_len, ssm_state_size]
-        D: Skip connection [intermediate_size]
-        dt: Time step (after softplus) [batch, seq_len, intermediate_size]
-        initial_state: Initial hidden state [batch, intermediate_size, ssm_state_size]
-        use_single_step: If True and seq_len=1, use optimized single step
+        hidden_states: Input tensor [batch, seq_len, intermediate_size].
+        A: A matrix in real form, typically negative for stability
+            [intermediate_size, ssm_state_size].
+        B: B projection [batch, seq_len, ssm_state_size].
+        C: C projection [batch, seq_len, ssm_state_size].
+        D: Skip-connection weight [intermediate_size].
+        dt: Time step after softplus [batch, seq_len, intermediate_size].
+        initial_state: Optional initial SSM hidden state
+            [batch, intermediate_size, ssm_state_size].  If None, zeros are used.
+        use_single_step: Static flag (nondiff_argnums).  If True and seq_len=1
+            and initial_state is not None, uses the single-step inference path.
 
     Returns:
-        Tuple of (output, final_state)
+        Tuple of:
+            - output: SSM output [batch, seq_len, intermediate_size].
+            - final_state: Final hidden state [batch, intermediate_size, ssm_state_size].
     """
     _batch_size, seq_len, _intermediate_size = hidden_states.shape
     _ssm_state_size = B.shape[-1]

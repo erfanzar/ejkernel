@@ -105,6 +105,8 @@ class BlockSizes:
     block_q_dq: int | None = None
 
     def __post_init__(self):
+        """Validate major/minor block-size relationships on construction."""
+
         def verify_major_minor(prefix, suffix, major, minor):
             if minor > major:
                 raise ValueError(f"{prefix}{suffix}={minor} should be smaller than {prefix}_major{suffix}={major}")
@@ -121,6 +123,7 @@ class BlockSizes:
 
     @property
     def has_backward_blocks(self) -> bool:
+        """Return True if all backward-pass block fields are set (not None)."""
         backward_blocks = (
             self.block_q_major_dkv,
             self.block_k_major_dkv,
@@ -134,6 +137,22 @@ class BlockSizes:
 
     @classmethod
     def get_default(cls, batch_size, num_heads, q_seq_len, kv_len, d_model):
+        """Return a default BlockSizes with all tiles set to 128.
+
+        All arguments are accepted for API compatibility but are currently
+        ignored — the returned sizes are unconditionally 128 for every field.
+
+        Args:
+            batch_size: Batch size (unused).
+            num_heads: Number of attention heads (unused).
+            q_seq_len: Query sequence length (unused).
+            kv_len: Key/value sequence length (unused).
+            d_model: Head dimension (unused).
+
+        Returns:
+            BlockSizes with block_q, block_k_major, block_k, block_b, and all
+            backward fields set to 128 / 1 respectively.
+        """
         del batch_size, num_heads, q_seq_len, kv_len, d_model
         return BlockSizes(
             block_q=128,

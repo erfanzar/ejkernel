@@ -18,6 +18,8 @@ from __future__ import annotations
 import jaxtyping
 from beartype import beartype
 
+from ejkernel.ops import BwdParams, FwdParams
+
 from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_fwd import Array, Bool, Callable, Float, Int
 from ._xla_impl_fwd import scaled_dot_product_attention as _scaled_dot_product_attention_impl
@@ -37,6 +39,8 @@ def scaled_dot_product_attention(
     sliding_window: int | tuple[int, int] | None = None,
     cum_seqlens_q: Int[Array, "batch"] | None = None,
     cum_seqlens_k: Int[Array, "batch"] | None = None,
+    fwd_params: FwdParams | None = None,
+    bwd_params: BwdParams | None = None,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
     """Compute scaled dot-product attention using XLA backend.
     This function wraps JAX's native dot_product_attention with the XLA
@@ -60,10 +64,13 @@ def scaled_dot_product_attention(
             - int: symmetric window size (past and future)
             - tuple[int, int]: (past_window, future_window) for asymmetric windows
             When set, limits attention to local context.
-        cum_seqlens_q: Optional cumulative sequence lengths for query, shape [batch+1].
-            Used for variable-length sequences in packed format.
-        cum_seqlens_k: Optional cumulative sequence lengths for key/value, shape [batch+1].
-            Used for variable-length sequences in packed format.
+        cum_seqlens_q: Optional per-example query sequence lengths, shape [batch].
+            Passed through to ``jax.nn.dot_product_attention`` as
+            ``query_seq_lengths`` to mask padding in variable-length batches.
+        cum_seqlens_k: Optional per-example key/value sequence lengths,
+            shape [batch].  Passed as ``key_value_seq_lengths``.
+        fwd_params: Operation-level tuning hint accepted for API parity; ignored by XLA.
+        bwd_params: Operation-level tuning hint accepted for API parity; ignored by XLA.
     Returns:
         Attention output tensor of shape [batch, seq_len, num_q_heads, head_dim].
     Note:
@@ -79,6 +86,7 @@ def scaled_dot_product_attention(
         >>> output.shape
         (2, 128, 8, 64)
     """
+    _ = fwd_params, bwd_params
     return _scaled_dot_product_attention_impl(
         query,
         key,

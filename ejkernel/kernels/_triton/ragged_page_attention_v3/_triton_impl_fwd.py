@@ -34,8 +34,11 @@ KV Cache (5D): [num_pages, page_size, heads_per_pack, pack_factor, head_dim_padd
 Block Tables: [max_num_seqs * pages_per_seq] (flattened)
   - Maps (sequence, page_index) to physical page numbers
 
-Distribution: [3] tensor containing [prefill_count, decode_count, num_seqs]
-  - Controls workload distribution between prefill and decode
+Distribution: [3] integer tensor with layout [num_decode, num_prefill, num_seqs]
+  - num_decode: number of decode (single-token) sequences at the front
+  - num_prefill: number of short prefill sequences following the decode group
+  - num_seqs: total number of active sequences (index 2 is read by the kernel)
+  Note: the Triton kernel only reads index 2 (num_seqs) from this tensor.
 
 Key Features:
 - Inline KV cache scatter updates (donates cache buffer)
@@ -451,35 +454,49 @@ def ragged_paged_attention_triton(
     """Execute ragged paged attention v3 with inline KV cache update.
 
     Performs two operations in sequence:
-    1. Scatters new keys and values into the paged KV cache
-    2. Computes attention over the updated cache using a Triton kernel
+    1. Scatters new keys and values into the paged KV cache via
+       ``_kv_update_scatter`` (using JAX ``lax.scatter`` with CLIP mode).
+    2. Computes causal attention over the updated cache using the Triton
+       kernel ``_rpa_v3_attn_fwd``.
 
-    The function validates all inputs, resolves configuration parameters,
-    and launches the Triton kernel with appropriate grid dimensions.
+    The Triton kernel grid is ``(ceil(total_tokens / BLOCK_M), num_q_heads, max_num_seqs)``.
+    ``BLOCK_M`` defaults to 128 (overridable via ``num_queries_per_block``);
+    ``BLOCK_NPAGES`` defaults to ``min(16, pages_per_seq, 32)``
+    (overridable via ``num_kv_pages_per_block``).
 
     Args:
-        queries: Query tensor of shape (total_tokens, num_q_heads, head_dim).
-        keys: New key tensor of shape (total_tokens, num_kv_heads, head_dim).
-        values: New value tensor of shape (total_tokens, num_kv_heads, head_dim).
-        kv_cache: Paged KV cache in 5D packed format.
-        kv_lens: Per-sequence KV lengths, shape (max_num_seqs,).
-        block_tables: Flattened block table, shape (max_num_seqs * pages_per_seq,).
-        query_start_loc: Cumulative query offsets, shape (max_num_seqs + 1,).
-        distribution: Workload distribution [num_decode, num_prefill, num_seqs].
-        softmax_aux: Optional attention sink values, shape (num_q_heads,).
-        softmax_scale: Attention scaling factor.
-        sliding_window: Optional sliding window size.
-        logits_soft_cap: Optional logit soft capping value.
-        q_scale: Optional FP8 scale for queries.
-        k_scale: Optional FP8 scale for keys.
-        v_scale: Optional FP8 scale for values.
-        chunk_prefill_size: Ignored (TPU-specific).
-        num_kv_pages_per_block: KV pages per compute block. Defaults to 16.
-        num_queries_per_block: Queries per compute block. Defaults to 128.
-        vmem_limit_bytes: Ignored (TPU-specific).
+        queries: Query tensor, shape ``(total_tokens, num_q_heads, head_dim)``.
+        keys: New key tensor, shape ``(total_tokens, num_kv_heads, head_dim)``.
+        values: New value tensor, shape ``(total_tokens, num_kv_heads, head_dim)``.
+        kv_cache: Paged KV cache in 5D packed format
+            ``(num_pages, page_size, num_kv_heads_x2_per_pack, pack, head_dim_padded)``.
+            The buffer is donated (mutated in-place via JAX buffer donation).
+        kv_lens: Per-sequence KV lengths, shape ``(max_num_seqs,)``, int32.
+        block_tables: Flattened block table, shape ``(max_num_seqs * pages_per_seq,)``,
+            int32.
+        query_start_loc: Cumulative query offsets, shape ``(max_num_seqs + 1,)``, int32.
+        distribution: Workload distribution ``[num_decode, num_prefill, num_seqs]``,
+            int32. Only element 2 (``num_seqs``) is read by the Triton kernel.
+        softmax_aux: Optional attention sink values, shape ``(num_q_heads,)``.
+            Pre-fills the running softmax max before the first KV tile is processed.
+        softmax_scale: Attention scaling factor. Defaults to ``1/sqrt(head_dim)``.
+        sliding_window: Optional sliding window size in tokens.
+        logits_soft_cap: Optional logit soft capping value. Applied as
+            ``logits_soft_cap * tanh(logits / logits_soft_cap)``.
+        q_scale: Optional FP8 scale for queries (applied after loading).
+        k_scale: Optional FP8 scale for keys (applied to QK dot product).
+        v_scale: Optional FP8 scale for values (applied to output).
+        chunk_prefill_size: Ignored; accepted for API compatibility (TPU-specific).
+        num_kv_pages_per_block: KV pages per inner-loop block (``BLOCK_NPAGES``).
+            Clamped to ``[1, min(pages_per_seq, 32)]``. Defaults to 16.
+        num_queries_per_block: Query block size (``BLOCK_M``). Defaults to 128.
+        vmem_limit_bytes: Ignored; accepted for API compatibility (TPU-specific).
 
     Returns:
-        Tuple of (attention_output, updated_kv_cache).
+        Tuple of ``(attention_output, updated_kv_cache)``:
+            - ``attention_output``: shape ``(total_tokens, num_q_heads, head_dim)``.
+            - ``updated_kv_cache``: same shape as input ``kv_cache``, with new
+              keys/values scattered in.
 
     Raises:
         ValueError: If input shapes, dtypes, or dimensions are invalid.

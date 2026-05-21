@@ -14,24 +14,26 @@
 
 """XLA backend for RWKV-6 recurrence.
 
-This submodule provides XLA-optimized implementation of RWKV-6's
-recurrence mechanism with DPLR (Decoupled Position-aware Linear Recurrence).
+This submodule provides a pure JAX/XLA implementation of the RWKV-6
+multi-head time-mix recurrence.
 
 Key Features:
     - O(N) complexity through linear recurrence
-    - DPLR state update for improved expressivity
-    - Position-aware decay with data-dependent gating
+    - Multi-head structure with per-head [K, V] state matrices
+    - Per-timestep data-dependent decay (w is input-dependent, unlike RWKV-4)
+    - Bonus term u that boosts the current token's contribution
     - Efficient state caching for incremental inference
+    - Variable-length packed-sequence mode (cu_seqlens)
 
 Algorithm:
-    RWKV-6 extends RWKV-4 with data-dependent decay:
-        h_t = diag(w_t) * h_{t-1} + k_t^T * v_t
-        y_t = sigmoid(r_t) * (h_t @ q_t)
-    where w_t is input-dependent (unlike fixed w in RWKV-4).
+    RWKV-6 extends RWKV-4/5 with multi-head state and input-dependent decay:
+        kv_t = k_t^T ⊗ v_t            (outer product, [H, K, V])
+        o_t  = r_t^T @ (h_{t-1} + kv_t * u)  (query with current-token bonus)
+        h_t  = h_{t-1} * exp(w_t) + kv_t     (exponential decay update)
+    where w_t is sequence-position-dependent (shape [B, T, H, K]).
 
 Reference:
-    RWKV: Reinventing RNNs for the Transformer Era
-    https://arxiv.org/abs/2305.13048
+    RWKV-6 (BlinkDL): https://github.com/BlinkDL/RWKV-LM
 """
 
 from ._interface import rwkv6

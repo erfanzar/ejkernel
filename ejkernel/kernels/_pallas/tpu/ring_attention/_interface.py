@@ -51,30 +51,53 @@ def ring_attention(
     fused_backward: bool = False,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
     """Computes ring attention using Splash Attention kernels on TPU.
+
     This implementation uses JAX's splash attention with ring communication
     topology for distributed attention computation across devices.
+
     Args:
         query: Query tensor [batch, q_len, num_heads, head_dim].
         key: Key tensor [batch, kv_len, num_kv_heads, head_dim].
         value: Value tensor [batch, kv_len, num_kv_heads, head_dim].
-        q_segment_ids: Optional query segment IDs [batch, q_len].
+        q_segment_ids: Optional query segment IDs [batch, q_len]. Used for
+            cross-document masking in packed-sequence training.
         kv_segment_ids: Optional KV segment IDs [batch, kv_len].
-        softmax_aux: Optional attention sink logits (maps to sinks parameter).
-        bias: Optional attention bias (not supported in splash attention).
-        mask_builder: Optional custom mask builder function.
-        sliding_window: Sliding window size for local attention.
-        chunk_size: Chunk size for chunked causal attention.
+        q_position_ids: Optional query position IDs [batch, q_len]. Forwarded
+            to the XLA ring-attention fallback; not used by the Pallas splash
+            path when ``axis_name`` is set.
+        kv_position_ids: Optional KV position IDs [batch, kv_len]. Forwarded
+            to the XLA ring-attention fallback; not used by the Pallas splash
+            path when ``axis_name`` is set.
+        softmax_aux: Optional attention sink logits [num_sinks] (1-D).
+            Converted to per-head sink weights via ``logsumexp`` and passed
+            to the splash kernel as ``sinks``.
+        bias: Optional attention bias (not supported in the Pallas splash path;
+            only passed through to the XLA fallback).
+        mask_builder: Optional custom mask builder function. Forces the XLA
+            ring-attention fallback when ``axis_name`` is ``None``.
+        sliding_window: Sliding window size as int (symmetric) or
+            ``(left, right)`` tuple for local attention.
+        chunk_size: Chunk size for chunked causal attention (Llama4-style).
         causal: Whether to use causal masking.
         logits_soft_cap: Soft cap for attention logits.
-        softmax_scale: Scaling factor for attention scores.
-        axis_name: Name of the ring communication axis.
-        fwd_params: Forward pass block size parameters.
-        bwd_params: Backward pass block size parameters.
-        fused_backward: Whether to use fused backward kernel.
+        softmax_scale: Scaling factor for attention scores. Defaults to
+            ``head_dim ** -0.5`` when ``None``.
+        axis_name: Name of the ring communication axis. ``None`` routes to
+            the XLA single-device path.
+        fwd_params: Forward pass block size parameters (``q_blocksize``,
+            ``kv_blocksize``).
+        bwd_params: Backward pass block size parameters (``q_blocksize``,
+            ``kv_blocksize``).
+        fused_backward: Whether to use fused backward kernel (forwarded to the
+            XLA fallback only; the Pallas path manages its own backward via
+            ``ring_splash_attention``).
+
     Returns:
         Attention output [batch, q_len, num_heads, head_dim].
+
     Raises:
-        NotImplementedError: If bias is provided (not supported).
+        NotImplementedError: If ``bias`` is provided when ``axis_name`` is set
+            (bias is not supported by the Pallas splash path).
     """
     return _ring_attention_impl(
         query,

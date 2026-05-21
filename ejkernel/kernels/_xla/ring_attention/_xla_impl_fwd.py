@@ -91,36 +91,59 @@ def _blockwise_attention_fwd(
     attention_sink_size: int = 0,
     causal: bool = False,
 ):
-    """Forward pass for blockwise attention.
+    """Forward pass for blockwise attention over one KV shard.
+
+    Processes the full query tensor against the full key/value tensor using a
+    chunk-by-chunk scan.  Accumulates attention using the online softmax
+    algorithm, updating the running (numerator, denominator, max_score) state
+    passed in via ``carry``.
 
     Args:
-            query: Query array of shape (batch, q_len, num_heads, dim_per_head).
-            key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
-            value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-            carry: Tuple of intermediate values from the previous iteration.
-            q_chunk_idx_start: Start index of the query chunk.
-            k_chunk_idx_start: Start index of the key chunk.
-            bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
-            q_segment_ids: tp.Optional query segment ids array of shape (batch, q_len).
-            kv_segment_ids: tp.Optional key/value segment ids array of shape (batch, kv_len).
-            softmax_scale: softmax_scale for softmax or depth ** -0.5.
-            causal_block_size: Size of causal blocks.
-            query_chunk_size: Size of query chunks.
-            key_chunk_size: Size of key chunks.
-            deterministic: Whether to apply dropout.
-            dropout_rng: PRNG key for dropout.
-            pdrop: Dropout probability.
-            dtype: dtype of the computation.
-            policy: Checkpoint policy.
-            precision: Precision of the computation.
-            prevent_cse: Whether to prevent common subexpression elimination.
-            sliding_window: Size of sliding window for local attention. Can be int or tuple (left_window, right_window).
-            logits_soft_cap: Soft cap value for logits to prevent overflow.
-            attention_sink_size: Number of initial tokens to always attend to (attention sink).
-            causal: If True, applies causal masking.
+        query: Query array of shape (batch, q_len, num_heads, dim_per_head).
+        key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
+        value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
+        carry: Tuple of (numerator, denominator, max_score) online-softmax
+            accumulators from the previous ring step, each shaped
+            (batch, q_len, num_heads, dim_per_head), (batch, num_heads, q_len),
+            and (batch, num_heads, q_len) respectively.
+        q_chunk_idx_start: Absolute chunk index of the first query chunk in this
+            call (used to compute correct positional offsets for masking).
+        k_chunk_idx_start: Absolute chunk index of the first KV chunk in this
+            call (used to compute correct positional offsets for masking).
+        bias: Optional additive bias (batch, num_heads, q_len, kv_len).
+        q_segment_ids: Optional query segment IDs (batch, q_len).
+        kv_segment_ids: Optional key/value segment IDs (batch, kv_len).
+        q_position_ids: Optional query position IDs (batch, q_len).  When
+            provided together with kv_position_ids, masking uses explicit
+            positions rather than chunk offsets.
+        kv_position_ids: Optional key/value position IDs (batch, kv_len).
+        softmax_aux: Optional attention-sink logits (1-D [num_sinks] or 2-D
+            [num_heads, num_sinks]).  These logits enter the softmax denominator
+            but are not projected into the output.
+        softmax_scale: Scale multiplier for QK^T logits.  The implementation
+            computes ``logits / (1 / softmax_scale)`` = ``logits * softmax_scale``.
+            Defaults to ``1/sqrt(head_dim)``.
+        causal_block_size: Block granularity for the causal diagonal check.
+            If None (with causal=False), no causal masking is applied.
+        query_chunk_size: Number of query tokens per chunk.
+        key_chunk_size: Number of key tokens per chunk.
+        deterministic: If True, disables dropout.
+        dropout_rng: PRNG key for dropout.
+        pdrop: Dropout probability.
+        dtype: Dtype for the output and chunk biases.
+        policy: JAX checkpoint policy passed to ``jax.checkpoint``.
+        precision: JAX matmul precision.
+        prevent_cse: Passed to ``jax.checkpoint`` to control CSE suppression.
+        sliding_window: Local attention window — int for symmetric or
+            (left, right) tuple for asymmetric.  None = full attention.
+        logits_soft_cap: If set, applies ``cap * tanh(logits / cap)`` before
+            softmax.
+        attention_sink_size: Number of initial KV positions always attended to.
+        causal: If True, passes causal_block_size to the bias function.
 
     Returns:
-            A tuple containing the numerator, denominator, and max score arrays.
+        Tuple of (numerator, denominator, max_score) updated accumulators,
+        with the same shapes as the corresponding inputs in ``carry``.
     """
     batch, q_len, num_heads, dim_per_head = query.shape
     batch, kv_len, num_heads, dim_per_head = key.shape
@@ -362,35 +385,58 @@ def _ring_attention_fwd(
     attention_sink_size: int = 0,
     causal: bool = False,
 ):
-    """Forward pass for ring attention.
+    """Forward pass for ring attention (XLA custom-VJP forward rule).
+
+    Performs the distributed ring-attention scan: ``axis_size`` ring steps,
+    each calling ``_blockwise_attention_fwd`` on the local KV shard and then
+    rotating the KV (and optional segment/position metadata) to the next
+    device via ``lax.ppermute``.
+
+    The ``softmax_aux`` attention-sink baseline is folded into the initial
+    (denominator, max_score) state before the ring scan begins so that it
+    participates correctly in all online-softmax rescaling steps.
 
     Args:
-            query: Query array of shape (batch, q_len, num_heads, dim_per_head).
-            key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
-            value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-            bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
-            q_segment_ids: tp.Optional query segment ids array of shape (batch, q_len).
-            kv_segment_ids: tp.Optional key/value segment ids array of shape (batch, kv_len).
-            axis_name: Name of the axis to ppermute over.
-            float32_logits: Whether to compute logits in float32.
-            softmax_scale: softmax_scale for softmax or depth ** -0.5.
-            query_chunk_size: Size of query chunks.
-            key_chunk_size: Size of key chunks.
-            causal_block_size: Size of causal blocks.
-            deterministic: Whether to apply dropout.
-            dropout_rng: PRNG key for dropout.
-            pdrop: Dropout probability.
-            dtype: dtype of the computation.
-            policy: Checkpoint policy.
-            precision: Precision of the computation.
-            prevent_cse: Whether to prevent common subexpression elimination.
-            sliding_window: Size of sliding window for local attention. Can be int or tuple (left_window, right_window).
-            logits_soft_cap: Soft cap value for logits to prevent overflow.
-            attention_sink_size: Number of initial tokens to always attend to (attention sink).
-            causal: If True, applies causal masking.
+        query: Query array (batch, q_len, num_heads, dim_per_head).
+        key: Key array (batch, kv_len, num_heads, dim_per_head).
+        value: Value array (batch, kv_len, num_heads, dim_per_head).
+        bias: Optional additive bias (batch, num_heads, q_len, kv_len).
+        q_segment_ids: Optional query segment IDs (batch, q_len).
+        kv_segment_ids: Optional key/value segment IDs (batch, kv_len).
+        q_position_ids: Optional query position IDs (batch, q_len).
+        kv_position_ids: Optional key/value position IDs (batch, kv_len).
+        softmax_aux: Optional attention-sink logits, shape [num_sinks] (1-D) or
+            [num_heads, num_sinks] (2-D).  Incorporated into the initial softmax
+            denominator/max without contributing to the output value.
+        axis_name: JAX collective axis name.  If None, axis_size is 1 (single
+            device).
+        float32_logits: If True, casts query and key to float32 before matmul.
+        softmax_scale: Scale multiplier for QK^T logits (see
+            ``_blockwise_attention_fwd`` for the convention).  Defaults to
+            ``1/sqrt(head_dim)``.
+        query_chunk_size: Query tokens per chunk.
+        key_chunk_size: Key tokens per chunk.
+        causal_block_size: Block size for the causal diagonal check; ignored when
+            causal=False.
+        deterministic: If True, disables dropout.
+        dropout_rng: PRNG key for dropout.
+        pdrop: Dropout probability.
+        dtype: Output dtype (the numerator accumulator is float32 internally).
+        policy: JAX checkpoint policy for intermediate activations.
+        precision: JAX matmul precision.
+        prevent_cse: Controls CSE suppression inside checkpointed blocks.
+        sliding_window: Local attention window (int or (left, right) tuple).
+        logits_soft_cap: Applies ``cap * tanh(logits/cap)`` when not None.
+        attention_sink_size: Number of leading KV tokens always attended to.
+        causal: If True, enables causal masking.
 
     Returns:
-            A tuple containing the output array and a tuple of intermediate values.
+        Tuple of (output, residuals) where:
+            - output: Attention result cast to ``value.dtype``,
+              shape (batch, q_len, num_heads, dim_per_head).
+            - residuals: Tuple of 11 tensors saved for the backward pass:
+              (output, query, key, value, bias, q_segment_ids, kv_segment_ids,
+              q_position_ids, kv_position_ids, denominator, max_score).
     """
     if float32_logits:
         query, key = query.astype(jnp.float32), key.astype(jnp.float32)

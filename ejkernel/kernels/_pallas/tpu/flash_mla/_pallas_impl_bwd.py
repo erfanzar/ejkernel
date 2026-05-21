@@ -80,11 +80,43 @@ def _flash_mla_dkv_kernel(
     block_q,
     block_k,
 ):
-    """Pallas kernel for computing dk_nope and dv gradients.
+    """Pallas kernel for computing ``dk_nope``, ``dv``, and optionally ``db_k``.
 
-    Grid: (batch, q_heads, kv_len // block_k, seq_q // block_q)
-    Axis 3 (q_blocks) is arbitrary — iterates over query blocks,
-    accumulating dk and dv in scratch memory.
+    Grid: ``(batch, q_heads, kv_len // block_k, seq_q // block_q)``.
+    Axis 3 (q_blocks) is "arbitrary" — iterates over query blocks in order,
+    accumulating ``dk_nope`` and ``dv`` in VMEM scratch per KV block, then
+    stores when ``q_seq_index == q_seq_len // block_q - 1``.
+
+    VMEM scratch:
+        dk_scratch_ref: [block_k, d_nope] float32.
+        dv_scratch_ref: [block_k, v_head_dim] float32.
+        db_k_scratch_ref: [block_k, rope_dim] float32 (used only for RoPE
+            modes; allocated but unused for ROPE_NONE).
+
+    Args:
+        q_tile_ref: [1, 1, block_q, q_head_dim].
+        k_nope_tile_ref: [1, 1, block_k, d_nope].
+        v_tile_ref: [1, 1, block_k, v_head_dim].
+        bq_tile_ref: Optional [1, block_q, rope_dim].
+        bk_tile_ref: Optional [1, block_k, rope_dim].
+        bias_tile_ref: Optional [1, 1, block_q, block_k].
+        l_tile_ref, m_tile_ref: [1, 1, block_q, MIN_BLOCK_SIZE] — residuals.
+        do_tile_ref: [1, 1, block_q, v_head_dim].
+        di_tile_ref: [1, 1, block_q, MIN_BLOCK_SIZE].
+        dk_tile_ref: [1, 1, block_k, d_nope] — output.
+        dv_tile_ref: [1, 1, block_k, v_head_dim] — output.
+        db_k_tile_ref: [1, 1, block_k, rope_dim] output (or None).
+        dk_scratch_ref, dv_scratch_ref, db_k_scratch_ref: VMEM accumulators.
+        rope_mode: ROPE_NONE / ROPE_FUSED / ROPE_DECOUPLED.
+        d_nope: Nope key dimension.
+        causal: Whether causal masking was applied.
+        softmax_scale: Attention scale factor.
+        sliding_window: Optional (left, right) window.
+        logits_soft_cap: Optional soft cap.
+        mask_value: Large negative value for masked positions.
+        q_seq_len: Total query sequence length.
+        block_q: Query block size.
+        block_k: KV block size.
     """
     kv_seq_index = pl.program_id(axis=2)
     q_seq_index = pl.program_id(axis=3)
@@ -239,6 +271,46 @@ def _flash_mla_bwd_dkv(
     logits_soft_cap,
     causal,
 ):
+    """Compute gradients w.r.t. the projected keys, values, and RoPE keys.
+
+    Sets up and launches ``_flash_mla_dkv_kernel`` which iterates over query
+    blocks (the "arbitrary" axis), accumulating ``dk_nope`` and ``dv`` in
+    VMEM scratch per KV block.  Optionally also computes ``db_k`` for
+    ROPE_FUSED or ROPE_DECOUPLED modes.
+
+    Grid: ``(batch, q_heads, kv_len // block_k, seq_q // block_q)``.
+    Dimension semantics: ``(parallel, parallel, parallel, arbitrary)``.
+
+    VMEM scratch: three buffers of shape ``(block_k, d_nope)``,
+    ``(block_k, v_head_dim)``, and ``(block_k, rope_dim)``.
+
+    Args:
+        q: Query [B, q_heads, seq_q, q_head_dim].
+        k_nope: Expanded nope-key [B, kv_heads, kv_len, d_nope].
+        v: Expanded value [B, kv_heads, kv_len, v_head_dim].
+        b_q: Optional query RoPE [B, seq_q, rope_dim].
+        b_k: Optional key RoPE [B, kv_len, rope_dim].
+        bias: Optional additive bias [B, q_heads, seq_q, kv_len].
+        l: Saved softmax denominator [B, q_heads, seq_q, MIN_BLOCK_SIZE].
+        m: Saved softmax max [B, q_heads, seq_q, MIN_BLOCK_SIZE].
+        do: Output gradient [B, q_heads, seq_q, v_head_dim].
+        di: Precomputed ``sum(o * do)`` [B, q_heads, seq_q, MIN_BLOCK_SIZE].
+        rope_mode: ROPE_NONE / ROPE_FUSED / ROPE_DECOUPLED.
+        d_nope: Size of the nope (non-RoPE) key dimension.
+        gqa_ratio: ``q_heads // kv_heads``.
+        block_q: Query block size for the backward kernel.
+        block_k: KV block size for the backward kernel.
+        softmax_scale: Attention scale used in forward.
+        sliding_window: Optional (left, right) window tuple.
+        logits_soft_cap: Optional soft cap for logits.
+        causal: Whether causal masking was applied.
+
+    Returns:
+        Three-element tuple ``(dk_nope, dv_all, db_k_all)`` where shapes are
+        ``[B, q_heads, kv_len, d_nope]``, ``[B, q_heads, kv_len, v_head_dim]``,
+        and ``[B, q_heads, kv_len, rope_dim]`` respectively.
+        ``db_k_all`` is ``None`` when ``rope_mode == ROPE_NONE``.
+    """
     batch_size, q_heads, seq_q, q_head_dim = q.shape
     _, _, kv_len, _ = k_nope.shape
     v_head_dim = v.shape[-1]
@@ -418,11 +490,41 @@ def _flash_mla_dq_kernel(
     block_q,
     block_k,
 ):
-    """Pallas kernel for computing dQ gradients.
+    """Pallas kernel for computing ``dq`` and optionally ``dbias`` / ``db_q``.
 
-    Grid: (batch, q_heads, seq_q // block_q, kv_len // block_k)
-    Axis 3 (kv_blocks) is arbitrary — iterates over KV blocks,
-    accumulating dq in scratch memory.
+    Grid: ``(batch, q_heads, seq_q // block_q, kv_len // block_k)``.
+    Axis 3 (kv_blocks) is "arbitrary" — iterates over KV blocks accumulating
+    ``dq`` in VMEM scratch, then stores when
+    ``kv_seq_index == kv_seq_len // block_k - 1``.
+
+    VMEM scratch:
+        dq_scratch_ref: [block_q, q_head_dim] float32.
+        db_q_scratch_ref: [block_q, rope_dim] float32 (ROPE_DECOUPLED only).
+
+    Args:
+        q_tile_ref: [1, 1, block_q, q_head_dim].
+        k_nope_tile_ref: [1, 1, block_k, d_nope].
+        v_tile_ref: [1, 1, block_k, v_head_dim].
+        bq_tile_ref: Optional [1, block_q, rope_dim].
+        bk_tile_ref: Optional [1, block_k, rope_dim].
+        bias_tile_ref: Optional [1, 1, block_q, block_k].
+        l_tile_ref, m_tile_ref: [1, 1, block_q, MIN_BLOCK_SIZE] residuals.
+        do_tile_ref: [1, 1, block_q, v_head_dim].
+        di_tile_ref: [1, 1, block_q, MIN_BLOCK_SIZE].
+        dq_tile_ref: [1, 1, block_q, q_head_dim] — output.
+        dbias_tile_ref: Optional [1, 1, block_q, block_k] bias grad output.
+        db_q_tile_ref: Optional [1, 1, block_q, rope_dim] grad output.
+        dq_scratch_ref, db_q_scratch_ref: VMEM accumulators.
+        rope_mode: ROPE_NONE / ROPE_FUSED / ROPE_DECOUPLED.
+        d_nope: Nope key dimension.
+        causal: Whether causal masking was applied.
+        softmax_scale: Attention scale factor.
+        sliding_window: Optional (left, right) window.
+        logits_soft_cap: Optional soft cap.
+        mask_value: Large negative value for masked positions.
+        kv_seq_len: Total KV length.
+        block_q: Query block size.
+        block_k: KV block size.
     """
     q_seq_index = pl.program_id(axis=2)
     kv_seq_index = pl.program_id(axis=3)
@@ -585,6 +687,46 @@ def _flash_mla_bwd_dq(
     logits_soft_cap,
     causal,
 ):
+    """Compute gradient w.r.t. queries, optional bias, and optional b_q.
+
+    Sets up and launches ``_flash_mla_dq_kernel`` which iterates over KV
+    blocks (the "arbitrary" axis), accumulating ``dq`` in VMEM scratch.
+    Also optionally outputs ``dbias`` and ``db_q`` (for ROPE_DECOUPLED).
+
+    Grid: ``(batch, q_heads, seq_q // block_q, kv_len // block_k)``.
+    Dimension semantics: ``(parallel, parallel, parallel, arbitrary)``.
+
+    VMEM scratch: two buffers of shape ``(block_q, q_head_dim)`` and
+    ``(block_q, rope_dim)``.
+
+    Args:
+        q: Query [B, q_heads, seq_q, q_head_dim].
+        k_nope: Expanded nope-key [B, kv_heads, kv_len, d_nope].
+        v: Expanded value [B, kv_heads, kv_len, v_head_dim].
+        b_q: Optional query RoPE [B, seq_q, rope_dim].
+        b_k: Optional key RoPE [B, kv_len, rope_dim].
+        bias: Optional additive bias [B, q_heads, seq_q, kv_len].
+        l: Saved softmax denominator [B, q_heads, seq_q, MIN_BLOCK_SIZE].
+        m: Saved softmax max [B, q_heads, seq_q, MIN_BLOCK_SIZE].
+        do: Output gradient [B, q_heads, seq_q, v_head_dim].
+        di: Precomputed ``sum(o * do)`` [B, q_heads, seq_q, MIN_BLOCK_SIZE].
+        rope_mode: ROPE_NONE / ROPE_FUSED / ROPE_DECOUPLED.
+        d_nope: Size of the nope key dimension.
+        gqa_ratio: ``q_heads // kv_heads``.
+        block_q: Query block size.
+        block_k: KV block size.
+        softmax_scale: Attention scale used in forward.
+        sliding_window: Optional (left, right) window tuple.
+        logits_soft_cap: Optional soft cap.
+        causal: Whether causal masking was applied.
+
+    Returns:
+        Three-element tuple ``(dq, dbias_out, db_q_all)`` where ``dq``
+        has shape ``[B, q_heads, seq_q, q_head_dim]``, ``dbias_out`` matches
+        the bias shape (or ``None``), and ``db_q_all`` has shape
+        ``[B, q_heads, seq_q, rope_dim]`` (or ``None`` unless
+        ``rope_mode == ROPE_DECOUPLED``).
+    """
     batch_size, q_heads, seq_q, q_head_dim = q.shape
     _, _, kv_len, _ = k_nope.shape
     v_head_dim = v.shape[-1]

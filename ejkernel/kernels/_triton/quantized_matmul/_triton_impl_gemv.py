@@ -48,6 +48,14 @@ def _get_decode_tables() -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
 
 
 def _mode_to_id(mode: str) -> int:
+    """Map a quantization mode string to an integer ID used by Triton kernels.
+
+    Returns:
+        0 = affine, 1 = nf4, 2 = mxfp4, 3 = mxfp8, 4 = nvfp4, 5 = nvfp8.
+
+    Raises:
+        ValueError: If ``mode`` is not one of the supported strings.
+    """
     mode = mode.lower()
     if mode == "affine":
         return 0
@@ -76,6 +84,33 @@ def _decode_q_values(
     MODE_ID: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
+    """Decode a block of quantized values to float32 in-kernel.
+
+    Dispatches on ``MODE_ID`` at compile time:
+
+    * 0 (affine): ``q * scale + bias`` (bias only applied when ``HAS_BIAS``).
+    * 1 (nf4): table lookup in ``NF4_TABLE`` scaled by ``scale_vals``.
+    * 2 (mxfp4): E8M0 scale (``E8M0_TABLE``) × E2M1 mantissa (``E2M1_TABLE``).
+    * 3 (mxfp8): E8M0 scale (``E8M0_TABLE``) × E4M3 mantissa (``E4M3_TABLE``).
+    * 4 (nvfp4): E4M3 scale (``E4M3_TABLE``) × E2M1 mantissa (``E2M1_TABLE``).
+    * 5 (nvfp8): E4M3 scale and mantissa both from ``E4M3_TABLE``.
+
+    Args:
+        q: Raw integer quantized codes.
+        scale_vals: Per-group scale codes (int for minifloat modes, float for
+            affine).
+        bias_vals: Per-group bias values (affine mode only; unused otherwise).
+        NF4_TABLE: NF4 codebook pointer (16 float32 entries).
+        E2M1_TABLE: E2M1 minifloat table pointer (16 float32 entries).
+        E4M3_TABLE: E4M3 minifloat table pointer (256 float32 entries).
+        E8M0_TABLE: E8M0 exponent-only scale table pointer (256 float32
+            entries, indexed by uint8 exponent code).
+        MODE_ID: Compile-time quantization mode integer (0–5).
+        HAS_BIAS: Compile-time flag; enables bias addition for affine mode.
+
+    Returns:
+        Float32 decoded values with the same shape as ``q``.
+    """
     if MODE_ID == 0:
         out = q.to(tl.float32) * scale_vals.to(tl.float32)
         if HAS_BIAS:
@@ -131,6 +166,42 @@ def _qmm_gemv_splitk_kernel(
     TRANSPOSE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
+    """GEMV kernel for M==1 quantized matmul using split-K parallelism.
+
+    Grid: ``(cdiv(N, BN), SPLIT_K)``
+
+    Each program instance handles a tile of ``BN`` output elements and a
+    strided slice of K of width ``BK``.  When ``SPLIT_K > 1``, partial
+    results are accumulated via ``tl.atomic_add`` into the pre-zeroed output
+    buffer; when ``SPLIT_K == 1`` a direct store is used.
+
+    Args:
+        X: Input vector pointer, shape (1, K).
+        Wq: Packed quantized weight pointer. Layout depends on ``TRANSPOSE``:
+            - ``TRANSPOSE=True``: (N, cdiv(K, VALUES_PER_WORD))
+            - ``TRANSPOSE=False``: (K, cdiv(N, VALUES_PER_WORD))
+        Wscale: Per-group scale pointer.
+        Wbias: Per-group bias pointer (ignored if not ``HAS_BIAS``).
+        NF4_TABLE, E2M1_TABLE, E4M3_TABLE, E8M0_TABLE: Decode lookup tables.
+        N: Output dimension.
+        K: Reduction dimension.
+        O: Output buffer pointer, shape (1, N); must be pre-zeroed when
+            ``SPLIT_K > 1``.
+        stride_xk: Stride of X along K.
+        stride_wq0, stride_wq1: Strides of Wq.
+        stride_ws0, stride_ws1: Strides of Wscale.
+        stride_wb0, stride_wb1: Strides of Wbias.
+        stride_on: Stride of O along N.
+        GROUP_SIZE: Quantization group size.
+        VALUES_PER_WORD: Number of quantized values packed per uint32 word
+            (8 for 4-bit, 4 for 8-bit).
+        BN: Output tile width.
+        BK: Reduction tile width.
+        SPLIT_K: Number of split-K partitions.
+        MODE_ID: Quantization mode integer (see ``_mode_to_id``).
+        TRANSPOSE: Weight layout flag.
+        HAS_BIAS: Whether to add per-group bias.
+    """
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
 
@@ -266,6 +337,39 @@ def _qmm_gemv_revsplitk_kernel(
     TRANSPOSE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
+    """GEMV kernel for M==1 quantized matmul using GemLite-style reverse split-K.
+
+    Grid: ``(cdiv(N, BN), cdiv(REV_PARTS, 2))``
+
+    Each program instance processes two adjacent K-partitions in a single
+    thread block, halving the number of atomic operations compared to the
+    standard split-K kernel.  When ``REV_PARTS <= 2`` a direct store is used;
+    otherwise ``tl.atomic_add`` accumulates into the pre-zeroed output.
+
+    Args:
+        X: Input vector pointer, shape (1, K).
+        Wq: Packed quantized weight pointer (same layout as split-K kernel).
+        Wscale: Per-group scale pointer.
+        Wbias: Per-group bias pointer (ignored if not ``HAS_BIAS``).
+        NF4_TABLE, E2M1_TABLE, E4M3_TABLE, E8M0_TABLE: Decode lookup tables.
+        N: Output dimension.
+        K: Reduction dimension.
+        O: Output buffer pointer, shape (1, N); must be pre-zeroed when
+            ``REV_PARTS > 2``.
+        stride_xk: Stride of X along K.
+        stride_wq0, stride_wq1: Strides of Wq.
+        stride_ws0, stride_ws1: Strides of Wscale.
+        stride_wb0, stride_wb1: Strides of Wbias.
+        stride_on: Stride of O along N.
+        GROUP_SIZE: Quantization group size.
+        VALUES_PER_WORD: Number of quantized values packed per uint32 word.
+        BN: Output tile width.
+        BK: Reduction tile width (fixed at 32 in the launcher).
+        REV_PARTS: Total reverse-split-K partitions; must be in {2, 4, 8, 16}.
+        MODE_ID: Quantization mode integer (see ``_mode_to_id``).
+        TRANSPOSE: Weight layout flag.
+        HAS_BIAS: Whether to add per-group bias.
+    """
     pid_n = tl.program_id(0)
     pid_k2 = tl.program_id(1) * 2
 
@@ -461,7 +565,34 @@ def quantized_matmul_triton_gemv(
     revsplit_parts: int | None,
     block_n: int,
 ) -> jax.Array:
-    """Run dedicated Triton GEMV family kernels for M==1 quantized matmul."""
+    """Run dedicated Triton GEMV family kernels for M==1 quantized matmul.
+
+    Selects between the split-K and reverse-split-K kernel families and
+    launches the appropriate Triton kernel.  The output is always cast to
+    **bfloat16** before returning.
+
+    Args:
+        x: Activation vector of shape (1, K).
+        w: Packed quantized weight tensor.
+        scales: Per-group scale tensor.
+        biases: Per-group bias tensor for affine mode; ``None`` otherwise.
+        transpose: Weight layout flag.
+        group_size: Quantization group size.
+        bits: Bits per quantized value (4 or 8).
+        mode: Quantization mode string (see ``_mode_to_id``).
+        kernel_family: ``"gemv_splitk"`` or ``"gemv_revsplitk"``.
+        split_k: Number of split-K partitions (``gemv_splitk`` only).
+        revsplit_parts: Number of reverse-split-K partitions (``gemv_revsplitk``
+            only); must be in {2, 4, 8, 16}, defaults to 2.
+        block_n: Output tile width hint.
+
+    Returns:
+        Output tensor of shape (1, N) in bfloat16.
+
+    Raises:
+        ValueError: If ``x.shape[0] != 1``, or if ``revsplit_parts`` is not
+            in {2, 4, 8, 16} for the reverse-split-K path.
+    """
     nf4_table, e2m1_table, e4m3_table, e8m0_exp2_table = _get_decode_tables()
     if int(x.shape[0]) != 1:
         raise ValueError("Dedicated GEMV kernels require M == 1.")

@@ -52,6 +52,46 @@ def test_mean_pooling_matches_reference():
     )
 
 
+def test_mean_pooling_fixed_3d_matches_reference():
+    key = jax.random.PRNGKey(2)
+    x = jax.random.normal(key, (3, 67, 48), dtype=jnp.float16)
+
+    out_triton = triton_mean_pooling(x, chunk_size=16)
+    out_ref = jnp.mean(x, axis=1)
+
+    out_triton = jax.block_until_ready(out_triton)
+    out_ref = jax.block_until_ready(out_ref)
+
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_mean_pooling_varlen_2d_matches_reference():
+    key = jax.random.PRNGKey(3)
+    lengths = (5, 17, 9)
+    cu_seqlens = jnp.array([0, 5, 22, 31], dtype=jnp.int32)
+    x = jax.random.normal(key, (31, 40), dtype=jnp.float16)
+
+    out_triton = triton_mean_pooling(x, chunk_size=8, cu_seqlens=cu_seqlens)
+    out_ref = jnp.stack(
+        [jnp.mean(x[int(cu_seqlens[i]) : int(cu_seqlens[i + 1])], axis=0) for i, _ in enumerate(lengths)]
+    )
+
+    out_triton = jax.block_until_ready(out_triton)
+    out_ref = jax.block_until_ready(out_ref)
+
+    np.testing.assert_allclose(
+        np.asarray(out_triton, dtype=np.float32),
+        np.asarray(out_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
 def test_mean_pooling_grad_matches_reference():
     key = jax.random.PRNGKey(1)
     x = jax.random.normal(key, (2, 50, 4, 32), dtype=jnp.float16)
@@ -62,6 +102,59 @@ def test_mean_pooling_grad_matches_reference():
 
     def loss_ref(inp):
         return jnp.sum(_block_mean_pooling_ref(inp, chunk_size))
+
+    grad_triton = jax.grad(loss_triton)(x)
+    grad_ref = jax.grad(loss_ref)(x)
+
+    grad_triton = jax.block_until_ready(grad_triton)
+    grad_ref = jax.block_until_ready(grad_ref)
+
+    np.testing.assert_allclose(
+        np.asarray(grad_triton, dtype=np.float32),
+        np.asarray(grad_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_mean_pooling_fixed_3d_grad_matches_reference():
+    key = jax.random.PRNGKey(4)
+    x = jax.random.normal(key, (2, 37, 24), dtype=jnp.float16)
+
+    def loss_triton(inp):
+        return jnp.sum(triton_mean_pooling(inp, chunk_size=8))
+
+    def loss_ref(inp):
+        return jnp.sum(jnp.mean(inp, axis=1))
+
+    grad_triton = jax.grad(loss_triton)(x)
+    grad_ref = jax.grad(loss_ref)(x)
+
+    grad_triton = jax.block_until_ready(grad_triton)
+    grad_ref = jax.block_until_ready(grad_ref)
+
+    np.testing.assert_allclose(
+        np.asarray(grad_triton, dtype=np.float32),
+        np.asarray(grad_ref, dtype=np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_mean_pooling_varlen_2d_grad_matches_reference():
+    key = jax.random.PRNGKey(5)
+    cu_seqlens = jnp.array([0, 4, 10, 23], dtype=jnp.int32)
+    x = jax.random.normal(key, (23, 20), dtype=jnp.float16)
+
+    def loss_triton(inp):
+        return jnp.sum(triton_mean_pooling(inp, chunk_size=8, cu_seqlens=cu_seqlens))
+
+    def loss_ref(inp):
+        return jnp.sum(
+            jnp.stack(
+                [jnp.mean(inp[int(cu_seqlens[i]) : int(cu_seqlens[i + 1])], axis=0) for i in range(len(cu_seqlens) - 1)]
+            )
+        )
 
     grad_triton = jax.grad(loss_triton)(x)
     grad_ref = jax.grad(loss_ref)(x)

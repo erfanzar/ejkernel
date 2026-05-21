@@ -12,11 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lightning Attention interface with layer-dependent decay.
+"""XLA/JAX implementation of Lightning Attention with layer-dependent decay.
 
-This module provides the public API for Lightning Attention using recurrent
-formulation with layer-depth-dependent decay rates for different temporal
-receptive fields across transformer layers.
+This module is the concrete forward implementation for the Lightning Attention
+mechanism. It computes a per-layer decay vector ``g_gamma`` whose values depend
+on both the head index and the layer depth, then delegates all computation to
+the generic ``recurrent`` kernel.
+
+Decay formula (per head ``h``)::
+
+    g_gamma[h] = -(8 / num_heads) * (1 - layer_idx / num_layers) * h
+
+This means:
+- Shallower layers (small ``layer_idx``) receive larger decay magnitudes,
+  giving them shorter effective memory.
+- Deeper layers approach zero decay (near-undecayed recurrence).
+- Earlier heads within a layer have smaller decay magnitudes than later heads.
+
+The actual recurrence, online softmax, and ``cu_seqlens`` unpacking logic all
+live in the ``recurrent`` module; this module only constructs ``g_gamma``.
 """
 
 from jax import numpy as jnp
@@ -79,25 +93,22 @@ def lightning_attn(
             does not match the number of sequences.
 
     Examples:
-        >>>
+        >>> import jax.numpy as jnp
         >>> q = jnp.ones((2, 100, 8, 64))
         >>> k = jnp.ones((2, 100, 8, 64))
         >>> v = jnp.ones((2, 100, 8, 64))
-        >>> output, final_state = lightning_attn(query, key, value, layer_idx=5, num_layers=24)
+        >>> output, final_state = lightning_attn(q, k, v, layer_idx=5, num_layers=24)
         >>> output.shape
         (2, 100, 8, 64)
 
-        >>>
-        >>>
-        >>>
+        Packed variable-length sequences (batch_size must be 1):
 
-        >>>
         >>> q = jnp.ones((1, 150, 8, 64))
         >>> k = jnp.ones((1, 150, 8, 64))
         >>> v = jnp.ones((1, 150, 8, 64))
         >>> cu_seqlens = jnp.array([0, 50, 100, 150])
         >>> output, final_state = lightning_attn(
-        ...     query, key, value, layer_idx=10, num_layers=24, cu_seqlens=cu_seqlens
+        ...     q, k, v, layer_idx=10, num_layers=24, cu_seqlens=cu_seqlens
         ... )
     """
     if cu_seqlens is not None:

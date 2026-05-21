@@ -117,14 +117,16 @@ def _grouped_matmul_fwd(
 
     Args:
         lhs: Left-hand side matrix of shape [m, k].
-        rhs: Right-hand side tensor of shape [num_groups, k, n] or
+        rhs: Right-hand side tensor of shape [num_groups, k, n], or
             [num_groups, n, k] if transpose_rhs is True.
         group_sizes: Array of group sizes with shape [num_groups], dtype int32.
             Each element specifies the number of rows from lhs for that group.
         preferred_element_type: Output dtype, defaults to float32.
         tiling: Tile dimensions (tm, tk, tn) for kernel execution.
+        input_buffer_count: Number of input buffers passed to
+            ``buffered_pallas_call``; higher values trade memory for
+            potential throughput gains.
         group_offset: Starting group index for computation (for sharding).
-        existing_out: Optional existing output array to accumulate into.
         transpose_rhs: Whether to transpose the last two dimensions of rhs.
         interpret: Whether to run in interpret mode for debugging.
 
@@ -132,7 +134,7 @@ def _grouped_matmul_fwd(
         Tuple of:
             - out: Result of grouped matmul with shape [m, n]
             - residual: Tuple of tensors needed for backward pass
-                (lhs, rhs, group_sizes, group_offset, num_groups)
+                ``(lhs, rhs, group_sizes, group_offset, num_groups)``
     """
     out = back_grouped_matmul(
         lhs,
@@ -164,20 +166,23 @@ def _grouped_matmul_bwd(
     during the backward pass of automatic differentiation.
 
     Args:
-        preferred_element_type: Output dtype (unused in backward).
+        preferred_element_type: Output dtype; unused in the backward pass.
         tiling: Tile dimensions (tm, tk, tn) for kernel execution.
-        transpose_rhs: Whether rhs was transposed in forward pass.
+        input_buffer_count: Number of input buffers forwarded to the
+            underlying ``back_grouped_matmul`` and ``back_tgrouped_matmul``
+            calls.
+        transpose_rhs: Whether rhs was transposed in the forward pass.
         interpret: Whether to run in interpret mode for debugging.
-        residual: Saved tensors from forward pass containing
-            (lhs, rhs, group_sizes, group_offset, num_actual_groups).
-        grad: Gradient of the loss with respect to the output, shape [m, n].
+        residual: Saved tensors from the forward pass:
+            ``(lhs, rhs, group_sizes, group_offset, num_actual_groups)``.
+        grad: Gradient of the loss w.r.t. the output, shape [m, n].
 
     Returns:
         Tuple of gradients:
-            - grad_lhs: Gradient w.r.t. lhs, shape [m, k]
-            - grad_rhs: Gradient w.r.t. rhs, same shape as original rhs
-            - None: Placeholder for group_sizes gradient (non-differentiable)
-            - None: Placeholder for group_offset gradient (non-differentiable)
+            - grad_lhs: Gradient w.r.t. lhs, shape [m, k].
+            - grad_rhs: Gradient w.r.t. rhs, same shape as the original rhs.
+            - None: Placeholder for group_sizes gradient (non-differentiable).
+            - None: Placeholder for group_offset gradient (non-differentiable).
     """
 
     del preferred_element_type
@@ -289,13 +294,16 @@ def grouped_matmulv2(
         >>> lhs = jnp.randn(300, 64)
         >>> rhs = jnp.randn(3, 64, 32)
         >>> group_sizes = jnp.array([100, 150, 50], dtype=jnp.int32)
-        >>> result = grouped_matmul(lhs, rhs, group_sizes)
+        >>> result = grouped_matmulv2(lhs, rhs, group_sizes)
 
-    Notes:
-        - The k dimension can have partial tiles (handled via masking)
-        - The m dimension must be divisible by tm for correctness
-        - Empty groups (size 0) are skipped for efficiency
-        - Cost estimation helps XLA make scheduling decisions
+    Note:
+        - The k dimension supports partial tiles (handled via masking).
+        - The m dimension must be divisible by ``tm`` for correctness.
+        - Empty groups (size 0) are skipped for efficiency.
+        - Cost estimation is provided to XLA to aid scheduling decisions.
+        - ``existing_out`` is accepted in the signature but immediately raises
+          ``NotImplementedError``; accumulation into an existing output is not
+          supported in v2.  Use v1 (``grouped_matmul``) for that use-case.
     """
     if existing_out is not None:
         raise NotImplementedError("existing_out is not supported in ragged dot")

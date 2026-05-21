@@ -79,10 +79,6 @@ from ejkernel.callib import cdiv, next_power_of_2, triton_call
 from ejkernel.xla_utils.utils import prepare_chunk_indices, prepare_chunk_offsets
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4]],
-    key=["BLOCKSIZE", "BLOCKSIZE_K", "BLOCKSIZE_V"],
-)
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] != 1})
 @triton.jit
 def nsa_compression_fwd_kernel(
@@ -107,6 +103,54 @@ def nsa_compression_fwd_kernel(
     BLOCKSIZE_V: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Forward attention kernel over compressed (mean-pooled) KV blocks.
+
+    Grid: ``(SEQUENCE, cdiv(BLOCK_DIMV, BLOCKSIZE_V), batch * KV_HEADS)``
+
+    Each program instance computes the compressed attention output for a
+    single query token (program axis 0), a value-head tile (axis 1), and a
+    (batch, KV-head) pair (axis 2).  The query attends to all compressed
+    blocks that precede it causally (``NC = (i_t + 1) // BLOCKSIZE`` blocks).
+
+    The compressed keys/values are stored at a base offset ``boc``
+    (chunk offset for variable-length mode, or ``batch * TC`` otherwise) with
+    the KV-head interleaved layout ``(TC, KV_HEADS, BLOCK_DIM)``.
+
+    For each query token, the kernel:
+
+    1. Loads the query vector and scales by ``softmax_scale``.
+    2. Iterates over compressed KV blocks in tiles of ``BLOCK_SEQ``.
+    3. Accumulates attention output using online softmax (running max ``b_m``
+       and sum ``b_acc``).
+    4. Writes the normalised output to ``o`` and the LSE to ``lse`` (only from
+       the first value tile ``i_v == 0`` to avoid double-writes).
+
+    Args:
+        q: Query pointer, shape (batch * SEQUENCE, Q_HEADS, BLOCK_DIMK).
+        k: Compressed key pointer, shape (TC_total, KV_HEADS, BLOCK_DIMK),
+            where ``TC_total`` is the total number of compressed blocks.
+        v: Compressed value pointer, shape (TC_total, KV_HEADS, BLOCK_DIMV).
+        softmax_scale: Scalar attention scale (passed at launch time).
+        cu_seqlens: Cumulative sequence lengths pointer (variable-length mode).
+        token_indices: Per-token (sequence, offset) index pairs (varlen mode).
+        chunk_offsets: Per-sequence compressed-block start offsets (varlen).
+        o: Output pointer, shape (batch * SEQUENCE, Q_HEADS, BLOCK_DIMV).
+        lse: Log-sum-exp output pointer, shape (batch * SEQUENCE, Q_HEADS).
+        SEQUENCE: Sequence length (compile-time constant; overridden per
+            sequence in variable-length mode).
+        KV_HEADS: Number of KV attention heads.
+        Q_HEADS: Total number of query heads (= KV_HEADS * QK_GROUPS).
+        QK_GROUPS: GQA group size (Q_HEADS // KV_HEADS).
+        BLOCK_DIMK: Key head dimension.
+        BLOCK_DIMV: Value head dimension.
+        BLOCK_SEQ: Number of compressed KV blocks processed per inner
+            iteration.
+        BLOCKSIZE: Original block size used for mean-pooling (tokens per
+            compressed block).
+        BLOCKSIZE_K: Tile width for the key dimension (<= 128).
+        BLOCKSIZE_V: Tile width for the value dimension (<= 128).
+        IS_VARLEN: Heuristic flag enabling variable-length mode.
+    """
     i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // KV_HEADS, i_bh % KV_HEADS
 
@@ -192,10 +236,6 @@ def nsa_compression_fwd_kernel(
         )
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4]],
-    key=["BLOCKSIZE", "BLOCKSIZE_K", "BLOCKSIZE_V"],
-)
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] != 1})
 @triton.jit
 def nsa_compression_bwd_kernel_dq(
@@ -223,6 +263,52 @@ def nsa_compression_bwd_kernel_dq(
     BLOCKSIZE_V: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Compute dQ for one query token over its causally valid compressed KV blocks.
+
+    Grid: ``(SEQUENCE, NumVBlocks, Z * KV_HEADS)``
+
+    - Axis 0 (``i_t``): query token position within the sequence.
+    - Axis 1 (``i_v``): V-dimension tile index (0 .. NumVBlocks-1).
+    - Axis 2 (``i_bh``): packed batch-head index; decoded as
+      ``i_b = i_bh // KV_HEADS``, ``i_h = i_bh % KV_HEADS``.
+
+    Each CTA iterates over all compressed KV blocks in tiles of ``BLOCK_SEQ``
+    up to ``NC = (i_t + 1) // BLOCKSIZE``, accumulating the dQ gradient:
+    ``dQ = scale * sum_c( dS_c @ K_c^T )``, where ``dS_c = P_c * (dP_c - delta)``.
+
+    When ``NumVBlocks > 1`` (value dimension > 128), partial dQ tiles are
+    written into a leading NumVBlocks accumulation dimension and reduced by
+    the caller.
+
+    Args:
+        q: Query pointer, shape (batch * SEQUENCE, Q_HEADS, BLOCK_DIMK).
+        k: Compressed key pointer, shape (TC_total, KV_HEADS, BLOCK_DIMK).
+        v: Compressed value pointer, shape (TC_total, KV_HEADS, BLOCK_DIMV).
+        lse: Log-sum-exp from the forward pass, shape (batch * SEQUENCE, Q_HEADS).
+        delta: Precomputed dot(o, do), shape (batch * SEQUENCE, Q_HEADS).
+        do: Upstream gradient, shape (batch * SEQUENCE, Q_HEADS, BLOCK_DIMV).
+        softmax_scale: Scalar attention scale factor.
+        cu_seqlens: Cumulative sequence lengths for variable-length mode;
+            pass ``1`` when ``IS_VARLEN=False``.
+        token_indices: Per-token (seq, offset) lookup table (varlen mode);
+            pass ``1`` when ``IS_VARLEN=False``.
+        chunk_offsets: Per-sequence compressed-block start offsets (varlen);
+            pass ``1`` when ``IS_VARLEN=False``.
+        dq: Output gradient buffer, shape
+            (NumVBlocks, batch * SEQUENCE, Q_HEADS, BLOCK_DIMK).
+        SEQUENCE: Uniform sequence length (constexpr).
+        Z: Batch size (constexpr).
+        KV_HEADS: Number of KV attention heads (constexpr).
+        Q_HEADS: Total number of query heads (constexpr).
+        QK_GROUPS: GQA group size ``Q_HEADS // KV_HEADS`` (constexpr).
+        BLOCK_DIMK: Key head dimension (constexpr).
+        BLOCK_DIMV: Value head dimension (constexpr).
+        BLOCK_SEQ: Number of compressed KV blocks per inner iteration (constexpr).
+        BLOCKSIZE: Tokens per compressed block (constexpr).
+        BLOCKSIZE_K: Tile size along the key dimension (constexpr).
+        BLOCKSIZE_V: Tile size along the value dimension (constexpr).
+        IS_VARLEN: Heuristic flag; True when ``cu_seqlens`` is a real array.
+    """
     i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // KV_HEADS, i_bh % KV_HEADS
 
@@ -311,6 +397,21 @@ def bwd_kernel_preprocess(
     Z: tl.constexpr,
     BLOCK_DIMV: tl.constexpr,
 ):
+    """Compute per-token delta = sum(o * do) needed for stable softmax gradients.
+
+    Grid: ``(numel(o[..., 0]),)`` – one program per (batch * seq * head) row.
+
+    ``delta[i] = sum(o[i] * do[i])`` is the dot-product of the forward output
+    with the upstream gradient, used to stabilise the softmax backward formula:
+    ``dS = P * (dP - delta)``.
+
+    Args:
+        o: Forward attention output pointer, last dimension = ``BLOCK_DIMV``.
+        do: Upstream gradient pointer, same shape as ``o``.
+        delta: Output pointer for the per-row scalar delta values.
+        Z: Power-of-2 padded value dimension used to load aligned tiles.
+        BLOCK_DIMV: Actual (unpadded) value dimension.
+    """
     i_n = tl.program_id(0)
     o_d = tl.arange(0, Z)
     m_d = o_d < BLOCK_DIMV
@@ -322,10 +423,6 @@ def bwd_kernel_preprocess(
     tl.store(delta + i_n, b_delta.to(delta.dtype.element_ty))
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4]],
-    key=["BLOCKSIZE", "BLOCKSIZE_K", "BLOCKSIZE_V"],
-)
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] != 1})
 @triton.jit
 def nsa_compression_bwd_kernel_dkv(
@@ -354,6 +451,59 @@ def nsa_compression_bwd_kernel_dkv(
     BLOCKSIZE_V: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Compute dK and dV for one compressed KV tile over all attending queries.
+
+    Grid: ``(NumVBlocks, NC_total, Z * KV_HEADS)``
+
+    - Axis 0 (``i_v``): V-dimension tile index (0 .. NumVBlocks-1).
+    - Axis 1 (``i_c``): compressed KV block tile index; one CTA handles a
+      slice of ``BLOCK_SEQ`` consecutive compressed blocks.
+    - Axis 2 (``i_bh``): packed batch-head index; decoded as
+      ``i_b = i_bh // KV_HEADS``, ``i_h = i_bh % KV_HEADS``.
+
+    Each CTA iterates over all query tokens ``i`` that could attend to the
+    compressed blocks ``[i_c * BLOCK_SEQ, (i_c+1) * BLOCK_SEQ)``, i.e. tokens
+    with ``i >= i_c * BLOCK_SEQ * BLOCKSIZE``.  The causal constraint is
+    enforced inside the loop via the masking of ``b_p``.
+
+    Accumulates:
+    - ``dV += P^T @ dO``
+    - ``dK += dS @ Q`` where ``dS = P * (dP - delta)``
+
+    Both partial dK and dV tiles are written into per-tile accumulation buffers
+    with a leading NumVBlocks dimension; the caller sums along axis 0.
+
+    Args:
+        q: Query pointer, shape (batch * SEQUENCE, Q_HEADS, BLOCK_DIMK).
+        k: Compressed key pointer, shape (TC_total, KV_HEADS, BLOCK_DIMK).
+        v: Compressed value pointer, shape (TC_total, KV_HEADS, BLOCK_DIMV).
+        lse: Log-sum-exp from the forward pass, shape (batch * SEQUENCE, Q_HEADS).
+        delta: Precomputed dot(o, do), shape (batch * SEQUENCE, Q_HEADS).
+        do: Upstream gradient, shape (batch * SEQUENCE, Q_HEADS, BLOCK_DIMV).
+        cu_seqlens: Cumulative sequence lengths for variable-length mode;
+            pass ``1`` when ``IS_VARLEN=False``.
+        chunk_indices: KV-block-to-(seq, tile) lookup table for varlen mode;
+            pass ``1`` when ``IS_VARLEN=False``.
+        chunk_offsets: Per-sequence compressed-block start offsets (varlen);
+            pass ``1`` when ``IS_VARLEN=False``.
+        softmax_scale: Scalar attention scale factor.
+        dk: Output gradient buffer for keys, shape
+            (NumVBlocks, TC_total, KV_HEADS, BLOCK_DIMK).
+        dv: Output gradient buffer for values, shape
+            (NumVBlocks, TC_total, KV_HEADS, BLOCK_DIMV).
+        SEQUENCE: Uniform sequence length (constexpr).
+        Z: Batch size (constexpr).
+        KV_HEADS: Number of KV attention heads (constexpr).
+        Q_HEADS: Total number of query heads (constexpr).
+        QK_GROUPS: GQA group size ``Q_HEADS // KV_HEADS`` (constexpr).
+        BLOCK_DIMK: Key head dimension (constexpr).
+        BLOCK_DIMV: Value head dimension (constexpr).
+        BLOCK_SEQ: Number of compressed KV blocks per CTA tile (constexpr).
+        BLOCKSIZE: Tokens per compressed block (constexpr).
+        BLOCKSIZE_K: Tile size along the key dimension (constexpr).
+        BLOCKSIZE_V: Tile size along the value dimension (constexpr).
+        IS_VARLEN: Heuristic flag; True when ``cu_seqlens`` is a real array.
+    """
     i_v, i_c, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // KV_HEADS, i_bh % KV_HEADS
 
@@ -454,13 +604,42 @@ def nsa_compression_fwd(
     softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
+    """Launch the NSA compressed-attention forward kernel.
+
+    Args:
+        q: Query tensor, shape (batch, seq_len, Q_HEADS, BLOCK_DIMK).
+        k: Compressed key tensor, shape (batch, TC, KV_HEADS, BLOCK_DIMK),
+            where ``TC = seq_len // block_size``.
+        v: Compressed value tensor, same shape as ``k`` except last dim may
+            differ (BLOCK_DIMV).
+        block_size: Compression block size (tokens per compressed KV entry).
+        softmax_scale: Attention score scaling factor.
+        cu_seqlens: Optional cumulative sequence lengths for variable-length
+            mode, shape (num_seqs + 1,).
+        token_indices: Optional per-token (seq, offset) index pairs for
+            variable-length mode.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
+
+    Returns:
+        Tuple of (o, lse):
+            - o: Compressed attention output, shape
+              (batch, seq_len, Q_HEADS, BLOCK_DIMV).
+            - lse: Log-sum-exp values, shape (batch, seq_len, Q_HEADS).
+    """
     Z, SEQUENCE, Q_HEADS, BLOCK_DIMK, BLOCK_DIMV = *q.shape, v.shape[-1]
     KV_HEADS = k.shape[2]
     QK_GROUPS = Q_HEADS // KV_HEADS
     BLOCK_SEQ = BLOCKSIZE = block_size
-    BLOCKSIZE_K = min(128, next_power_of_2(BLOCK_DIMK))
-    BLOCKSIZE_V = min(128, next_power_of_2(BLOCK_DIMV))
+    BLOCKSIZE_K = min(128, max(int(block_k), next_power_of_2(BLOCK_DIMK)))
+    BLOCKSIZE_V = min(128, int(block_v), next_power_of_2(BLOCK_DIMV))
     NumKBlocks = cdiv(BLOCK_DIMK, BLOCKSIZE_K)
     NumVBlocks = cdiv(BLOCK_DIMV, BLOCKSIZE_V)
     assert NumKBlocks == 1, "The key dimension can not be larger than 256"
@@ -493,6 +672,8 @@ def nsa_compression_fwd(
         grid=lambda META: (SEQUENCE, NumVBlocks, Z * KV_HEADS),
         out_shape=outputs,
         name="ejkernel::triton::sparse_attn_compression_fwd",
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
     return o, lse
@@ -509,13 +690,48 @@ def nsa_compression_bwd(
     softmax_scale: float | None = None,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ):
+    """Compute gradients (dq, dk, dv) for the compressed-attention forward pass.
+
+    The backward pass consists of three Triton kernel launches:
+
+    1. ``bwd_kernel_preprocess``: compute per-row delta = dot(o, do).
+    2. ``nsa_compression_bwd_kernel_dq``: accumulate dQ for each query token.
+    3. ``nsa_compression_bwd_kernel_dkv``: accumulate dK and dV for each
+       compressed KV block.
+
+    When the value dimension requires multiple tiles (``NumVBlocks > 1``),
+    per-tile partial gradients are summed along axis 0 after the kernel.
+
+    Args:
+        q: Forward query tensor, shape (batch, seq_len, Q_HEADS, BLOCK_DIMK).
+        k: Compressed key tensor, shape (batch, TC, KV_HEADS, BLOCK_DIMK).
+        v: Compressed value tensor, shape (batch, TC, KV_HEADS, BLOCK_DIMV).
+        o: Forward attention output, shape (batch, seq_len, Q_HEADS, BLOCK_DIMV).
+        lse: Log-sum-exp from forward pass, shape (batch, seq_len, Q_HEADS).
+        do: Upstream gradient for the output, same shape as ``o``.
+        block_size: Compression block size used in the forward pass.
+        softmax_scale: Attention scale used in the forward pass.
+        cu_seqlens: Optional cumulative sequence lengths for variable-length mode.
+        token_indices: Optional per-token index pairs for variable-length mode.
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
+
+    Returns:
+        Tuple (dq, dk, dv) with the same shapes as the corresponding inputs.
+    """
     Z, SEQUENCE, Q_HEADS, BLOCK_DIMK, BLOCK_DIMV = *q.shape, v.shape[-1]
     KV_HEADS = k.shape[2]
     QK_GROUPS = Q_HEADS // KV_HEADS
     BLOCK_SEQ = BLOCKSIZE = block_size
-    BLOCKSIZE_K = next_power_of_2(BLOCK_DIMK)
-    BLOCKSIZE_V = min(128, next_power_of_2(v.shape[-1]))
+    BLOCKSIZE_K = min(128, max(int(block_k), next_power_of_2(BLOCK_DIMK)))
+    BLOCKSIZE_V = min(128, int(block_v), next_power_of_2(v.shape[-1]))
     NumVBlocks = cdiv(BLOCK_DIMV, BLOCKSIZE_V)
     if cu_seqlens is not None:
         chunk_indices, chunk_offsets = (
@@ -569,6 +785,8 @@ def nsa_compression_bwd(
         grid=lambda META: (SEQUENCE, NumVBlocks, Z * KV_HEADS),
         name="ejkernel::triton::sparse_attn_compression_bwd_dq",
         out_shape=outputs,
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
     dq = jnp.sum(dq, 0)
@@ -592,6 +810,8 @@ def nsa_compression_bwd(
         grid=lambda META: (NumVBlocks, NC, Z * KV_HEADS),
         name="ejkernel::triton::sparse_attn_compression_bwd_dkdv",
         out_shape=outputs,
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
     dk = jnp.sum(dk, 0)
@@ -606,7 +826,12 @@ def _fwd_call(
     softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ):
+    """VJP forward pass: runs compressed attention and saves residuals."""
     o, lse = nsa_compression_fwd(
         q=q,
         k=k,
@@ -615,6 +840,10 @@ def _fwd_call(
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     residual = q, k, v, o, lse
     return (o, lse), residual
@@ -625,9 +854,14 @@ def _bwd_call(
     softmax_scale: float,
     cu_seqlens: jax.Array | None,
     token_indices: jax.Array | None,
+    block_k: int,
+    block_v: int,
+    num_warps: int,
+    num_stages: int,
     residual: tuple[jax.Array],
     do: jax.Array,
 ):
+    """VJP backward pass: delegates to ``nsa_compression_bwd``."""
     q, k, v, o, lse = residual
     dq, dk, dv = nsa_compression_bwd(
         q=q,
@@ -640,12 +874,16 @@ def _bwd_call(
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return dq, dk, dv
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6))
-@partial(jax.jit, static_argnums=(3, 4))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8, 9, 10))
+@partial(jax.jit, static_argnums=(3, 4, 7, 8, 9, 10))
 def _nsa_compression(
     q: jax.Array,
     k: jax.Array,
@@ -654,7 +892,12 @@ def _nsa_compression(
     softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
+    """JIT-compiled inner compressed attention with custom VJP."""
     return _fwd_call(
         q=q,
         k=k,
@@ -663,6 +906,10 @@ def _nsa_compression(
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )[0]
 
 
@@ -677,6 +924,10 @@ def nsa_compression(
     softmax_scale: float,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute compressed attention over mean-pooled key-value blocks.
 
@@ -704,6 +955,10 @@ def nsa_compression(
             variable-length processing.
         token_indices: Optional token indices for variable-length sequences,
             shape (total_tokens, 2). Each row contains [sequence_id, token_offset].
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         A tuple containing:
@@ -750,4 +1005,8 @@ def nsa_compression(
         softmax_scale=softmax_scale,
         cu_seqlens=cu_seqlens,
         token_indices=token_indices,
+        block_k=block_k,
+        block_v=block_v,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )

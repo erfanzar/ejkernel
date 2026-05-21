@@ -13,15 +13,21 @@
 # limitations under the License.
 
 
-"""Pallas GPU kernel implementations.
+"""Pallas GPU kernel implementations (Triton backend).
 
-This module provides GPU-optimized kernels using Pallas with Triton backend.
-Kernels leverage GPU's parallel architecture for efficient attention and
-matrix operations.
+Provides GPU-optimized attention kernels written with JAX Pallas and compiled
+via the Triton backend.  Import from this package requires Triton to be
+installed; the parent ``_pallas`` package suppresses ``ModuleNotFoundError``
+when Triton is absent.
 
-Available Kernels:
-    - ragged_decode_attention: Decode-phase attention for serving
-    - scaled_dot_product_attention: Standard SDPA implementation
+Available kernels:
+    ragged_decode_attention: Single-token decode attention for variable-length
+        (ragged) KV caches.  Implements online-softmax tiling over the key
+        sequence with configurable head/key block sizes.
+    scaled_dot_product_attention: Full scaled dot-product attention delegating
+        to ``jax.nn.dot_product_attention`` with ``implementation="cudnn"``.
+        Supports causal masking, sliding-window, GQA/MQA, and variable-length
+        packed sequences.
 """
 
 from .ragged_decode_attention import ragged_decode_attention

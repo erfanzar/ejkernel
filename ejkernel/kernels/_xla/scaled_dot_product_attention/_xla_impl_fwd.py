@@ -61,10 +61,11 @@ def scaled_dot_product_attention(
             - int: symmetric window size (past and future)
             - tuple[int, int]: (past_window, future_window) for asymmetric windows
             When set, limits attention to local context.
-        cum_seqlens_q: Optional cumulative sequence lengths for query, shape [batch+1].
-            Used for variable-length sequences in packed format.
-        cum_seqlens_k: Optional cumulative sequence lengths for key/value, shape [batch+1].
-            Used for variable-length sequences in packed format.
+        cum_seqlens_q: Optional per-example query sequence lengths, shape [batch].
+            Passed to ``jax.nn.dot_product_attention`` as ``query_seq_lengths``
+            to mask padding tokens in variable-length batches.
+        cum_seqlens_k: Optional per-example key/value sequence lengths,
+            shape [batch].  Passed as ``key_value_seq_lengths``.
 
     Returns:
         Attention output tensor of shape [batch, seq_len, num_q_heads, head_dim].

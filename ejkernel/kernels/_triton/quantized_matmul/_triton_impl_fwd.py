@@ -12,7 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Forward Triton implementation for quantized matrix multiplication."""
+"""Forward pass for the Triton quantized matmul backend.
+
+This module implements ``quantized_matmul_forward``, which chooses between
+two execution paths depending on problem shape and environment variables:
+
+Two-stage path (``EJKERNEL_QMM_TWO_STAGE=1``, enabled by default):
+    For shapes where M, N, K >= 4096, the weight is first dequantized once
+    (via ``quantized_matmul_dequant_triton``) and then multiplied against the
+    activation using ``jax.lax.dot_general``.  The dequantized weight tensor
+    can be cached across calls via an LRU dict (``EJKERNEL_QMM_DEQUANT_CACHE``).
+
+Fused kernel path (fallback or when ``EJKERNEL_QMM_TWO_STAGE=0``):
+    Invokes ``quantized_matmul_triton`` which fuses dequantization and matmul
+    in a single autotuned Triton kernel.
+
+Environment variables:
+
+* ``EJKERNEL_QMM_TWO_STAGE`` (default ``"1"``): enable two-stage path.
+* ``EJKERNEL_QMM_DEQUANT_CACHE`` (default ``"1"``): enable weight cache.
+* ``EJKERNEL_QMM_DEQUANT_CACHE_MAX_ITEMS`` (default ``"2"``): max cache size.
+* ``EJKERNEL_QMM_MATMUL_PRECISION``: override JAX dot precision
+  (``"fastest"``, ``"high"``, ``"highest"``).
+"""
 
 from __future__ import annotations
 
@@ -42,6 +64,7 @@ _QMM_DEQUANT_CACHE_LOCK = threading.Lock()
 
 
 def _device_key(arr: jax.Array) -> tuple | None:
+    """Return a hashable device identifier for ``arr``, or ``None`` on failure."""
     try:
         dev = arr.device()
     except Exception:
@@ -61,6 +84,12 @@ def _dequant_cache_key(
     mode: str,
     transpose: bool,
 ) -> tuple:
+    """Build a hashable cache key for the dequantized-weight LRU cache.
+
+    The key incorporates array identity (``id``), shape, dtype, and all
+    quantization hyper-parameters so that re-used weights with identical
+    metadata hit the cache.
+    """
     return (
         _device_key(w),
         id(w),
@@ -147,7 +176,40 @@ def quantized_matmul_forward(
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
 ):
-    """Forward Triton QMM with optional two-stage large-kernel path."""
+    """Execute quantized matmul forward pass, choosing the best kernel path.
+
+    For large shapes (M, N, K >= 4096) when ``EJKERNEL_QMM_TWO_STAGE=1``,
+    dequantizes the weight separately and runs a standard BF16 GEMM.  The
+    dequantized weight is stored in an LRU cache (up to
+    ``EJKERNEL_QMM_DEQUANT_CACHE_MAX_ITEMS`` entries) to amortize cost across
+    consecutive calls with the same weight.
+
+    For all other shapes (or when the two-stage path is disabled), falls back
+    to the autotuned fused ``quantized_matmul_triton`` kernel.
+
+    The output is always cast to **bfloat16** before returning.
+
+    Args:
+        x: Activation matrix, shape (M, K).
+        w: Packed quantized weight.
+        scales: Per-group scale factors.
+        biases: Per-group additive biases (affine mode) or ``None``.
+        transpose: Weight transposition flag.
+        group_size: Quantization group size.
+        bits: Bits per quantized value.
+        mode: Backend quantization mode string.
+        block_m, block_n, block_k: Triton tile sizes.
+        use_bf16: Use BF16 accumulation tiles.
+        num_warps: Triton warps per program (``None`` = autotuned).
+        num_stages: Triton pipeline stages (``None`` = autotuned).
+        split_k: Split-K factor (``None`` = autotuned).
+        gemv_mode: GEMV kernel selection mode.
+        revsplit_k: Reverse split-K mode.
+        revsplit_k_parts: Reverse split-K parts.
+
+    Returns:
+        Output of shape (M, N) in bfloat16.
+    """
     mode_lower = mode.lower()
     use_two_stage = os.getenv("EJKERNEL_QMM_TWO_STAGE", "1").lower() in {"1", "true", "yes", "y"}
     use_cache = os.getenv("EJKERNEL_QMM_DEQUANT_CACHE", "1").lower() in {"1", "true", "yes", "y"}

@@ -151,9 +151,9 @@ def ragged_page_attention_v3(
             memory-compute tradeoff for very long prompts.
         num_kv_pages_per_block: Number of KV pages per compute block. Higher values
             may improve throughput at cost of memory.
-        num_queries_per_block: Number of queries per compute block (TPU-specific,
-            not supported in Triton).
-        vmem_limit_bytes: Vector memory limit (TPU-specific, not supported in Triton).
+        num_queries_per_block: Number of query tokens per compute block (``BLOCK_M``).
+            Defaults to 128 when None.
+        vmem_limit_bytes: Ignored; accepted for API compatibility (TPU-specific).
 
     Returns:
         Tuple of (attention_output, updated_kv_cache):

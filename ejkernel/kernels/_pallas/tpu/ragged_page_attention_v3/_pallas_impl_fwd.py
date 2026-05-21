@@ -1559,17 +1559,16 @@ def ragged_paged_attention(
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
         k is also the total number of sequences.
       softmax_aux: optional per-query-head sink logits used to bias the softmax.
-      actual_head_dim: the actual head size of the attention. Here we assume k and
-        v have the same actual head size.
       softmax_scale: the softmax scale which will be applied to the Q@K^T.
       sliding_window: the sliding window size for the attention.
       logits_soft_cap: the logit soft cap for the attention.
       mask_value: mask value for causal mask.
+      q_scale: optional dequantisation scale for the query cache.
       k_scale: the scale for the key cache.
       v_scale: the scale for the value cache.
       num_kv_pages_per_block: number of kv pages to be processed in one flash
         attention block in the pallas kernel.
-      num_queries_per_block: number of kv pages to be processed in one flash
+      num_queries_per_block: number of queries to be processed in one flash
         attention block in the pallas kernel.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
 

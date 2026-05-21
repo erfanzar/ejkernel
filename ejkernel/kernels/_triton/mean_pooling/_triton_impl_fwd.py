@@ -34,7 +34,7 @@ Memory Layout:
 Key Features:
 ------------
 - Chunked processing for efficient memory access patterns
-- Autotuned block sizes for optimal GPU utilization
+- Explicit block sizes supplied by the launcher
 - Variable-length sequence support via cumulative indices
 - Fused kernel implementation for reduced memory bandwidth
 
@@ -53,14 +53,6 @@ from ejkernel.callib import cdiv, triton_call
 from ejkernel.xla_utils.utils import prepare_chunk_indices
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_DIM": BLOCK_DIM}, num_warps=num_warps)
-        for BLOCK_DIM in [16, 32, 64, 128]
-        for num_warps in [1, 2, 4, 8]
-    ],
-    key=["BLOCK_SEQ"],
-)
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] != 1})
 @triton.jit
 def fwd_kernel(
@@ -121,10 +113,72 @@ def fwd_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
+@triton.jit
+def fwd_global_kernel(
+    x,
+    o,
+    SEQUENCE: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Triton kernel for fixed-length global mean pooling over 3-D inputs."""
+    i_d, i_b = tl.program_id(0), tl.program_id(1)
+    o_d = i_d * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    acc = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
+
+    for i_t in range(0, SEQUENCE, BLOCK_SEQ):
+        o_t = i_t + tl.arange(0, BLOCK_SEQ)
+        b_x = tl.load(
+            x + (i_b * SEQUENCE + o_t[:, None]) * DIM + o_d[None, :],
+            mask=(o_t[:, None] < SEQUENCE) & (o_d[None, :] < DIM),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(b_x, axis=0)
+
+    b_o = acc / SEQUENCE
+    tl.store(o + i_b * DIM + o_d, b_o.to(o.dtype.element_ty), mask=o_d < DIM)
+
+
+@triton.jit
+def fwd_global_varlen_kernel(
+    x,
+    cu_seqlens,
+    o,
+    TOTAL_TOKENS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Triton kernel for packed variable-length global mean pooling."""
+    i_d, i_n = tl.program_id(0), tl.program_id(1)
+    o_d = i_d * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    length = eos - bos
+    acc = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
+
+    for i_t in range(0, TOTAL_TOKENS, BLOCK_SEQ):
+        o_t = i_t + tl.arange(0, BLOCK_SEQ)
+        b_x = tl.load(
+            x + (bos + o_t[:, None]) * DIM + o_d[None, :],
+            mask=(o_t[:, None] < length) & (o_d[None, :] < DIM),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(b_x, axis=0)
+
+    denom = tl.maximum(length, 1).to(tl.float32)
+    b_o = acc / denom
+    tl.store(o + i_n * DIM + o_d, b_o.to(o.dtype.element_ty), mask=o_d < DIM)
+
+
 def fwd_triton_impl(
     x: Float[Array, "batch seq_len hidden_dim"],
     chunk_size: int,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
+    block_dim: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> Float[Array, "batch hidden_dim"]:
     """Execute mean pooling forward pass using Triton kernel.
 
@@ -139,11 +193,48 @@ def fwd_triton_impl(
     Returns:
         jax.Array: Mean-pooled output tensor with reduced sequence dimension
     """
+    if cu_seqlens is None and x.ndim == 3:
+        Z, SEQUENCE, DIM = x.shape
+        BLOCK_SEQ = chunk_size
+        metaparams = dict(SEQUENCE=SEQUENCE, DIM=DIM, BLOCK_SEQ=BLOCK_SEQ, BLOCK_DIM=block_dim)
+        (o,) = triton_call(
+            x,
+            kernel=fwd_global_kernel,
+            out_shape=[jax.ShapeDtypeStruct((Z, DIM), x.dtype)],
+            name="ejkernel::triton::mean_pooling_global_fwd",
+            grid=lambda META: (cdiv(DIM, META["BLOCK_DIM"]), Z),
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **metaparams,
+        )
+        return o
+
+    if cu_seqlens is not None and x.ndim == 2:
+        TOTAL_TOKENS, DIM = x.shape
+        NUM_SEQS = len(cu_seqlens) - 1
+        BLOCK_SEQ = chunk_size
+        metaparams = dict(TOTAL_TOKENS=TOTAL_TOKENS, DIM=DIM, BLOCK_SEQ=BLOCK_SEQ, BLOCK_DIM=block_dim)
+        (o,) = triton_call(
+            x,
+            cu_seqlens,
+            kernel=fwd_global_varlen_kernel,
+            out_shape=[jax.ShapeDtypeStruct((NUM_SEQS, DIM), x.dtype)],
+            name="ejkernel::triton::mean_pooling_global_varlen_fwd",
+            grid=lambda META: (cdiv(DIM, META["BLOCK_DIM"]), NUM_SEQS),
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **metaparams,
+        )
+        return o
+
+    if x.ndim != 4:
+        raise ValueError("Triton mean_pooling expects 3-D fixed, 2-D packed varlen, or 4-D block-pooling inputs.")
+
     Z, SEQUENCE, HEAD, DIM = x.shape
     BLOCK_SEQ = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size) if cu_seqlens is not None else None
     NUM_SEQ_BLOCK = cdiv(SEQUENCE, BLOCK_SEQ) if cu_seqlens is None else len(chunk_indices)
-    metaparams = dict(SEQUENCE=SEQUENCE, HEAD=HEAD, DIM=DIM, BLOCK_SEQ=BLOCK_SEQ)
+    metaparams = dict(SEQUENCE=SEQUENCE, HEAD=HEAD, DIM=DIM, BLOCK_SEQ=BLOCK_SEQ, BLOCK_DIM=block_dim)
     (o,) = triton_call(
         x,
         cu_seqlens if cu_seqlens is not None else 1,
@@ -152,6 +243,8 @@ def fwd_triton_impl(
         out_shape=[jax.ShapeDtypeStruct((Z, NUM_SEQ_BLOCK, HEAD, DIM), x.dtype)],
         name="ejkernel::triton::mean_pooling_fwd",
         grid=lambda META: (cdiv(DIM, META["BLOCK_DIM"]), NUM_SEQ_BLOCK, Z * HEAD),
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
     return o

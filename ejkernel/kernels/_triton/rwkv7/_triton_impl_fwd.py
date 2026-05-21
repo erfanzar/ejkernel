@@ -15,8 +15,8 @@
 """RWKV-7 forward pass Triton kernel implementation.
 
 This module provides the Triton GPU kernel for RWKV-7 DPLR (Diagonal + Low-Rank)
-recurrence. Features autotuned block sizes and supports variable-length sequences
-(packed mode) and reverse processing.
+recurrence. It uses explicit launcher-supplied block sizes and supports
+variable-length sequences (packed mode) and reverse processing.
 """
 
 from __future__ import annotations
@@ -35,15 +35,6 @@ from ejkernel.callib import cdiv, triton_call
         "USE_INITIAL_STATE": lambda args: args["h0"] != 1,
         "IS_VARLEN": lambda args: args["cu_seqlens"] != 1,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BV in [16, 32, 64]
-        for num_warps in [2, 4, 8, 16]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["K"],
 )
 @triton.jit
 def _rwkv7_fwd_kernel(
@@ -175,6 +166,9 @@ def fwd_triton_impl(
     initial_state: Float[Array, "... num_heads qk_head_dim v_head_dim"] | None,
     reverse: bool,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None,
+    block_v: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads v_head_dim"],
     Float[Array, "... num_heads qk_head_dim v_head_dim"],
@@ -192,6 +186,9 @@ def fwd_triton_impl(
         initial_state: Optional initial state.
         reverse: Whether to process in reverse order.
         cu_seqlens: Cumulative sequence lengths for packed mode.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
 
     Returns:
         Tuple of (output, final_state) both in appropriate shapes.
@@ -201,6 +198,7 @@ def fwd_triton_impl(
     N = B if cu_seqlens is None else int(cu_seqlens.shape[0] - 1)
 
     BK = triton.next_power_of_2(K)
+    BV = min(V, int(block_v))
 
     out_shape = jax.ShapeDtypeStruct(v.shape, v.dtype)
     ht_shape = jax.ShapeDtypeStruct((N, H, K, V), jnp.float32)
@@ -215,6 +213,7 @@ def fwd_triton_impl(
         K=K,
         V=V,
         BK=BK,
+        BV=BV,
         REVERSE=reverse,
     )
 
@@ -232,6 +231,8 @@ def fwd_triton_impl(
         out_shape=[out_shape, ht_shape],
         name="ejkernel::triton::rwkv7_fwd",
         grid=grid,
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
     return out, ht

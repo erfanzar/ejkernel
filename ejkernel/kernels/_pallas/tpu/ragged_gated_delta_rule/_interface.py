@@ -72,7 +72,45 @@ def ragged_gated_delta_rule_decode(
     Float[Array, "num_tokens num_heads v_head_dim"],
     Float[Array, "num_slots num_heads qk_head_dim v_head_dim"],
 ]:
-    """Direct decode-only Pallas path without ``lax.cond`` dispatch."""
+    """Direct decode-only Pallas path without ``lax.cond`` dispatch.
+
+    Executes the Pallas TPU kernel unconditionally for decode (single-token)
+    inputs. Unlike :func:`ragged_gated_delta_rule`, this function does not
+    perform mixed prefill/decode branching, so it is safe to call when all
+    requests in the batch are decode-only (one query token per sequence).
+
+    The function applies optional L2 normalisation to ``query`` and ``key``
+    before invoking the kernel, gathers per-request recurrent states from the
+    state pool, runs the in-place delta-rule update, and scatters the updated
+    states back.
+
+    Args:
+        query: Packed query tokens [num_tokens, num_heads, qk_head_dim].
+            One token per decode request; ``num_tokens == num_requests``.
+        key: Packed key tokens [num_tokens, num_heads, qk_head_dim].
+        value: Packed value tokens [num_tokens, num_heads, v_head_dim].
+        beta: Per-token, per-head beta coefficients [num_tokens, num_heads].
+            Controls the magnitude of the delta-rule state update.
+        decay: Per-token, per-head decay factors [num_tokens, num_heads].
+            Applied to the recurrent state before the update step.
+        recurrent_state: Recurrent state pool [num_slots, num_heads,
+            qk_head_dim, v_head_dim]. Each slot holds the running state for
+            one active sequence; ``num_slots >= max(state_indices) + 1``.
+        state_indices: Indices into ``recurrent_state`` for each request
+            [num_requests]. ``state_indices[i]`` is the slot that stores the
+            recurrent state for request ``i``.
+        use_qk_l2norm: Whether to L2-normalise ``query`` and ``key`` along
+            ``head_dim`` (eps=1e-6) before the kernel. Default: ``True``.
+
+    Returns:
+        A 2-tuple:
+
+        - **output** – Attention output tokens
+          [num_tokens, num_heads, v_head_dim].
+        - **updated_recurrent_state** – Updated state pool with the same
+          shape as ``recurrent_state`` [num_slots, num_heads,
+          qk_head_dim, v_head_dim].
+    """
     return _decode_path(query, key, value, beta, decay, recurrent_state, state_indices, use_qk_l2norm)
 
 
@@ -94,7 +132,58 @@ def ragged_gated_delta_rule(
     Float[Array, "num_tokens num_heads v_head_dim"],
     Float[Array, "num_slots num_heads qk_head_dim v_head_dim"],
 ]:
-    """Ragged GDR with Pallas TPU decode kernel and XLA chunked prefill fallback."""
+    """Ragged GDR with Pallas TPU decode kernel and XLA chunked prefill fallback.
+
+    Dispatches to one of two implementations at runtime using ``lax.cond``:
+
+    - **Decode path** (all sequences have exactly one query token):
+      Runs :func:`ragged_gated_delta_rule_decode`, a Pallas TPU kernel with
+      per-token parallelism and in-place recurrent-state updates.
+    - **Prefill path** (any sequence has more than one query token):
+      Falls back to ``_ragged_gdr_chunked_prefill`` (XLA chunked).
+
+    The dispatch condition is ``all(seq_lengths <= 1)`` where
+    ``seq_lengths = query_start_loc[1:] - query_start_loc[:-1]``.
+
+    Both paths apply optional L2 normalisation to ``query`` and ``key``
+    before the core computation.
+
+    Args:
+        query: Packed query tokens [num_tokens, num_heads, qk_head_dim].
+            All sequences' query tokens are concatenated along dim 0.
+        key: Packed key tokens [num_tokens, num_heads, qk_head_dim].
+        value: Packed value tokens [num_tokens, num_heads, v_head_dim].
+        beta: Per-token, per-head beta coefficients [num_tokens, num_heads].
+        decay: Per-token, per-head decay factors [num_tokens, num_heads], or
+            ``None`` to use all-zero decay (no state forgetting).
+        recurrent_state: Recurrent state pool [num_slots, num_heads,
+            qk_head_dim, v_head_dim]. Each slot stores the running state for
+            one active sequence.
+        query_start_loc: Cumulative query token counts [num_requests + 1].
+            ``query_start_loc[i]`` is the index of the first query token for
+            request ``i``; ``query_start_loc[-1] == num_tokens``.
+        state_indices: Indices into ``recurrent_state`` for each request
+            [num_requests]. ``state_indices[i]`` selects the slot for
+            request ``i``.
+        chunk_size: Chunk size used by the XLA chunked-prefill fallback path.
+            Ignored when the decode path is taken. Default: ``64``.
+        use_qk_l2norm: Whether to L2-normalise ``query`` and ``key`` along
+            ``head_dim`` (eps=1e-6) before the kernel. Default: ``True``.
+
+    Returns:
+        A 2-tuple:
+
+        - **output** – Attention output tokens
+          [num_tokens, num_heads, v_head_dim].
+        - **updated_recurrent_state** – Updated state pool with the same
+          shape as ``recurrent_state`` [num_slots, num_heads,
+          qk_head_dim, v_head_dim].
+
+    Note:
+        ``lax.cond`` traces both branches at compile time. To ensure shapes
+        match, ``state_indices`` is padded or sliced to length ``num_tokens``
+        before being passed to the decode path.
+    """
     if decay is None:
         decay = jnp.zeros_like(beta)
 

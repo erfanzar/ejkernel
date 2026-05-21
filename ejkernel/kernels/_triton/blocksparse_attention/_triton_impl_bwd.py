@@ -44,14 +44,6 @@ from ejkernel.ops import BwdParams, FwdParams
 from ._utilities import make_causal_mask, make_segment_mask
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-    ],
-    key=["SEQ_LEN", "HEAD_DIM"],
-)
 @triton.jit
 def blocksparse_attn_bwd_preprocess(
     Po,
@@ -1291,6 +1283,8 @@ def _bwd_blocksparse_attn_call(
         name="ejkernel::triton::blocksparse_attn_bwd_preprocess",
         BLOCK_SIZE=preprocess_block_size,
         HEAD_DIM=value_head_dim,
+        num_warps=bwd_params.num_warps,
+        num_stages=bwd_params.num_stages,
         zeroed_outputs=(0,),
     )
 

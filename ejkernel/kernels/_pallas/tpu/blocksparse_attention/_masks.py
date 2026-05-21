@@ -259,7 +259,18 @@ class LogicalAnd(Mask):
 
 @dataclasses.dataclass
 class MultiHeadMask(Mask):
-    """Lazy multihead mask, combines multiple lazy masks one per head."""
+    """Per-head mask wrapper that combines multiple single-head masks.
+
+    Stores one :class:`Mask` per attention head, allowing each head to have
+    a distinct sparsity pattern.  All per-head masks must share the same
+    2-D shape ``(q_seq_len, kv_seq_len)``.  Nesting ``MultiHeadMask`` inside
+    another ``MultiHeadMask`` is not supported.
+
+    Shape: ``(num_heads, q_seq_len, kv_seq_len)``.
+
+    Attributes:
+        masks: Sequence of per-head :class:`Mask` objects.
+    """
 
     masks: Sequence[Mask]
 
@@ -305,24 +316,21 @@ class MultiHeadMask(Mask):
 
 
 class _ComputableMask(Mask):
-    """Superclass for all masks that can be computed inside the kernel using a callable object.
+    """Base class for lazily-evaluated masks computed by a callable inside the kernel.
 
-    This subclass is designed to be used with Splash Attention.
-    It allows the mask logic to be computed on-the-fly or fused into the attention
-    kernel, avoiding the memory cost of materializing the full
-    (sequence_length, sequence_length) boolean mask array, which can be excessive
-    for long sequences.
+    Designed for use with Splash Attention.  Subclasses supply a
+    ``mask_function(q_ids, kv_ids) -> bool[q, kv]`` that the Splash kernel
+    calls on-the-fly to avoid materialising the full
+    ``(q_seq_len, kv_seq_len)`` boolean matrix, which can be prohibitively
+    large for long sequences.
 
     Attributes:
-      _shape: Shape of the 2-dim mask: (q_seq_len, kv_seq_len).
-      offset: Offset of q start wrt kv. A positive offset shifts the bottom
-        triangle upward, a negative one shifts it downward. A negative offset
-        makes the first 'offset' rows of the attention matrix all 0s which leads
-        to undefined softmax.
-      q_sequence: Indices of Q sequence. q_sequence is reused across __getitem__
-        calls which is important for compile-time performance.
-      mask_function: Function used by the SplashAttention kernel to compute the
-        mask rather than loading it.
+        _shape: 2-D mask shape ``(q_seq_len, kv_seq_len)``.
+        q_sequence: ``int32[q_seq_len]`` index array.  Reused across
+            ``__getitem__`` calls to avoid repeated allocation at trace time.
+        mask_function: Callable ``(q_ids, kv_ids) -> bool[q, kv]`` supplied
+            by the concrete subclass.  Used by the Splash Attention kernel to
+            compute mask values without loading pre-stored arrays.
     """
 
     _shape: tuple[int, int]
@@ -374,13 +382,19 @@ class _ComputableMask(Mask):
 
 
 class CausalMask(_ComputableMask):
-    """Lazy causal mask, prevents the model from attending to future tokens.
+    """Lazy lower-triangular causal mask for autoregressive attention.
+
+    Each query position ``q`` can attend to key positions ``k`` where
+    ``k + offset <= q`` (i.e. the lower triangle shifted by ``offset``).
+
+    The mask is not materialised: the Splash Attention kernel calls
+    ``mask_function`` on-the-fly to compute mask values for each block.
 
     Attributes:
-      offset: Offset of q start wrt kv. A positive offset shifts the bottom
-        triangle upward, a negative one shifts it downward. A negative offset
-        makes the first 'offset' rows of the attention matrix all 0s which leads
-        to undefined softmax.
+        offset: Shift applied to the diagonal.  A positive offset extends the
+            triangle upward (earlier keys become visible); a negative offset
+            shifts it downward, making the first ``|offset|`` query rows
+            all-zero, which produces undefined softmax.  Defaults to 0.
     """
 
     offset: int
@@ -429,15 +443,19 @@ class CausalMask(_ComputableMask):
 
 
 class ChunkedCausalMask(_ComputableMask):
-    """Lazy chunked causal mask.
+    """Lazy chunked causal mask for block-diagonal attention (Llama4-style).
 
-    Attention is causal within each chunk (0, K), (K, 2K), (2K, 3K), ... tokens
-    attend to each other but not across chunks.
-    Llama4 models use interleaved chunk attention along with global attention.
+    Attention is causal within non-overlapping fixed-size chunks.  Tokens in
+    chunk ``[i*K, (i+1)*K)`` attend only to earlier tokens within the same
+    chunk; no cross-chunk attention is allowed.
 
+    Formally: ``mask[q, k] = (q // chunk_size == k // chunk_size) and (q >= k)``.
+
+    Llama4 models use interleaved chunk attention (this mask) alternating with
+    global attention layers.
 
     Attributes:
-      chunk_size: The size of each attention chunk.
+        chunk_size: Number of tokens per attention chunk.  Must be positive.
     """
 
     chunk_size: int
@@ -489,15 +507,21 @@ class ChunkedCausalMask(_ComputableMask):
 
 
 class LocalMask(_ComputableMask):
-    """Lazy local mask, prevents model from attending to tokens outside window.
+    """Lazy sliding-window local attention mask.
+
+    Each query position ``q`` attends only to key positions ``k`` satisfying:
+        ``q - left_size + offset <= k <= q + right_size + offset``
+
+    Either side may be ``None`` to indicate no limit in that direction.  Combine
+    with :class:`CausalMask` (``mask & causal``) for causal sliding-window
+    attention.
 
     Attributes:
-      window_size: Size of the two sides of the local window (None identifies no
-        limit for the given side).
-      offset: Offset of q start wrt kv. A positive offset shifts the bottom
-        triangle upward, a negative one shifts it downward. A negative offset
-        makes the first 'offset' rows of the attention matrix all 0s which leads
-        to undefined softmax.
+        window_size: ``(left_size, right_size)`` where each element is an
+            ``int`` (finite window) or ``None`` (unbounded in that direction).
+        offset: Shift applied to ``q`` before window comparison.  Positive
+            values move the window toward earlier keys.  A large negative
+            offset can create all-zero rows, leading to undefined softmax.
     """
 
     window_size: tuple[int | None, int | None]
@@ -569,7 +593,18 @@ class LocalMask(_ComputableMask):
 
 @dataclasses.dataclass
 class NumpyMask(Mask):
-    """A mask backed by a dense numpy array."""
+    """Dense attention mask backed by a numpy boolean array.
+
+    Use when the mask pattern cannot be expressed as a computable function.
+    The full ``[q_seq_len, kv_seq_len]`` boolean array is stored in memory
+    and sliced on demand.  For long sequences prefer the lazy ``_ComputableMask``
+    subclasses (``CausalMask``, ``LocalMask``, etc.) to avoid materialising
+    the full matrix.
+
+    Attributes:
+        array: 2-D boolean numpy array of shape ``(q_seq_len, kv_seq_len)``.
+            Must have dtype ``np.bool_``.
+    """
 
     array: np.ndarray
 
@@ -598,6 +633,15 @@ class NumpyMask(Mask):
 
 
 def _fill_slice(inp_slice: slice, size: int) -> slice:
+    """Normalise a slice by filling in ``None`` start/stop with 0 / ``size``.
+
+    Args:
+        inp_slice: Input slice; must have ``step`` of ``None`` or ``1``.
+        size: Total length of the dimension being sliced.
+
+    Returns:
+        An equivalent slice with explicit integer ``start`` and ``stop``.
+    """
     assert inp_slice.step is None or inp_slice.step == 1
     start = 0 if inp_slice.start is None else inp_slice.start
     stop = size if inp_slice.stop is None else inp_slice.stop
@@ -608,7 +652,15 @@ def _fill_slice(inp_slice: slice, size: int) -> slice:
 
 @dataclasses.dataclass(frozen=True)
 class FullMask(Mask):
-    """Lazy full mask, allows all tokens to attend to all other tokens."""
+    """Lazy dense (all-ones) mask — every token can attend every other token.
+
+    Equivalent to no masking.  Stored lazily: ``__getitem__`` materialises
+    only the requested slice as a numpy ones array without allocating the
+    full ``[q_seq_len, kv_seq_len]`` matrix.
+
+    Attributes:
+        _shape: Tuple ``(q_seq_len, kv_seq_len)`` defining the mask dimensions.
+    """
 
     _shape: tuple[int, int]
 

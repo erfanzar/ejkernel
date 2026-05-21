@@ -274,22 +274,28 @@ def _blocksparse_attention_bhtd_bwd(
     residuals saved from the forward pass. This function is registered as the
     backward pass in the custom VJP definition.
 
+    Note:
+        All leading positional arguments are non-differentiable static values
+        captured from the ``nondiff_argnums`` of ``jax.custom_vjp``.
+
     Args:
         softmax_scale: Attention score scaling factor (non-differentiable).
-        bias: Optional attention bias (non-differentiable).
         apply_load_balance: Load balancing flag (non-differentiable).
         sequence_parallelism_mesh_axis_name: Sequence parallelism axis (non-differentiable).
         window_left: Left window size (non-differentiable).
         window_right: Right window size (non-differentiable).
         causal: Causal masking flag (non-differentiable).
+        fwd_params: Forward pass configuration parameters (non-differentiable).
+        bwd_params: Backward pass configuration parameters (non-differentiable).
         logits_soft_cap: Soft capping value (non-differentiable).
-        res: Residuals from forward pass containing intermediate values.
+        res: Residuals from forward pass containing (query, key, value, positions,
+            segment_ids, qkv_layouts, output, lse, softmax_aux, bias).
         dout: Gradient of loss with respect to the output.
 
     Returns:
         Tuple of gradients (dq, dk, dv, d_q_positions, d_q_segment_ids,
-        d_kv_positions, d_kv_segment_ids, d_qkv_layouts, d_softmax_aux)
-        where only dq, dk, dv are non-None for differentiable parameters.
+        d_kv_positions, d_kv_segment_ids, d_qkv_layouts, d_softmax_aux, d_bias)
+        where only dq, dk, dv are non-None (all positional/auxiliary inputs receive None).
     """
     return _bwd_blocksparse_attn_call(
         softmax_scale=softmax_scale,
@@ -364,7 +370,8 @@ def blocksparse_attention(
         q_positions: Optional position indices for queries [batch, seq_len]
         kv_positions: Optional position indices for keys/values [batch, kv_len]
         softmax_aux: Optional auxiliary softmax values (e.g., attention sinks)
-        bias: Optional attention bias [batch, num_heads, seq_len, head_dim]
+        bias: Optional attention bias [batch, num_heads, seq_len, kv_len].
+            Currently unsupported; raises ``NotImplementedError`` if provided.
         attention_mask: Optional attention mask [batch, seq_len, kv_len] or [batch, num_heads, seq_len, kv_len].
             Used to automatically infer q_segment_ids and kv_segment_ids if they are not provided.
             Tokens with True/1 can attend to each other, False/0 indicates masking.
@@ -380,10 +387,10 @@ def blocksparse_attention(
         sliding_window: Window size for local attention, int for symmetric or (left, right) tuple
         chunk_size: Alternative to separate q_blocksize/kv_blocksize
         causal: Whether to apply causal masking (default: True)
-        fused_backward: Use fused backward pass (default: False)
+        fused_backward: Accepted but currently ignored (reserved for future use).
 
     Returns:
-        Attention output [batch, num_heads, seq_len, head_dim]
+        Attention output [batch, num_heads, seq_len, vhead_dim]
 
     Examples:
         >>> output = blocksparse_attention(q, k, v)

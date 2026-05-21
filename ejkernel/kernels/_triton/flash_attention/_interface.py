@@ -205,20 +205,32 @@ def _jax_bwd_attention_call(
     """Backward pass for flash attention gradient computation.
 
     Computes gradients with respect to queries, keys, and values using
-    the saved residuals from the forward pass.
+    the saved residuals from the forward pass.  This is the VJP ``bwd`` function
+    registered with :func:`flash_attention_call`.
+
+    Note:
+        The leading positional arguments (``softmax_scale`` through
+        ``logits_soft_cap``) are the non-differentiable static values passed
+        through from ``nondiff_argnums``.
 
     Args:
-        softmax_scale: Scaling factor used in forward pass
-        dropout_prob: Dropout probability used in forward pass
-        causal: Whether causal masking was applied
-        sliding_window: Window size for local attention if used
-        residual: Saved tensors from forward pass containing query, key, value, bias,
-                 attention_mask, output, log-sum-exp, and other metadata
-        dO: Gradient of loss with respect to attention output
+        softmax_scale: Scaling factor used in forward pass (non-differentiable).
+        dropout_prob: Dropout probability used in forward pass (non-differentiable).
+        causal: Whether causal masking was applied (non-differentiable).
+        fwd_params: Forward pass block/warp/stage parameters (non-differentiable).
+        bwd_params: Backward pass block/warp/stage parameters (non-differentiable).
+        sliding_window: Window size for local attention if used (non-differentiable).
+        logits_soft_cap: Soft cap value for logits (non-differentiable).
+        residual: Saved tensors from forward pass: (query, key, value, bias,
+            attention_mask, output, lse, dropout_seed, cum_seqlens_q,
+            cum_seqlens_k, q_segment_ids, kv_segment_ids).
+        dO: Gradient of loss with respect to attention output.
 
     Returns:
-        tuple: Gradients (dq, dk, dv, d_attention_mask, d_bias, d_scale, d_prob, d_seed)
-               where only dq, dk, dv are non-None for differentiable parameters
+        Tuple of 11 gradients: (dq, dk, dv, None, None, None, None, None, None, None, None)
+        where only dq, dk, dv are non-None; the remaining Nones correspond to
+        attention_mask, bias, softmax_aux, q_segment_ids, kv_segment_ids and
+        other non-differentiable inputs.
     """
     (
         query,
@@ -285,34 +297,44 @@ def flash_attention_call(
     q_segment_ids: Int[Array, "batch seq_len_q"] | None = None,
     kv_segment_ids: Int[Array, "batch seq_len_k"] | None = None,
 ) -> Float[Array, "batch seq_len_q num_heads head_dim"]:
-    """Flash attention with custom gradient computation.
+    """Flash attention with custom gradient computation (internal JIT-compiled form).
 
     Efficient attention implementation using tiling and online softmax computation.
     Supports variable sequence lengths, causal masking, and sliding windows.
 
-    This function is decorated with custom_vjp for efficient backward pass and
-    ejit for JIT compilation with static arguments.
+    This function is decorated with ``custom_vjp`` for an efficient custom backward
+    pass and ``ejit`` for JIT compilation with static arguments.  Call the public
+    :func:`flash_attention` wrapper instead of this function directly.
 
     Args:
-        query: Query tensor of shape [batch, seq_len, num_heads, head_dim]
-        key: Key tensor of shape [batch, seq_len, num_heads, head_dim]
-        value: Value tensor of shape [batch, seq_len, num_heads, head_dim]
-        attention_mask: Optional legacy attention mask (deprecated, use bias)
-        bias: Attention bias tensor for masking or positional encoding
-        softmax_scale: Scale factor for attention scores (default: 1/sqrt(head_dim))
-        dropout_prob: Dropout probability for attention weights
-        causal: Apply causal (autoregressive) masking
+        query: Query tensor [batch, seq_len_q, num_heads, head_dim]
+        key: Key tensor [batch, seq_len_k, num_kv_heads, head_dim]
+        value: Value tensor [batch, seq_len_k, num_kv_heads, head_dim]
+        attention_mask: Optional legacy attention mask (deprecated, use ``bias``)
+        bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k]
+        softmax_scale: Scale factor for attention scores (default: 1/sqrt(head_dim)).
+            Marked as non-differentiable (nondiff_argnum 5).
+        dropout_prob: Dropout probability for attention weights.
+            Marked as non-differentiable (nondiff_argnum 6).
+        causal: Apply causal (autoregressive) masking.
+            Marked as non-differentiable (nondiff_argnum 7).
         dropout_seed: Random seed for dropout
+        fwd_params: Forward pass block/warp/stage configuration.
+            Marked as non-differentiable (nondiff_argnum 9).
+        bwd_params: Backward pass block/warp/stage configuration.
+            Marked as non-differentiable (nondiff_argnum 10).
         cum_seqlens_q: Cumulative sequence lengths for variable-length queries
         cum_seqlens_k: Cumulative sequence lengths for variable-length keys
-        sliding_window: Local attention window size (int or (left, right) tuple)
+        sliding_window: Local attention window size (int or (left, right) tuple).
+            Marked as non-differentiable (nondiff_argnum 13).
+        logits_soft_cap: Optional tanh soft-cap for logits.
+            Marked as non-differentiable (nondiff_argnum 14).
+        softmax_aux: Optional attention sink logits
+        q_segment_ids: Optional segment IDs for queries [batch, seq_len_q]
+        kv_segment_ids: Optional segment IDs for keys/values [batch, seq_len_k]
 
     Returns:
-        chex.Array: Attention output tensor with same shape as query
-
-    Note:
-        Arguments at positions 5, 6, 7, 11 (softmax_scale, dropout_prob,
-        causal, sliding_window) are marked as non-differentiable.
+        Attention output tensor of shape [batch, seq_len_q, num_heads, head_dim]
     """
     return _fwd_attention_kernel_call(
         q=query,
@@ -381,22 +403,27 @@ def flash_attention(
         key: Key tensor of shape [batch, seq_len_k, num_heads, head_dim]
         value: Value tensor of shape [batch, seq_len_k, num_heads, head_dim]
         attention_mask: Optional attention mask (legacy, prefer bias parameter)
-        bias: Attention bias for masking or relative position encoding
+        bias: Optional attention bias [batch, num_heads, seq_len_q, seq_len_k]
         softmax_scale: Scaling factor for QK^T (default: 1/sqrt(head_dim))
         dropout_prob: Dropout probability for attention weights (0-1)
         causal: Whether to apply causal masking for autoregressive models
         dropout_seed: Random seed for reproducible dropout
         cum_seqlens_q: Cumulative sequence lengths for packed variable-length sequences
         cum_seqlens_k: Cumulative sequence lengths for keys in variable-length mode
-        sliding_window: Size of local attention window for sparse patterns
-        logits_soft_cap: Optional soft cap value for logits (e.g., 20.0 for Gemma)
-        softmax_aux: Optional attention sink logits of shape [num_sinks]
-        q_segment_ids/kv_segment_ids: Optional packed-sequence segment IDs (mask cross-segment attention)
-        block_tables: Optional paged-KV block table of shape
-            ``(batch, max_blocks)``. Unsupported by the Triton backend.
+        sliding_window: Size of local attention window; int for symmetric or (left, right) tuple
+        logits_soft_cap: Optional tanh soft-cap value for logits (e.g., 20.0 for Gemma-2)
+        softmax_aux: Optional attention sink logits [num_sinks] or [num_heads, num_sinks]
+        q_segment_ids: Optional segment IDs for queries [batch, seq_len_q]; prevents
+            cross-segment attention when multiple sequences are packed into one batch entry.
+        kv_segment_ids: Optional segment IDs for keys/values [batch, seq_len_k]
+        block_tables: Optional paged-KV block table [batch, max_blocks].
+            **Not supported by the Triton backend** — raises ``EjkernelRuntimeError``.
+        normalize_output: Must be True for the Triton backend; False raises an error.
+        precision: Must be ``lax.Precision.DEFAULT`` for the Triton backend.
+        logits_dtype: Must be ``jnp.float32`` for the Triton backend.
 
     Returns:
-        chex.Array: Attention output with shape [batch, seq_len, num_heads, head_dim]
+        Attention output of shape [batch, seq_len_q, num_heads, head_dim]
 
     Examples:
         >>>

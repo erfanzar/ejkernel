@@ -99,7 +99,22 @@ def _l2norm_bwd(grad_y, y, inv_norm):
 
 
 def _strict_lower_inverse(matrix_strict_lower: jax.Array) -> jax.Array:
-    """Compute inverse of (I + L) where L is strict-lower triangular."""
+    """Compute the inverse of (I + L) where L is a batch of strict-lower-triangular matrices.
+
+    This is used in the chunked GDR forward pass to solve the intra-chunk
+    linear system ``(I + S) v_beta = v_final`` efficiently.  Because ``(I + L)``
+    is unit-lower-triangular (ones on the diagonal), the inverse is computed
+    via a single triangular solve rather than a general LU factorisation.
+
+    Args:
+        matrix_strict_lower: Batch of strict-lower-triangular matrices with
+            shape ``[..., n, n]``.  The diagonal and upper triangle are
+            assumed to be zero; only the strict lower triangle is used.
+
+    Returns:
+        Batch of inverses of ``(I + matrix_strict_lower)`` with the same
+        shape as the input.
+    """
     n = int(matrix_strict_lower.shape[-1])
     eye = jnp.eye(n, dtype=matrix_strict_lower.dtype)
     flat = matrix_strict_lower.reshape((-1, n, n))
@@ -130,28 +145,47 @@ def _recurrent_gdr_fwd(
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Chunked forward pass for Gated Delta Rule using triangular solve.
+    """Chunked forward pass for Gated Delta Rule using exact triangular solve.
 
-    Processes the sequence in chunks, computing intra-chunk attention in
-    parallel via MXU matmuls and propagating state across chunks with a
-    lightweight lax.scan (4 matmuls per chunk).
+    Processes the sequence in chunks of ``chunk_size``, computing the
+    intra-chunk linear system via ``jax.scipy.linalg.solve_triangular``
+    (exact ``(I+S)^{-1}`` rather than a Neumann approximation) and
+    propagating the recurrent state across chunks with ``lax.scan``.
 
-    Uses ``jax.scipy.linalg.solve_triangular`` for the exact (I+S)^{-1}
-    computation instead of Neumann approximation.
+    This is the *production* multi-token path for GDR: the custom-VJP
+    Neumann variant (``_chunk_gdr_fwd``) delegates to this function because
+    the Neumann series diverges on padded batches at training time.
+
+    The per-chunk update solves:
+        S[i,j] = sum_{j'<i} exp(g_cumsum[i] - g_cumsum[j']) * beta[j'] * (k[j'] ⊗ k[i])
+        v_final = (I + S)^{-1} v_beta           (triangular solve)
+        h_next  = h * exp(g_end) + K_scaled^T @ v_final
+
+    Note:
+        Internal tensor layout is [batch, num_heads, seq_len, dim] (heads-first),
+        which is the opposite of the public-API convention.
 
     Args:
         query: Query tensor [batch, num_heads, seq_len, head_dim].
+            Must already be in heads-first layout.
         key: Key tensor [batch, num_heads, seq_len, head_dim].
         value: Value tensor [batch, num_heads, seq_len, d_state].
-        beta: Gating tensor [batch, num_heads, seq_len].
-        decay: Per-token decay [batch, num_heads, seq_len].
+        beta: Per-token gating [batch, num_heads, seq_len].
+        decay: Per-token log-decay [batch, num_heads, seq_len], or None for
+            zero decay (full memory retention).
         initial_state: Optional initial recurrent state
-            [batch, num_heads, head_dim, d_state].
-        use_qk_l2norm: Whether to L2-normalize queries and keys.
-        chunk_size: Number of tokens per chunk for parallel processing.
+            [batch, num_heads, head_dim, d_state].  Defaults to all-zeros.
+        use_qk_l2norm: Whether to L2-normalize queries and keys before
+            the attention computation.  Strongly recommended for stability.
+        chunk_size: Number of tokens per chunk.  The sequence is padded to
+            a multiple of this value before processing.
 
     Returns:
-        Tuple of (outputs, final_state).
+        Tuple of (outputs, final_state) where:
+            - outputs: [batch, num_heads, seq_len, d_state], cast to
+              ``query.dtype``.
+            - final_state: [batch, num_heads, head_dim, d_state], cast to
+              ``query.dtype``.
     """
     B, H, L, K_dim = query.shape
     V_dim = value.shape[-1]
@@ -246,6 +280,17 @@ def _recurrent_gdr_fwd(
     )
 
     def scan_body(state, inputs):
+        """Process one chunk: apply inter-chunk state contribution and update state.
+
+        Args:
+            state: Current recurrent state [batch, heads, head_dim, d_state].
+            inputs: Tuple of pre-computed chunk tensors
+                (u, w, q_scaled, attn_intra, g_last_exp, k_scaled).
+
+        Returns:
+            Tuple of (new_state, core_out) where core_out has shape
+            [batch, heads, chunk_size, d_state].
+        """
         u, w, q_scaled, attn_intra, g_last_exp, k_scaled = inputs
 
         v_prime = jnp.einsum("bhck,bhkv->bhcv", w, state, precision=_MATMUL_PRECISION)
@@ -276,10 +321,12 @@ def _chunk_gdr_fwd_impl(
     initial_state,
     use_qk_l2norm,
 ):
-    """Core implementation for chunked gated delta rule forward.
+    """Core implementation for the Neumann-series chunked GDR forward.
 
-    This function is shared by the custom_vjp wrapper. Forward executes in
-    ``input_dtype`` with Neumann-series accumulation in float32.
+    Delegates to ``_chunk_gdr_fwd_core`` with ``save_residual=False``.
+    This helper is used exclusively by the superseded private
+    ``_chunk_gdr_fwd_neumann`` custom-VJP variant. The public
+    ``_chunk_gdr_fwd`` uses the exact triangular-solve formulation.
     """
     output, final_state, _ = _chunk_gdr_fwd_core(
         query=query,
@@ -473,7 +520,7 @@ def _chunk_gdr_fwd_core(
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(5, 7))
-def _chunk_gdr_fwd(
+def _chunk_gdr_fwd_neumann(
     query: Float[Array, "batch num_heads seq_len head_dim"],
     key: Float[Array, "batch num_heads seq_len head_dim"],
     value: Float[Array, "batch num_heads seq_len d_state"],
@@ -518,7 +565,27 @@ def _chunk_gdr_fwd(
 
 
 def _chunk_gdr_fwd_rule(query, key, value, beta, decay, chunk_size, initial_state, use_qk_l2norm):
-    """Forward pass for custom_vjp -- saves minimal backward context."""
+    """Forward rule for the custom_vjp of the Neumann-series chunked GDR.
+
+    Runs the chunked forward pass with ``save_residual=True`` so that the
+    tensors required by the hand-derived backward are stored in the VJP
+    residual tuple.  This is the ``fwd`` half of the ``custom_vjp`` pair
+    registered on the private ``_chunk_gdr_fwd_neumann`` helper. The public
+    ``_chunk_gdr_fwd`` below uses the exact triangular-solve formulation.
+
+    Args:
+        query: [batch, num_heads, seq_len, head_dim].
+        key: [batch, num_heads, seq_len, head_dim].
+        value: [batch, num_heads, seq_len, d_state].
+        beta: [batch, num_heads, seq_len].
+        decay: [batch, num_heads, seq_len] or None.
+        chunk_size: Chunk size (non-diff, captured via nondiff_argnums).
+        initial_state: [batch, num_heads, head_dim, d_state] or None.
+        use_qk_l2norm: Whether to L2-normalize (non-diff).
+
+    Returns:
+        Tuple of ((output, final_state), residual_tuple).
+    """
     output, final_state, residual = _chunk_gdr_fwd_core(
         query,
         key,
@@ -534,13 +601,28 @@ def _chunk_gdr_fwd_rule(query, key, value, beta, decay, chunk_size, initial_stat
 
 
 def _chunk_gdr_bwd_rule(chunk_size, use_qk_l2norm, res, g):
-    """Backward rule -- delegates to _xla_impl_bwd."""
+    """Backward rule for the custom_vjp of the Neumann-series chunked GDR.
+
+    Delegates gradient computation to the hand-derived backward in
+    ``_xla_impl_bwd._chunk_gdr_bwd``.  Like ``_chunk_gdr_fwd_rule``, this
+    is registered on the private Neumann helper.
+
+    Args:
+        chunk_size: Chunk size (non-diff, bound via nondiff_argnums).
+        use_qk_l2norm: Whether L2-norm was applied (non-diff).
+        res: Residual tuple from ``_chunk_gdr_fwd_rule``.
+        g: Upstream gradient tuple (d_output, d_final_state).
+
+    Returns:
+        Tuple of gradients (d_query, d_key, d_value, d_beta, d_decay,
+        d_initial_state).
+    """
     from ._xla_impl_bwd import _chunk_gdr_bwd
 
     return _chunk_gdr_bwd(chunk_size, use_qk_l2norm, res, g)
 
 
-_chunk_gdr_fwd.defvjp(_chunk_gdr_fwd_rule, _chunk_gdr_bwd_rule)
+_chunk_gdr_fwd_neumann.defvjp(_chunk_gdr_fwd_rule, _chunk_gdr_bwd_rule)
 
 
 def _chunk_gdr_fwd(
@@ -556,12 +638,29 @@ def _chunk_gdr_fwd(
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
 ]:
-    """Exact multi-token chunked GDR path.
+    """Exact multi-token chunked GDR forward path (triangular-solve formulation).
 
-    The previous Neumann/custom-VJP implementation diverges catastrophically on
-    real padded SFT batches even though isolated tensor probes looked small.
-    Use the exact triangular-solve chunked formulation for the production
-    multi-token path and rely on standard autodiff through it.
+    This is the active public entry point for multi-token GDR inference and
+    training. It uses the exact formulation because the older Neumann-series
+    approximation diverges catastrophically on padded SFT batches.
+
+    Delegates entirely to ``_recurrent_gdr_fwd``, which uses
+    ``jax.scipy.linalg.solve_triangular`` for an exact intra-chunk solve and
+    relies on standard JAX autodiff for gradient computation.
+
+    Args:
+        query: Query tensor [batch, num_heads, seq_len, head_dim].
+        key: Key tensor [batch, num_heads, seq_len, head_dim].
+        value: Value tensor [batch, num_heads, seq_len, d_state].
+        beta: Per-token gating [batch, num_heads, seq_len].
+        decay: Per-token log-decay [batch, num_heads, seq_len], or None.
+        chunk_size: Number of tokens per chunk (passed to ``_recurrent_gdr_fwd``).
+        initial_state: Optional initial recurrent state
+            [batch, num_heads, head_dim, d_state].
+        use_qk_l2norm: Whether to L2-normalize queries and keys.
+
+    Returns:
+        Tuple of (outputs, final_state) — see ``_recurrent_gdr_fwd`` for details.
     """
     return _recurrent_gdr_fwd(
         query=query,

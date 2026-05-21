@@ -49,44 +49,58 @@ def page_attention(
     megacore_mode: str | None = None,
     inline_seq_dim: bool = True,
     sliding_window: int | None = None,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> Float[Array, "num_seqs num_heads head_dim"]:
-    """
-    Paged attention for efficient KV cache management using JAX/XLA.
+    """Compute paged attention for decode-phase inference using JAX/XLA.
 
-    This function implements paged attention where the KV cache is organized into
-    fixed-size blocks (pages). Each sequence maintains a block table that maps
-    logical KV positions to physical block indices. This enables efficient memory
-    management for variable-length sequences and dynamic batching.
+    Each sequence contributes exactly one query token (decode step).  The KV
+    cache is stored in fixed-size pages (blocks); the ``block_tables`` array
+    maps each sequence's logical block positions to physical pages.  The
+    function gathers all pages for each sequence, computes full attention
+    with a validity mask (tokens beyond ``context_lens`` are masked), and
+    returns the weighted sum of values.
+
+    GQA / MQA is supported: ``num_heads`` must be a multiple of
+    ``num_kv_heads``.
+
+    The function accepts a ``key_cache`` / ``value_cache`` in either layout:
+
+    - *Blocks-first*: ``[num_blocks, num_kv_heads, block_size, head_dim]``
+    - *KV-heads-first*: ``[num_kv_heads, num_blocks, block_size, head_dim]``
+
+    The layout is detected automatically via divisibility of ``num_heads``
+    by each candidate first dimension; when the first dimension is
+    ambiguous (e.g. ``num_blocks == num_kv_heads``), blocks-first is assumed.
 
     Args:
-        query: Query tensor of shape [num_seqs, num_heads, head_dim]. Each sequence
-            has a single query token (typically for decode/generation).
-        key_cache: Paged key cache of shape [num_blocks, num_kv_heads, block_size, head_dim].
-            The total KV cache is divided into blocks of size `block_size`.
-        value_cache: Paged value cache of shape [num_blocks, num_kv_heads, block_size, head_dim].
-            Must have the same structure as key_cache.
-        context_lens: Context length for each sequence [num_seqs]. Indicates how many
-            tokens are valid in the KV cache for each sequence.
-        block_tables: Block table mapping [num_seqs, max_blocks]. For each sequence,
-            maps logical block indices to physical block indices in the cache.
-        attn_scale: Attention scaling factor. If None, defaults to 1/sqrt(head_dim).
-        max_context_len: Maximum context length (not used in XLA implementation).
-        num_splits: Number of splits for partitioned attention (not used in XLA implementation).
-        mask_value: Value used for masking (not used in XLA implementation).
-        attn_logits_soft_cap: Soft cap for attention logits (not used in XLA implementation).
-        pages_per_compute_block: Pages per compute block (not used in XLA implementation).
-        megacore_mode: Megacore parallelization mode (not used in XLA implementation).
-        inline_seq_dim: Whether to inline sequence dimension (not used in XLA implementation).
+        query: Query tensor ``[num_seqs, num_heads, head_dim]``.
+        key_cache: Paged key cache, blocks-first or KV-heads-first (see above).
+        value_cache: Paged value cache, same layout as ``key_cache``.
+        context_lens: Valid token count per sequence ``[num_seqs]``.  Tokens
+            beyond this length are masked out with ``-1e9``.
+        block_tables: Logical-to-physical block mapping ``[num_seqs, max_blocks]``.
+        attn_scale: QK scaling factor.  Defaults to ``1 / sqrt(head_dim)``.
+        max_context_len: Not supported; raises ``NotImplementedError`` if provided.
+        num_splits: Partitioned-attention splits.  Only ``0`` is accepted; any
+            other value raises ``NotImplementedError``.
+        mask_value: Not used in this implementation; accepted for API compatibility.
+        attn_logits_soft_cap: Logit soft-cap.  Raises ``NotImplementedError``
+            if provided (not yet implemented on the XLA path).
+        pages_per_compute_block: TPU tile size hint.  Raises ``NotImplementedError``
+            if provided.
+        megacore_mode: TPU megacore hint.  Raises ``NotImplementedError`` if provided.
+        inline_seq_dim: Must be ``True``; ``False`` raises ``NotImplementedError``.
+        sliding_window: Not used in this implementation; accepted for API
+            compatibility but silently ignored.
+        num_warps: Accepted for API compatibility with Triton; ignored by XLA.
+        num_stages: Accepted for API compatibility with Triton; ignored by XLA.
 
     Returns:
-        Attention output of shape [num_seqs, num_heads, head_dim].
+        Attention output ``[num_seqs, num_heads, head_dim]``.
 
-    Notes:
-        - Supports Grouped Query Attention (GQA) where num_heads >= num_kv_heads
-        - Each sequence can use a different number of blocks based on context_lens
-        - Blocks are indexed via block_tables to avoid fragmentation
-        - This is a simpler version compared to ragged_page_attention_v2 which handles
-          multiple query tokens per sequence
+    Raises:
+        NotImplementedError: If any unsupported parameter is non-default.
 
     Examples:
         >>> num_seqs, num_heads, head_dim = 2, 8, 64

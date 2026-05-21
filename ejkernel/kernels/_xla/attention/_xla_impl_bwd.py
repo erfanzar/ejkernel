@@ -13,9 +13,11 @@
 # limitations under the License.
 
 
-"""Backward implementation placeholder module.
+"""Backward pass for the XLA standard attention kernel.
 
-This kernel currently relies on JAX autodiff/default backward behavior.
+No custom VJP is defined here.  Gradients are computed automatically by
+JAX's reverse-mode autodiff through the ``jnp.einsum`` and ``jax.nn.softmax``
+operations in ``_xla_impl_fwd.attention``.
 """
 
 __all__: tuple[str, ...] = ()

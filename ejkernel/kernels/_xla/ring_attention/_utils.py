@@ -43,26 +43,59 @@ def _chunk_attention_bias(
     sliding_window: int | tuple[int, int] | None = None,
     attention_sink_size: int = 0,
 ):
-    """Computes the attention bias for a chunk of the input.
+    """Compute the additive attention bias for one query-chunk × KV-chunk pair.
+
+    Combines all active masking mechanisms into a single additive bias that is
+    added to the raw QK^T logits before softmax.  Each mask contributes 0
+    (allow) or -inf (block) to the bias.
+
+    Masking is applied in the following order (all are additive):
+    1. Slice of the explicit ``bias`` tensor, if provided.
+    2. Segment-ID mask: positions where query and KV segments differ, or either
+       ID is negative (padding), are masked to -inf.
+    3. Causal mask: if ``causal_block_size`` is not None, future KV positions
+       are masked.  Uses ``q_position_ids`` / ``kv_position_ids`` for explicit
+       position comparisons when both are provided; otherwise uses absolute
+       chunk-offset arithmetic.
+    4. Sliding-window mask: KV positions outside the window ``[-right_window,
+       left_window]`` (relative to the query position) are masked.  When
+       ``attention_sink_size > 0``, the first ``attention_sink_size`` KV
+       positions are exempt from window masking.
+    5. Dropout: random -inf mask applied when ``not deterministic and pdrop > 0``.
 
     Args:
-            query_chunk_size: Size of query chunks.
-            key_chunk_size: Size of key chunks.
-            bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
-            q_segment_ids: tp.Optional query segment ids array of shape (batch, q_len).
-            kv_segment_ids: tp.Optional key/value segment ids array of shape (batch, kv_len).
-            deterministic: Whether to apply dropout.
-            attn_dropout: Dropout mask.
-            pdrop: Dropout probability.
-            causal_block_size: Size of causal blocks.
-            dtype: dtype of the computation.
-            query_chunk_idx: Index of the query chunk.
-            key_chunk_idx: Index of the key chunk.
-            sliding_window: Size of sliding window for local attention. Can be int or tuple (left_window, right_window).
-            attention_sink_size: Number of initial tokens to always attend to (attention sink).
+        query_chunk_size: Number of query tokens in the chunk.
+        key_chunk_size: Number of key tokens in the chunk.
+        bias: Optional full-sequence additive bias
+            (batch, num_heads, q_len, kv_len).  A slice is extracted for this
+            chunk.
+        q_segment_ids: Optional query segment IDs (batch, q_len).
+        kv_segment_ids: Optional key/value segment IDs (batch, kv_len).
+        q_position_ids: Optional query position IDs (batch, q_len).  When both
+            q_position_ids and kv_position_ids are provided, they are used for
+            causal and sliding-window position comparisons.
+        kv_position_ids: Optional key/value position IDs (batch, kv_len).
+        deterministic: If True, dropout is skipped.
+        attn_dropout: Pre-generated boolean dropout mask
+            (batch, num_heads, q_len, kv_len); a slice is extracted for this
+            chunk.  Ignored when ``deterministic=True`` or ``pdrop=0``.
+        pdrop: Dropout probability.
+        causal_block_size: If not None, applies causal masking (future KV
+            positions are blocked).
+        dtype: Dtype for the returned bias tensor.
+        query_chunk_idx: Absolute chunk index for the query chunk (used to
+            compute the chunk's token offset as ``query_chunk_idx *
+            query_chunk_size``).
+        key_chunk_idx: Absolute chunk index for the key chunk.
+        sliding_window: Local attention window.  An int applies a symmetric
+            window; a tuple (left_window, right_window) applies an asymmetric
+            window.  None = no sliding-window mask.
+        attention_sink_size: Number of initial KV tokens that are always
+            attended to (exempt from the sliding-window mask).  0 = disabled.
 
     Returns:
-            Attention bias for the chunk.
+        Additive attention bias for this chunk, shape broadcastable to
+        (batch, num_heads, query_chunk_size, key_chunk_size), dtype ``dtype``.
     """
     query_offset = query_chunk_idx * query_chunk_size
     key_offset = key_chunk_idx * key_chunk_size
@@ -180,17 +213,35 @@ def _chunk_attention_bias(
 
 
 def below_or_on_diag(r: int, r_blk_size: int, c: int, c_blk_size: int, causal_block_size: int):
-    """Checks if the element at (r, c) is below or on the diagonal.
+    """Check whether a query-chunk/KV-chunk pair overlaps or lies below the causal diagonal.
+
+    Used to skip KV blocks that are entirely above the causal diagonal (i.e.,
+    all their key positions are strictly greater than all query positions in the
+    block).  The check operates at the granularity of ``causal_block_size``
+    super-blocks to enable coarse-grained early exit.
+
+    Both ``r`` and ``c`` are raw chunk indices (not token indices).  They are
+    first mapped to super-block indices by dividing by
+    ``max(causal_block_size, r_blk_size) // r_blk_size`` (or the equivalent for
+    the column), and then the inequality
+    ``(r_super + 1) * causal_block_size_q - 1 > c_super * causal_block_size_k``
+    determines whether the query super-block's last token comes after the
+    KV super-block's first token.
 
     Args:
-            r: Row index.
-            r_blk_size: Block size of the row.
-            c: Column index.
-            c_blk_size: Block size of the column.
-            causal_block_size: Size of causal blocks.
+        r: Query chunk index (0-based).
+        r_blk_size: Query chunk size in tokens.
+        c: KV chunk index (0-based).
+        c_blk_size: KV chunk size in tokens.
+        causal_block_size: Causal super-block size in tokens.  The causal
+            masking is applied at the granularity of
+            ``max(causal_block_size, r_blk_size)`` for query and
+            ``max(causal_block_size, c_blk_size)`` for key.
 
     Returns:
-            True if the element is below or on the diagonal, False otherwise.
+        A JAX boolean scalar: True if any query in the block could attend to
+        any key in the KV block (i.e., the block is not entirely masked by
+        the causal constraint); False if the entire block should be skipped.
     """
     causal_block_size_q = max(causal_block_size, r_blk_size)
     causal_block_size_k = max(causal_block_size, c_blk_size)

@@ -71,10 +71,6 @@ from ....xla_utils.utils import prepare_chunk_indices
 from ._utilities import nsa_block_mask
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4]],
-    key=["BLOCKSIZE", "BLOCKSIZE_K", "BLOCKSIZE_V"],
-)
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] != 1,
@@ -109,6 +105,54 @@ def nsa_bwd_kernel_dq(
     IS_VARLEN: tl.constexpr,
     USE_BLOCK_COUNTS: tl.constexpr,
 ):
+    """Compute dQ gradients for one query token over its selected KV blocks.
+
+    Grid: ``(SEQUENCE, NumVBlocks, Z * KV_HEADS)``
+
+    - Axis 0 (``i_t``): query token position within the sequence.
+    - Axis 1 (``i_v``): V-dimension tile index (0 .. NumVBlocks-1).
+    - Axis 2 (``i_bh``): packed batch-head index; decoded as
+      ``i_b = i_bh // KV_HEADS``, ``i_h = i_bh % KV_HEADS``.
+
+    Each CTA accumulates the dQ contribution from all KV blocks listed in
+    ``block_indices`` for query ``i_t``.  The causal constraint is enforced
+    by skipping blocks whose start position ``i_s * BLOCKSIZE > i_t``.
+
+    When ``NumVBlocks > 1``, partial dQ tiles are written into a leading
+    ``NumVBlocks`` accumulation dimension and summed by the caller.
+
+    Args:
+        q: Query tensor pointer, layout (batch_or_varlen, Q_HEADS, BLOCK_DIMK).
+        k: Key tensor pointer, layout (batch_or_varlen, KV_HEADS, BLOCK_DIMK).
+        v: Value tensor pointer, layout (batch_or_varlen, KV_HEADS, BLOCK_DIMV).
+        lse: Log-sum-exp from forward pass, shape (batch_or_varlen, Q_HEADS).
+        delta: Precomputed dot(o, do) per query row, same shape as ``lse``.
+        do: Upstream output gradient, layout matching ``v`` output.
+        softmax_scale: Scalar attention scale factor (typically ``1/sqrt(head_dim)``).
+        block_indices: Sparse KV block indices, shape
+            (batch_or_varlen, KV_HEADS, IndicesSize).
+        block_counts: Valid block count per query; ``jax.Array`` enables
+            ``USE_BLOCK_COUNTS``, int scalar disables per-position count.
+        cu_seqlens: Cumulative sequence lengths for variable-length mode;
+            pass ``1`` (int) when ``IS_VARLEN=False``.
+        token_indices: Token-to-(sequence, position) lookup table for
+            variable-length mode; pass ``1`` (int) when ``IS_VARLEN=False``.
+        dq: Output gradient buffer, shape (NumVBlocks, batch_or_varlen, Q_HEADS, BLOCK_DIMK).
+        SEQUENCE: Uniform sequence length (constexpr).
+        Z: Batch size (constexpr).
+        KV_HEADS: Number of KV attention heads (constexpr).
+        Q_HEADS: Number of query attention heads (constexpr).
+        QK_GROUPS: ``Q_HEADS // KV_HEADS``, GQA group size (constexpr).
+        BLOCK_DIMK: Key/query head dimension (constexpr).
+        BLOCK_DIMV: Value head dimension (constexpr).
+        IndicesSize: Number of selected KV blocks per query (constexpr).
+        BLOCKSIZE: Tokens per KV block (constexpr).
+        BLOCKSIZE_K: Tile size along the key dimension (constexpr).
+        BLOCKSIZE_V: Tile size along the value dimension (constexpr).
+        IS_VARLEN: Heuristic flag; True when ``cu_seqlens`` is a real array.
+        USE_BLOCK_COUNTS: Heuristic flag; True when ``block_counts`` is a
+            ``jax.Array`` (per-position valid block count).
+    """
     i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // KV_HEADS, i_bh % KV_HEADS
 
@@ -189,10 +233,6 @@ def nsa_bwd_kernel_dq(
     tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4]],
-    key=["BLOCKSIZE", "BLOCKSIZE_K", "BLOCKSIZE_V"],
-)
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] != 1})
 @triton.jit
 def nsa_bwd_kernel_dkv(
@@ -221,6 +261,56 @@ def nsa_bwd_kernel_dkv(
     BLOCKSIZE_V: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Compute dK and dV gradients for one KV block over all attending queries.
+
+    Grid: ``(NumVBlocks, NS, Z * KV_HEADS)``
+
+    - Axis 0 (``i_v``): V-dimension tile index (0 .. NumVBlocks-1).
+    - Axis 1 (``i_s``): KV block index (0 .. NS-1), where ``NS = cdiv(SEQUENCE, BLOCKSIZE)``
+      for uniform batches or ``len(chunk_indices)`` for variable-length mode.
+    - Axis 2 (``i_bh``): packed batch-head index; decoded as
+      ``i_b = i_bh // KV_HEADS``, ``i_h = i_bh % KV_HEADS``.
+
+    Each CTA iterates from ``i_s * BLOCKSIZE`` to ``SEQUENCE``, checking
+    ``block_mask[b, t, h, i_s]`` to skip query positions that do not attend
+    to this KV block, then accumulates dK and dV from those that do.
+
+    When ``NumVBlocks > 1``, partial dK tiles are written into a leading
+    ``NumVBlocks`` accumulation dimension and summed by the caller.
+    dV does not require the extra dimension because each CTA writes a disjoint
+    V-slice.
+
+    Args:
+        q: Query tensor pointer, layout (batch_or_varlen, Q_HEADS, BLOCK_DIMK).
+        k: Key tensor pointer, layout (batch_or_varlen, KV_HEADS, BLOCK_DIMK).
+        v: Value tensor pointer, layout (batch_or_varlen, KV_HEADS, BLOCK_DIMV).
+        lse: Log-sum-exp from forward pass, shape (batch_or_varlen, Q_HEADS).
+        delta: Precomputed dot(o, do) per query row, same shape as ``lse``.
+        do: Upstream output gradient, layout matching the forward output.
+        block_mask: Dense boolean mask, shape (batch_or_varlen, KV_HEADS, MaskSize);
+            entry ``[b, t, h, i_s]`` is True iff query ``t`` attended to block ``i_s``.
+        cu_seqlens: Cumulative sequence lengths for variable-length mode;
+            pass ``1`` (int) when ``IS_VARLEN=False``.
+        chunk_indices: KV-block-to-(sequence, block) lookup table for
+            variable-length mode; pass ``1`` (int) when ``IS_VARLEN=False``.
+        softmax_scale: Scalar attention scale factor (typically ``1/sqrt(head_dim)``).
+        dk: Output gradient buffer for keys, shape
+            (NumVBlocks, batch_or_varlen, KV_HEADS, BLOCK_DIMK).
+        dv: Output gradient buffer for values, shape
+            (batch_or_varlen, KV_HEADS, BLOCK_DIMV).
+        SEQUENCE: Uniform sequence length (constexpr).
+        Z: Batch size (constexpr).
+        KV_HEADS: Number of KV attention heads (constexpr).
+        Q_HEADS: Number of query attention heads (constexpr).
+        QK_GROUPS: ``Q_HEADS // KV_HEADS``, GQA group size (constexpr).
+        BLOCK_DIMK: Key/query head dimension (constexpr).
+        BLOCK_DIMV: Value head dimension (constexpr).
+        MaskSize: Width of the block mask's last dimension (constexpr).
+        BLOCKSIZE: Tokens per KV block (constexpr).
+        BLOCKSIZE_K: Tile size along the key dimension (constexpr).
+        BLOCKSIZE_V: Tile size along the value dimension (constexpr).
+        IS_VARLEN: Heuristic flag; True when ``cu_seqlens`` is a real array.
+    """
     i_v, i_s, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // KV_HEADS, i_bh % KV_HEADS
 
@@ -311,6 +401,17 @@ def nsa_bwd_kernel_dkv(
 
 @triton.jit
 def bwd_kernel_preprocess(o, do, delta, Z: tl.constexpr, BLOCK_DIMV: tl.constexpr):
+    """Compute per-row delta = dot(o, do) for numerically stable softmax gradients.
+
+    Grid: ``(num_rows,)`` where num_rows = batch * seq_len * num_q_heads.
+
+    Args:
+        o: Forward output pointer, flattened with last dim = ``BLOCK_DIMV``.
+        do: Upstream gradient pointer, same layout as ``o``.
+        delta: Output scalar pointer, shape (num_rows,).
+        Z: Power-of-2 padded BLOCK_DIMV for aligned vector loads.
+        BLOCK_DIMV: Actual (unpadded) value head dimension.
+    """
     i_n = tl.program_id(0)
     o_d = tl.arange(0, Z)
     m_d = o_d < BLOCK_DIMV
@@ -335,7 +436,47 @@ def bwd_triton_impl(
     softmax_scale: float | None = None,
     cu_seqlens: jax.Array | None = None,
     token_indices: jax.Array | None = None,
+    block_k: int = 128,
+    block_v: int = 128,
+    num_warps: int = 4,
+    num_stages: int = 1,
 ):
+    """Compute (dq, dk, dv) for NSA sparse attention backward pass.
+
+    Orchestrates three kernel launches:
+
+    1. ``bwd_kernel_preprocess``: compute per-row delta = dot(o, do).
+    2. ``nsa_bwd_kernel_dq``: accumulate dQ for each query position using
+       the sparse block pattern.
+    3. ``nsa_bwd_kernel_dkv``: accumulate dK and dV for each KV block by
+       iterating over all queries that attended to it (determined by
+       ``nsa_block_mask``).
+
+    When ``NumVBlocks > 1`` (head_dim_v > 128), per-tile partial gradients
+    are reduced by summing along axis 0 after the dQ and dK kernel launches.
+
+    Args:
+        q: Query tensor, shape (batch, seq_len, num_q_heads, head_dim).
+        k: Key tensor, shape (batch, seq_len, num_kv_heads, head_dim).
+        v: Value tensor, shape (batch, seq_len, num_kv_heads, head_dim_v).
+        o: Forward attention output, same shape as the expected output.
+        lse: Log-sum-exp from the forward pass, shape
+            (batch, seq_len, num_q_heads).
+        do: Upstream gradient for the output, same shape as ``o``.
+        block_indices: Sparse block index tensor used in the forward pass.
+        block_counts: Valid block count per query position (int or array).
+        block_size: Tokens per KV block.
+        softmax_scale: Attention scale used in the forward pass.
+        cu_seqlens: Optional cumulative sequence lengths (variable-length).
+        token_indices: Optional per-token index pairs (variable-length).
+        block_k: Key-dimension tile size selected by the operation config.
+        block_v: Value-dimension tile size selected by the operation config.
+        num_warps: Number of Triton warps selected by the operation config.
+        num_stages: Number of Triton pipeline stages selected by the operation config.
+
+    Returns:
+        Tuple (dq, dk, dv) with the same shapes as q, k, and v respectively.
+    """
     Z, SEQUENCE, KV_HEADS, BLOCK_DIMK, BLOCK_DIMV, IndicesSize = (
         *k.shape,
         v.shape[-1],
@@ -344,8 +485,8 @@ def bwd_triton_impl(
     Q_HEADS = q.shape[2]
     QK_GROUPS = Q_HEADS // KV_HEADS
     BLOCKSIZE = block_size
-    BLOCKSIZE_K = next_power_of_2(BLOCK_DIMK)
-    BLOCKSIZE_V = min(128, next_power_of_2(v.shape[-1]))
+    BLOCKSIZE_K = min(128, max(int(block_k), next_power_of_2(BLOCK_DIMK)))
+    BLOCKSIZE_V = min(128, int(block_v), next_power_of_2(v.shape[-1]))
     NumVBlocks = cdiv(BLOCK_DIMV, BLOCKSIZE_V)
 
     delta_shape = o.shape[:-1]
@@ -391,6 +532,8 @@ def bwd_triton_impl(
         grid=lambda META: (SEQUENCE, NumVBlocks, Z * KV_HEADS),
         out_shape=outputs,
         name="ejkernel::triton::sparse_attn_bwd_dq",
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
     dq = jnp.sum(dq, 0)
@@ -435,6 +578,8 @@ def bwd_triton_impl(
         grid=lambda META: (NumVBlocks, NS, Z * KV_HEADS),
         out_shape=outputs,
         name="ejkernel::triton::sparse_attn_bwd_dkdv",
+        num_warps=num_warps,
+        num_stages=num_stages,
         **metaparams,
     )
     dk = jnp.sum(dk, 0)

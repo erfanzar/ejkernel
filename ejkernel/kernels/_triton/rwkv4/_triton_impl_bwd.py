@@ -172,7 +172,36 @@ def bwd_triton_impl(
     Float[Array, "batch seq_len chans"],
     Float[Array, "batch three chans"],
 ]:
-    """Execute Triton RWKV-4 backward and reduce channel-wise parameter grads."""
+    """Execute RWKV-4 backward pass using Triton and reduce per-batch parameter gradients.
+
+    Launches ``_rwkv4_bwd_kernel`` on a ``(B, ceil(C / BLOCK_C))`` grid. The
+    kernel computes per-batch-element gradients for ``u`` and ``w_neg``; this
+    function then sums them over the batch dimension to produce the final
+    channel-wise gradients.
+
+    The state history ``state_hist`` of shape ``(B, T+1, 3, C)`` must have been
+    produced by ``fwd_triton_impl_with_history``. Each entry ``state_hist[:, t]``
+    contains the recurrent state ``(alpha, beta, eps)`` **before** processing
+    token ``t``, enabling exact gradient computation without recomputation.
+
+    Args:
+        w_neg: Negated exponentiated time-decay ``-exp(w_raw)``, shape ``(C,)``.
+        u: Time-mix bias, shape ``(C,)``.
+        k: Key tensor, shape ``(B, T, C)``.
+        v: Value tensor, shape ``(B, T, C)``.
+        state_hist: Per-step state history from forward pass, shape ``(B, T+1, 3, C)``.
+            Axis 2 indexes the three state components: alpha (0), beta (1), eps (2).
+        do: Gradient of the output WKV tensor, shape ``(B, T, C)``.
+        dstate: Gradient of the final state, shape ``(B, 3, C)``.
+
+    Returns:
+        Tuple ``(dw_neg, du, dk, dv, dstate0)`` where:
+            - ``dw_neg``: Gradient w.r.t. ``w_neg``, shape ``(C,)`` (batch-reduced).
+            - ``du``: Gradient w.r.t. ``u``, shape ``(C,)`` (batch-reduced).
+            - ``dk``: Gradient w.r.t. ``k``, shape ``(B, T, C)``.
+            - ``dv``: Gradient w.r.t. ``v``, shape ``(B, T, C)``.
+            - ``dstate0``: Gradient w.r.t. the initial state, shape ``(B, 3, C)``.
+    """
     B, T, C = k.shape
     BLOCK_C = 128 if C >= 128 else 64 if C >= 64 else 32
     grid = (B, cdiv(C, BLOCK_C))
