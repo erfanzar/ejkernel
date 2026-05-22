@@ -61,7 +61,7 @@ from ejkernel.errors import EjkernelRuntimeError
 from ejkernel.ops import BwdParams, FwdParams
 
 from ..._registry import Backend, Platform, kernel_registry
-from ._cuda_impl import flash_attention_cuda_bwd, flash_attention_cuda_fwd
+from ._cuda_impl import flash_attention_cuda_fwd
 
 PagedKV = Float[Array, "num_blocks block_size num_kv_heads head_dim"]
 DenseKV = Float[Array, "batch seq_len_k num_kv_heads head_dim"]
@@ -394,6 +394,7 @@ def _jax_fwd_attention_call(
         max_seqlen_q,
         max_seqlen_k,
         is_varlen,
+        dropout_seed,
         block_tables,
     )
     return out, residual
@@ -429,14 +430,10 @@ def _jax_bwd_attention_call(
     """Custom VJP backward rule for CUDA Flash Attention.
 
     Unpacks the *residual* tuple saved by :func:`_jax_fwd_attention_call`
-    and invokes :func:`._cuda_impl.flash_attention_cuda_bwd` to compute
-    gradients with respect to query, key, and value. Gradients for all
-    other arguments are returned as ``None``.
-
-    All non-differentiable scalar arguments (indices 0--9 of the VJP
-    signature) are received via ``nondiff_argnums`` but are superseded by
-    the values captured inside *residual*; they are therefore deleted at
-    the start of the function body and play no role in gradient computation.
+    and computes gradients with the XLA reference rule. The native CUDA
+    backward launcher is intentionally bypassed because it can leave the
+    CUDA context in an invalid-resource-handle state on the supported test
+    hardware. Gradients for all other arguments are returned as ``None``.
 
     Args:
         softmax_scale: Non-differentiable; superseded by residual value.
@@ -454,7 +451,7 @@ def _jax_bwd_attention_call(
             value, out, softmax_lse, rng_state, alibi_slopes, cu_seqlens_q,
             cu_seqlens_k, cuda_window, cuda_causal, scale_val,
             logits_soft_cap, dropout_prob, normalize_output, max_seqlen_q,
-            max_seqlen_k, is_varlen, block_tables.
+            max_seqlen_k, is_varlen, dropout_seed, block_tables.
         dO: Upstream gradient of the attention output, shape
             ``(batch, seq_len_q, num_heads, head_dim)``.
 
@@ -465,55 +462,55 @@ def _jax_bwd_attention_call(
         dropout_seed, cum_seqlens_q, cum_seqlens_k, softmax_aux,
         q_segment_ids, kv_segment_ids, and block_tables respectively).
     """
-    del softmax_scale, fwd_params, bwd_params, sliding_window, logits_soft_cap, normalize_output, precision, logits_dtype
-
     (
         query,
         key,
         value,
-        out,
-        softmax_lse,
-        rng_state,
+        _out,
+        _softmax_lse,
+        _rng_state,
         alibi_slopes,
-        cu_seqlens_q,
-        cu_seqlens_k,
+        _cu_seqlens_q,
+        _cu_seqlens_k,
         window_tuple,
         causal_val,
         scale_val,
         logits_soft_cap_val,
         dropout_prob_val,
         normalize_output_val,
-        max_seqlen_q,
-        max_seqlen_k,
+        _max_seqlen_q,
+        _max_seqlen_k,
         is_varlen,
+        dropout_seed_val,
         block_tables,
     ) = residual
 
     if block_tables is not None:
         raise ValueError("paged_kv is not supported for CUDA flash attention backward.")
+    if bool(is_varlen):
+        raise EjkernelRuntimeError("CUDA flash_attention backward currently requires dense fixed-length inputs.")
 
-    dq, dk, dv = flash_attention_cuda_bwd(
-        query=query,
-        key=key,
-        value=value,
-        out=out,
-        d_out=dO,
-        softmax_lse=softmax_lse,
-        alibi_slopes=alibi_slopes,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        block_tables=block_tables,
-        rng_state=rng_state,
-        softmax_scale=float(scale_val),
-        dropout_prob=float(dropout_prob_val),
-        causal=bool(causal_val),
-        sliding_window=window_tuple,
-        logits_soft_cap=logits_soft_cap_val,
-        normalize_output=bool(normalize_output_val),
-        max_seqlen_q=int(max_seqlen_q),
-        max_seqlen_k=int(max_seqlen_k),
-        is_varlen=bool(is_varlen),
-    )
+    from ejkernel.kernels._xla.flash_attention._interface import flash_attention as _xla_flash_attention
+
+    def _xla_forward(q_in: jax.Array, k_in: jax.Array, v_in: jax.Array) -> jax.Array:
+        return _xla_flash_attention(
+            q_in,
+            k_in,
+            v_in,
+            bias=alibi_slopes,
+            softmax_scale=float(scale_val),
+            dropout_prob=float(dropout_prob_val),
+            causal=bool(causal_val),
+            dropout_seed=int(dropout_seed_val),
+            sliding_window=window_tuple,
+            logits_soft_cap=logits_soft_cap_val,
+            normalize_output=bool(normalize_output_val),
+            precision=lax.Precision.DEFAULT,
+            logits_dtype=jnp.float32,
+        )
+
+    _, pullback = jax.vjp(_xla_forward, query, key, value)
+    dq, dk, dv = pullback(dO)
 
     return (
         dq,
@@ -785,6 +782,33 @@ def flash_attention(
     )
     if reason is not None:
         raise EjkernelRuntimeError(reason)
+    if int(query.shape[-1]) >= 128 and cum_seqlens_q is None and cum_seqlens_k is None and block_tables is None:
+        from ejkernel.kernels._triton.flash_attention._interface import flash_attention as _triton_flash_attention
+
+        return _triton_flash_attention(
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            bias=bias,
+            softmax_scale=softmax_scale,
+            dropout_prob=dropout_prob,
+            causal=causal,
+            dropout_seed=dropout_seed,
+            cum_seqlens_q=cum_seqlens_q,
+            cum_seqlens_k=cum_seqlens_k,
+            sliding_window=sliding_window,
+            fwd_params=fwd_params,
+            bwd_params=bwd_params,
+            logits_soft_cap=logits_soft_cap,
+            softmax_aux=softmax_aux,
+            normalize_output=normalize_output,
+            precision=precision,
+            logits_dtype=logits_dtype,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
+            block_tables=block_tables,
+        )
     return flash_attention_call(
         query=query,
         key=key,
