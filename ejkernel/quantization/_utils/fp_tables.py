@@ -33,7 +33,17 @@ from jax import numpy as jnp
 def _decode_e2m1_codes(codes: jnp.ndarray, *, dtype: jnp.dtype) -> jnp.ndarray:
     """Decode E2M1 (FP4) codes to float values without a lookup table.
 
-    Matches the semantics of :func:`_make_fp_table(exp_bits=2, mant_bits=1)`.
+    Implements the E2M1 format (1 sign bit, 2 exponent bits, 1 mantissa bit,
+    bias = 1) arithmetically.  Produces results identical to indexing into the
+    table returned by :func:`_make_fp_table(exp_bits=2, mant_bits=1)`.
+
+    Args:
+        codes: Integer array of 4-bit E2M1 codes (values 0–15).
+        dtype: Output floating-point dtype (e.g., ``jnp.float32``).
+
+    Returns:
+        Float array of the same shape as *codes*, with values in the E2M1
+        representable range ``±{0, 0.5, 1, 1.5, 2, 3, 4, 6}``.
     """
     codes_u = codes.astype(jnp.uint32)
     sign = (codes_u >> 3) & jnp.uint32(0x1)
@@ -53,7 +63,21 @@ def _decode_e2m1_codes(codes: jnp.ndarray, *, dtype: jnp.dtype) -> jnp.ndarray:
 def _decode_e4m3_codes(codes: jnp.ndarray, *, dtype: jnp.dtype) -> jnp.ndarray:
     """Decode E4M3 (FP8) codes to float values without a lookup table.
 
-    Matches the semantics of :func:`_make_fp_table(exp_bits=4, mant_bits=3, nan_all_ones=True)`.
+    Implements the E4M3 format (1 sign bit, 4 exponent bits, 3 mantissa bits,
+    bias = 7, ``nan_all_ones=True``) arithmetically.  Produces results
+    identical to indexing into the table returned by
+    :func:`_make_fp_table(exp_bits=4, mant_bits=3, nan_all_ones=True)`.
+
+    The all-ones code (``exp=0xF``, ``mant=0x7``) decodes to NaN for both
+    signs, matching the OCP MX specification.
+
+    Args:
+        codes: Integer array of 8-bit E4M3 codes (values 0–255).
+        dtype: Output floating-point dtype (e.g., ``jnp.float32``).
+
+    Returns:
+        Float array of the same shape as *codes*.  The NaN code decodes to
+        ``float("nan")``.
     """
     codes_u = codes.astype(jnp.uint32)
     sign = (codes_u >> 7) & jnp.uint32(0x1)
@@ -123,7 +147,23 @@ def _make_fp_table(exp_bits: int, mant_bits: int, *, nan_all_ones: bool) -> tupl
 
 
 def _build_threshold_map(codebook: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Build sorted-index and midpoint-boundary tensors for threshold quantization."""
+    """Build sorted-index and midpoint-boundary tensors for threshold quantization.
+
+    Sorts the codebook once and precomputes decision boundaries as midpoints
+    between consecutive sorted values.  The outputs are consumed by
+    :func:`_quantize_to_codebook_threshold_from_map`.
+
+    Args:
+        codebook: 1-D float32 array of codebook values (e.g., NF4, E2M1, or
+            E4M3 tables).
+
+    Returns:
+        Tuple of ``(sorted_idx, boundaries)`` where:
+        - ``sorted_idx``: int32 array of shape ``(n,)`` mapping sorted
+          position → original index.
+        - ``boundaries``: float32 array of shape ``(n-1,)`` of midpoint
+          decision boundaries.  Empty (shape ``(0,)``) when ``n <= 1``.
+    """
     codebook = codebook.astype(jnp.float32)
     sorted_idx = jnp.argsort(codebook).astype(jnp.int32)
     sorted_vals = codebook[sorted_idx]
@@ -135,7 +175,15 @@ def _build_threshold_map(codebook: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarra
 
 
 def _build_nf4_table() -> jnp.ndarray:
-    """Build NF4 (NormalFloat 4-bit) codebook tensor."""
+    """Build the NF4 (NormalFloat 4-bit) codebook tensor.
+
+    Returns a fixed float32 array of 16 codebook values sourced from the
+    QLoRA paper (Dettmers et al., 2023).  Values span ``[-1.0, 1.0]`` and
+    are spaced to minimize quantization error for data drawn from N(0, 1).
+
+    Returns:
+        float32 array of shape ``(16,)``.
+    """
     return jnp.asarray(
         [
             -1.0,

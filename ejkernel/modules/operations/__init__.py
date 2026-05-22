@@ -13,81 +13,110 @@
 # limitations under the License.
 
 
-"""Attention kernel modules with automatic optimization.
+"""Registered kernel operations: public API for ejkernel attention and matmul.
 
-This module provides a collection of high-performance attention mechanisms
-and related operations optimized for JAX. All implementations support automatic
-platform selection (XLA, Triton, Pallas, CUDA) and optional autotuning.
+Each operation in this package is a thin dispatch layer that:
 
-Available Attention Variants:
-    - Attention: Standard multi-head attention with XLA optimization
-    - DeepSeekAttention: DeepSeek Sparse Attention (MLA + Lightning Indexer)
-    - FlashAttention: Memory-efficient O(N) complexity attention
-    - FlashMLA: Multi-head latent attention with low-rank KV compression
-    - GLAttention: Gated linear attention mechanism
-    - KernelDeltaAttention: Linear attention with delta rule updates (O(N))
-    - LightningAttention: Layer-aware attention optimization
-    - NativeSparseAttention: Sparse attention with explicit block patterns
-    - PageAttention: Paged KV cache for serving workloads
-    - PrefillPageAttention: Chunked prefill attention with paged KV cache
-    - RaggedPageAttentionv2: Page attention for variable-length sequences
-    - RaggedPageAttentionv2TurboQuant: TurboQuant-compressed read-only page attention
-    - RaggedPageAttentionv3: Advanced page attention for variable-length sequences v3
-    - RaggedPageAttentionv3TurboQuant: TurboQuant-compressed fused page attention
-    - RecurrentAttention: Stateful recurrent attention
-    - RingAttention: Distributed attention with ring topology
-    - ScaledDotProductAttention: Standard scaled dot-product attention
+1. Wraps a ``Kernel`` subclass (e.g. ``FlashAttention``) responsible for
+   ``run()``, ``heuristic_cfg()``, and ``candidate_cfgs()`` methods.
+2. Exposes a module-level functional alias (e.g. ``flash_attention``) backed by
+   a pre-configured ``Executor`` with config caching and optional autotuning.
+3. Selects the fastest registered backend automatically using ``detect_platform``
+   from ``ejkernel.modules.base`` — no manual platform specification required.
 
-Linear Recurrent Models:
-    - RWKV4: Linear attention with time-decay (efficient language modeling)
-    - RWKV6: Enhanced RWKV with token-dependent decay
-    - RWKV7: Latest RWKV with improved state updates
-    - RWKV7Mul: RWKV-7 with multiplicative state updates
+All operations accept an optional ``cfg`` keyword argument (a typed
+``BaseOperationConfig`` subclass from ``configs.py``) to override block sizes,
+platform, or backend selection. Pass ``platform=`` directly to the functional
+interface as a shorthand for a one-off platform override.
 
-State Space Models:
-    - StateSpaceV1: Mamba-1 style selective state space model
-    - StateSpaceV2: Mamba-2 style selective state space model
+Available Operations:
+    Attention:
+        - Attention / attention: Standard MHA (XLA); returns (output, weights).
+        - FlashAttention / flash_attention: Memory-efficient O(N) attention.
+        - ScaledDotProductAttention / scaled_dot_product_attention: XLA SDPA.
+        - BlockSparseAttention / blocksparse_attention: Block-sparse with mask builder.
+        - NativeSparseAttention / native_sparse_attention: Explicit block patterns.
+        - RingAttention / ring_attention: Ring-topology distributed attention.
+        - DeepSeekAttention / deepseek_attn: MLA + Lightning Indexer sparse attn.
+        - FlashMLA / flash_mla: Flash multi-head latent (low-rank KV) attention.
 
-Additional Operations:
-    - GroupedMatmul: Efficient grouped matrix multiplication (for MoE)
-    - MeanPooling: Sequence mean pooling operation
-    - MultiLatentRaggedPageAttention: MLA ragged paged attention
-    - MultiLatentRaggedPageAttentionV2: MLA ragged paged attention v2
-    - QuantizedMatmul: Packed uint32 quantized matmul
+    Paged / Serving Attention:
+        - PageAttention / page_attention: Single-query paged KV decode.
+        - DecodeAttention / decode_attention: vLLM paged decode returning output+LSE.
+        - UnifiedAttention / unified_attention: vLLM unified prefill+decode attention.
+        - PrefillPageAttention / prefill_page_attention: Chunked prefill with paged KV.
+        - ChunkedPrefillPagedDecode / chunked_prefill_paged_decode: Fused KV write+decode.
+        - RaggedDecodeAttention / ragged_decode_attention: Ragged sequence decode.
+        - RaggedPageAttentionv2 / ragged_page_attention_v2: Ragged paged v2 (read-only).
+        - RaggedPageAttentionv2TurboQuant / ragged_page_attention_v2_turboquant:
+            TurboQuant compressed ragged paged v2.
+        - RaggedPageAttentionv3 / ragged_page_attention_v3: Ragged paged v3 with
+            chunked-prefill support.
+        - RaggedPageAttentionv3TurboQuant / ragged_page_attention_v3_turboquant:
+            TurboQuant compressed ragged paged v3.
+        - MultiLatentRaggedPageAttention / multi_latent_ragged_page_attention: MLA+ragged.
+        - MultiLatentRaggedPageAttentionV2 / multi_latent_ragged_page_attention_v2:
+            MLA ragged v2 with per-phase block tuning.
 
-Features:
-    - Automatic kernel selection based on hardware and input shapes
-    - Configuration caching for consistent performance
-    - Optional autotuning to find optimal block sizes
-    - Support for causal masking, dropout, and sliding windows
-    - Variable-length sequence handling via cumulative lengths
-    - Gradient-checkpointing support for memory efficiency
+    Linear / Recurrent Attention:
+        - GLAttention / gla_attention: Gated linear attention (O(N)).
+        - LightningAttention / lightning_attention: Lightning attention with decay.
+        - KernelDeltaAttention / kernel_delta_attention / kda_attention: Delta-rule LA.
+        - RecurrentAttention / recurrent_attention: Stateful recurrent attention.
+        - GatedDeltaRule / gated_delta_rule / gdr_attention: Gated delta rule (O(N)).
+        - RaggedGatedDeltaRule / ragged_gated_delta_rule: GDR for ragged sequences.
+
+    Linear Recurrent Models:
+        - RWKV4 / rwkv4: WKV recurrence with fixed time-decay.
+        - RWKV6 / rwkv6: WKV recurrence with token-dependent decay.
+        - RWKV7 / rwkv7: Enhanced RWKV-7 state-update recurrence.
+        - RWKV7Mul / rwkv7_mul: RWKV-7 with multiplicative state updates.
+
+    State Space Models:
+        - StateSpaceV1 / state_space_v1: Mamba-1 style selective SSM.
+        - StateSpaceV2 / state_space_v2: Mamba-2 style SSD.
+
+    Matrix Operations:
+        - GroupedMatmul / grouped_matmul: Variable-group-size matmul for MoE.
+        - AllGatherMatmul / all_gather_matmul: Fused all-gather + matmul.
+        - ReduceScatterMatmul / reduce_scatter_matmul: Fused matmul + reduce-scatter.
+        - QuantizedMatmul / quantized_matmul: Packed uint32 symmetric quantized matmul.
+
+    Miscellaneous:
+        - MeanPooling / mean_pooling: Sequence mean pooling.
+
+Configuration classes (imported from ``configs``):
+    Each operation has a corresponding ``*Config`` dataclass documented in
+    ``ejkernel.modules.operations.configs``.  All configs inherit ``platform``
+    and ``backend`` from ``BaseOperationConfig``.
+
+Aliases:
+    ``gdr_attention`` is an alias for ``gated_delta_rule`` (module-level
+    assignment at the bottom of this file).
 
 Example:
-    >>> from ejkernel.modules.operations import flash_attention
+    >>> from ejkernel.modules.operations import flash_attention, FlashAttentionConfig
     >>>
-    >>> # Basic causal attention
+    >>> # Minimal causal attention (auto platform selection)
     >>> output = flash_attention(query, key, value, causal=True)
     >>>
-    >>> # With all features
-    >>> output = flash_attention(
-    ...     query, key, value,
-    ...     softmax_scale=0.125,
-    ...     dropout_prob=0.1,
-    ...     sliding_window=(256, 256)
+    >>> # Explicit Triton platform with custom block sizes
+    >>> from ejkernel.ops import FwdParams
+    >>> cfg = FlashAttentionConfig(
+    ...     fwd_params=FwdParams(q_blocksize=128, kv_blocksize=64),
+    ...     platform="triton",
     ... )
-
-    >>> # Using MLA for memory-efficient inference
+    >>> output = flash_attention(query, key, value, causal=True, cfg=cfg)
+    >>>
+    >>> # MLA for memory-efficient inference (low-rank KV compression)
     >>> from ejkernel.modules.operations import flash_mla
     >>> output = flash_mla(query, key_value, w_kc, w_vc, causal=True)
 
-    >>> # Using linear attention for O(N) complexity
-    >>> from ejkernel.modules.operations import kernel_delta_attention
-    >>> output = kernel_delta_attention(query, key, value, beta, decay)
-
 Note:
-    All attention functions automatically handle mixed precision and
-    select the best available backend for your hardware.
+    All functional interfaces are backed by persistent-cache-aware ``Executor``
+    instances that amortise autotuning cost across repeated calls with the same
+    tensor shapes.  Set the ``EJKERNEL_AUTOTUNE_POLICY`` environment variable
+    to ``"heuristics"`` to skip autotuning and always use heuristic defaults.
 """
 
 from .all_gather_matmul import AllGatherMatmul, all_gather_matmul
@@ -221,7 +250,6 @@ __all__ = (
     "PageAttention",
     "PageAttentionConfig",
     "PrefillPageAttention",
-    "PrefillPageAttention",
     "PrefillPageAttentionConfig",
     "QuantizedMatmul",
     "QuantizedMatmulConfig",
@@ -276,7 +304,6 @@ __all__ = (
     "multi_latent_ragged_page_attention_v2",
     "native_sparse_attention",
     "page_attention",
-    "prefill_page_attention",
     "prefill_page_attention",
     "quantized_matmul",
     "ragged_decode_attention",

@@ -77,12 +77,14 @@ from collections.abc import Callable
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, DTypeLike, Float, PRNGKeyArray
 
-from ejkernel.kernels._registry import kernel_registry
+from ejkernel.kernels._registry import Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
+    BwdParams,
     ConfigCache,
     ConfigSelectorChain,
     Executor,
+    FwdParams,
     Invocation,
     Kernel,
     Tuner,
@@ -100,13 +102,14 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
     Supports causal masking, dropout, sliding windows, and variable-length sequences.
 
     Features:
-        - Automatic platform/backend selection (XLA Only ;0)
-        - Configuration caching for consistent performance
-        - Optional autotuning to find optimal implementation
-        - Custom gradient support for efficient backpropagation
-        - Support for variable-length sequences via cumulative sequence lengths
-        - Sliding window attention for local attention patterns
-        - Logits soft capping for numerical stability
+        - Automatic platform/backend selection (XLA-only; no Triton/Pallas dispatch
+          is registered for this op — see FlashAttention for GPU/TPU alternatives).
+        - Configuration caching for consistent performance.
+        - Optional autotuning to find optimal implementation.
+        - Custom gradient support for efficient backpropagation.
+        - Support for variable-length sequences via cumulative sequence lengths.
+        - Sliding window attention for local attention patterns.
+        - Logits soft capping for numerical stability.
 
     Example:
         >>> from ejkernel.modules import Attention, create_default_executor
@@ -173,25 +176,44 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         Float[Array, "batch seq_len num_q_heads vhead_dim"],
         Float[Array, "batch num_heads seq_len kv_len"],
     ]:
-        """Execute flash attention with the given configuration.
+        """Execute standard multi-head attention with the given configuration.
 
         Args:
-            query: Query tensor [batch, seq_len_q, num_heads, head_dim]
-            key: Key tensor [batch, seq_len_k, num_heads, head_dim]
-            value: Value tensor [batch, seq_len_k, num_heads, head_dim]
-            attention_mask: Optional attention mask (legacy, prefer bias)
-            bias: Optional attention bias tensor
-            softmax_scale: Scaling factor for attention scores
-            dropout_prob: Dropout probability for attention weights
-            sliding_window: Window size for local attention
-            platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
-            cfg: Configuration object specifying platform/backend
+            query: Query tensor [batch, seq_len, num_q_heads, head_dim]
+            key: Key tensor [batch, kv_len, num_kv_heads, head_dim]
+            value: Value tensor [batch, kv_len, num_kv_heads, vhead_dim]
+            attention_mask: Optional boolean/integer mask [batch, num_heads_or_1,
+                seq_len, kv_len]. Positions where mask is False/0 are excluded
+                from attention. Prefer ``bias`` for additive masking.
+            bias: Optional additive bias added to raw attention logits
+                [batch, num_heads, seq_len, kv_len].
+            init_bias: Lazy factory for ``bias``. Called only when ``bias``
+                is None; avoids materialising large bias tensors when unused.
+            deterministic: Disable dropout when True (default: True).
+            dropout_rng: PRNG key for dropout; required when
+                ``dropout_prob > 0`` and ``deterministic=False``.
+            softmax_aux: Optional attention-sink logits added before softmax.
+            softmax_scale: Scale factor applied to logits before softmax.
+                Defaults to ``1 / sqrt(head_dim)``.
+            logits_soft_cap: If set, clamps logits via
+                ``soft_cap * tanh(logits / soft_cap)`` (Gemma-2 style).
+            dtype: Dtype for intermediate computations (default: bfloat16).
+            softmax_dtype: Dtype for softmax accumulation; falls back to
+                ``dtype`` when None.
+            dropout_prob: Dropout probability (default: 0.0).
+            causal: Apply causal masking (default: False).
+            sliding_window: Local attention window.  An ``int`` applies a
+                symmetric window; a ``(left, right)`` tuple is asymmetric.
+            cfg: Kernel configuration (platform/backend selection).
 
         Returns:
-            Attention output [batch, seq_len_q, num_heads, head_dim]
+            Tuple of:
+                - output: Attention output [batch, seq_len, num_q_heads, vhead_dim]
+                - weights: Attention probabilities [batch, num_heads, seq_len, kv_len]
         """
+        resolved_platform = detect_platform("attention", cfg.platform)
         impl = self.get_impl(cfg)
-        return impl(
+        impl_kwargs = dict(
             query=query,
             key=key,
             value=value,
@@ -209,6 +231,20 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
             softmax_aux=softmax_aux,
             causal=causal,
         )
+        if resolved_platform == Platform.TILELANG:
+            impl_kwargs["fwd_params"] = FwdParams(
+                q_blocksize=cfg.block_q,
+                kv_blocksize=cfg.block_k,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+            )
+            impl_kwargs["bwd_params"] = BwdParams(
+                q_blocksize=max(32, cfg.block_q // 2),
+                kv_blocksize=max(32, cfg.block_k // 2),
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+            )
+        return impl(**impl_kwargs)
 
     def heuristic_cfg(self, inv: Invocation[AttentionConfig, Array]) -> AttentionConfig:
         """Provide default configuration based on invocation context.
@@ -248,7 +284,42 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
             so there are no meaningful configurations to benchmark.
         """
 
-        return []
+        return [
+            AttentionConfig(block_q=128, block_k=128, num_warps=4, num_stages=2, platform="auto", backend="any"),
+            AttentionConfig(block_q=128, block_k=128, num_warps=4, num_stages=2, platform="xla", backend="any"),
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[AttentionConfig, Array]):
+        """Generate GPU candidates for dense attention with weights."""
+        query = inv.kwargs["query"]
+        key = inv.kwargs["key"]
+        q_len = int(query.shape[1])
+        k_len = int(key.shape[1])
+        head_dim = int(query.shape[-1])
+        q_opts = [32, 64, 128] if q_len <= 256 else [64, 128]
+        k_opts = [32, 64, 128] if k_len <= 256 else [64, 128]
+        if head_dim >= 128:
+            k_opts = [k for k in k_opts if k <= 64] or [64]
+        candidates = [
+            AttentionConfig(
+                block_q=block_q,
+                block_k=block_k,
+                num_warps=8 if head_dim >= 128 and max(block_q, block_k) >= 128 else 4,
+                num_stages=2,
+                platform="tilelang",
+                backend="gpu",
+            )
+            for block_q in q_opts
+            for block_k in k_opts
+        ]
+        candidates.append(
+            AttentionConfig(block_q=128, block_k=128, num_warps=4, num_stages=2, platform="xla", backend="any")
+        )
+        return candidates
+
+    def candidate_cfgs_tpu(self, inv: Invocation[AttentionConfig, Array]):
+        """Return TPU candidates for the portable XLA dense-attention path."""
+        return [AttentionConfig(block_q=128, block_k=128, num_warps=4, num_stages=2, platform="xla", backend="any")]
 
 
 _executor: Executor[AttentionConfig, tuple[Array, Array]] = Executor(
@@ -281,33 +352,52 @@ def attention(
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
 ) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
-    """Execute flash attention with automatic optimization.
+    """Execute standard multi-head attention with automatic optimization.
 
-    Convenience function that uses a default executor and flash attention module.
+    Convenience wrapper around ``Attention.run`` that drives the operation
+    through a pre-configured ``Executor`` with config caching.
+
+    Unlike ``flash_attention``, this function returns **both** the attention
+    output and the full attention weight matrix, which requires O(N²) memory.
+    Prefer ``flash_attention`` when the attention weights are not needed.
 
     Args:
-        query: Query tensor [batch, seq_len, num_heads, head_dim]
-        key: Key tensor [batch, seq_len_k, num_heads, head_dim]
-        value: Value tensor [batch, seq_len_k, num_heads, head_dim]
-        mask_info: Optional MaskInfo containing attention mask and/or segment IDs
-        bias: Optional attention bias tensor
-        softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
-        dropout_prob: Dropout probability for attention weights
-        sliding_window: Window size for local attention (int or (left, right) tuple)
-        platform: Specific platform to use ("triton", "pallas", "cuda", or "xla")
+        query: Query tensor [batch, seq_len, num_q_heads, head_dim].
+        key: Key tensor [batch, kv_len, num_kv_heads, head_dim].
+        value: Value tensor [batch, kv_len, num_kv_heads, vhead_dim].
+        bias: Optional additive bias added to raw attention logits
+            [batch, num_heads, seq_len, kv_len].
+        dropout_rng: PRNG key required when ``dropout_prob > 0`` and
+            ``deterministic=False``.
+        softmax_aux: Optional attention-sink logits.
+        mask_info: Optional ``MaskInfo`` container; the attention mask is
+            extracted via ``get_or_compute_attention_mask()``.
+        init_bias: Lazy factory for ``bias``; called only when ``bias``
+            is None.
+        deterministic: Disable dropout (default: True).
+        softmax_scale: Scale factor for logits (default: 1/sqrt(head_dim)).
+        logits_soft_cap: Soft cap value for attention logits (Gemma-2 style).
+        dtype: Dtype for intermediate computations (default: bfloat16).
+        softmax_dtype: Dtype for softmax accumulation.
+        dropout_prob: Dropout probability (default: 0.0).
+        causal: Apply causal masking (default: False).
+        sliding_window: Local attention window (int or (left, right) tuple).
 
     Returns:
-        Attention output with same shape as query
+        Tuple of:
+            - output: Attention output [batch, seq_len, num_q_heads, vhead_dim]
+            - weights: Attention probabilities [batch, num_heads, seq_len, kv_len]
+
+    Note:
+        This operation is XLA-only; it does not dispatch to Triton or Pallas
+        backends. For hardware-efficient fused attention use ``flash_attention``.
 
     Example:
+        >>> out, weights = attention(query, key, value)
         >>>
-        >>> out = attention(query, key, value)
+        >>> out, weights = attention(query, key, value, causal=True, softmax_scale=0.125)
         >>>
-        >>>
-        >>> out = attention(query, key, value, dropout_prob=0.1, softmax_scale=0.125)
-        >>>
-        >>>
-        >>> out = attention(query, key, value, platform="xla")
+        >>> out, weights = attention(query, key, value, causal=True, sliding_window=256)
     """
 
     attention_mask = None

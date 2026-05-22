@@ -108,7 +108,7 @@ class ChunkedPrefillPagedDecode(Kernel[ChunkedPrefillPagedDecodeConfig, tuple[Ar
         logits_soft_cap: float | None = None,
         seq_threshold_3d: int | None = None,
         num_par_softmax_segments: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: ChunkedPrefillPagedDecodeConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -243,7 +243,7 @@ class ChunkedPrefillPagedDecode(Kernel[ChunkedPrefillPagedDecodeConfig, tuple[Ar
         logits_soft_cap: float | None = None,
         seq_threshold_3d: int | None = None,
         num_par_softmax_segments: int | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: ChunkedPrefillPagedDecodeConfig,
     ) -> tuple[
         Float[Array, "total_tokens num_q_heads head_dim"],
@@ -319,17 +319,22 @@ class ChunkedPrefillPagedDecode(Kernel[ChunkedPrefillPagedDecodeConfig, tuple[Ar
         """Generate default heuristic configuration.
 
         Args:
-            inv: Invocation context (unused).
+            inv: Invocation context.
 
         Returns:
             Default configuration with automatic platform selection.
         """
-        del inv
+        queries = inv.kwargs["queries"]
+        block_tables = inv.kwargs["block_tables"]
+        num_seqs = int(block_tables.shape[0])
+        head_dim = int(queries.shape[-1])
+        seq_threshold_3d = 16 if num_seqs >= 16 else 32
+        num_par_softmax_segments = 4 if num_seqs >= 16 else 2
         return ChunkedPrefillPagedDecodeConfig(
-            seq_threshold_3d=None,
-            num_par_softmax_segments=None,
-            num_warps=None,
-            num_stages=None,
+            seq_threshold_3d=seq_threshold_3d,
+            num_par_softmax_segments=num_par_softmax_segments,
+            num_warps=8 if head_dim >= 128 else 4,
+            num_stages=2,
             platform="auto",
             backend="any",
         )
@@ -338,13 +343,100 @@ class ChunkedPrefillPagedDecode(Kernel[ChunkedPrefillPagedDecodeConfig, tuple[Ar
         """Generate candidate configurations for autotuning.
 
         Args:
-            inv: Invocation context (unused).
+            inv: Invocation context.
 
         Returns:
-            Empty list (no autotuning candidates currently defined).
+            Portable fallback candidates for non-GPU execution.
         """
-        del inv
-        return []
+        base = self.heuristic_cfg(inv)
+        return [
+            ChunkedPrefillPagedDecodeConfig(
+                seq_threshold_3d=base.seq_threshold_3d,
+                num_par_softmax_segments=base.num_par_softmax_segments,
+                num_warps=base.num_warps,
+                num_stages=base.num_stages,
+                platform="auto",
+                backend="any",
+            ),
+            ChunkedPrefillPagedDecodeConfig(
+                seq_threshold_3d=base.seq_threshold_3d,
+                num_par_softmax_segments=base.num_par_softmax_segments,
+                num_warps=base.num_warps,
+                num_stages=base.num_stages,
+                platform="xla",
+                backend="any",
+            ),
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[ChunkedPrefillPagedDecodeConfig, tuple[Array, Array, Array]]):
+        """Generate GPU candidates for fused prefill/update + paged decode."""
+        queries = inv.kwargs["queries"]
+        block_tables = inv.kwargs["block_tables"]
+        requested = inv.kwargs.get("platform", None)
+        num_seqs = int(block_tables.shape[0])
+        head_dim = int(queries.shape[-1])
+        threshold_choices = tuple(sorted({8, 16, 32, max(1, num_seqs)}))
+        segment_choices = (1, 2, 4, 8) if num_seqs >= 16 else (1, 2, 4)
+        warp_choices = (4, 8) if head_dim >= 128 else (2, 4)
+        platforms = ("triton", "cute", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+
+        candidates: list[ChunkedPrefillPagedDecodeConfig] = []
+        if "triton" in platforms or "cute" in platforms:
+            for platform_name in ("triton", "cute"):
+                if platform_name not in platforms:
+                    continue
+                for threshold in threshold_choices[:3]:
+                    for segments in segment_choices[:2]:
+                        for warps in warp_choices:
+                            candidates.append(
+                                ChunkedPrefillPagedDecodeConfig(
+                                    seq_threshold_3d=threshold,
+                                    num_par_softmax_segments=segments,
+                                    num_warps=warps,
+                                    num_stages=2,
+                                    platform=platform_name,
+                                    backend="gpu",
+                                )
+                            )
+        if "tilelang" in platforms:
+            for stages in (2, 3, 4):
+                candidates.append(
+                    ChunkedPrefillPagedDecodeConfig(
+                        seq_threshold_3d=None,
+                        num_par_softmax_segments=None,
+                        num_warps=4,
+                        num_stages=stages,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
+                )
+        if "xla" in platforms:
+            base = self.heuristic_cfg(inv)
+            candidates.append(
+                ChunkedPrefillPagedDecodeConfig(
+                    seq_threshold_3d=base.seq_threshold_3d,
+                    num_par_softmax_segments=base.num_par_softmax_segments,
+                    num_warps=base.num_warps,
+                    num_stages=base.num_stages,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[ChunkedPrefillPagedDecodeConfig, tuple[Array, Array, Array]]):
+        """Return TPU candidates for the XLA fallback path."""
+        base = self.heuristic_cfg(inv)
+        return [
+            ChunkedPrefillPagedDecodeConfig(
+                seq_threshold_3d=base.seq_threshold_3d,
+                num_par_softmax_segments=base.num_par_softmax_segments,
+                num_warps=base.num_warps,
+                num_stages=base.num_stages,
+                platform="xla",
+                backend="any",
+            )
+        ]
 
 
 _chunked_prefill_paged_decode_executor: Executor[ChunkedPrefillPagedDecodeConfig, tuple[Array, Array, Array]] = Executor(
@@ -380,7 +472,7 @@ def chunked_prefill_paged_decode(
     logits_soft_cap: float | None = None,
     seq_threshold_3d: int | None = None,
     num_par_softmax_segments: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: tuple[PartitionSpec, PartitionSpec, PartitionSpec] | None = None,

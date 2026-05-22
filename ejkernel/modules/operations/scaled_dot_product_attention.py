@@ -80,12 +80,14 @@ import jax
 from jax import shard_map
 from jaxtyping import Array, Bool, Float, Int
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
+    BwdParams,
     ConfigCache,
     ConfigSelectorChain,
     Executor,
+    FwdParams,
     Invocation,
     Kernel,
     Tuner,
@@ -98,18 +100,24 @@ from .configs import ScaledDotProductAttentionConfig
 
 
 class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
-    """ScaledDotProductAttention with custom optimization logic.
+    """Standard scaled dot-product attention kernel wrapper.
 
-    Supports causal masking, dropout, sliding windows, and variable-length sequences.
+    Dispatches to XLA's built-in attention primitive or a platform-specific
+    implementation.  Supports causal masking, sliding windows, and
+    variable-length sequences, but does **not** support dropout.
+
+    Note:
+        Block sizes are not tunable for this operation — the XLA backend
+        optimises tiling internally.  For block-size autotuning or fused
+        dropout, use :class:`FlashAttention` instead.
 
     Features:
-        - Automatic platform/backend selection (XLA Only ;0)
+        - Automatic platform/backend selection (primarily XLA)
         - Configuration caching for consistent performance
-        - Optional autotuning to find optimal implementation
         - Custom gradient support for efficient backpropagation
         - Support for variable-length sequences via cumulative sequence lengths
         - Sliding window attention for local attention patterns
-        - Logits soft capping for numerical stability
+        - Lazy bias initialisation via ``init_bias`` callable
 
     Example:
         >>> from ejkernel.modules import ScaledDotProductAttention, create_default_executor
@@ -169,44 +177,58 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
         sliding_window: int | tuple[int, int] | None = None,
         cum_seqlens_q: Int[Array, "batch"] | None = None,
         cum_seqlens_k: Int[Array, "batch"] | None = None,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: ScaledDotProductAttentionConfig,
     ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
-        """Execute scaled_dot_product_attention with the given configuration.
+        """Execute scaled dot-product attention with the given configuration.
 
         Args:
-            query: Query tensor [batch, seq_len_q, num_heads, head_dim]
-            key: Key tensor [batch, seq_len_k, num_heads, head_dim]
-            value: Value tensor [batch, seq_len_k, num_heads, head_dim]
-            attention_mask: Optional scaled_dot_product_attention mask (legacy, prefer bias)
-            bias: Optional scaled_dot_product_attention bias tensor
-            softmax_scale: Scaling factor for attention scores
-            dropout_prob: Dropout probability for attention weights
-            causal: Whether to apply causal masking
-            dropout_seed: Random seed for dropout
-            cum_seqlens_q: Cumulative sequence lengths for variable-length queries
-            cum_seqlens_k: Cumulative sequence lengths for variable-length keys
-            sliding_window: Window size for local attention
-            logits_soft_cap: Optional soft cap value for logits
-            softmax_aux: Optional attention sink logits
-            cfg: Configuration object specifying platform/backend
-            segment_ids: Segment IDs for grouped sequences (TPU-specific)
-            block_sizes: Block sizes for kernel execution (TPU-specific)
+            query: Query tensor [batch, seq_len_q, num_q_heads, head_dim].
+            key: Key tensor [batch, kv_len, num_kv_heads, head_dim].
+            value: Value tensor [batch, kv_len, num_kv_heads, head_dim].
+            attention_mask: Optional boolean/integer mask
+                [batch, num_heads_or_1, seq_len_q, kv_len]. ``True`` (or 1)
+                means *attend*, 0/``False`` means *mask out*. Prefer ``bias``
+                for additive masking.
+            bias: Optional additive attention bias
+                [batch, num_heads, seq_len_q, kv_len]. Added directly to
+                pre-softmax logits.
+            init_bias: Optional callable that lazily creates the bias on-device.
+                Called only when ``bias`` is ``None``; the returned tensor must
+                match the expected bias shape.
+            softmax_scale: Multiplicative scale applied to QK^T logits before
+                softmax. Defaults to ``1 / sqrt(head_dim)`` when ``None``.
+            causal: If ``True``, apply a causal (lower-triangular) mask so
+                each query position attends only to earlier key positions.
+            sliding_window: If set, restrict attention to a window of this many
+                key positions around each query (int = symmetric window; tuple
+                ``(left, right)`` for asymmetric).
+            cum_seqlens_q: Cumulative sequence lengths for variable-length
+                queries [batch].
+            cum_seqlens_k: Cumulative sequence lengths for variable-length
+                keys [batch].
+            platform: Override platform selection ("triton", "pallas", "cuda",
+                "xla", "auto").
+            cfg: Configuration object specifying platform and backend.
 
         Returns:
-            ScaledDotProductAttention output [batch, seq_len_q, num_heads, head_dim]
+            Attention output [batch, seq_len_q, num_q_heads, head_dim].
         """
 
         if platform is not None:
             cfg = ScaledDotProductAttentionConfig(
+                block_q=cfg.block_q,
+                block_k=cfg.block_k,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
 
+        resolved_platform = detect_platform("scaled_dot_product_attention", cfg.platform)
         impl = self.get_impl(cfg)
-
-        return impl(
+        impl_kwargs = dict(
             query=query,
             key=key,
             value=value,
@@ -219,6 +241,20 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
             cum_seqlens_q=cum_seqlens_q,
             cum_seqlens_k=cum_seqlens_k,
         )
+        if resolved_platform == Platform.TILELANG:
+            impl_kwargs["fwd_params"] = FwdParams(
+                q_blocksize=cfg.block_q,
+                kv_blocksize=cfg.block_k,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+            )
+            impl_kwargs["bwd_params"] = BwdParams(
+                q_blocksize=max(32, cfg.block_q // 2),
+                kv_blocksize=max(32, cfg.block_k // 2),
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+            )
+        return impl(**impl_kwargs)
 
     def create_shard_map_wrapper(
         self,
@@ -239,7 +275,7 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
         softmax_scale: float | None = None,
         causal: bool = False,
         sliding_window: int | tuple[int, int] | None = None,
-        platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     ):
         """Create a shard_map wrapper for distributed ScaledDotProductAttention execution.
 
@@ -332,6 +368,10 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
         """
 
         return ScaledDotProductAttentionConfig(
+            block_q=128,
+            block_k=128,
+            num_warps=4,
+            num_stages=2,
             platform="auto",
             backend="any",
         )
@@ -353,7 +393,94 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
             block sizes, so there are no meaningful configurations to benchmark.
         """
 
-        return []
+        return [
+            ScaledDotProductAttentionConfig(
+                block_q=128,
+                block_k=128,
+                num_warps=4,
+                num_stages=2,
+                platform="auto",
+                backend="any",
+            ),
+            ScaledDotProductAttentionConfig(
+                block_q=128,
+                block_k=128,
+                num_warps=4,
+                num_stages=2,
+                platform="xla",
+                backend="any",
+            ),
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[ScaledDotProductAttentionConfig, Array]):
+        """Generate GPU candidates for SDPA.
+
+        TileLang candidates tune FlashAttention tile sizes. Pallas/Triton
+        route to the cuDNN-backed SDPA wrapper and therefore have a single
+        platform candidate.
+        """
+        query = inv.kwargs["query"]
+        key = inv.kwargs["key"]
+        requested = inv.kwargs.get("platform", None)
+        head_dim = int(query.shape[-1])
+        q_len = int(query.shape[1])
+        k_len = int(key.shape[1])
+        q_opts = [32, 64, 128] if q_len <= 256 else [64, 128]
+        k_opts = [32, 64, 128] if k_len <= 256 else [64, 128, 256]
+        if head_dim >= 128:
+            k_opts = [k for k in k_opts if k <= 128] or [128]
+        platforms = ("tilelang", "pallas", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[ScaledDotProductAttentionConfig] = []
+        if "tilelang" in platforms:
+            for block_q in q_opts:
+                for block_k in k_opts:
+                    candidates.append(
+                        ScaledDotProductAttentionConfig(
+                            block_q=block_q,
+                            block_k=block_k,
+                            num_warps=8 if head_dim >= 128 and max(block_q, block_k) >= 128 else 4,
+                            num_stages=2,
+                            platform="tilelang",
+                            backend="gpu",
+                        )
+                    )
+        if "pallas" in platforms or "triton" in platforms:
+            platform_name = "triton" if "triton" in platforms else "pallas"
+            candidates.append(
+                ScaledDotProductAttentionConfig(
+                    block_q=128,
+                    block_k=128,
+                    num_warps=4,
+                    num_stages=2,
+                    platform=platform_name,
+                    backend="gpu",
+                )
+            )
+        if "xla" in platforms:
+            candidates.append(
+                ScaledDotProductAttentionConfig(
+                    block_q=128,
+                    block_k=128,
+                    num_warps=4,
+                    num_stages=2,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[ScaledDotProductAttentionConfig, Array]):
+        """Generate TPU candidates for XLA SDPA."""
+        return [
+            ScaledDotProductAttentionConfig(
+                block_q=128,
+                block_k=128,
+                num_warps=4,
+                num_stages=2,
+                platform="xla",
+                backend="any",
+            )
+        ]
 
 
 _executor: Executor[ScaledDotProductAttentionConfig, Array] = Executor(
@@ -380,45 +507,62 @@ def scaled_dot_product_attention(
     softmax_scale: float | None = None,
     causal: bool = False,
     sliding_window: int | tuple[int, int] | None = None,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     mesh: jax.sharding.Mesh | None = None,
     in_specs: tuple[jax.sharding.PartitionSpec, ...] | None = None,
     out_specs: jax.sharding.PartitionSpec | None = None,
 ) -> Float[Array, "batch seq_len num_q_heads head_dim"]:
-    """Execute scaled dot product attention with automatic optimization.
+    """Execute scaled dot-product attention with automatic optimization.
 
-    Convenience function that uses a default executor and flash attention module.
+    Standard ``Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V`` computed
+    via XLA or a platform-specific kernel.  Unlike :func:`flash_attention`,
+    this function exposes no block-size tuning; the XLA backend optimises
+    the computation internally.
+
+    Note:
+        This operation does **not** support dropout.  For dropout or
+        memory-efficient training, use :func:`flash_attention` instead.
 
     Args:
-        query: Query tensor [batch, seq_len, num_heads, head_dim]
-        key: Key tensor [batch, seq_len_k, num_heads, head_dim]
-        value: Value tensor [batch, seq_len_k, num_heads, head_dim]
-        mask_info: Optional MaskInfo containing attention mask and/or segment IDs
-        bias: Optional attention bias tensor
-        softmax_scale: Scaling factor for attention scores (default: 1/sqrt(head_dim))
-        dropout_prob: Dropout probability for attention weights
-        causal: Whether to apply causal masking
-        dropout_seed: Random seed for dropout
+        query: Query tensor [batch, seq_len_q, num_q_heads, head_dim].
+        key: Key tensor [batch, kv_len, num_kv_heads, head_dim].
+        value: Value tensor [batch, kv_len, num_kv_heads, head_dim].
+        bias: Optional additive bias [batch, num_heads, seq_len_q, kv_len].
+            Added directly to pre-softmax logits.
         cum_seqlens_q: Cumulative sequence lengths for variable-length queries
+            [batch].
         cum_seqlens_k: Cumulative sequence lengths for variable-length keys
-        sliding_window: Window size for local attention (int or (left, right) tuple)
-        logits_soft_cap: Optional soft cap value for logits
-        mesh: JAX device mesh for shard_map execution (optional)
-        in_specs: Input partition specs for shard_map (optional)
-        out_specs: Output partition spec for shard_map (optional)
+            [batch].
+        mask_info: Optional :class:`~ejkernel.types.mask.MaskInfo` providing
+            an attention mask.  When supplied, the contained mask is extracted
+            and passed as ``attention_mask`` to the backend.
+        init_bias: Optional callable that lazily initialises the bias on-device
+            (called only when ``bias`` is ``None``).
+        softmax_scale: Scale factor for logits (default: ``1/sqrt(head_dim)``).
+        causal: If ``True``, apply causal masking.
+        sliding_window: Sliding window size for local attention (int or
+            ``(left, right)`` tuple).
+        platform: Override platform selection ("triton", "pallas", "cuda",
+            "xla", "auto").
+        mesh: JAX device mesh for ``shard_map`` distributed execution.
+        in_specs: Input ``PartitionSpec`` tuple for ``shard_map``.
+            Must contain 7 entries matching the shard_map call_args order
+            (query, key, value, bias, cum_seqlens_q, cum_seqlens_k,
+            attention_mask).
+        out_specs: Output ``PartitionSpec`` for ``shard_map``.
 
     Returns:
-        ScaledDotProductAttention output with same shape as query
+        Attention output [batch, seq_len_q, num_q_heads, head_dim].
 
     Example:
-        >>>
         >>> out = scaled_dot_product_attention(query, key, value, causal=True)
-        >>>
-        >>>
-        >>> out = scaled_dot_product_attention(query, key, value, dropout_prob=0.1, softmax_scale=0.125)
-        >>>
-        >>>
-        >>> out = scaled_dot_product_attention(query, key, value, cum_seqlens_q=cu_q, cum_seqlens_k=cu_k)
+        >>> out = scaled_dot_product_attention(
+        ...     query, key, value, softmax_scale=0.125, causal=True
+        ... )
+        >>> out = scaled_dot_product_attention(
+        ...     query, key, value,
+        ...     cum_seqlens_q=cu_q, cum_seqlens_k=cu_k
+        ... )
     """
 
     attention_mask = None

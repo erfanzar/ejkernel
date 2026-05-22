@@ -13,27 +13,43 @@
 # limitations under the License.
 
 
-"""Utility functions for ejKernel library.
+"""Utility functions for the ejKernel library.
 
-This module provides a comprehensive collection of utility functions for kernel
-development, including mathematical operations, array manipulation, hardware
-detection, performance testing, and distributed synchronization utilities.
+This module provides a collection of utility functions for kernel development,
+including mathematical operations, array manipulation, hardware detection,
+performance testing, distributed synchronization, and JAX mesh / sharding helpers.
 
-The utilities are designed to support both Triton and JAX-based kernel implementations
-with focus on GPU architectures (CDNA, RDNA) and distributed training scenarios.
+The utilities support both Triton and JAX-based kernel implementations, with
+specific handling for AMD CDNA/RDNA GPU architectures and distributed training
+scenarios using ``jax.distributed``.
 
-Key Features:
-    - Mathematical utilities (cdiv, next_power_of_2, strides)
-    - GPU architecture detection (is_hip, is_cdna, is_rdna)
-    - Triton autotuning helpers (safe_autotune)
-    - Distributed training utilities (barrier_sync)
-    - Test data generation (random_dense, numeric_gen)
-    - Sharding utilities for distributed JAX (make_mesh, get_qkv_shardings)
+Key Functions:
+    cdiv: Ceiling division for int and JAX arrays.
+    next_power_of_2: Smallest power of 2 >= x.
+    strides_from_shape / get_strides: Row-major (C-contiguous) stride computation.
+    get_stride / kw_strides: Per-dimension stride access and kernel kwarg helpers.
+    is_hip / is_cdna / is_rdna: AMD GPU architecture detection via Triton runtime.
+    safe_autotune: Triton autotuning with graceful fallback.
+    barrier_sync: Multi-process JAX barrier using the distributed client.
+    numeric_gen / random_dense: Reproducible random array generation for testing.
+    make_mesh / get_qkv_shardings / get_segments_shardings: JAX mesh and sharding
+        helpers for (dp, fsdp, tp, sp) parallelism configurations.
+    make_dummy_rpa_inputs: Full dummy input set for Ragged Paged Attention testing.
+    generate_block_indices: Random sparse-attention block index generator.
+    get_tpu_generation: TPU generation detection by parsing ``device_kind``.
+    calculate_blocksize_and_wraps: Triton block-size / warp-count selection.
 
 Constants:
-    CDNA_ARCHS: List of AMD CDNA architecture identifiers
-    RDNA_ARCHS: List of AMD RDNA architecture identifiers
-    Layouts: Type alias for attention layout formats
+    CDNA_ARCHS: AMD CDNA GPU architecture identifiers (MI100/MI200/MI300 series).
+    RDNA_ARCHS: AMD RDNA GPU architecture identifiers (RX 6000/7000 series).
+    Layouts: Type alias for supported attention tensor layout format strings.
+    DEBUG_GLOBAL_RNG: Module-level JAX PRNGKey used by numeric_gen/random_dense.
+
+Note:
+    ``get_abs_err`` and ``get_err_ratio`` call PyTorch-style methods (``.detach()``,
+    ``.square()``, ``.flatten().abs().max().item()``) and therefore only work with
+    PyTorch tensors, not JAX arrays. They are likely legacy helpers; avoid using
+    them with JAX arrays.
 
 Example:
     >>> from ejkernel.utils import cdiv, next_power_of_2, is_hip
@@ -112,13 +128,21 @@ def cdiv(a: int | jax.Array, b: int | jax.Array) -> int | jax.Array:
 
 
 def strides_from_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
-    """Calculate the strides for a contiguous array with the given shape.
+    """Calculate row-major (C-contiguous) strides for an array with the given shape.
+
+    The stride for dimension ``i`` is the number of elements between consecutive
+    elements along that dimension, assuming a contiguous C-order layout.
 
     Args:
-            shape: A tuple of integers representing the dimensions of an array.
+        shape: A tuple of integers representing the dimensions of an array.
 
     Returns:
-            A tuple of integers representing the strides of a contiguous array.
+        A tuple of integers representing the C-contiguous strides. The last
+        dimension always has stride 1.
+
+    Example:
+        >>> strides_from_shape((2, 3, 4))
+        (12, 4, 1)
     """
     size = np.prod(shape)
     strides = []
@@ -129,14 +153,23 @@ def strides_from_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def get_stride(shape: tuple[int, ...] | jax.Array, index=0) -> int:
-    """Get the stride at a specific dimension index.
+    """Get the C-contiguous stride at a specific dimension index.
+
+    Delegates to :func:`get_strides` and returns the element at ``index``.
+    If an array is passed instead of a shape tuple, its ``.shape`` attribute
+    is used automatically.
 
     Args:
-        shape: Shape of the array or the array itself.
-        index: The dimension index to get the stride for. Defaults to 0.
+        shape: Shape tuple ``(d0, d1, ..., dn)`` or a JAX array whose
+            ``.shape`` is used.
+        index: The dimension index to retrieve the stride for. Defaults to 0.
 
     Returns:
-        The stride value at the specified index.
+        The stride (number of elements) at the specified dimension.
+
+    Example:
+        >>> get_stride((2, 3, 4), index=1)
+        4
     """
     return get_strides(shape)[index]
 
@@ -274,13 +307,22 @@ def get_sharding(arr: jax.Array):
 
 
 def get_strides(shape: tuple[int, ...] | jax.Array) -> tuple[int, ...]:
-    """Calculates strides for a given shape.
+    """Calculate row-major (C-contiguous) strides for a given shape.
+
+    Equivalent to :func:`strides_from_shape` but also accepts a JAX array
+    directly, extracting its ``.shape`` attribute automatically.
 
     Args:
-            shape: Shape of the array.
+        shape: Shape tuple ``(d0, d1, ..., dn)`` or a JAX array whose
+            ``.shape`` attribute is used.
 
     Returns:
-            Tuple of strides.
+        Tuple of integer strides in the same order as the shape dimensions.
+        The last element is always 1 (innermost stride).
+
+    Example:
+        >>> get_strides((2, 3, 4))
+        (12, 4, 1)
     """
     if hasattr(shape, "shape"):
         shape = shape.shape
@@ -295,18 +337,26 @@ def get_strides(shape: tuple[int, ...] | jax.Array) -> tuple[int, ...]:
 def get_padded_headsize(size):
     """Calculate padded head size for optimal memory alignment.
 
-    Rounds up the head size to the next power of 2 with a minimum of 16
-    for better memory access patterns in attention kernels.
+    Rounds up the head size to the smallest power of 2 that is >= ``size``,
+    with a minimum of 16. This is used in attention kernels to ensure
+    favourable memory-access patterns.
+
+    Note:
+        Unlike :func:`next_power_of_2`, this function uses a bit-length
+        trick (``1 << (size - 1).bit_length()``) rather than a loop, and
+        enforces a floor of 16 regardless of input.
 
     Args:
-        size: Original head size.
+        size: Original head dimension size (positive integer).
 
     Returns:
-        Padded head size as the next power of 2, minimum 16.
+        Padded head size as a power of 2, at least 16.
 
     Example:
         >>> get_padded_headsize(13)
+        16
         >>> get_padded_headsize(20)
+        32
     """
     padded_d_model = 1 << (size - 1).bit_length()
     padded_d_model = max(padded_d_model, 16)
@@ -532,12 +582,19 @@ def random_dense(
 def get_abs_err(x, y):
     """Calculate maximum absolute error between two arrays.
 
+    Warning:
+        This function uses PyTorch-style tensor methods (``.detach()``,
+        ``.flatten()``, ``.abs()``, ``.max()``, ``.item()``). It only works
+        with PyTorch tensors — passing JAX arrays will raise an
+        ``AttributeError``. This appears to be a legacy helper retained for
+        PyTorch-based test scripts.
+
     Args:
-        x: First array.
-        y: Second array.
+        x: First PyTorch tensor.
+        y: Second PyTorch tensor.
 
     Returns:
-        Maximum absolute difference between the arrays.
+        Maximum absolute difference as a Python float.
     """
     return (x.detach() - y.detach()).flatten().abs().max().item()
 
@@ -545,14 +602,22 @@ def get_abs_err(x, y):
 def get_err_ratio(x, y):
     """Calculate relative error ratio between two arrays.
 
-    Computes the root mean square error normalized by the RMS of the reference.
+    Computes the root mean square error (RMSE) between ``x`` and ``y``,
+    normalized by the RMS magnitude of ``x`` (the reference).
+
+    Warning:
+        This function uses PyTorch-style tensor methods (``.detach()``,
+        ``.flatten()``, ``.square()``, ``.mean()``, ``.sqrt()``, ``.item()``).
+        It only works with PyTorch tensors — passing JAX arrays will raise an
+        ``AttributeError``. This appears to be a legacy helper retained for
+        PyTorch-based test scripts.
 
     Args:
-        x: Reference array.
-        y: Array to compare against reference.
+        x: Reference PyTorch tensor.
+        y: PyTorch tensor to compare against the reference.
 
     Returns:
-        Relative error ratio (RMSE / RMS of reference).
+        Relative error ratio ``RMSE(x, y) / (RMS(x) + 1e-8)`` as a Python float.
     """
     err = (x.detach() - y.detach()).flatten().square().mean().sqrt().item()
     base = (x.detach()).flatten().square().mean().sqrt().item()
@@ -560,21 +625,37 @@ def get_err_ratio(x, y):
 
 
 def assert_close(prefix, ref, tri, ratio, warning=False, err_atol=1e-6):
-    """Assert that two arrays are close within tolerance.
+    """Assert that two arrays are numerically close within tolerance.
 
-    Compares arrays using both absolute and relative error thresholds,
-    with options for warnings vs assertions.
+    Compares arrays using both absolute error and a relative error ratio.
+    If the absolute error is below ``err_atol`` the check passes unconditionally.
+    Otherwise the error ratio (from :func:`get_err_ratio`) is compared against
+    ``ratio``.
+
+    Warning:
+        Internally calls :func:`get_abs_err` and :func:`get_err_ratio`, which
+        use PyTorch-style tensor methods. This function only works with PyTorch
+        tensors, not JAX arrays.
+
+    The pass/fail logic is:
+        1. If ``abs_atol <= err_atol`` → pass (print message, return).
+        2. If ``warning=True`` **or** ``error_rate < 0.01`` **or** ``abs_atol <= 0.3``:
+           - If ``error_rate > ratio`` → emit a ``warnings.warn``.
+        3. Otherwise → ``assert error_rate < ratio``.
 
     Args:
-        prefix: Message prefix for error reporting.
-        ref: Reference array for comparison.
-        tri: Array to test against reference.
-        ratio: Maximum allowed error ratio.
-        warning: If True, issue warning instead of assertion on failure.
-        err_atol: Absolute tolerance threshold. Defaults to 1e-6.
+        prefix: String prefix shown in the diagnostic message.
+        ref: Reference PyTorch tensor.
+        tri: PyTorch tensor to test against the reference.
+        ratio: Maximum allowed relative error ratio.
+        warning: If ``True``, failures emit a ``UserWarning`` instead of
+            raising ``AssertionError``. Defaults to ``False``.
+        err_atol: Absolute error threshold below which the check always passes.
+            Defaults to 1e-6.
 
     Raises:
-        AssertionError: If arrays differ beyond tolerance and warning=False.
+        AssertionError: If ``error_rate >= ratio`` and ``warning=False`` and
+            neither of the soft-pass conditions is met.
 
     Example:
         >>> ref = jnp.ones((10,))
@@ -1072,23 +1153,35 @@ def make_mesh(mesh_axis: tuple[int, int, int, int]):
 
 
 def get_qkv_shardings(layout: Literal["bhsd", "bshd", "thd"]):
-    """Get sharding specifications for attention tensors based on layout.
+    """Get sharding specifications for attention QKV tensors based on layout.
 
     Returns PartitionSpecs for queries, keys, and values that are compatible
-    with the given tensor layout and a standard (dp, fsdp, tp, sp) mesh.
+    with the given tensor layout and a standard (dp, fsdp, tp, sp) mesh created
+    by :func:`make_mesh`.
+
+    The returned specs come in two groups of three:
+    - Non-sequence-parallel specs (``q_spec, k_spec, v_spec``): no ``sp`` axis.
+    - Sequence-parallel specs (``sq_spec, sk_spec, sv_spec``): adds the ``sp``
+      axis to the sequence/token dimension.
 
     Args:
-        layout: Tensor layout format:
-            - "bhsd": [batch, heads, seq, dim]
-            - "bshd": [batch, seq, heads, dim]
-            - "thd": [tokens, heads, dim] for packed sequences
+        layout: Tensor layout format string:
+            - ``"bhsd"``: tensors have shape ``[batch, heads, seq, dim]``.
+              Batch+fsdp on axis 0, tp on heads (axis 1).
+            - ``"bshd"``: tensors have shape ``[batch, seq, heads, dim]``.
+              Batch+fsdp on axis 0, tp on heads (axis 2).
+            - ``"thd"``: packed/ragged tensors. The PartitionSpec has four axes
+              ``(None, tp, (dp, fsdp), None)``; the exact dimension ordering
+              used in practice should be confirmed against the calling site.
 
     Returns:
-        Tuple of 6 PartitionSpecs: (q_spec, k_spec, v_spec, sq_spec, sk_spec, sv_spec)
-        where the 's' prefix indicates sequence-parallel variants.
+        Tuple of 6 ``PartitionSpec`` objects:
+        ``(q_spec, k_spec, v_spec, sq_spec, sk_spec, sv_spec)``.
+        The first three are non-sequence-parallel; the last three include the
+        ``sp`` axis for sequence-parallel training.
 
     Raises:
-        ValueError: If layout is not one of the supported formats.
+        ValueError: If ``layout`` is not one of ``"bhsd"``, ``"bshd"``, ``"thd"``.
     """
     if layout == "bhsd":
         qps = Ps(("dp", "fsdp"), "tp", None, None)

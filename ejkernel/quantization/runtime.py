@@ -12,7 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime policy controls for quantization fast paths."""
+"""Runtime policy controls for quantization fast paths.
+
+This module defines :class:`QuantRuntimeConfig`, a frozen dataclass that
+controls implementation choices within the quantize/dequantize pipeline.
+None of the flags change quantization semantics (the numerical values of
+the output are identical across all flag combinations for the same mode and
+metadata dtype); they only select among equivalent implementation strategies.
+
+The module also provides :func:`resolve_runtime_config`, which returns a
+backend-tuned default when no explicit config is supplied.
+"""
 
 from __future__ import annotations
 
@@ -24,8 +34,50 @@ from typing import Literal
 class QuantRuntimeConfig:
     """Optional runtime policy for quantize/dequantize internals.
 
-    These flags do not change quantization semantics. They select between
-    compatible implementation strategies.
+    All flags are purely implementation choices and do not alter the numerical
+    semantics of quantization.  They are exposed so that advanced users and
+    autotuning can select the fastest path for a particular backend and shape.
+
+    Attributes:
+        enable_u4_u8_fastpath: When ``True``, uses the dedicated grouped
+            pack/unpack kernels for bit-widths in ``{1, 2, 4, 8}`` instead
+            of the generic scatter/gather path.  Default: ``True``.
+
+        enable_threshold_codebook: When ``True``, uses binary-search
+            (threshold/midpoint) codebook quantization instead of the
+            streaming argmin fallback.  Default: ``True``.
+
+        enable_parity_fallback: When ``True``, forces the slow streaming
+            argmin codebook path regardless of ``enable_threshold_codebook``.
+            Useful for numerical parity checks.  Default: ``False``.
+
+        strict_shape_alignment: When ``True``, the fast grouped pack/unpack
+            path raises ``ValueError`` if the last dimension is not a multiple
+            of ``values_per_word`` rather than auto-padding.  Default:
+            ``True``.
+
+        prefer_compute_dtype: Floating-point dtype for dequantization
+            arithmetic.  One of ``"bf16"``, ``"fp16"``, ``"fp32"``.
+            Default: ``"fp32"``.
+
+        affine_metadata_dtype: Storage dtype for affine ``scales`` and
+            ``zeros`` arrays.  One of ``"input"`` (match the weight tensor
+            input dtype), ``"bf16"``, ``"fp16"``, ``"fp32"``.
+            Default: ``"input"``.
+
+        dequant_output_dtype: Output dtype for the dequantized tensor.
+            One of ``"compute"`` (same as ``prefer_compute_dtype``), ``"bf16"``,
+            ``"fp16"``, ``"fp32"``.  Default: ``"fp32"``.
+
+        dequant_unpack_policy: Unpacking strategy selector.  One of
+            ``"auto"`` (use fast path when ``enable_u4_u8_fastpath=True``),
+            ``"fast"`` (force fast path), ``"generic"`` (force generic path).
+            Default: ``"auto"``.
+
+        minifloat_decode_policy: Decode strategy for FP4/FP8 codebooks.
+            One of ``"auto"`` (currently always table lookup), ``"table"``
+            (constant-memory gather), ``"arith"`` (arithmetic decode).
+            Default: ``"auto"``.
     """
 
     enable_u4_u8_fastpath: bool = True
@@ -45,7 +97,29 @@ class QuantRuntimeConfig:
         backend: str | None = None,
         keep_fp32_output: bool = False,
     ) -> "QuantRuntimeConfig":
-        """Return an aggressive throughput profile tuned for the current backend."""
+        """Return an aggressive throughput profile tuned for the current backend.
+
+        Selects reduced-precision compute and metadata dtypes to maximise
+        dequantization throughput:
+
+        - **TPU**: ``prefer_compute_dtype="bf16"``, ``affine_metadata_dtype="bf16"``.
+        - **GPU / MPS / CPU**: ``prefer_compute_dtype="fp16"``,
+          ``affine_metadata_dtype="fp16"``.
+
+        All fast-path flags (``enable_u4_u8_fastpath``,
+        ``enable_threshold_codebook``, ``strict_shape_alignment``) are enabled.
+
+        Args:
+            backend: JAX backend string (e.g., ``"tpu"``, ``"gpu"``,
+                ``"cuda"``).  When ``None``, the current default backend from
+                ``jax.default_backend()`` is used.
+            keep_fp32_output: If ``True``, forces the output dtype to
+                ``"fp32"`` regardless of the compute dtype.  Default
+                ``False`` (output dtype matches compute dtype).
+
+        Returns:
+            A :class:`QuantRuntimeConfig` with backend-appropriate settings.
+        """
         if backend is None:
             import jax
 
@@ -73,7 +147,15 @@ class QuantRuntimeConfig:
 
 
 def resolve_runtime_config(config: QuantRuntimeConfig | None) -> QuantRuntimeConfig:
-    """Return *config* or a backend-tuned fast config when omitted."""
+    """Return *config* unchanged, or a backend-tuned fast config when ``None``.
+
+    Args:
+        config: Explicit runtime config, or ``None`` to auto-select.
+
+    Returns:
+        The provided *config*, or ``QuantRuntimeConfig.fastest_for_backend()``
+        when *config* is ``None``.
+    """
     if config is None:
         return QuantRuntimeConfig.fastest_for_backend()
     return config

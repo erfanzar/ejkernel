@@ -108,7 +108,7 @@ class DecodeAttention(Kernel[DecodeAttentionConfig, tuple[Array, Array]]):
         num_kv_splits: int | None = None,
         page_size: int = 1,
         logits_soft_cap: float | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: DecodeAttentionConfig | None = None,
         mesh: Mesh | None = None,
         in_specs: tuple[PartitionSpec, ...] | None = None,
@@ -205,7 +205,7 @@ class DecodeAttention(Kernel[DecodeAttentionConfig, tuple[Array, Array]]):
         num_kv_splits: int | None = None,
         page_size: int = 1,
         logits_soft_cap: float | None = None,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: DecodeAttentionConfig,
     ) -> tuple[
         Float[Array, "batch num_q_heads head_dim"],
@@ -267,11 +267,23 @@ class DecodeAttention(Kernel[DecodeAttentionConfig, tuple[Array, Array]]):
         Returns:
             Default configuration with 16 KV splits and automatic platform selection.
         """
-        del inv
+        query = inv.kwargs["query"]
+        req_to_tokens = inv.kwargs["req_to_tokens"]
+        page_size = int(inv.kwargs.get("page_size", 1))
+        max_context = int(req_to_tokens.shape[1]) * page_size
+        if max_context <= 1024:
+            num_kv_splits = 1
+        elif max_context <= 4096:
+            num_kv_splits = 4
+        elif max_context <= 8192:
+            num_kv_splits = 8
+        else:
+            num_kv_splits = 16
+        head_dim = int(query.shape[-1])
         return DecodeAttentionConfig(
-            num_kv_splits=16,
-            num_warps=None,
-            num_stages=None,
+            num_kv_splits=num_kv_splits,
+            num_warps=8 if head_dim >= 128 else 4,
+            num_stages=2,
             platform="auto",
             backend="any",
         )
@@ -280,13 +292,97 @@ class DecodeAttention(Kernel[DecodeAttentionConfig, tuple[Array, Array]]):
         """Generate candidate configurations for autotuning.
 
         Args:
-            inv: Invocation context (unused).
+            inv: Invocation context.
 
         Returns:
-            Empty list (no autotuning candidates currently defined).
+            Portable XLA fallback candidates for non-GPU devices.
         """
-        del inv
-        return []
+        base = self.heuristic_cfg(inv)
+        return [
+            DecodeAttentionConfig(
+                num_kv_splits=base.num_kv_splits,
+                num_warps=base.num_warps,
+                num_stages=base.num_stages,
+                platform="auto",
+                backend="any",
+            ),
+            DecodeAttentionConfig(
+                num_kv_splits=base.num_kv_splits,
+                num_warps=base.num_warps,
+                num_stages=base.num_stages,
+                platform="xla",
+                backend="any",
+            ),
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[DecodeAttentionConfig, tuple[Array, Array]]):
+        """Generate GPU decode-attention candidates.
+
+        Triton candidates vary split-K parallelism plus warp/stage count.
+        TileLang candidates vary pipeline depth; XLA remains as a fallback.
+        """
+        query = inv.kwargs["query"]
+        req_to_tokens = inv.kwargs["req_to_tokens"]
+        page_size = int(inv.kwargs.get("page_size", 1))
+        requested = inv.kwargs.get("platform", None)
+        head_dim = int(query.shape[-1])
+        max_context = int(req_to_tokens.shape[1]) * page_size
+        split_choices = [1, 2, 4, 8, 16, 32]
+        split_choices = [s for s in split_choices if s <= max(1, max_context // 128)] or [1]
+        if max_context >= 8192 and 16 not in split_choices:
+            split_choices.append(16)
+        warps = (4, 8) if head_dim >= 128 else (2, 4)
+
+        candidates: list[DecodeAttentionConfig] = []
+        platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        if "triton" in platforms:
+            for splits in split_choices[:5]:
+                for num_warps in warps:
+                    candidates.append(
+                        DecodeAttentionConfig(
+                            num_kv_splits=splits,
+                            num_warps=num_warps,
+                            num_stages=2,
+                            platform="triton",
+                            backend="gpu",
+                        )
+                    )
+        if "tilelang" in platforms:
+            for num_stages in (2, 3, 4):
+                candidates.append(
+                    DecodeAttentionConfig(
+                        num_kv_splits=split_choices[min(len(split_choices) - 1, 3)],
+                        num_warps=4,
+                        num_stages=num_stages,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
+                )
+        if "xla" in platforms:
+            base = self.heuristic_cfg(inv)
+            candidates.append(
+                DecodeAttentionConfig(
+                    num_kv_splits=base.num_kv_splits,
+                    num_warps=base.num_warps,
+                    num_stages=base.num_stages,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[DecodeAttentionConfig, tuple[Array, Array]]):
+        """Return TPU candidates for the XLA fallback path."""
+        base = self.heuristic_cfg(inv)
+        return [
+            DecodeAttentionConfig(
+                num_kv_splits=base.num_kv_splits,
+                num_warps=base.num_warps,
+                num_stages=base.num_stages,
+                platform="xla",
+                backend="any",
+            )
+        ]
 
 
 _decode_attention_executor: Executor[DecodeAttentionConfig, tuple[Array, Array]] = Executor(
@@ -315,7 +411,7 @@ def decode_attention(
     num_kv_splits: int | None = None,
     page_size: int = 1,
     logits_soft_cap: float | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     mesh: Mesh | None = None,
     in_specs: tuple[PartitionSpec | None, ...] | None = None,
     out_specs: tuple[PartitionSpec, PartitionSpec] | None = None,

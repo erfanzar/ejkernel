@@ -79,23 +79,37 @@ from .types import Cfg, Out
 
 @dataclasses.dataclass(frozen=True)
 class Invocation(Generic[Cfg, Out]):
-    """Represents a specific call to a kernel with arguments and metadata.
+    """Immutable snapshot of a single kernel call, including its arguments and execution context.
 
-    This dataclass captures all the information needed to execute a kernel,
-    including arguments, configuration overrides, and execution metadata.
+    :class:`Invocation` is the unit of work flowing through the config-selection
+    and execution pipeline.  It is created by :class:`~ejkernel.ops.execution.Executor`
+    after calling :meth:`~ejkernel.ops.core.Kernel.prepare`, then passed to
+    :class:`~ejkernel.ops.config.ConfigSelectorChain` to look up or compute the
+    optimal configuration.
+
+    The :attr:`call_key` and :meth:`make_key` methods derive a stable hash from
+    argument shapes/dtypes (not values) so the same configuration can be reused
+    for different arrays that share the same structure.
 
     Attributes:
-        op_id: Unique identifier for the operation
-        args: Positional arguments for the kernel
-        kwargs: Keyword arguments for the kernel
-        batch_axes: Optional mapping of parameter names to batch axes for vmapping
-        override_cfg: Optional configuration to use instead of cached/computed ones
-        stamp: Whether to add profiling metadata to the operation
-        method: Execution method (e.g., "shard_map" or None for standard)
-        mesh: JAX mesh for shard_map execution
-        in_specs: Input partition specs for shard_map
-        out_specs: Output partition spec for shard_map
-        check_vma: Whether to check for valid memory access in shard_map
+        op_id: Unique operation identifier, used as part of the cache key.
+        args: Positional arguments for the kernel (after ``kernel.prepare()``).
+        kwargs: Keyword arguments for the kernel (after ``kernel.prepare()``).
+        batch_axes: Optional mapping of parameter names to batch axes, set when
+            the invocation is issued inside a vmap context.
+        override_cfg: If not ``None``, bypasses all cache and autotuning logic
+            and uses this configuration directly.  The chosen value is also
+            written back to the in-memory and persistent caches.
+        stamp: Whether :class:`~ejkernel.ops.execution.Executor` should inject
+            profiling metadata into the compiled graph (default ``True``).
+        method: Execution mode.  Currently the only non-default value is
+            ``'shard_map'``, which causes the executor to wrap the call with
+            ``jax.shard_map``.
+        mesh: :class:`jax.sharding.Mesh` required when ``method='shard_map'``.
+        in_specs: Per-argument ``PartitionSpec`` tuple for ``shard_map`` inputs.
+        out_specs: ``PartitionSpec`` for the ``shard_map`` output.
+        check_vma: Passed as ``check_vma`` to ``jax.shard_map``; when ``True``,
+            JAX verifies that non-sharded inputs are replicated across all devices.
     """
 
     op_id: str
@@ -162,39 +176,63 @@ class Invocation(Generic[Cfg, Out]):
 
 
 class Kernel(Generic[Cfg, Out]):
-    """Abstract base class for implementing custom JAX operations with configuration management.
+    """Abstract base class for configurable JAX operations with autotuning support.
 
-    A Kernel encapsulates the logic for a specific operation, including how to execute it
-    with different configurations, what configurations are available, and optionally how
-    to compute custom gradients.
+    A :class:`Kernel` encapsulates the logic for a single operation together
+    with all the information required to select, cache, and validate its
+    execution configuration.  Subclasses are registered with an
+    :class:`~ejkernel.ops.execution.Executor` that handles the full lifecycle:
 
-    Required methods to implement:
-        run: Execute the operation with a given configuration
-        heuristic_cfg: Provide a reasonable default configuration
+    1. **Preprocessing** — :meth:`prepare` transforms raw call arguments.
+    2. **Config selection** — :class:`~ejkernel.ops.config.ConfigSelectorChain`
+       looks up or autotuners the best :class:`Cfg`.
+    3. **Execution** — :meth:`run` (or a context/platform-specific variant) is
+       called with the chosen config.
+    4. **Gradients** — if :meth:`fwd_with_residuals` and :meth:`vjp` are both
+       overridden, JAX's ``custom_vjp`` mechanism is used automatically.
 
-    Optional methods:
-        prepare: Preprocess arguments before execution
-        candidate_cfgs: Provide alternative configurations for autotuning
-        fwd_with_residuals: Forward pass with residuals for custom VJP
-        vjp: Backward pass for custom VJP
-        run_shard_map: Specialized execution for shard_map contexts
-        fwd_with_residuals_shard_map: Forward pass with residuals for shard_map
-        vjp_shard_map: Backward pass for shard_map
+    **Required overrides:**
 
-    Method Naming Convention:
-        - Platform-specific: {method}_{platform} (e.g., run_gpu, run_tpu)
-        - Context-specific: {method}_{context} (e.g., run_shard_map)
-        - Composite: {method}_{context}_{platform} (e.g., run_shard_map_gpu)
+    * :meth:`run` — core computation.
+    * :meth:`heuristic_cfg` — fast, always-correct default configuration.
 
-        Platforms: 'gpu', 'tpu', 'cpu' (hardware backends)
-        Contexts: 'shard_map' (execution modes/environments)
+    **Optional overrides:**
 
-        Priority: composite > context > platform > generic
+    * :meth:`prepare` — argument preprocessing / validation.
+    * :meth:`candidate_cfgs` — configurations to benchmark during autotuning.
+    * :meth:`fwd_with_residuals` + :meth:`vjp` — custom gradient pair.
+    * ``run_{context}``, ``run_{platform}``, ``run_{context}_{platform}`` — specialised
+      execution variants (see method-naming convention below).
+    * Same naming pattern for ``fwd_with_residuals`` / ``vjp`` variants.
+
+    **Method-naming convention:**
+
+    The execution system resolves the most specific available method at runtime
+    using :func:`_get_platform_method`:
+
+    ============================================  ================================
+    Name pattern                                  Example
+    ============================================  ================================
+    ``{method}_{context}_{platform}`` (highest)  ``run_shard_map_gpu``
+    ``{method}_{context}``                        ``run_shard_map``
+    ``{method}_{platform}``                       ``run_gpu``
+    ``{method}`` (lowest / generic)               ``run``
+    ============================================  ================================
+
+    Known platforms: ``'gpu'``, ``'tpu'``, ``'cpu'``.
+    Known contexts: ``'shard_map'``.
 
     Attributes:
-        op_id: Unique identifier for this operation
-        key_builder: Optional custom function to generate cache keys
-        version: Version string for cache invalidation
+        op_id: Unique string identifier for this operation.  Used as part of
+            every cache key and in profiling labels.  May be set as a class
+            attribute or passed to :meth:`__init__`.
+        key_builder: Optional callable ``(Invocation) -> str`` for generating
+            custom cache keys.  Useful when sharding or other metadata not
+            captured by the default hash should affect caching.
+        version: String version tag appended to ``op_id`` in cache keys as
+            ``"{op_id}@v{version}"``.  Increment this to invalidate existing
+            cached configurations when the kernel implementation changes
+            (default: ``"0"``).
     """
 
     op_id: str
@@ -402,29 +440,30 @@ class Kernel(Generic[Cfg, Out]):
     def run_shard_map(self, *args, cfg: Cfg, **kwargs) -> Out:
         """Execute the operation within a shard_map context. Optional override.
 
-        This method can be implemented to provide a specialized version of the
-        operation that runs efficiently within JAX's shard_map context. If not
-        implemented, the regular run() method will be used as fallback.
+        Implement this method to provide a version of the operation that runs
+        efficiently inside ``jax.shard_map``.  When this override is present,
+        :func:`_get_platform_method` will select it over the generic :meth:`run`
+        whenever ``context='shard_map'`` (i.e. when the executor is called with
+        ``method='shard_map'``).
+
+        If this method is not overridden, the execution system falls back to the
+        generic :meth:`run` method.
 
         Args:
-            *args: Positional arguments (after prepare() preprocessing)
-            cfg: Configuration object specifying how to execute the operation
-            **kwargs: Keyword arguments (after prepare() preprocessing)
+            *args: Positional arguments (after :meth:`prepare` preprocessing).
+            cfg: Configuration object specifying how to execute the operation.
+            **kwargs: Keyword arguments (after :meth:`prepare` preprocessing).
 
         Returns:
-            Result of the operation
+            Result of the operation.
 
         Raises:
-            NotImplementedError: Only implement if providing shard_map-specific execution
+            NotImplementedError: Base implementation raises this; override in
+                subclasses to provide shard_map-specific execution.
 
         Example:
             >>> def run_shard_map(self, x, y, cfg: MatMulConfig) -> jax.Array:
-            ...
             ...     return custom_sharded_matmul(x, y, cfg)
-
-        Note:
-            This method is automatically detected by _get_platform_method() and
-            used when 'shard_map' is specified as the platform.
         """
         raise NotImplementedError
 
@@ -635,20 +674,30 @@ def _has_custom_vjp(
     platform: str | None = None,
     context: str | None = None,
 ) -> bool:
-    """Check if a kernel has implemented custom VJP (vector-Jacobian product) methods.
+    """Determine whether a kernel provides a custom VJP implementation.
 
-    Returns True if both fwd_with_residuals and vjp methods have been overridden
-    from the base Kernel class. Supports context and platform-specific methods
-    (e.g., fwd_with_residuals_shard_map_gpu).
+    Returns ``True`` if *both* the ``fwd_with_residuals`` and ``vjp`` methods
+    (or their context/platform-specific variants) have been overridden from the
+    base :class:`Kernel` stubs.  The same priority chain as
+    :func:`_get_platform_method` is followed:
+
+    1. Composite ``{method}_{context}_{platform}`` pair (e.g.
+       ``fwd_with_residuals_shard_map_gpu`` + ``vjp_shard_map_gpu``).
+    2. Context-specific pair (e.g. ``fwd_with_residuals_shard_map`` + ``vjp_shard_map``).
+    3. Platform-specific pair (e.g. ``fwd_with_residuals_gpu`` + ``vjp_gpu``).
+    4. Generic pair (``fwd_with_residuals`` + ``vjp``).
+
+    *Both* methods of a pair must be overridden; overriding only one is not
+    sufficient.
 
     Args:
-        k: Kernel instance to check
-        platform: Optional platform identifier (e.g., 'gpu', 'tpu', 'cpu')
-        context: Optional execution context (e.g., 'shard_map')
+        k: Kernel instance to inspect.
+        platform: Optional platform identifier (e.g. ``'gpu'``, ``'tpu'``, ``'cpu'``).
+        context: Optional execution-context identifier (e.g. ``'shard_map'``).
 
     Returns:
-        True if kernel has custom VJP implementation (generic, context-specific,
-        platform-specific, or composite)
+        ``True`` if the kernel provides a matching custom VJP pair at any
+        specificity level; ``False`` otherwise (including on ``AttributeError``).
     """
     try:
         if context and platform:
@@ -704,27 +753,37 @@ def _get_platform_method(
     platform: str | None = None,
     context: str | None = None,
 ) -> Callable | None:
-    """Get context and platform-specific method from kernel, with fallback hierarchy.
+    """Look up the most specific method override on a kernel, following the priority chain.
 
-    Supports execution contexts (like 'shard_map') combined with hardware platforms
-    (like 'gpu', 'tpu', 'cpu'). The lookup follows this priority:
-    1. {method}_{context}_{platform} (e.g., run_shard_map_gpu)
-    2. {method}_{context} (e.g., run_shard_map)
-    3. {method}_{platform} (e.g., run_gpu)
-    4. {method} (e.g., run)
+    Supports execution contexts (e.g. ``'shard_map'``) combined with hardware
+    platforms (e.g. ``'gpu'``, ``'tpu'``, ``'cpu'``).  The lookup priority is:
+
+    1. ``{method}_{context}_{platform}`` — e.g. ``run_shard_map_gpu``
+    2. ``{method}_{context}``           — e.g. ``run_shard_map``
+    3. ``{method}_{platform}``          — e.g. ``run_gpu``
+    4. ``{method}``                     — e.g. ``run`` (generic fallback)
+
+    A method is only considered an "override" if it is not the same object as
+    the corresponding method on the base :class:`Kernel` class.  This prevents
+    the base ``NotImplementedError`` stubs from being returned as valid overrides.
 
     Args:
-        k: Kernel instance
-        method_name: Base method name (e.g., 'run', 'candidate_cfgs', 'fwd_with_residuals')
-        platform: Optional platform identifier (e.g., 'gpu', 'tpu', 'cpu')
-        context: Optional execution context (e.g., 'shard_map')
+        k: Kernel instance to inspect.
+        method_name: Base method name (e.g. ``'run'``, ``'candidate_cfgs'``,
+            ``'fwd_with_residuals'``).
+        platform: Optional platform identifier (``'gpu'``, ``'tpu'``, ``'cpu'``).
+            Derived from :func:`~ejkernel.ops.utils.fingerprint.get_device_platform`.
+        context: Optional execution-context identifier (currently only
+            ``'shard_map'`` is recognised).
 
     Returns:
-        Most specific available method, or None if no override exists
+        The most specific bound method that overrides the base class, or ``None``
+        if no override exists at any priority level.
 
     Example:
-        >>>
         >>> method = _get_platform_method(kernel, 'run', platform='gpu', context='shard_map')
+        >>> if method:
+        ...     result = method(*args, cfg=cfg)
     """
 
     if context and platform:

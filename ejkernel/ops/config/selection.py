@@ -194,7 +194,15 @@ class forward_autotune_only:
 
 
 def _is_backward_autotune_enabled() -> bool:
-    """Return whether backward validation is currently enabled for autotune."""
+    """Return whether backward-pass validation is currently enabled for autotuning.
+
+    Reads the ``_backward_autotune_enabled`` context variable which is set to
+    ``False`` by :class:`forward_autotune_only` context managers.
+
+    Returns:
+        True unless :class:`forward_autotune_only` is active in the current
+        context, in which case False.
+    """
     return bool(_backward_autotune_enabled.get())
 
 
@@ -256,13 +264,24 @@ def set_autotune_progress(enabled: bool = True) -> None:
 
 
 class Tuner(Generic[Cfg]):
-    """Performance benchmarking and autotuning for kernel configurations.
+    """Performance benchmarking engine used by :class:`ConfigSelectorChain`.
 
-    Measures execution time of different configurations and selects the fastest one.
+    Compiles each candidate configuration under ``jax.jit``, runs warmup
+    iterations to let the XLA runtime reach steady-state, and then times
+    ``iters`` iterations.  The measured average is compared across all
+    candidates and the fastest is returned.
+
+    Deep-flattening of ``(args, kwargs)`` ensures that only array leaves are
+    dynamic JIT parameters; everything else (dtypes, strings, callables) is
+    captured as a Python constant so comparisons are JIT-stable.
+
+    When ``_ejk_validate_backward=True`` is set on the function tag, the tuner
+    differentiates a scalar sum-reduction loss over the output and times the
+    resulting gradient computation instead of the forward pass alone.
 
     Attributes:
-        warmup: Number of warmup iterations before timing
-        iters: Number of timing iterations to average over
+        warmup: Number of warmup iterations before timing begins (default: 1).
+        iters: Number of timed iterations; the average is reported (default: 3).
     """
 
     def __init__(self, warmup=1, iters=3):
@@ -298,7 +317,7 @@ class Tuner(Generic[Cfg]):
         """
 
         def _is_arrayish(x) -> bool:
-            """Check if a value is an array-like object (JAX Array, NumPy array, or JAX Tracer)."""
+            """Return True for JAX Arrays, NumPy arrays, and JAX Tracers (abstract values)."""
             return isinstance(x, jax.Array | np.ndarray) or isinstance(x, jcore.Tracer)
 
         def _to_concrete(x):
@@ -688,7 +707,7 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
             kw = dict(inv.kwargs)
 
             def _is_arrayish(x) -> bool:
-                """Check if a value is an array-like object for argument partitioning."""
+                """Return True for JAX Arrays, NumPy arrays, and JAX Tracers."""
                 return isinstance(x, jax.Array | np.ndarray) or isinstance(x, jcore.Tracer)
 
             static_fun_kwargs = {k: v for k, v in kw.items() if callable(v)}
@@ -703,10 +722,10 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                     )
 
                 def mk(c, _static=static_fun_kwargs):
-                    """Create a shard_map-wrapped function for benchmarking a specific configuration."""
+                    """Return a callable that benchmarks the kernel under shard_map with config ``c``."""
 
                     def f(*a, **k):
-                        """Execute the shard_map wrapper with the bound config and process callback."""
+                        """Build the shard_map wrapper for config ``c`` and run it, applying any callback."""
                         callback = None
                         eagers = kernel.create_shard_map_wrapper(
                             *a,
@@ -736,10 +755,10 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
                 run_method = _get_platform_method(kernel, "run", platform, context) or kernel.run
 
                 def mk(c, _run=run_method, _static=static_fun_kwargs):
-                    """Create a function that executes the kernel run method with a specific config."""
+                    """Return a callable that benchmarks ``kernel.run`` with config ``c``."""
 
                     def f(*a, **k):
-                        """Execute the run method with the bound configuration and static kwargs."""
+                        """Call the resolved run method with config ``c`` and closed-over static kwargs."""
                         return _run(*a, cfg=c, **(k | _static))
 
                     f._ejk_method = "regular"
@@ -792,13 +811,22 @@ class ConfigSelectorChain(Generic[Cfg, Out]):
         raise RuntimeError("No config found: override/overlay/cache/persistent/autotune/heuristics all unavailable.")
 
     def _emit(self, event: str, **data):
-        """Emit selection event for monitoring and debugging.
+        """Invoke the optional monitoring callback with a selection event.
 
-        Calls the configured event callback with selection information.
+        Called at every decision point inside :meth:`choose` so that callers
+        can trace cache hits, autotune starts/finishes, heuristic fallbacks,
+        and errors without instrumenting the selector themselves.
 
         Args:
-            event: Event type (e.g., 'cache_hit', 'autotune_start', 'error')
-            **data: Additional event data (device, op_id, call_key, etc.)
+            event: Event type string.  Known values:
+                ``'override'``, ``'overlay_hit'``, ``'cache_hit'``,
+                ``'autotune_start'``, ``'autotune_finish'``,
+                ``'heuristics'``, ``'error'``.
+            **data: Event-specific keyword arguments, which vary by event but
+                always include ``device``, ``op_id``, and ``call_key``.
+
+        Note:
+            Does nothing when :attr:`on_event` is ``None`` (the default).
         """
         if self.on_event:
             self.on_event(event, **data)

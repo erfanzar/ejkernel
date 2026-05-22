@@ -19,14 +19,21 @@ This module provides a comprehensive configuration selection and caching system
 with multiple fallback layers and automatic performance tuning capabilities.
 
 Classes:
-    ConfigCache: In-memory configuration cache
-    PersistentCache: Disk-based configuration persistence
-    ConfigSelectorChain: Multi-tier configuration selection system
-    AutotunePolicy: Policy configuration for autotuning behavior
-    Tuner: Performance benchmarking and autotuning
-    overlay_cache: Context manager for temporary cache overrides
-    policy_override: Context manager for temporary policy changes
-    forward_autotune_only: Context manager to force forward-only autotuning
+    ConfigCache: In-memory configuration cache keyed by (device, op_id, call_key).
+    PersistentCache: Disk-based configuration persistence using JSON files.
+    ConfigSelectorChain: Multi-tier configuration selection with a fallback chain
+        (override → overlay → memory cache → persistent cache → autotune → heuristics).
+    AutotunePolicy: Dataclass controlling autotuning behavior (allow_autotune,
+        allow_heuristics, cache_miss_fallback, validate_backward).
+    Tuner: Performance benchmarking engine used by ConfigSelectorChain to rank
+        candidate configurations.
+    overlay_cache: Context manager for temporary in-process cache overrides.
+    policy_override: Context manager for temporary AutotunePolicy changes.
+    forward_autotune_only: Context manager that suppresses backward-pass timing
+        during autotuning even when AutotunePolicy.validate_backward is True.
+    log_autotune_progress: Context manager that enables tqdm progress bars during
+        autotuning (also controllable via EJKERNEL_AUTOTUNE_PROGRESS=1).
+    set_autotune_progress: Imperative toggle for autotune progress bars.
 """
 
 from .cache import ConfigCache, overlay_cache

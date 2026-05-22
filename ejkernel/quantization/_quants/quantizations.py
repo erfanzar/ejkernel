@@ -415,7 +415,21 @@ def _to_quant_layout(w: jax.Array, axis: QuantizationAxis) -> jax.Array:
 
 
 def _resolve_affine_metadata_dtype(w_layout: jax.Array, runtime_cfg: QuantRuntimeConfig) -> jnp.dtype:
-    """Resolve storage dtype for affine scales/zeros metadata."""
+    """Resolve storage dtype for affine scales/zeros metadata.
+
+    Args:
+        w_layout: Weight tensor in quantization layout.  Its dtype is used
+            when ``runtime_cfg.affine_metadata_dtype == "input"``.
+        runtime_cfg: Runtime config whose ``affine_metadata_dtype`` field
+            selects the storage dtype.
+
+    Returns:
+        JAX dtype for scale/zero-point storage.
+
+    Raises:
+        ValueError: If ``affine_metadata_dtype`` is not one of ``{"input",
+            "bf16", "fp16", "fp32"}``.
+    """
     mode = runtime_cfg.affine_metadata_dtype
     if mode == "input":
         return w_layout.dtype
@@ -434,7 +448,23 @@ def _pack_group_codes(
     bits: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> jax.Array:
-    """Pack grouped quantization codes into uint32 storage layout."""
+    """Pack grouped quantization codes into uint32 storage layout.
+
+    Reshapes the code tensor to match the original weight layout (before
+    grouping) then delegates to :func:`_pack_bits`.
+
+    Args:
+        w_layout: Weight tensor in quantization layout (used for shape
+            reference only; its data is not read).
+        q: uint32 array of quantization codes with shape
+            ``(*w_layout.shape[:-1], n_groups, group_size)``.
+        bits: Number of bits per code.
+        runtime_cfg: Runtime config forwarded to ``_pack_bits``.
+
+    Returns:
+        Packed uint32 array of shape
+        ``(*w_layout.shape[:-1], ceil(n_values / (32 // bits)))``.
+    """
     return _pack_bits(
         q.reshape(*w_layout.shape[:-1], -1),
         bits,
@@ -444,7 +474,12 @@ def _pack_group_codes(
 
 
 def _use_argmin_codebook(runtime_cfg: QuantRuntimeConfig) -> bool:
-    """Select reference argmin codebook quantization when requested."""
+    """Return ``True`` when the slow argmin codebook path should be used.
+
+    The argmin path is selected when ``enable_parity_fallback=True`` (explicit
+    parity mode) or when ``enable_threshold_codebook=False`` (threshold codebook
+    disabled).
+    """
     return runtime_cfg.enable_parity_fallback or not runtime_cfg.enable_threshold_codebook
 
 
@@ -455,7 +490,28 @@ def _quantize_affine(
     bits: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Quantize groups with affine (scale + zero-point) metadata."""
+    """Quantize groups with affine (scale + zero-point) metadata.
+
+    For each group the per-group min/max determine:
+    - ``scale = (max - min) / (2^bits - 1)``  (clipped to 1 when zero)
+    - ``zero  = -min / scale``
+
+    Quantization formula: ``q = clip(round(w / scale + zero), 0, 2^bits - 1)``
+
+    Dequantization (inverse): ``w ≈ (q - zero) * scale``
+
+    Args:
+        w_layout: Weight tensor in quantization layout (shape reference).
+        w_groups: Weight tensor reshaped as ``(..., n_groups, group_size)``.
+        bits: Bit-width.  Controls the dynamic range ``[0, 2^bits - 1]``.
+        runtime_cfg: Runtime config.  Affects metadata dtype and pack strategy.
+
+    Returns:
+        Tuple of ``(packed_data, scales, zeros)``:
+        - ``packed_data``: uint32, shape ``(*w_layout.shape[:-1], n_words)``.
+        - ``scales``: float, shape ``(*w_layout.shape[:-1], n_groups)``.
+        - ``zeros``: float, same shape as ``scales``.
+    """
     qmax = 2**bits - 1
     meta_dtype = _resolve_affine_metadata_dtype(w_layout, runtime_cfg)
     alpha = jnp.max(w_groups, axis=-1)
@@ -478,7 +534,28 @@ def _quantize_nf4(
     bits: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> tuple[jax.Array, jax.Array]:
-    """Quantize groups into NF4 codebook indices and per-group absmax scales."""
+    """Quantize groups into NF4 codebook indices and per-group absmax scales.
+
+    Normalizes each group by its absolute-maximum value (so each element lies
+    in ``[-1, 1]``), then maps to the nearest NF4 codebook entry using the
+    configured search strategy (threshold or argmin).
+
+    Dequantization: ``w ≈ nf4_table[q] * scale``
+
+    Args:
+        w_layout: Weight tensor in quantization layout (shape reference).
+        w_groups: Weight tensor reshaped as ``(..., n_groups, group_size)``.
+        bits: Must be 4 (NF4 always uses 4-bit codes); passed through for
+            consistency with other quantize helpers.
+        runtime_cfg: Runtime config.  Controls codebook search strategy and
+            pack fast path.
+
+    Returns:
+        Tuple of ``(packed_data, scales)``:
+        - ``packed_data``: uint32 packed codes.
+        - ``scales``: float, per-group absmax values with same dtype as
+          ``w_layout``.
+    """
     codebook = _get_nf4_table()
     nf4_sorted_idx, nf4_boundaries = _get_nf4_threshold_map()
     max_abs = jnp.max(jnp.abs(w_groups), axis=-1)
@@ -502,7 +579,28 @@ def _quantize_mxfp(
     bits: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> tuple[jax.Array, jax.Array]:
-    """Quantize groups using MXFP shared-exponent scaling."""
+    """Quantize groups using MXFP shared-exponent scaling.
+
+    Computes a per-group shared exponent ``exp = ceil(log2(max_abs / vmax))``
+    (clipped to the int8 range ``[-128, 127]``), then normalizes each group by
+    ``2^exp`` and maps to the nearest E2M1 (4-bit) or E4M3 (8-bit) codebook
+    entry.
+
+    Dequantization: ``w ≈ e2m1_or_e4m3_table[q] * 2^exp``
+
+    Args:
+        w_layout: Weight tensor in quantization layout (shape reference).
+        w_groups: Weight tensor reshaped as ``(..., n_groups, group_size)``.
+        bits: 4 for MXFP4 (E2M1 codes) or 8 for MXFP8 (E4M3 codes).
+        runtime_cfg: Runtime config.  Controls codebook search strategy and
+            pack fast path.
+
+    Returns:
+        Tuple of ``(packed_data, scales)``:
+        - ``packed_data``: uint32 packed E2M1 or E4M3 codes.
+        - ``scales``: uint8 per-group shared exponents (int8 interpreted
+          as uint8 for storage).
+    """
     max_abs = jnp.max(jnp.abs(w_groups), axis=-1)
     if bits == 4:
         vmax = _get_e2m1_max()
@@ -537,7 +635,32 @@ def _quantize_nvfp(
     bits: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> tuple[jax.Array, jax.Array]:
-    """Quantize groups using NVFP value codes and E4M3 quantized scales."""
+    """Quantize groups using NVFP value codes and E4M3 quantized scales.
+
+    Unlike MXFP, NVFP stores a *quantized* (E4M3-coded) scale rather than a
+    raw shared exponent:
+
+    1. Compute ``scale_raw = max_abs / vmax``.
+    2. Quantize ``scale_raw`` into an E4M3 index and decode back to float.
+    3. Normalize each group element by the decoded scale.
+    4. Quantize each element into the target code (E2M1 for 4-bit, E4M3 for
+       8-bit).
+
+    Dequantization:
+    ``w ≈ q_table[q] * e4m3_table[scale_q]``
+
+    Args:
+        w_layout: Weight tensor in quantization layout (shape reference).
+        w_groups: Weight tensor reshaped as ``(..., n_groups, group_size)``.
+        bits: 4 for NVFP4 (E2M1 value codes) or 8 for NVFP8 (E4M3 value codes).
+        runtime_cfg: Runtime config.  Controls codebook search strategy and
+            pack fast path.
+
+    Returns:
+        Tuple of ``(packed_data, scales)``:
+        - ``packed_data``: uint32 packed E2M1 or E4M3 value codes.
+        - ``scales``: uint8 per-group E4M3 scale codes.
+    """
     scale_sorted_idx, scale_boundaries = _get_e4m3_q_threshold_map()
     if bits == 4:
         vmax = _get_e2m1_max()
@@ -576,7 +699,18 @@ def _quantize_nvfp(
 
 
 def _resolve_compute_dtype(runtime_cfg: QuantRuntimeConfig) -> jnp.dtype:
-    """Resolve arithmetic dtype for dequantization math."""
+    """Resolve arithmetic dtype for dequantization math.
+
+    Args:
+        runtime_cfg: Config whose ``prefer_compute_dtype`` field is read.
+
+    Returns:
+        JAX dtype for intermediate arithmetic.
+
+    Raises:
+        ValueError: If ``prefer_compute_dtype`` is not ``"bf16"``, ``"fp16"``,
+            or ``"fp32"``.
+    """
     mode = runtime_cfg.prefer_compute_dtype
     if mode == "bf16":
         return jnp.bfloat16
@@ -588,7 +722,20 @@ def _resolve_compute_dtype(runtime_cfg: QuantRuntimeConfig) -> jnp.dtype:
 
 
 def _resolve_dequant_output_dtype(runtime_cfg: QuantRuntimeConfig, compute_dtype: jnp.dtype) -> jnp.dtype:
-    """Resolve output dtype for dequantized tensors."""
+    """Resolve output dtype for dequantized tensors.
+
+    Args:
+        runtime_cfg: Config whose ``dequant_output_dtype`` field is read.
+        compute_dtype: The resolved compute dtype (used when
+            ``dequant_output_dtype == "compute"``).
+
+    Returns:
+        JAX dtype for the dequantized output tensor.
+
+    Raises:
+        ValueError: If ``dequant_output_dtype`` is not one of
+            ``{"compute", "bf16", "fp16", "fp32"}``.
+    """
     mode = runtime_cfg.dequant_output_dtype
     if mode == "compute":
         return compute_dtype
@@ -608,7 +755,31 @@ def _prefer_fast_unpack(
     bits: int,
     batch_size_hint: int,
 ) -> bool:
-    """Select fast-vs-generic unpack strategy for dequantization."""
+    """Return ``True`` to select the fast grouped unpack path.
+
+    The decision is driven by ``runtime_cfg.dequant_unpack_policy``:
+
+    - ``"fast"``: always use the fast path (when
+      ``enable_u4_u8_fastpath=True``).
+    - ``"generic"``: always use the generic scatter/gather path.
+    - ``"auto"``: equivalent to the fast path when
+      ``enable_u4_u8_fastpath=True``.
+
+    Args:
+        runtime_cfg: Runtime config.
+        mode: Quantization mode (currently unused; reserved for future
+            per-mode dispatch).
+        bits: Bit-width (currently unused; reserved for future dispatch).
+        batch_size_hint: Product of leading dimensions (currently unused;
+            reserved for future batch-size-aware dispatch).
+
+    Returns:
+        ``True`` to use the fast grouped unpacker.
+
+    Raises:
+        ValueError: If ``dequant_unpack_policy`` is not one of
+            ``{"auto", "fast", "generic"}``.
+    """
     del mode, bits, batch_size_hint
     policy = runtime_cfg.dequant_unpack_policy
     if policy == "fast":
@@ -621,7 +792,23 @@ def _prefer_fast_unpack(
 
 
 def _prefer_arith_minifloat_decode(runtime_cfg: QuantRuntimeConfig) -> bool:
-    """Select arithmetic decode over table lookup for FP4/FP8 codebooks."""
+    """Return ``True`` to use arithmetic decode instead of table lookup.
+
+    Table lookup (the default) maps integer codes through a pre-computed
+    float32 table via gather.  Arithmetic decode reconstructs float values
+    from sign/exponent/mantissa fields using bitwise ops.
+
+    The choice is driven by ``runtime_cfg.minifloat_decode_policy``:
+
+    - ``"arith"``: always use arithmetic decode.
+    - ``"table"``: always use table lookup.
+    - ``"auto"``: currently always returns ``False`` (table lookup), as table
+      lookup maps well to constant-memory gathers on GPU.
+
+    Raises:
+        ValueError: If ``minifloat_decode_policy`` is not one of
+            ``{"auto", "table", "arith"}``.
+    """
     policy = runtime_cfg.minifloat_decode_policy
     if policy == "arith":
         return True
@@ -642,7 +829,24 @@ def _unpack_groups(
     bits: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> tuple[jax.Array, int]:
-    """Unpack bitpacked codes and reshape to ``(..., n_groups, group_size)``."""
+    """Unpack bitpacked codes and reshape to ``(..., n_groups, group_size)``.
+
+    Args:
+        w_q: Packed uint32 array from :func:`quantize`.
+        scales: Per-group scale array.  Its shape is used to infer the number
+            of groups (``n_groups = scales.shape[-1]``).
+        mode: Quantization mode (forwarded to ``_prefer_fast_unpack``).
+        group_size: Number of elements per group.
+        bits: Bits per code.
+        runtime_cfg: Runtime config controlling the unpack strategy.
+
+    Returns:
+        Tuple of ``(codes, n)`` where:
+        - ``codes``: uint32 array of shape
+          ``(*scales.shape[:-1], n_groups, group_size)``.
+        - ``n``: total number of dequantized values
+          (``n_groups * group_size``).
+    """
     n_groups = scales.shape[-1]
     n = n_groups * group_size
     batch_size_hint = 1
@@ -672,7 +876,22 @@ def _dequantize_affine_bits(
     bits: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> jax.Array:
-    """Affine dequantization specialized by static bit-width."""
+    """Affine dequantization specialized by static bit-width.
+
+    Formula: ``w ≈ (q - zero) * scale``
+
+    Args:
+        w_q: Packed uint32 codes.
+        scales: Float per-group scales.
+        zeros: Float per-group zero-points (same shape as *scales*).
+        group_size: Elements per group.
+        bits: Bit-width of the stored codes.
+        runtime_cfg: Controls compute/output dtypes and unpack strategy.
+
+    Returns:
+        Dequantized float array of shape
+        ``(*scales.shape[:-1], n_groups * group_size)``.
+    """
     compute_dtype = _resolve_compute_dtype(runtime_cfg)
     output_dtype = _resolve_dequant_output_dtype(runtime_cfg, compute_dtype)
     q, n = _unpack_groups(w_q, scales, mode="affine", group_size=group_size, bits=bits, runtime_cfg=runtime_cfg)
@@ -692,7 +911,20 @@ def _dequantize_nf4(
     group_size: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> jax.Array:
-    """NF4 dequantization hot path."""
+    """NF4 dequantization: table lookup then scale by per-group absmax.
+
+    Formula: ``w ≈ nf4_table[q] * scale``
+
+    Args:
+        w_q: Packed uint32 NF4 codes.
+        scales: Float per-group absmax scales.
+        group_size: Elements per group.
+        runtime_cfg: Controls compute/output dtypes and unpack strategy.
+
+    Returns:
+        Dequantized float array of shape
+        ``(*scales.shape[:-1], n_groups * group_size)``.
+    """
     compute_dtype = _resolve_compute_dtype(runtime_cfg)
     output_dtype = _resolve_dequant_output_dtype(runtime_cfg, compute_dtype)
     q, n = _unpack_groups(w_q, scales, mode="nf4", group_size=group_size, bits=4, runtime_cfg=runtime_cfg)
@@ -713,7 +945,26 @@ def _dequantize_mxfp_bits(
     bits: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> jax.Array:
-    """MXFP dequantization specialized for 4-bit/8-bit payloads."""
+    """MXFP dequantization specialized for 4-bit (E2M1) or 8-bit (E4M3) payloads.
+
+    Decodes E2M1 or E4M3 codes (via lookup or arithmetic) then scales by
+    ``2^exp`` using :func:`jnp.ldexp` for integer exponents.
+
+    Formula: ``w ≈ e2m1_or_e4m3_table[q] * 2^exp``
+
+    Args:
+        w_q: Packed uint32 E2M1 or E4M3 codes.
+        scales: uint8 per-group shared exponents (stored as uint8; cast to
+            int8 before use).
+        group_size: Elements per group.
+        bits: 4 for MXFP4 or 8 for MXFP8.
+        runtime_cfg: Controls compute/output dtypes, unpack, and decode
+            strategy.
+
+    Returns:
+        Dequantized float array of shape
+        ``(*scales.shape[:-1], n_groups * group_size)``.
+    """
     compute_dtype = _resolve_compute_dtype(runtime_cfg)
     output_dtype = _resolve_dequant_output_dtype(runtime_cfg, compute_dtype)
     q, n = _unpack_groups(
@@ -751,7 +1002,24 @@ def _dequantize_nvfp_bits(
     bits: int,
     runtime_cfg: QuantRuntimeConfig,
 ) -> jax.Array:
-    """NVFP dequantization specialized for 4-bit/8-bit payloads."""
+    """NVFP dequantization specialized for 4-bit (E2M1) or 8-bit (E4M3) payloads.
+
+    Decodes E4M3 scale codes and E2M1/E4M3 value codes then multiplies:
+
+    Formula: ``w ≈ q_table[q] * e4m3_table[scale_q]``
+
+    Args:
+        w_q: Packed uint32 E2M1 or E4M3 value codes.
+        scales: uint8 per-group E4M3 scale codes.
+        group_size: Elements per group.
+        bits: 4 for NVFP4 or 8 for NVFP8.
+        runtime_cfg: Controls compute/output dtypes, unpack, and decode
+            strategy.
+
+    Returns:
+        Dequantized float array of shape
+        ``(*scales.shape[:-1], n_groups * group_size)``.
+    """
     compute_dtype = _resolve_compute_dtype(runtime_cfg)
     output_dtype = _resolve_dequant_output_dtype(runtime_cfg, compute_dtype)
     q, n = _unpack_groups(
@@ -994,7 +1262,19 @@ def dequantize(
 
 
 def _resolve_matmul_align_multiple(align_multiple: int | None) -> int:
-    """Resolve K/N alignment multiple for dense dequantize-then-matmul path."""
+    """Resolve K/N padding multiple for the dense dequantize-then-matmul path.
+
+    Reads ``EJKERNEL_QMM_ALIGN_MULTIPLE`` from the environment when
+    *align_multiple* is ``None`` and no env var is set.  Backend-specific
+    defaults: 128 on GPU/TPU/MPS, 0 (no alignment) on CPU.
+
+    Args:
+        align_multiple: Explicit padding multiple, or ``None`` to use the
+            environment variable / backend default.
+
+    Returns:
+        Non-negative int alignment multiple.  0 or 1 means no padding.
+    """
     if align_multiple is not None:
         return max(0, int(align_multiple))
     env = os.getenv("EJKERNEL_QMM_ALIGN_MULTIPLE")
@@ -1007,7 +1287,20 @@ def _resolve_matmul_align_multiple(align_multiple: int | None) -> int:
 
 
 def _pad_axis_to_multiple(x: jax.Array, axis: int, multiple: int) -> tuple[jax.Array, int]:
-    """Pad *x* along *axis* to a given multiple, returning (padded, original_size)."""
+    """Pad *x* along *axis* to the nearest multiple, returning ``(padded, original_size)``.
+
+    Does nothing when ``multiple <= 1`` or when the dimension is already
+    aligned.
+
+    Args:
+        x: Input array.
+        axis: Axis to pad (negative indices supported).
+        multiple: Target alignment multiple.
+
+    Returns:
+        Tuple of ``(padded_array, original_size)`` where ``original_size`` is
+        the un-padded size along ``axis``.
+    """
     if multiple <= 1:
         return x, int(x.shape[axis])
     axis_n = axis if axis >= 0 else x.ndim + axis

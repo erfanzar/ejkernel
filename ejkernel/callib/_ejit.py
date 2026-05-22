@@ -27,30 +27,30 @@ Functions:
     hash_fn: Generate hash for function signature
 
 Constants:
-    RECOMPILE_FORCE: Force recompilation flag
-    ECACHE_COMPILES: Enable compilation caching
-    CACHE_DIR: Cache directory path
-    COMPILE_FUNC_DIR: Compiled functions directory
-    COMPILED_CACHE: In-memory cache of compiled functions
+    RECOMPILE_FORCE: Force recompilation flag (``EASYDEL_RECOMPILE_FORCE``).
+    ECACHE_COMPILES: Enable two-level compilation caching (``EASYDEL_CACHE_COMPILES``).
+    ALLOW_FULL_CACHE: Persist all XLA caches including tiny entries (``ALLOW_FULL_CACHE``).
+    CACHE_DIR: Platform-specific base cache directory.
+    COMPILE_FUNC_DIR: Directory for serialized compiled executables
+        (``COMPILE_FUNC_DIR`` env var or ``<CACHE_DIR>/ejit_compiled_functions``).
+    COMPILED_CACHE: Module-level in-memory dict of compiled ``Compiled`` objects.
 
 Key Features:
     - Persistent disk caching of compiled functions
-    - Automatic cache invalidation on changes
-    - Hardware-specific signatures
-    - Two-level caching (memory + disk)
-    - Graceful fallback on errors
+    - Automatic cache invalidation on source, hardware, or argument-signature changes
+    - Hardware-specific cache keys (device list included in signature)
+    - Two-level caching (in-memory dict + disk pickle)
+    - Graceful fallback to standard ``jax.jit`` on any error
 
 Example:
-    >>> from easydel.utils.compiling_utils import ejit
+    >>> from ejkernel.callib import ejit
     >>>
     >>> @ejit
     ... def optimized_fn(x, y):
     ...     return x @ y + x.T @ y.T
     >>>
-    >>>
     >>> result = optimized_fn(a, b)
-    >>>
-    >>> result = optimized_fn(a, b)
+    >>> result = optimized_fn(a, b)  # served from cache on second call
 """
 
 from __future__ import annotations
@@ -294,18 +294,27 @@ def ejit(
     def get_compiled_and_cache(static_key: str, args_sig: str, args, kwargs) -> Compiled | None:
         """Retrieve or compile a function with the given argument signature.
 
-        Handles the cache lookup and compilation "slow path":
-        1. Check in-memory cache (L2)
-        2. Check disk cache
-        3. Compile and cache if not found
+        Implements the three-level lookup and compilation "slow path":
+
+        1. Check in-memory ``COMPILED_CACHE`` dict (L1 / fastest).
+        2. Check on-disk pickle under ``COMPILE_FUNC_DIR`` (L2).
+        3. Compile via ``jitted_function.lower(...).compile()`` and persist (L3).
+
+        Serialization failures on disk writes are silently swallowed so that a
+        read-only filesystem never prevents execution.
 
         Args:
-            args_sig: String signature of the arguments
-            args: Positional arguments for compilation
-            kwargs: Keyword arguments for compilation
+            static_key: Stable string incorporating function source, hardware
+                signature, and JIT options — used as the non-argument portion
+                of the cache key.
+            args_sig: String signature of the dynamic arguments (shapes, dtypes,
+                shardings). Combined with ``static_key`` to form the MD5 hash.
+            args: Positional arguments forwarded to ``jitted_function.lower``.
+            kwargs: Keyword arguments forwarded to ``jitted_function.lower``.
 
         Returns:
-            Compiled function if successful, None otherwise
+            The compiled ``Compiled`` object if successful, ``None`` if
+            compilation itself failed (caller falls back to ``jitted_function``).
         """
         compilation_key = hashlib.md5((static_key + args_sig).encode("utf-8")).hexdigest()
 
@@ -471,19 +480,34 @@ def save_compiled_fn(path: str | os.PathLike, fn: Compiled, prefix: str | None =
 def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
     """Load a previously saved compiled function from disk.
 
+    Reconstructs a ``Compiled`` JAX object from the pickle produced by
+    :func:`save_compiled_fn`, using ``jax.experimental.serialize_executable``.
+
     Args:
         path: Directory path where the compiled function was saved.
-        prefix: Optional prefix that was used when saving.
+        prefix: Optional prefix that was used when saving. When provided, the
+            filename is ``{prefix}-compiled.executable``; otherwise just
+            ``compiled.executable``.
 
     Returns:
-        The deserialized compiled JAX function.
+        The deserialized ``Compiled`` JAX function, ready to call directly
+        (bypassing re-compilation).
 
     Raises:
-        FileNotFoundError: If the compiled function file doesn't exist.
-        pickle.UnpicklingError: If the file is corrupted.
+        FileNotFoundError: If the compiled function file doesn't exist at
+            the resolved path.
+        pickle.UnpicklingError: If the file is corrupt or incompatible.
+
+    Note:
+        Compiled functions are hardware- and XLA-version-specific.  Loading
+        a file produced on a different GPU model or JAX version will likely
+        raise an error inside ``deserialize_and_load``.
     """
+    from pathlib import Path
+
+    path = Path(path)
     prefix = prefix or ""
-    filename = path / (prefix + "-" + COMPILED_FILE_NAME)
+    filename = path / (prefix + "-" + COMPILED_FILE_NAME if prefix else COMPILED_FILE_NAME)
     (serialized, in_tree, out_tree) = pickle.load(open(filename, "rb"))
     return deserialize_and_load(
         serialized=serialized,
@@ -571,25 +595,37 @@ def smart_compile(
     verbose: bool = True,
     cache_key: tuple[str, tuple] | None = None,
 ) -> tuple[Compiled, tuple[str, tuple] | None]:
-    """Compile a lowered JAX function with intelligent caching.
+    """Compile a lowered JAX function with intelligent disk caching.
 
-    Attempts to load a previously compiled version from disk cache,
-    falling back to fresh compilation if not found. Automatically
-    caches newly compiled functions for future use.
+    Attempts to load a previously compiled version from the disk cache
+    (``COMPILE_FUNC_DIR/<tag>-<sha256>/compiled.executable``), falling back
+    to fresh compilation if not found or if the cache entry is corrupt.
+    Newly compiled functions are persisted to disk only when
+    ``EASYDEL_CACHE_COMPILES`` is set; otherwise only the in-memory path via
+    :func:`ejit` is used.
 
     Args:
-        lowered_func: JAX lowered function to compile.
-        tag: Optional tag to include in the cache filename for organization.
-        verbose: If True, print warnings about cache operations.
-        cache_key: Optional custom cache key for the function signature.
+        lowered_func: A ``jax.stages.Lowered`` object — typically the result
+            of calling ``jax.jit(fn).lower(*args)``.
+        tag: Optional human-readable tag prepended to the directory name under
+            ``COMPILE_FUNC_DIR`` (e.g. a model name). Useful for organizing
+            multiple compiled functions in the same cache root.
+        verbose: If ``True``, emit warnings via the ``warnings`` module when
+            loading or saving fails.
+        cache_key: Optional caller-supplied signature tuple that is persisted
+            alongside the compiled binary in a ``compiled.signature`` file. On
+            a cache hit the stored signature is returned to the caller.
 
     Returns:
-        Tuple of (compiled_function, cache_key) where cache_key may be
-        updated if loaded from disk.
+        A tuple ``(compiled_func, effective_cache_key)`` where
+        ``compiled_func`` is the ready-to-call ``Compiled`` object and
+        ``effective_cache_key`` is either the signature loaded from disk (on
+        a clean hit) or the ``cache_key`` argument passed in.
 
     Note:
-        Uses SHA-256 hash of the lowered function text for cache keys,
-        combined with optional tag for namespacing.
+        The cache directory key is ``SHA-256(lowered_func.as_text())``, so the
+        cache is automatically invalidated whenever the lowered MLIR changes
+        (e.g. after a JAX or XLA version upgrade).
     """
     func_hash = get_hash_of_lowering(lowered_func)
     foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"

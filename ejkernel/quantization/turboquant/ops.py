@@ -35,28 +35,36 @@ def turboquant_compress_keys(
     rotation_matrix: jax.Array,
     key_codebook: jax.Array,
     projection_matrix: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compress key vectors using TurboQuant Stage 1 + Stage 2 (QJL).
 
     Pipeline:
-        1. Normalize keys, store original norms
-        2. Rotate by Pi: y = keys_norm @ Pi^T
-        3. Lloyd-Max quantize each coordinate
-        4. Compute MSE reconstruction residual
-        5. Project residual through S, store sign bits and residual norms
-        6. Pack indices (4-bit) and signs (1-bit)
+        1. Normalize keys to unit norm, store original norms.
+        2. Rotate by Pi: ``y = keys_norm @ Pi^T``.
+        3. Lloyd-Max quantize each coordinate of the rotated vector.
+        4. Compute MSE reconstruction residual in the rotated space.
+        5. Project residual through S, binarize signs; store residual norms.
+        6. Pack indices (4-bit) and signs (1-bit per element).
 
     Args:
-        keys: Key vectors, shape [..., head_dim].
-        rotation_matrix: Orthogonal matrix Pi, shape [head_dim, head_dim].
-        key_codebook: Lloyd-Max centroids for keys, shape [2^(bits-1)].
-        projection_matrix: QJL matrix S, shape [qjl_dim, head_dim].
+        keys: Key vectors, shape ``[..., head_dim]``.
+        rotation_matrix: Haar-distributed orthogonal matrix Pi, shape
+            ``[head_dim, head_dim]``.
+        key_codebook: Lloyd-Max centroids for quantizing the rotated
+            coordinates, shape ``[n_levels]`` (e.g., ``[2^bits]``).
+        projection_matrix: QJL Gaussian projection matrix S, shape
+            ``[qjl_dim, head_dim]``, with entries i.i.d. N(0, 1/qjl_dim).
 
     Returns:
-        Tuple of:
-            - packed_indices: uint8, shape [..., head_dim // 2] (4-bit packed)
-            - packed_signs: uint8, shape [..., qjl_dim // 8] (bit-packed)
-            - norms: bf16, shape [..., 2] ([:, 0] = original norm, [:, 1] = residual norm)
+        3-tuple of:
+        - ``packed_indices``: uint8, shape ``[..., head_dim // 2]`` (two
+          4-bit codes packed per byte, low nibble first).
+        - ``packed_signs``: uint8, shape ``[..., qjl_dim // 8]`` (one
+          sign bit per QJL projection, packed 8 per byte).
+        - ``norms``: bfloat16, shape ``[..., 2]``, where
+          ``norms[..., 0]`` = original key norm,
+          ``norms[..., 1]`` = rotated-space residual norm.
+
     """
     keys.shape[:-1]
     keys.shape[-1]
@@ -106,21 +114,27 @@ def turboquant_compress_values(
 ) -> tuple[jax.Array, jax.Array]:
     """Compress value vectors using TurboQuant Stage 1 only (MSE).
 
+    Values do not receive QJL residual correction (unlike keys), so only the
+    Lloyd-Max MSE quantization step is applied.
+
     Pipeline:
-        1. Normalize values, store original norms
-        2. Rotate by Pi: y = values_norm @ Pi^T
-        3. Lloyd-Max quantize each coordinate
-        4. Pack indices (4-bit)
+        1. Normalize values to unit norm, store original norms.
+        2. Rotate by Pi: ``y = values_norm @ Pi^T``.
+        3. Lloyd-Max quantize each coordinate.
+        4. Pack indices (4-bit, two per byte).
 
     Args:
-        values: Value vectors, shape [..., head_dim].
-        rotation_matrix: Orthogonal matrix Pi, shape [head_dim, head_dim].
-        value_codebook: Lloyd-Max centroids for values, shape [2^bits].
+        values: Value vectors, shape ``[..., head_dim]``.
+        rotation_matrix: Haar-distributed orthogonal matrix Pi, shape
+            ``[head_dim, head_dim]``.
+        value_codebook: Lloyd-Max centroids for the rotated coordinates,
+            shape ``[n_levels]`` (e.g., ``[2^bits]``).
 
     Returns:
-        Tuple of:
-            - packed_indices: uint8, shape [..., head_dim // 2] (4-bit packed)
-            - norms: bf16, shape [...] (original norms)
+        2-tuple of:
+        - ``packed_indices``: uint8, shape ``[..., head_dim // 2]`` (two
+          4-bit codes per byte, low nibble first).
+        - ``norms``: bfloat16, shape ``[...]`` (per-vector original norms).
     """
     values_f32 = values.astype(jnp.float32)
 

@@ -15,66 +15,93 @@
 
 """High-level kernel modules with automatic optimization.
 
-This module provides user-friendly interfaces for kernel operations using the
-ejkernel.ops framework for automatic configuration management and performance tuning.
+This is the top-level public namespace for ejkernel. It re-exports every class
+and functional alias from ``ejkernel.modules.operations`` so that callers can
+import directly from here without traversing the internal package layout.
+
+All operations follow the same two-layer pattern:
+
+1. **Class interface** — a ``Kernel`` subclass (e.g. ``FlashAttention``) that
+   exposes ``run()``, ``heuristic_cfg()``, and ``candidate_cfgs()`` methods and
+   is intended to be driven by an ``Executor``.
+2. **Functional interface** — a module-level function (e.g. ``flash_attention``)
+   that wraps a pre-configured ``Executor`` for one-line call-site usage.
+
+Kernel selection is automatic by default: ``detect_platform`` inspects the
+active JAX backend (CPU/GPU/TPU) and the kernel registry to pick the best
+available implementation (XLA, Triton, Pallas GPU, Pallas TPU, CUDA, CUTE).
 
 Available Attention Modules:
     Standard Attention:
-        - Attention: Standard multi-head attention with XLA optimization
-        - FlashAttention: Memory-efficient O(N) complexity attention
-        - ScaledDotProductAttention: Standard scaled dot-product attention
+        - Attention: Standard multi-head attention (XLA); returns output + weights.
+        - FlashAttention: Memory-efficient O(N) attention via tiling.
+        - ScaledDotProductAttention: Thin wrapper over XLA dot-product attention.
 
     Paged/Serving Attention:
-        - PageAttention: Paged KV cache for decode phase
-        - PrefillPageAttention: Chunked prefill with paged KV cache
-        - RaggedPageAttentionv2: Page attention for variable-length sequences
-        - RaggedPageAttentionv2TurboQuant: TurboQuant-compressed read-only page attention
-        - RaggedPageAttentionv3: Advanced variable-length page attention
-        - RaggedPageAttentionv3TurboQuant: TurboQuant-compressed fused page attention
+        - PageAttention: Single-query paged decode attention.
+        - DecodeAttention: vLLM-style paged decode attention returning output + LSE.
+        - UnifiedAttention: vLLM-style unified (prefill + decode) paged attention.
+        - PrefillPageAttention: Chunked prefill with paged KV cache.
+        - ChunkedPrefillPagedDecode: Fused KV-cache write + paged decode in one pass.
+        - RaggedDecodeAttention: Ragged sequence decode attention.
+        - RaggedPageAttentionv2: Ragged paged attention (read-only cache).
+        - RaggedPageAttentionv2TurboQuant: TurboQuant-compressed ragged paged attention v2.
+        - RaggedPageAttentionv3: Ragged paged attention with chunked prefill support.
+        - RaggedPageAttentionv3TurboQuant: TurboQuant-compressed ragged paged attention v3.
 
     Sparse Attention:
-        - BlockSparseAttention: Memory-efficient block-sparse attention
-        - NativeSparseAttention: Sparse attention with explicit block patterns
+        - BlockSparseAttention: Block-sparse attention with custom mask builder.
+        - NativeSparseAttention: Sparse attention with explicit block patterns.
 
     Linear/Recurrent Attention:
-        - GatedDeltaRule: Gated delta rule linear attention
-        - GLAttention: Gated linear attention mechanism
-        - LightningAttention: Lightning attention with decay
-        - KernelDeltaAttention: Linear attention with delta rule updates
-        - RecurrentAttention: Stateful recurrent attention
+        - GatedDeltaRule: Gated delta rule linear attention (O(N)).
+        - RaggedGatedDeltaRule: GDR for ragged (variable-length packed) sequences.
+        - GLAttention: Gated linear attention with token-level and layer-level gates.
+        - LightningAttention: Lightning attention with per-layer decay factors.
+        - KernelDeltaAttention: Linear attention with delta rule updates.
+        - RecurrentAttention: Stateful recurrent attention.
 
     Distributed Attention:
-        - RingAttention: Distributed attention with ring topology
+        - RingAttention: Ring-topology distributed attention.
 
-    Memory-Efficient Attention:
-        - DeepSeekAttention: DeepSeek Sparse Attention (MLA + Lightning Indexer)
-        - FlashMLA: Multi-head latent attention with low-rank KV compression
-        - MultiLatentRaggedPageAttention: MLA ragged paged attention with cache updates
-        - MultiLatentRaggedPageAttentionV2: MLA ragged paged attention v2
+    MLA / Compressed Attention:
+        - DeepSeekAttention: DeepSeek Sparse Attention (MLA + Lightning Indexer).
+        - FlashMLA: Flash multi-head latent attention with low-rank KV compression.
+        - MultiLatentRaggedPageAttention: MLA ragged paged attention.
+        - MultiLatentRaggedPageAttentionV2: MLA ragged paged attention v2 with
+          per-phase block-size tuning.
 
 Linear Recurrent Models:
-    - RWKV4: Linear attention with time-decay
-    - RWKV6: Enhanced RWKV with token-dependent decay
-    - RWKV7: Latest RWKV with improved state updates
-    - RWKV7Mul: RWKV-7 with multiplicative state updates
+    - RWKV4: WKV recurrence with fixed time-decay (RWKV v4).
+    - RWKV6: WKV recurrence with token-dependent decay (RWKV v6).
+    - RWKV7: Enhanced state-update recurrence (RWKV v7).
+    - RWKV7Mul: RWKV-7 with multiplicative state updates.
 
 State Space Models:
-    - StateSpaceV1: Mamba-1 style selective state space model
-    - StateSpaceV2: Mamba-2 style selective state space model
+    - StateSpaceV1: Mamba-1 style selective state space model.
+    - StateSpaceV2: Mamba-2 style selective state space model (SSD).
 
-Additional Operations:
-    - GroupedMatmul: Efficient grouped matrix multiplication (for MoE)
-    - MeanPooling: Sequence mean pooling operation
+Matrix Operations:
+    - GroupedMatmul: Grouped matmul for Mixture-of-Experts routing.
+    - AllGatherMatmul: Fused all-gather + matmul for tensor-parallel layers.
+    - ReduceScatterMatmul: Fused matmul + reduce-scatter for tensor-parallel layers.
+    - QuantizedMatmul: Packed uint32 symmetric quantized matmul.
+
+Miscellaneous:
+    - MeanPooling: Sequence mean pooling with optional attention mask.
+
+Aliases:
+    ``gdr_attention`` is an alias for ``gated_delta_rule``.
+    ``kda_attention`` and ``kernel_delta_attention`` both refer to the same op.
 
 Example:
-    >>> from ejkernel.modules import FlashAttention
+    >>> from ejkernel.modules import FlashAttention, flash_attention
     >>>
-    >>> # Basic usage
+    >>> # Class interface (for use with a custom Executor)
     >>> attn = FlashAttention()
     >>> output = attn.run(q, k, v, causal=True, cfg=attn.heuristic_cfg(None))
-
-    >>> # Using the functional interface with auto-optimization
-    >>> from ejkernel.modules import flash_attention
+    >>>
+    >>> # Functional interface (uses the built-in Executor with autotuning)
     >>> output = flash_attention(q, k, v, causal=True)
 """
 

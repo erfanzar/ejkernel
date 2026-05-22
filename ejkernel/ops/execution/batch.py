@@ -105,10 +105,10 @@ def vmap_with_config(executor, kernel, in_axes=0) -> Callable[..., Any]:
     """
 
     def wrapped(*args, **kwargs):
-        """Wrapper that performs configuration selection and vectorized execution."""
+        """Select a configuration using a representative sample, then vmap over the batch."""
 
         def slice0(x, axis):
-            """Extract first element along specified axis for sampling."""
+            """Return the first element of ``x`` along ``axis``, or ``x`` unchanged."""
             if axis is None or not isinstance(x, jax.Array):
                 return x
             return jax.lax.index_in_dim(x, 0, axis, keepdims=False)
@@ -120,7 +120,7 @@ def vmap_with_config(executor, kernel, in_axes=0) -> Callable[..., Any]:
         _ = executor(kernel, *sample, stamp=False, **kwargs)
 
         def fn(*a, **k):
-            """Inner function to be vectorized by jax.vmap."""
+            """Execute ``kernel`` via ``executor`` — vectorized by ``jax.vmap``."""
             return executor(kernel, *a, **k)
 
         return jax.vmap(fn, in_axes=in_axes)(*args, **kwargs)
@@ -176,14 +176,14 @@ def pmap_with_config(executor, kernel, in_axes=0, axis_name="devices"):
     """
 
     def wrapped(*args, **kwargs):
-        """Wrapper that performs configuration selection and parallel execution."""
+        """Select a configuration using device-0 data, then pmap over all devices."""
 
         local_args = jax.tree.map(lambda x: x[0] if isinstance(x, jax.Array) else x, args)
 
         _ = executor(kernel, *local_args, stamp=False, **kwargs)
 
         def fn(*a, **k):
-            """Inner function to be parallelized by jax.pmap."""
+            """Execute ``kernel`` via ``executor`` — parallelised by ``jax.pmap``."""
             return executor(kernel, *a, **k)
 
         return jax.pmap(fn, in_axes=in_axes, axis_name=axis_name)(*args, **kwargs)

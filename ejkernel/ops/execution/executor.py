@@ -220,7 +220,18 @@ class Executor(Generic[Cfg, Out]):
 
     @staticmethod
     def _has_cute_impl(algorithm: str) -> bool:
-        """Check if a CuTe DSL implementation exists for the given algorithm."""
+        """Check if a CuTe DSL implementation exists for the given algorithm.
+
+        Queries the kernel registry to determine whether a CUTE-platform
+        implementation is registered for the specified algorithm name.
+
+        Args:
+            algorithm: Algorithm/kernel name to look up (typically ``kernel.op_id``).
+
+        Returns:
+            True if a CuTe implementation exists in the registry, False if not
+            found or if the registry query fails.
+        """
         try:
             specs = kernel_registry.list_implementations(algorithm)
         except Exception:
@@ -396,27 +407,48 @@ class Executor(Generic[Cfg, Out]):
         profiling, and invocation recording.
 
         Args:
-            kernel: Kernel implementation to execute
-            *args: Positional arguments for the kernel
-            cfg: Optional configuration override (bypasses selection if provided)
-            stamp: Whether to add profiling metadata to the operation
-            method: Execution method - "shard_map" for distributed execution
-            mesh: JAX device mesh for shard_map (required if method="shard_map")
-            in_specs: Input partition specs for shard_map (required if method="shard_map")
-            out_specs: Output partition spec for shard_map (required if method="shard_map")
-            check_vma: Whether to check replication for shard_map
-            **kwargs: Keyword arguments for the kernel
+            kernel: Kernel implementation to execute.
+            *args: Positional arguments forwarded to ``kernel.prepare()`` and
+                then to ``kernel.run()``.
+            cfg: Optional configuration override.  When provided, bypasses all
+                cache and autotuning logic (equivalent to setting
+                ``Invocation.override_cfg``).  Can also be passed as the
+                keyword argument ``_cfg`` for legacy call-sites.
+            stamp: Whether to inject profiling metadata into the compiled graph.
+                The format is controlled by the ``EJKERNEL_OPS_STAMP``
+                environment variable:
+                ``'hash'`` (default when stamp=True) — compact ``op_id:call_key`` label;
+                ``'json'`` — full JSON payload with args/kwargs/cfg details;
+                ``'none'`` — no label (same as stamp=False).
+            method: Execution mode.  ``'shard_map'`` wraps the call with
+                ``jax.shard_map`` using the provided ``mesh``/``in_specs``/
+                ``out_specs``.  ``None`` (default) uses standard execution.
+            mesh: :class:`jax.sharding.Mesh` required when ``method='shard_map'``.
+            in_specs: Per-argument ``PartitionSpec`` tuple, required when
+                ``method='shard_map'``.
+            out_specs: ``PartitionSpec`` for the output, required when
+                ``method='shard_map'``.
+            check_vma: Passed to ``jax.shard_map`` as ``check_vma``; when
+                ``True``, JAX checks that non-sharded inputs are replicated.
+            **kwargs: Keyword arguments forwarded to ``kernel.prepare()`` and
+                then to ``kernel.run()``.
 
         Returns:
-            Result of kernel execution with optimal configuration
+            Result of kernel execution with the chosen configuration.
 
         Note:
-            This method handles both regular operations and kernels with custom
-            VJP implementations. Custom gradients are automatically detected and
-            properly integrated with JAX's differentiation system.
+            Custom VJP is detected automatically via
+            :func:`~ejkernel.ops.core._has_custom_vjp`.  If the kernel overrides
+            both ``fwd_with_residuals`` and ``vjp``, a ``jax.custom_vjp`` wrapper
+            is created transparently so that ``jax.grad`` works correctly.
 
-            When method="shard_map", the execution will be wrapped with shard_map
-            for distributed computation across the specified mesh.
+            When ``method='shard_map'``, the executor calls
+            ``kernel.create_shard_map_wrapper`` instead of ``kernel.run``,
+            so custom VJP is bypassed.  Kernels must handle gradients inside the
+            shard_map wrapper in that case.
+
+            Invocations are recorded to the global registry when the environment
+            variable ``EJKERNEL_OPS_RECORD=1`` is set.
         """
 
         if "_cfg" in kwargs:

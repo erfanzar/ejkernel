@@ -59,22 +59,40 @@ Cfg = TypeVar("Cfg")
 
 
 class PersistentCache(Generic[Cfg]):
-    """Persistent disk-based cache for kernel configurations.
+    """Disk-backed JSON cache for kernel configurations.
 
-    Provides thread-safe storage and retrieval of optimization configurations
-    using JSON files. Supports automatic serialization for common types and
-    custom serialization via loader/dumper functions.
+    Stores and retrieves optimisation results across Python process restarts.
+    Uses atomic file operations (write to a temp file, then ``os.replace``) to
+    prevent data corruption during concurrent writes.
 
-    The cache uses atomic file operations to ensure data consistency and
-    prevent corruption during concurrent access.
+    The cache is *best-effort*: if the backing file cannot be created or written
+    (e.g. due to permission errors or a read-only filesystem), the instance
+    silently degrades to an in-process-only cache (``_disabled = True``) rather
+    than raising an exception.
+
+    Serialization priority for :meth:`put`:
+        1. Custom ``dumper`` function (if provided at construction).
+        2. ``dataclasses.asdict()`` for dataclass instances.
+        3. ``model_dump()`` for Pydantic v2 models.
+        4. Raw value (must be JSON-serializable).
+
+    Deserialization priority for :meth:`get`:
+        1. Custom ``loader`` function (if provided at construction).
+        2. If the stored value is a ``dict`` and ``cfg_type`` was given,
+           ``cfg_type(**stored_dict)`` is called to reconstruct the object.
+        3. If the stored value is a ``dict`` and no ``cfg_type`` was given,
+           it is wrapped in ``argparse.Namespace(**stored_dict)``.
+        4. Otherwise the raw JSON value is returned.
 
     Type Parameters:
-        Cfg: Configuration type to be cached
+        Cfg: Configuration type to be cached.
 
     Attributes:
-        path: File path for the JSON cache
-        loader: Optional function to deserialize configurations
-        dumper: Optional function to serialize configurations
+        path: Absolute path of the backing JSON file.
+        loader: Optional ``(raw_json_value) -> Cfg`` deserialiser.
+        dumper: Optional ``(Cfg) -> json_serializable`` serialiser.
+        cfg_type: Optional class used to reconstruct dict-valued cache entries
+            when no ``loader`` is provided.
     """
 
     def __init__(

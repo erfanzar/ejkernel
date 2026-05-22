@@ -44,11 +44,12 @@ from ..kernels._registry import Backend, Platform, kernel_registry
 
 def detect_platform(
     algorithm: str,
-    platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] | None = "auto",
+    platform: Platform | Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] | None = "auto",
     prefer_pallas: bool = False,
     prefer_cuda: bool = False,
     prefer_triton: bool = False,
     prefer_cute: bool = False,
+    prefer_tilelang: bool = False,
 ) -> Platform:
     """Detect the best platform for a given algorithm.
 
@@ -67,7 +68,7 @@ def detect_platform(
         - NVIDIA GPU + CUTE implementation available -> CUTE
         - NVIDIA GPU + CUDA implementation available -> CUDA
         - GPU backend + Triton available -> Triton
-        - GPU backend + no Triton -> XLA
+        - GPU backend + no specialised GPU implementation -> XLA
         - CPU backend -> XLA
 
     Args:
@@ -83,6 +84,7 @@ def detect_platform(
         prefer_cute: Prefer CUTE on NVIDIA GPUs when available.
         prefer_cuda: Prefer CUDA on NVIDIA GPUs when available.
         prefer_triton: Prefer Triton on GPU when available.
+        prefer_tilelang: Prefer TileLang on GPU when available.
 
     Returns:
         The selected Platform enum value
@@ -117,6 +119,9 @@ def detect_platform(
     has_cuda = any(spec.platform == Platform.CUDA and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
     has_triton = any(spec.platform == Platform.TRITON and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
     has_cute = any(spec.platform == Platform.CUTE and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs)
+    has_tilelang = any(
+        spec.platform == Platform.TILELANG and spec.backend in (Backend.GPU, Backend.ANY) for spec in specs
+    )
     has_pallas_tpu = any(
         spec.platform == Platform.PALLAS and spec.backend in (Backend.TPU, Backend.ANY) for spec in specs
     )
@@ -151,6 +156,9 @@ def detect_platform(
 
     if prefer_triton and has_triton and jax_backend in ("gpu", "cuda"):
         return Platform.TRITON
+
+    if prefer_tilelang and has_tilelang and jax_backend in ("gpu", "cuda"):
+        return Platform.TILELANG
 
     if is_nvidia and has_cute and jax_backend in ("gpu", "cuda"):
         return Platform.CUTE
@@ -188,7 +196,7 @@ class KernelConfig:
     block_d: int = 64
     num_warps: int = 4
     num_stages: int = 2
-    platform: Platform | Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] = "auto"
+    platform: Platform | Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] = "auto"
     backend: Backend | Literal["gpu", "mps", "tpu", "cpu", "any"] = Backend.ANY
     algorithm: str | None = None
     priority: int = 0

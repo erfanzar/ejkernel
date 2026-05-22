@@ -2899,9 +2899,11 @@ class MaskInfo:
 
         Returns:
             Tuple of (children, aux_data) where:
-            - children: Tuple of (attention_mask, q_segment_ids, kv_segment_ids, cu_seqlens_q, cu_seqlens_kv,
-              q_positions, kv_positions)
-            - aux_data: Tuple of (batch_axis_name, qheads_axis_name, kvheads_axis_name, sequence_axis_name)
+            - children: 7-tuple ``(attention_mask, q_segment_ids, kv_segment_ids, cu_seqlens_q,
+              cu_seqlens_kv, q_positions, kv_positions)`` — the array leaves.
+            - aux_data: 8-tuple ``(batch_axis_name, qheads_axis_name, kvheads_axis_name,
+              sequence_axis_name, causal_mask_baked_in, sliding_window_baked_in,
+              chunked_mask_baked_in, token_type_ids_baked_in)`` — static metadata.
 
         Notes:
             - This method is automatically called by JAX during pytree operations
@@ -2941,10 +2943,13 @@ class MaskInfo:
         transformations have been applied.
 
         Args:
-            aux_data: Static metadata tuple containing
-                (batch_axis_name, qheads_axis_name, kvheads_axis_name, sequence_axis_name)
-            children: Traced array tuple containing
-                (attention_mask, q_segment_ids, kv_segment_ids, cu_seqlens_q, cu_seqlens_kv, q_positions, kv_positions)
+            aux_data: Static metadata tuple of 8 elements:
+                ``(batch_axis_name, qheads_axis_name, kvheads_axis_name, sequence_axis_name,
+                causal_mask_baked_in, sliding_window_baked_in, chunked_mask_baked_in,
+                token_type_ids_baked_in)``.
+            children: Traced array tuple of 7 elements:
+                ``(attention_mask, q_segment_ids, kv_segment_ids, cu_seqlens_q, cu_seqlens_kv,
+                q_positions, kv_positions)``.
 
         Returns:
             Reconstructed MaskInfo instance with the provided arrays and metadata

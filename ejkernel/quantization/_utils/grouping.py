@@ -25,7 +25,19 @@ from jax import numpy as jnp
 
 
 def _quantize_to_codebook_argmin(values: jax.Array, codebook: jax.Array) -> jax.Array:
-    """Reference argmin-based codebook quantization."""
+    """Reference argmin-based codebook quantization.
+
+    For each element of *values*, linearly scans the *codebook* via
+    :func:`jax.lax.fori_loop` and returns the index of the closest entry
+    by L1 distance.  Memory cost is O(values) rather than O(values * codebook).
+
+    Args:
+        values: Input array of arbitrary shape and float dtype.
+        codebook: 1-D array of codebook entries.
+
+    Returns:
+        uint32 index array with the same shape as *values*.
+    """
     min_dist = jnp.abs(values - codebook[0])
     min_idx = jnp.zeros(values.shape, dtype=jnp.int32)
 
@@ -44,8 +56,20 @@ def _quantize_to_codebook_argmin(values: jax.Array, codebook: jax.Array) -> jax.
 def _quantize_to_codebook_threshold(values: jax.Array, codebook: jax.Array) -> jax.Array:
     """Threshold bucketization codebook quantization.
 
-    Sorts the codebook once, quantizes values by midpoint boundaries, and maps
-    back to original codebook indices. Ties resolve toward the lower bucket.
+    Sorts the codebook once, builds midpoint decision boundaries, then uses
+    binary search (``jnp.searchsorted``) to assign each value to the nearest
+    codebook bin.  Ties resolve toward the lower bucket (``side="left"``).
+
+    On MPS backends, :func:`jnp.searchsorted` is emulated with a manual binary
+    search loop because the native lowering is unreliable.
+
+    Args:
+        values: Input float array of arbitrary shape.
+        codebook: 1-D float array of codebook entries.
+
+    Returns:
+        uint32 index array with the same shape as *values*, mapping each
+        element to the index of its nearest codebook entry.
     """
     codebook = codebook.astype(jnp.float32)
     sorted_idx = jnp.argsort(codebook).astype(jnp.int32)
@@ -62,7 +86,22 @@ def _quantize_to_codebook_threshold_from_map(
     sorted_idx: jax.Array,
     boundaries: jax.Array,
 ) -> jax.Array:
-    """Threshold quantization from precomputed sorted index/boundary tensors."""
+    """Threshold quantization using precomputed sorted-index and boundary tensors.
+
+    Fast variant of :func:`_quantize_to_codebook_threshold` that avoids
+    re-computing the sort on every call by accepting precomputed tensors from
+    :func:`_build_threshold_map` (or the ``_get_*_threshold_map`` helpers).
+
+    Args:
+        values: Input float array of arbitrary shape.
+        sorted_idx: int32 1-D array mapping sorted-bucket index → original
+            codebook index (from :func:`_build_threshold_map`).
+        boundaries: float32 1-D array of decision boundaries of length
+            ``len(sorted_idx) - 1``.
+
+    Returns:
+        uint32 original-codebook-index array with the same shape as *values*.
+    """
     values = values.astype(jnp.float32)
 
     if sorted_idx.shape[0] == 1:

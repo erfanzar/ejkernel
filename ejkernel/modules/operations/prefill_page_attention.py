@@ -106,7 +106,7 @@ class PrefillPageAttention(Kernel[PrefillPageAttentionConfig, Array]):
         value_cache: Float[Array, "num_kv_heads total_num_pages page_size head_dim"],
         context_len: Int[Array, "1"],
         page_indices: Int[Array, "num_pages"],
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: PrefillPageAttentionConfig,
         softmax_scale: float | None = None,
@@ -146,6 +146,7 @@ class PrefillPageAttention(Kernel[PrefillPageAttentionConfig, Array]):
         """
         if platform is not None:
             cfg = PrefillPageAttentionConfig(
+                block_k=cfg.block_k,
                 num_warps=cfg.num_warps,
                 num_stages=cfg.num_stages,
                 platform=platform,
@@ -162,6 +163,9 @@ class PrefillPageAttention(Kernel[PrefillPageAttentionConfig, Array]):
             mask_value=mask_value,
             attn_logits_soft_cap=attn_logits_soft_cap,
             sliding_window=sliding_window,
+            block_k=cfg.block_k,
+            num_warps=cfg.num_warps,
+            num_stages=cfg.num_stages,
         )
 
     def heuristic_cfg(self, inv: Invocation[PrefillPageAttentionConfig, Array]) -> PrefillPageAttentionConfig:
@@ -173,9 +177,12 @@ class PrefillPageAttention(Kernel[PrefillPageAttentionConfig, Array]):
         Returns:
             Default configuration suitable for prefill workloads
         """
+        query = inv.kwargs["query"]
+        head_dim = int(query.shape[-1])
         return PrefillPageAttentionConfig(
+            block_k=128 if head_dim >= 64 else 64,
             num_warps=4,
-            num_stages=1,
+            num_stages=2,
             platform="auto",
             backend="any",
         )
@@ -189,7 +196,80 @@ class PrefillPageAttention(Kernel[PrefillPageAttentionConfig, Array]):
         Returns:
             List of candidate configurations to benchmark during autotuning
         """
-        return []
+        base = self.heuristic_cfg(inv)
+        return [
+            PrefillPageAttentionConfig(
+                block_k=base.block_k,
+                num_warps=base.num_warps,
+                num_stages=base.num_stages,
+                platform="auto",
+                backend="any",
+            ),
+            PrefillPageAttentionConfig(
+                block_k=base.block_k,
+                num_warps=base.num_warps,
+                num_stages=base.num_stages,
+                platform="xla",
+                backend="any",
+            ),
+        ]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[PrefillPageAttentionConfig, Array]):
+        """Generate GPU candidates for TileLang prefill paged attention."""
+        query = inv.kwargs["query"]
+        page_indices = inv.kwargs["page_indices"]
+        requested = inv.kwargs.get("platform", None)
+        head_dim = int(query.shape[-1])
+        pages = int(page_indices.shape[0])
+        block_choices = (64, 128, 256) if head_dim >= 64 else (32, 64, 128)
+        if pages <= 2:
+            block_choices = tuple(b for b in block_choices if b <= 128)
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[PrefillPageAttentionConfig] = []
+        if "tilelang" in platforms:
+            for block_k in block_choices:
+                for stages in (2, 3, 4):
+                    candidates.append(
+                        PrefillPageAttentionConfig(
+                            block_k=block_k,
+                            num_warps=4,
+                            num_stages=stages,
+                            platform="tilelang",
+                            backend="gpu",
+                        )
+                    )
+        if "xla" in platforms:
+            base = self.heuristic_cfg(inv)
+            candidates.append(
+                PrefillPageAttentionConfig(
+                    block_k=base.block_k,
+                    num_warps=base.num_warps,
+                    num_stages=base.num_stages,
+                    platform="xla",
+                    backend="any",
+                )
+            )
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[PrefillPageAttentionConfig, Array]):
+        """Generate TPU candidates for Pallas and XLA prefill paged attention."""
+        base = self.heuristic_cfg(inv)
+        return [
+            PrefillPageAttentionConfig(
+                block_k=base.block_k,
+                num_warps=4,
+                num_stages=1,
+                platform="pallas",
+                backend="tpu",
+            ),
+            PrefillPageAttentionConfig(
+                block_k=base.block_k,
+                num_warps=base.num_warps,
+                num_stages=base.num_stages,
+                platform="xla",
+                backend="any",
+            ),
+        ]
 
     def create_shard_map_wrapper(
         self,
@@ -198,7 +278,7 @@ class PrefillPageAttention(Kernel[PrefillPageAttentionConfig, Array]):
         value_cache: Float[Array, "num_kv_heads total_num_pages page_size head_dim"],
         context_len: Int[Array, "1"],
         page_indices: Int[Array, "num_pages"],
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
         cfg: PrefillPageAttentionConfig | None = None,
         softmax_scale: float | None = None,
@@ -303,7 +383,7 @@ def prefill_page_attention(
     mask_value: float = -2.381976426469702e38,
     attn_logits_soft_cap: float | None = None,
     sliding_window: int | None = None,
-    platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: PrefillPageAttentionConfig | None = None,
 ) -> Float[Array, "chunk_size num_heads head_dim"]:
     """Execute prefill page attention with automatic optimization.

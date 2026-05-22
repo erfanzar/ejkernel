@@ -139,7 +139,7 @@ class KernelDeltaAttention(Kernel[KernelDeltaAttentionConfig, Array]):
         use_qk_l2norm: bool = True,
         use_chunked: bool = True,
         return_state: bool = False,
-        platform: Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+        platform: Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         cfg: KernelDeltaAttentionConfig,
     ) -> (
         Float[Array, "batch seq_len num_heads v_head_dim"]
@@ -180,9 +180,12 @@ class KernelDeltaAttention(Kernel[KernelDeltaAttentionConfig, Array]):
         """
         if platform is not None:
             cfg = KernelDeltaAttentionConfig(
+                chunk_size=cfg.chunk_size,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
+        if not use_chunked:
+            cfg = KernelDeltaAttentionConfig(chunk_size=cfg.chunk_size, platform="xla", backend="any")
 
         impl = self.get_impl(cfg)
         out, final_state = impl(
@@ -192,7 +195,7 @@ class KernelDeltaAttention(Kernel[KernelDeltaAttentionConfig, Array]):
             beta=beta,
             decay=decay,
             softmax_scale=softmax_scale,
-            chunk_size=chunk_size,
+            chunk_size=int(cfg.chunk_size),
             initial_state=initial_state,
             use_qk_l2norm=use_qk_l2norm,
             use_chunked=use_chunked,
@@ -211,24 +214,49 @@ class KernelDeltaAttention(Kernel[KernelDeltaAttentionConfig, Array]):
         Returns:
             Default configuration with auto platform selection
         """
-        del inv  # Unused
-        return KernelDeltaAttentionConfig(platform="auto", backend="any")
+        return KernelDeltaAttentionConfig(
+            chunk_size=int(inv.kwargs.get("chunk_size", 64)),
+            platform="auto",
+            backend="any",
+        )
 
     def candidate_cfgs(self, inv: Invocation[KernelDeltaAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Args:
-            inv: Invocation object (unused)
+            inv: Invocation object
 
         Returns:
-            Empty list - KDA uses XLA without tunable block sizes
-
-        Note:
-            KDA currently has a single XLA implementation without
-            tunable parameters, so autotuning is not applicable.
+            Chunk-size candidates for the XLA chunked path plus the automatic
+            backend choice.
         """
-        del inv  # Unused
-        return []
+        base_chunk = int(inv.kwargs.get("chunk_size", 64))
+        chunks = sorted({max(16, base_chunk // 2), base_chunk, min(512, base_chunk * 2), 128, 256})
+        return [KernelDeltaAttentionConfig(chunk_size=c, platform="auto", backend="any") for c in chunks]
+
+    def candidate_cfgs_gpu(self, inv: Invocation[KernelDeltaAttentionConfig, Array]):
+        """Generate GPU candidates for KDA.
+
+        TileLang is a native recurrent scan; XLA exposes ``chunk_size`` as
+        the meaningful tuning knob for chunked training workloads.
+        """
+        requested = inv.kwargs.get("platform", None)
+        use_chunked = bool(inv.kwargs.get("use_chunked", True))
+        base = int(inv.kwargs.get("chunk_size", 64))
+        chunks = sorted({max(16, base // 2), base, min(512, base * 2), 128, 256})
+        platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        candidates: list[KernelDeltaAttentionConfig] = []
+        if "tilelang" in platforms and use_chunked:
+            candidates.append(KernelDeltaAttentionConfig(chunk_size=base, platform="tilelang", backend="gpu"))
+        if "xla" in platforms:
+            candidates.extend(KernelDeltaAttentionConfig(chunk_size=c, platform="xla", backend="any") for c in chunks)
+        return candidates or self.candidate_cfgs(inv)
+
+    def candidate_cfgs_tpu(self, inv: Invocation[KernelDeltaAttentionConfig, Array]):
+        """Generate TPU candidates for the XLA chunked KDA implementation."""
+        base = int(inv.kwargs.get("chunk_size", 64))
+        chunks = sorted({max(16, base // 2), base, min(512, base * 2), 128, 256})
+        return [KernelDeltaAttentionConfig(chunk_size=c, platform="xla", backend="any") for c in chunks]
 
 
 _executor: Executor[KernelDeltaAttentionConfig, Array] = Executor(
@@ -255,7 +283,7 @@ def kernel_delta_attention(
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
     return_state: bool = False,
-    platform: typing.Literal["triton", "pallas", "cuda", "xla", "auto", "cute"] | None = None,
+    platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
     cfg: KernelDeltaAttentionConfig | None = None,
 ) -> (
     Float[Array, "batch seq_len num_heads v_head_dim"]

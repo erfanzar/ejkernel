@@ -135,7 +135,7 @@ class BaseOperationConfig:
         since XLA handles backend selection internally.
     """
 
-    platform: Literal["triton", "pallas", "cuda", "cute", "xla", "auto"] = "auto"
+    platform: Literal["triton", "pallas", "cuda", "cute", "tilelang", "xla", "auto"] = "auto"
     backend: str = "any"
 
     __hash__ = hash_fn
@@ -309,6 +309,7 @@ class UnifiedAttentionConfig(BaseOperationConfig):
             decode kernel on GPU (Triton only).
         num_par_softmax_segments: Number of parallel softmax segments used by
             the segmented 3D decode kernel (Triton only).
+        block_dim: CUDA thread-block dimension for the CUDA backend.
         num_warps: Optional Triton kernel override.
         num_stages: Optional Triton kernel override.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
@@ -317,6 +318,7 @@ class UnifiedAttentionConfig(BaseOperationConfig):
 
     seq_threshold_3d: int | None = None
     num_par_softmax_segments: int | None = None
+    block_dim: int = 128
     num_warps: int | None = None
     num_stages: int | None = None
 
@@ -393,13 +395,18 @@ class GroupedMatmulConfig(BaseOperationConfig):
     """Configuration for Grouped Matrix Multiplication operation.
 
     Args:
-        block_m: M dimension block size (default: 128)
-        block_n: N dimension block size (default: 128)
-        block_k: K dimension block size (default: 64)
-        num_warps: Number of warps for Triton kernels (default: 4)
-        num_stages: Number of pipeline stages (default: 2)
-        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
-        backend: Backend specification (default: "any")
+        block_m: M dimension tile size (default: 128).
+        block_n: N dimension tile size (default: 128).
+        block_k: K (contraction) dimension tile size (default: 128).
+        num_warps: Number of warps for Triton kernels (default: 4).
+            Pass ``None`` to let the backend choose.
+        num_stages: Number of pipeline stages (default: 2).
+            Pass ``None`` to let the backend choose.
+        bypass_xla_tiling: If True and the resolved platform is XLA, skip
+            the tiling computation and pass ``tiling=None`` to the XLA impl
+            (default: False).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
     """
 
     block_m: int = 128
@@ -414,7 +421,22 @@ class GroupedMatmulConfig(BaseOperationConfig):
 
 @dataclass
 class AllGatherMatmulConfig(BaseOperationConfig):
-    """Configuration for All-Gather Matmul operation."""
+    """Configuration for the fused All-Gather + Matmul operation.
+
+    Block sizes are silently clamped to the largest divisor of the actual
+    matrix dimension that is still ``<=`` the requested value, so they need
+    not exactly divide the problem size.
+
+    Args:
+        block_n: N-dimension block size for RHS tiling (default: 128).
+        block_k: K-dimension (contraction) block size (default: 128).
+        num_warps: Number of warps for Triton kernels (default: 4).
+            Unused in the XLA/Pallas path.
+        num_stages: Pipeline stages for Triton kernels (default: 2).
+            Unused in the XLA/Pallas path.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
 
     block_n: int = 128
     block_k: int = 128
@@ -426,7 +448,22 @@ class AllGatherMatmulConfig(BaseOperationConfig):
 
 @dataclass
 class ReduceScatterMatmulConfig(BaseOperationConfig):
-    """Configuration for Reduce-Scatter Matmul operation."""
+    """Configuration for the fused Matmul + Reduce-Scatter operation.
+
+    Block sizes are silently clamped to the largest divisor of the actual
+    matrix dimension that is still ``<=`` the requested value.
+
+    Args:
+        block_m: M-dimension block size (default: 128).
+        block_n: N-dimension block size (default: 128).
+        block_k: K-dimension (contraction) block size (default: 128).
+        num_warps: Number of warps for Triton kernels (default: 4).
+            Unused in the XLA/Pallas path.
+        num_stages: Pipeline stages for Triton kernels (default: 2).
+            Unused in the XLA/Pallas path.
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
+    """
 
     block_m: int = 128
     block_n: int = 128
@@ -474,6 +511,7 @@ class MeanPoolingConfig(BaseOperationConfig):
 
     Args:
         block_size: Block size for pooling (default: 64)
+        block_dim: Triton hidden-dimension tile size (default: 64)
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
@@ -481,6 +519,7 @@ class MeanPoolingConfig(BaseOperationConfig):
     """
 
     block_size: int = 64
+    block_dim: int = 64
     num_warps: int = 4
     num_stages: int = 1
 
@@ -491,12 +530,17 @@ class MeanPoolingConfig(BaseOperationConfig):
 class RaggedDecodeAttentionConfig(BaseOperationConfig):
     """Configuration for Ragged Decode Attention operation.
 
+    The only tunable block-size parameter is ``fwd_params``, which passes
+    ``q_blocksize`` and ``kv_blocksize`` to the underlying kernel.  Triton
+    ``num_warps``/``num_stages`` are embedded in ``FwdParams``; there are no
+    separate top-level fields for those.
+
     Args:
-        block_size: Block size for computation tiling (default: 256)
-        num_warps: Number of warps for Triton kernels (default: 4)
-        num_stages: Number of pipeline stages (default: 1)
-        platform: Target platform (triton/pallas/cuda/cute/xla/auto)
-        backend: Backend specification (default: "any")
+        fwd_params: Forward-pass tiling parameters (``FwdParams`` with
+            ``q_blocksize``, ``kv_blocksize``, ``num_warps``, ``num_stages``).
+            Defaults to ``None`` (kernel selects defaults).
+        platform: Target platform (triton/pallas/cuda/cute/xla/auto).
+        backend: Backend specification (default: "any").
     """
 
     fwd_params: FwdParams | None = None
@@ -765,15 +809,14 @@ class LightningAttentionConfig(BaseOperationConfig):
 class KernelDeltaAttentionConfig(BaseOperationConfig):
     """Configuration for Kernel Delta Attention (KDA) operation.
 
-    Note: This operation currently uses an XLA implementation without tunable
-    block sizes. The config exists primarily for platform/backend selection.
-
     Args:
+        chunk_size: Chunk size for the XLA chunked recurrence path. TileLang
+            uses a recurrent native scan and treats this as a compatibility hint.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
-    pass
+    chunk_size: int = 64
 
     __hash__ = hash_fn
 
@@ -874,15 +917,16 @@ class RWKV7Config(BaseOperationConfig):
     with enhanced state update mechanisms and gating operations.
 
     Args:
+        block_v: Value-dimension tile size for Triton kernels.
+        num_warps: Number of warps for Triton kernels.
+        num_stages: Number of pipeline stages for Triton kernels.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
-
-    Note:
-        This operation currently uses XLA implementation without
-        tunable block sizes.
     """
 
-    pass
+    block_v: int = 64
+    num_warps: int = 4
+    num_stages: int = 3
 
     __hash__ = hash_fn
 
@@ -896,15 +940,16 @@ class RWKV7MulConfig(BaseOperationConfig):
     for sequence modeling tasks.
 
     Args:
+        block_v: Value-dimension tile size for Triton kernels.
+        num_warps: Number of warps for Triton kernels.
+        num_stages: Number of pipeline stages for Triton kernels.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
-
-    Note:
-        This operation currently uses XLA implementation without
-        tunable block sizes.
     """
 
-    pass
+    block_v: int = 64
+    num_warps: int = 4
+    num_stages: int = 3
 
     __hash__ = hash_fn
 
@@ -963,15 +1008,19 @@ class DeepSeekAttentionConfig(BaseOperationConfig):
 class ScaledDotProductAttentionConfig(BaseOperationConfig):
     """Configuration for Scaled Dot Product Attention operation.
 
-    Note: This operation uses XLA primitives directly without tunable block sizes.
-    The config exists primarily for platform/backend selection.
-
     Args:
+        block_q: Query tile size for tile-lang FlashAttention-backed SDPA.
+        block_k: Key/value tile size for tile-lang FlashAttention-backed SDPA.
+        num_warps: GPU warp-count hint when the selected backend uses it.
+        num_stages: Pipeline-stage hint when the selected backend uses it.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
-    pass
+    block_q: int = 128
+    block_k: int = 128
+    num_warps: int = 4
+    num_stages: int = 2
 
     __hash__ = hash_fn
 
@@ -981,12 +1030,14 @@ class PrefillPageAttentionConfig(BaseOperationConfig):
     """Configuration for Prefill Page Attention operation.
 
     Args:
+        block_k: KV-token tile size for TileLang prefill paged attention.
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 1)
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
 
+    block_k: int | None = None
     num_warps: int = 4
     num_stages: int = 1
 

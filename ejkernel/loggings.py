@@ -15,24 +15,35 @@
 
 """Logging utilities for ejKernel with colored output and progress tracking.
 
-This module provides enhanced logging capabilities including:
-- Colored console output with level-specific formatting
-- Lazy logger initialization for multi-process JAX environments
-- Progress tracking with ETAs and progress bars
-- JAX profiler integration with Perfetto support
+This module provides enhanced logging capabilities built on top of the standard
+``logging`` module:
 
-The logging system automatically adjusts for distributed training scenarios,
-suppressing output from non-primary processes to avoid clutter.
+- ANSI-colored console output with level-specific formatting and timestamps.
+- Lazy logger initialization that defers creation until the first log call,
+  avoiding issues with JAX runtime initialization order.
+- Automatic suppression of log messages from non-primary JAX processes
+  (process_index > 0 is silenced to WARNING level) in distributed settings.
+- Terminal progress bars with ETA calculations via :class:`ProgressLogger`.
+- JAX profiler integration helpers (``ignite_profiler``, ``extinguish_profiler``,
+  ``create_step_profiler``) with optional Perfetto UI link generation.
 
 Key Components:
-    LazyLogger: Lazy-initialized logger with JAX process awareness
-    ProgressLogger: Terminal progress bars with ETA calculations
-    ColorFormatter: ANSI color formatting for log messages
-    Profiler utilities: JAX trace profiler with Perfetto support
+    ColorFormatter: ``logging.Formatter`` subclass that adds ANSI colors and
+        wall-clock timestamps to each log record.
+    LazyLogger: Lazy-initialized, process-aware logger facade. Use
+        :func:`get_logger` to obtain an instance.
+    ProgressLogger: Terminal progress bar with ETA; supports context manager
+        usage. Falls back to plain logging when stdout is not a TTY.
+    get_logger: Factory function for creating :class:`LazyLogger` instances.
+    ignite_profiler / extinguish_profiler: Start/stop the JAX trace profiler.
+    create_step_profiler: Build a per-step callback that automatically starts
+        and stops profiling within a configured training step window.
 
-Constants:
-    COLORS: ANSI color code mappings
-    LEVEL_COLORS: Log level to color mappings
+Module-level objects:
+    COLORS (dict): Mapping of color names to ANSI escape codes.
+    LEVEL_COLORS (dict): Mapping of log level names to their ANSI color codes.
+    logger: Pre-built :class:`LazyLogger` named ``"ejKernelLoggings"`` for
+        internal use by profiler utilities.
 
 Example:
     >>> from ejkernel.loggings import get_logger, ProgressLogger
@@ -466,18 +477,21 @@ def create_step_profiler(
     from ejkernel.utils import barrier_sync
 
     class ProfilerState:
-        """State tracker for profiler lifecycle management.
+        """Mutable state container for the step-profiler lifecycle.
 
-        Tracks whether the profiler is currently active and whether
-        profiling has been completed to prevent re-activation.
+        Tracks whether the JAX trace profiler is currently running and
+        whether the profiling window has already completed, preventing
+        the profiler from being started or stopped more than once.
 
         Attributes:
-            active: True if profiler is currently running.
-            completed: True if profiling has finished.
+            active: ``True`` while the profiler is running (between
+                ``ignite_profiler`` and ``extinguish_profiler`` calls).
+            completed: ``True`` after the profiling window has finished.
+                Once set, the ``profile_step`` callback becomes a no-op.
         """
 
         def __init__(self):
-            """Initialize profiler state as inactive and not completed."""
+            """Initialize profiler state as inactive and not yet completed."""
             self.active = False
             self.completed = False
 
@@ -556,24 +570,29 @@ def extinguish_profiler(enable_perfetto: bool) -> None:
 def _pulse_output_during_wait(completion_signal: threading.Event) -> None:
     """Keep output streams alive during blocking profiler shutdown.
 
-    Spawns a daemon thread that periodically flushes stdout/stderr
-    to prevent connection timeouts during long-running profiler
-    finalization.
+    Spawns a daemon thread that flushes stdout/stderr immediately and then
+    prints ``"Profiler finalizing..."`` every 5 seconds until
+    ``completion_signal`` is set. This prevents remote connection timeouts
+    during long-running Perfetto trace finalization.
 
     Args:
-        completion_signal: Event that signals when to stop pulsing.
-            The thread runs until this event is set.
+        completion_signal: A ``threading.Event`` that is set by the caller
+            (``extinguish_profiler``) after ``jax.profiler.stop_trace()``
+            returns. The background thread exits once the event is set.
 
     Note:
-        This is an internal function used by extinguish_profiler().
-        The spawned thread is a daemon and will not block program exit.
+        This is an internal helper used exclusively by
+        :func:`extinguish_profiler`. The spawned thread is a daemon thread
+        and will not prevent program exit.
     """
 
     def pulse_output() -> None:
-        """Periodically flush stdout and stderr until the completion signal is set.
+        """Flush streams once, then print keep-alive messages every 5 seconds.
 
-        Runs in a daemon thread, printing keep-alive messages every 5 seconds
-        to prevent connection timeouts during long profiler finalization.
+        Runs in a daemon thread. Flushes stdout/stderr immediately on entry,
+        sleeps 5 seconds, then enters a loop that prints
+        ``"Profiler finalizing..."`` to stdout and a blank line to stderr
+        every 5 seconds until ``completion_signal`` is set.
         """
         sys.stdout.flush()
         sys.stderr.flush()

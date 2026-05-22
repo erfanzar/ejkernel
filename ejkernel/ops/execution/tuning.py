@@ -309,44 +309,59 @@ class AutotuningResult:
 def autotune_recorded(hyperparameter_selector, *, show_progress=False, repetition_count=1):
     """Autotune all kernel invocations recorded for the current device.
 
-    This function iterates through all kernel invocations that have been recorded
-    in the global registry for the current device and runs autotuning to find
-    optimal configurations for each unique operation/call-key combination.
+    Iterates over every ``(op_id, call_key)`` entry stored in the global
+    invocation registry for the current device (see
+    :func:`~ejkernel.ops.registry.get_invocations`), benchmarks each
+    candidate configuration via :func:`benchmark`, and writes the winner to
+    both the in-memory and persistent caches.
 
-    The autotuning process:
-        1. Retrieves all recorded invocations for the current device
-        2. For each recorded kernel call, prepares arguments and generates candidates
-        3. Benchmarks each candidate configuration
-        4. Stores the optimal configuration in both memory and persistent caches
-        5. Returns results as an AutotuningResult for context manager usage
+    The registry is populated only when ``EJKERNEL_OPS_RECORD=1`` is set in the
+    environment before the initial (non-tuning) run.
+
+    Autotuning process:
+        1. Retrieve all invocations recorded for the current device.
+        2. For each ``(op_id_v, call_key, kernel, args, kwargs)`` entry:
+           a. Call ``kernel.prepare(*args, **kwargs)`` to get processed inputs.
+           b. Call ``kernel.candidate_cfgs()`` for candidate configurations.
+           c. Benchmark each candidate with :func:`benchmark`.
+           d. Write the fastest configuration to the selector's cache (and
+              persistent cache, if configured).
+        3. Return an :class:`AutotuningResult` wrapping all winners.
 
     Args:
-        hyperparameter_selector: ConfigSelectorChain instance with cache and
-            persistent storage for storing optimization results
-        show_progress: Whether to display progress bars during optimization
-            (currently unused, reserved for future implementation)
-        repetition_count: Number of times to repeat the optimization process
-            (currently unused, reserved for future implementation)
+        hyperparameter_selector: :class:`~ejkernel.ops.config.ConfigSelectorChain`
+            instance whose ``.cache`` and ``.persistent`` attributes receive
+            the optimised configurations.
+        show_progress: Whether to display tqdm progress bars during
+            benchmarking.  Also enabled by the ``EJKERNEL_AUTOTUNE_PROGRESS=1``
+            environment variable or the
+            :class:`~ejkernel.ops.config.log_autotune_progress` context manager.
+            *Note:* the ``repetition_count`` argument is accepted but currently
+            has no effect (reserved for future multi-pass support).
+        repetition_count: Reserved for future use.  Accepted but ignored.
 
     Returns:
-        AutotuningResult containing all optimal configurations found. Can be
-        used as a context manager to temporarily apply the configurations.
+        :class:`AutotuningResult` containing one :class:`Entry` per tuned
+        operation.  Can be used as a context manager to apply the results as a
+        cache overlay for a subsequent run.
 
     Example:
         >>> from ejkernel.ops.config import ConfigCache, ConfigSelectorChain
         >>> cache = ConfigCache()
         >>> selector = ConfigSelectorChain(cache)
         >>>
-        >>> # Record invocations by running with EJKERNEL_OPS_RECORD=1
+        >>> # First run: record invocations
+        >>> # EJKERNEL_OPS_RECORD=1 python my_script.py
+        >>>
         >>> # Then autotune all recorded operations:
         >>> result = autotune_recorded(selector)
         >>> with result:
-        ...     # Runs with optimized configurations
         ...     output = my_model(input_data)
 
     Note:
-        Requires invocations to be previously recorded using the
-        EJKERNEL_OPS_RECORD=1 environment variable during initial runs.
+        Requires invocations to have been previously recorded.  If the registry
+        is empty, this function returns an :class:`AutotuningResult` with an
+        empty ``entries`` tuple.
     """
     from ..registry import get_invocations
 
@@ -493,14 +508,19 @@ class TimingResult:
 
 
 def _get_global_mesh():
-    """Retrieve the current global mesh from JAX thread resources.
+    """Retrieve the currently active global JAX mesh from thread-local state.
 
-    Accesses JAX's internal thread-local resources to get the currently
-    active device mesh for distributed computation. Returns None if no
-    mesh is configured or the mesh is empty.
+    Reads the physical mesh from ``jax.interpreters.pxla.thread_resources``.
+    This is the mesh set by the innermost active ``jax.sharding.Mesh`` context
+    manager, or ``None`` when no mesh is active.
 
     Returns:
-        The current JAX mesh object, or None if no active mesh exists
+        The active :class:`jax.sharding.Mesh`, or ``None`` if no mesh is
+        configured or the mesh is empty (``mesh.empty`` is ``True``).
+
+    Note:
+        This accesses JAX internals (``pxla.thread_resources``) which may
+        change across JAX releases.
     """
     env = pxla.thread_resources.env
     mesh = env.physical_mesh
@@ -508,13 +528,14 @@ def _get_global_mesh():
 
 
 def _get_default_device():
-    """Get the default device for JAX computation.
+    """Return the default JAX compute device.
 
-    Returns the explicitly configured default device if set, otherwise
-    falls back to the first available device in the system.
+    Reads ``jax.config.values['jax_default_device']`` first; falls back to
+    the first device returned by ``jax.devices()`` when no explicit default
+    has been set.
 
     Returns:
-        The default JAX device for computation
+        A :class:`jax.Device` instance representing the default compute device.
     """
     if jax.config.values["jax_default_device"] is not None:
         return jax.config.values["jax_default_device"]
@@ -557,22 +578,33 @@ def _normalize_sharding(
     sharding_or_spec: PartitionSpec | Sharding | None,
     default_device: jax.Device,  # type: ignore
 ):
-    """Normalize sharding specification to a concrete Sharding object.
+    """Convert a sharding specification into a concrete :class:`~jax.sharding.Sharding`.
 
-    Converts various sharding specifications (PartitionSpec, Sharding, None)
-    into concrete Sharding objects that can be used for array placement.
-    Handles both global mesh and single-device scenarios.
+    Used inside :class:`FNAutotuner` to resolve the ``in_shardings`` argument
+    so that concrete random arrays can be placed on the correct devices before
+    benchmarking.
 
     Args:
-        arg: Array or array-like object to be sharded
-        sharding_or_spec: Sharding specification (PartitionSpec, Sharding, or None)
-        default_device: Default device to use for single-device sharding
+        arg: The array (or other value) for which sharding is being resolved.
+            Non-array values receive ``None`` (they are not sharded).
+        sharding_or_spec: How to shard ``arg``:
+
+            - :class:`~jax.sharding.Sharding` instance — returned as-is.
+            - :class:`~jax.sharding.PartitionSpec` — converted to a
+              :class:`~jax.sharding.NamedSharding` using the current global
+              mesh.  Raises ``ValueError`` if no global mesh is active.
+            - ``None`` — resolved to :class:`~jax.sharding.SingleDeviceSharding`
+              on ``default_device``.
+
+        default_device: Fallback device when no explicit sharding is given.
 
     Returns:
-        Concrete Sharding object, or None for non-array arguments
+        A concrete :class:`~jax.sharding.Sharding`, or ``None`` if ``arg`` is
+        not an array.
 
     Raises:
-        ValueError: If PartitionSpec is provided but no global mesh is defined
+        ValueError: If a :class:`~jax.sharding.PartitionSpec` is provided but
+            no global mesh is currently active.
     """
     if not isinstance(arg, jax.Array | np.ndarray):
         return None
@@ -588,16 +620,18 @@ def _normalize_sharding(
 
 
 def _ensure_dtype(dt):
-    """Extract dtype from an array or return the input if already a dtype.
+    """Return the ``.dtype`` of an array, or the input itself if not an array.
 
-    Safely extracts the dtype attribute from arrays, handling edge cases
-    where the dtype extraction might fail.
+    Used to normalise entries in a shape/dtype specification that might be
+    either concrete arrays or already-extracted dtypes.
 
     Args:
-        dt: JAX array, NumPy array, or dtype-like object
+        dt: A :class:`jax.Array`, :class:`numpy.ndarray`, or any dtype-like
+            object.
 
     Returns:
-        The dtype of the input array, or the input itself if not an array
+        ``dt.dtype`` if ``dt`` is a JAX or NumPy array; otherwise ``dt`` itself.
+        Returns ``dt`` unchanged on any exception.
     """
     try:
         return dt.dtype if isinstance(dt, jax.Array | np.ndarray) else dt
@@ -607,23 +641,33 @@ def _ensure_dtype(dt):
 
 @partial(jax.jit, static_argnames=("sds", "sharding"))
 def _get_random_value(sds, sharding=None):
-    """Generate random values matching a shape/dtype specification.
+    """Generate a concrete random array matching a shape/dtype specification.
 
-    Creates random data matching the shape and dtype of the input specification.
-    For floating point types, generates normally distributed random values.
-    For integer types, generates zeros. Supports optional output sharding.
+    Used by :class:`FNAutotuner` to materialise abstract input specifications
+    (e.g. ``jax.ShapeDtypeStruct``) into concrete arrays suitable for JIT
+    compilation and benchmarking.
+
+    Both arguments are treated as *static* by the surrounding ``@jax.jit``
+    wrapper so that different shape/sharding combinations each produce a
+    separately-compiled function.
 
     Args:
-        sds: Shape/dtype specification (ShapeDtypeStruct or similar object with
-            shape and dtype attributes), or any other value to return unchanged
-        sharding: Optional sharding specification for the output array
+        sds: A shape/dtype specification with ``.shape`` and ``.dtype``
+            attributes (e.g. :class:`jax.ShapeDtypeStruct`), or any other
+            value that should be returned unchanged.
+        sharding: Optional :class:`~jax.sharding.Sharding` passed as
+            ``out_shardings`` to the inner JIT call.  ``None`` means no
+            explicit sharding is requested.
 
     Returns:
-        Random array matching the specification, or the input unchanged if
-        it doesn't have shape/dtype attributes
+        For floating-point ``sds``: a normally-distributed random array of the
+        specified shape and dtype.
+        For integer ``sds``: a zero-filled array of the specified shape and dtype.
+        For any other ``sds`` (no ``.shape``/``.dtype``): returns ``sds`` unchanged.
 
     Raises:
-        ValueError: If the dtype is not floating point or integer
+        ValueError: If ``sds`` has ``.shape`` and ``.dtype`` but the dtype is
+            neither floating-point nor integer.
     """
     if hasattr(sds, "shape") and hasattr(sds, "dtype"):
         dt = _ensure_dtype(sds.dtype)
@@ -638,22 +682,26 @@ def _get_random_value(sds, sharding=None):
 
 
 def _try_hash_input(args, kws, must_be_concrete: bool = True):
-    """Attempt to create a hashable key from function input arguments.
+    """Attempt to create a hashable signature key from function input arguments.
 
-    Creates a hash key based on the structure and types of input arguments,
-    which can be used for caching autotuning results. Arrays are hashed
-    based on their shape, dtype, and sharding rather than their values.
+    Builds a hash of the PyTree *structure* plus the shape, dtype, and sharding
+    of every array leaf.  Non-array leaves are included directly.  Array values
+    are intentionally ignored so the same key is produced for arrays that have
+    the same structure but different data.
 
     Args:
-        args: Positional arguments to hash
-        kws: Keyword arguments to hash
-        must_be_concrete: If True, returns None when any arrays are abstract
-            (e.g., inside JAX transformations). Default is True.
+        args: Positional arguments to hash.
+        kws: Keyword arguments to hash.
+        must_be_concrete: If ``True`` (default), returns ``None`` when any JAX
+            array leaf is abstract (i.e. is a tracer, as happens inside
+            ``jax.jit`` or ``jax.vmap``).  Setting to ``False`` allows hashing
+            inside traced contexts, but the resulting key may be less stable.
 
     Returns:
-        A hash integer uniquely identifying the input signature, or None if:
-        - must_be_concrete is True and arguments contain abstract arrays
-        - Hashing fails for any reason (e.g., unhashable types)
+        An integer hash uniquely identifying the input signature, or ``None`` if:
+
+        - ``must_be_concrete`` is ``True`` and at least one array leaf is abstract.
+        - Hashing fails for any reason (e.g. unhashable leaf types).
     """
     flat_vals, struct = jax.tree.flatten((args, kws))
     all_concrete = all(jax.core.is_concrete(x) for x in flat_vals if isinstance(x, jax.Array))
@@ -678,40 +726,54 @@ def _try_hash_input(args, kws, must_be_concrete: bool = True):
 
 
 class FNAutotuner:
-    """Advanced class-based JAX autotuner with profiler-first timing and Python fallback.
+    """Advanced JAX autotuner with profiler-first timing and Python fallback.
 
-    Provides comprehensive hyperparameter optimization for JAX functions using
-    JAX's native profiling infrastructure when available, with automatic fallback
-    to Python-level timing. Supports parallel compilation, statistical timing
-    analysis, and intelligent caching of optimization results.
+    This is the engine behind the :func:`autotune` decorator.  It provides a
+    full hyperparameter optimisation pipeline:
 
-    Key Features:
-        - Profiler-based timing for accurate GPU/TPU measurements
-        - Python-level timing fallback when profiler unavailable
-        - Parallel compilation of hyperparameter configurations
-        - Statistical analysis with outlier removal
-        - Thread-safe caching of optimal configurations
-        - Optional automatic memory layout optimization
+    1. Generate all hyperparameter combinations (up to ``sample_num``).
+    2. Compile each configuration in parallel (``ThreadPoolExecutor``).
+    3. Time execution using :class:`~ejkernel.ops.execution.profiler.Profiler`
+       (JAX XPlane profiler) when available, or fall back to Python-level
+       ``time.perf_counter`` timing.
+    4. Remove outliers and rank by a composite score
+       (mean + 0.1 × std, see :meth:`_calculate_timing_score`).
+    5. Return (and cache) the fastest configuration.
 
-    The autotuner works by:
-        1. Generating all hyperparameter combinations
-        2. Compiling each configuration in parallel
-        3. Timing execution using profiler or Python fallback
-        4. Selecting the configuration with best performance
-        5. Caching results for future calls
+    Thread-safety:
+        The per-function result cache (inside :meth:`decorate`) is protected by
+        a :class:`threading.Lock`.  The ``FNAutotuner`` instance itself is
+        stateless between :meth:`tune` calls and may be shared across threads.
 
     Attributes:
-        allow_fallback_timing: Whether to use Python timing when profiler fails
-        profiling_samples: Number of profiling iterations for statistics
-        must_find_profiler_fraction: Minimum fraction of configs needing profiler results
-        enable_detailed_logging: Enable verbose error logging
-        find_optimal_layouts_automatically: Auto-discover optimal memory layouts
-        max_compilation_time_seconds: Maximum compilation time per config
-        timing_warmup_iterations: Warmup iterations before timing
-        timing_rounds: Number of timing rounds for statistics
-        calls_per_round: Function calls per timing round
-        cache_size_limit: Maximum cached optimization results
-        profiler: Profiler instance for trace capture and analysis
+        allow_fallback_timing: Fall back to Python timing when the profiler is
+            unavailable or raises an error (default: ``True``).
+        profiling_samples: Number of full profile captures for statistical
+            aggregation.  More samples reduce noise but increase tuning time
+            (default: ``5``).
+        must_find_profiler_fraction: Minimum fraction of compiled configurations
+            that must appear in the profiler output before the profiler results
+            are accepted.  Below this threshold the system falls back to Python
+            timing (default: ``0.5``).
+        enable_detailed_logging: When ``True``, failed compilation and execution
+            errors are logged with full tracebacks (default: ``False``).
+        find_optimal_layouts_automatically: When ``True``, query
+            ``compiled.input_formats`` to discover device-preferred memory
+            layouts and place inputs accordingly before timing (default:
+            ``False``).
+        max_compilation_time_seconds: Timeout hint passed to ``_try_call``.
+            Currently accepted but not enforced (default: ``300.0``).
+        timing_warmup_iterations: Number of un-timed warm-up calls before
+            Python-level timing begins (default: ``2``).
+        timing_rounds: Number of timed rounds for Python-level timing; the
+            outer two (min and max) are discarded before averaging (default:
+            ``5``).
+        calls_per_round: Calls executed per Python timing round; each round's
+            wall-clock time is divided by this value (default: ``3``).
+        cache_size_limit: Maximum number of entries in the per-decorated-function
+            LRU-style cache inside :meth:`decorate` (default: ``1000``).
+        profiler: :class:`~ejkernel.ops.execution.profiler.Profiler` instance
+            configured with the ``profiler_*`` constructor arguments.
     """
 
     PREFIX_FN = "autotune_fn_{}"

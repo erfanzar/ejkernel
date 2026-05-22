@@ -116,25 +116,35 @@ _cache_overlay: contextvars.ContextVar[list[dict[tuple[str, str, str], Any]]] = 
 
 
 class overlay_cache:
-    """Context manager for temporarily overriding cache entries.
+    """Context manager for temporarily overriding configuration cache entries.
 
-    This context manager allows temporary cache overlays that shadow the main cache
-    during execution. Useful for testing, debugging, or providing custom configurations
-    for specific contexts without permanently modifying the global cache.
+    Pushes a mapping of ``(device, op_id, call_key) → config`` onto a
+    thread-local context-variable stack so that :class:`ConfigSelectorChain`
+    can intercept those keys *before* consulting the in-memory or persistent
+    cache.  Overlays are checked by ``ConfigSelectorChain.choose`` in reverse
+    stack order (most-recently-pushed wins).
 
-    The overlay uses a context variable stack to support nested overlays.
+    .. important::
+        Overlay lookup is performed by ``ConfigSelectorChain``, not by
+        :class:`ConfigCache` itself.  Calling ``ConfigCache.get`` directly will
+        still return the value stored in the real cache; only the selector chain
+        respects overlays.
+
+    Supports nesting: each ``with overlay_cache(...)`` block appends its mapping
+    to the stack and removes it on exit, regardless of exceptions.
 
     Args:
-        mapping: Dictionary mapping cache keys to override configurations
+        mapping: Dictionary mapping ``(device_fingerprint, op_id, call_key)``
+            triples to the configuration that should be returned for that key
+            while the overlay is active.
 
     Example:
         >>> cache = ConfigCache()
         >>> cache.put('dev1', 'op1', 'key1', 'original_config')
         >>> override = {('dev1', 'op1', 'key1'): 'override_config'}
         >>> with overlay_cache(override):
-        ...
-        ...     config = cache.get('dev1', 'op1', 'key1')
-        >>>
+        ...     # ConfigSelectorChain.choose() will return 'override_config'
+        ...     pass
     """
 
     def __init__(self, mapping: dict[tuple[str, str, str], Any]):
@@ -147,12 +157,13 @@ class overlay_cache:
         self.token = None
 
     def __enter__(self):
-        """Enter the cache overlay context.
+        """Activate the overlay by pushing the mapping onto the context-variable stack.
 
-        Pushes the overlay mapping onto the context variable stack.
+        Also attempts to register with JAX's user-context machinery (if available)
+        so that the overlay survives JAX trace boundaries where applicable.
 
         Returns:
-            Self for use in with statements
+            Self, for use as ``with overlay_cache(...) as ctx:``.
         """
         stack = list(_cache_overlay.get())
         stack.append(self.mapping)
@@ -171,13 +182,14 @@ class overlay_cache:
         return self
 
     def __exit__(self, *exc):
-        """Exit the cache overlay context.
+        """Deactivate the overlay by restoring the context-variable stack token.
 
-        Pops the overlay mapping from the context variable stack,
-        restoring the previous cache state.
+        Called automatically at the end of a ``with`` block.  Any exception
+        raised inside the block is propagated normally; the overlay is always
+        removed regardless.
 
         Args:
-            *exc: Exception information (ignored)
+            *exc: Exception information (exc_type, exc_val, exc_tb); ignored.
         """
         _cache_overlay.reset(self.token)
         try:

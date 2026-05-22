@@ -62,18 +62,30 @@ def solve_lloyd_max(
 
     Uses iterative optimization: alternate between computing decision
     boundaries (midpoints between adjacent centroids) and updating
-    centroids as conditional expectations E[X | X in partition_i].
+    centroids as conditional expectations ``E[X | X in partition_i]``.
+    Centroids are initialized uniformly in ``[-3σ, 3σ]`` where ``σ = 1/sqrt(dim)``.
+
+    Requires ``scipy`` at call time (imported inside the function).
 
     Args:
-        bits: Number of quantization bits (1-8).
-        dim: Vector dimensionality (determines variance = 1/dim).
-        max_iters: Maximum iterations for convergence.
-        tol: Convergence tolerance on centroid change.
-        use_gaussian_approx: If True, use Gaussian approximation (good for dim >= 64).
-            Otherwise use exact Beta-type PDF.
+        bits: Number of quantization bits, typically 3 or 4 for TurboQuant.
+            Determines ``n_levels = 2^bits``.
+        dim: Vector dimensionality; sets the distribution variance to ``1/dim``.
+            Defaults to 128 (common attention head dimension).
+        max_iters: Maximum Lloyd-Max iterations before stopping even without
+            convergence.  200 is sufficient for most practical settings.
+        tol: Convergence threshold on the max absolute centroid change between
+            iterations.
+        use_gaussian_approx: If ``True`` (or if ``dim >= 64``), the coordinate
+            distribution is modelled as ``N(0, 1/dim)`` using ``scipy.stats.norm``.
+            If ``False`` and ``dim < 64``, uses the exact marginal PDF of a uniform
+            unit-sphere projection (Beta-type), computed via ``scipy.special.gamma``.
+            Note: the ``dim >= 64`` condition takes precedence — even when this
+            argument is ``False``, the Gaussian path is used whenever ``dim >= 64``.
 
     Returns:
-        LloydMaxCodebook with precomputed centroids and boundaries.
+        ``LloydMaxCodebook`` with ``centroids`` and ``boundaries`` stored as
+        float32 numpy arrays of shapes ``[n_levels]`` and ``[n_levels - 1]``.
     """
     from scipy import integrate
     from scipy.stats import norm
@@ -142,12 +154,19 @@ def solve_lloyd_max(
 def get_codebook(bits: int, dim: int = 128) -> LloydMaxCodebook:
     """Get or compute a cached Lloyd-Max codebook.
 
+    Results are memoized via ``functools.lru_cache`` (up to 32 distinct
+    ``(bits, dim)`` pairs).  Calls :func:`solve_lloyd_max` with default
+    ``use_gaussian_approx=True``, which uses the Gaussian approximation
+    for all ``dim`` values.  Requires ``scipy`` on first call for any
+    given ``(bits, dim)`` pair.
+
     Args:
-        bits: Number of quantization bits.
-        dim: Vector dimensionality.
+        bits: Number of quantization bits, e.g. 3 or 4.
+        dim: Vector dimensionality (sets the quantizer distribution variance
+            to ``1/dim``).  Defaults to 128.
 
     Returns:
-        Cached LloydMaxCodebook instance.
+        Cached :class:`LloydMaxCodebook` instance.
     """
     return solve_lloyd_max(bits=bits, dim=dim)
 
@@ -156,14 +175,19 @@ def quantize_to_indices(
     x: jax.Array,
     centroids: jax.Array,
 ) -> jax.Array:
-    """Quantize each element of x to the nearest centroid index.
+    """Quantize each element of x to the index of the nearest centroid.
+
+    Computes the L1 distance from each element to every centroid by broadcasting
+    ``x[..., None] - centroids`` into a ``[..., n_levels]`` array and taking
+    ``argmin`` along the last axis.  Memory cost is O(numel(x) * n_levels).
 
     Args:
-        x: Input array of arbitrary shape.
-        centroids: 1D array of centroid values [n_levels].
+        x: Input float array of arbitrary shape.
+        centroids: 1-D float array of centroid values, shape ``[n_levels]``.
+            Must have ``n_levels <= 256`` so that indices fit in uint8.
 
     Returns:
-        Integer array of same shape as x, with values in [0, n_levels).
+        uint8 array of the same shape as ``x``, with values in ``[0, n_levels)``.
     """
     diffs = jnp.abs(x[..., None] - centroids)
     return jnp.argmin(diffs, axis=-1).astype(jnp.uint8)
@@ -173,14 +197,20 @@ def dequantize_from_indices(
     indices: jax.Array,
     centroids: jax.Array,
 ) -> jax.Array:
-    """Map indices back to centroid float values.
+    """Map centroid indices back to their float values.
+
+    Uses a one-hot matrix multiply rather than a gather/index operation.
+    This avoids Mosaic's restriction to 2-D indexing on TPU Pallas backends
+    and is practical for small codebooks (typically 8–16 entries at 3–4 bits).
 
     Args:
-        indices: Integer array of centroid indices.
-        centroids: 1D array of centroid values [n_levels].
+        indices: Integer array of centroid indices, arbitrary shape.
+            Values must be in ``[0, n_levels)``.
+        centroids: 1-D float array of centroid values, shape ``[n_levels]``.
 
     Returns:
-        Float array of same shape as indices.
+        float32 array of the same shape as ``indices``, where each element is
+        replaced by its corresponding centroid value.
     """
     # One-hot matmul avoids Mosaic's 2D-only gather on TPU Pallas.
     # Safe for small codebooks (8-16 entries at 3-4 bits).

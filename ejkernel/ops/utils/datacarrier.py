@@ -13,23 +13,26 @@
 # limitations under the License.
 
 
-"""Data carrier classes for kernel configuration parameters.
+"""Data carrier dataclasses for kernel tiling and execution configuration.
 
-This module provides dataclasses that encapsulate forward and backward pass
-parameters for various kernel operations, particularly attention mechanisms.
-These parameter carriers enable consistent configuration across different
-kernel implementations and facilitate autotuning by providing hashable
-parameter sets.
+This module provides :class:`FwdParams` and :class:`BwdParams` — lightweight
+dataclasses that carry the block-size and GPU-execution parameters commonly
+needed by forward and backward kernel variants (primarily attention and
+matrix-multiplication operations).
+
+All fields default to ``None``, which signals to the kernel that it should
+select an appropriate value automatically (via heuristics or autotuning).
+
+Custom hashing:
+    Both dataclasses override ``__hash__`` with :func:`hash_fn`, which builds
+    a hash from the concatenated string representations of all ``float``,
+    ``int``, ``bool``, ``dict``, and ``list`` attributes.  This makes the
+    objects usable as dictionary keys and in :class:`~ejkernel.ops.config.ConfigCache`
+    lookups without requiring them to be ``frozen=True``.
 
 Classes:
-    FwdParams: Forward pass parameters for kernel configuration
-    BwdParams: Backward pass parameters for kernel configuration
-
-The parameter carriers support:
-    - Block size configuration for tiling strategies
-    - Warp and pipeline stage configuration for GPU kernels
-    - Consistent hashing for configuration caching
-    - Optional parameters that can be None for auto-selection
+    FwdParams: Block-size and GPU-execution parameters for forward kernels.
+    BwdParams: Block-size and GPU-execution parameters for backward kernels.
 """
 
 import hashlib
@@ -71,25 +74,31 @@ def get_safe_hash_int(text, algorithm="md5"):
 
 
 def hash_fn(self) -> int:
-    """Generate a hash for an object based on its dictionary values.
+    """Compute an integer hash from the numeric/collection attributes of an object.
 
-    Creates a deterministic hash by concatenating string representations
-    of all hashable-type values in the object's __dict__ attribute.
-    Only includes values that are float, int, bool, dict, or list types.
+    Intended to be assigned as the ``__hash__`` method of a dataclass (e.g.
+    ``__hash__ = hash_fn``), providing hashability without requiring the
+    dataclass to be ``frozen=True``.
 
-    This function is designed to be used as a __hash__ method replacement
-    for dataclasses that need consistent hashing for configuration caching.
+    The hash is derived from the concatenated ``str()`` representations of all
+    attribute values whose types are ``float``, ``int``, ``bool``, ``dict``, or
+    ``list``.  Attribute values of other types (``None``, ``str``, arbitrary
+    objects) are excluded from the hash computation.
 
     Args:
-        self: Object instance with __dict__ attribute containing configuration
+        self: Dataclass instance whose ``__dict__`` contains the configuration
+            attributes to hash.
 
     Returns:
-        Integer hash value derived from the object's attribute values
+        An integer hash value.  Two instances with the same numeric/collection
+        attribute values will produce the same hash (though not necessarily the
+        same string representation for ``str``-typed attributes).
 
     Note:
-        Only primitive types (float, int, bool) and collections (dict, list)
-        are included in the hash. Other types (e.g., None, str, objects) are
-        excluded to ensure stable hashing across different configurations.
+        ``None`` values are excluded from the hash, so a parameter left at its
+        default of ``None`` does not contribute to the hash.  This means two
+        instances that differ only in ``None`` vs a set value will have
+        different hashes only when the set value is of a hashable primitive type.
     """
     shu = "".join(str(cu) for cu in self.__dict__.values() if isinstance(cu, float | int | bool | dict | list))
     return get_safe_hash_int(shu)

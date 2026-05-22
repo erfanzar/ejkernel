@@ -309,30 +309,39 @@ def short_hash(obj: Any) -> str:
 
 
 def abstractify(pytree: Any) -> Any:
-    """Convert a PyTree containing arrays to abstract shape/dtype specifications.
+    """Replace all arrays in a PyTree with abstract shape/dtype specifications.
 
-    Transforms a nested data structure containing JAX or NumPy arrays into an
-    abstract representation using ShapeDtypeStruct objects. This allows for
-    consistent hashing and comparison based on array shapes and dtypes rather
-    than actual array values.
+    Traverses ``pytree`` with ``jax.tree_util.tree_map`` and converts every
+    :class:`jax.Array` or :class:`numpy.ndarray` leaf to a
+    :class:`jax.ShapeDtypeStruct` containing only the array's shape and dtype.
+    All other leaves (strings, ints, callables, ``None``, etc.) are passed
+    through unchanged.
+
+    This is the primary mechanism for generating stable cache keys: two calls
+    that produce arrays with the same shape and dtype but different values will
+    map to the same abstract representation and therefore the same cache entry.
 
     Args:
-        pytree: Nested data structure potentially containing arrays
+        pytree: Arbitrarily nested Python structure potentially containing JAX
+            or NumPy arrays.
 
     Returns:
-        PyTree with same structure but arrays replaced by ShapeDtypeStruct
+        PyTree with identical structure, but every array leaf replaced by a
+        :class:`jax.ShapeDtypeStruct`.
 
-    Examples:
+    Example:
         >>> import jax.numpy as jnp
-        >>> data = {'x': jnp.array([1, 2, 3]), 'y': 'scalar'}
+        >>> data = {'x': jnp.ones((2, 3), dtype=jnp.float32), 'y': 'label'}
         >>> abstract = abstractify(data)
-        >>>
-        >>>
+        >>> abstract['x']
+        ShapeDtypeStruct(shape=(2, 3), dtype=float32)
+        >>> abstract['y']
+        'label'
 
     Note:
-        This is essential for creating cache keys based on array structure
-        rather than values, allowing the same optimized configuration to be
-        reused for arrays with the same shape and dtype but different values.
+        Sharding information is *not* captured.  Use
+        :func:`default_key_builder_with_sharding` when sharding-aware cache
+        keys are required.
     """
 
     def leaf(x):

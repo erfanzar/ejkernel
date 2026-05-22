@@ -20,30 +20,31 @@ labels embedded in JAX compiled programs. It enables extraction of operation
 identifiers and configuration mappings from compiled HLO code.
 
 Key Functions:
-    label: Generate standardized labels for operations
-    extract_labels_from_hlo_text: Find all ejkernel labels in HLO text
-    find_labels_in_lowered: Extract labels from lowered JAX computations
-    labels_to_configs: Map found labels back to their configurations
+    label: Generate standardized labels for operations.
+    extract_labels_from_hlo_text: Find all ejkernel labels in HLO text.
+    find_labels_in_lowered: Extract labels from a lowered JAX computation.
+    labels_to_configs: Map found labels back to their cached configurations.
 
 Label Format:
-    Labels follow the pattern: 'ejkernel_ops#operation@version:hash'
-    Example: 'ejkernel_ops#matmul@v1:1a2b3c4d5e6f7g8h'
+    Labels follow the pattern: ``'<prefix><op_id>@v<version>:<16-hex-hash>'``
+
+    The default prefix is ``'ejkernel_ops#'`` and can be overridden via the
+    ``EJKERNEL_OPS_PREFIX`` environment variable.
+
+    Example: ``'ejkernel_ops#matmul@v1:1a2b3c4d5e6f7g8h'``
 
 These utilities enable:
-    - Tracking which operations were compiled with which configurations
-    - Post-compilation analysis of optimization choices
-    - Debugging and profiling of specific operation instances
-    - Configuration recovery from compiled programs
+    - Tracking which operations were compiled with which configurations.
+    - Post-compilation analysis of optimization choices.
+    - Debugging and profiling of specific operation instances.
+    - Configuration recovery from compiled programs via :func:`labels_to_configs`.
 
 Example Usage:
-    >>>
     >>> op_label = label('matmul@v1', '1a2b3c4d5e6f7g8h')
-    >>> print(op_label)
-    >>>
+    >>> # op_label == 'ejkernel_ops#matmul@v1:1a2b3c4d5e6f7g8h'
     >>>
     >>> lowered = jax.jit(my_function).lower(args)
     >>> labels = find_labels_in_lowered(lowered)
-    >>>
     >>>
     >>> configs = labels_to_configs(lowered, selector)
 """
@@ -55,8 +56,8 @@ import re
 
 from .fingerprint import device_fingerprint
 
-LABEL_PREFIXES = ("ejkernel_ops#", "ejkernel_ops#")
-LABEL_RE = re.compile(r"(?:ejkernel_ops|ejkernel_ops)#(?P<op>[^:]+@v[0-9A-Za-z_.-]+):(?P<key>[0-9a-f]{16})")
+LABEL_PREFIXES = ("ejkernel_ops#",)
+LABEL_RE = re.compile(r"ejkernel_ops#(?P<op>[^:]+@v[0-9A-Za-z_.-]+):(?P<key>[0-9a-f]{16})")
 
 
 def labels_to_configs(lowered, selector):
@@ -93,27 +94,32 @@ def labels_to_configs(lowered, selector):
 
 
 def label(op_id: str, call_hash: str, prefix: str | None = None) -> str:
-    """Generate a standardized label for an operation.
+    """Generate a standardised label string for an operation instance.
 
-    Creates a label string that uniquely identifies an operation instance
-    for embedding in compiled code and later retrieval.
+    Labels are embedded into compiled JAX graphs via ``jax.named_call`` /
+    ``jax.named_scope`` so that the operation and its call-signature hash can
+    later be extracted from HLO text by :func:`extract_labels_from_hlo_text`.
 
     Args:
-        op_id: Operation identifier with version (e.g., 'matmul@v1')
-        call_hash: 16-character hash of the call signature
-        prefix: Optional custom prefix (default: 'ejkernel_ops#' or from
-            EJKERNEL_OPS_PREFIX environment variable)
+        op_id: Operation identifier with version (e.g. ``'matmul@v1'``).
+        call_hash: 16-character hexadecimal hash of the call signature, as
+            produced by :func:`~ejkernel.ops.utils.fingerprint.short_hash`.
+        prefix: Optional custom prefix.  Resolution order:
+            1. ``prefix`` argument (if not ``None``).
+            2. ``EJKERNEL_OPS_PREFIX`` environment variable.
+            3. Hard-coded default ``'ejkernel_ops#'``.
 
     Returns:
-        Formatted label string following ejkernel convention
+        Label string in the form ``'<prefix><op_id>:<call_hash>'``.
 
     Examples:
         >>> label('matmul@v1', '1a2b3c4d5e6f7g8h')
         'ejkernel_ops#matmul@v1:1a2b3c4d5e6f7g8h'
         >>> label('conv@v2', 'abcd1234efgh5678', prefix='custom#')
         'custom#conv@v2:abcd1234efgh5678'
+
     """
-    chosen_prefix = prefix or os.getenv("EJKERNEL_OPS_PREFIX") or os.getenv("EJKERNEL_OPS_PREFIX") or "ejkernel_ops#"
+    chosen_prefix = prefix or os.getenv("EJKERNEL_OPS_PREFIX") or "ejkernel_ops#"
     return f"{chosen_prefix}{op_id}:{call_hash}"
 
 
@@ -133,7 +139,7 @@ def extract_labels_from_hlo_text(hlo_text: str) -> list[str]:
         The regex pattern matches the standard ejkernel label format:
         'ejkernel_ops#' + operation_name + ':' + 16-char hex hash
     """
-    pat = re.compile(r"(?:ejkernel_ops|ejkernel_ops)#[A-Za-z0-9_.@-]+:[0-9a-f]{16}")
+    pat = re.compile(r"ejkernel_ops#[A-Za-z0-9_.@-]+:[0-9a-f]{16}")
     return pat.findall(hlo_text)
 
 

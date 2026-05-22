@@ -13,27 +13,34 @@
 # limitations under the License.
 
 
-"""Offline autotuning for pre-compiled JAX computations.
+"""Offline autotuning driven by the HLO of lowered JAX computations.
 
-This module provides utilities for autotuning kernel configurations
-based on lowered (compiled but not yet executed) JAX computations.
-It enables optimization of kernels based on the actual operations
-that will be executed, rather than relying on heuristics.
-
-Key Functions:
-    autotune_lowered: Autotune all ejkernel operations found in a lowered computation
+This module provides :func:`autotune_lowered`, which extracts the ejkernel
+operation labels embedded in a ``jax.jit(...).lower(...)`` result, looks up
+matching invocations in the global registry, and benchmarks every candidate
+configuration under ``jax.core.eval_context`` so that autotuning runs outside
+the JAX tracing stack.
 
 The offline tuning workflow:
-    1. Lower a JAX function to get compiled representation
-    2. Extract ejkernel operation labels from the HLO code
-    3. Match labels to recorded invocations in the registry
-    4. Run autotuning for each matched operation
-    5. Store optimal configurations in cache
+    1. Lower a JAX function to obtain its HLO representation.
+    2. Parse the HLO text to extract all ``ejkernel_ops#...`` labels.
+    3. For each label, look up the recorded ``(kernel, args, kwargs)`` in the
+       global registry (populated when ``EJKERNEL_OPS_RECORD=1`` is set).
+    4. Benchmark each candidate configuration returned by
+       ``kernel.candidate_cfgs()`` using :class:`~ejkernel.ops.config.Tuner`.
+    5. Write the fastest configuration to the in-memory and persistent caches.
+    6. Return an :class:`~ejkernel.ops.execution.tuning.AutotuningResult` that
+       can be used as a context manager to apply all results at once.
+
+Note:
+    Operations not present in the registry are silently skipped.  Enable
+    ``EJKERNEL_OPS_RECORD=1`` during an initial non-tuning run to populate
+    the registry.
 
 Example:
     >>> lowered = jax.jit(my_function).lower(example_args)
     >>> result = autotune_lowered(selector, lowered)
-    >>> with result:  # Apply optimized configurations
+    >>> with result:  # temporarily apply the optimised configurations
     ...     output = jax.jit(my_function)(real_args)
 """
 
@@ -50,16 +57,20 @@ from .tuning import AutotuningResult, Entry
 
 
 def _labels_to_invocations(lowered) -> list[tuple[str, str]]:
-    """Extract operation ID and call key pairs from a lowered computation.
+    """Parse ejkernel labels from a lowered computation into (op_id_v, call_key) pairs.
 
-    Parses the HLO representation of a lowered JAX computation to find
-    all embedded ejkernel operation labels and extracts their identifiers.
+    Extracts the HLO text from ``lowered`` (falling back to ``str(lowered)``
+    if the HLO dialect is unavailable) and applies :data:`~ejkernel.ops.utils.meta.LABEL_RE`
+    to find every embedded ``ejkernel_ops#<op>:<key>`` label.
 
     Args:
-        lowered: JAX lowered computation object
+        lowered: A ``jax.stages.Lowered`` object (the result of
+            ``jax.jit(...).lower(...)``).
 
     Returns:
-        List of (operation_id, call_key) tuples found in the computation
+        List of ``(op_id_v, call_key)`` tuples, one per matching label found
+        in the HLO text.  ``op_id_v`` has the form ``'<name>@v<version>'``
+        and ``call_key`` is a 16-character hexadecimal hash.
     """
     try:
         hlo_text = lowered.compiler_ir(dialect="hlo").as_text()
@@ -78,29 +89,37 @@ def _labels_to_invocations(lowered) -> list[tuple[str, str]]:
 def autotune_lowered(selector: ConfigSelectorChain, lowered) -> AutotuningResult:
     """Autotune all ejkernel operations found in a lowered JAX computation.
 
-    Analyzes a lowered JAX computation to identify all ejkernel operations,
-    then runs autotuning for each operation using recorded invocations from
-    the global registry.
+    Parses the HLO of ``lowered`` to find embedded ``ejkernel_ops#`` labels,
+    matches each label against the global invocation registry, and benchmarks
+    the candidate configurations for every matched operation inside a
+    ``jax.core.eval_context`` so that execution is not traced.
+
+    Winning configurations are written to ``selector.cache`` and, when
+    ``selector.persistent is not None and selector.persist_autotune``, to
+    ``selector.persistent`` as well.
 
     Args:
-        selector: ConfigSelectorChain with tuner and cache for optimization
-        lowered: JAX lowered computation containing ejkernel operations
+        selector: :class:`~ejkernel.ops.config.ConfigSelectorChain` that owns
+            the ``tuner``, ``cache``, and (optionally) ``persistent`` attributes
+            used during benchmarking and result storage.
+        lowered: A ``jax.stages.Lowered`` object — the result of
+            ``jax.jit(fn).lower(*example_args)``.
 
     Returns:
-        AutotuningResult containing optimal configurations for all tuned operations.
-        Can be used as a context manager to temporarily apply the configurations.
+        :class:`~ejkernel.ops.execution.tuning.AutotuningResult` wrapping all
+        tuned ``(op_id_v, call_key, best_cfg)`` entries for the current device.
+        Can be used as a context manager to apply the results as a cache overlay.
 
     Example:
         >>> lowered = jax.jit(my_model).lower(example_input)
         >>> result = autotune_lowered(selector, lowered)
         >>> with result:
-        ...     # Runs with optimized configurations
         ...     output = jax.jit(my_model)(real_input)
 
     Note:
-        Only operations that have been previously recorded in the invocation
-        registry will be tuned. Use EJKERNEL_OPS_RECORD=1 environment variable
-        to enable invocation recording during initial runs.
+        Operations not present in the invocation registry are silently skipped.
+        Set ``EJKERNEL_OPS_RECORD=1`` and run the model once to populate the
+        registry before calling this function.
     """
     dev = device_fingerprint()
     invs = get_invocations(dev)
@@ -126,10 +145,10 @@ def autotune_lowered(selector: ConfigSelectorChain, lowered) -> AutotuningResult
         run_method = _get_platform_method(kernel, "run", platform, None) or kernel.run
 
         def mk(c, _run=run_method, _static=static_fun_kwargs):
-            """Create a function that executes the kernel run method with a specific configuration."""
+            """Return a callable that runs ``kernel.run`` with configuration ``c``."""
 
             def f(*a, **k):
-                """Execute the kernel with the bound configuration and static kwargs."""
+                """Call the resolved run method with config ``c`` and closed-over static kwargs."""
                 return _run(*a, cfg=c, **(k | _static))  # noqa: B023
 
             return f

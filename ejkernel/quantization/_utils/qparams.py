@@ -410,16 +410,36 @@ def validate_packed_quantized_matmul_layout(
     fused kernels where layout mismatches can silently trigger slow fallbacks.
 
     Canonical runtime contract:
-      - axis='row' <-> transpose=False: w_q is (K, ceil(N / values_per_word)),
-        scales/zeros are (K, N // group_size).
-      - axis='col' <-> transpose=True: w_q is (N, ceil(K / values_per_word)),
-        scales/zeros are (N, K // group_size).
+      - ``axis='row'`` (``transpose=False``): ``w_q`` is ``(K, ceil(N / vpw))``,
+        ``scales``/``zeros`` are ``(K, N // group_size)``.
+      - ``axis='col'`` (``transpose=True``): ``w_q`` is ``(N, ceil(K / vpw))``,
+        ``scales``/``zeros`` are ``(N, K // group_size)``.
+    where ``vpw = 32 // bits`` (values per uint32 word).
+
+    Args:
+        x: Activation array with ``x.shape[-1] == K``.
+        w_q: Packed uint32 weight codes, rank-2.
+        scales: Scale metadata array, rank-2.  Must be float for affine/nf4
+            modes and uint8 for mx/nv modes.
+        zeros: Zero-point array for affine mode (same shape as ``scales``),
+            or ``None`` for all other modes.
+        mode: Quantization mode; one of ``{"affine", "nf4", "mxfp4", "mxfp8",
+            "nvfp4", "nvfp8"}``.
+        group_size: Number of elements per quantization group.
+        bits: Bit-width of the packed codes.
+        axis: Quantization axis, either ``"row"`` or ``"col"``.
+        transpose: Whether the weight is transposed at runtime.  Must be
+            consistent with ``axis``: ``"row"`` ↔ ``False``, ``"col"`` ↔ ``True``.
 
     Returns:
-      Tuple of (K, N) inferred from inputs.
+        Tuple ``(K, N)`` where ``K`` is the input channel dimension and ``N``
+        is the output channel dimension, both inferred from the input shapes.
 
     Raises:
-      ValueError: When shapes/dtypes are inconsistent with the contract.
+        ValueError: When shapes or dtypes are inconsistent with the contract,
+            including mismatched ``axis``/``transpose``, incorrect ``w_q`` dtype
+            (must be uint32), wrong scale dtype, missing or unexpected ``zeros``,
+            or shape mismatches between ``x``, ``w_q``, and ``scales``.
     """
     axis_n = normalize_axis(axis)
     transpose_n = bool(transpose)
