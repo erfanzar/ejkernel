@@ -331,8 +331,8 @@ class TestSoftmaxAux:
         assert output.shape == (batch, num_heads, head_dim)
         assert not jnp.any(jnp.isnan(output))
 
-    def test_attention_sinks_per_kv_head_raises(self):
-        """Per-KV-head sinks are not supported (softmax_aux must be 1D)."""
+    def test_attention_sinks_per_kv_head(self):
+        """Per-KV-head sink logits are supported."""
         batch, seq_len, num_heads, num_kv_heads, head_dim = 2, 256, 8, 2, 64
         num_sinks = 4
 
@@ -344,15 +344,17 @@ class TestSoftmaxAux:
         sequence_end = jnp.array([256, 256], dtype=jnp.int32)
 
         softmax_aux = jnp.ones((num_kv_heads, num_sinks), dtype=jnp.float32) * 5.0
-        with pytest.raises(Exception):  # noqa: B017
-            ragged_decode_attention(
-                query=query,
-                key=key,
-                value=value,
-                sequence_start=sequence_start,
-                sequence_end=sequence_end,
-                softmax_aux=softmax_aux,
-            )
+        output = ragged_decode_attention(
+            query=query,
+            key=key,
+            value=value,
+            sequence_start=sequence_start,
+            sequence_end=sequence_end,
+            softmax_aux=softmax_aux,
+        )
+
+        assert output.shape == (batch, num_heads, head_dim)
+        assert not jnp.any(jnp.isnan(output))
 
     def test_different_sink_strengths(self):
         """Test varying sink strength values."""

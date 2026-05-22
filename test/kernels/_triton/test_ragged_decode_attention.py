@@ -47,8 +47,8 @@ def ragged_decode_ref(
     G = HQ // HKV
 
     out = jnp.zeros((B, HQ, D), dtype=query.dtype)
-    if softmax_aux is not None and getattr(softmax_aux, "ndim", None) != 1:
-        raise ValueError(f"softmax_aux must be 1D (num_sinks,), got shape {softmax_aux.shape}")
+    if softmax_aux is not None and getattr(softmax_aux, "ndim", None) not in (1, 2):
+        raise ValueError(f"softmax_aux must be rank 1 or 2, got shape {softmax_aux.shape}")
     for b in range(B):
         s_b = int(sequence_start[b])
         e_b = int(sequence_end[b])
@@ -81,7 +81,16 @@ def ragged_decode_ref(
 
             logits_seq = jnp.where(mask, logits, -jnp.inf)
 
-            logits_sink = softmax_aux.astype(jnp.float32) if softmax_aux is not None else None
+            logits_sink = None
+            if softmax_aux is not None:
+                if softmax_aux.ndim == 1:
+                    logits_sink = softmax_aux.astype(jnp.float32)
+                elif softmax_aux.shape[0] == HKV:
+                    logits_sink = softmax_aux[kvh].astype(jnp.float32)
+                elif softmax_aux.shape[0] == HQ:
+                    logits_sink = softmax_aux[hq].astype(jnp.float32)
+                else:
+                    raise ValueError(f"softmax_aux head dimension must be {HKV} or {HQ}, got {softmax_aux.shape[0]}")
 
             if logits_sink is None:
                 m = jnp.max(logits_seq)
@@ -192,30 +201,29 @@ class TestRaggedDecodeAttentionTriton:
         aux_per_kv = jax.random.normal(ka, (HKV, NS), dtype=jnp.float32)
         aux_shared = jnp.linspace(-0.5, 0.5, NS, dtype=jnp.float32)
 
-        with pytest.raises(Exception):  # noqa: B017
-            ragged_decode_triton(
-                q,
-                k,
-                v,
-                starts,
-                ends,
-                softmax_scale=0.75,
-                sliding_window=(128, 16),
-                logits_soft_cap=25.0,
-                softmax_aux=aux_per_kv,
-            )
-        with pytest.raises(Exception):  # noqa: B017
-            ragged_decode_ref(
-                q,
-                k,
-                v,
-                starts,
-                ends,
-                softmax_scale=0.75,
-                sliding_window=(128, 16),
-                logits_soft_cap=25.0,
-                softmax_aux=aux_per_kv,
-            )
+        out_tri = ragged_decode_triton(
+            q,
+            k,
+            v,
+            starts,
+            ends,
+            softmax_scale=0.75,
+            sliding_window=(128, 16),
+            logits_soft_cap=25.0,
+            softmax_aux=aux_per_kv,
+        )
+        out_ref = ragged_decode_ref(
+            q,
+            k,
+            v,
+            starts,
+            ends,
+            softmax_scale=0.75,
+            sliding_window=(128, 16),
+            logits_soft_cap=25.0,
+            softmax_aux=aux_per_kv,
+        )
+        assert jnp.allclose(out_tri, out_ref, rtol=2e-4, atol=2e-5)
 
         out_tri2 = ragged_decode_triton(
             q,
