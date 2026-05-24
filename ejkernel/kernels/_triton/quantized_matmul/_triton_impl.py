@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -82,6 +82,19 @@ def _e4m3_to_f32(x: tl.tensor, table_ptr) -> tl.tensor:
 
 
 @triton.jit
+def _unpack_packed_codes(word0, word1, shifts, BITS: tl.constexpr):
+    """Decode packed uint32 codes for arbitrary affine bit-widths."""
+    low_bits = tl.minimum(32 - shifts, BITS)
+    high_bits = BITS - low_bits
+    one = tl.full(shifts.shape, 1, tl.uint32)
+    low_mask = (one << low_bits) - 1
+    high_mask = (one << high_bits) - 1
+    low = (word0 >> shifts) & low_mask
+    high = word1 & high_mask
+    return low | (high << low_bits)
+
+
+@triton.jit
 def qmm_dequant_nf4_kernel(
     Wq,
     Wscale,
@@ -148,12 +161,12 @@ def qmm_dequant_nf4_kernel(
         word_offsets = offs_c // VALUES_PER_WORD
         word_mask = word_offsets < tl.cdiv(K, VALUES_PER_WORD)
         shifts = (offs_c % VALUES_PER_WORD) * 4
-        w_word = tl.load(
+        w_word0 = tl.load(
             Wq + offs_r[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
             mask=r_mask[:, None] & word_mask[None, :],
             other=0,
         )
-        q = (w_word >> shifts[None, :]) & 0xF
+        q = (w_word0 >> shifts[None, :]) & 0xF
         group_idx = offs_c // GROUP_SIZE
         group_mask = group_idx < tl.cdiv(K, GROUP_SIZE)
         ws = tl.load(
@@ -174,12 +187,12 @@ def qmm_dequant_nf4_kernel(
         word_offsets = offs_c // VALUES_PER_WORD
         word_mask = word_offsets < tl.cdiv(N, VALUES_PER_WORD)
         shifts = (offs_c % VALUES_PER_WORD) * 4
-        w_word = tl.load(
+        w_word0 = tl.load(
             Wq + offs_r[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
             mask=r_mask[:, None] & word_mask[None, :],
             other=0,
         )
-        q = (w_word >> shifts[None, :]) & 0xF
+        q = (w_word0 >> shifts[None, :]) & 0xF
         group_idx = offs_c // GROUP_SIZE
         group_mask = group_idx < tl.cdiv(N, GROUP_SIZE)
         ws = tl.load(
@@ -214,17 +227,19 @@ def qmm_dequant_affine4_kernel(
     stride_oc: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     VALUES_PER_WORD: tl.constexpr,
+    BITS: tl.constexpr,
     BR: tl.constexpr,
     BC: tl.constexpr,
     TRANSPOSE: tl.constexpr,
     OUT_BF16: tl.constexpr,
 ):
-    """Dequantize a packed 4-bit affine-quantized weight tile to fp16/bf16.
+    """Dequantize a packed affine-quantized weight tile to fp16/bf16.
 
     Grid: ``(cdiv(rows, BR), cdiv(cols, BC))``
 
-    Unpacks ``VALUES_PER_WORD = 8`` 4-bit codes from each int32 word and
-    applies the per-group affine transform ``out = code * scale + bias``.
+    Unpacks affine codes from a contiguous bitstream with ``BITS`` bits per
+    code and applies the per-group affine transform
+    ``out = code * scale + bias``.
     The output is cast to bfloat16 if ``OUT_BF16=True``, otherwise float16.
 
     Args:
@@ -246,8 +261,8 @@ def qmm_dequant_affine4_kernel(
         stride_or: Row stride of ``O``.
         stride_oc: Column stride of ``O``.
         GROUP_SIZE: Number of values sharing one (scale, bias) pair (constexpr).
-        VALUES_PER_WORD: Packed values per int32 word; equals 8 for 4-bit
-            codes (constexpr).
+        VALUES_PER_WORD: Legacy packed values-per-word hint.
+        BITS: Bits per affine code, from 1 through 8.
         BR: Tile rows per CTA (constexpr).
         BC: Tile columns per CTA (constexpr).
         TRANSPOSE: Whether weight is stored transposed (NxK) vs (KxN) (constexpr).
@@ -262,15 +277,23 @@ def qmm_dequant_affine4_kernel(
     if TRANSPOSE:
         r_mask = offs_r < N
         c_mask = offs_c < K
-        word_offsets = offs_c // VALUES_PER_WORD
-        word_mask = word_offsets < tl.cdiv(K, VALUES_PER_WORD)
-        shifts = (offs_c % VALUES_PER_WORD) * 4
-        w_word = tl.load(
+        bit_offsets = offs_c * BITS
+        word_offsets = bit_offsets // 32
+        shifts = bit_offsets - word_offsets * 32
+        n_words = tl.cdiv(K * BITS, 32)
+        word_mask = word_offsets < n_words
+        word_offsets1 = tl.minimum(word_offsets + 1, n_words - 1)
+        w_word0 = tl.load(
             Wq + offs_r[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
             mask=r_mask[:, None] & word_mask[None, :],
             other=0,
         )
-        q = (w_word >> shifts[None, :]) & 0xF
+        w_word1 = tl.load(
+            Wq + offs_r[:, None] * stride_wq0 + word_offsets1[None, :] * stride_wq1,
+            mask=r_mask[:, None] & word_mask[None, :],
+            other=0,
+        )
+        q = _unpack_packed_codes(w_word0, w_word1, shifts[None, :], BITS)
         group_idx = offs_c // GROUP_SIZE
         group_mask = group_idx < tl.cdiv(K, GROUP_SIZE)
         ws = tl.load(
@@ -293,15 +316,23 @@ def qmm_dequant_affine4_kernel(
     else:
         r_mask = offs_r < K
         c_mask = offs_c < N
-        word_offsets = offs_c // VALUES_PER_WORD
-        word_mask = word_offsets < tl.cdiv(N, VALUES_PER_WORD)
-        shifts = (offs_c % VALUES_PER_WORD) * 4
-        w_word = tl.load(
+        bit_offsets = offs_c * BITS
+        word_offsets = bit_offsets // 32
+        shifts = bit_offsets - word_offsets * 32
+        n_words = tl.cdiv(N * BITS, 32)
+        word_mask = word_offsets < n_words
+        word_offsets1 = tl.minimum(word_offsets + 1, n_words - 1)
+        w_word0 = tl.load(
             Wq + offs_r[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
             mask=r_mask[:, None] & word_mask[None, :],
             other=0,
         )
-        q = (w_word >> shifts[None, :]) & 0xF
+        w_word1 = tl.load(
+            Wq + offs_r[:, None] * stride_wq0 + word_offsets1[None, :] * stride_wq1,
+            mask=r_mask[:, None] & word_mask[None, :],
+            other=0,
+        )
+        q = _unpack_packed_codes(w_word0, w_word1, shifts[None, :], BITS)
         group_idx = offs_c // GROUP_SIZE
         group_mask = group_idx < tl.cdiv(N, GROUP_SIZE)
         ws = tl.load(
@@ -1372,6 +1403,7 @@ def qmm_affine4_kernel(
     stride_on: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     VALUES_PER_WORD: tl.constexpr,
+    BITS: tl.constexpr,
     BM: tl.constexpr,
     BK: tl.constexpr,
     BN: tl.constexpr,
@@ -1380,14 +1412,14 @@ def qmm_affine4_kernel(
     TRANSPOSE: tl.constexpr = True,
     HAS_BIAS: tl.constexpr = True,
 ):
-    """Fused affine dequantization and matrix multiplication Triton kernel (4-bit).
+    """Fused affine dequantization and matrix multiplication Triton kernel.
 
     Performs x @ dequant(w) where w is packed in affine quantization format.
     Dequantization applies: w_float = w_int * scale + bias (when HAS_BIAS)
     or w_float = w_int * scale (when not HAS_BIAS).
 
-    Supports 4-bit quantization with per-group scale and bias factors.
-    Multiple quantized values are packed into uint32 words.
+    Supports affine bit-widths from 1 through 8 with per-group scale and bias
+    factors. Quantized values are packed into a contiguous uint32 bitstream.
 
     Uses split-K parallelism with atomic accumulation when SPLIT_K > 1.
 
@@ -1400,7 +1432,8 @@ def qmm_affine4_kernel(
         O: Output matrix pointer, shape (M, N).
         stride_*: Tensor stride parameters.
         GROUP_SIZE: Number of elements per quantization group.
-        Fixed 4-bit quantization (8 values per uint32).
+        VALUES_PER_WORD: Legacy packed values-per-word hint.
+        BITS: Bits per affine code, from 1 through 8.
         BM, BK, BN: Block tile sizes for M, K, N dimensions.
         SPLIT_K: Split-K parallelism factor.
         USE_BF16: If True, use BF16 for dot product tiles; otherwise FP16.
@@ -1421,11 +1454,17 @@ def qmm_affine4_kernel(
     acc = tl.zeros((BM, BN), tl.float32)
     dot_ty = tl.bfloat16 if USE_BF16 else tl.float16
 
-    mask_bits = 0xF
-    shifts = tl.arange(0, VALUES_PER_WORD) * 4
     if not TRANSPOSE:
-        word_offsets_n = (pid_n * BN) // VALUES_PER_WORD + tl.arange(0, BN // VALUES_PER_WORD)
-        word_mask_n = word_offsets_n < tl.cdiv(N, VALUES_PER_WORD)
+        if BITS == 1 or BITS == 2 or BITS == 4 or BITS == 8:
+            word_offsets_n = (pid_n * BN) // VALUES_PER_WORD + tl.arange(0, BN // VALUES_PER_WORD)
+            word_mask_n = word_offsets_n < tl.cdiv(N, VALUES_PER_WORD)
+        else:
+            bit_offsets_n = offs_n * BITS
+            word_offsets_n = bit_offsets_n // 32
+            shifts_n = bit_offsets_n - word_offsets_n * 32
+            n_words = tl.cdiv(N * BITS, 32)
+            word_mask_n = word_offsets_n < n_words
+            word_offsets_n1 = tl.minimum(word_offsets_n + 1, n_words - 1)
         group_idx_n = offs_n // GROUP_SIZE
 
     for k0 in tl.range(0, K, BK * SPLIT_K, loop_unroll_factor=1):
@@ -1439,16 +1478,38 @@ def qmm_affine4_kernel(
         ).to(dot_ty)
 
         if TRANSPOSE:
-            word_offsets = (k0 + pid_k * BK) // VALUES_PER_WORD + tl.arange(0, BK // VALUES_PER_WORD)
-            word_mask = word_offsets < tl.cdiv(K, VALUES_PER_WORD)
-            w_word = tl.load(
-                Wq + offs_n[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
-                mask=n_mask[:, None] & word_mask[None, :],
-                other=0,
-            )
-            q = (w_word[:, :, None] >> shifts[None, None, :]) & mask_bits
-            q = tl.reshape(q, (BN, BK))
-            q = tl.trans(q)
+            if BITS == 1 or BITS == 2 or BITS == 4 or BITS == 8:
+                mask_bits = (1 << BITS) - 1
+                shifts = tl.arange(0, VALUES_PER_WORD) * BITS
+                word_offsets = (k0 + pid_k * BK) // VALUES_PER_WORD + tl.arange(0, BK // VALUES_PER_WORD)
+                word_mask = word_offsets < tl.cdiv(K, VALUES_PER_WORD)
+                w_word = tl.load(
+                    Wq + offs_n[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
+                    mask=n_mask[:, None] & word_mask[None, :],
+                    other=0,
+                )
+                q = (w_word[:, :, None] >> shifts[None, None, :]) & mask_bits
+                q = tl.reshape(q, (BN, BK))
+                q = tl.trans(q)
+            else:
+                bit_offsets_k = offs_k * BITS
+                word_offsets = bit_offsets_k // 32
+                shifts_k = bit_offsets_k - word_offsets * 32
+                n_words = tl.cdiv(K * BITS, 32)
+                word_mask = word_offsets < n_words
+                word_offsets1 = tl.minimum(word_offsets + 1, n_words - 1)
+                w_word0 = tl.load(
+                    Wq + offs_n[:, None] * stride_wq0 + word_offsets[None, :] * stride_wq1,
+                    mask=n_mask[:, None] & word_mask[None, :],
+                    other=0,
+                )
+                w_word1 = tl.load(
+                    Wq + offs_n[:, None] * stride_wq0 + word_offsets1[None, :] * stride_wq1,
+                    mask=n_mask[:, None] & word_mask[None, :],
+                    other=0,
+                )
+                q = _unpack_packed_codes(w_word0, w_word1, shifts_k[None, :], BITS)
+                q = tl.trans(q)
             group_idx_k = offs_k // GROUP_SIZE
             ws = tl.load(
                 Wscale + offs_n[None, :] * stride_ws0 + group_idx_k[:, None] * stride_ws1,
@@ -1462,13 +1523,28 @@ def qmm_affine4_kernel(
                     other=0.0,
                 )
         else:
-            w_word = tl.load(
-                Wq + offs_k[:, None] * stride_wq0 + word_offsets_n[None, :] * stride_wq1,
-                mask=k_mask[:, None] & word_mask_n[None, :],
-                other=0,
-            )
-            q = (w_word[:, :, None] >> shifts[None, None, :]) & mask_bits
-            q = tl.reshape(q, (BK, BN))
+            if BITS == 1 or BITS == 2 or BITS == 4 or BITS == 8:
+                mask_bits = (1 << BITS) - 1
+                shifts = tl.arange(0, VALUES_PER_WORD) * BITS
+                w_word = tl.load(
+                    Wq + offs_k[:, None] * stride_wq0 + word_offsets_n[None, :] * stride_wq1,
+                    mask=k_mask[:, None] & word_mask_n[None, :],
+                    other=0,
+                )
+                q = (w_word[:, :, None] >> shifts[None, None, :]) & mask_bits
+                q = tl.reshape(q, (BK, BN))
+            else:
+                w_word0 = tl.load(
+                    Wq + offs_k[:, None] * stride_wq0 + word_offsets_n[None, :] * stride_wq1,
+                    mask=k_mask[:, None] & word_mask_n[None, :],
+                    other=0,
+                )
+                w_word1 = tl.load(
+                    Wq + offs_k[:, None] * stride_wq0 + word_offsets_n1[None, :] * stride_wq1,
+                    mask=k_mask[:, None] & word_mask_n[None, :],
+                    other=0,
+                )
+                q = _unpack_packed_codes(w_word0, w_word1, shifts_n[None, :], BITS)
             ws = tl.load(
                 Wscale + offs_k[:, None] * stride_ws0 + group_idx_n[None, :] * stride_ws1,
                 mask=k_mask[:, None] & n_mask[None, :],
@@ -1971,8 +2047,7 @@ def _resolve_qparams(mode: str, group_size: int | None, bits: int | None) -> tup
 
     Raises:
         ValueError: If mode is not supported by Triton kernels.
-        ValueError: If group_size is not in {32, 64, 128} for affine mode.
-        ValueError: If bits is not in {4, 8} for affine mode.
+        ValueError: If affine bits are outside 1..8.
         ValueError: If bits != 4 for nf4 mode.
         ValueError: If group_size/bits mismatch for explicit MXFP/NVFP modes.
     """
@@ -2018,11 +2093,9 @@ def _validate_shapes(
         raise ValueError("biases must be 2D when provided.")
 
     M, K = x.shape
-    values_per_word = 32 // bits
-
     if transpose:
         N = w.shape[0]
-        words_expected = math.ceil(K / values_per_word)
+        words_expected = math.ceil(K * bits / 32)
         if w.shape[1] != words_expected:
             raise ValueError("Packed weight shape does not match K dimension.")
         if scales.shape[0] != N:
@@ -2037,7 +2110,7 @@ def _validate_shapes(
             raise ValueError("Packed weight first dimension must match K when transpose=False.")
         groups_expected = scales.shape[1]
         N = groups_expected * group_size
-        words_expected = math.ceil(N / values_per_word)
+        words_expected = math.ceil(N * bits / 32)
         if w.shape[1] != words_expected:
             raise ValueError("Packed weight shape does not match N dimension.")
         if scales.shape[0] != K:
@@ -2063,11 +2136,10 @@ def _validate_weight_shapes(
     if biases is not None and biases.ndim != 2:
         raise ValueError("biases must be 2D when provided.")
 
-    values_per_word = 32 // bits
     if transpose:
         N = w.shape[0]
         K = scales.shape[1] * group_size
-        words_expected = math.ceil(K / values_per_word)
+        words_expected = math.ceil(K * bits / 32)
         if w.shape[1] != words_expected:
             raise ValueError("Packed weight shape does not match K dimension.")
         if scales.shape[0] != N:
@@ -2077,7 +2149,7 @@ def _validate_weight_shapes(
     else:
         K = w.shape[0]
         N = scales.shape[1] * group_size
-        words_expected = math.ceil(N / values_per_word)
+        words_expected = math.ceil(N * bits / 32)
         if w.shape[1] != words_expected:
             raise ValueError("Packed weight shape does not match N dimension.")
         if scales.shape[0] != K:
@@ -2135,9 +2207,6 @@ def quantized_matmul_dequant_triton(
         raise ValueError("affine quantized_matmul requires affine metadata.")
     if mode != "affine" and biases is not None:
         raise ValueError("affine metadata must be None for non-affine modes.")
-    if mode == "affine" and bits not in (4, 8):
-        raise ValueError("Triton affine kernel supports bits in {4, 8}.")
-
     K, N = _validate_weight_shapes(
         w,
         scales,
@@ -2191,12 +2260,6 @@ def quantized_matmul_dequant_triton(
         )
     elif mode == "affine":
         stride_wb0, stride_wb1 = strides_from_shape(biases.shape) if biases is not None else (0, 0)
-        if bits == 4:
-            kernel = qmm_dequant_affine4_kernel
-            values_per_word = 8
-        else:
-            kernel = qmm_dequant_affine8_kernel
-            values_per_word = 4
         (w_deq,) = triton_call(
             w,
             scales,
@@ -2205,7 +2268,7 @@ def quantized_matmul_dequant_triton(
             K,
             out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
             grid=grid,
-            kernel=kernel,
+            kernel=qmm_dequant_affine4_kernel,
             stride_wq0=stride_wq0,
             stride_wq1=stride_wq1,
             stride_ws0=stride_ws0,
@@ -2215,7 +2278,8 @@ def quantized_matmul_dequant_triton(
             stride_or=stride_or,
             stride_oc=stride_oc,
             GROUP_SIZE=group_size,
-            VALUES_PER_WORD=values_per_word,
+            VALUES_PER_WORD=max(1, 32 // bits),
+            BITS=bits,
             BR=br,
             BC=bc,
             TRANSPOSE=transpose,
@@ -2352,8 +2416,8 @@ def quantized_matmul_triton(
     Args:
         x: Input activation matrix of shape (M, K) in float dtype.
         w: Packed uint32 weights. For transpose=True, shape is
-            (N, ceil(K/values_per_word)). For transpose=False, shape is
-            (K, ceil(N/values_per_word)), where values_per_word = 32 // bits.
+            (N, ceil(K * bits / 32)). For transpose=False, shape is
+            (K, ceil(N * bits / 32)).
         scales: Per-group scales. Shape is (N, K//group_size) for
             transpose=True or (K, N//group_size) for transpose=False.
         biases: Per-group affine additive offsets (required for affine mode only). Must have
@@ -2392,9 +2456,6 @@ def quantized_matmul_triton(
         raise ValueError("affine quantized_matmul requires affine metadata.")
     if mode != "affine" and biases is not None:
         raise ValueError("affine metadata must be None for non-affine modes.")
-
-    if mode == "affine" and bits not in (4, 8):
-        raise ValueError("Triton affine kernel supports bits in {4, 8}.")
 
     M, K, N = _validate_shapes(
         x,
@@ -2516,12 +2577,6 @@ def quantized_matmul_triton(
             )
         elif mode == "affine":
             stride_wb0, stride_wb1 = strides_from_shape(biases.shape) if biases is not None else (0, 0)
-            if bits == 4:
-                kernel = qmm_dequant_affine4_kernel
-                values_per_word = 8
-            else:
-                kernel = qmm_dequant_affine8_kernel
-                values_per_word = 4
             (w_deq,) = triton_call(
                 w,
                 scales,
@@ -2530,7 +2585,7 @@ def quantized_matmul_triton(
                 K,
                 out_shape=[jax.ShapeDtypeStruct(shape=deq_shape, dtype=out_dtype)],
                 grid=grid,
-                kernel=kernel,
+                kernel=qmm_dequant_affine4_kernel,
                 stride_wq0=stride_wq0,
                 stride_wq1=stride_wq1,
                 stride_ws0=stride_ws0,
@@ -2540,7 +2595,8 @@ def quantized_matmul_triton(
                 stride_or=stride_or,
                 stride_oc=stride_oc,
                 GROUP_SIZE=group_size,
-                VALUES_PER_WORD=values_per_word,
+                VALUES_PER_WORD=max(1, 32 // bits),
+                BITS=bits,
                 BR=br,
                 BC=bc,
                 TRANSPOSE=transpose,
@@ -2699,10 +2755,7 @@ def quantized_matmul_triton(
     if mode == "affine":
         stride_wb0, stride_wb1 = strides_from_shape(biases.shape) if biases is not None else (0, 0)
         bias_arg = biases if biases is not None else scales
-        if bits == 4:
-            kernel = qmm_affine4_kernel_large if use_large_kernel else qmm_affine4_kernel
-        else:
-            kernel = qmm_affine8_kernel_large if use_large_kernel else qmm_affine8_kernel
+        kernel = qmm_affine4_kernel_large if use_large_kernel else qmm_affine4_kernel
 
         (out,) = triton_call(
             x,
@@ -2729,7 +2782,8 @@ def quantized_matmul_triton(
             stride_om=stride_om,
             stride_on=stride_on,
             GROUP_SIZE=group_size,
-            VALUES_PER_WORD=8 if bits == 4 else 4,
+            VALUES_PER_WORD=max(1, 32 // bits),
+            BITS=bits,
             USE_BF16=use_bf16,
             TRANSPOSE=transpose,
             HAS_BIAS=biases is not None,

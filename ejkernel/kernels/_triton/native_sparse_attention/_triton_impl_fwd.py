@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -584,9 +584,9 @@ def fwd_triton_impl(
 
     num_k_blocks = cdiv(head_dim, triton_block_size_k)
     num_v_blocks = cdiv(head_dim_v, triton_block_size_v)
-    assert num_k_blocks == 1, (
-        "The key dimension cannot be split into more than one block (head_dim > 128 not supported)."
-    )
+    assert (
+        num_k_blocks == 1
+    ), "The key dimension cannot be split into more than one block (head_dim > 128 not supported)."
 
     output_shapes = [
         jax.ShapeDtypeStruct((batch_size, seq_len, num_q_heads, head_dim_v), dtype=v.dtype),

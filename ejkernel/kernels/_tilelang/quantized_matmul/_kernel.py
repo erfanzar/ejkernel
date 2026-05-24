@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -234,6 +234,60 @@ def _decode_quant_value(mode: str, code, scale_code, zero_code, accum):
     raise ValueError(f"Unsupported quantized_matmul TileLang mode: {mode}")
 
 
+def _load_packed_code(Wq, row, elem_idx, words: int, bits: int):
+    """Load one packed uint32 code, including fields that cross word boundaries."""
+    if bits in (1, 2, 4, 8):
+        values_per_word = 32 // bits
+        word_idx = elem_idx // values_per_word
+        shift = (elem_idx - word_idx * values_per_word) * bits
+        safe_word = T.min(word_idx, words - 1)
+        word = T.Cast("uint32", Wq[row, safe_word])
+        return (word >> shift) & T.Cast("uint32", (1 << bits) - 1)
+
+    bit_offset = elem_idx * bits
+    word_idx = bit_offset // 32
+    shift = bit_offset - word_idx * 32
+    safe_word = T.min(word_idx, words - 1)
+    safe_word1 = T.min(word_idx + 1, words - 1)
+    word0 = T.Cast("uint32", Wq[row, safe_word])
+    word1 = T.Cast("uint32", Wq[row, safe_word1])
+    low_bits = T.min(32 - shift, bits)
+    high_bits = bits - low_bits
+    one = T.Cast("uint32", 1)
+    low_mask = (one << low_bits) - one
+    high_mask = (one << high_bits) - one
+    low = (word0 >> shift) & low_mask
+    high = word1 & high_mask
+    return low | (high << low_bits)
+
+
+def _load_packed_code_kmajor(Wq, elem_idx, col, words: int, bits: int):
+    """Load one packed uint32 code from ``Wq: (words, N)`` K-major layout."""
+    if bits in (1, 2, 4, 8):
+        values_per_word = 32 // bits
+        word_idx = elem_idx // values_per_word
+        shift = (elem_idx - word_idx * values_per_word) * bits
+        safe_word = T.min(word_idx, words - 1)
+        word = T.Cast("uint32", Wq[safe_word, col])
+        return (word >> shift) & T.Cast("uint32", (1 << bits) - 1)
+
+    bit_offset = elem_idx * bits
+    word_idx = bit_offset // 32
+    shift = bit_offset - word_idx * 32
+    safe_word = T.min(word_idx, words - 1)
+    safe_word1 = T.min(word_idx + 1, words - 1)
+    word0 = T.Cast("uint32", Wq[safe_word, col])
+    word1 = T.Cast("uint32", Wq[safe_word1, col])
+    low_bits = T.min(32 - shift, bits)
+    high_bits = bits - low_bits
+    one = T.Cast("uint32", 1)
+    low_mask = (one << low_bits) - one
+    high_mask = (one << high_bits) - one
+    low = (word0 >> shift) & low_mask
+    high = word1 & high_mask
+    return low | (high << low_bits)
+
+
 def make_fwd_prim_func(
     *,
     m: int,
@@ -441,6 +495,7 @@ def make_packed_fwd_prim_func(
     dtype,
     scale_dtype,
     use_bf16: bool,
+    k_major: bool = False,
     threads: int = 128,
     num_stages: int = 2,
 ):
@@ -475,13 +530,13 @@ def make_packed_fwd_prim_func(
         k: Input channel count (``K``).
         groups: Number of quantisation groups.
         words: Packed ``uint32`` words per weight row/column
-            (``ceil(K/VPW)`` for column-major or ``ceil(N/VPW)`` for
-            row-major).
+            (``ceil(K * bits / 32)`` for column-major or
+            ``ceil(N * bits / 32)`` for row-major).
         transpose: If ``True``, weights are packed column-major
             (output-channel indexed); if ``False``, row-major
             (input-channel indexed).
         group_size: Number of elements per quantisation group.
-        bits: Bits per quantised value (2, 4, or 8).
+        bits: Bits per quantised value (1 through 8 for affine).
         mode: Quantisation mode string; one of ``"affine"``, ``"nf4"``,
             ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``, ``"nvfp8"``.
         block_m: Tile size along ``M``.
@@ -515,8 +570,106 @@ def make_packed_fwd_prim_func(
     cts = _compute_dtype_str(dtype, use_bf16)
     accum = "float32"
     BM, BN, BK = block_m, block_n, block_k
-    VPW = 32 // bits
-    MASK = (1 << bits) - 1
+    meta_groups_per_tile = max(1, (BK + group_size - 1) // group_size)
+    cache_group_meta = False
+    if k_major:
+        if mode != "affine" or not transpose:
+            raise ValueError("TileLang K-major packed layout currently supports affine transpose=True forward only.")
+
+        @T.prim_func
+        def qmm_packed_fwd_col_kmajor(
+            X: T.Tensor((m, k), ts),
+            Wq: T.Tensor((words, n), "uint32"),
+            S: T.Tensor((groups, n), mts),
+            Z: T.Tensor((groups, n), mts),
+            Y: T.Tensor((m, n), ts),
+        ):
+            with T.Kernel(T.ceildiv(n, BN), T.ceildiv(m, BM), threads=threads) as (bx, by):
+                dtype_ref = T.alloc_fragment((1,), ts)
+                meta_ref = T.alloc_fragment((1,), mts)
+                Xs = T.alloc_shared((BM, BK), cts)
+                Ws = T.alloc_shared((BN, BK), cts)
+                C = T.alloc_fragment((BM, BN), accum)
+                if cache_group_meta:
+                    Sg = T.alloc_shared((BN, meta_groups_per_tile), mts)
+                    Zg = T.alloc_shared((BN, meta_groups_per_tile), mts)
+                dtype_ref[0] = T.Cast(ts, 0.0)
+                meta_ref[0] = T.Cast(mts, 0.0)
+                T.clear(C)
+
+                for k_iter in T.Pipelined(T.ceildiv(k, BK), num_stages=num_stages):
+                    tile_group_base = (k_iter * BK) // group_size
+                    for i, j in T.Parallel(BM, BK):
+                        m_idx = by * BM + i
+                        k_idx = k_iter * BK + j
+                        Xs[i, j] = T.if_then_else(
+                            (m_idx < m) & (k_idx < k),
+                            T.Cast(cts, X[m_idx, k_idx]),
+                            T.Cast(cts, 0.0),
+                        )
+                    if cache_group_meta:
+                        for i, g in T.Parallel(BN, meta_groups_per_tile):
+                            n_idx = bx * BN + i
+                            safe_n = T.min(n_idx, n - 1)
+                            group_idx = T.min(tile_group_base + g, groups - 1)
+                            Sg[i, g] = S[group_idx, safe_n]
+                            Zg[i, g] = Z[group_idx, safe_n]
+                        T.sync_threads()
+                    if bits in (2, 4, 8) and BK % (32 // bits) == 0 and group_size % (32 // bits) == 0:
+                        for i, j in T.Parallel(BN, BK // (32 // bits)):
+                            n_idx = bx * BN + i
+                            k_base = k_iter * BK + j * (32 // bits)
+                            word_idx = k_base // (32 // bits)
+                            safe_n = T.min(n_idx, n - 1)
+                            safe_word = T.min(word_idx, words - 1)
+                            packed = T.Cast("uint32", Wq[safe_word, safe_n])
+                            group_idx = T.min(k_base // group_size, groups - 1)
+                            if cache_group_meta:
+                                local_group = T.min(T.max(group_idx - tile_group_base, 0), meta_groups_per_tile - 1)
+                                scale = T.Cast(accum, Sg[i, local_group])
+                                zero = T.Cast(accum, Zg[i, local_group])
+                            else:
+                                scale = T.Cast(accum, S[group_idx, safe_n])
+                                zero = T.Cast(accum, Z[group_idx, safe_n])
+                            for lane in T.serial(32 // bits):
+                                local_k = j * (32 // bits) + lane
+                                k_idx = k_base + lane
+                                code = (packed >> (lane * bits)) & T.Cast("uint32", (1 << bits) - 1)
+                                val = (T.Cast(accum, code) - zero) * scale
+                                Ws[i, local_k] = T.if_then_else(
+                                    (n_idx < n) & (word_idx < words) & (k_idx < k),
+                                    T.Cast(cts, val),
+                                    T.Cast(cts, 0.0),
+                                )
+                    else:
+                        for i, j in T.Parallel(BN, BK):
+                            n_idx = bx * BN + i
+                            k_idx = k_iter * BK + j
+                            group_idx = T.min(k_idx // group_size, groups - 1)
+                            safe_n = T.min(n_idx, n - 1)
+                            code = _load_packed_code_kmajor(Wq, k_idx, safe_n, words, bits)
+                            if cache_group_meta:
+                                local_group = T.min(T.max(group_idx - tile_group_base, 0), meta_groups_per_tile - 1)
+                                scale = T.Cast(accum, Sg[i, local_group])
+                                zero = T.Cast(accum, Zg[i, local_group])
+                            else:
+                                scale = T.Cast(accum, S[group_idx, safe_n])
+                                zero = T.Cast(accum, Z[group_idx, safe_n])
+                            val = (T.Cast(accum, code) - zero) * scale
+                            Ws[i, j] = T.if_then_else(
+                                (n_idx < n) & (k_idx < k),
+                                T.Cast(cts, val),
+                                T.Cast(cts, 0.0),
+                            )
+                    T.gemm(Xs, Ws, C, transpose_B=True)
+
+                for i, j in T.Parallel(BM, BN):
+                    m_idx = by * BM + i
+                    n_idx = bx * BN + j
+                    if (m_idx < m) & (n_idx < n):
+                        Y[m_idx, n_idx] = C[i, j]
+
+        return qmm_packed_fwd_col_kmajor
 
     if mode != "affine":
         if transpose:
@@ -526,7 +679,7 @@ def make_packed_fwd_prim_func(
                 X: T.Tensor((m, k), ts),
                 Wq: T.Tensor((n, words), "uint32"),
                 S: T.Tensor((n, groups), mts),
-                Y: T.Tensor((m, n), accum),
+                Y: T.Tensor((m, n), ts),
             ):
                 with T.Kernel(T.ceildiv(n, BN), T.ceildiv(m, BM), threads=threads) as (bx, by):
                     dtype_ref = T.alloc_fragment((1,), ts)
@@ -550,13 +703,9 @@ def make_packed_fwd_prim_func(
                         for i, j in T.Parallel(BN, BK):
                             n_idx = bx * BN + i
                             k_idx = k_iter * BK + j
-                            word_idx = k_idx // VPW
-                            shift = (k_idx - word_idx * VPW) * bits
                             group_idx = T.min(k_idx // group_size, groups - 1)
                             safe_n = T.min(n_idx, n - 1)
-                            safe_word = T.min(word_idx, words - 1)
-                            word = T.Cast("uint32", Wq[safe_n, safe_word])
-                            code = (word >> shift) & MASK
+                            code = _load_packed_code(Wq, safe_n, k_idx, words, bits)
                             val = _decode_quant_value(mode, code, S[safe_n, group_idx], 0.0, accum)
                             Ws[i, j] = T.if_then_else(
                                 (n_idx < n) & (k_idx < k),
@@ -578,7 +727,7 @@ def make_packed_fwd_prim_func(
             X: T.Tensor((m, k), ts),
             Wq: T.Tensor((k, words), "uint32"),
             S: T.Tensor((k, groups), mts),
-            Y: T.Tensor((m, n), accum),
+            Y: T.Tensor((m, n), ts),
         ):
             with T.Kernel(T.ceildiv(n, BN), T.ceildiv(m, BM), threads=threads) as (bx, by):
                 dtype_ref = T.alloc_fragment((1,), ts)
@@ -602,13 +751,9 @@ def make_packed_fwd_prim_func(
                     for i, j in T.Parallel(BK, BN):
                         k_idx = k_iter * BK + i
                         n_idx = bx * BN + j
-                        word_idx = n_idx // VPW
-                        shift = (n_idx - word_idx * VPW) * bits
                         group_idx = T.min(n_idx // group_size, groups - 1)
                         safe_k = T.min(k_idx, k - 1)
-                        safe_word = T.min(word_idx, words - 1)
-                        word = T.Cast("uint32", Wq[safe_k, safe_word])
-                        code = (word >> shift) & MASK
+                        code = _load_packed_code(Wq, safe_k, n_idx, words, bits)
                         val = _decode_quant_value(mode, code, S[safe_k, group_idx], 0.0, accum)
                         Ws[i, j] = T.if_then_else(
                             (k_idx < k) & (n_idx < n),
@@ -633,7 +778,7 @@ def make_packed_fwd_prim_func(
             Wq: T.Tensor((n, words), "uint32"),
             S: T.Tensor((n, groups), mts),
             Z: T.Tensor((n, groups), mts),
-            Y: T.Tensor((m, n), accum),
+            Y: T.Tensor((m, n), ts),
         ):
             with T.Kernel(T.ceildiv(n, BN), T.ceildiv(m, BM), threads=threads) as (bx, by):
                 dtype_ref = T.alloc_fragment((1,), ts)
@@ -641,11 +786,15 @@ def make_packed_fwd_prim_func(
                 Xs = T.alloc_shared((BM, BK), cts)
                 Ws = T.alloc_shared((BN, BK), cts)
                 C = T.alloc_fragment((BM, BN), accum)
+                if cache_group_meta:
+                    Sg = T.alloc_shared((BN, meta_groups_per_tile), mts)
+                    Zg = T.alloc_shared((BN, meta_groups_per_tile), mts)
                 dtype_ref[0] = T.Cast(ts, 0.0)
                 meta_ref[0] = T.Cast(mts, 0.0)
                 T.clear(C)
 
                 for k_iter in T.Pipelined(T.ceildiv(k, BK), num_stages=num_stages):
+                    tile_group_base = (k_iter * BK) // group_size
                     for i, j in T.Parallel(BM, BK):
                         m_idx = by * BM + i
                         k_idx = k_iter * BK + j
@@ -654,18 +803,27 @@ def make_packed_fwd_prim_func(
                             T.Cast(cts, X[m_idx, k_idx]),
                             T.Cast(cts, 0.0),
                         )
+                    if cache_group_meta:
+                        for i, g in T.Parallel(BN, meta_groups_per_tile):
+                            n_idx = bx * BN + i
+                            safe_n = T.min(n_idx, n - 1)
+                            group_idx = T.min(tile_group_base + g, groups - 1)
+                            Sg[i, g] = S[safe_n, group_idx]
+                            Zg[i, g] = Z[safe_n, group_idx]
+                        T.sync_threads()
                     for i, j in T.Parallel(BN, BK):
                         n_idx = bx * BN + i
                         k_idx = k_iter * BK + j
-                        word_idx = k_idx // VPW
-                        shift = (k_idx - word_idx * VPW) * bits
                         group_idx = T.min(k_idx // group_size, groups - 1)
                         safe_n = T.min(n_idx, n - 1)
-                        safe_word = T.min(word_idx, words - 1)
-                        word = T.Cast("uint32", Wq[safe_n, safe_word])
-                        code = (word >> shift) & MASK
-                        scale = T.Cast(accum, S[safe_n, group_idx])
-                        zero = T.Cast(accum, Z[safe_n, group_idx])
+                        code = _load_packed_code(Wq, safe_n, k_idx, words, bits)
+                        if cache_group_meta:
+                            local_group = T.min(T.max(group_idx - tile_group_base, 0), meta_groups_per_tile - 1)
+                            scale = T.Cast(accum, Sg[i, local_group])
+                            zero = T.Cast(accum, Zg[i, local_group])
+                        else:
+                            scale = T.Cast(accum, S[safe_n, group_idx])
+                            zero = T.Cast(accum, Z[safe_n, group_idx])
                         val = (T.Cast(accum, code) - zero) * scale
                         Ws[i, j] = T.if_then_else(
                             (n_idx < n) & (k_idx < k),
@@ -690,7 +848,7 @@ def make_packed_fwd_prim_func(
             Wq: T.Tensor((k, words), "uint32"),
             S: T.Tensor((k, groups), mts),
             Z: T.Tensor((k, groups), mts),
-            Y: T.Tensor((m, n), accum),
+            Y: T.Tensor((m, n), ts),
         ):
             with T.Kernel(T.ceildiv(n, BN), T.ceildiv(m, BM), threads=threads) as (bx, by):
                 dtype_ref = T.alloc_fragment((1,), ts)
@@ -710,11 +868,8 @@ def make_packed_fwd_prim_func(
                     for i, j in T.Parallel(BK, BN):
                         k_idx = k_iter * BK + i
                         n_idx = bx * BN + j
-                        word_idx = n_idx // VPW
-                        shift = (n_idx - word_idx * VPW) * bits
                         group_idx = n_idx // group_size
-                        word = T.Cast("uint32", Wq[k_idx, word_idx])
-                        code = (word >> shift) & MASK
+                        code = _load_packed_code(Wq, k_idx, n_idx, words, bits)
                         scale = T.Cast(accum, S[k_idx, group_idx])
                         zero = T.Cast(accum, Z[k_idx, group_idx])
                         val = (T.Cast(accum, code) - zero) * scale
@@ -732,7 +887,7 @@ def make_packed_fwd_prim_func(
         Wq: T.Tensor((k, words), "uint32"),
         S: T.Tensor((k, groups), mts),
         Z: T.Tensor((k, groups), mts),
-        Y: T.Tensor((m, n), accum),
+        Y: T.Tensor((m, n), ts),
     ):
         with T.Kernel(T.ceildiv(n, BN), T.ceildiv(m, BM), threads=threads) as (bx, by):
             dtype_ref = T.alloc_fragment((1,), ts)
@@ -756,13 +911,9 @@ def make_packed_fwd_prim_func(
                 for i, j in T.Parallel(BK, BN):
                     k_idx = k_iter * BK + i
                     n_idx = bx * BN + j
-                    word_idx = n_idx // VPW
-                    shift = (n_idx - word_idx * VPW) * bits
                     group_idx = T.min(n_idx // group_size, groups - 1)
                     safe_k = T.min(k_idx, k - 1)
-                    safe_word = T.min(word_idx, words - 1)
-                    word = T.Cast("uint32", Wq[safe_k, safe_word])
-                    code = (word >> shift) & MASK
+                    code = _load_packed_code(Wq, safe_k, n_idx, words, bits)
                     scale = T.Cast(accum, S[safe_k, group_idx])
                     zero = T.Cast(accum, Z[safe_k, group_idx])
                     val = (T.Cast(accum, code) - zero) * scale
@@ -782,6 +933,372 @@ def make_packed_fwd_prim_func(
     return qmm_packed_fwd_row
 
 
+def make_packed_gemv_kmajor_prim_func(
+    *,
+    n: int,
+    k: int,
+    groups: int,
+    words: int,
+    group_size: int,
+    bits: int,
+    dtype,
+    scale_dtype,
+    block_n: int,
+    block_k: int,
+    threads: int = 128,
+    num_stages: int = 2,
+):
+    """Build the serial native TileLang affine GEMV for K-major packed weights.
+
+    This is the decode-only path for ``X: (1, K)`` and ``Wq: (words, N)``.
+    It avoids the tensor-core GEMM kernel's padded-M overcompute while keeping
+    unpack, dequantization, reduction, and masking inside one ``@T.prim_func``.
+    """
+    ts = _act_dtype_str(dtype)
+    mts = _meta_dtype_str(scale_dtype)
+    accum = "float32"
+    BN, BK = block_n, block_k
+
+    if bits == 8:
+        BW = max(1, BK // 4)
+        word_tiles = (words + BW - 1) // BW
+
+        @T.prim_func
+        def qmm_packed_gemv_kmajor_bit8_words(
+            X: T.Tensor((1, k), ts),
+            Wq: T.Tensor((words, n), "uint32"),
+            S: T.Tensor((groups, n), mts),
+            Z: T.Tensor((groups, n), mts),
+            Y: T.Tensor((1, n), ts),
+        ):
+            with T.Kernel(T.ceildiv(n, BN), threads=threads) as bx:
+                prod = T.alloc_fragment((BN, BW), accum)
+                partial = T.alloc_fragment((BN,), accum)
+                C = T.alloc_fragment((BN,), accum)
+                dtype_ref = T.alloc_fragment((1,), ts)
+                meta_ref = T.alloc_fragment((1,), mts)
+                dtype_ref[0] = T.Cast(ts, 0.0)
+                meta_ref[0] = T.Cast(mts, 0.0)
+                T.clear(C)
+
+                for word_iter in T.Pipelined(word_tiles, num_stages=num_stages):
+                    for i, j in T.Parallel(BN, BW):
+                        n_idx = bx * BN + i
+                        word_idx = word_iter * BW + j
+                        safe_n = T.min(n_idx, n - 1)
+                        safe_word = T.min(word_idx, words - 1)
+                        packed = T.Cast("uint32", Wq[safe_word, safe_n])
+                        group_idx = T.min((word_idx * 4) // group_size, groups - 1)
+                        scale = T.Cast(accum, S[group_idx, safe_n])
+                        zero = T.Cast(accum, Z[group_idx, safe_n])
+                        prod[i, j] = T.Cast(accum, 0.0)
+                        for lane in T.serial(4):
+                            k_idx = word_idx * 4 + lane
+                            code = (packed >> (lane * 8)) & T.Cast("uint32", 0xFF)
+                            val = (T.Cast(accum, code) - zero) * scale
+                            prod[i, j] += T.if_then_else(
+                                (n_idx < n) & (word_idx < words) & (k_idx < k),
+                                T.Cast(accum, X[0, k_idx]) * val,
+                                T.Cast(accum, 0.0),
+                            )
+                    T.reduce_sum(prod, partial, dim=1, clear=True)
+                    for i in T.Parallel(BN):
+                        C[i] += partial[i]
+
+                for i in T.Parallel(BN):
+                    n_idx = bx * BN + i
+                    if n_idx < n:
+                        Y[0, n_idx] = C[i]
+
+        return qmm_packed_gemv_kmajor_bit8_words
+
+    @T.prim_func
+    def qmm_packed_gemv_kmajor(
+        X: T.Tensor((1, k), ts),
+        Wq: T.Tensor((words, n), "uint32"),
+        S: T.Tensor((groups, n), mts),
+        Z: T.Tensor((groups, n), mts),
+        Y: T.Tensor((1, n), ts),
+    ):
+        with T.Kernel(T.ceildiv(n, BN), threads=threads) as bx:
+            prod = T.alloc_fragment((BN, BK), accum)
+            partial = T.alloc_fragment((BN,), accum)
+            C = T.alloc_fragment((BN,), accum)
+            dtype_ref = T.alloc_fragment((1,), ts)
+            meta_ref = T.alloc_fragment((1,), mts)
+            dtype_ref[0] = T.Cast(ts, 0.0)
+            meta_ref[0] = T.Cast(mts, 0.0)
+            T.clear(C)
+
+            for k_iter in T.Pipelined(T.ceildiv(k, BK), num_stages=num_stages):
+                for i, j in T.Parallel(BN, BK):
+                    n_idx = bx * BN + i
+                    k_idx = k_iter * BK + j
+                    safe_n = T.min(n_idx, n - 1)
+                    group_idx = T.min(k_idx // group_size, groups - 1)
+                    code = _load_packed_code_kmajor(Wq, k_idx, safe_n, words, bits)
+                    scale = T.Cast(accum, S[group_idx, safe_n])
+                    zero = T.Cast(accum, Z[group_idx, safe_n])
+                    val = (T.Cast(accum, code) - zero) * scale
+                    prod[i, j] = T.if_then_else(
+                        (n_idx < n) & (k_idx < k),
+                        T.Cast(accum, X[0, k_idx]) * val,
+                        T.Cast(accum, 0.0),
+                    )
+                T.reduce_sum(prod, partial, dim=1, clear=True)
+                for i in T.Parallel(BN):
+                    C[i] += partial[i]
+
+            for i in T.Parallel(BN):
+                n_idx = bx * BN + i
+                if n_idx < n:
+                    Y[0, n_idx] = C[i]
+
+    return qmm_packed_gemv_kmajor
+
+
+def make_packed_gemv_kmajor_split_prim_func(
+    *,
+    n: int,
+    k: int,
+    groups: int,
+    words: int,
+    group_size: int,
+    bits: int,
+    dtype,
+    scale_dtype,
+    block_n: int,
+    block_k: int,
+    threads: int = 128,
+):
+    """Build the split-K partial kernel for native TileLang affine GEMV."""
+    ts = _act_dtype_str(dtype)
+    mts = _meta_dtype_str(scale_dtype)
+    accum = "float32"
+    BN, BK = block_n, block_k
+    k_tiles = (k + BK - 1) // BK
+
+    if bits == 8 and group_size in (32, 64, 128) and BK == 64:
+        BW = BK // 4
+        groups_per_tile = BK // group_size if group_size <= BK else 1
+        words_per_meta = BW // groups_per_tile
+
+        @T.prim_func
+        def qmm_packed_gemv_kmajor_split_bit8_grouped_words(
+            X: T.Tensor((1, k), ts),
+            Wq: T.Tensor((words, n), "uint32"),
+            S: T.Tensor((groups, n), mts),
+            Z: T.Tensor((groups, n), mts),
+            P: T.Tensor((k_tiles, n), accum),
+        ):
+            with T.Kernel(T.ceildiv(n, BN), k_tiles, threads=threads) as (bx, by):
+                C = T.alloc_fragment((BN,), accum)
+                scale_v = T.alloc_fragment((BN,), accum)
+                zero_v = T.alloc_fragment((BN,), accum)
+                dtype_ref = T.alloc_fragment((1,), ts)
+                meta_ref = T.alloc_fragment((1,), mts)
+                dtype_ref[0] = T.Cast(ts, 0.0)
+                meta_ref[0] = T.Cast(mts, 0.0)
+                T.clear(C)
+
+                for go in T.serial(groups_per_tile):
+                    for i in T.Parallel(BN):
+                        n_idx = bx * BN + i
+                        safe_n = T.min(n_idx, n - 1)
+                        if group_size <= BK:
+                            group_idx = T.min(by * groups_per_tile + go, groups - 1)
+                        else:
+                            group_idx = T.min((by * BK) // group_size, groups - 1)
+                        scale_v[i] = T.Cast(accum, S[group_idx, safe_n])
+                        zero_v[i] = T.Cast(accum, Z[group_idx, safe_n])
+
+                    for j in T.serial(words_per_meta):
+                        for i in T.Parallel(BN):
+                            n_idx = bx * BN + i
+                            word_idx = by * BW + go * words_per_meta + j
+                            safe_n = T.min(n_idx, n - 1)
+                            safe_word = T.min(word_idx, words - 1)
+                            packed = T.Cast("uint32", Wq[safe_word, safe_n])
+                            for lane in T.serial(4):
+                                k_idx = word_idx * 4 + lane
+                                code = (packed >> (lane * 8)) & T.Cast("uint32", 0xFF)
+                                val = (T.Cast(accum, code) - zero_v[i]) * scale_v[i]
+                                C[i] += T.if_then_else(
+                                    (n_idx < n) & (word_idx < words) & (k_idx < k),
+                                    T.Cast(accum, X[0, k_idx]) * val,
+                                    T.Cast(accum, 0.0),
+                                )
+
+                for i in T.Parallel(BN):
+                    n_idx = bx * BN + i
+                    if n_idx < n:
+                        P[by, n_idx] = C[i]
+
+        return qmm_packed_gemv_kmajor_split_bit8_grouped_words
+
+    if bits == 8:
+        BW = max(1, BK // 4)
+
+        @T.prim_func
+        def qmm_packed_gemv_kmajor_split_bit8_words(
+            X: T.Tensor((1, k), ts),
+            Wq: T.Tensor((words, n), "uint32"),
+            S: T.Tensor((groups, n), mts),
+            Z: T.Tensor((groups, n), mts),
+            P: T.Tensor((k_tiles, n), accum),
+        ):
+            with T.Kernel(T.ceildiv(n, BN), k_tiles, threads=threads) as (bx, by):
+                C = T.alloc_fragment((BN,), accum)
+                dtype_ref = T.alloc_fragment((1,), ts)
+                meta_ref = T.alloc_fragment((1,), mts)
+                dtype_ref[0] = T.Cast(ts, 0.0)
+                meta_ref[0] = T.Cast(mts, 0.0)
+                T.clear(C)
+
+                for j in T.serial(BW):
+                    for i in T.Parallel(BN):
+                        n_idx = bx * BN + i
+                        word_idx = by * BW + j
+                        safe_n = T.min(n_idx, n - 1)
+                        safe_word = T.min(word_idx, words - 1)
+                        packed = T.Cast("uint32", Wq[safe_word, safe_n])
+                        group_idx = T.min((word_idx * 4) // group_size, groups - 1)
+                        scale = T.Cast(accum, S[group_idx, safe_n])
+                        zero = T.Cast(accum, Z[group_idx, safe_n])
+                        for lane in T.serial(4):
+                            k_idx = word_idx * 4 + lane
+                            code = (packed >> (lane * 8)) & T.Cast("uint32", 0xFF)
+                            val = (T.Cast(accum, code) - zero) * scale
+                            C[i] += T.if_then_else(
+                                (n_idx < n) & (word_idx < words) & (k_idx < k),
+                                T.Cast(accum, X[0, k_idx]) * val,
+                                T.Cast(accum, 0.0),
+                            )
+                for i in T.Parallel(BN):
+                    n_idx = bx * BN + i
+                    if n_idx < n:
+                        P[by, n_idx] = C[i]
+
+        return qmm_packed_gemv_kmajor_split_bit8_words
+
+    if bits == 8:
+
+        @T.prim_func
+        def qmm_packed_gemv_kmajor_split_direct(
+            X: T.Tensor((1, k), ts),
+            Wq: T.Tensor((words, n), "uint32"),
+            S: T.Tensor((groups, n), mts),
+            Z: T.Tensor((groups, n), mts),
+            P: T.Tensor((k_tiles, n), accum),
+        ):
+            with T.Kernel(T.ceildiv(n, BN), k_tiles, threads=threads) as (bx, by):
+                C = T.alloc_fragment((BN,), accum)
+                dtype_ref = T.alloc_fragment((1,), ts)
+                meta_ref = T.alloc_fragment((1,), mts)
+                dtype_ref[0] = T.Cast(ts, 0.0)
+                meta_ref[0] = T.Cast(mts, 0.0)
+                T.clear(C)
+
+                for j in T.serial(BK):
+                    for i in T.Parallel(BN):
+                        n_idx = bx * BN + i
+                        k_idx = by * BK + j
+                        safe_n = T.min(n_idx, n - 1)
+                        group_idx = T.min(k_idx // group_size, groups - 1)
+                        code = _load_packed_code_kmajor(Wq, k_idx, safe_n, words, bits)
+                        scale = T.Cast(accum, S[group_idx, safe_n])
+                        zero = T.Cast(accum, Z[group_idx, safe_n])
+                        val = (T.Cast(accum, code) - zero) * scale
+                        C[i] += T.if_then_else(
+                            (n_idx < n) & (k_idx < k),
+                            T.Cast(accum, X[0, k_idx]) * val,
+                            T.Cast(accum, 0.0),
+                        )
+
+                for i in T.Parallel(BN):
+                    n_idx = bx * BN + i
+                    if n_idx < n:
+                        P[by, n_idx] = C[i]
+
+        return qmm_packed_gemv_kmajor_split_direct
+
+    @T.prim_func
+    def qmm_packed_gemv_kmajor_split(
+        X: T.Tensor((1, k), ts),
+        Wq: T.Tensor((words, n), "uint32"),
+        S: T.Tensor((groups, n), mts),
+        Z: T.Tensor((groups, n), mts),
+        P: T.Tensor((k_tiles, n), accum),
+    ):
+        with T.Kernel(T.ceildiv(n, BN), k_tiles, threads=threads) as (bx, by):
+            prod = T.alloc_fragment((BN, BK), accum)
+            partial = T.alloc_fragment((BN,), accum)
+            dtype_ref = T.alloc_fragment((1,), ts)
+            meta_ref = T.alloc_fragment((1,), mts)
+            dtype_ref[0] = T.Cast(ts, 0.0)
+            meta_ref[0] = T.Cast(mts, 0.0)
+
+            for i, j in T.Parallel(BN, BK):
+                n_idx = bx * BN + i
+                k_idx = by * BK + j
+                safe_n = T.min(n_idx, n - 1)
+                group_idx = T.min(k_idx // group_size, groups - 1)
+                code = _load_packed_code_kmajor(Wq, k_idx, safe_n, words, bits)
+                scale = T.Cast(accum, S[group_idx, safe_n])
+                zero = T.Cast(accum, Z[group_idx, safe_n])
+                val = (T.Cast(accum, code) - zero) * scale
+                prod[i, j] = T.if_then_else(
+                    (n_idx < n) & (k_idx < k),
+                    T.Cast(accum, X[0, k_idx]) * val,
+                    T.Cast(accum, 0.0),
+                )
+            T.reduce_sum(prod, partial, dim=1, clear=True)
+            for i in T.Parallel(BN):
+                n_idx = bx * BN + i
+                if n_idx < n:
+                    P[by, n_idx] = partial[i]
+
+    return qmm_packed_gemv_kmajor_split
+
+
+def make_packed_gemv_kmajor_reduce_prim_func(
+    *,
+    n: int,
+    k_tiles: int,
+    dtype,
+    block_n: int,
+    threads: int = 128,
+):
+    """Build the native TileLang reduction kernel for split-K GEMV partials."""
+    ts = _act_dtype_str(dtype)
+    accum = "float32"
+    BN = block_n
+
+    @T.prim_func
+    def qmm_packed_gemv_kmajor_reduce(
+        P: T.Tensor((k_tiles, n), accum),
+        Y: T.Tensor((1, n), ts),
+    ):
+        with T.Kernel(T.ceildiv(n, BN), threads=threads) as bx:
+            C = T.alloc_fragment((BN,), accum)
+            dtype_ref = T.alloc_fragment((1,), ts)
+            dtype_ref[0] = T.Cast(ts, 0.0)
+            T.clear(C)
+
+            for split in T.serial(k_tiles):
+                for i in T.Parallel(BN):
+                    n_idx = bx * BN + i
+                    if n_idx < n:
+                        C[i] += P[split, n_idx]
+
+            for i in T.Parallel(BN):
+                n_idx = bx * BN + i
+                if n_idx < n:
+                    Y[0, n_idx] = C[i]
+
+    return qmm_packed_gemv_kmajor_reduce
+
+
 def make_packed_dequant_prim_func(
     *,
     n: int,
@@ -795,24 +1312,44 @@ def make_packed_dequant_prim_func(
     scale_dtype,
     block_k: int,
     block_n: int,
+    transpose: bool = False,
     threads: int = 256,
 ):
-    """Build a row-major packed-weight dequantization ``@T.prim_func``.
+    """Build a packed-weight dequantization ``@T.prim_func``.
 
-    The produced kernel decodes canonical row-major packed weights
-    ``Wq: (K, words)`` and metadata ``(K, groups)`` into a dense
-    ``(K, N)`` matrix suitable for a follow-up TileLang GEMM.  It is intended
-    for large ``M`` workloads where decoding the same weight tile once per
-    output-row CTA is more expensive than materializing the dense weight once.
+    The produced kernel decodes packed weights into a dense ``(K, N)`` matrix
+    suitable for a follow-up TileLang GEMM. It supports canonical row-major
+    ``Wq: (K, words)`` and canonical column-major ``Wq: (N, words)`` layouts.
     """
     mts = _meta_dtype_str(scale_dtype)
     ots = _compute_dtype_str(out_dtype, jnp.dtype(out_dtype) == jnp.dtype(jnp.bfloat16))
     accum = "float32"
     BK, BN = block_k, block_n
-    VPW = 32 // bits
-    MASK = (1 << bits) - 1
 
     if mode == "affine":
+        if transpose:
+
+            @T.prim_func
+            def qmm_packed_dequant_col(
+                Wq: T.Tensor((n, words), "uint32"),
+                S: T.Tensor((n, groups), mts),
+                Z: T.Tensor((n, groups), mts),
+                Wd: T.Tensor((k, n), ots),
+            ):
+                with T.Kernel(T.ceildiv(n, BN), T.ceildiv(k, BK), threads=threads) as (bx, by):
+                    meta_ref = T.alloc_fragment((1,), mts)
+                    meta_ref[0] = T.Cast(mts, 0.0)
+                    for i, j in T.Parallel(BK, BN):
+                        k_idx = by * BK + i
+                        n_idx = bx * BN + j
+                        group_idx = T.min(k_idx // group_size, groups - 1)
+                        safe_n = T.min(n_idx, n - 1)
+                        code = _load_packed_code(Wq, safe_n, k_idx, words, bits)
+                        val = _decode_quant_value(mode, code, S[safe_n, group_idx], Z[safe_n, group_idx], accum)
+                        if (k_idx < k) & (n_idx < n):
+                            Wd[k_idx, n_idx] = T.Cast(ots, val)
+
+            return qmm_packed_dequant_col
 
         @T.prim_func
         def qmm_packed_dequant_row(
@@ -827,13 +1364,9 @@ def make_packed_dequant_prim_func(
                 for i, j in T.Parallel(BK, BN):
                     k_idx = by * BK + i
                     n_idx = bx * BN + j
-                    word_idx = n_idx // VPW
-                    shift = (n_idx - word_idx * VPW) * bits
                     group_idx = T.min(n_idx // group_size, groups - 1)
                     safe_k = T.min(k_idx, k - 1)
-                    safe_word = T.min(word_idx, words - 1)
-                    word = T.Cast("uint32", Wq[safe_k, safe_word])
-                    code = (word >> shift) & MASK
+                    code = _load_packed_code(Wq, safe_k, n_idx, words, bits)
                     val = _decode_quant_value(mode, code, S[safe_k, group_idx], Z[safe_k, group_idx], accum)
                     if (k_idx < k) & (n_idx < n):
                         Wd[k_idx, n_idx] = T.Cast(ots, val)
@@ -852,13 +1385,9 @@ def make_packed_dequant_prim_func(
             for i, j in T.Parallel(BK, BN):
                 k_idx = by * BK + i
                 n_idx = bx * BN + j
-                word_idx = n_idx // VPW
-                shift = (n_idx - word_idx * VPW) * bits
                 group_idx = T.min(n_idx // group_size, groups - 1)
                 safe_k = T.min(k_idx, k - 1)
-                safe_word = T.min(word_idx, words - 1)
-                word = T.Cast("uint32", Wq[safe_k, safe_word])
-                code = (word >> shift) & MASK
+                code = _load_packed_code(Wq, safe_k, n_idx, words, bits)
                 val = _decode_quant_value(mode, code, S[safe_k, group_idx], 0.0, accum)
                 if (k_idx < k) & (n_idx < n):
                     Wd[k_idx, n_idx] = T.Cast(ots, val)
@@ -1126,8 +1655,6 @@ def make_packed_bwd_dx_prim_func(
     cts = _compute_dtype_str(dtype, use_bf16)
     accum = "float32"
     BM, BK, BN = block_m, block_k, block_n
-    VPW = 32 // bits
-    MASK = (1 << bits) - 1
 
     if mode != "affine":
         if transpose:
@@ -1159,13 +1686,9 @@ def make_packed_bwd_dx_prim_func(
                         for i, j in T.Parallel(BN, BK):
                             n_idx = n_iter * BN + i
                             k_idx = kx * BK + j
-                            word_idx = k_idx // VPW
-                            shift = (k_idx - word_idx * VPW) * bits
                             group_idx = T.min(k_idx // group_size, groups - 1)
                             safe_n = T.min(n_idx, n - 1)
-                            safe_word = T.min(word_idx, words - 1)
-                            word = T.Cast("uint32", Wq[safe_n, safe_word])
-                            code = (word >> shift) & MASK
+                            code = _load_packed_code(Wq, safe_n, k_idx, words, bits)
                             val = _decode_quant_value(mode, code, S[safe_n, group_idx], 0.0, accum)
                             Ws[i, j] = T.if_then_else(
                                 (n_idx < n) & (k_idx < k),
@@ -1209,13 +1732,9 @@ def make_packed_bwd_dx_prim_func(
                     for i, j in T.Parallel(BN, BK):
                         n_idx = n_iter * BN + i
                         k_idx = kx * BK + j
-                        word_idx = n_idx // VPW
-                        shift = (n_idx - word_idx * VPW) * bits
                         group_idx = T.min(n_idx // group_size, groups - 1)
                         safe_k = T.min(k_idx, k - 1)
-                        safe_word = T.min(word_idx, words - 1)
-                        word = T.Cast("uint32", Wq[safe_k, safe_word])
-                        code = (word >> shift) & MASK
+                        code = _load_packed_code(Wq, safe_k, n_idx, words, bits)
                         val = _decode_quant_value(mode, code, S[safe_k, group_idx], 0.0, accum)
                         Ws[i, j] = T.if_then_else(
                             (n_idx < n) & (k_idx < k),
@@ -1262,13 +1781,9 @@ def make_packed_bwd_dx_prim_func(
                     for i, j in T.Parallel(BN, BK):
                         n_idx = n_iter * BN + i
                         k_idx = kx * BK + j
-                        word_idx = k_idx // VPW
-                        shift = (k_idx - word_idx * VPW) * bits
                         group_idx = T.min(k_idx // group_size, groups - 1)
                         safe_n = T.min(n_idx, n - 1)
-                        safe_word = T.min(word_idx, words - 1)
-                        word = T.Cast("uint32", Wq[safe_n, safe_word])
-                        code = (word >> shift) & MASK
+                        code = _load_packed_code(Wq, safe_n, k_idx, words, bits)
                         scale = T.Cast(accum, S[safe_n, group_idx])
                         zero = T.Cast(accum, Z[safe_n, group_idx])
                         val = (T.Cast(accum, code) - zero) * scale
@@ -1315,13 +1830,9 @@ def make_packed_bwd_dx_prim_func(
                 for i, j in T.Parallel(BN, BK):
                     n_idx = n_iter * BN + i
                     k_idx = kx * BK + j
-                    word_idx = n_idx // VPW
-                    shift = (n_idx - word_idx * VPW) * bits
                     group_idx = T.min(n_idx // group_size, groups - 1)
                     safe_k = T.min(k_idx, k - 1)
-                    safe_word = T.min(word_idx, words - 1)
-                    word = T.Cast("uint32", Wq[safe_k, safe_word])
-                    code = (word >> shift) & MASK
+                    code = _load_packed_code(Wq, safe_k, n_idx, words, bits)
                     scale = T.Cast(accum, S[safe_k, group_idx])
                     zero = T.Cast(accum, Z[safe_k, group_idx])
                     val = (T.Cast(accum, code) - zero) * scale
@@ -1393,8 +1904,6 @@ def make_packed_bwd_meta_prim_func(
     xts = _act_dtype_str(x_dtype)
     mts = _act_dtype_str(scale_dtype)
     accum = "float32"
-    VPW = 32 // bits
-    MASK = (1 << bits) - 1
 
     if transpose:
 
@@ -1421,10 +1930,7 @@ def make_packed_bwd_meta_prim_func(
                 zero = T.Cast(accum, Z[bn, bg])
                 for kk in T.serial(group_size):
                     k_idx = bg * group_size + kk
-                    word_idx = k_idx // VPW
-                    shift = (k_idx - word_idx * VPW) * bits
-                    word = T.Cast("uint32", Wq[bn, word_idx])
-                    code = T.Cast(accum, (word >> shift) & MASK)
+                    code = T.Cast(accum, _load_packed_code(Wq, bn, k_idx, words, bits))
                     centered = code - zero
                     for mm in T.serial(m):
                         prod = T.Cast(accum, X[mm, k_idx]) * T.Cast(accum, dY[mm, bn])
@@ -1458,10 +1964,7 @@ def make_packed_bwd_meta_prim_func(
             zero = T.Cast(accum, Z[bk, bg])
             for jj in T.serial(group_size):
                 n_idx = bg * group_size + jj
-                word_idx = n_idx // VPW
-                shift = (n_idx - word_idx * VPW) * bits
-                word = T.Cast("uint32", Wq[bk, word_idx])
-                code = T.Cast(accum, (word >> shift) & MASK)
+                code = T.Cast(accum, _load_packed_code(Wq, bk, n_idx, words, bits))
                 centered = code - zero
                 for mm in T.serial(m):
                     prod = T.Cast(accum, X[mm, bk]) * T.Cast(accum, dY[mm, n_idx])
@@ -1528,8 +2031,6 @@ def make_packed_bwd_scale_prim_func(
     xts = _act_dtype_str(x_dtype)
     mts = _meta_dtype_str(scale_dtype)
     accum = "float32"
-    VPW = 32 // bits
-    MASK = (1 << bits) - 1
 
     if transpose:
 
@@ -1552,10 +2053,7 @@ def make_packed_bwd_scale_prim_func(
                 sum_s[0] = 0.0
                 for kk in T.serial(group_size):
                     k_idx = bg * group_size + kk
-                    word_idx = k_idx // VPW
-                    shift = (k_idx - word_idx * VPW) * bits
-                    word = T.Cast("uint32", Wq[bn, word_idx])
-                    code = (word >> shift) & MASK
+                    code = _load_packed_code(Wq, bn, k_idx, words, bits)
                     code_val = _decode_nf4_value(code, accum)
                     for mm in T.serial(m):
                         prod = T.Cast(accum, X[mm, k_idx]) * T.Cast(accum, dY[mm, bn])
@@ -1583,10 +2081,7 @@ def make_packed_bwd_scale_prim_func(
             sum_s[0] = 0.0
             for jj in T.serial(group_size):
                 n_idx = bg * group_size + jj
-                word_idx = n_idx // VPW
-                shift = (n_idx - word_idx * VPW) * bits
-                word = T.Cast("uint32", Wq[bk, word_idx])
-                code = (word >> shift) & MASK
+                code = _load_packed_code(Wq, bk, n_idx, words, bits)
                 code_val = _decode_nf4_value(code, accum)
                 for mm in T.serial(m):
                     prod = T.Cast(accum, X[mm, bk]) * T.Cast(accum, dY[mm, n_idx])

@@ -1,4 +1,4 @@
-// Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+// Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -412,7 +412,6 @@ inline Error ResolveQmmKernelFamily(int64_t M, int64_t mode, int64_t bits,
     return Error::Success();
   }
 
-  // auto
   if (effective_4bit) {
     revsplit_parts = revsplit_k_parts == 0 ? 2 : revsplit_k_parts;
     if (revsplit_parts < 2) {
@@ -456,6 +455,74 @@ __device__ __forceinline__ uint32_t LoadPackedQ(const uint32_t *row, int64_t n,
   return low | (high << low_bits);
 }
 
+template <int Bits>
+__device__ __forceinline__ uint32_t LoadPackedQConst(const uint32_t *row,
+                                                     int64_t n,
+                                                     int bits_runtime) {
+  if constexpr (Bits == 4) {
+    int64_t word_idx = n >> 3;
+    int32_t shift = static_cast<int32_t>(n & 7) * 4;
+    return (row[word_idx] >> shift) & 0xFu;
+  } else if constexpr (Bits == 8) {
+    int64_t word_idx = n >> 2;
+    int32_t shift = static_cast<int32_t>(n & 3) * 8;
+    return (row[word_idx] >> shift) & 0xFFu;
+  } else if constexpr (Bits > 0) {
+    int64_t bit_offset = n * Bits;
+    int64_t word_idx = bit_offset >> 5;
+    int32_t shift = static_cast<int32_t>(bit_offset & 31);
+    uint32_t low_word = row[word_idx];
+    int32_t low_bits = (shift + Bits > 32) ? (32 - shift) : Bits;
+    int32_t high_bits = Bits - low_bits;
+    uint32_t low_mask = (uint32_t(1) << low_bits) - 1u;
+    uint32_t low = (low_word >> shift) & low_mask;
+    uint32_t high = 0;
+    if (high_bits > 0) {
+      uint32_t high_mask = (uint32_t(1) << high_bits) - 1u;
+      high = row[word_idx + 1] & high_mask;
+    }
+    return low | (high << low_bits);
+  } else {
+    return LoadPackedQ(row, n, bits_runtime);
+  }
+}
+
+template <int Bits>
+__device__ __forceinline__ uint32_t LoadPackedQKMajorConst(
+    const uint32_t *base, int64_t N, int64_t k, int64_t n, int bits_runtime) {
+  if constexpr (Bits == 1 || Bits == 2 || Bits == 4 || Bits == 8) {
+    constexpr int kValuesPerWord = 32 / Bits;
+    constexpr uint32_t kMask = (uint32_t(1) << Bits) - 1u;
+    int64_t word_idx = k / kValuesPerWord;
+    int32_t shift = static_cast<int32_t>(k % kValuesPerWord) * Bits;
+    return (base[word_idx * N + n] >> shift) & kMask;
+  } else {
+    int64_t bit_offset = k * bits_runtime;
+    int64_t word_idx = bit_offset >> 5;
+    int32_t shift = static_cast<int32_t>(bit_offset & 31);
+    uint32_t low_word = base[word_idx * N + n];
+    int32_t low_bits =
+        (shift + bits_runtime > 32) ? (32 - shift) : bits_runtime;
+    int32_t high_bits = bits_runtime - low_bits;
+    uint32_t low_mask = (uint32_t(1) << low_bits) - 1u;
+    uint32_t low = (low_word >> shift) & low_mask;
+    uint32_t high = 0;
+    if (high_bits > 0) {
+      uint32_t high_mask = (uint32_t(1) << high_bits) - 1u;
+      high = base[(word_idx + 1) * N + n] & high_mask;
+    }
+    return low | (high << low_bits);
+  }
+}
+
+__device__ __forceinline__ float WarpReduceSum(float v) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    v += __shfl_down_sync(0xffffffffu, v, offset);
+  }
+  return v;
+}
+
 template <typename XType>
 __device__ __forceinline__ half LoadXAsHalf(const XType *ptr) {
   return ToHalf(ToFloatLocal(*ptr));
@@ -482,6 +549,25 @@ __device__ __forceinline__ half CastOut<half>(float v) {
 template <>
 __device__ __forceinline__ __nv_bfloat16 CastOut<__nv_bfloat16>(float v) {
   return __float2bfloat16(v);
+}
+
+template <typename OutT>
+__device__ __forceinline__ void AtomicAddOut(OutT *ptr, float v);
+
+template <>
+__device__ __forceinline__ void AtomicAddOut<float>(float *ptr, float v) {
+  atomicAdd(ptr, v);
+}
+
+template <>
+__device__ __forceinline__ void AtomicAddOut<half>(half *ptr, float v) {
+  atomicAdd(ptr, __float2half_rn(v));
+}
+
+template <>
+__device__ __forceinline__ void AtomicAddOut<__nv_bfloat16>(
+    __nv_bfloat16 *ptr, float v) {
+  atomicAdd(ptr, __float2bfloat16(v));
 }
 
 template <typename ScaleT, typename BiasT>
@@ -541,8 +627,15 @@ __global__ void DequantToBf16Kernel(const uint32_t *wq, const ScaleT *scales,
     if (idx >= total) {
       return;
     }
-    int64_t k = idx / N;
-    int64_t n = idx - k * N;
+    int64_t k;
+    int64_t n;
+    if (transposed) {
+      n = idx / K;
+      k = idx - n * K;
+    } else {
+      k = idx / N;
+      n = idx - k * N;
+    }
     const uint32_t *wq_row =
         transposed ? (wq + n * n_words) : (wq + k * n_words);
     uint32_t q = LoadPackedQ(wq_row, transposed ? k : n, bits);
@@ -578,8 +671,15 @@ __global__ void DequantToHalfKernel(const uint32_t *wq, const ScaleT *scales,
     if (idx >= total) {
       return;
     }
-    int64_t k = idx / N;
-    int64_t n = idx - k * N;
+    int64_t k;
+    int64_t n;
+    if (transposed) {
+      n = idx / K;
+      k = idx - n * K;
+    } else {
+      k = idx / N;
+      n = idx - k * N;
+    }
     const uint32_t *wq_row =
         transposed ? (wq + n * n_words) : (wq + k * n_words);
     uint32_t q = LoadPackedQ(wq_row, transposed ? k : n, bits);
@@ -587,6 +687,31 @@ __global__ void DequantToHalfKernel(const uint32_t *wq, const ScaleT *scales,
     float val =
         DequantValue(q, scales, biases, n, k, g, n_groups, transposed, mode);
     out[idx] = __float2half_rn(val);
+  }
+}
+
+template <typename ScaleT, typename BiasT, typename OutT>
+__global__ void DequantKMajorAffineKernel(
+    const uint32_t *wq, const ScaleT *scales, const BiasT *biases, OutT *out,
+    int64_t K, int64_t N, int64_t n_groups, int64_t group_size, int bits) {
+  int64_t total = K * N;
+  int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
+      kDequantElemsPerThread;
+
+#pragma unroll
+  for (int i = 0; i < kDequantElemsPerThread; ++i) {
+    int64_t idx = base + i;
+    if (idx >= total) {
+      return;
+    }
+    int64_t n = idx / K;
+    int64_t k = idx - n * K;
+    int64_t g = k / group_size;
+    uint32_t q = LoadPackedQKMajorConst<0>(wq, N, k, n, bits);
+    float val = static_cast<float>(q) * ToFloatLocal(scales[g * N + n]) +
+                ToFloatLocal(biases[g * N + n]);
+    out[idx] = CastOut<OutT>(val);
   }
 }
 
@@ -785,6 +910,922 @@ __global__ void QmmFusedGemvRevSplitKKernel(
   out[n] = CastOut<OutT>(acc);
 }
 
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits, int WarpsPerBlock, int WarpsPerOutput>
+__global__ void QmmFusedGemvWarpKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_words,
+    int64_t n_groups, int64_t group_size, int bits_runtime, int64_t mode,
+    int64_t transpose) {
+  int warp_id = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  constexpr int kOutputsPerBlock = WarpsPerBlock / WarpsPerOutput;
+  int output_slot = warp_id / WarpsPerOutput;
+  int output_warp = warp_id - output_slot * WarpsPerOutput;
+  int64_t n = static_cast<int64_t>(blockIdx.x) * kOutputsPerBlock +
+              output_slot;
+  bool valid_n = n < N;
+
+  bool transposed = transpose != 0;
+  float acc = 0.0f;
+  __shared__ float warp_partials[WarpsPerBlock];
+  if (mode == 0 && transposed) {
+    float grouped_acc = 0.0f;
+    if (valid_n) {
+      const uint32_t *wq_row = wq + n * n_words;
+      const ScaleT *scale_row = scales + n * n_groups;
+      const BiasT *bias_row = biases + n * n_groups;
+      for (int64_t g = output_warp; g < n_groups; g += WarpsPerOutput) {
+        int64_t k_begin = g * group_size;
+        int64_t k_end =
+            (k_begin + group_size < K) ? (k_begin + group_size) : K;
+        float xq_sum = 0.0f;
+        float x_sum = 0.0f;
+        for (int64_t k = k_begin + lane; k < k_end; k += 32) {
+          float x_val = ToFloatLocal(x[k]);
+          uint32_t q = LoadPackedQConst<Bits>(wq_row, k, bits_runtime);
+          xq_sum += x_val * static_cast<float>(q);
+          x_sum += x_val;
+        }
+        xq_sum = WarpReduceSum(xq_sum);
+        x_sum = WarpReduceSum(x_sum);
+        if (lane == 0) {
+          grouped_acc += ToFloatLocal(scale_row[g]) * xq_sum +
+                         ToFloatLocal(bias_row[g]) * x_sum;
+        }
+      }
+    }
+    if (lane == 0) {
+      warp_partials[warp_id] = grouped_acc;
+    }
+    __syncthreads();
+    if (valid_n && output_warp == 0 && lane == 0) {
+      float total = 0.0f;
+#pragma unroll
+      for (int i = 0; i < WarpsPerOutput; ++i) {
+        total += warp_partials[output_slot * WarpsPerOutput + i];
+      }
+      out[n] = CastOut<OutT>(total);
+    }
+    return;
+  }
+
+  if (!valid_n) {
+    return;
+  }
+
+  if (mode == 0) {
+    for (int64_t k = lane; k < K; k += 32) {
+      const uint32_t *wq_row = wq + k * n_words;
+      uint32_t q = LoadPackedQConst<Bits>(wq_row, n, bits_runtime);
+      int64_t g = n / group_size;
+      int64_t idx = k * n_groups + g;
+      float w_val = static_cast<float>(q) * ToFloatLocal(scales[idx]) +
+                    ToFloatLocal(biases[idx]);
+      acc += ToFloatLocal(x[k]) * w_val;
+    }
+  } else {
+    for (int64_t k = lane; k < K; k += 32) {
+      const uint32_t *wq_row =
+          transposed ? (wq + n * n_words) : (wq + k * n_words);
+      uint32_t q =
+          LoadPackedQConst<Bits>(wq_row, transposed ? k : n, bits_runtime);
+      int64_t g = transposed ? (k / group_size) : (n / group_size);
+      float w_val =
+          DequantValue(q, scales, biases, n, k, g, n_groups, transposed, mode);
+      acc += ToFloatLocal(x[k]) * w_val;
+    }
+  }
+
+  acc = WarpReduceSum(acc);
+  if (lane == 0) {
+    out[n] = CastOut<OutT>(acc);
+  }
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits, int BlockN>
+__global__ void QmmFusedGemvKMajorAffineKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_groups,
+    int64_t group_size, int bits_runtime) {
+  int64_t n = static_cast<int64_t>(blockIdx.x) * BlockN + threadIdx.x;
+  if (n >= N) {
+    return;
+  }
+
+  float acc = 0.0f;
+  if constexpr (Bits == 1 || Bits == 2 || Bits == 4 || Bits == 8) {
+    constexpr int kValuesPerWord = 32 / Bits;
+    constexpr uint32_t kMask = (uint32_t(1) << Bits) - 1u;
+    for (int64_t g = 0; g < n_groups; ++g) {
+      float scale = ToFloatLocal(scales[g * N + n]);
+      float bias = ToFloatLocal(biases[g * N + n]);
+      int64_t k_begin = g * group_size;
+      int64_t k_end =
+          (k_begin + group_size < K) ? (k_begin + group_size) : K;
+      int64_t word_begin = k_begin / kValuesPerWord;
+      int64_t word_end = (k_end + kValuesPerWord - 1) / kValuesPerWord;
+      for (int64_t word = word_begin; word < word_end; ++word) {
+        uint32_t packed = wq[word * N + n];
+#pragma unroll
+        for (int i = 0; i < kValuesPerWord; ++i) {
+          int64_t k_idx = word * kValuesPerWord + i;
+          if (k_idx >= k_begin && k_idx < k_end) {
+            uint32_t q = (packed >> (i * Bits)) & kMask;
+            float w_val = static_cast<float>(q) * scale + bias;
+            acc += ToFloatLocal(x[k_idx]) * w_val;
+          }
+        }
+      }
+    }
+  } else {
+    for (int64_t k = 0; k < K; ++k) {
+      int64_t g = k / group_size;
+      uint32_t q = LoadPackedQKMajorConst<Bits>(wq, N, k, n, bits_runtime);
+      float w_val = static_cast<float>(q) * ToFloatLocal(scales[g * N + n]) +
+                    ToFloatLocal(biases[g * N + n]);
+      acc += ToFloatLocal(x[k]) * w_val;
+    }
+  }
+
+  out[n] = CastOut<OutT>(acc);
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits>
+Error LaunchQmmFusedGemvKMajorAffineKernelBits(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_groups,
+    int64_t group_size, int bits, cudaStream_t stream) {
+  constexpr int kBlockN = 256;
+  dim3 block(kBlockN);
+  dim3 grid(static_cast<uint32_t>((N + kBlockN - 1) / kBlockN));
+  QmmFusedGemvKMajorAffineKernel<XType, ScaleT, BiasT, OutT, Bits, kBlockN>
+      <<<grid, block, 0, stream>>>(x, wq, scales, biases, out, N, K, n_groups,
+                                   group_size, bits);
+  return CheckCuda(cudaPeekAtLastError(),
+                   "fused qmm k-major affine gemv kernel launch");
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT>
+Error LaunchQmmFusedGemvKMajorAffineKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_groups,
+    int64_t group_size, int bits, cudaStream_t stream) {
+  switch (bits) {
+  case 1:
+    return LaunchQmmFusedGemvKMajorAffineKernelBits<XType, ScaleT, BiasT, OutT,
+                                                    1>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream);
+  case 2:
+    return LaunchQmmFusedGemvKMajorAffineKernelBits<XType, ScaleT, BiasT, OutT,
+                                                    2>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream);
+  case 4:
+    return LaunchQmmFusedGemvKMajorAffineKernelBits<XType, ScaleT, BiasT, OutT,
+                                                    4>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream);
+  case 8:
+    return LaunchQmmFusedGemvKMajorAffineKernelBits<XType, ScaleT, BiasT, OutT,
+                                                    8>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream);
+  default:
+    return LaunchQmmFusedGemvKMajorAffineKernelBits<XType, ScaleT, BiasT, OutT,
+                                                    0>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream);
+  }
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits, int BlockN, int BlockK, int Threads>
+__global__ void QmmFusedGemvKMajorAffineTileKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t group_size,
+    int bits_runtime) {
+  __shared__ float tile_acc[BlockN];
+  int tid = threadIdx.x;
+  int64_t n_base = static_cast<int64_t>(blockIdx.x) * BlockN;
+  int64_t k_base = static_cast<int64_t>(blockIdx.y) * BlockK;
+  int64_t g = k_base / group_size;
+
+  for (int idx = tid; idx < BlockN; idx += Threads) {
+    tile_acc[idx] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int idx = tid; idx < BlockN * BlockK; idx += Threads) {
+    int k_off = idx / BlockN;
+    int n_off = idx - k_off * BlockN;
+    int64_t n = n_base + n_off;
+    int64_t k = k_base + k_off;
+    if (n < N && k < K) {
+      uint32_t q = LoadPackedQKMajorConst<Bits>(wq, N, k, n, bits_runtime);
+      float scale = ToFloatLocal(scales[g * N + n]);
+      float bias = ToFloatLocal(biases[g * N + n]);
+      float w_val = static_cast<float>(q) * scale + bias;
+      atomicAdd(tile_acc + n_off, ToFloatLocal(x[k]) * w_val);
+    }
+  }
+  __syncthreads();
+
+  for (int n_off = tid; n_off < BlockN; n_off += Threads) {
+    int64_t n = n_base + n_off;
+    if (n < N) {
+      AtomicAddOut(out + n, tile_acc[n_off]);
+    }
+  }
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits>
+Error LaunchQmmFusedGemvKMajorAffineTileKernelBits(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t group_size,
+    int bits, cudaStream_t stream) {
+  size_t out_bytes = static_cast<size_t>(N) * sizeof(OutT);
+  if (Error err = CheckCuda(cudaMemsetAsync(out, 0, out_bytes, stream),
+                            "K-major tile GEMV output memset");
+      err.failure()) {
+    return err;
+  }
+
+  constexpr int kBlockN = 512;
+  constexpr int kBlockK = 16;
+  constexpr int kThreads = 128;
+  dim3 block(kThreads);
+  dim3 grid(static_cast<uint32_t>((N + kBlockN - 1) / kBlockN),
+            static_cast<uint32_t>((K + kBlockK - 1) / kBlockK));
+  QmmFusedGemvKMajorAffineTileKernel<XType, ScaleT, BiasT, OutT, Bits,
+                                     kBlockN, kBlockK, kThreads>
+      <<<grid, block, 0, stream>>>(x, wq, scales, biases, out, N, K,
+                                   group_size, bits);
+  return CheckCuda(cudaPeekAtLastError(),
+                   "fused qmm K-major tile GEMV kernel launch");
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT>
+Error LaunchQmmFusedGemvKMajorAffineTileKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t group_size,
+    int bits, cudaStream_t stream) {
+  switch (bits) {
+  case 1:
+    return LaunchQmmFusedGemvKMajorAffineTileKernelBits<
+        XType, ScaleT, BiasT, OutT, 1>(x, wq, scales, biases, out, N, K,
+                                       group_size, bits, stream);
+  case 2:
+    return LaunchQmmFusedGemvKMajorAffineTileKernelBits<
+        XType, ScaleT, BiasT, OutT, 2>(x, wq, scales, biases, out, N, K,
+                                       group_size, bits, stream);
+  case 4:
+    return LaunchQmmFusedGemvKMajorAffineTileKernelBits<
+        XType, ScaleT, BiasT, OutT, 4>(x, wq, scales, biases, out, N, K,
+                                       group_size, bits, stream);
+  case 8:
+    return LaunchQmmFusedGemvKMajorAffineTileKernelBits<
+        XType, ScaleT, BiasT, OutT, 8>(x, wq, scales, biases, out, N, K,
+                                       group_size, bits, stream);
+  default:
+    return LaunchQmmFusedGemvKMajorAffineTileKernelBits<
+        XType, ScaleT, BiasT, OutT, 0>(x, wq, scales, biases, out, N, K,
+                                       group_size, bits, stream);
+  }
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits, int BlockN, int BlockK>
+__global__ void QmmFusedGemvKMajorAffineSplitKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, const float *group_sums, OutT *out, int64_t N,
+    int64_t K, int64_t group_size, int bits_runtime) {
+  int tid = threadIdx.x;
+  int64_t n = static_cast<int64_t>(blockIdx.x) * BlockN + threadIdx.x;
+  bool valid_n = n < N;
+
+  int64_t tile_begin = static_cast<int64_t>(blockIdx.y) * BlockK;
+  int64_t tile_end = (tile_begin + BlockK < K) ? (tile_begin + BlockK) : K;
+  int64_t tile_len = tile_end - tile_begin;
+  int64_t g_begin = tile_begin / group_size;
+  int64_t g_end = (tile_end + group_size - 1) / group_size;
+  __shared__ float x_tile[BlockK];
+  for (int off = tid; off < tile_len; off += BlockN) {
+    x_tile[off] = ToFloatLocal(x[tile_begin + off]);
+  }
+  __syncthreads();
+  if (!valid_n) {
+    return;
+  }
+  float acc = 0.0f;
+
+  for (int64_t g = g_begin; g < g_end; ++g) {
+    int64_t k_begin = g * group_size;
+    int64_t k_end = (k_begin + group_size < K) ? (k_begin + group_size) : K;
+    k_begin = (k_begin > tile_begin) ? k_begin : tile_begin;
+    k_end = (k_end < tile_end) ? k_end : tile_end;
+    float scale = ToFloatLocal(scales[g * N + n]);
+    float bias = ToFloatLocal(biases[g * N + n]);
+    float xq_sum = 0.0f;
+    float x_sum = 0.0f;
+
+    if constexpr (Bits == 1) {
+      constexpr int kValuesPerWord = 32;
+      int64_t word_begin = k_begin / kValuesPerWord;
+      int64_t word_end = (k_end + kValuesPerWord - 1) / kValuesPerWord;
+      if ((k_begin % kValuesPerWord) == 0 &&
+          (k_end % kValuesPerWord) == 0) {
+#pragma unroll
+        for (int64_t word = word_begin; word < word_end; ++word) {
+          uint32_t packed = wq[word * N + n];
+          while (packed != 0u) {
+            int bit = __ffs(packed) - 1;
+            int64_t k_idx = word * kValuesPerWord + bit;
+            xq_sum += x_tile[k_idx - tile_begin];
+            packed &= packed - 1u;
+          }
+        }
+      } else {
+#pragma unroll
+        for (int64_t word = word_begin; word < word_end; ++word) {
+          uint32_t packed = wq[word * N + n];
+          while (packed != 0u) {
+            int bit = __ffs(packed) - 1;
+            int64_t k_idx = word * kValuesPerWord + bit;
+            if (k_idx >= k_begin && k_idx < k_end) {
+              xq_sum += x_tile[k_idx - tile_begin];
+            }
+            packed &= packed - 1u;
+          }
+        }
+      }
+    } else if constexpr (Bits == 2 || Bits == 4 || Bits == 8) {
+      constexpr int kValuesPerWord = 32 / Bits;
+      constexpr uint32_t kMask = (uint32_t(1) << Bits) - 1u;
+      int64_t word_begin = k_begin / kValuesPerWord;
+      int64_t word_end = (k_end + kValuesPerWord - 1) / kValuesPerWord;
+      if ((k_begin % kValuesPerWord) == 0 &&
+          (k_end % kValuesPerWord) == 0) {
+#pragma unroll
+        for (int64_t word = word_begin; word < word_end; ++word) {
+          uint32_t packed = wq[word * N + n];
+#pragma unroll
+          for (int i = 0; i < kValuesPerWord; ++i) {
+            int64_t k_idx = word * kValuesPerWord + i;
+            float x_val = x_tile[k_idx - tile_begin];
+            uint32_t q = (packed >> (i * Bits)) & kMask;
+            xq_sum += x_val * static_cast<float>(q);
+            if (group_sums == nullptr) {
+              x_sum += x_val;
+            }
+          }
+        }
+      } else {
+#pragma unroll
+        for (int64_t word = word_begin; word < word_end; ++word) {
+          uint32_t packed = wq[word * N + n];
+#pragma unroll
+          for (int i = 0; i < kValuesPerWord; ++i) {
+            int64_t k_idx = word * kValuesPerWord + i;
+            if (k_idx >= k_begin && k_idx < k_end) {
+              float x_val = x_tile[k_idx - tile_begin];
+              uint32_t q = (packed >> (i * Bits)) & kMask;
+              xq_sum += x_val * static_cast<float>(q);
+              if (group_sums == nullptr) {
+                x_sum += x_val;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      for (int64_t k = k_begin; k < k_end; ++k) {
+        float x_val = x_tile[k - tile_begin];
+        uint32_t q = LoadPackedQKMajorConst<Bits>(wq, N, k, n, bits_runtime);
+        xq_sum += x_val * static_cast<float>(q);
+        if (group_sums == nullptr) {
+          x_sum += x_val;
+        }
+      }
+    }
+    float bias_sum = group_sums == nullptr ? x_sum : group_sums[g];
+    acc += scale * xq_sum + bias * bias_sum;
+  }
+  AtomicAddOut(out + n, acc);
+}
+
+template <typename XType>
+__global__ void QmmGemvGroupSumsKernel(const XType *x, float *group_sums,
+                                       int64_t K, int64_t n_groups,
+                                       int64_t group_size) {
+  int64_t g = static_cast<int64_t>(blockIdx.x);
+  int tid = threadIdx.x;
+  float acc = 0.0f;
+  int64_t k_begin = g * group_size;
+  int64_t k_end = (k_begin + group_size < K) ? (k_begin + group_size) : K;
+  for (int64_t k = k_begin + tid; k < k_end; k += blockDim.x) {
+    acc += ToFloatLocal(x[k]);
+  }
+  __shared__ float smem[256];
+  smem[tid] = acc;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      smem[tid] += smem[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0 && g < n_groups) {
+    group_sums[g] = smem[0];
+  }
+}
+
+template <typename XType, typename ScaleT, typename BiasT, int Bits,
+          int BlockN, int GroupSize>
+__global__ void QmmFusedGemvKMajorAffinePartialKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, float *partials, int64_t N, int64_t K,
+    int64_t n_groups, int bits_runtime) {
+  int tid = threadIdx.x;
+  int64_t n = static_cast<int64_t>(blockIdx.x) * BlockN + tid;
+  int64_t g = static_cast<int64_t>(blockIdx.y);
+  int64_t k_begin = g * GroupSize;
+
+  __shared__ float x_tile[GroupSize];
+  __shared__ float x_sum;
+  if (tid < GroupSize) {
+    int64_t k_idx = k_begin + tid;
+    x_tile[tid] = (k_idx < K) ? ToFloatLocal(x[k_idx]) : 0.0f;
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < GroupSize; ++i) {
+      sum += x_tile[i];
+    }
+    x_sum = sum;
+  }
+  __syncthreads();
+
+  if (n >= N || g >= n_groups) {
+    return;
+  }
+
+  float xq_sum = 0.0f;
+  if constexpr (Bits == 1) {
+    constexpr int kValuesPerWord = 32;
+    constexpr int kWordsPerGroup = GroupSize / kValuesPerWord;
+    int64_t word_begin = k_begin / kValuesPerWord;
+#pragma unroll
+    for (int w = 0; w < kWordsPerGroup; ++w) {
+      uint32_t packed = wq[(word_begin + w) * N + n];
+      while (packed != 0u) {
+        int bit = __ffs(packed) - 1;
+        xq_sum += x_tile[w * kValuesPerWord + bit];
+        packed &= packed - 1u;
+      }
+    }
+  } else if constexpr (Bits == 2 || Bits == 4 || Bits == 8) {
+    constexpr int kValuesPerWord = 32 / Bits;
+    constexpr int kWordsPerGroup = GroupSize / kValuesPerWord;
+    constexpr uint32_t kMask = (uint32_t(1) << Bits) - 1u;
+    int64_t word_begin = k_begin / kValuesPerWord;
+#pragma unroll
+    for (int w = 0; w < kWordsPerGroup; ++w) {
+      uint32_t packed = wq[(word_begin + w) * N + n];
+#pragma unroll
+      for (int i = 0; i < kValuesPerWord; ++i) {
+        uint32_t q = (packed >> (i * Bits)) & kMask;
+        xq_sum += x_tile[w * kValuesPerWord + i] * static_cast<float>(q);
+      }
+    }
+  } else {
+    for (int64_t k = k_begin; k < k_begin + GroupSize && k < K; ++k) {
+      uint32_t q = LoadPackedQKMajorConst<Bits>(wq, N, k, n, bits_runtime);
+      xq_sum += x_tile[k - k_begin] * static_cast<float>(q);
+    }
+  }
+
+  float scale = ToFloatLocal(scales[g * N + n]);
+  float bias = ToFloatLocal(biases[g * N + n]);
+  partials[g * N + n] = scale * xq_sum + bias * x_sum;
+}
+
+template <typename OutT, int BlockN>
+__global__ void QmmFusedGemvPartialReduceKernel(const float *partials,
+                                                OutT *out, int64_t N,
+                                                int64_t n_groups) {
+  int64_t n = static_cast<int64_t>(blockIdx.x) * BlockN + threadIdx.x;
+  if (n >= N) {
+    return;
+  }
+  float acc = 0.0f;
+  for (int64_t g = 0; g < n_groups; ++g) {
+    acc += partials[g * N + n];
+  }
+  out[n] = CastOut<OutT>(acc);
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits, int GroupSize>
+Error LaunchQmmFusedGemvKMajorAffinePartialKernelGroup(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_groups,
+    int bits, cudaStream_t stream, ScratchAllocator &scratch) {
+  constexpr int kBlockN = 256;
+  size_t partial_bytes =
+      static_cast<size_t>(N) * static_cast<size_t>(n_groups) * sizeof(float);
+  auto partials_opt = scratch.Allocate(partial_bytes, alignof(float));
+  if (!partials_opt.has_value()) {
+    return MakeInternal("Failed to allocate partial buffer for K-major GEMV.");
+  }
+  float *partials = reinterpret_cast<float *>(*partials_opt);
+  dim3 block(kBlockN);
+  dim3 partial_grid(static_cast<uint32_t>((N + kBlockN - 1) / kBlockN),
+                    static_cast<uint32_t>(n_groups));
+  QmmFusedGemvKMajorAffinePartialKernel<XType, ScaleT, BiasT, Bits, kBlockN,
+                                        GroupSize>
+      <<<partial_grid, block, 0, stream>>>(x, wq, scales, biases, partials, N,
+                                           K, n_groups, bits);
+  if (Error err = CheckCuda(cudaPeekAtLastError(),
+                            "fused qmm K-major partial GEMV kernel launch");
+      err.failure()) {
+    return err;
+  }
+  dim3 reduce_grid(static_cast<uint32_t>((N + kBlockN - 1) / kBlockN));
+  QmmFusedGemvPartialReduceKernel<OutT, kBlockN>
+      <<<reduce_grid, block, 0, stream>>>(partials, out, N, n_groups);
+  return CheckCuda(cudaPeekAtLastError(),
+                   "fused qmm K-major partial GEMV reduce launch");
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits>
+Error LaunchQmmFusedGemvKMajorAffinePartialKernelBits(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_groups,
+    int64_t group_size, int bits, cudaStream_t stream,
+    ScratchAllocator &scratch) {
+  if (group_size == 32) {
+    return LaunchQmmFusedGemvKMajorAffinePartialKernelGroup<
+        XType, ScaleT, BiasT, OutT, Bits, 32>(
+        x, wq, scales, biases, out, N, K, n_groups, bits, stream, scratch);
+  }
+  if (group_size == 64) {
+    return LaunchQmmFusedGemvKMajorAffinePartialKernelGroup<
+        XType, ScaleT, BiasT, OutT, Bits, 64>(
+        x, wq, scales, biases, out, N, K, n_groups, bits, stream, scratch);
+  }
+  if (group_size == 128) {
+    return LaunchQmmFusedGemvKMajorAffinePartialKernelGroup<
+        XType, ScaleT, BiasT, OutT, Bits, 128>(
+        x, wq, scales, biases, out, N, K, n_groups, bits, stream, scratch);
+  }
+  return MakeInvalid(
+      "K-major partial GEMV supports group_size in {32,64,128}.");
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT>
+Error LaunchQmmFusedGemvKMajorAffinePartialKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_groups,
+    int64_t group_size, int bits, cudaStream_t stream,
+    ScratchAllocator &scratch) {
+  switch (bits) {
+  case 1:
+    return LaunchQmmFusedGemvKMajorAffinePartialKernelBits<
+        XType, ScaleT, BiasT, OutT, 1>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch);
+  case 2:
+    return LaunchQmmFusedGemvKMajorAffinePartialKernelBits<
+        XType, ScaleT, BiasT, OutT, 2>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch);
+  case 4:
+    return LaunchQmmFusedGemvKMajorAffinePartialKernelBits<
+        XType, ScaleT, BiasT, OutT, 4>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch);
+  case 8:
+    return LaunchQmmFusedGemvKMajorAffinePartialKernelBits<
+        XType, ScaleT, BiasT, OutT, 8>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch);
+  default:
+    return LaunchQmmFusedGemvKMajorAffinePartialKernelBits<
+        XType, ScaleT, BiasT, OutT, 0>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch);
+  }
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename AccumOutT,
+          int Bits, int BlockN, int BlockK>
+Error LaunchQmmFusedGemvKMajorAffineSplitKernelConfig(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, const float *group_sums, AccumOutT *out, int64_t N,
+    int64_t K, int64_t group_size, int bits, cudaStream_t stream) {
+  dim3 block(BlockN);
+  dim3 grid(static_cast<uint32_t>((N + BlockN - 1) / BlockN),
+            static_cast<uint32_t>((K + BlockK - 1) / BlockK));
+  QmmFusedGemvKMajorAffineSplitKernel<XType, ScaleT, BiasT, AccumOutT, Bits,
+                                      BlockN, BlockK>
+      <<<grid, block, 0, stream>>>(x, wq, scales, biases, group_sums, out, N,
+                                   K, group_size, bits);
+  return CheckCuda(cudaPeekAtLastError(),
+                   "fused qmm K-major split GEMV kernel launch");
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename AccumOutT,
+          int Bits, int BlockK>
+Error LaunchQmmFusedGemvKMajorAffineSplitKernelBlockK(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, const float *group_sums, AccumOutT *out, int64_t N,
+    int64_t K, int64_t group_size, int bits, int64_t block_n,
+    cudaStream_t stream) {
+  if (block_n <= 64) {
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelConfig<
+        XType, ScaleT, BiasT, AccumOutT, Bits, 64, BlockK>(
+        x, wq, scales, biases, group_sums, out, N, K, group_size, bits,
+        stream);
+  }
+  if (block_n <= 128) {
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelConfig<
+        XType, ScaleT, BiasT, AccumOutT, Bits, 128, BlockK>(
+        x, wq, scales, biases, group_sums, out, N, K, group_size, bits,
+        stream);
+  }
+  if (block_n <= 256) {
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelConfig<
+        XType, ScaleT, BiasT, AccumOutT, Bits, 256, BlockK>(
+        x, wq, scales, biases, group_sums, out, N, K, group_size, bits,
+        stream);
+  }
+  return LaunchQmmFusedGemvKMajorAffineSplitKernelConfig<
+      XType, ScaleT, BiasT, AccumOutT, Bits, 512, BlockK>(
+      x, wq, scales, biases, group_sums, out, N, K, group_size, bits, stream);
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename AccumOutT,
+          int Bits>
+Error LaunchQmmFusedGemvKMajorAffineSplitKernelOut(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, const float *group_sums, AccumOutT *out, int64_t N,
+    int64_t K, int64_t group_size, int bits, int64_t block_n,
+    int64_t block_k, cudaStream_t stream) {
+  int64_t effective_block_n = block_n > 0 ? block_n : 256;
+  if (group_size >= 128 && Bits != 2 && Bits != 8 && block_n <= 0) {
+    effective_block_n = 128;
+  }
+  int64_t effective_block_k = block_k > 0 ? block_k : 128;
+  if (effective_block_k <= 64) {
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelBlockK<
+        XType, ScaleT, BiasT, AccumOutT, Bits, 64>(
+        x, wq, scales, biases, group_sums, out, N, K, group_size, bits,
+        effective_block_n, stream);
+  }
+  if (effective_block_k <= 128) {
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelBlockK<
+        XType, ScaleT, BiasT, AccumOutT, Bits, 128>(
+        x, wq, scales, biases, group_sums, out, N, K, group_size, bits,
+        effective_block_n, stream);
+  }
+  if (effective_block_k <= 256) {
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelBlockK<
+        XType, ScaleT, BiasT, AccumOutT, Bits, 256>(
+        x, wq, scales, biases, group_sums, out, N, K, group_size, bits,
+        effective_block_n, stream);
+  }
+  return LaunchQmmFusedGemvKMajorAffineSplitKernelBlockK<
+      XType, ScaleT, BiasT, AccumOutT, Bits, 512>(
+      x, wq, scales, biases, group_sums, out, N, K, group_size, bits,
+      effective_block_n, stream);
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits>
+Error LaunchQmmFusedGemvKMajorAffineSplitKernelBits(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_groups,
+    int64_t group_size, int bits, cudaStream_t stream,
+    ScratchAllocator &scratch, int64_t block_n, int64_t block_k) {
+  const char *gemv_impl = std::getenv("EJKERNEL_QMM_CUDA_KMAJOR_GEMV");
+  size_t out_bytes = static_cast<size_t>(N) * sizeof(OutT);
+  if (Error err = CheckCuda(cudaMemsetAsync(out, 0, out_bytes, stream),
+                            "K-major GEMV output memset");
+      err.failure()) {
+    return err;
+  }
+  bool fold_bias_sum =
+      gemv_impl != nullptr && std::string(gemv_impl) == "nosum" && Bits != 1;
+  float *group_sums = nullptr;
+  if (!fold_bias_sum) {
+    size_t group_sum_bytes = static_cast<size_t>(n_groups) * sizeof(float);
+    auto group_sums_opt = scratch.Allocate(group_sum_bytes, alignof(float));
+    if (!group_sums_opt.has_value()) {
+      return MakeInternal(
+          "Failed to allocate group-sum scratch buffer for K-major GEMV.");
+    }
+    group_sums = reinterpret_cast<float *>(*group_sums_opt);
+    QmmGemvGroupSumsKernel<XType>
+        <<<static_cast<uint32_t>(n_groups), 256, 0, stream>>>(
+            x, group_sums, K, n_groups, group_size);
+    if (Error err = CheckCuda(cudaPeekAtLastError(),
+                              "K-major GEMV group-sum kernel launch");
+        err.failure()) {
+      return err;
+    }
+  }
+  return LaunchQmmFusedGemvKMajorAffineSplitKernelOut<
+      XType, ScaleT, BiasT, OutT, Bits>(
+      x, wq, scales, biases, group_sums, out, N, K, group_size, bits, block_n,
+      block_k, stream);
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT>
+Error LaunchQmmFusedGemvKMajorAffineSplitKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_groups,
+    int64_t group_size, int bits, cudaStream_t stream,
+    ScratchAllocator &scratch, int64_t block_n, int64_t block_k) {
+  switch (bits) {
+  case 1:
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelBits<
+        XType, ScaleT, BiasT, OutT, 1>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch, block_n, block_k);
+  case 2:
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelBits<
+        XType, ScaleT, BiasT, OutT, 2>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch, block_n, block_k);
+  case 4:
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelBits<
+        XType, ScaleT, BiasT, OutT, 4>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch, block_n, block_k);
+  case 8:
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelBits<
+        XType, ScaleT, BiasT, OutT, 8>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch, block_n, block_k);
+  default:
+    return LaunchQmmFusedGemvKMajorAffineSplitKernelBits<
+        XType, ScaleT, BiasT, OutT, 0>(
+        x, wq, scales, biases, out, N, K, n_groups, group_size, bits, stream,
+        scratch, block_n, block_k);
+  }
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits, int WarpsPerBlock, int OutputsPerWarp, int GroupSize>
+__global__ void QmmFusedGemvAffineColVecKernel(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_words,
+    int64_t n_groups, int64_t group_size, int bits_runtime) {
+  int warp_id = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int64_t n_base =
+      (static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + warp_id) *
+      OutputsPerWarp;
+
+  float grouped_acc[OutputsPerWarp];
+  const uint32_t *wq_rows[OutputsPerWarp];
+  const ScaleT *scale_rows[OutputsPerWarp];
+  const BiasT *bias_rows[OutputsPerWarp];
+  bool valid[OutputsPerWarp];
+#pragma unroll
+  for (int j = 0; j < OutputsPerWarp; ++j) {
+    int64_t n = n_base + j;
+    valid[j] = n < N;
+    grouped_acc[j] = 0.0f;
+    wq_rows[j] = valid[j] ? (wq + n * n_words) : nullptr;
+    scale_rows[j] = valid[j] ? (scales + n * n_groups) : nullptr;
+    bias_rows[j] = valid[j] ? (biases + n * n_groups) : nullptr;
+  }
+
+  for (int64_t g = 0; g < n_groups; ++g) {
+    float scale_vals[OutputsPerWarp];
+    float bias_vals[OutputsPerWarp];
+#pragma unroll
+    for (int j = 0; j < OutputsPerWarp; ++j) {
+      scale_vals[j] = valid[j] ? ToFloatLocal(scale_rows[j][g]) : 0.0f;
+      bias_vals[j] = valid[j] ? ToFloatLocal(bias_rows[j][g]) : 0.0f;
+    }
+    if constexpr (GroupSize == 32 || GroupSize == 64 || GroupSize == 128) {
+      int64_t k_begin = g * GroupSize;
+#pragma unroll
+      for (int kk = 0; kk < GroupSize / 32; ++kk) {
+        int64_t k_idx = k_begin + kk * 32 + lane;
+        if (k_idx >= K) {
+          continue;
+        }
+        float x_val = ToFloatLocal(x[k_idx]);
+#pragma unroll
+        for (int j = 0; j < OutputsPerWarp; ++j) {
+          if (valid[j]) {
+            uint32_t q =
+                LoadPackedQConst<Bits>(wq_rows[j], k_idx, bits_runtime);
+            float w_val =
+                static_cast<float>(q) * scale_vals[j] + bias_vals[j];
+            grouped_acc[j] += x_val * w_val;
+          }
+        }
+      }
+    } else {
+      int64_t k_begin = g * group_size;
+      int64_t k_end =
+          (k_begin + group_size < K) ? (k_begin + group_size) : K;
+      for (int64_t k_idx = k_begin + lane; k_idx < k_end; k_idx += 32) {
+        float x_val = ToFloatLocal(x[k_idx]);
+#pragma unroll
+        for (int j = 0; j < OutputsPerWarp; ++j) {
+          if (valid[j]) {
+            uint32_t q =
+                LoadPackedQConst<Bits>(wq_rows[j], k_idx, bits_runtime);
+            float w_val =
+                static_cast<float>(q) * scale_vals[j] + bias_vals[j];
+            grouped_acc[j] += x_val * w_val;
+          }
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int j = 0; j < OutputsPerWarp; ++j) {
+    grouped_acc[j] = WarpReduceSum(grouped_acc[j]);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int j = 0; j < OutputsPerWarp; ++j) {
+      if (valid[j]) {
+        out[n_base + j] = CastOut<OutT>(grouped_acc[j]);
+      }
+    }
+  }
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits, int OutputsPerWarp, int GroupSize>
+Error LaunchQmmFusedGemvAffineColVecKernelGroup(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_words,
+    int64_t n_groups, int64_t group_size, int bits, cudaStream_t stream) {
+  constexpr int kWarpsPerBlock = 8;
+  dim3 block(kWarpsPerBlock * 32);
+  dim3 grid(static_cast<uint32_t>(
+      (N + kWarpsPerBlock * OutputsPerWarp - 1) /
+      (kWarpsPerBlock * OutputsPerWarp)));
+  QmmFusedGemvAffineColVecKernel<XType, ScaleT, BiasT, OutT, Bits,
+                                 kWarpsPerBlock, OutputsPerWarp, GroupSize>
+      <<<grid, block, 0, stream>>>(x, wq, scales, biases, out, N, K, n_words,
+                                   n_groups, group_size, bits);
+  return CheckCuda(cudaPeekAtLastError(),
+                   "fused qmm affine-col vector gemv kernel launch");
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits, int OutputsPerWarp>
+Error LaunchQmmFusedGemvAffineColVecKernelBits(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_words,
+    int64_t n_groups, int64_t group_size, int bits, cudaStream_t stream) {
+  return LaunchQmmFusedGemvAffineColVecKernelGroup<
+      XType, ScaleT, BiasT, OutT, Bits, OutputsPerWarp, 0>(
+      x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+      stream);
+}
+
+template <typename XType, typename ScaleT, typename BiasT, typename OutT,
+          int Bits>
+Error LaunchQmmFusedGemvWarpKernelBits(
+    const XType *x, const uint32_t *wq, const ScaleT *scales,
+    const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_words,
+    int64_t n_groups, int64_t group_size, int bits, int64_t mode,
+    int64_t transpose, cudaStream_t stream) {
+  if (mode == 0 && transpose != 0) {
+    return LaunchQmmFusedGemvAffineColVecKernelBits<
+        XType, ScaleT, BiasT, OutT, Bits, 4>(
+        x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+        stream);
+  }
+  constexpr int kWarpsPerBlock = 8;
+  constexpr int kWarpsPerOutput = 1;
+  constexpr int kOutputsPerBlock = kWarpsPerBlock / kWarpsPerOutput;
+  dim3 block(kWarpsPerBlock * 32);
+  dim3 grid(static_cast<uint32_t>((N + kOutputsPerBlock - 1) /
+                                  kOutputsPerBlock));
+  QmmFusedGemvWarpKernel<XType, ScaleT, BiasT, OutT, Bits, kWarpsPerBlock,
+                         kWarpsPerOutput>
+      <<<grid, block, 0, stream>>>(x, wq, scales, biases, out, N, K, n_words,
+                                   n_groups, group_size, bits, mode,
+                                   transpose);
+  return CheckCuda(cudaPeekAtLastError(), "fused qmm warp-gemv kernel launch");
+}
+
 template <typename XType, typename ScaleT, typename BiasT, typename OutT>
 Error LaunchQmmFusedGemvKernel(const XType *x, const uint32_t *wq,
                                const ScaleT *scales, const BiasT *biases,
@@ -792,12 +1833,28 @@ Error LaunchQmmFusedGemvKernel(const XType *x, const uint32_t *wq,
                                int64_t n_words, int64_t n_groups,
                                int64_t group_size, int bits, int64_t mode,
                                int64_t transpose, cudaStream_t stream) {
-  dim3 block(256);
-  dim3 grid(static_cast<uint32_t>((N + block.x - 1) / block.x));
-  QmmFusedGemvKernel<XType, ScaleT, BiasT, OutT><<<grid, block, 0, stream>>>(
-      x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
-      mode, transpose);
-  return CheckCuda(cudaPeekAtLastError(), "fused qmm gemv kernel launch");
+  switch (bits) {
+  case 1:
+    return LaunchQmmFusedGemvWarpKernelBits<XType, ScaleT, BiasT, OutT, 1>(
+        x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+        mode, transpose, stream);
+  case 2:
+    return LaunchQmmFusedGemvWarpKernelBits<XType, ScaleT, BiasT, OutT, 2>(
+        x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+        mode, transpose, stream);
+  case 4:
+    return LaunchQmmFusedGemvWarpKernelBits<XType, ScaleT, BiasT, OutT, 4>(
+        x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+        mode, transpose, stream);
+  case 8:
+    return LaunchQmmFusedGemvWarpKernelBits<XType, ScaleT, BiasT, OutT, 8>(
+        x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+        mode, transpose, stream);
+  default:
+    return LaunchQmmFusedGemvWarpKernelBits<XType, ScaleT, BiasT, OutT, 0>(
+        x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+        mode, transpose, stream);
+  }
 }
 
 template <typename XType, typename ScaleT, typename BiasT, typename OutT>
@@ -806,14 +1863,10 @@ Error LaunchQmmFusedGemvRevSplitKernel(
     const BiasT *biases, OutT *out, int64_t N, int64_t K, int64_t n_words,
     int64_t n_groups, int64_t group_size, int bits, int64_t mode,
     int64_t transpose, int64_t revsplit_k_parts, cudaStream_t stream) {
-  dim3 block(256);
-  dim3 grid(static_cast<uint32_t>((N + block.x - 1) / block.x));
-  QmmFusedGemvRevSplitKKernel<XType, ScaleT, BiasT, OutT>
-      <<<grid, block, 0, stream>>>(
-          x, wq, scales, biases, out, N, K, n_words, n_groups, group_size,
-          bits, mode, transpose, revsplit_k_parts);
-  return CheckCuda(cudaPeekAtLastError(),
-                   "fused qmm gemv revsplit-k kernel launch");
+  (void)revsplit_k_parts;
+  return LaunchQmmFusedGemvKernel<XType, ScaleT, BiasT, OutT>(
+      x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
+      mode, transpose, stream);
 }
 
 template <typename XType, typename ScaleT, typename BiasT, typename OutT>
@@ -822,7 +1875,55 @@ Error LaunchQmmFusedByFamily(
     const uint32_t *wq, const ScaleT *scales, const BiasT *biases, OutT *out,
     int64_t M, int64_t N, int64_t K, int64_t n_words, int64_t n_groups,
     int64_t group_size, int bits, int64_t mode, int64_t transpose,
-    cudaStream_t stream) {
+    bool packed_k_major, int64_t block_n, int64_t block_k,
+    cudaStream_t stream, ScratchAllocator &scratch) {
+  if (packed_k_major) {
+    if ((family == QmmKernelFamily::kGemvSplitK ||
+         family == QmmKernelFamily::kGemvRevSplitK) &&
+        mode == 0 && transpose != 0 && M == 1) {
+      const char *gemv_impl = std::getenv("EJKERNEL_QMM_CUDA_KMAJOR_GEMV");
+      bool use_tile =
+          gemv_impl != nullptr && std::string(gemv_impl) == "tile";
+      if (use_tile) {
+        return LaunchQmmFusedGemvKMajorAffineTileKernel<XType, ScaleT, BiasT,
+                                                        OutT>(
+            x, wq, scales, biases, out, N, K, group_size, bits, stream);
+      }
+      bool use_serial =
+          gemv_impl != nullptr && std::string(gemv_impl) == "serial";
+      if (use_serial) {
+        return LaunchQmmFusedGemvKMajorAffineKernel<XType, ScaleT, BiasT, OutT>(
+            x, wq, scales, biases, out, N, K, n_groups, group_size, bits,
+            stream);
+      }
+      bool use_partial =
+          gemv_impl != nullptr && std::string(gemv_impl) == "partial";
+      if (use_partial) {
+        return LaunchQmmFusedGemvKMajorAffinePartialKernel<XType, ScaleT, BiasT,
+                                                           OutT>(
+            x, wq, scales, biases, out, N, K, n_groups, group_size, bits,
+            stream, scratch);
+      }
+      bool use_split =
+          gemv_impl != nullptr &&
+          (std::string(gemv_impl) == "split" ||
+           std::string(gemv_impl) == "nosum");
+      if (!use_split && (group_size == 32 || group_size == 64 ||
+                         group_size == 128)) {
+        return LaunchQmmFusedGemvKMajorAffinePartialKernel<XType, ScaleT, BiasT,
+                                                           OutT>(
+            x, wq, scales, biases, out, N, K, n_groups, group_size, bits,
+            stream, scratch);
+      }
+      return LaunchQmmFusedGemvKMajorAffineSplitKernel<XType, ScaleT, BiasT,
+                                                       OutT>(
+          x, wq, scales, biases, out, N, K, n_groups, group_size, bits,
+          stream, scratch, block_n, block_k);
+    }
+    return MakeInvalid(
+        "CUDA K-major packed layout currently supports affine transpose=True "
+        "GEMV only.");
+  }
   if (family == QmmKernelFamily::kGemvSplitK) {
     return LaunchQmmFusedGemvKernel<XType, ScaleT, BiasT, OutT>(
         x, wq, scales, biases, out, N, K, n_words, n_groups, group_size, bits,
@@ -918,7 +2019,8 @@ Error RunCublasLtGemm(const void *w_deq, cudaDataType_t a_type, const void *x,
                       cudaDataType_t b_type, void *out,
                       xla::ffi::DataType out_dtype, int64_t M, int64_t N,
                       int64_t K, cudaStream_t stream, ScratchAllocator &scratch,
-                      cublasComputeType_t compute_type) {
+                      cublasComputeType_t compute_type,
+                      bool a_is_row_major_nk) {
   cublasLtHandle_t lt_handle;
   if (Error err = g_cublaslt_cache.Get(&lt_handle); err.failure()) {
     return err;
@@ -930,7 +2032,9 @@ Error RunCublasLtGemm(const void *w_deq, cudaDataType_t a_type, const void *x,
   cublasLtMatrixLayout_t layout_c = nullptr;
   cublasLtMatmulPreference_t preference = nullptr;
 
-  cublasOperation_t trans = CUBLAS_OP_N;
+  cublasOperation_t transa =
+      a_is_row_major_nk ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasOperation_t transb = CUBLAS_OP_N;
 
   if (Error err = CheckCublasLt(
           cublasLtMatmulDescCreate(&op_desc, compute_type, CUDA_R_32F),
@@ -940,8 +2044,8 @@ Error RunCublasLtGemm(const void *w_deq, cudaDataType_t a_type, const void *x,
   }
   if (Error err = CheckCublasLt(
           cublasLtMatmulDescSetAttribute(op_desc,
-                                         CUBLASLT_MATMUL_DESC_TRANSA, &trans,
-                                         sizeof(trans)),
+                                         CUBLASLT_MATMUL_DESC_TRANSA, &transa,
+                                         sizeof(transa)),
           "cublasLtMatmulDescSetAttribute(TRANSA)");
       err.failure()) {
     cublasLtMatmulDescDestroy(op_desc);
@@ -949,8 +2053,8 @@ Error RunCublasLtGemm(const void *w_deq, cudaDataType_t a_type, const void *x,
   }
   if (Error err = CheckCublasLt(
           cublasLtMatmulDescSetAttribute(op_desc,
-                                         CUBLASLT_MATMUL_DESC_TRANSB, &trans,
-                                         sizeof(trans)),
+                                         CUBLASLT_MATMUL_DESC_TRANSB, &transb,
+                                         sizeof(transb)),
           "cublasLtMatmulDescSetAttribute(TRANSB)");
       err.failure()) {
     cublasLtMatmulDescDestroy(op_desc);
@@ -958,9 +2062,12 @@ Error RunCublasLtGemm(const void *w_deq, cudaDataType_t a_type, const void *x,
   }
   if (Error err = CheckCublasLt(
           cublasLtMatrixLayoutCreate(&layout_a, a_type,
-                                     static_cast<int64_t>(N),
-                                     static_cast<int64_t>(K),
-                                     static_cast<int64_t>(N)),
+                                     a_is_row_major_nk ? static_cast<int64_t>(K)
+                                                       : static_cast<int64_t>(N),
+                                     a_is_row_major_nk ? static_cast<int64_t>(N)
+                                                       : static_cast<int64_t>(K),
+                                     a_is_row_major_nk ? static_cast<int64_t>(K)
+                                                       : static_cast<int64_t>(N)),
           "cublasLtMatrixLayoutCreate(A)");
       err.failure()) {
     cublasLtMatmulDescDestroy(op_desc);
@@ -1243,6 +2350,7 @@ struct DequantCache {
   int bits = 0;
   int mode = -1;
   int64_t transpose = 0;
+  bool packed_k_major = false;
   int device = -1;
   size_t bytes = 0;
   half *buffer = nullptr;
@@ -1273,6 +2381,7 @@ struct DequantCache {
     bits = 0;
     mode = -1;
     transpose = 0;
+    packed_k_major = false;
     device = -1;
     bf16_valid = false;
   }
@@ -1304,13 +2413,11 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                           Result<AnyBuffer> out, int64_t group_size,
                           int64_t bits, int64_t mode, int64_t transpose,
                           int64_t gemv_mode, int64_t revsplit_k,
-                          int64_t revsplit_k_parts, cudaStream_t stream,
+                          int64_t revsplit_k_parts, int64_t block_n,
+                          int64_t block_k, cudaStream_t stream,
                           ScratchAllocator scratch) {
-  if (bits != kBits4 && bits != kBits8) {
-    return MakeInvalid("CUDA quantized_matmul supports bits in {4, 8}.");
-  }
-  if (mode == 0 && !(bits == kBits4 || bits == kBits8)) {
-    return MakeInvalid("affine mode supports bits in {4,8} on CUDA.");
+  if (bits < 1 || bits > 8) {
+    return MakeInvalid("CUDA quantized_matmul supports bits in [1,8].");
   }
   if (mode == 1 && bits != kBits4) {
     return MakeInvalid("nf4 mode requires bits=4 on CUDA.");
@@ -1344,6 +2451,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
   int64_t N_words = w_dims[1];
   bool use_bf16_gemm = x.element_type() == xla::ffi::DataType::BF16;
   bool transposed = transpose != 0;
+  bool packed_k_major = false;
 
   QmmKernelFamily kernel_family = QmmKernelFamily::kGemm;
   int64_t revsplit_parts_effective = 0;
@@ -1361,21 +2469,28 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
   int64_t n_groups = 0;
   int64_t N = 0;
   if (transposed) {
-    // Weights stored in NxK (packed), scales/biases stored in (N, K/group_size).
-    N = K_w;
-    if (s_dims[0] != N) {
-      return MakeInvalid("scales shape must be (N, K/group_size) for transpose=True.");
-    }
-    if (group_size <= 0 || (K % group_size) != 0) {
+    if ((K % group_size) != 0) {
       return MakeInvalid("K must be divisible by group_size for transpose=True.");
     }
-    n_groups = s_dims[1];
-    if (n_groups != (K / group_size)) {
-      return MakeInvalid("scales second dimension must be K/group_size for transpose=True.");
-    }
+    n_groups = K / group_size;
     int64_t expected_words = (static_cast<int64_t>(K) * bits + 31) / 32;
-    if (N_words != expected_words) {
-      return MakeInvalid("packed weight shape does not match K and bits for transpose=True.");
+    if (s_dims[1] == n_groups && w_dims[1] == expected_words &&
+        w_dims[0] == s_dims[0]) {
+      // Canonical ejkernel layout: Wq is (N, K/pack), metadata is (N, groups).
+      N = w_dims[0];
+      N_words = w_dims[1];
+    } else if (s_dims[0] == n_groups && w_dims[0] == expected_words &&
+               w_dims[1] == s_dims[1]) {
+      // GemLite-compatible K-major layout: Wq is (K/pack, N), metadata is
+      // (groups, N). This is accepted for native decode kernels.
+      packed_k_major = true;
+      N = w_dims[1];
+      N_words = expected_words;
+    } else {
+      return MakeInvalid(
+          "packed weight/scales shape does not match transpose=True layout. "
+          "Expected either Wq=(N,ceil(K*bits/32)), scales=(N,K/group_size) "
+          "or Wq=(ceil(K*bits/32),N), scales=(K/group_size,N).");
     }
   } else {
     // Weights stored in KxN (packed), scales/biases stored in (K, N/group_size).
@@ -1426,8 +2541,15 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
       return MakeInvalid("affine mode requires biases.");
     }
     Span<const int64_t> b_dims = biases->dimensions();
-    if (b_dims.size() != 2 || b_dims[0] != s_dims[0] ||
-        b_dims[1] != n_groups) {
+    bool biases_match = false;
+    if (packed_k_major) {
+      biases_match = b_dims.size() == 2 && b_dims[0] == n_groups &&
+                     b_dims[1] == N;
+    } else {
+      biases_match = b_dims.size() == 2 && b_dims[0] == s_dims[0] &&
+                     b_dims[1] == n_groups;
+    }
+    if (!biases_match) {
       return MakeInvalid("biases shape must match scales shape.");
     }
   } else if (mode == 1) {
@@ -1448,12 +2570,23 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
 
   bool is_gemv_family = kernel_family == QmmKernelFamily::kGemvSplitK ||
                         kernel_family == QmmKernelFamily::kGemvRevSplitK;
+  const char *kmajor_gemv_impl = std::getenv("EJKERNEL_QMM_CUDA_KMAJOR_GEMV");
+  bool use_kmajor_dense_gemv =
+      packed_k_major && M == 1 && mode == 0 && kmajor_gemv_impl != nullptr &&
+      std::string(kmajor_gemv_impl) == "dense";
   bool use_fused_path = false;
   if (is_gemv_family) {
-    // Default to cuBLAS/dequant for M==1; enable fused GEMV only for experiments.
-    use_fused_path = UseExperimentalGemvQmm();
+    use_fused_path =
+        mode == 0 && bits >= 1 && bits <= 8 ? true : UseExperimentalGemvQmm();
   } else {
     use_fused_path = UseFusedQmm();
+  }
+  if (use_kmajor_dense_gemv) {
+    use_fused_path = false;
+  }
+  if (packed_k_major && mode != 0) {
+    return MakeInvalid(
+        "CUDA K-major packed layout currently supports affine mode only.");
   }
 
   if (use_fused_path) {
@@ -1476,21 +2609,24 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                 kernel_family, revsplit_parts_effective,
                 static_cast<const half *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
-                mode, transpose, stream);
+                mode, transpose, packed_k_major, block_n, block_k, stream,
+                scratch);
           }
           if (x_dtype == xla::ffi::DataType::F32) {
             return LaunchQmmFusedByFamily<float, float, float, OutT>(
                 kernel_family, revsplit_parts_effective,
                 static_cast<const float *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
-                mode, transpose, stream);
+                mode, transpose, packed_k_major, block_n, block_k, stream,
+                scratch);
           }
           if (x_dtype == xla::ffi::DataType::BF16) {
             return LaunchQmmFusedByFamily<__nv_bfloat16, float, float, OutT>(
                 kernel_family, revsplit_parts_effective,
                 static_cast<const __nv_bfloat16 *>(x.untyped_data()), wq_ptr,
                 scales_ptr, bias_ptr, out_ptr, M, N, K, N_words, n_groups,
-                group_size, bits, mode, transpose, stream);
+                group_size, bits, mode, transpose, packed_k_major, block_n,
+                block_k, stream, scratch);
           }
           return MakeInvalid("x dtype must be float16/float32/bfloat16.");
         }
@@ -1506,21 +2642,24 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                 kernel_family, revsplit_parts_effective,
                 static_cast<const half *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
-                mode, transpose, stream);
+                mode, transpose, packed_k_major, block_n, block_k, stream,
+                scratch);
           }
           if (x_dtype == xla::ffi::DataType::F32) {
             return LaunchQmmFusedByFamily<float, half, half, OutT>(
                 kernel_family, revsplit_parts_effective,
                 static_cast<const float *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
-                mode, transpose, stream);
+                mode, transpose, packed_k_major, block_n, block_k, stream,
+                scratch);
           }
           if (x_dtype == xla::ffi::DataType::BF16) {
             return LaunchQmmFusedByFamily<__nv_bfloat16, half, half, OutT>(
                 kernel_family, revsplit_parts_effective,
                 static_cast<const __nv_bfloat16 *>(x.untyped_data()), wq_ptr,
                 scales_ptr, bias_ptr, out_ptr, M, N, K, N_words, n_groups,
-                group_size, bits, mode, transpose, stream);
+                group_size, bits, mode, transpose, packed_k_major, block_n,
+                block_k, stream, scratch);
           }
           return MakeInvalid("x dtype must be float16/float32/bfloat16.");
         }
@@ -1538,7 +2677,8 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                 kernel_family, revsplit_parts_effective,
                 static_cast<const half *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
-                mode, transpose, stream);
+                mode, transpose, packed_k_major, block_n, block_k, stream,
+                scratch);
           }
           if (x_dtype == xla::ffi::DataType::F32) {
             return LaunchQmmFusedByFamily<float, __nv_bfloat16, __nv_bfloat16,
@@ -1546,7 +2686,8 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                 kernel_family, revsplit_parts_effective,
                 static_cast<const float *>(x.untyped_data()), wq_ptr, scales_ptr,
                 bias_ptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
-                mode, transpose, stream);
+                mode, transpose, packed_k_major, block_n, block_k, stream,
+                scratch);
           }
           if (x_dtype == xla::ffi::DataType::BF16) {
             return LaunchQmmFusedByFamily<__nv_bfloat16, __nv_bfloat16,
@@ -1554,7 +2695,8 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                 kernel_family, revsplit_parts_effective,
                 static_cast<const __nv_bfloat16 *>(x.untyped_data()), wq_ptr,
                 scales_ptr, bias_ptr, out_ptr, M, N, K, N_words, n_groups,
-                group_size, bits, mode, transpose, stream);
+                group_size, bits, mode, transpose, packed_k_major, block_n,
+                block_k, stream, scratch);
           }
           return MakeInvalid("x dtype must be float16/float32/bfloat16.");
         }
@@ -1570,21 +2712,24 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
               kernel_family, revsplit_parts_effective,
               static_cast<const half *>(x.untyped_data()), wq_ptr, scales_ptr,
               nullptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
-              mode, transpose, stream);
+              mode, transpose, packed_k_major, block_n, block_k, stream,
+              scratch);
         }
         if (x_dtype == xla::ffi::DataType::F32) {
           return LaunchQmmFusedByFamily<float, uint8_t, uint8_t, OutT>(
               kernel_family, revsplit_parts_effective,
               static_cast<const float *>(x.untyped_data()), wq_ptr, scales_ptr,
               nullptr, out_ptr, M, N, K, N_words, n_groups, group_size, bits,
-              mode, transpose, stream);
+              mode, transpose, packed_k_major, block_n, block_k, stream,
+              scratch);
         }
         if (x_dtype == xla::ffi::DataType::BF16) {
           return LaunchQmmFusedByFamily<__nv_bfloat16, uint8_t, uint8_t, OutT>(
               kernel_family, revsplit_parts_effective,
               static_cast<const __nv_bfloat16 *>(x.untyped_data()), wq_ptr,
               scales_ptr, nullptr, out_ptr, M, N, K, N_words, n_groups,
-              group_size, bits, mode, transpose, stream);
+              group_size, bits, mode, transpose, packed_k_major, block_n,
+              block_k, stream, scratch);
         }
         return MakeInvalid("x dtype must be float16/float32/bfloat16.");
       }
@@ -1629,7 +2774,8 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
                  g_dequant_cache.n_groups == n_groups &&
                  g_dequant_cache.group_size == group_size &&
                  g_dequant_cache.bits == bits && g_dequant_cache.mode == mode &&
-                 g_dequant_cache.transpose == transpose;
+                 g_dequant_cache.transpose == transpose &&
+                 g_dequant_cache.packed_k_major == packed_k_major;
     if (match) {
       if (!use_bf16_gemm) {
         w_deq = g_dequant_cache.buffer;
@@ -1668,6 +2814,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
       g_dequant_cache.bits = bits;
       g_dequant_cache.mode = mode;
       g_dequant_cache.transpose = transpose;
+      g_dequant_cache.packed_k_major = packed_k_major;
       g_dequant_cache.device = current_device;
       g_dequant_cache.bf16_valid = false;
       if (!use_bf16_gemm) {
@@ -1703,9 +2850,16 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
       auto launch_dequant_half = [&](auto *scales_ptr, auto *biases_ptr) {
         using ScaleT = std::remove_pointer_t<decltype(scales_ptr)>;
         using BiasT = std::remove_pointer_t<decltype(biases_ptr)>;
-        DequantToHalfKernel<ScaleT, BiasT><<<grid, block, 0, stream>>>(
-            wq_ptr, scales_ptr, biases_ptr, w_deq, K, N, N_words, n_groups,
-            group_size, bits, mode, transpose);
+        if (packed_k_major) {
+          DequantKMajorAffineKernel<ScaleT, BiasT, half>
+              <<<grid, block, 0, stream>>>(wq_ptr, scales_ptr, biases_ptr,
+                                           w_deq, K, N, n_groups, group_size,
+                                           bits);
+        } else {
+          DequantToHalfKernel<ScaleT, BiasT><<<grid, block, 0, stream>>>(
+              wq_ptr, scales_ptr, biases_ptr, w_deq, K, N, N_words, n_groups,
+              group_size, bits, mode, transpose);
+        }
       };
 
       if (mode == 0) {
@@ -1797,7 +2951,11 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
               N, N_words, group_size, n_groups, grid, block, stream);
           break;
         default:
-          return MakeInvalid("affine mode supports bits in {4,8} on CUDA.");
+          DequantToHalfKernel<float, float><<<grid, block, 0, stream>>>(
+              wq_ptr, static_cast<const float *>(scales.untyped_data()),
+              static_cast<const float *>(biases_buf.untyped_data()), w_deq, K,
+              N, N_words, n_groups, group_size, bits, mode, transpose);
+          break;
         }
       } else if (scales_dtype == xla::ffi::DataType::F16) {
         switch (bits) {
@@ -1814,7 +2972,11 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
               N, N_words, group_size, n_groups, grid, block, stream);
           break;
         default:
-          return MakeInvalid("affine mode supports bits in {4,8} on CUDA.");
+          DequantToHalfKernel<half, half><<<grid, block, 0, stream>>>(
+              wq_ptr, static_cast<const half *>(scales.untyped_data()),
+              static_cast<const half *>(biases_buf.untyped_data()), w_deq, K,
+              N, N_words, n_groups, group_size, bits, mode, transpose);
+          break;
         }
       } else if (scales_dtype == xla::ffi::DataType::BF16) {
         switch (bits) {
@@ -1833,7 +2995,15 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
               w_deq, K, N, N_words, group_size, n_groups, grid, block, stream);
           break;
         default:
-          return MakeInvalid("affine mode supports bits in {4,8} on CUDA.");
+          DequantToHalfKernel<__nv_bfloat16, __nv_bfloat16>
+              <<<grid, block, 0, stream>>>(
+                  wq_ptr,
+                  static_cast<const __nv_bfloat16 *>(scales.untyped_data()),
+                  static_cast<const __nv_bfloat16 *>(
+                      biases_buf.untyped_data()),
+                  w_deq, K, N, N_words, n_groups, group_size, bits, mode,
+                  transpose);
+          break;
         }
       } else {
         return MakeInvalid(
@@ -1994,9 +3164,16 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     auto launch_dequant_bf16 = [&](auto *scales_ptr, auto *biases_ptr) -> Error {
       using ScaleT = std::remove_pointer_t<decltype(scales_ptr)>;
       using BiasT = std::remove_pointer_t<decltype(biases_ptr)>;
-      DequantToBf16Kernel<ScaleT, BiasT><<<grid, block, 0, stream>>>(
-          wq_ptr, scales_ptr, biases_ptr, w_deq_bf16, K, N, N_words, n_groups,
-          group_size, bits, mode, transpose);
+      if (packed_k_major) {
+        DequantKMajorAffineKernel<ScaleT, BiasT, __nv_bfloat16>
+            <<<grid, block, 0, stream>>>(wq_ptr, scales_ptr, biases_ptr,
+                                         w_deq_bf16, K, N, n_groups,
+                                         group_size, bits);
+      } else {
+        DequantToBf16Kernel<ScaleT, BiasT><<<grid, block, 0, stream>>>(
+            wq_ptr, scales_ptr, biases_ptr, w_deq_bf16, K, N, N_words,
+            n_groups, group_size, bits, mode, transpose);
+      }
       return CheckCuda(cudaPeekAtLastError(), "bf16 dequant kernel launch");
     };
 
@@ -2203,11 +3380,11 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     // Try cublasLt then CUTLASS for non-cublas fallback paths.
     Error err = RunCublasLtGemm(gemm_a_ptr, gemm_a_type, gemm_b_ptr, gemm_b_type,
                                 gemm_out_ptr, gemm_out_dtype, M, N, K, stream,
-                                scratch, compute_type);
+                                scratch, compute_type, transposed);
     if (!err.failure()) {
       return finalize_bf16();
     }
-    if (!use_bf16_gemm && !x_is_f32) {
+    if (!use_bf16_gemm && !x_is_f32 && !transposed) {
       Error cutlass_err = dispatch_cutlass([&](auto *out_ptr) {
         return RunCutlassGemm(w_deq, x_half, out_ptr, M, N, K, stream, scratch);
       });
@@ -2221,14 +3398,14 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
   if (backend == GemmBackend::kCublasLt) {
     Error err = RunCublasLtGemm(gemm_a_ptr, gemm_a_type, gemm_b_ptr, gemm_b_type,
                                 gemm_out_ptr, gemm_out_dtype, M, N, K, stream,
-                                scratch, compute_type);
+                                scratch, compute_type, transposed);
     if (!err.failure()) {
       return finalize_bf16();
     }
     if (StrictGemmBackend()) {
       return err;
     }
-  } else if (backend == GemmBackend::kCutlass && !x_is_f32) {
+  } else if (backend == GemmBackend::kCutlass && !x_is_f32 && !transposed) {
     Error err = dispatch_cutlass([&](auto *out_ptr) {
       return RunCutlassGemm(w_deq, x_half, out_ptr, M, N, K, stream, scratch);
     });
@@ -2238,7 +3415,7 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
     if (StrictGemmBackend()) {
       return err;
     }
-  } else if (backend == GemmBackend::kCutlassTuned && !x_is_f32) {
+  } else if (backend == GemmBackend::kCutlassTuned && !x_is_f32 && !transposed) {
     Error err = dispatch_cutlass([&](auto *out_ptr) {
       return RunCutlassGemmTuned(w_deq, x_half, out_ptr, M, N, K, stream,
                                  scratch);
@@ -2287,11 +3464,14 @@ Error QuantizedMatmulCuda(AnyBuffer x, AnyBuffer wq, AnyBuffer scales,
 
   void *out_ptr = gemm_out_ptr;
   cudaDataType_t out_type = ToCudaDataType(gemm_out_dtype);
+  cublasOperation_t gemm_transa =
+      transposed ? CUBLAS_OP_T : CUBLAS_OP_N;
+  int gemm_lda = static_cast<int>(transposed ? K : N);
 
   cublasStatus_t gemm_status =
-      cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(N),
+      cublasGemmEx(handle, gemm_transa, CUBLAS_OP_N, static_cast<int>(N),
                    static_cast<int>(M), static_cast<int>(K), alpha_ptr,
-                   gemm_a_ptr, gemm_a_type, static_cast<int>(N), gemm_b_ptr,
+                   gemm_a_ptr, gemm_a_type, gemm_lda, gemm_b_ptr,
                    gemm_b_type, static_cast<int>(K), beta_ptr, out_ptr,
                    out_type,
                    static_cast<int>(N), compute_type, algo);
@@ -2330,6 +3510,8 @@ extern "C" XLA_FFI_Error *ejk_qmm_cuda(XLA_FFI_CallFrame *call_frame) {
                             .Attr<int64_t>("gemv_mode")
                             .Attr<int64_t>("revsplit_k")
                             .Attr<int64_t>("revsplit_k_parts")
+                            .Attr<int64_t>("block_n")
+                            .Attr<int64_t>("block_k")
                             .Ctx<PlatformStream<cudaStream_t>>()
                             .Ctx<ScratchAllocator>()
                             .To(QuantizedMatmulCuda);

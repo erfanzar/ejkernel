@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,9 +39,10 @@ class QuantRuntimeConfig:
     autotuning can select the fastest path for a particular backend and shape.
 
     Attributes:
-        enable_u4_u8_fastpath: When ``True``, uses the dedicated grouped
-            pack/unpack kernels for bit-widths in ``{1, 2, 4, 8}`` instead
-            of the generic scatter/gather path.  Default: ``True``.
+        enable_u4_u8_fastpath: When ``True``, uses dedicated grouped
+            pack/unpack kernels for bit-widths in ``{1, 2, 4, 8}`` and the
+            generic cross-word path for affine bit-widths ``3, 5, 6, 7``.
+            Default: ``True``.
 
         enable_threshold_codebook: When ``True``, uses binary-search
             (threshold/midpoint) codebook quantization instead of the

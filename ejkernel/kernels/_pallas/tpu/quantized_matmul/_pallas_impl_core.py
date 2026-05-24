@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ provides bit-unpacking, dequantization, block normalization, legality checks,
 predecoded weight caching, and a generic dense Pallas matmul.
 
 Key Components:
-    - Bit packing/unpacking: ``_unpack_bits_4_8`` extracts 4-bit or 8-bit
-      quantized values from packed 32-bit words
+    - Bit packing/unpacking: ``_unpack_packed_bits`` extracts 1-bit through
+      8-bit affine values from packed 32-bit words
     - Dequantization: ``_dequantize_tile`` supports affine, NF4, MXFP4,
       MXFP8, NVFP4, and NVFP8 quantization modes
     - Predecode caching: ``get_predecoded_dense_weight`` materializes and
@@ -89,6 +89,16 @@ def _lcm(a: int, b: int) -> int:
     if b <= 0:
         return max(1, int(a))
     return abs(a * b) // math.gcd(a, b)
+
+
+def _bit_aligned_values(bits: int) -> int:
+    """Return the value count that starts and ends on a 32-bit word boundary."""
+    return 32 // math.gcd(32, int(bits))
+
+
+def _packed_words_for_values(values: int, bits: int) -> int:
+    """Return the number of uint32 words needed for a packed bitstream."""
+    return _ceil_div(int(values) * int(bits), 32)
 
 
 def _pad_2d(x: jax.Array, pad0: int, pad1: int) -> jax.Array:
@@ -188,10 +198,10 @@ def is_packed_tpu_legal_forward(
 
     Args:
         x: Activation tensor [M, K].
-        w_q: Packed quantized weight tensor [K, N // values_per_word].
+        w_q: Packed quantized weight tensor [K, ceil(N * bits / 32)].
         scales: Per-group scale tensor [K, N // group_size].
         group_size: Number of output elements per quantization group.
-        bits: Quantization bit width (must be 4 or 8).
+        bits: Quantization bit width, from 1 through 8.
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -199,15 +209,15 @@ def is_packed_tpu_legal_forward(
     Returns:
         True if all constraints are satisfied for the packed TPU path.
     """
-    if bits not in (4, 8):
+    if bits < 1 or bits > 8:
         return False
     try:
         block_m, block_n, block_k = _normalize_tpu_blocks(block_m, block_n, block_k)
     except ValueError:
         return False
 
-    values_per_word = 32 // bits
-    if block_n % values_per_word != 0 or block_n % group_size != 0:
+    value_alignment = _bit_aligned_values(bits)
+    if block_n % value_alignment != 0 or block_n % group_size != 0:
         return False
 
     m, k = x.shape
@@ -221,12 +231,12 @@ def is_packed_tpu_legal_forward(
     n_pad = _ceil_div(n, block_n) * block_n
     k_pad = _ceil_div(k, block_k) * block_k
 
-    words_pad = n_pad // values_per_word
+    words_pad = _packed_words_for_values(n_pad, bits)
     groups_pad = n_pad // group_size
     if w_q.shape[1] > words_pad or scales.shape[1] > groups_pad:
         return False
 
-    block_words = block_n // values_per_word
+    block_words = _packed_words_for_values(block_n, bits)
     block_groups = block_n // group_size
     return (
         _is_2d_blockspec_legal(block_m, block_k, m_pad, k_pad)
@@ -255,10 +265,10 @@ def is_packed_tpu_legal_input_grad(
 
     Args:
         dy: Upstream gradient tensor [M, N].
-        w_q: Packed quantized weight tensor [K, N // values_per_word].
+        w_q: Packed quantized weight tensor [K, ceil(N * bits / 32)].
         scales: Per-group scale tensor [K, N // group_size].
         group_size: Number of output elements per quantization group.
-        bits: Quantization bit width (must be 4 or 8).
+        bits: Quantization bit width, from 1 through 8.
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -266,15 +276,15 @@ def is_packed_tpu_legal_input_grad(
     Returns:
         True if all constraints are satisfied for the packed TPU dX path.
     """
-    if bits not in (4, 8):
+    if bits < 1 or bits > 8:
         return False
     try:
         block_m, block_n, block_k = _normalize_tpu_blocks(block_m, block_n, block_k)
     except ValueError:
         return False
 
-    values_per_word = 32 // bits
-    if block_n % values_per_word != 0 or block_n % group_size != 0:
+    value_alignment = _bit_aligned_values(bits)
+    if block_n % value_alignment != 0 or block_n % group_size != 0:
         return False
 
     m, n = dy.shape
@@ -289,12 +299,12 @@ def is_packed_tpu_legal_input_grad(
     n_pad = _ceil_div(n, block_n) * block_n
     k_pad = _ceil_div(k, block_k) * block_k
 
-    words_pad = n_pad // values_per_word
+    words_pad = _packed_words_for_values(n_pad, bits)
     groups_pad = n_pad // group_size
     if w_q.shape[1] > words_pad or scales.shape[1] > groups_pad:
         return False
 
-    block_words = block_n // values_per_word
+    block_words = _packed_words_for_values(block_n, bits)
     block_groups = block_n // group_size
     return (
         _is_2d_blockspec_legal(block_m, block_n, m_pad, n_pad)
@@ -422,11 +432,11 @@ def choose_packed_n_subtile(
     *,
     block_n: int,
     group_size: int,
-    values_per_word: int,
+    value_alignment: int,
     max_subtile: int = 256,
 ) -> int:
     """Pick an N-subtile width for packed kernels to reduce unpack/dequant pressure."""
-    align = _lcm(group_size, values_per_word)
+    align = _lcm(group_size, value_alignment)
     target = min(block_n, max_subtile)
     target = max(align, (target // align) * align)
     n_subtile = target
@@ -554,24 +564,26 @@ def _decode_nf4(code: jax.Array) -> jax.Array:
     return vals
 
 
-def _unpack_bits_4_8(words: jax.Array, bits: int) -> jax.Array:
-    """Unpack 4-bit or 8-bit quantized values from packed 32-bit words.
+def _unpack_packed_bits(words: jax.Array, bits: int) -> jax.Array:
+    """Unpack 1-bit through 8-bit quantized values from packed 32-bit words.
 
-    Each 32-bit word contains ``32 // bits`` quantized values stored in
-    little-endian order. The function extracts each value using bit shifts
-    and masks, then reshapes the result to [K, N] where N is the number of
-    unpacked values.
+    The packed representation is a contiguous little-endian bitstream. The
+    output width is inferred from the number of whole values that fit in the
+    provided words, so callers should pass word-aligned tiles whose value count
+    is a multiple of ``32 / gcd(32, bits)``.
 
     Args:
         words: Packed weight array [K, N_packed] of uint32 words.
-        bits: Quantization bit width (4 or 8).
+        bits: Quantization bit width, from 1 through 8.
 
     Returns:
-        Unpacked uint32 code array [K, N_packed * (32 // bits)].
+        Unpacked uint32 code array [K, floor(N_packed * 32 / bits)].
 
     Raises:
-        ValueError: If bits is not 4 or 8.
+        ValueError: If bits is outside 1..8.
     """
+    if bits < 1 or bits > 8:
+        raise ValueError("Packed bit unpack supports bits in [1, 8].")
     words = words.astype(jnp.uint32)
     if bits == 4:
         q = jnp.stack(
@@ -599,7 +611,26 @@ def _unpack_bits_4_8(words: jax.Array, bits: int) -> jax.Array:
             axis=-1,
         )
         return q.reshape(words.shape[0], words.shape[1] * 4)
-    raise ValueError("Only bits in {4, 8} are supported by _unpack_bits_4_8.")
+    out_width = words.shape[1] * 32 // bits
+    value_idx = jnp.arange(out_width, dtype=jnp.uint32)
+    bit_offsets = value_idx * jnp.uint32(bits)
+    word_idx = bit_offsets // jnp.uint32(32)
+    shifts = bit_offsets - word_idx * jnp.uint32(32)
+    word0 = words[:, word_idx.astype(jnp.int32)]
+    word1_idx = jnp.minimum(word_idx + jnp.uint32(1), jnp.uint32(max(0, words.shape[1] - 1)))
+    word1 = words[:, word1_idx.astype(jnp.int32)]
+    low_bits = jnp.minimum(jnp.uint32(32) - shifts, jnp.uint32(bits))
+    high_bits = jnp.uint32(bits) - low_bits
+    low_mask = (jnp.left_shift(jnp.uint32(1), low_bits) - jnp.uint32(1)).astype(jnp.uint32)
+    high_mask = (jnp.left_shift(jnp.uint32(1), high_bits) - jnp.uint32(1)).astype(jnp.uint32)
+    low = jnp.right_shift(word0, shifts) & low_mask
+    high = word1 & high_mask
+    return low | jnp.left_shift(high, low_bits)
+
+
+def _unpack_bits_4_8(words: jax.Array, bits: int) -> jax.Array:
+    """Backward-compatible alias for packed 1-bit through 8-bit unpacking."""
+    return _unpack_packed_bits(words, bits)
 
 
 def _expand_groups(values: jax.Array, group_size: int, width: int) -> jax.Array:
@@ -707,19 +738,19 @@ def _predecode_dense_weight(
         scales: Per-group scales [K, N // group_size].
         biases: Optional per-group biases [K, N // group_size].
         group_size: Elements per quantization group.
-        bits: Bit width (4 or 8).
+        bits: Bit width, from 1 through 8.
         mode: Quantization mode (e.g. "affine", "nf4").
 
     Returns:
         Dense bfloat16 weight [K, N].
 
     Raises:
-        ValueError: If bits is not 4 or 8 or packed width is too small.
+        ValueError: If bits is outside 1..8 or packed width is too small.
     """
-    if bits not in (4, 8):
-        raise ValueError("TPU predecode path supports bits in {4, 8}.")
+    if bits < 1 or bits > 8:
+        raise ValueError("TPU predecode path supports bits in [1, 8].")
     n = scales.shape[-1] * group_size
-    q_full = _unpack_bits_4_8(w_q, bits)
+    q_full = _unpack_packed_bits(w_q, bits)
     if q_full.shape[-1] < n:
         raise ValueError("Packed weight width is smaller than scales-implied output width.")
     q = q_full[:, :n]
@@ -795,7 +826,7 @@ def get_predecoded_dense_weight(
         scales: Per-group scales [K, N // group_size].
         biases: Optional per-group biases (affine mode only).
         group_size: Elements per quantization group.
-        bits: Quantization bit width (4 or 8).
+        bits: Quantization bit width, from 1 through 8.
         mode: Quantization mode string.
 
     Returns:

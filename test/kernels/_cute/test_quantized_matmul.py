@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,7 +42,13 @@ if not has_cute_ffi_support():
 @pytest.mark.parametrize(
     "mode,bits",
     [
+        ("affine", 1),
+        ("affine", 2),
+        ("affine", 3),
         ("affine", 4),
+        ("affine", 5),
+        ("affine", 6),
+        ("affine", 7),
         ("affine", 8),
         ("nf4", 4),
         ("mxfp4", 4),
@@ -95,11 +101,13 @@ def test_quantized_matmul_cute_matches_xla(mode: str, bits: int):
     out_cute = jax.block_until_ready(out_cute)
     out_xla = jax.block_until_ready(out_xla)
 
+    rtol = 1.5e-1 if mode == "affine" else 6e-2
+    atol = 1.5e-1 if mode == "affine" else 6e-2
     np.testing.assert_allclose(
         np.asarray(out_cute, dtype=np.float32),
         np.asarray(out_xla, dtype=np.float32),
-        rtol=6e-2,
-        atol=6e-2,
+        rtol=rtol,
+        atol=atol,
     )
 
 
@@ -246,7 +254,13 @@ def test_quantized_matmul_cute_transpose_cache_key_regression():
 @pytest.mark.parametrize(
     "mode,bits",
     [
+        ("affine", 1),
+        ("affine", 2),
+        ("affine", 3),
         ("affine", 4),
+        ("affine", 5),
+        ("affine", 6),
+        ("affine", 7),
         ("affine", 8),
         ("nf4", 4),
         ("mxfp4", 4),

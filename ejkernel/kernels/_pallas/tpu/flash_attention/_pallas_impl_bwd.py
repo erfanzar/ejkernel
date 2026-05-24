@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -863,7 +863,7 @@ def _flash_attention_bwd(
     """
     if save_residuals:
         raise NotImplementedError("Higher-order AD not supported")
-    (q, k, v, ab, segment_ids, o, l, m) = residuals
+    q, k, v, ab, segment_ids, o, l, m = residuals
     if not block_sizes.has_backward_blocks:
         raise ValueError("Program is being differentiated, but not all backward blocks are specified")
 

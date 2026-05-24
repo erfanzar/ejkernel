@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,10 +42,17 @@ def test_every_benchmark_spec_has_script_entrypoint():
 
 
 def test_no_duplicate_benchmark_entrypoints():
-    """Only the canonical suite and one script per benchmark spec are kept."""
+    """Only canonical benchmark entry points and intentional standalone tools are kept."""
 
     root = Path(__file__).resolve().parents[1]
     allowed = {f"benchmark_{name}.py" for name in SPECS}
-    allowed.update({"_op_benchmark_registry.py", "benchmark_suite.py"})
+    allowed.update(
+        {
+            "_op_benchmark_registry.py",
+            "benchmark_quantized_matmul_native_vs_gemlite.py",
+            "benchmark_suite.py",
+            "plot_qmm_native_vs_gemlite.py",
+        }
+    )
     actual = {path.name for path in (root / "benchmarks").glob("*.py")}
     assert sorted(actual - allowed) == []

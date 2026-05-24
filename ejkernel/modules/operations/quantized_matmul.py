@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -55,6 +55,7 @@ References:
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import warnings
@@ -152,6 +153,11 @@ def _lcm(a: int, b: int) -> int:
     return abs(a * b) // math.gcd(a, b)
 
 
+def _bit_aligned_values(bits: int) -> int:
+    """Return the value count that starts and ends on a 32-bit word boundary."""
+    return 32 // math.gcd(32, int(bits))
+
+
 def _ceil_div(a: int, b: int) -> int:
     """Compute ceiling division of a by b.
 
@@ -214,7 +220,7 @@ def _ensure_aligned(choices: list[int], align: int, max_choice: int) -> list[int
 
     Args:
         choices: List of candidate block sizes.
-        align: Required alignment (e.g., group_size * values_per_word).
+        align: Required alignment.
         max_choice: Maximum allowed value after rounding.
 
     Returns:
@@ -270,7 +276,16 @@ def _infer_mkn(inv: Invocation[QuantizedMatmulConfig, Array], group_size: int) -
     transpose = _static_bool(inv.kwargs.get("transpose", False), "transpose")
     M, K = x.shape
     if transpose:
-        N = w.shape[0]
+        _, bits = _resolve_qparams(
+            str(inv.kwargs.get("mode", "affine")),
+            inv.kwargs.get("group_size"),
+            inv.kwargs.get("bits"),
+        )
+        exp_words = _ceil_div(int(K) * int(bits), 32)
+        if int(w.shape[0]) == exp_words and int(scales.shape[0]) * int(group_size) == int(K):
+            N = w.shape[1]
+        else:
+            N = w.shape[0]
     else:
         N = scales.shape[1] * group_size
     return int(M), int(K), int(N), transpose
@@ -296,6 +311,17 @@ def _prefer_bf16(x: Array) -> bool:
     if dt is None:
         return True
     return dt == jnp.bfloat16
+
+
+@functools.lru_cache(maxsize=1)
+def _tilelang_runtime_available() -> bool:
+    """Return whether TileLang FFI can actually run in this environment."""
+    try:
+        from ejkernel.callib._tilelang_ffi import has_tilelang_ffi_support
+
+        return bool(has_tilelang_ffi_support())
+    except Exception:
+        return False
 
 
 def _pick_split_k(m: int, k: int, block_k: int) -> int:
@@ -600,11 +626,11 @@ def _maybe_tpu_predecode_once_matmul(
     ``dot_general`` matmul.  The dense weight is cached across calls so
     subsequent invocations only pay the cost of the matmul.
 
-    Returns ``None`` when the path is inapplicable — e.g. when ``bits``
-    is not 4 or 8, when any of ``w``/``scales``/``zeros`` are JAX tracers
-    (indicating JIT-traced weights that cannot be pre-decoded), or when the
-    import of the predecode helper fails.  In all these cases the caller
-    should fall back to the fused kernel dispatch.
+    Returns ``None`` when the path is inapplicable — e.g. when any of
+    ``w``/``scales``/``zeros`` are JAX tracers (indicating JIT-traced weights
+    that cannot be pre-decoded), or when the import of the predecode helper
+    fails. In all these cases the caller should fall back to the fused kernel
+    dispatch.
 
     Args:
         x: Input activation matrix ``(M, K)``.
@@ -613,14 +639,12 @@ def _maybe_tpu_predecode_once_matmul(
         zeros: Per-group zero-points (``None`` for non-affine modes).
         mode: Quantization mode (``"affine"`` or non-affine).
         group_size: Elements per quantization group.
-        bits: Quantization bit-width (must be 4 or 8 for this path).
+        bits: Quantization bit-width, from 1 through 8 for affine mode.
 
     Returns:
         Dense matmul output ``(M, N)`` in bfloat16, or ``None`` if the path
         cannot be used.
     """
-    if bits not in (4, 8):
-        return None
     # Predecode-once requires concrete quantized metadata.
     if _is_tracer_value(w) or _is_tracer_value(scales) or (zeros is not None and _is_tracer_value(zeros)):
         return None
@@ -667,21 +691,20 @@ def _packed_legal_block_n(
 ) -> int:
     """Return the smallest packed-legal block_n for the given N dimension.
 
-    Mosaic TPU tiling requires that for a 2-D BlockSpec ``(block_k, block_n // X)``
-    the trailing-dimension tile either equals the padded dimension or is a multiple
-    of 128.  For packed-quantized kernels ``X`` is ``values_per_word`` (weight) and
-    ``group_size`` (scales), so the cheapest legal choice is ``block_n == n_pad``
-    which makes both tile sizes exactly equal to the padded dimension.
+    Mosaic TPU tiling requires that for a 2-D BlockSpec over packed words the
+    trailing-dimension tile either equals the padded dimension or is a multiple
+    of 128. The cheapest legal choice is ``block_n == n_pad`` which makes both
+    packed-word and scale-group tile sizes exactly equal to the padded dimension.
 
     For very large *N* where ``n_pad`` would blow the VMEM budget, the fallback
-    is the packed-lane alignment ``lcm(128 * values_per_word, 128 * group_size)``
+    is the packed-lane alignment ``lcm(128 * bit_alignment, 128 * group_size)``
     which guarantees both tile sizes are multiples of 128.
 
     Args:
         n: The output dimension (unpacked, pre-padding).
         group_size: Elements per quantization group.
-        bits: Quantization bit width (4 or 8).
-        align_n: Base alignment for n (``lcm(128, lcm(group_size, values_per_word))``).
+        bits: Quantization bit width, from 1 through 8.
+        align_n: Base alignment for n (``lcm(128, lcm(group_size, bit_alignment))``).
         vmem_cap: Maximum acceptable block_n (default 4096).
 
     Returns:
@@ -690,8 +713,8 @@ def _packed_legal_block_n(
     n_pad = max(align_n, _ceil_div(n, align_n) * align_n)
     if n_pad <= vmem_cap:
         return n_pad
-    values_per_word = 32 // bits if bits in (4, 8) else 1
-    packed_lane_align = _lcm(128 * values_per_word, 128 * group_size)
+    value_alignment = _bit_aligned_values(bits)
+    packed_lane_align = _lcm(128 * value_alignment, 128 * group_size)
     bn = max(packed_lane_align, _ceil_div(n, packed_lane_align) * packed_lane_align)
     # If the computed bn exceeds the cap, prefer n_pad anyway (the Pallas
     # compiler will handle VMEM spilling for correctness).
@@ -715,8 +738,8 @@ def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> 
     mode = str(inv.kwargs.get("mode", "affine"))
     group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
     m, k, n, _ = _infer_mkn(inv, group_size)
-    values_per_word = 32 // bits if bits in (4, 8) else 1
-    align_n = _lcm(128, _lcm(group_size, values_per_word))
+    value_alignment = _bit_aligned_values(bits)
+    align_n = _lcm(128, _lcm(group_size, value_alignment))
 
     block_m = 256 if m >= 2048 else 128
     block_k = 256 if k >= 4096 else 128
@@ -756,11 +779,11 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
     group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
     m, k, n, _ = _infer_mkn(inv, group_size)
 
-    values_per_word = 32 // bits if bits in (4, 8) else 1
-    align_n = _lcm(128, _lcm(group_size, values_per_word))
+    value_alignment = _bit_aligned_values(bits)
+    align_n = _lcm(128, _lcm(group_size, value_alignment))
     bm_opts = (128, 256)
     n_pad = _ceil_div(n, align_n) * align_n
-    packed_lane_align = _lcm(align_n, _lcm(group_size * 128, values_per_word * 128))
+    packed_lane_align = _lcm(align_n, _lcm(group_size * 128, value_alignment * 128))
     bn_seed = {
         128,
         256,
@@ -826,7 +849,7 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
                 ):
                     continue
                 packed_legal = False
-                if _packed_legal_forward is not None and bits in (4, 8):
+                if _packed_legal_forward is not None:
                     packed_legal = bool(
                         _packed_legal_forward(
                             x,
@@ -899,8 +922,6 @@ def _normalize_pallas_tpu_packed_cfg_forward(
     This guards against stale cache entries or manual cfg overrides that use
     a block_n legal for dense/XLA but illegal for packed TPU BlockSpecs.
     """
-    if bits not in (4, 8):
-        return cfg
     try:
         from ejkernel.kernels._pallas.tpu.quantized_matmul._pallas_impl_core import (
             is_packed_tpu_legal_forward as _packed_legal_forward,
@@ -912,11 +933,11 @@ def _normalize_pallas_tpu_packed_cfg_forward(
     k_dim = int(x.shape[1]) if x.ndim >= 2 else int(cfg.block_k)
     bm = max(8, _ceil_div(min(int(cfg.block_m), max(8, m_dim)), 8) * 8)
     bk = max(128, _ceil_div(min(int(cfg.block_k), max(128, k_dim)), 128) * 128)
-    values_per_word = 32 // int(bits)
-    align_n = _lcm(128, _lcm(int(group_size), values_per_word))
+    value_alignment = _bit_aligned_values(int(bits))
+    align_n = _lcm(128, _lcm(int(group_size), value_alignment))
     n = int(scales.shape[-1]) * int(group_size)
     n_pad = max(align_n, _ceil_div(n, align_n) * align_n)
-    packed_lane_align = _lcm(align_n, _lcm(int(group_size) * 128, values_per_word * 128))
+    packed_lane_align = _lcm(align_n, _lcm(int(group_size) * 128, value_alignment * 128))
 
     def _legal(block_n: int) -> bool:
         return bool(
@@ -981,8 +1002,8 @@ def _xla_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array], hardware:
     mode = str(inv.kwargs.get("mode", "affine"))
     group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
     M, K, N, transpose = _infer_mkn(inv, group_size)
-    values_per_word = 32 // bits if bits in (4, 8) else 1
-    align = _lcm(group_size, values_per_word)
+    value_alignment = _bit_aligned_values(bits)
+    align = _lcm(group_size, value_alignment)
 
     bm_choices, bn_choices, bk_choices = _xla_choices(hardware)
     base_m = _nearest_choices(M, bm_choices, count=1)[0]
@@ -1110,10 +1131,15 @@ def _cuda_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> Quanti
     Returns:
         A QuantizedMatmulConfig tuned for CUDA custom-call execution.
     """
+    mode = str(inv.kwargs.get("mode", "affine"))
+    group_size, _bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
+    M, _K, _N, _transpose = _infer_mkn(inv, group_size)
+    block_n = 256 if M < 16 else 128
+    block_k = 128 if M < 16 else 64
     return QuantizedMatmulConfig(
         block_m=128,
-        block_n=128,
-        block_k=64,
+        block_n=block_n,
+        block_k=block_k,
         num_warps=4,
         num_stages=2,
         use_bf16=_prefer_bf16(_inv_arg(inv, "x", 0)),
@@ -1126,14 +1152,20 @@ def _cuda_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> Quanti
 def _tilelang_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> QuantizedMatmulConfig:
     """Generate a launch-safe heuristic configuration for TileLang QMM."""
     mode = str(inv.kwargs.get("mode", "affine"))
-    group_size, _ = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
+    group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
     M, _K, N, _ = _infer_mkn(inv, group_size)
-    block_m = 128 if M >= 128 else 64 if M >= 64 else 32
+    block_m = 128 if M >= 128 else 64 if M >= 64 else 32 if M >= 16 else 16
     block_m_tall = 256 if M >= 256 else block_m
+    num_stages = 2
     if mode == "affine":
-        block_n = 128 if N >= 128 else 64
-        block_k = 128
+        block_n = 64 if M < 16 and N >= 64 else 128 if N >= 128 else 64
+        block_k = 64 if M < 16 else 128
         num_warps = 4
+        num_stages = 3 if bits == 8 and M >= 512 else 2
+        if bits == 8 and M >= 512:
+            block_n = 64 if N >= 64 else 32
+            num_warps = 8
+            num_stages = 4
     elif mode == "nf4":
         block_m = block_m_tall
         block_n = 32
@@ -1162,7 +1194,7 @@ def _tilelang_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> Qu
         block_n=block_n,
         block_k=block_k,
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=num_stages,
         use_bf16=_prefer_bf16(_inv_arg(inv, "x", 0)),
         split_k=None,
         platform="tilelang",
@@ -1215,7 +1247,7 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
         >>> output = kernel.run(x, w_q, scales, zeros, cfg=cfg)
     """
 
-    version = "10"
+    version = "16"
 
     def __init__(self) -> None:
         """Initialize the quantized matmul kernel."""
@@ -1294,8 +1326,9 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
                 (weights stored in KxN layout). If ``False``, compute
                 ``x @ dequantize(w)`` (weights in transposed layout).
             group_size: Quantization group size. ``None`` uses the mode default.
-            bits: Bit-width used in quantization. Honoured for affine (``{4, 8}``);
-                ignored for nf4/mxfp4/mxfp8/nvfp4/nvfp8.
+            bits: Bit-width used in quantization. Honoured for affine
+                (``1`` through ``8``); ignored for
+                nf4/mxfp4/mxfp8/nvfp4/nvfp8.
             mode: Quantization mode string. One of
                 ``{"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}``.
             axis: Optional quantization axis alias. ``"row"`` maps to
@@ -1547,10 +1580,11 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
                     backend="gpu",
                 )
                 for bm, bn, bk, warps, stages in (
+                    (128, 256, 128, 4, 2),
+                    (128, 128, 128, 4, 2),
                     (128, 128, 64, 4, 2),
                     (128, 256, 64, 4, 2),
                     (64, 128, 64, 4, 2),
-                    (128, 128, 128, 4, 2),
                 )
             ]
         if resolved == Platform.CUTE:
@@ -1577,21 +1611,38 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
             ]
         if resolved == Platform.TILELANG:
             mode = str(inv.kwargs.get("mode", "affine"))
-            group_size, _ = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
+            group_size, bits = _resolve_qparams(mode, inv.kwargs.get("group_size"), inv.kwargs.get("bits"))
             M, _K, N, _ = _infer_mkn(inv, group_size)
-            block_m = 128 if M >= 128 else 64 if M >= 64 else 32
+            block_m = 128 if M >= 128 else 64 if M >= 64 else 32 if M >= 16 else 16
             block_m_tall = 256 if M >= 256 else block_m
             block_n_hi = 128 if N >= 128 else 64
             block_n_lo = 64 if N >= 64 else 32
             block_n_micro = 32
             use_bf16 = _prefer_bf16(_inv_arg(inv, "x", 0))
             if mode == "affine":
-                shapes = (
-                    (block_m, block_n_hi, 128, 4),
-                    (block_m, block_n_hi, 64, 4),
-                    (block_m, block_n_lo, 64, 4),
-                    (block_m, block_n_hi, 32, 4),
-                )
+                if M < 16:
+                    shapes = (
+                        (block_m, block_n_lo, 64, 4),
+                        (block_m, block_n_lo, 128, 4),
+                        (block_m, block_n_hi, 64, 4),
+                        (block_m, block_n_hi, 128, 4),
+                    )
+                else:
+                    if bits == 8 and M >= 512:
+                        shapes = (
+                            (block_m, block_n_lo, 128, 8),
+                            (block_m_tall, block_n_lo, 64, 4),
+                            (block_m, block_n_hi, 128, 4),
+                            (block_m, block_n_hi, 64, 4),
+                            (block_m, block_n_lo, 64, 4),
+                        )
+                    else:
+                        shapes = (
+                            (block_m, block_n_hi, 128, 4),
+                            (block_m, block_n_hi, 64, 4),
+                            (block_m, block_n_lo, 64, 4),
+                            (block_m, block_n_hi, 32, 4),
+                        )
             elif mode == "nf4":
                 shapes = (
                     (block_m_tall, block_n_micro, 64, 4),
@@ -1629,13 +1680,19 @@ class QuantizedMatmul(Kernel[QuantizedMatmulConfig, Array]):
                     (block_m, block_n_hi, 64, 4),
                     (block_m, block_n_lo, 64, 4),
                 )
+
+            def _tilelang_num_stages(bk: int, warps: int) -> int:
+                if mode == "affine" and bits == 8 and M >= 512:
+                    return 4 if warps >= 8 else 3 if bk >= 128 else 2
+                return 2
+
             return [
                 QuantizedMatmulConfig(
                     block_m=bm,
                     block_n=bn,
                     block_k=bk,
                     num_warps=warps,
-                    num_stages=2,
+                    num_stages=_tilelang_num_stages(bk, warps),
                     use_bf16=use_bf16,
                     split_k=None,
                     platform="tilelang",
@@ -1800,24 +1857,42 @@ def _quantized_matmul_impl(
     except Exception:
         backend_name = "cpu"
 
-    prefer_cuda = backend_name in ("gpu", "cuda") and axis != "col"
-    # Prefer Triton for axis='col' (transpose=True) on CUDA backends by default.
-    # CUDA supports transpose=True, but Triton is generally more competitive
-    # for fused transpose workloads unless proven otherwise.
-    prefer_triton = backend_name in ("gpu", "cuda") and axis == "col"
+    prefer_cuda_col_lowbit = (
+        backend_name in ("gpu", "cuda")
+        and axis == "col"
+        and mode == "affine"
+        and bits in {1, 2, 4, 8}
+        and int(x.shape[0]) >= 512
+    )
+    prefer_tilelang = (
+        backend_name in ("gpu", "cuda")
+        and axis == "col"
+        and mode == "affine"
+        and bits in {1, 2, 4, 8}
+        and int(x.shape[0]) >= 512
+        and not prefer_cuda_col_lowbit
+        and _tilelang_runtime_available()
+    )
+    prefer_cuda = backend_name in ("gpu", "cuda") and (axis != "col" or prefer_cuda_col_lowbit)
+    # Column-packed large affine divisor-bit GEMM is fastest on the native CUDA
+    # path after its internal dequant layout conversion. TileLang remains
+    # available by explicit platform request; Triton is the fallback when no
+    # native preference applies.
+    prefer_triton = backend_name in ("gpu", "cuda") and axis == "col" and not prefer_cuda and not prefer_tilelang
     resolved = detect_platform(
         "quantized_matmul",
         platform if platform is not None else (cfg.platform if cfg is not None else "auto"),
         prefer_pallas=backend_name == "tpu",
         prefer_cuda=prefer_cuda,
         prefer_triton=prefer_triton,
+        prefer_tilelang=prefer_tilelang,
     )
     dispatch_platform = resolved.value
     extra_kwargs = {}
     if resolved in (Platform.XLA, Platform.PALLAS):
         extra_kwargs["allow_dense_fallback"] = allow_dense_fallback
 
-    if resolved in (Platform.TRITON, Platform.CUDA, Platform.CUTE):
+    if resolved in (Platform.TRITON, Platform.CUDA, Platform.CUTE, Platform.TILELANG):
         with policy_override(
             _quantized_matmul_executor.chooser,
             allow_autotune=False,
@@ -1912,7 +1987,7 @@ def quantized_matmul(
             None for non-affine modes.
         transpose: If True, compute x @ dequantize(w).T.
         group_size: Quantization group size. If None, uses mode default.
-        bits: Quantization bit-width. Honored for affine ({1,2,4,8});
+        bits: Quantization bit-width. Honored for affine ({1,2,3,4,5,6,7,8});
             ignored for nf4/mxfp4/mxfp8/nvfp4/nvfp8.
         mode: Quantization mode. One of
             {"affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"}.
@@ -2031,16 +2106,6 @@ def quantized_matmul(
                     backend=cfg.backend,
                 )
 
-    if fuse and mode_n == "affine" and bits_n not in (4, 8):
-        msg = "fuse=True with affine bits not in {4,8} is unsupported."
-        if strict_fuse_n:
-            raise ValueError(msg)
-        warnings.warn(
-            f"{msg} Falling back to reference dequantize+matmul path.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        fuse = False
     if fuse and backend_name == "mps":
         msg = "fuse=True on MPS currently falls back to reference dequantize+matmul for stability."
         if strict_fuse_n:

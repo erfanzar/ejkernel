@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,9 +54,9 @@ def blocksparse_attention(
     kv_positions: Int[Array, "batch kv_len"] | None = None,
     softmax_aux: Float[Array, "num_sinks"] | None = None,
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
-    | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
-    | None = None,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | Int[Array, "batch num_heads_or_1 seq_len kv_len"] | None
+    ) = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
     logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,

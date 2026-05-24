@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -183,6 +183,8 @@ def quantized_matmul_cuda(
     gemv_mode: GemvMode = "auto",
     revsplit_k: RevSplitKMode = "auto",
     revsplit_k_parts: int | None = None,
+    block_n: int = 0,
+    block_k: int = 0,
 ) -> jax.Array:
     """Execute quantized matrix multiplication on CUDA via JAX FFI.
 
@@ -240,7 +242,7 @@ def quantized_matmul_cuda(
         Result matrix of shape ``(M, N)`` with the same dtype as *x*.
 
     Raises:
-        ValueError: If *bits* is not in {4, 8} or incompatible with the
+        ValueError: If *bits* is outside [1, 8] or incompatible with the
             chosen *mode*.
         ValueError: If *scales* is not rank-2 or its shape is inconsistent
             with *x* and *w*.
@@ -279,17 +281,29 @@ def quantized_matmul_cuda(
     if biases is not None and (biases.ndim != 2 or biases.shape != scales.shape):
         raise ValueError("CUDA quantized_matmul biases shape must match scales shape.")
     if transpose:
-        if scales.shape[0] != int(w.shape[0]):
-            raise ValueError("CUDA quantized_matmul scales shape must be (N, K/group_size) for transpose=True.")
         if k % group_size != 0:
             raise ValueError("CUDA quantized_matmul K must be divisible by group_size for transpose=True.")
-        n_groups = int(scales.shape[1])
-        if n_groups != k // group_size:
-            raise ValueError("CUDA quantized_matmul scales second dimension must be K/group_size.")
-        n = int(w.shape[0])
         expected_words = _expected_words(k, bits)
-        if int(w.shape[1]) != expected_words:
-            raise ValueError("CUDA quantized_matmul packed weight shape does not match K and bits.")
+        if (
+            scales.shape[1] == k // group_size
+            and int(w.shape[1]) == expected_words
+            and scales.shape[0] == int(w.shape[0])
+        ):
+            n_groups = int(scales.shape[1])
+            n = int(w.shape[0])
+        elif (
+            scales.shape[0] == k // group_size
+            and int(w.shape[0]) == expected_words
+            and scales.shape[1] == int(w.shape[1])
+        ):
+            n_groups = int(scales.shape[0])
+            n = int(w.shape[1])
+        else:
+            raise ValueError(
+                "CUDA quantized_matmul transpose=True expects either "
+                "w=(N, ceil(K*bits/32)), scales=(N, K/group_size), or "
+                "k-major w=(ceil(K*bits/32), N), scales=(K/group_size, N)."
+            )
     else:
         n_groups = int(scales.shape[1])
         n = n_groups * group_size
@@ -318,6 +332,8 @@ def quantized_matmul_cuda(
         "gemv_mode": _gemv_mode_to_id(gemv_mode),
         "revsplit_k": _revsplit_mode_to_id(revsplit_k),
         "revsplit_k_parts": int(revsplit_k_parts),
+        "block_n": int(block_n),
+        "block_k": int(block_k),
     }
 
     if biases is None:

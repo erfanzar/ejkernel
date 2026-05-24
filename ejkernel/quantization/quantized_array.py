@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,8 +59,8 @@ class QuantizedArray:
             :func:`quantize` or :func:`prepack_quantized_weights`.  Shape
             depends on ``axis`` and ``bits``:
 
-            - ``axis='row'``: shape ``(K, ceil(N / (32 // bits)))``.
-            - ``axis='col'``: shape ``(N, ceil(K / (32 // bits)))``.
+            - ``axis='row'``: shape ``(K, ceil(N * bits / 32))``.
+            - ``axis='col'``: shape ``(N, ceil(K * bits / 32))``.
 
         scales: Per-group scale tensor.  Shape is ``(K, N // group_size)`` for
             ``axis='row'`` or ``(N, K // group_size)`` for ``axis='col'``.
@@ -77,7 +77,7 @@ class QuantizedArray:
         group_size: Number of elements per quantization group.  Defaults and
             valid values depend on ``mode`` (see :func:`resolve_qparams`).
 
-        bits: Effective bit-width of stored codes (1, 2, 4, or 8 for affine;
+        bits: Effective bit-width of stored codes (1 through 8 for affine;
             fixed for other modes).
 
         axis: Quantization axis.  ``"row"`` groups over output channels;

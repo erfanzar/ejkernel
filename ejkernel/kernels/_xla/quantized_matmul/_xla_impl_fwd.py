@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ quantization modes implemented in ejkernel.quantization.
 
 For performance, a blocked decode-and-matmul path is used when the
 quantization parameters are compatible with fixed tiling. When the
-inputs are not aligned to the tile sizes or use unsupported bit-widths,
-this falls back to dequantize+matmul.
+inputs are not aligned to the tile sizes or the bit-width does not have a
+blocked specialization, this falls back to dequantize+matmul.
 """
 
 from __future__ import annotations
@@ -84,6 +84,16 @@ def _lcm(a: int, b: int) -> int:
     if b <= 0:
         return int(a)
     return abs(a * b) // math.gcd(a, b)
+
+
+def _bit_aligned_values(bits: int) -> int:
+    """Return the value count that starts and ends on a 32-bit word boundary."""
+    return 32 // math.gcd(32, int(bits))
+
+
+def _packed_words_for_values(values: int, bits: int) -> int:
+    """Return the number of uint32 words needed for a packed bitstream."""
+    return _ceil_div(int(values) * int(bits), 32)
 
 
 def _pad_2d(x: jax.Array, pad0: int, pad1: int) -> jax.Array:
@@ -267,7 +277,7 @@ def _blocked_quantized_matmul(
             ``zeros`` metadata), or None.
         transpose: If True, weights are in NxK layout; if False, KxN layout.
         group_size: Number of elements per quantization group.
-        bits: Bit-width per quantized element (4 or 8).
+        bits: Bit-width per quantized element.
         mode: Backend quantization key
             ("affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8").
         block_m: Block size for M dimension.
@@ -289,14 +299,14 @@ def _blocked_quantized_matmul(
     else:
         N = scales.shape[-1] * group_size
 
-    values_per_word = 32 // bits
+    value_alignment = _bit_aligned_values(bits)
 
     if transpose:
-        if block_k % values_per_word != 0 or block_k % group_size != 0:
-            raise ValueError("block_k must be a multiple of values_per_word and group_size for transpose=True")
+        if block_k % value_alignment != 0 or block_k % group_size != 0:
+            raise ValueError("block_k must be word-aligned and a multiple of group_size for transpose=True")
     else:
-        if block_n % values_per_word != 0 or block_n % group_size != 0:
-            raise ValueError("block_n must be a multiple of values_per_word and group_size for transpose=False")
+        if block_n % value_alignment != 0 or block_n % group_size != 0:
+            raise ValueError("block_n must be word-aligned and a multiple of group_size for transpose=False")
 
     M_pad = _ceil_div(M, block_m) * block_m
     N_pad = _ceil_div(N, block_n) * block_n
@@ -305,13 +315,13 @@ def _blocked_quantized_matmul(
     x_pad = _pad_2d(x, M_pad - M, K_pad - K)
 
     if transpose:
-        words_pad = K_pad // values_per_word
+        words_pad = _packed_words_for_values(K_pad, bits)
         w_q_pad = _pad_2d(w_q, N_pad - N, words_pad - w_q.shape[-1])
         groups_pad = K_pad // group_size
         scales_pad = _pad_2d(scales, N_pad - N, groups_pad - scales.shape[-1])
         biases_pad = _pad_2d_optional(biases, N_pad - N, groups_pad - scales.shape[-1])
     else:
-        words_pad = N_pad // values_per_word
+        words_pad = _packed_words_for_values(N_pad, bits)
         w_q_pad = _pad_2d(w_q, K_pad - K, words_pad - w_q.shape[-1])
         groups_pad = N_pad // group_size
         scales_pad = _pad_2d(scales, K_pad - K, groups_pad - scales.shape[-1])
@@ -338,14 +348,14 @@ def _blocked_quantized_matmul(
             Unpacked quantized codes of shape (block_k, block_n).
         """
         if transpose:
-            word_start = off_k // values_per_word
-            words_tile = block_k // values_per_word
+            word_start = off_k * bits // 32
+            words_tile = _packed_words_for_values(block_k, bits)
             wq_tile = jax.lax.dynamic_slice(w_q_pad, (off_n, word_start), (block_n, words_tile))
             q = _unpack_bits(wq_tile, block_k, bits)
             q = jnp.swapaxes(q, 0, 1)
         else:
-            word_start = off_n // values_per_word
-            words_tile = block_n // values_per_word
+            word_start = off_n * bits // 32
+            words_tile = _packed_words_for_values(block_n, bits)
             wq_tile = jax.lax.dynamic_slice(w_q_pad, (off_k, word_start), (block_k, words_tile))
             q = _unpack_bits(wq_tile, block_n, bits)
         return q
@@ -652,14 +662,15 @@ def quantized_matmul(
     is ``True`` and the fused path raises ``ValueError``).
 
     For ``transpose=True`` the ``block_k`` tile is automatically rounded up to
-    the nearest multiple of both ``values_per_word`` and ``group_size`` before
-    JIT compilation if the default value is not already compatible.
+    the nearest multiple of both the packed-word value alignment and
+    ``group_size`` before JIT compilation if the default value is not already
+    compatible.
 
     Args:
         x: Activation matrix ``[M, K]`` in a float dtype.
         w: Packed uint32 weights.  Shape:
-            ``[N, ceil(K / values_per_word)]`` when ``transpose=True``, or
-            ``[K, ceil(N / values_per_word)]`` when ``transpose=False``.
+            ``[N, ceil(K * bits / 32)]`` when ``transpose=True``, or
+            ``[K, ceil(N * bits / 32)]`` when ``transpose=False``.
         scales: Per-group scales.  Shape and dtype depend on mode:
 
             - ``affine``/``nf4``: float, shape ``[N, K//gs]`` (T) or ``[K, N//gs]``.
@@ -672,7 +683,7 @@ def quantized_matmul(
             If ``False``, weights are in KxN layout (compute ``x @ w``).
         group_size: Quantization group size.  Mode defaults:
             64 (affine/nf4), 32 (mxfp4/mxfp8), 16 (nvfp4/nvfp8).
-        bits: Bit-width per element.  Honoured for affine (``{4, 8}``);
+        bits: Bit-width per element. Honoured for affine bits 1 through 8;
             ignored for other explicit modes.
         mode: User-facing quantization mode string (see ``_resolve_qparams`` for
             normalisation).
@@ -712,9 +723,9 @@ def quantized_matmul(
     # (transpose=True, group_size=128) configurations hit a ValueError and
     # silently fall back to dequantize+matmul (dense path).
     if transpose:
-        values_per_word = 32 // int(bits)
-        if block_k % values_per_word != 0 or block_k % int(group_size) != 0:
-            block_k = _lcm(int(block_k), int(values_per_word))
+        value_alignment = _bit_aligned_values(int(bits))
+        if block_k % value_alignment != 0 or block_k % int(group_size) != 0:
+            block_k = _lcm(int(block_k), int(value_alignment))
             block_k = _lcm(int(block_k), int(group_size))
 
     if mode == "affine":

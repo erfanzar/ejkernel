@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -615,7 +615,7 @@ def build_tilelang_call(
         raise ValueError("`build_tilelang_call` requires `out_shape` or `output_shape_dtype`.")
 
     meta_dict = dict(meta or {})
-    config_list = tuple(dict(config) for config in (configs or ()))
+    config_list = tuple(dict(config) for config in configs or ())
     do_autotune = bool(config_list) if autotune is None else bool(autotune)
     if prim_func is not None and do_autotune:
         raise ValueError("TileLang autotune requires a `kernel` prim-func factory, not a direct `prim_func`.")
@@ -641,24 +641,26 @@ def build_tilelang_call(
 
     call_key = (
         "build_tilelang_call",
-        _freeze_key(cache_key)
-        if cache_key is not None
-        else (
-            str(name) if name is not None else "",
-            _freeze_key(prim_func) if prim_func is not None else None,
-            _freeze_key(kernel),
-            _freeze_key(meta_dict),
-            _freeze_key(config_list),
-            _out_contract_key(flat_out_shape),
-            _freeze_key(input_output_aliases or {}),
-            resolved_target,
-            target_host,
-            _freeze_key(pass_configs or {}),
-            resolved_compile_flags,
-            bool(do_autotune),
-            resolved_warmup,
-            resolved_rep,
-            resolved_timeout,
+        (
+            _freeze_key(cache_key)
+            if cache_key is not None
+            else (
+                str(name) if name is not None else "",
+                _freeze_key(prim_func) if prim_func is not None else None,
+                _freeze_key(kernel),
+                _freeze_key(meta_dict),
+                _freeze_key(config_list),
+                _out_contract_key(flat_out_shape),
+                _freeze_key(input_output_aliases or {}),
+                resolved_target,
+                target_host,
+                _freeze_key(pass_configs or {}),
+                resolved_compile_flags,
+                bool(do_autotune),
+                resolved_warmup,
+                resolved_rep,
+                resolved_timeout,
+            )
         ),
     )
     with _NAMED_CALL_CACHE_LOCK:

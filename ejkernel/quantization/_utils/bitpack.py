@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,8 +18,9 @@ This module provides functions to pack and unpack quantized values into
 uint32 words in an MLX-compatible format. Values are stored LSB-first
 (least significant bit first) within each 32-bit word.
 
-The packing format stores `32 // bits` values per uint32 word, handling
-the case where values may span word boundaries for non-power-of-2 bit widths.
+The packing format stores a contiguous bitstream in uint32 words, using
+``ceil(n_values * bits / 32)`` storage words and handling values that span word
+boundaries for non-power-of-2 bit widths.
 """
 
 from __future__ import annotations

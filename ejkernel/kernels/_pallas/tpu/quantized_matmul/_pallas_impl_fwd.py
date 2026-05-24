@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,12 +40,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ._pallas_impl_core import (
+    _bit_aligned_values,
     _ceil_div,
     _dequantize_tile,
     _normalize_tpu_blocks,
+    _packed_words_for_values,
     _pad_2d,
     _pad_2d_optional,
-    _unpack_bits_4_8,
+    _unpack_packed_bits,
     choose_packed_n_subtile,
     estimate_qmm_tpu_vmem_limit_bytes,
     get_qmm_tpu_vmem_limit_bytes,
@@ -77,11 +79,11 @@ def _pallas_qmm_transpose_false_packed(
 
     Args:
         x: Activation tensor [M, K].
-        w_q: Packed quantized weight [K, N // values_per_word].
+        w_q: Packed quantized weight [K, ceil(N * bits / 32)].
         scales: Per-group scale tensor [K, N // group_size].
         biases: Optional per-group additive bias [K, N // group_size].
         group_size: Number of output elements per quantization group.
-        bits: Quantization bit width (4 or 8).
+        bits: Quantization bit width, from 1 through 8.
         mode: Quantization mode ("affine" or "nf4").
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
@@ -95,15 +97,15 @@ def _pallas_qmm_transpose_false_packed(
         ValueError: If bits, mode, or block constraints are invalid.
     """
     del use_bf16  # TPU fused path always computes in bfloat16.
-    if bits not in (4, 8):
-        raise ValueError("TPU packed fused path supports bits in {4, 8}.")
+    if bits < 1 or bits > 8:
+        raise ValueError("TPU packed fused path supports bits in [1, 8].")
     if mode not in _PACKED_SUPPORTED_MODES:
         raise ValueError(f"TPU packed fused path currently supports modes {sorted(_PACKED_SUPPORTED_MODES)}.")
 
     block_m, block_n, block_k = _normalize_tpu_blocks(block_m, block_n, block_k)
-    values_per_word = 32 // bits
-    if block_n % values_per_word != 0:
-        raise ValueError("block_n must be a multiple of values_per_word for TPU packed path.")
+    value_alignment = _bit_aligned_values(bits)
+    if block_n % value_alignment != 0:
+        raise ValueError("block_n must start and end on packed-word boundaries for TPU packed path.")
     if block_n % group_size != 0:
         raise ValueError("block_n must be a multiple of group_size for TPU packed path.")
 
@@ -117,7 +119,7 @@ def _pallas_qmm_transpose_false_packed(
     k_pad = _ceil_div(k, block_k) * block_k
 
     x_pad = _pad_2d(x, m_pad - m, k_pad - k).astype(jnp.bfloat16)
-    words_pad = n_pad // values_per_word
+    words_pad = _packed_words_for_values(n_pad, bits)
     groups_pad = n_pad // group_size
     if w_q.shape[1] > words_pad or scales.shape[1] > groups_pad:
         raise ValueError("Packed/scales trailing dimensions are incompatible with tiled N padding.")
@@ -129,14 +131,14 @@ def _pallas_qmm_transpose_false_packed(
     num_m = m_pad // block_m
     num_n = n_pad // block_n
     num_k = k_pad // block_k
-    block_words = block_n // values_per_word
+    block_words = _packed_words_for_values(block_n, bits)
     block_groups = block_n // group_size
     n_subtile = choose_packed_n_subtile(
         block_n=block_n,
         group_size=group_size,
-        values_per_word=values_per_word,
+        value_alignment=value_alignment,
     )
-    subtile_words = n_subtile // values_per_word
+    subtile_words = _packed_words_for_values(n_subtile, bits)
     subtile_groups = n_subtile // group_size
     num_n_subtiles = block_n // n_subtile
     dot_dims = (((1,), (0,)), ((), ()))
@@ -155,7 +157,7 @@ def _pallas_qmm_transpose_false_packed(
             word_end = word_start + subtile_words
             group_start = n_i * subtile_groups
             group_end = group_start + subtile_groups
-            q = _unpack_bits_4_8(w_ref[:, word_start:word_end], bits)
+            q = _unpack_packed_bits(w_ref[:, word_start:word_end], bits)
             w_deq = _dequantize_tile(q, s_ref[:, group_start:group_end], None, mode, group_size).astype(jnp.bfloat16)
             acc_ref[:, n_start:n_end] += jax.lax.dot_general(
                 x_ref[...].astype(jnp.bfloat16),
@@ -182,7 +184,7 @@ def _pallas_qmm_transpose_false_packed(
             word_end = word_start + subtile_words
             group_start = n_i * subtile_groups
             group_end = group_start + subtile_groups
-            q = _unpack_bits_4_8(w_ref[:, word_start:word_end], bits)
+            q = _unpack_packed_bits(w_ref[:, word_start:word_end], bits)
             w_deq = _dequantize_tile(
                 q,
                 s_ref[:, group_start:group_end],
@@ -293,7 +295,7 @@ def _pallas_qmm_transpose_false(
         scales: Per-group scale tensor [K, N // group_size].
         biases: Optional per-group additive bias.
         group_size: Elements per quantization group.
-        bits: Quantization bit width (4 or 8).
+        bits: Quantization bit width, from 1 through 8.
         mode: Quantization mode string.
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.

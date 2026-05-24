@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -938,7 +938,7 @@ class FNAutotuner:
                             else x
                         )
 
-                    (argument_shapes, keyword_shapes) = jax.tree.map(to_shape, (resolved_args, resolved_kwargs))
+                    argument_shapes, keyword_shapes = jax.tree.map(to_shape, (resolved_args, resolved_kwargs))
                     try:
                         compiled_function = jax.jit(fn).lower(*argument_shapes, **keyword_shapes).compile()
                         optimal_input_formats = getattr(compiled_function, "input_formats", None)
@@ -962,7 +962,7 @@ class FNAutotuner:
                         )
 
                     try:
-                        (optimally_placed_args, optimally_placed_kwargs) = jax.tree.map(
+                        optimally_placed_args, optimally_placed_kwargs = jax.tree.map(
                             place_array_on_optimal_device, (resolved_args, resolved_kwargs), optimal_formats
                         )
                         _ = jax.block_until_ready(fn(*optimally_placed_args, **optimally_placed_kwargs))

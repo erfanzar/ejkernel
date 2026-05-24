@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -252,9 +252,9 @@ class TestPrefillThenDecode:
 
         decode_cat = jnp.concatenate(decode_outs, axis=1)
         expected = out_full[:, prefill_len:]
-        assert jnp.allclose(decode_cat, expected, atol=5e-2, rtol=0), (
-            f"Prefill+decode vs full recurrent max diff: {jnp.max(jnp.abs(decode_cat - expected))}"
-        )
+        assert jnp.allclose(
+            decode_cat, expected, atol=5e-2, rtol=0
+        ), f"Prefill+decode vs full recurrent max diff: {jnp.max(jnp.abs(decode_cat - expected))}"
 
 
 class TestRecurrentFallback:

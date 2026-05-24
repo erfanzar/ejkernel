@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -279,16 +279,12 @@ def ejit(
     static_arg_indices = (
         set(static_argnums)
         if isinstance(static_argnums, list | tuple)
-        else {static_argnums}
-        if static_argnums is not None
-        else set()
+        else {static_argnums} if static_argnums is not None else set()
     )
     static_arg_names_set = (
         set(static_argnames)
         if isinstance(static_argnames, list | tuple)
-        else {static_argnames}
-        if static_argnames is not None
-        else set()
+        else {static_argnames} if static_argnames is not None else set()
     )
 
     def get_compiled_and_cache(static_key: str, args_sig: str, args, kwargs) -> Compiled | None:
@@ -508,7 +504,7 @@ def load_compiled_fn(path: str | os.PathLike, prefix: str | None = None):
     path = Path(path)
     prefix = prefix or ""
     filename = path / (prefix + "-" + COMPILED_FILE_NAME if prefix else COMPILED_FILE_NAME)
-    (serialized, in_tree, out_tree) = pickle.load(open(filename, "rb"))
+    serialized, in_tree, out_tree = pickle.load(open(filename, "rb"))
     return deserialize_and_load(
         serialized=serialized,
         in_tree=in_tree,
@@ -637,7 +633,7 @@ def smart_compile(
 
     if filepath.exists() and not RECOMPILE_FORCE:
         try:
-            (serialized, in_tree, out_tree) = pickle.load(open(filepath, "rb"))
+            serialized, in_tree, out_tree = pickle.load(open(filepath, "rb"))
             signature = pickle.load(open(signature_filepath, "rb"))
             compiled_func = deserialize_and_load(
                 serialized=serialized,

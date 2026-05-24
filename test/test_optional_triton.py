@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,8 +42,7 @@ def test_triton_call_errors_cleanly_when_triton_missing():
 
 
 def test_import_works_when_triton_imports_are_blocked():
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import builtins
 
         _orig_import = builtins.__import__
@@ -60,8 +59,7 @@ def test_import_works_when_triton_imports_are_blocked():
 
         from ejkernel.callib import ejit
         assert callable(ejit)
-        """
-    )
+        """)
     env = os.environ.copy()
     proc = subprocess.run(
         [sys.executable, "-c", script],
@@ -74,8 +72,7 @@ def test_import_works_when_triton_imports_are_blocked():
 
 
 def test_import_works_when_cute_cuda_bindings_are_missing():
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import builtins
         import importlib.util
 
@@ -98,8 +95,7 @@ def test_import_works_when_cute_cuda_bindings_are_missing():
 
         import ejkernel
         assert ejkernel.kernels.cute is None
-        """
-    )
+        """)
     env = os.environ.copy()
     proc = subprocess.run(
         [sys.executable, "-c", script],

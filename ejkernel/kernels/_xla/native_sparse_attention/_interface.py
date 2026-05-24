@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -276,8 +276,10 @@ def apply_native_sparse_attention(
     query: Float[Array, "batch seq_len num_q_heads head_dim"],
     key: Float[Array, "batch seq_len num_kv_heads head_dim"],
     value: Float[Array, "batch seq_len num_kv_heads head_dim"],
-    block_indices: Int[Array, "batch seq_len num_kv_heads num_selected_blocks"]
-    | Int[Array, "batch num_kv_heads num_blocks num_selected_blocks"],
+    block_indices: (
+        Int[Array, "batch seq_len num_kv_heads num_selected_blocks"]
+        | Int[Array, "batch num_kv_heads num_blocks num_selected_blocks"]
+    ),
     block_counts: Int[Array, "batch seq_len num_kv_heads"] | Int[Array, "batch num_kv_heads num_blocks"] | int = 16,
     block_size: int = 64,
     softmax_scale: float | None = None,

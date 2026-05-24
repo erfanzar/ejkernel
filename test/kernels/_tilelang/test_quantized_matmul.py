@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,9 +51,10 @@ def test_quantized_matmul_fwd_bwd():
     assert _max_abs(g_tl, g_ref) < _FP16_BWD_TOL
 
 
-@pytest.mark.parametrize(("axis", "bits"), [("row", 4), ("col", 8)])
+@pytest.mark.parametrize("axis", ["row", "col"])
+@pytest.mark.parametrize("bits", range(1, 9))
 def test_quantized_matmul_packed_affine_fwd_bwd(axis, bits):
-    M, N, K = 16, 64, 64
+    M, N, K = 8, 64, 64
     group_size = 32
     key = jax.random.PRNGKey(_SEED + 28)
     kx, kw = jax.random.split(key, 2)
@@ -79,15 +80,16 @@ def test_quantized_matmul_packed_affine_fwd_bwd(axis, bits):
     }
     tl, xla = _tl("quantized_matmul"), _xla("quantized_matmul")
     out_tl = tl(x, wq, scales, zeros, **kwargs)
-    out_xla = xla(x, wq, scales, zeros, **kwargs)
+    xla_kwargs = kwargs | {"allow_dense_fallback": True}
+    out_xla = xla(x, wq, scales, zeros, **xla_kwargs)
     assert _max_abs(out_tl, out_xla) < 3e-2
 
-    def loss(fn, x_, s_, z_):
-        out = fn(x_, wq, s_, z_, **kwargs).astype(jnp.float32)
+    def loss(fn, call_kwargs, x_, s_, z_):
+        out = fn(x_, wq, s_, z_, **call_kwargs).astype(jnp.float32)
         return jnp.sum(out * out)
 
-    g_tl = jax.grad(loss, argnums=(1, 2, 3))(tl, x, scales, zeros)
-    g_xla = jax.grad(loss, argnums=(1, 2, 3))(xla, x, scales, zeros)
+    g_tl = jax.grad(lambda x_, s_, z_: loss(tl, kwargs, x_, s_, z_), argnums=(0, 1, 2))(x, scales, zeros)
+    g_xla = jax.grad(lambda x_, s_, z_: loss(xla, xla_kwargs, x_, s_, z_), argnums=(0, 1, 2))(x, scales, zeros)
     for a, b, name in zip(g_tl, g_xla, ("x", "scales", "zeros"), strict=True):
         limit = 5e-3 * max(float(jnp.abs(b.astype(jnp.float32)).max()), 1.0) + 2.5e-1
         assert _max_abs(a, b) < limit, f"packed affine grad d{name} diff too large"

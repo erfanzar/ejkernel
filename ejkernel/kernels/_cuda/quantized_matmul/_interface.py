@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ from ._cuda_impl_bwd import quantized_matmul_input_grad
 from ._cuda_impl_fwd import quantized_matmul_forward
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8, 9, 10))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8, 9, 10, 11, 12))
 def _operate(
     x,
     w,
@@ -65,6 +65,8 @@ def _operate(
     gemv_mode: GemvMode,
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
+    block_n: int,
+    block_k: int,
 ):
     """Differentiable quantized matmul primitive with custom VJP.
 
@@ -100,6 +102,8 @@ def _operate(
         gemv_mode=gemv_mode,
         revsplit_k=revsplit_k,
         revsplit_k_parts=revsplit_k_parts,
+        block_n=block_n,
+        block_k=block_k,
     )
 
 
@@ -115,6 +119,8 @@ def _operate_fwd(
     gemv_mode: GemvMode,
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
+    block_n: int,
+    block_k: int,
 ):
     """Custom VJP forward rule for :func:`_operate`.
 
@@ -137,6 +143,8 @@ def _operate_fwd(
         gemv_mode=gemv_mode,
         revsplit_k=revsplit_k,
         revsplit_k_parts=revsplit_k_parts,
+        block_n=block_n,
+        block_k=block_k,
     )
     return out, (w, scales, biases)
 
@@ -149,6 +157,8 @@ def _operate_bwd(
     gemv_mode: GemvMode,
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
+    block_n: int,
+    block_k: int,
     residual,
     grad_out,
 ):
@@ -162,6 +172,7 @@ def _operate_bwd(
     Returns:
         A 4-tuple ``(grad_x, None, None, None)``.
     """
+    del block_n, block_k
     w, scales, biases = residual
     grad_x = quantized_matmul_input_grad(
         grad_out,
@@ -244,7 +255,7 @@ def quantized_matmul(
         ValueError: If ``zeros`` is ``None`` when mode is ``"affine"``,
             or non-``None`` for non-affine modes.
     """
-    del tpu_path, allow_dense_fallback, block_m, block_n, block_k, use_bf16, num_warps, num_stages, split_k
+    del tpu_path, allow_dense_fallback, block_m, use_bf16, num_warps, num_stages, split_k
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
     _, transpose = resolve_runtime_axis_and_transpose(axis=axis, transpose=transpose)
     gemv_mode = normalize_gemv_mode(gemv_mode)
@@ -274,4 +285,6 @@ def quantized_matmul(
         gemv_mode,
         revsplit_k,
         revsplit_k_parts,
+        int(block_n),
+        int(block_k),
     )

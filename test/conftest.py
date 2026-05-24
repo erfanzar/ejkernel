@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any
 
 os.environ.setdefault("EJKERNEL_AUTOTUNE_POLICY", "heuristics")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+_xla_flags = os.environ.get("XLA_FLAGS", "")
+if "--xla_gpu_enable_command_buffer" not in _xla_flags:
+    os.environ["XLA_FLAGS"] = f"{_xla_flags} --xla_gpu_enable_command_buffer=".strip()
 
 _TRITON_ONLY_TEST_BASENAMES = {
     # Cross-backend comparisons that require Triton.

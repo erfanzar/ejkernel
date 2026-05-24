@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -275,6 +275,7 @@ def _flash_mla_kernel_single_batch(
 
                 def l_broadcast(val):
                     return val[:, :v_head_dim]
+
             else:
                 raise NotImplementedError(f"v_head_dim={v_head_dim} should be a multiple of {MIN_BLOCK_SIZE} if larger")
 

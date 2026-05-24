@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -505,14 +505,14 @@ class Executor(Generic[Cfg, Out]):
 
             def fwd_arrays(*array_leaves):
                 """Forward rule: takes only array leaves, rebuilds args/kwargs inside."""
-                (a, k) = _restore_args_kwargs(array_leaves)
+                a, k = _restore_args_kwargs(array_leaves)
                 y, res = fwd_method(*a, cfg=chosen, **k)
                 return y, (tuple(array_leaves), res)
 
             def bwd_arrays(payload, dy):
                 """Backward rule: rebuild args/kwargs, call kernel.vjp, and map grads to array inputs."""
                 array_leaves, res = payload
-                (a, k) = _restore_args_kwargs(array_leaves)
+                a, k = _restore_args_kwargs(array_leaves)
 
                 grads = vjp_method(res, dy, *a, cfg=chosen, **k)
                 if isinstance(grads, dict):
@@ -561,6 +561,7 @@ class Executor(Generic[Cfg, Out]):
                 flat_call, _ = jtu.tree_flatten((a, k))
                 array_in = [x for x, m in zip(flat_call, is_arr, strict=False) if m]
                 return g(*array_in)
+
         else:
             run_method = _get_platform_method(kernel, "run", platform, context) or kernel.run
 

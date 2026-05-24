@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,8 +39,7 @@ import pytest  # noqa
 
 
 def test_importing_ejkernel_tree_does_not_trigger_jax_backend_init():
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import importlib
         import jax._src.xla_bridge as xb
 
@@ -72,8 +71,7 @@ def test_importing_ejkernel_tree_does_not_trigger_jax_backend_init():
 
         from ejkernel import benchmarks, callib, errors, kernels, loggings, modules  # noqa: F401
         _assert_not_initialized("from ejkernel import benchmarks/callib/errors/kernels/loggings/modules")
-        """
-    )
+        """)
 
     proc = subprocess.run(
         [sys.executable, "-c", script],

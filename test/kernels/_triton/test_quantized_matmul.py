@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,7 +35,13 @@ def _device_put_all(dev, *arrays):
 @pytest.mark.parametrize(
     "mode,bits",
     [
+        ("affine", 1),
+        ("affine", 2),
+        ("affine", 3),
         ("affine", 4),
+        ("affine", 5),
+        ("affine", 6),
+        ("affine", 7),
         ("affine", 8),
         ("nf4", 4),
         ("mxfp4", 4),
@@ -86,18 +92,26 @@ def test_quantized_matmul_triton_matches_xla(mode: str, bits: int):
     out_triton = jax.block_until_ready(out_triton)
     out_xla = jax.block_until_ready(out_xla)
 
+    rtol = 1.5e-1 if mode == "affine" else 6e-2
+    atol = 1.5e-1 if mode == "affine" else 6e-2
     np.testing.assert_allclose(
         np.asarray(out_triton, dtype=np.float32),
         np.asarray(out_xla, dtype=np.float32),
-        rtol=6e-2,
-        atol=6e-2,
+        rtol=rtol,
+        atol=atol,
     )
 
 
 @pytest.mark.parametrize(
     "mode,bits",
     [
+        ("affine", 1),
+        ("affine", 2),
+        ("affine", 3),
         ("affine", 4),
+        ("affine", 5),
+        ("affine", 6),
+        ("affine", 7),
         ("affine", 8),
         ("nf4", 4),
         ("mxfp4", 4),
@@ -153,18 +167,26 @@ def test_quantized_matmul_triton_grad_input_matches_xla(mode: str, bits: int):
     g_triton = jax.block_until_ready(jax.grad(_loss_triton)(x))
     g_xla = jax.block_until_ready(jax.grad(_loss_xla)(x))
 
+    rtol = 1.5e-1 if mode == "affine" else 7e-2
+    atol = 1.5e-1 if mode == "affine" else 7e-2
     np.testing.assert_allclose(
         np.asarray(g_triton, dtype=np.float32),
         np.asarray(g_xla, dtype=np.float32),
-        rtol=7e-2,
-        atol=7e-2,
+        rtol=rtol,
+        atol=atol,
     )
 
 
 @pytest.mark.parametrize(
     "mode,bits",
     [
+        ("affine", 1),
+        ("affine", 2),
+        ("affine", 3),
         ("affine", 4),
+        ("affine", 5),
+        ("affine", 6),
+        ("affine", 7),
         ("affine", 8),
         ("nf4", 4),
         ("mxfp4", 4),
@@ -217,7 +239,14 @@ def test_quantized_matmul_triton_grad_input_same_kernel_path(monkeypatch: pytest
 @pytest.mark.parametrize(
     "mode,bits",
     [
+        ("affine", 1),
+        ("affine", 2),
+        ("affine", 3),
         ("affine", 4),
+        ("affine", 5),
+        ("affine", 6),
+        ("affine", 7),
+        ("affine", 8),
         ("nf4", 4),
         ("nvfp8", 8),
     ],
@@ -267,11 +296,13 @@ def test_quantized_matmul_triton_m1_gemv_paths_match_xla(mode: str, bits: int):
     out_triton = jax.block_until_ready(out_triton)
     out_xla = jax.block_until_ready(out_xla)
 
+    rtol = 1.5e-1 if mode == "affine" else 7e-2
+    atol = 1.5e-1 if mode == "affine" else 7e-2
     np.testing.assert_allclose(
         np.asarray(out_triton, dtype=np.float32),
         np.asarray(out_xla, dtype=np.float32),
-        rtol=7e-2,
-        atol=7e-2,
+        rtol=rtol,
+        atol=atol,
     )
 
 

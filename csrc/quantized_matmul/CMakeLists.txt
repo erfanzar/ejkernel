@@ -1,3 +1,17 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 cmake_minimum_required(VERSION 3.21)
 project(ejkernel_quantized_matmul LANGUAGES CXX CUDA)
 
@@ -27,7 +41,7 @@ if(NOT EJKERNEL_CUTLASS_INCLUDE)
   set(EJKERNEL_CUTLASS_INCLUDE "${CUTLASS_ROOT}/include")
 endif()
 file(GLOB QMM_DEQUANT_SOURCES "${QMM_SRC_DIR}/qmm_dequant_*.cu")
-list(FILTER QMM_DEQUANT_SOURCES EXCLUDE REGEX "qmm_dequant_affine_bits(2|3|5|6|7)_.*\\.cu$")
+list(FILTER QMM_DEQUANT_SOURCES EXCLUDE REGEX "qmm_dequant_affine_bits(1|2|3|5|6|7)_.*\\.cu$")
 set(QMM_SOURCES
   "${QMM_SRC_DIR}/qmm_cuda.cu"
   ${QMM_DEQUANT_SOURCES}

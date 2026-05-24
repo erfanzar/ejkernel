@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -155,9 +155,9 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         logits_soft_cap: float | None = None,
         qkv_layouts: tuple["SparseMask"] | None = None,
         softmax_scale: float | None = None,
-        mask_builder: typing.Callable[[int, int, int, int, int], "Mask"]
-        | typing.Callable[[], "SparseMask"]
-        | None = None,
+        mask_builder: (
+            typing.Callable[[int, int, int, int, int], "Mask"] | typing.Callable[[], "SparseMask"] | None
+        ) = None,
         sliding_window: int | tuple[int, int] | None = None,
         chunk_size: int | None = None,
         causal: bool = True,
@@ -277,18 +277,18 @@ class BlockSparseAttention(Kernel[BlockSparseAttentionConfig, Array]):
         logits_soft_cap: float | None = None,
         qkv_layouts: tuple["SparseMask"] | None = None,
         softmax_scale: float | None = None,
-        mask_builder: typing.Callable[[int, int, int, int, int], "Mask"]
-        | typing.Callable[[], "SparseMask"]
-        | None = None,
+        mask_builder: (
+            typing.Callable[[int, int, int, int, int], "Mask"] | typing.Callable[[], "SparseMask"] | None
+        ) = None,
         sliding_window: int | tuple[int, int] | None = None,
         chunk_size: int | None = None,
         causal: bool = True,
         fused_backward: bool = False,
         platform: typing.Literal["triton", "pallas", "cuda", "tilelang", "xla", "auto", "cute"] | None = None,
         *,
-        attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
-        | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
-        | None = None,
+        attention_mask: (
+            Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | Int[Array, "batch num_heads_or_1 seq_len kv_len"] | None
+        ) = None,
         cfg: BlockSparseAttentionConfig,
     ) -> Float[Array, "batch num_heads seq_len vhead_dim"]:
         """Execute block-sparse attention with the given configuration.
@@ -873,9 +873,9 @@ def blocksparse_attention(
     bias: Float[Array, "batch num_heads seq_len kv_len"] | None = None,
     *,
     mask_info: MaskInfo | None = None,
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len kv_len"]
-    | Int[Array, "batch num_heads_or_1 seq_len kv_len"]
-    | None = None,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len kv_len"] | Int[Array, "batch num_heads_or_1 seq_len kv_len"] | None
+    ) = None,
     sequence_parallelism_mesh_axis_name: str | None = None,
     logits_soft_cap: float | None = None,
     qkv_layouts: tuple["SparseMask"] | None = None,

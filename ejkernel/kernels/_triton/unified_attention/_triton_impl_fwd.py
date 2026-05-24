@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -129,7 +129,7 @@ def _find_seq_idx(
     Returns:
         The 0-based sequence index that contains ``target_idx``.
     """
-    left: tl.int32 = 0  # type:ignore
+    left: tl.int32 = 0  # type: ignore
     right = num_seqs
     while left < right:
         mid = (left + right) // 2

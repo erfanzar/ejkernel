@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 """Quantization functions for weight compression.
 
 Supported quantization modes:
-- ``affine`` with bits in ``{1, 2, 4, 8}``
+- ``affine`` with bits in ``{1, 2, 3, 4, 5, 6, 7, 8}``
 - ``nf4`` (4-bit normal-float codebook)
 - ``mxfp4`` / ``mxfp8``
 - ``nvfp4`` / ``nvfp8``
@@ -463,7 +463,7 @@ def _pack_group_codes(
 
     Returns:
         Packed uint32 array of shape
-        ``(*w_layout.shape[:-1], ceil(n_values / (32 // bits)))``.
+        ``(*w_layout.shape[:-1], ceil(n_values * bits / 32))``.
     """
     return _pack_bits(
         q.reshape(*w_layout.shape[:-1], -1),
@@ -1117,7 +1117,6 @@ def quantize(
     if mode in {"mxfp4", "mxfp8"}:
         return _quantize_mxfp(w_layout, w_groups, bits=bits, runtime_cfg=runtime_cfg)
 
-    # mode in {"nvfp4", "nvfp8"}
     return _quantize_nvfp(w_layout, w_groups, bits=bits, runtime_cfg=runtime_cfg)
 
 
@@ -1182,39 +1181,12 @@ def dequantize(
     if mode == "affine":
         if zeros is None:
             raise ValueError("affine dequantize requires `zeros`.")
-        if bits == 1:
-            return _dequantize_affine_bits(
-                w_q,
-                scales,
-                zeros,
-                group_size=group_size,
-                bits=1,
-                runtime_cfg=runtime_cfg,
-            )
-        if bits == 2:
-            return _dequantize_affine_bits(
-                w_q,
-                scales,
-                zeros,
-                group_size=group_size,
-                bits=2,
-                runtime_cfg=runtime_cfg,
-            )
-        if bits == 4:
-            return _dequantize_affine_bits(
-                w_q,
-                scales,
-                zeros,
-                group_size=group_size,
-                bits=4,
-                runtime_cfg=runtime_cfg,
-            )
         return _dequantize_affine_bits(
             w_q,
             scales,
             zeros,
             group_size=group_size,
-            bits=8,
+            bits=bits,
             runtime_cfg=runtime_cfg,
         )
 
@@ -1243,7 +1215,6 @@ def dequantize(
             runtime_cfg=runtime_cfg,
         )
 
-    # mode in {"nvfp4", "nvfp8"}
     if bits == 4:
         return _dequantize_nvfp_bits(
             w_q,

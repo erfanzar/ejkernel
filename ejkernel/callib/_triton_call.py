@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -528,8 +528,8 @@ class CompilationResult:
 
 def compile_ttir_inplace(
     ttir,
-    backend: [cb.CUDABackend | hb.HIPBackend],  # type:ignore
-    options: [cb.CUDAOptions | hb.HIPOptions],  # type:ignore
+    backend: [cb.CUDABackend | hb.HIPBackend],  # type: ignore
+    options: [cb.CUDAOptions | hb.HIPOptions],  # type: ignore
     compute_capability,
     platform,
 ):
@@ -638,8 +638,8 @@ def compile_ttir_to_ptx_inplace(
 
 def compile_ttir_to_hsaco_inplace(
     ttir,
-    hip_backend: hb.HIPBackend,  # type:ignore
-    hip_options: hb.HIPOptions,  # type:ignore
+    hip_backend: hb.HIPBackend,  # type: ignore
+    hip_options: hb.HIPOptions,  # type: ignore
     compute_capability,
 ) -> CompilationResult:
     """Compile Triton IR to HSACO binary for AMD ROCm devices.
@@ -898,7 +898,7 @@ def _save_triton_kernel_cache(
     os.replace(tmp_path, cache_path)
 
 
-_COMPILED_KERNEL_CACHE: OrderedDict[str, triton_kernel_call_lib.TritonKernel] = OrderedDict()  # type:ignore
+_COMPILED_KERNEL_CACHE: OrderedDict[str, triton_kernel_call_lib.TritonKernel] = OrderedDict()  # type: ignore
 
 
 def _lru_get(cache: OrderedDict, key: str):
@@ -949,7 +949,7 @@ def get_or_create_triton_kernel(
     enable_fp_fusion,
     metaparams,
     dump: bool,
-) -> tuple[triton_kernel_call_lib.TritonKernel, Any]:  # type:ignore
+) -> tuple[triton_kernel_call_lib.TritonKernel, Any]:  # type: ignore
     """Get or create a compiled Triton kernel with caching.
 
     Args:

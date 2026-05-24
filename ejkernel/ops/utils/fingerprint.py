@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -121,7 +121,7 @@ def default_key_builder_with_sharding(inv) -> str:
     return short_hash(spec)
 
 
-def device_fingerprint(dev: jax.Device | None = None) -> str:  # type:ignore
+def device_fingerprint(dev: jax.Device | None = None) -> str:  # type: ignore
     """Generate a stable identifier for a JAX device including platform version.
 
     Creates a unique, stable identifier for JAX devices that includes both the
@@ -152,7 +152,7 @@ def device_fingerprint(dev: jax.Device | None = None) -> str:  # type:ignore
     return f"{kind}|{plat_ver}"
 
 
-def get_device_platform(dev: jax.Device | None = None) -> str:  # type:ignore
+def get_device_platform(dev: jax.Device | None = None) -> str:  # type: ignore
     """Extract the platform identifier (gpu/tpu/cpu) from a JAX device.
 
     Args:

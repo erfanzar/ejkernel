@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -379,7 +379,7 @@ class Tuner(Generic[Cfg]):
 
             def core(*arrs):
                 """Reconstruct args/kwargs from array leaves and call the target function."""
-                (aa, kk) = _restore_args_kwargs(arrs)
+                aa, kk = _restore_args_kwargs(arrs)
                 return fn(*aa, **kk)
 
             if jitted:
@@ -458,7 +458,7 @@ class Tuner(Generic[Cfg]):
             def loss(theta, nondiff):
                 """Compute scalar loss for backward pass validation timing."""
                 arrs = _merge(theta, nondiff)
-                (aa, kk) = _restore_args_kwargs(arrs)
+                aa, kk = _restore_args_kwargs(arrs)
                 y = fn(*aa, **kk)
                 return _scalarize_output(y)
 

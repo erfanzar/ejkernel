@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -646,7 +646,7 @@ def _process_mask(
 
     for mask_id, unique_mask in enumerate(unique_masks):
         for coords in np.ndindex((q_blocks_count, kv_blocks_count)):
-            (q_index, kv_index) = coords
+            q_index, kv_index = coords
             chunk = unique_mask[
                 (
                     slice(q_index * q_block_size, (q_index + 1) * q_block_size),

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 # Copyright 2025 DeepMind Technologies Limited (modified from original tokamax implementation).
 # (we dont use their splash impl as is, but modified our splash for ring attention)
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -303,7 +303,7 @@ def _ring_attention_backward(
     Returns:
         Tuple of (dq, dk, dv, dsinks) gradients.
     """
-    (q, k, v, segment_ids, sinks, out, logsumexp, _fwd_mask_info, dq_mask_info, dkv_mask_info) = res
+    q, k, v, segment_ids, sinks, out, logsumexp, _fwd_mask_info, dq_mask_info, dkv_mask_info = res
     do_main = do.astype(jnp.float32)
 
     ring_axis_size = lax.psum(1, ring_axis)

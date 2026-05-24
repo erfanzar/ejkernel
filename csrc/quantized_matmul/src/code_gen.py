@@ -1,3 +1,17 @@
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Generate quantized matmul dequantization instantiation stubs.
 
 This script emits per-mode CUDA wrapper files and a dispatch header.
@@ -22,16 +36,16 @@ DTYPE_SUFFIX = {
     "bf16": "BF16",
 }
 
-AFFINE_BITS = (4, 8)
+AFFINE_BITS = tuple(range(1, 9))
 AFFINE_DTYPES = ("f32", "f16", "bf16")
 
 NF4_DTYPES = ("f32", "f16", "bf16")
 
 MXFP_GROUP_SIZE = 32
 NVFP_GROUP_SIZE = 16
-GROUP_SIZES = list(range(8, 1025))
+AFFINE_NF4_GROUP_SIZES = (16, 32, 64, 128, 256, 512, 1024)
 
-PRELUDE = """// Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+PRELUDE = """// Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 //
 // Licensed under the Apache License, Version 2.0 (the \"License\");
 // you may not use this file except in compliance with the License.
@@ -178,7 +192,7 @@ class Kernel:
         """Render the full C++ source file content for this kernel."""
         if self.kind == "affine":
             gs_wrappers = []
-            for group_size in GROUP_SIZES:
+            for group_size in AFFINE_NF4_GROUP_SIZES:
                 gs_wrappers.append(
                     f"void {self.gs_func_name(group_size)}({self.signature()}) {{\n"
                     "  (void)group_size;\n"
@@ -196,7 +210,7 @@ class Kernel:
             )
         if self.kind == "nf4":
             gs_wrappers = []
-            for group_size in GROUP_SIZES:
+            for group_size in AFFINE_NF4_GROUP_SIZES:
                 gs_wrappers.append(
                     f"void {self.gs_func_name(group_size)}({self.signature()}) {{\n"
                     "  (void)group_size;\n"
@@ -275,7 +289,7 @@ def _render_dispatch_header(kernels: list[Kernel]) -> str:
     for kernel in kernels:
         lines.append(f"void {kernel.func_name}({kernel.signature()});\n")
         if kernel.kind in ("affine", "nf4"):
-            for group_size in GROUP_SIZES:
+            for group_size in AFFINE_NF4_GROUP_SIZES:
                 lines.append(f"void {kernel.gs_func_name(group_size)}({kernel.signature()});\n")
     lines.append("\n")
     lines.append("using DequantAffineF32Fn = void (*)(")
@@ -329,7 +343,7 @@ def _render_dispatch_header(kernels: list[Kernel]) -> str:
                 ret = "DequantNf4BF16Fn"
         lines.append(f"inline {ret} Resolve{kernel.func_name}(int64_t group_size) {{\n")
         lines.append("  switch (group_size) {\n")
-        for group_size in GROUP_SIZES:
+        for group_size in AFFINE_NF4_GROUP_SIZES:
             lines.append(f"  case {group_size}: return &{kernel.gs_func_name(group_size)};\n")
         lines.append(f"  default: return &{kernel.func_name};\n")
         lines.append("  }\n")

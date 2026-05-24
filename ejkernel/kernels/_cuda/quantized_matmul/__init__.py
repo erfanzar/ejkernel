@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ entry point, which performs matrix multiplication between a float input tensor a
 packed quantized weights using a custom CUDA kernel invoked via JAX FFI.
 
 Supported quantization modes:
-    - **affine**: Grouped affine quantization with bits in {4, 8}.
+    - **affine**: Grouped affine quantization with bits from 1 through 8.
     - **nf4**: 4-bit NormalFloat codebook quantization.
     - **mxfp4/mxfp8**: Microscaling FP4/FP8 modes (group size 32).
     - **nvfp4/nvfp8**: NVIDIA FP4/FP8 modes (group size 16).

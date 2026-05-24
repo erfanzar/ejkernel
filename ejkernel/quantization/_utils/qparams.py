@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -103,8 +103,10 @@ def resolve_qparams(
     the rules for the chosen quantization mode.
 
     Mode-specific rules:
-        - affine: bits in {1, 2, 4, 8} (default 4), group_size in {16, 32, 64, 128, 256, 512, 1024} (default 64).
-        - nf4: bits fixed to 4, group_size in {16, 32, 64, 128, 256, 512, 1024} (default 64).
+        - affine: bits in {1, 2, 3, 4, 5, 6, 7, 8} (default 4),
+          group_size in {16, 32, 64, 128, 256, 512, 1024} (default 64).
+        - nf4: bits fixed to 4, group_size in
+          {16, 32, 64, 128, 256, 512, 1024} (default 64).
         - mxfp4 / mxfp8: bits fixed to 4 or 8 respectively, group_size must be 32.
         - nvfp4 / nvfp8: bits fixed to 4 or 8 respectively, group_size must be 16.
 
@@ -123,7 +125,7 @@ def resolve_qparams(
     mode, bits, used_legacy = normalize_mode_and_bits(mode, bits)
 
     if mode == "affine":
-        bits = 4 if bits is None else _require_bits(bits, {1, 2, 4, 8})
+        bits = 4 if bits is None else _require_bits(bits, set(range(1, 9)))
         group_size = 64 if group_size is None else int(group_size)
         if group_size not in AFFINE_NF4_GROUP_SIZES:
             raise ValueError("affine mode supports group_size in {16,32,64,128,256,512,1024}.")
@@ -234,7 +236,7 @@ def normalize_revsplitk_parts(parts: int | None) -> int | None:
 def is_effective_4bit_mode(mode: QuantizationMode, bits: int) -> bool:
     """Check whether the effective runtime quantization is 4-bit.
 
-    For affine mode, the bit-width is user-configurable and may be 1, 2, 4, or 8.
+    For affine mode, the bit-width is user-configurable from 1 through 8.
     For other modes, the effective bit-width is determined by the mode name
     (e.g., nf4, mxfp4, nvfp4 are all 4-bit).
 
@@ -320,7 +322,6 @@ def select_qmm_kernel_family(
     if revsplit_k_n == "off":
         return "gemv_splitk", None
 
-    # auto
     if is_4bit:
         if revsplit_k_parts_n is None:
             return "gemv_revsplitk", 2
@@ -410,11 +411,10 @@ def validate_packed_quantized_matmul_layout(
     fused kernels where layout mismatches can silently trigger slow fallbacks.
 
     Canonical runtime contract:
-      - ``axis='row'`` (``transpose=False``): ``w_q`` is ``(K, ceil(N / vpw))``,
+      - ``axis='row'`` (``transpose=False``): ``w_q`` is ``(K, ceil(N * bits / 32))``,
         ``scales``/``zeros`` are ``(K, N // group_size)``.
-      - ``axis='col'`` (``transpose=True``): ``w_q`` is ``(N, ceil(K / vpw))``,
+      - ``axis='col'`` (``transpose=True``): ``w_q`` is ``(N, ceil(K * bits / 32))``,
         ``scales``/``zeros`` are ``(N, K // group_size)``.
-    where ``vpw = 32 // bits`` (values per uint32 word).
 
     Args:
         x: Activation array with ``x.shape[-1] == K``.
@@ -456,9 +456,8 @@ def validate_packed_quantized_matmul_layout(
         raise ValueError(f"group_size must be > 0, got {group_size}.")
     if bits <= 0:
         raise ValueError(f"bits must be > 0, got {bits}.")
-    values_per_word = 32 // bits
-    if values_per_word <= 0:
-        raise ValueError(f"Invalid bits={bits}: values_per_word={values_per_word}.")
+    if bits > 32:
+        raise ValueError(f"Invalid bits={bits}: bit-width must be <= 32.")
 
     x_shape = getattr(x, "shape", None)
     w_shape = getattr(w_q, "shape", None)
@@ -519,31 +518,24 @@ def validate_packed_quantized_matmul_layout(
                 f"x.shape={tuple(x_shape)} w_q.shape={tuple(w_shape)} scales.shape={tuple(s_shape)}."
             )
         N = int(s_shape[1]) * group_size
-        exp_words = _ceil_div(N, values_per_word)
+        exp_words = _ceil_div(N * bits, 32)
         if int(w_shape[1]) != exp_words:
             raise ValueError(
-                "Packed layout mismatch for axis='row': expected w_q.shape[1] == ceil(N/values_per_word). "
+                "Packed layout mismatch for axis='row': expected w_q.shape[1] == ceil(N * bits / 32). "
                 f"got w_q.shape[1]={int(w_shape[1])}, expected={exp_words}, "
-                f"N={N}, values_per_word={values_per_word}."
+                f"N={N}, bits={bits}."
             )
         return K, N
 
-    # axis == "col"
-    if int(s_shape[1]) * group_size != K:
-        raise ValueError(
-            "Packed layout mismatch for axis='col': expected scales.shape[1] * group_size == K. "
-            f"scales.shape={tuple(s_shape)} group_size={group_size} x.shape={tuple(x_shape)}."
-        )
-    exp_words = _ceil_div(K, values_per_word)
-    if int(w_shape[1]) != exp_words:
-        raise ValueError(
-            "Packed layout mismatch for axis='col': expected w_q.shape[1] == ceil(K/values_per_word). "
-            f"got w_q.shape[1]={int(w_shape[1])}, expected={exp_words}, "
-            f"K={K}, values_per_word={values_per_word}."
-        )
-    if int(w_shape[0]) != int(s_shape[0]):
-        raise ValueError(
-            "Packed layout mismatch for axis='col': expected w_q.shape[0] == scales.shape[0] (N). "
-            f"w_q.shape={tuple(w_shape)} scales.shape={tuple(s_shape)}."
-        )
-    return K, int(w_shape[0])
+    exp_words = _ceil_div(K * bits, 32)
+    if int(s_shape[1]) * group_size == K and int(w_shape[1]) == exp_words and int(w_shape[0]) == int(s_shape[0]):
+        return K, int(w_shape[0])
+    if int(s_shape[0]) * group_size == K and int(w_shape[0]) == exp_words and int(w_shape[1]) == int(s_shape[1]):
+        return K, int(w_shape[1])
+    raise ValueError(
+        "Packed layout mismatch for axis='col': expected either "
+        "w_q.shape=(N, ceil(K * bits / 32)), scales.shape=(N, K/group_size) "
+        "or k-major w_q.shape=(ceil(K * bits / 32), N), scales.shape=(K/group_size, N). "
+        f"x.shape={tuple(x_shape)} w_q.shape={tuple(w_shape)} scales.shape={tuple(s_shape)} "
+        f"group_size={group_size} bits={bits} expected_words={exp_words}."
+    )

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -137,6 +137,19 @@ def _decode_q_values(
 
 
 @triton.jit
+def _unpack_packed_codes(word0, word1, shifts, BITS: tl.constexpr):
+    """Decode packed uint32 codes for arbitrary affine bit-widths."""
+    low_bits = tl.minimum(32 - shifts, BITS)
+    high_bits = BITS - low_bits
+    one = tl.full(shifts.shape, 1, tl.uint32)
+    low_mask = (one << low_bits) - 1
+    high_mask = (one << high_bits) - 1
+    low = (word0 >> shifts) & low_mask
+    high = word1 & high_mask
+    return low | (high << low_bits)
+
+
+@triton.jit
 def _qmm_gemv_splitk_kernel(
     X,
     Wq,
@@ -159,6 +172,7 @@ def _qmm_gemv_splitk_kernel(
     stride_on: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     VALUES_PER_WORD: tl.constexpr,
+    BITS: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -193,8 +207,8 @@ def _qmm_gemv_splitk_kernel(
         stride_wb0, stride_wb1: Strides of Wbias.
         stride_on: Stride of O along N.
         GROUP_SIZE: Quantization group size.
-        VALUES_PER_WORD: Number of quantized values packed per uint32 word
-            (8 for 4-bit, 4 for 8-bit).
+        VALUES_PER_WORD: Legacy packed values-per-word hint.
+        BITS: Quantized bits per code.
         BN: Output tile width.
         BK: Reduction tile width.
         SPLIT_K: Number of split-K partitions.
@@ -208,19 +222,15 @@ def _qmm_gemv_splitk_kernel(
     offs_n = pid_n * BN + tl.arange(0, BN)
     n_mask = offs_n < N
 
-    if VALUES_PER_WORD == 8:
-        q_bits = 4
-        q_mask = 0xF
-    else:
-        q_bits = 8
-        q_mask = 0xFF
-
     acc = tl.zeros((BN,), dtype=tl.float32)
 
     if not TRANSPOSE:
-        word_offsets_n = offs_n // VALUES_PER_WORD
-        word_mask_n = word_offsets_n < tl.cdiv(N, VALUES_PER_WORD)
-        shifts_n = (offs_n % VALUES_PER_WORD) * q_bits
+        bit_offsets_n = offs_n * BITS
+        word_offsets_n = bit_offsets_n // 32
+        shifts_n = bit_offsets_n - word_offsets_n * 32
+        n_words = tl.cdiv(N * BITS, 32)
+        word_mask_n = word_offsets_n < n_words
+        word_offsets_n1 = tl.minimum(word_offsets_n + 1, n_words - 1)
         group_idx_n = offs_n // GROUP_SIZE
 
     for k0 in tl.range(0, K, BK * SPLIT_K, loop_unroll_factor=1):
@@ -230,15 +240,24 @@ def _qmm_gemv_splitk_kernel(
         x_vals = tl.load(X + offs_k * stride_xk, mask=k_mask, other=0.0).to(tl.float32)
 
         if TRANSPOSE:
-            word_offsets_k = offs_k // VALUES_PER_WORD
-            shifts_k = (offs_k % VALUES_PER_WORD) * q_bits
+            bit_offsets_k = offs_k * BITS
+            word_offsets_k = bit_offsets_k // 32
+            shifts_k = bit_offsets_k - word_offsets_k * 32
+            n_words = tl.cdiv(K * BITS, 32)
+            word_mask_k = word_offsets_k < n_words
+            word_offsets_k1 = tl.minimum(word_offsets_k + 1, n_words - 1)
 
-            w_word = tl.load(
+            w_word0 = tl.load(
                 Wq + offs_n[:, None] * stride_wq0 + word_offsets_k[None, :] * stride_wq1,
-                mask=n_mask[:, None] & k_mask[None, :],
+                mask=n_mask[:, None] & k_mask[None, :] & word_mask_k[None, :],
                 other=0,
             )
-            q = (w_word >> shifts_k[None, :]) & q_mask
+            w_word1 = tl.load(
+                Wq + offs_n[:, None] * stride_wq0 + word_offsets_k1[None, :] * stride_wq1,
+                mask=n_mask[:, None] & k_mask[None, :] & word_mask_k[None, :],
+                other=0,
+            )
+            q = _unpack_packed_codes(w_word0, w_word1, shifts_k[None, :], BITS)
             group_idx_k = offs_k // GROUP_SIZE
             ws = tl.load(
                 Wscale + offs_n[:, None] * stride_ws0 + group_idx_k[None, :] * stride_ws1,
@@ -267,12 +286,17 @@ def _qmm_gemv_splitk_kernel(
             )
             acc += tl.sum(w_vals * x_vals[None, :], axis=1)
         else:
-            w_word = tl.load(
+            w_word0 = tl.load(
                 Wq + offs_k[:, None] * stride_wq0 + word_offsets_n[None, :] * stride_wq1,
                 mask=k_mask[:, None] & n_mask[None, :] & word_mask_n[None, :],
                 other=0,
             )
-            q = (w_word >> shifts_n[None, :]) & q_mask
+            w_word1 = tl.load(
+                Wq + offs_k[:, None] * stride_wq0 + word_offsets_n1[None, :] * stride_wq1,
+                mask=k_mask[:, None] & n_mask[None, :] & word_mask_n[None, :],
+                other=0,
+            )
+            q = _unpack_packed_codes(w_word0, w_word1, shifts_n[None, :], BITS)
             ws = tl.load(
                 Wscale + offs_k[:, None] * stride_ws0 + group_idx_n[None, :] * stride_ws1,
                 mask=k_mask[:, None] & n_mask[None, :],
@@ -330,6 +354,7 @@ def _qmm_gemv_revsplitk_kernel(
     stride_on: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     VALUES_PER_WORD: tl.constexpr,
+    BITS: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
     REV_PARTS: tl.constexpr,
@@ -376,38 +401,42 @@ def _qmm_gemv_revsplitk_kernel(
     offs_n = pid_n * BN + tl.arange(0, BN)
     n_mask = offs_n < N
 
-    if VALUES_PER_WORD == 8:
-        q_bits = 4
-        q_mask = 0xF
-    else:
-        q_bits = 8
-        q_mask = 0xFF
-
     acc = tl.zeros((BN,), dtype=tl.float32)
 
     if not TRANSPOSE:
-        word_offsets_n = offs_n // VALUES_PER_WORD
-        word_mask_n = word_offsets_n < tl.cdiv(N, VALUES_PER_WORD)
-        shifts_n = (offs_n % VALUES_PER_WORD) * q_bits
+        bit_offsets_n = offs_n * BITS
+        word_offsets_n = bit_offsets_n // 32
+        shifts_n = bit_offsets_n - word_offsets_n * 32
+        n_words = tl.cdiv(N * BITS, 32)
+        word_mask_n = word_offsets_n < n_words
+        word_offsets_n1 = tl.minimum(word_offsets_n + 1, n_words - 1)
         group_idx_n = offs_n // GROUP_SIZE
 
     # GemLite-style reverse split-K: each program processes two split parts.
     for k0 in tl.range(0, K, BK * REV_PARTS, loop_unroll_factor=1):
         offs_k0 = k0 + pid_k2 * BK + tl.arange(0, BK)
         offs_k1 = k0 + (pid_k2 + 1) * BK + tl.arange(0, BK)
-        # pass 0
         k_mask0 = offs_k0 < K
         x_vals0 = tl.load(X + offs_k0 * stride_xk, mask=k_mask0, other=0.0).to(tl.float32)
 
         if TRANSPOSE:
-            word_offsets_k0 = offs_k0 // VALUES_PER_WORD
-            shifts_k0 = (offs_k0 % VALUES_PER_WORD) * q_bits
-            w_word0 = tl.load(
+            bit_offsets_k0 = offs_k0 * BITS
+            word_offsets_k0 = bit_offsets_k0 // 32
+            shifts_k0 = bit_offsets_k0 - word_offsets_k0 * 32
+            n_words = tl.cdiv(K * BITS, 32)
+            word_mask_k0 = word_offsets_k0 < n_words
+            word_offsets_k01 = tl.minimum(word_offsets_k0 + 1, n_words - 1)
+            w_word00 = tl.load(
                 Wq + offs_n[:, None] * stride_wq0 + word_offsets_k0[None, :] * stride_wq1,
-                mask=n_mask[:, None] & k_mask0[None, :],
+                mask=n_mask[:, None] & k_mask0[None, :] & word_mask_k0[None, :],
                 other=0,
             )
-            q0 = (w_word0 >> shifts_k0[None, :]) & q_mask
+            w_word01 = tl.load(
+                Wq + offs_n[:, None] * stride_wq0 + word_offsets_k01[None, :] * stride_wq1,
+                mask=n_mask[:, None] & k_mask0[None, :] & word_mask_k0[None, :],
+                other=0,
+            )
+            q0 = _unpack_packed_codes(w_word00, w_word01, shifts_k0[None, :], BITS)
             group_idx_k0 = offs_k0 // GROUP_SIZE
             ws0 = tl.load(
                 Wscale + offs_n[:, None] * stride_ws0 + group_idx_k0[None, :] * stride_ws1,
@@ -436,12 +465,17 @@ def _qmm_gemv_revsplitk_kernel(
             )
             acc += tl.sum(w_vals0 * x_vals0[None, :], axis=1)
         else:
-            w_word0 = tl.load(
+            w_word00 = tl.load(
                 Wq + offs_k0[:, None] * stride_wq0 + word_offsets_n[None, :] * stride_wq1,
                 mask=k_mask0[:, None] & n_mask[None, :] & word_mask_n[None, :],
                 other=0,
             )
-            q0 = (w_word0 >> shifts_n[None, :]) & q_mask
+            w_word01 = tl.load(
+                Wq + offs_k0[:, None] * stride_wq0 + word_offsets_n1[None, :] * stride_wq1,
+                mask=k_mask0[:, None] & n_mask[None, :] & word_mask_n[None, :],
+                other=0,
+            )
+            q0 = _unpack_packed_codes(w_word00, w_word01, shifts_n[None, :], BITS)
             ws0 = tl.load(
                 Wscale + offs_k0[:, None] * stride_ws0 + group_idx_n[None, :] * stride_ws1,
                 mask=k_mask0[:, None] & n_mask[None, :],
@@ -469,19 +503,27 @@ def _qmm_gemv_revsplitk_kernel(
             )
             acc += tl.sum(w_vals0 * x_vals0[:, None], axis=0)
 
-        # pass 1
         k_mask1 = offs_k1 < K
         x_vals1 = tl.load(X + offs_k1 * stride_xk, mask=k_mask1, other=0.0).to(tl.float32)
 
         if TRANSPOSE:
-            word_offsets_k1 = offs_k1 // VALUES_PER_WORD
-            shifts_k1 = (offs_k1 % VALUES_PER_WORD) * q_bits
-            w_word1 = tl.load(
+            bit_offsets_k1 = offs_k1 * BITS
+            word_offsets_k1 = bit_offsets_k1 // 32
+            shifts_k1 = bit_offsets_k1 - word_offsets_k1 * 32
+            n_words = tl.cdiv(K * BITS, 32)
+            word_mask_k1 = word_offsets_k1 < n_words
+            word_offsets_k11 = tl.minimum(word_offsets_k1 + 1, n_words - 1)
+            w_word10 = tl.load(
                 Wq + offs_n[:, None] * stride_wq0 + word_offsets_k1[None, :] * stride_wq1,
-                mask=n_mask[:, None] & k_mask1[None, :],
+                mask=n_mask[:, None] & k_mask1[None, :] & word_mask_k1[None, :],
                 other=0,
             )
-            q1 = (w_word1 >> shifts_k1[None, :]) & q_mask
+            w_word11 = tl.load(
+                Wq + offs_n[:, None] * stride_wq0 + word_offsets_k11[None, :] * stride_wq1,
+                mask=n_mask[:, None] & k_mask1[None, :] & word_mask_k1[None, :],
+                other=0,
+            )
+            q1 = _unpack_packed_codes(w_word10, w_word11, shifts_k1[None, :], BITS)
             group_idx_k1 = offs_k1 // GROUP_SIZE
             ws1 = tl.load(
                 Wscale + offs_n[:, None] * stride_ws0 + group_idx_k1[None, :] * stride_ws1,
@@ -510,12 +552,17 @@ def _qmm_gemv_revsplitk_kernel(
             )
             acc += tl.sum(w_vals1 * x_vals1[None, :], axis=1)
         else:
-            w_word1 = tl.load(
+            w_word10 = tl.load(
                 Wq + offs_k1[:, None] * stride_wq0 + word_offsets_n[None, :] * stride_wq1,
                 mask=k_mask1[:, None] & n_mask[None, :] & word_mask_n[None, :],
                 other=0,
             )
-            q1 = (w_word1 >> shifts_n[None, :]) & q_mask
+            w_word11 = tl.load(
+                Wq + offs_k1[:, None] * stride_wq0 + word_offsets_n1[None, :] * stride_wq1,
+                mask=k_mask1[:, None] & n_mask[None, :] & word_mask_n[None, :],
+                other=0,
+            )
+            q1 = _unpack_packed_codes(w_word10, w_word11, shifts_n[None, :], BITS)
             ws1 = tl.load(
                 Wscale + offs_k1[:, None] * stride_ws0 + group_idx_n[None, :] * stride_ws1,
                 mask=k_mask1[:, None] & n_mask[None, :],
@@ -578,7 +625,7 @@ def quantized_matmul_triton_gemv(
         biases: Per-group bias tensor for affine mode; ``None`` otherwise.
         transpose: Weight layout flag.
         group_size: Quantization group size.
-        bits: Bits per quantized value (4 or 8).
+        bits: Bits per quantized value.
         mode: Quantization mode string (see ``_mode_to_id``).
         kernel_family: ``"gemv_splitk"`` or ``"gemv_revsplitk"``.
         split_k: Number of split-K partitions (``gemv_splitk`` only).
@@ -651,6 +698,7 @@ def quantized_matmul_triton_gemv(
             stride_on=stride_on,
             GROUP_SIZE=group_size,
             VALUES_PER_WORD=values_per_word,
+            BITS=bits,
             BN=bn,
             BK=32,
             SPLIT_K=split_k,
@@ -690,6 +738,7 @@ def quantized_matmul_triton_gemv(
         stride_on=stride_on,
         GROUP_SIZE=group_size,
         VALUES_PER_WORD=values_per_word,
+        BITS=bits,
         BN=bn,
         BK=32,
         REV_PARTS=rev_parts,

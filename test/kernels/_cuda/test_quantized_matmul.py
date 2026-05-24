@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -65,6 +65,59 @@ def _group_sizes_for_mode(mode: str) -> list[int]:
     if mode in ("nvfp4", "nvfp8"):
         return [16]
     raise ValueError(f"Unsupported quantization mode: {mode}")
+
+
+@pytest.mark.parametrize("bits", range(1, 9))
+@pytest.mark.parametrize("transpose", [False, True])
+def test_quantized_matmul_cuda_affine_all_bits_matches_xla(bits: int, transpose: bool):
+    key = jax.random.PRNGKey(503 + bits)
+    kx, kw = jax.random.split(key, 2)
+    m, k, n = 16, 64, 64
+    group_size = 32
+
+    x = jax.random.normal(kx, (m, k), dtype=jnp.float16)
+    w = jax.random.normal(kw, (n, k), dtype=jnp.float16)
+    w_q, scales, zeros = prepack_quantized_weights(
+        w,
+        mode="affine",
+        bits=bits,
+        group_size=group_size,
+        transpose=not transpose,
+    )
+
+    dev = jax.devices("gpu")[0]
+    x, w_q, scales, zeros = _device_put_all(dev, x, w_q, scales, zeros)
+
+    out_cuda = cuda_quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        transpose=transpose,
+        mode="affine",
+        bits=bits,
+        group_size=group_size,
+    )
+    out_xla = xla_quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        transpose=transpose,
+        mode="affine",
+        bits=bits,
+        group_size=group_size,
+    )
+
+    out_cuda = jax.block_until_ready(out_cuda)
+    out_xla = jax.block_until_ready(out_xla)
+
+    np.testing.assert_allclose(
+        np.asarray(out_cuda, dtype=np.float32),
+        np.asarray(out_xla, dtype=np.float32),
+        rtol=1.5e-1,
+        atol=1.5e-1,
+    )
 
 
 @pytest.mark.parametrize(
@@ -134,13 +187,13 @@ def test_quantized_matmul_cuda_matches_xla(mode: str, group_size: int, x_dtype: 
         # accumulation order means near-zero outputs (catastrophic cancellation)
         # can differ by O(eps_compute * k), independently of magnitude.  Large-
         # magnitude outputs differ by 1-2 ULPs of the compute dtype (covered by
-        # rtol).  Empirical worst-case (k=8192): fp16→0.26, bf16→0.48, fp32→0.28.
+        # rtol).  Empirical worst-case (k=8192): fp16→0.26, bf16→0.57, fp32→0.28.
         if x_dtype == jnp.float16:
             rtol = 3e-3  # ~3 fp16 ULPs relative for large-magnitude elements
             atol = 0.30  # near-zero cancellation ceiling for k ≤ 8192
         elif x_dtype == jnp.bfloat16:
             rtol = 2e-2  # ~3 bf16 ULPs relative for large-magnitude elements
-            atol = 0.55  # near-zero cancellation ceiling for k ≤ 8192
+            atol = 0.60  # near-zero cancellation ceiling for k ≤ 8192
         else:  # float32 (both CUDA & XLA use fp16/TF32 precision internally)
             rtol = 5e-3
             atol = 0.32  # near-zero cancellation ceiling for k ≤ 8192

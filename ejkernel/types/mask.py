@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -2052,9 +2052,7 @@ class MaskInfo:
         )
 
     @_debug_trace
-    def get_qkv_masks(
-        self, dtype: DTypeLike = jnp.bool_
-    ) -> tuple[
+    def get_qkv_masks(self, dtype: DTypeLike = jnp.bool_) -> tuple[
         Array,
         Array,
         Bool[Array, "batch nheads_or_1 qlen kvlen"] | Int[Array, "batch nheads_or_1 qlen kvlen"],
@@ -3330,8 +3328,8 @@ class MaskInfo:
 
         block_chars = {
             0: "  ",
-            1: (".." if charset == "ascii" else "░░"),
-            2: ("##" if charset == "ascii" else "██"),
+            1: ".." if charset == "ascii" else "░░",
+            2: "##" if charset == "ascii" else "██",
         }
         lines = ["".join(block_chars[int(v)] for v in cls[r]) for r in range(block_rows)]
 

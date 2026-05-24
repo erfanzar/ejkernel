@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -154,6 +154,44 @@ def _find_cutlass_include(repo_root: Path) -> Path:
     )
 
 
+def _cmake_cache_value(cache_path: Path, key: str) -> str | None:
+    """Read one string/filepath value from an existing CMake cache."""
+    if not cache_path.exists():
+        return None
+    prefix = f"{key}:"
+    try:
+        for line in cache_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith(prefix):
+                _, value = line.split("=", 1)
+                return value
+    except OSError:
+        return None
+    return None
+
+
+def _invalidate_stale_cmake_cache(build_dir: Path, *, cuda_compiler: str, arch: str, archs: list[str]) -> None:
+    """Remove stale CMake configure state when static build inputs change."""
+    cache_path = build_dir / "CMakeCache.txt"
+    if not cache_path.exists():
+        return
+    expected_archs = ";".join(archs) if archs else ""
+    expected_arch = "" if archs else arch
+    cached_compiler = _cmake_cache_value(cache_path, "CMAKE_CUDA_COMPILER")
+    cached_arch = _cmake_cache_value(cache_path, "EJKERNEL_CUDA_ARCH")
+    cached_archs = _cmake_cache_value(cache_path, "EJKERNEL_CUDA_ARCHS")
+    if (
+        (cached_compiler is not None and Path(cached_compiler) != Path(cuda_compiler))
+        or (cached_arch is not None and cached_arch != expected_arch)
+        or (cached_archs is not None and cached_archs != expected_archs)
+    ):
+        shutil.rmtree(build_dir / "CMakeFiles", ignore_errors=True)
+        for name in ("CMakeCache.txt", "Makefile", "cmake_install.cmake"):
+            try:
+                (build_dir / name).unlink()
+            except FileNotFoundError:
+                pass
+
+
 def build_cuda_lib() -> Path:
     """Build (or locate a cached) CUDA shared library for quantized matmul.
 
@@ -203,6 +241,7 @@ def build_cuda_lib() -> Path:
     include_dir = Path(ffi.include_dir())
     cutlass_include = _find_cutlass_include(repo_root)
     cuda_compiler = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    _invalidate_stale_cmake_cache(build_dir, cuda_compiler=cuda_compiler, arch=arch, archs=archs)
 
     cmake_cmd = [
         "cmake",

@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -507,9 +507,11 @@ def flash_attention(
     query: Float[Array, "batch seq_len_q num_heads head_dim"],
     key: DenseKV | PagedKV,
     value: DenseKV | PagedKV,
-    attention_mask: Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
-    | None = None,
+    attention_mask: (
+        Bool[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | Int[Array, "batch num_heads_or_1 seq_len_q seq_len_k"]
+        | None
+    ) = None,
     bias: Float[Array, "batch num_heads seq_len_q seq_len_k"] | None = None,
     softmax_scale: float | None = None,
     dropout_prob: float = 0.0,

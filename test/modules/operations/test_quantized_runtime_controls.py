@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -748,26 +748,25 @@ def test_quantized_array_matmul_forwards_tpu_controls(monkeypatch):
     assert captured["tpu_path"] == "packed"
 
 
-@pytest.mark.parametrize("bits", [1, 2])
-def test_quantized_matmul_affine_low_bits_uses_fallback(bits: int):
+@pytest.mark.parametrize("bits", [1, 2, 3, 5, 6, 7])
+def test_quantized_matmul_affine_non_power_two_bits_match_reference(bits: int):
     key_x, key_w = jax.random.split(jax.random.PRNGKey(27 + bits), 2)
     x = jax.random.normal(key_x, (8, 64), dtype=jnp.float32)
     w = jax.random.normal(key_w, (32, 64), dtype=jnp.float32)
     w_q, scales, zeros = prepack_quantized_weights(w, mode="affine", bits=bits, group_size=32, axis="row")
 
-    with pytest.warns(RuntimeWarning, match="affine bits not in \\{4,8\\}"):
-        y_auto = quantized_matmul(
-            x,
-            w_q,
-            scales,
-            zeros,
-            mode="affine",
-            bits=bits,
-            group_size=32,
-            axis="row",
-            platform="xla",
-            fuse=True,
-        )
+    y_auto = quantized_matmul(
+        x,
+        w_q,
+        scales,
+        zeros,
+        mode="affine",
+        bits=bits,
+        group_size=32,
+        axis="row",
+        platform="xla",
+        fuse=True,
+    )
 
     y_ref = quantized_matmul(
         x,
@@ -781,4 +780,4 @@ def test_quantized_matmul_affine_low_bits_uses_fallback(bits: int):
         platform="xla",
         fuse=False,
     )
-    np.testing.assert_allclose(np.asarray(y_auto), np.asarray(y_ref), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(y_auto), np.asarray(y_ref), rtol=2e-2, atol=2e-2)

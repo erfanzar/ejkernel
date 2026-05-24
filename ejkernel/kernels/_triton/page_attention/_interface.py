@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -305,9 +305,9 @@ def page_attention(
         def grid(meta):
             return (num_seqs, num_kv_heads, num_splits)
 
-        assert (partition_size >= kv_blocksize) and (partition_size % kv_blocksize == 0), (
-            f"partition_size={partition_size}, kv_blocksize={kv_blocksize}"
-        )
+        assert (partition_size >= kv_blocksize) and (
+            partition_size % kv_blocksize == 0
+        ), f"partition_size={partition_size}, kv_blocksize={kv_blocksize}"
 
         metaparams = dict(
             grid=grid,

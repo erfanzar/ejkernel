@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,6 +42,8 @@ RevSplitKMode = Literal["auto", "on", "off"]
         "gemv_mode",
         "revsplit_k",
         "revsplit_k_parts",
+        "block_n",
+        "block_k",
     ]
 )
 def quantized_matmul_forward(
@@ -57,6 +59,8 @@ def quantized_matmul_forward(
     gemv_mode: GemvMode,
     revsplit_k: RevSplitKMode,
     revsplit_k_parts: int | None,
+    block_n: int = 0,
+    block_k: int = 0,
 ):
     """Execute quantized matmul forward pass via the CUDA FFI custom call.
 
@@ -92,6 +96,8 @@ def quantized_matmul_forward(
         gemv_mode=gemv_mode,
         revsplit_k=revsplit_k,
         revsplit_k_parts=revsplit_k_parts,
+        block_n=block_n,
+        block_k=block_k,
     )
 
 

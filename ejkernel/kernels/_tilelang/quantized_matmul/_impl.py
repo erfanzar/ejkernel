@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,6 +58,9 @@ from ._kernel import (
     make_packed_bwd_scale_prim_func,
     make_packed_dequant_prim_func,
     make_packed_fwd_prim_func,
+    make_packed_gemv_kmajor_prim_func,
+    make_packed_gemv_kmajor_reduce_prim_func,
+    make_packed_gemv_kmajor_split_prim_func,
 )
 
 _DEFAULT_COMPILE_FLAGS: tuple[str, ...] = ("-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",)
@@ -65,6 +68,9 @@ _DEFAULT_COMPILE_FLAGS: tuple[str, ...] = ("-DCCCL_DISABLE_CTK_COMPATIBILITY_CHE
 _FWD_CACHE: dict[tuple, callable] = {}
 _BWD_CACHE: dict[tuple, callable] = {}
 _PACKED_FWD_CACHE: dict[tuple, callable] = {}
+_PACKED_GEMV_KMAJOR_CACHE: dict[tuple, callable] = {}
+_PACKED_GEMV_KMAJOR_SPLIT_CACHE: dict[tuple, callable] = {}
+_PACKED_GEMV_KMAJOR_REDUCE_CACHE: dict[tuple, callable] = {}
 _PACKED_DX_CACHE: dict[tuple, callable] = {}
 _PACKED_META_CACHE: dict[tuple, callable] = {}
 _PACKED_DEQUANT_CACHE: dict[tuple, callable] = {}
@@ -124,7 +130,7 @@ def _launch_safe_blocks(block_m: int, block_n: int, block_k: int) -> tuple[int, 
         return options[-1]
 
     bm = _round_block(block_m, (16, 32, 64, 128, 256))
-    bn = _round_block(block_n, (16, 32, 64, 128))
+    bn = _round_block(block_n, (1, 2, 4, 8, 16, 32, 64, 128))
     bk = _round_block(block_k, (16, 32, 64, 128))
     while bm * bn > 32768:
         if bm >= bn and bm > 16:
@@ -176,6 +182,11 @@ def _predecode_enabled() -> bool:
     return os.environ.get("EJKERNEL_QMM_TILELANG_PREDECODE", "1") not in ("0", "false", "False")
 
 
+def _col_predecode_enabled() -> bool:
+    """Return whether large column-major QMM should use the experimental predecode path."""
+    return os.environ.get("EJKERNEL_QMM_TILELANG_COL_PREDECODE", "0") not in ("0", "false", "False")
+
+
 def _dense_weight_dtype(x_dtype, use_bf16: bool):
     """Resolve the dense predecoded weight dtype used by TileLang GEMM."""
     canonical = jnp.dtype(x_dtype)
@@ -188,7 +199,7 @@ def _dense_weight_dtype(x_dtype, use_bf16: bool):
 
 def _should_predecode(m: int, n: int, k: int, transpose: bool) -> bool:
     """Return True for large row-major GEMM cells that benefit from one-time dequantization."""
-    return _predecode_enabled() and not bool(transpose) and m >= 512 and n >= 512 and k >= 512
+    return _predecode_enabled() and m >= 512 and n >= 512 and k >= 512
 
 
 def _get_fwd(m, n, k, dtype):
@@ -343,6 +354,7 @@ def _get_packed_fwd(
     block_k,
     num_stages,
     threads,
+    k_major=False,
 ):
     key = (
         "packed_fwd",
@@ -362,6 +374,7 @@ def _get_packed_fwd(
         int(block_k),
         int(num_stages),
         int(threads),
+        bool(k_major),
     )
     with _LOCK:
         cached = _PACKED_FWD_CACHE.get(key)
@@ -369,7 +382,7 @@ def _get_packed_fwd(
             return cached
     ffi = _build_qmm_call(
         kernel=make_packed_fwd_prim_func,
-        out_shape=jax.ShapeDtypeStruct((m, n), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((m, n), dtype),
         name="qmm_packed_fwd",
         cache_key=key,
         meta={
@@ -388,6 +401,7 @@ def _get_packed_fwd(
             "dtype": dtype,
             "scale_dtype": scale_dtype,
             "use_bf16": bool(use_bf16),
+            "k_major": bool(k_major),
             "threads": int(threads),
             "num_stages": int(num_stages),
         },
@@ -395,6 +409,195 @@ def _get_packed_fwd(
     with _LOCK:
         _PACKED_FWD_CACHE[key] = ffi
     return ffi
+
+
+def _get_packed_gemv_kmajor(
+    n,
+    k,
+    groups,
+    words,
+    bits,
+    group_size,
+    dtype,
+    scale_dtype,
+    block_n,
+    block_k,
+    num_stages,
+    threads,
+):
+    key = (
+        "packed_gemv_kmajor",
+        n,
+        k,
+        groups,
+        words,
+        int(bits),
+        int(group_size),
+        str(jnp.dtype(dtype)),
+        str(jnp.dtype(scale_dtype)),
+        int(block_n),
+        int(block_k),
+        int(num_stages),
+        int(threads),
+    )
+    with _LOCK:
+        cached = _PACKED_GEMV_KMAJOR_CACHE.get(key)
+        if cached is not None:
+            return cached
+    ffi = _build_qmm_call(
+        kernel=make_packed_gemv_kmajor_prim_func,
+        out_shape=jax.ShapeDtypeStruct((1, n), dtype),
+        name="qmm_packed_gemv_kmajor",
+        cache_key=key,
+        meta={
+            "n": n,
+            "k": k,
+            "groups": groups,
+            "words": words,
+            "group_size": int(group_size),
+            "bits": int(bits),
+            "dtype": dtype,
+            "scale_dtype": scale_dtype,
+            "block_n": int(block_n),
+            "block_k": int(block_k),
+            "threads": int(threads),
+            "num_stages": int(num_stages),
+        },
+    )
+    with _LOCK:
+        _PACKED_GEMV_KMAJOR_CACHE[key] = ffi
+    return ffi
+
+
+def _get_packed_gemv_kmajor_split(
+    n,
+    k,
+    groups,
+    words,
+    bits,
+    group_size,
+    dtype,
+    scale_dtype,
+    block_n,
+    block_k,
+    threads,
+):
+    k_tiles = (int(k) + int(block_k) - 1) // int(block_k)
+    key = (
+        "packed_gemv_kmajor_split",
+        n,
+        k,
+        groups,
+        words,
+        int(bits),
+        int(group_size),
+        str(jnp.dtype(dtype)),
+        str(jnp.dtype(scale_dtype)),
+        int(block_n),
+        int(block_k),
+        int(threads),
+    )
+    with _LOCK:
+        cached = _PACKED_GEMV_KMAJOR_SPLIT_CACHE.get(key)
+        if cached is not None:
+            return cached
+    ffi = _build_qmm_call(
+        kernel=make_packed_gemv_kmajor_split_prim_func,
+        out_shape=jax.ShapeDtypeStruct((k_tiles, n), jnp.float32),
+        name="qmm_packed_gemv_kmajor_split",
+        cache_key=key,
+        meta={
+            "n": n,
+            "k": k,
+            "groups": groups,
+            "words": words,
+            "group_size": int(group_size),
+            "bits": int(bits),
+            "dtype": dtype,
+            "scale_dtype": scale_dtype,
+            "block_n": int(block_n),
+            "block_k": int(block_k),
+            "threads": int(threads),
+        },
+    )
+    with _LOCK:
+        _PACKED_GEMV_KMAJOR_SPLIT_CACHE[key] = ffi
+    return ffi
+
+
+def _get_packed_gemv_kmajor_reduce(
+    n,
+    k_tiles,
+    dtype,
+    block_n,
+    threads,
+):
+    key = (
+        "packed_gemv_kmajor_reduce",
+        n,
+        k_tiles,
+        str(jnp.dtype(dtype)),
+        int(block_n),
+        int(threads),
+    )
+    with _LOCK:
+        cached = _PACKED_GEMV_KMAJOR_REDUCE_CACHE.get(key)
+        if cached is not None:
+            return cached
+    ffi = _build_qmm_call(
+        kernel=make_packed_gemv_kmajor_reduce_prim_func,
+        out_shape=jax.ShapeDtypeStruct((1, n), dtype),
+        name="qmm_packed_gemv_kmajor_reduce",
+        cache_key=key,
+        meta={
+            "n": n,
+            "k_tiles": k_tiles,
+            "dtype": dtype,
+            "block_n": int(block_n),
+            "threads": int(threads),
+        },
+    )
+    with _LOCK:
+        _PACKED_GEMV_KMAJOR_REDUCE_CACHE[key] = ffi
+    return ffi
+
+
+def _qmm_packed_gemv_kmajor_split_raw(
+    x,
+    w,
+    scales,
+    zeros,
+    n,
+    k,
+    groups,
+    words,
+    bits,
+    group_size,
+    block_n,
+    block_k,
+    threads,
+):
+    partials = _get_packed_gemv_kmajor_split(
+        n,
+        k,
+        groups,
+        words,
+        int(bits),
+        int(group_size),
+        x.dtype,
+        scales.dtype,
+        int(block_n),
+        int(block_k),
+        int(threads),
+    )(x, w, scales, zeros)
+    k_tiles = (int(k) + int(block_k) - 1) // int(block_k)
+    return _get_packed_gemv_kmajor_reduce(
+        n,
+        k_tiles,
+        x.dtype,
+        int(block_n),
+        int(threads),
+    )(partials)
 
 
 def _get_packed_dx(
@@ -540,6 +743,7 @@ def _get_packed_dequant(
     block_k,
     block_n,
     threads,
+    transpose=False,
 ):
     key = (
         "packed_dequant",
@@ -555,6 +759,7 @@ def _get_packed_dequant(
         int(block_k),
         int(block_n),
         int(threads),
+        bool(transpose),
     )
     with _LOCK:
         cached = _PACKED_DEQUANT_CACHE.get(key)
@@ -577,6 +782,7 @@ def _get_packed_dequant(
             "scale_dtype": scale_dtype,
             "block_k": int(block_k),
             "block_n": int(block_n),
+            "transpose": bool(transpose),
             "threads": int(threads),
         },
     )
@@ -737,7 +943,7 @@ def _get_packed_nonaffine_fwd(
             return cached
     ffi = _build_qmm_call(
         kernel=make_packed_fwd_prim_func,
-        out_shape=jax.ShapeDtypeStruct((m, n), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((m, n), dtype),
         name="qmm_packed_nonaffine_fwd",
         cache_key=key,
         meta={
@@ -1005,6 +1211,77 @@ def _qmm_packed_predecode_raw(
     return out
 
 
+def _qmm_packed_col_predecode_raw_with_weight(
+    x,
+    w,
+    scales,
+    zeros,
+    bits,
+    group_size,
+    use_bf16,
+    num_stages,
+    threads,
+):
+    m, n, k, groups, words = _packed_dims(x, w, scales, True, int(group_size))
+    weight_dtype = _dense_weight_dtype(x.dtype, bool(use_bf16))
+    dense_m, dense_n, dense_k, dequant_k, dequant_n = _predecode_blocks(m, n, k)
+    dequant = _get_packed_dequant(
+        n,
+        k,
+        groups,
+        words,
+        "affine",
+        int(bits),
+        int(group_size),
+        weight_dtype,
+        scales.dtype,
+        dequant_k,
+        dequant_n,
+        max(threads, 256),
+        True,
+    )
+    w_dense = dequant(w, scales, zeros)
+    out = _get_dense_fwd(
+        m,
+        n,
+        k,
+        x.dtype,
+        weight_dtype,
+        dense_m,
+        dense_n,
+        dense_k,
+        True,
+        int(num_stages),
+        int(threads),
+    )(x, w_dense)
+    return out, w_dense
+
+
+def _qmm_packed_col_predecode_raw(
+    x,
+    w,
+    scales,
+    zeros,
+    bits,
+    group_size,
+    use_bf16,
+    num_stages,
+    threads,
+):
+    out, _ = _qmm_packed_col_predecode_raw_with_weight(
+        x,
+        w,
+        scales,
+        zeros,
+        bits,
+        group_size,
+        use_bf16,
+        num_stages,
+        threads,
+    )
+    return out
+
+
 @functools.partial(jax.custom_vjp, nondiff_argnums=tuple(range(4, 9)))
 def _qmm_packed_predecode_core(
     x,
@@ -1097,6 +1374,100 @@ def _qmm_packed_predecode_bwd(
 
 
 _qmm_packed_predecode_core.defvjp(_qmm_packed_predecode_fwd, _qmm_packed_predecode_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=tuple(range(4, 9)))
+def _qmm_packed_col_predecode_core(
+    x,
+    w,
+    scales,
+    zeros,
+    bits,
+    group_size,
+    use_bf16,
+    num_stages,
+    threads,
+):
+    return _qmm_packed_col_predecode_raw(
+        x,
+        w,
+        scales,
+        zeros,
+        bits,
+        group_size,
+        use_bf16,
+        num_stages,
+        threads,
+    )
+
+
+def _qmm_packed_col_predecode_fwd(
+    x,
+    w,
+    scales,
+    zeros,
+    bits,
+    group_size,
+    use_bf16,
+    num_stages,
+    threads,
+):
+    out, w_dense = _qmm_packed_col_predecode_raw_with_weight(
+        x,
+        w,
+        scales,
+        zeros,
+        bits,
+        group_size,
+        use_bf16,
+        num_stages,
+        threads,
+    )
+    return out, (x, w, scales, zeros, w_dense)
+
+
+def _qmm_packed_col_predecode_bwd(
+    bits,
+    group_size,
+    use_bf16,
+    num_stages,
+    threads,
+    residual,
+    dy,
+):
+    x, w, scales, zeros, w_dense = residual
+    m, n, k, groups, words = _packed_dims(x, w, scales, True, int(group_size))
+    weight_dtype = _dense_weight_dtype(x.dtype, bool(use_bf16))
+    dense_m, dense_n, dense_k, _, _ = _predecode_blocks(m, n, k)
+    dx = _get_dense_dx(
+        m,
+        n,
+        k,
+        x.dtype,
+        weight_dtype,
+        dense_m,
+        dense_n,
+        dense_k,
+        int(num_stages),
+        int(threads),
+    )(dy, w_dense)
+    dscales, dzeros = _get_packed_meta(
+        m,
+        n,
+        k,
+        groups,
+        words,
+        True,
+        int(bits),
+        int(group_size),
+        x.dtype,
+        scales.dtype,
+        int(threads),
+    )(x, dy.astype(jnp.float32), w, scales, zeros)
+    return dx.astype(x.dtype), None, dscales.astype(scales.dtype), dzeros.astype(zeros.dtype)
+
+
+_qmm_packed_col_predecode_core.defvjp(_qmm_packed_col_predecode_fwd, _qmm_packed_col_predecode_bwd)
 
 
 def _qmm_packed_nonaffine_predecode_raw_with_weight(
@@ -1285,7 +1656,57 @@ def _qmm_packed_raw(
     num_stages,
     threads,
 ):
-    m, n, k, groups, words = _packed_dims(x, w, scales, bool(transpose), int(group_size))
+    m = int(x.shape[0])
+    k = int(x.shape[1])
+    bits_i = int(bits)
+    group_size_i = int(group_size)
+    expected_k_words = (k * bits_i + 31) // 32
+    k_major = (
+        bool(transpose)
+        and len(w.shape) == 2
+        and len(scales.shape) == 2
+        and int(w.shape[0]) == expected_k_words
+        and int(scales.shape[0]) * group_size_i == k
+        and int(w.shape[1]) == int(scales.shape[1])
+    )
+    if k_major:
+        n = int(w.shape[1])
+        groups = int(scales.shape[0])
+        words = int(w.shape[0])
+        gemv_impl = os.environ.get("EJKERNEL_QMM_TILELANG_KMAJOR_GEMV", "split")
+        if m == 1 and gemv_impl not in ("0", "false", "False"):
+            if gemv_impl != "serial":
+                return _qmm_packed_gemv_kmajor_split_raw(
+                    x,
+                    w,
+                    scales,
+                    zeros,
+                    n,
+                    k,
+                    groups,
+                    words,
+                    int(bits),
+                    int(group_size),
+                    int(block_n),
+                    int(block_k),
+                    int(threads),
+                )
+            return _get_packed_gemv_kmajor(
+                n,
+                k,
+                groups,
+                words,
+                int(bits),
+                int(group_size),
+                x.dtype,
+                scales.dtype,
+                int(block_n),
+                int(block_k),
+                int(num_stages),
+                int(threads),
+            )(x, w, scales, zeros)
+    else:
+        m, n, k, groups, words = _packed_dims(x, w, scales, bool(transpose), group_size_i)
     return _get_packed_fwd(
         m,
         n,
@@ -1303,6 +1724,7 @@ def _qmm_packed_raw(
         int(block_k),
         int(num_stages),
         int(threads),
+        k_major,
     )(x, w, scales, zeros)
 
 
@@ -1634,7 +2056,7 @@ def quantized_matmul_packed_tilelang(
         scales: Per-group affine scale, shape ``(N, groups)`` or ``(K, groups)``.
         zeros: Per-group affine zero-point, same shape as *scales*.
         transpose: ``True`` for column-major (output-indexed) weight packing.
-        bits: Bits per quantised value (2, 4, or 8).
+        bits: Bits per quantised value (1 through 8 for affine).
         group_size: Elements per quantisation group.
         use_bf16: Use bfloat16 compute dtype when activations are bfloat16.
         block_m: Tile size along M (clamped by ``_launch_safe_blocks``).
@@ -1644,7 +2066,7 @@ def quantized_matmul_packed_tilelang(
         num_warps: Warp count; ``None`` defaults to 4 (128 threads).
 
     Returns:
-        ``(M, N)`` float32 output tensor.
+        ``(M, N)`` output tensor in the activation dtype.
     """
     if not has_tilelang_ffi_support():
         raise RuntimeError("tile-lang quantized_matmul requires both `tilelang` and `jax_tvm_ffi`.")
@@ -1652,8 +2074,21 @@ def quantized_matmul_packed_tilelang(
     threads = _threads_from_warps(num_warps)
     block_m, block_n, block_k = _launch_safe_blocks(block_m, block_n, block_k)
     m, n, k, _, _ = _packed_dims(x, w, scales, bool(transpose), int(group_size))
-    if _should_predecode(m, n, k, bool(transpose)):
+    canonical_col_layout = bool(transpose) and int(w.shape[0]) == int(scales.shape[0])
+    if _should_predecode(m, n, k, bool(transpose)) and not bool(transpose):
         return _qmm_packed_predecode_core(
+            x,
+            w,
+            scales,
+            zeros,
+            int(bits),
+            int(group_size),
+            bool(use_bf16),
+            stages,
+            threads,
+        )
+    if _col_predecode_enabled() and _should_predecode(m, n, k, bool(transpose)) and canonical_col_layout:
+        return _qmm_packed_col_predecode_core(
             x,
             w,
             scales,
@@ -1719,7 +2154,7 @@ def quantized_matmul_packed_nonaffine_tilelang(
         num_warps: Warp count; ``None`` defaults to 4.
 
     Returns:
-        ``(M, N)`` float32 output tensor.
+        ``(M, N)`` output tensor in the activation dtype.
     """
     if not has_tilelang_ffi_support():
         raise RuntimeError("tile-lang quantized_matmul requires both `tilelang` and `jax_tvm_ffi`.")
@@ -1727,7 +2162,7 @@ def quantized_matmul_packed_nonaffine_tilelang(
     threads = _threads_from_warps(num_warps)
     block_m, block_n, block_k = _launch_safe_blocks(block_m, block_n, block_k)
     m, n, k, _, _ = _packed_dims(x, w, scales, bool(transpose), int(group_size))
-    if _should_predecode(m, n, k, bool(transpose)):
+    if _should_predecode(m, n, k, bool(transpose)) and not bool(transpose):
         return _qmm_packed_nonaffine_predecode_core(
             x,
             w,

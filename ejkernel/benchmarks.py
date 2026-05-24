@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -87,25 +87,25 @@ try:
     from rich.table import Table
     from rich.text import Text
 except ImportError:  # pragma: no cover
-    box = None  # type:ignore[assignment]
+    box = None  # type: ignore[assignment]
 
     class _NoRich:
         def __init__(self, *args, **kwargs):
             raise ImportError("rich is required for ejkernel.benchmarks rendering utilities.")
 
-    Console = _NoRich  # type:ignore[assignment]
-    Panel = _NoRich  # type:ignore[assignment]
-    Progress = _NoRich  # type:ignore[assignment]
-    SpinnerColumn = _NoRich  # type:ignore[assignment]
-    BarColumn = _NoRich  # type:ignore[assignment]
-    TaskProgressColumn = _NoRich  # type:ignore[assignment]
-    TextColumn = _NoRich  # type:ignore[assignment]
-    Table = _NoRich  # type:ignore[assignment]
-    Text = _NoRich  # type:ignore[assignment]
+    Console = _NoRich  # type: ignore[assignment]
+    Panel = _NoRich  # type: ignore[assignment]
+    Progress = _NoRich  # type: ignore[assignment]
+    SpinnerColumn = _NoRich  # type: ignore[assignment]
+    BarColumn = _NoRich  # type: ignore[assignment]
+    TaskProgressColumn = _NoRich  # type: ignore[assignment]
+    TextColumn = _NoRich  # type: ignore[assignment]
+    Table = _NoRich  # type: ignore[assignment]
+    Text = _NoRich  # type: ignore[assignment]
 
 try:
-    import matplotlib.patches as mpatches  # type:ignore
-    import matplotlib.pyplot as plt  # type:ignore
+    import matplotlib.patches as mpatches  # type: ignore
+    import matplotlib.pyplot as plt  # type: ignore
 
     HAS_MATPLOTLIB = True
 except ImportError:
@@ -355,6 +355,7 @@ class Benchmark:
                 def loss_fn(*args):
                     out = algo_fn(*args)
                     return self._make_scalar_loss(out)
+
             else:
 
                 def loss_fn(inp):

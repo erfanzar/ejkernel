@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,8 +30,8 @@ registry and provides:
 - **Packed-only dispatch**: TPU Pallas runs packed fused kernels only.
   Legacy path values (``"hybrid"``, ``"predecode"``) are normalized to
   packed for compatibility.
-- **XLA fallback**: transpose=True, unsupported bit widths, or tiling
-  failures silently fall back to the XLA quantized matmul backend.
+- **XLA fallback**: transpose=True execution or tiling failures fall back to
+  the XLA quantized matmul backend when dense fallback is enabled.
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ from ...._registry import Backend, Platform, kernel_registry
 from ...._xla.quantized_matmul import quantized_matmul as _xla_quantized_matmul
 from ._pallas_impl_bwd import quantized_matmul_input_grad
 from ._pallas_impl_core import (
+    _bit_aligned_values,
     _ceil_div,
     _get_tpu_version,
     _lcm,
@@ -119,7 +120,7 @@ def _is_packed_tpu_legal(
         w_q: Packed quantized weight tensor.
         scales: Per-group scale tensor.
         group_size: Elements per quantization group.
-        bits: Quantization bit width (4 or 8).
+        bits: Quantization bit width, from 1 through 8.
         block_m: M-dimension tile size.
         block_n: N-dimension tile size.
         block_k: K-dimension tile size.
@@ -163,8 +164,7 @@ def _should_force_xla_wide_packed_v4(*, bits: int, block_n: int) -> bool:
     256 or larger. In those cases, route to the XLA implementation instead of
     attempting a packed Pallas compile that deterministically fails.
     """
-    if bits not in (4, 8):
-        return False
+    del bits
     if block_n < 256:
         return False
     try:
@@ -194,8 +194,8 @@ def _recover_packed_legal_blocks(
     Returns ``(block_m, block_n, block_k, legal)`` where *legal* indicates whether
     the returned sizes pass the packed-legality check.
     """
-    values_per_word = 32 // bits
-    align_n = _lcm(128, _lcm(group_size, values_per_word))
+    value_alignment = _bit_aligned_values(bits)
+    align_n = _lcm(128, _lcm(group_size, value_alignment))
     m = int(x.shape[0])
     n = int(scales.shape[-1]) * group_size
     int(x.shape[1])
@@ -318,58 +318,56 @@ def _operate_impl(
         block_k=block_k,
     )
 
-    if bits in (4, 8):
-        fwd_bm, fwd_bn, fwd_bk = block_m, block_n, block_k
-        if not packed_legal:
-            # Auto-recover: try n_pad as block_n which is always packed-legal.
-            rec_bm, rec_bn, rec_bk, rec_legal = _recover_packed_legal_blocks(
-                x,
-                w,
-                scales,
-                group_size=group_size,
-                bits=bits,
-                block_m=block_m,
-                block_n=block_n,
-                block_k=block_k,
-            )
-            if rec_legal:
-                fwd_bm, fwd_bn, fwd_bk = rec_bm, rec_bn, rec_bk
-                packed_legal = True
-        if _should_force_xla_wide_packed_v4(bits=bits, block_n=fwd_bn):
-            return _xla_quantized_matmul(
-                x,
-                w,
-                scales,
-                zeros,
-                transpose=transpose,
-                group_size=group_size,
-                bits=bits,
-                mode=mode,
-                block_m=block_m,
-                block_n=block_n,
-                block_k=block_k,
-                use_bf16=compute_in_bf16,
-                allow_dense_fallback=allow_dense_fallback,
-            )
-        try:
-            return _pallas_qmm_transpose_false(
-                x,
-                w,
-                scales,
-                biases,
-                group_size=group_size,
-                bits=bits,
-                mode=mode,
-                block_m=fwd_bm,
-                block_n=fwd_bn,
-                block_k=fwd_bk,
-                use_bf16=compute_in_bf16,
-                path=path,
-                packed_legal=packed_legal,
-            )
-        except Exception:
-            if not allow_dense_fallback:
-                raise
+    fwd_bm, fwd_bn, fwd_bk = block_m, block_n, block_k
+    if not packed_legal:
+        rec_bm, rec_bn, rec_bk, rec_legal = _recover_packed_legal_blocks(
+            x,
+            w,
+            scales,
+            group_size=group_size,
+            bits=bits,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+        )
+        if rec_legal:
+            fwd_bm, fwd_bn, fwd_bk = rec_bm, rec_bn, rec_bk
+            packed_legal = True
+    if _should_force_xla_wide_packed_v4(bits=bits, block_n=fwd_bn):
+        return _xla_quantized_matmul(
+            x,
+            w,
+            scales,
+            zeros,
+            transpose=transpose,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            use_bf16=compute_in_bf16,
+            allow_dense_fallback=allow_dense_fallback,
+        )
+    try:
+        return _pallas_qmm_transpose_false(
+            x,
+            w,
+            scales,
+            biases,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            block_m=fwd_bm,
+            block_n=fwd_bn,
+            block_k=fwd_bk,
+            use_bf16=compute_in_bf16,
+            path=path,
+            packed_legal=packed_legal,
+        )
+    except Exception:
+        if not allow_dense_fallback:
+            raise
 
     return _xla_quantized_matmul(
         x,
@@ -693,7 +691,7 @@ def quantized_matmul(
     # illegal for packed TPU execution, try n_pad which is always legal.
     # This guards direct calls (e.g. from benchmarks) that bypass the
     # QuantizedMatmul.run() normalization.
-    if not transpose and bits in (4, 8):
+    if not transpose:
         if not is_packed_tpu_legal_forward(
             x,
             w,

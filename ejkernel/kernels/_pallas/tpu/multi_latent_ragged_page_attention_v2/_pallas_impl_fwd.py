@@ -1,4 +1,4 @@
-# Copyright 2025 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
+# Copyright 2026 The EasyDeL/ejKernel Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -190,7 +190,7 @@ def static_validate_inputs(
     lkv_dim = align_to(actual_lkv_dim, 128)
     r_dim = align_to(actual_r_dim, 128)
 
-    (_, page_size_per_kv_packing, kv_packing, kv_dim) = cache_kv.shape
+    _, page_size_per_kv_packing, kv_packing, kv_dim = cache_kv.shape
 
     if lkv_dim + r_dim != kv_dim:
         raise ValueError(f"Expected {lkv_dim=} + {r_dim=} to be equal to {kv_dim=}")
@@ -987,7 +987,9 @@ def _mla_ragged_paged_attention_kernel(
             bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
                 bq_sz * num_q_heads_per_q_packing,
                 lkv_dim,
-            )[...] = pltpu.bitcast(out, jnp.int32)
+            )[
+                ...
+            ] = pltpu.bitcast(out, jnp.int32)
 
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
