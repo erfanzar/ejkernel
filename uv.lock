@@ -569,9 +569,14 @@ dependencies = [
 
 [package.optional-dependencies]
 cuda = [
+    { name = "apache-tvm-ffi" },
     { name = "jax", extra = ["cuda13"] },
+    { name = "jax-cuda13-pjrt" },
+    { name = "jax-cuda13-plugin", extra = ["with-cuda"] },
     { name = "jax-tvm-ffi" },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
+    { name = "nvidia-cutlass-dsl-libs-base" },
+    { name = "nvidia-cutlass-dsl-libs-cu13" },
     { name = "triton" },
 ]
 dev = [
@@ -583,6 +588,7 @@ profile = [
     { name = "xprof-nightly" },
 ]
 tilelang = [
+    { name = "apache-tvm-ffi" },
     { name = "nvidia-cudnn-cu12" },
     { name = "tilelang" },
 ]
@@ -595,18 +601,24 @@ triton = [
 
 [package.metadata]
 requires-dist = [
+    { name = "apache-tvm-ffi", marker = "extra == 'cuda'", specifier = "==0.1.8.post2" },
+    { name = "apache-tvm-ffi", marker = "extra == 'tilelang'", specifier = "==0.1.8.post2" },
     { name = "beartype", specifier = ">=0.22.2" },
     { name = "chex", specifier = ">=0.1.91" },
     { name = "eformer", marker = "extra == 'dev'" },
     { name = "einops", specifier = ">=0.8.1" },
     { name = "jax", specifier = "~=0.10.0" },
-    { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.10.0" },
-    { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.10.0" },
+    { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = "~=0.10.0" },
+    { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = "~=0.10.0" },
+    { name = "jax-cuda13-pjrt", marker = "extra == 'cuda'", specifier = "~=0.10.0" },
+    { name = "jax-cuda13-plugin", extras = ["with-cuda"], marker = "extra == 'cuda'", specifier = "~=0.10.0" },
     { name = "jax-tvm-ffi", marker = "extra == 'cuda'", specifier = "==0.1.2" },
     { name = "jaxlib", specifier = "~=0.10.0" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
-    { name = "nvidia-cudnn-cu12", marker = "extra == 'tilelang'", specifier = ">=9.12.0.46" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'cuda'", specifier = ">=4.4.0.dev1" },
+    { name = "nvidia-cudnn-cu12", marker = "extra == 'tilelang'", specifier = "==9.12.0.46" },
+    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'cuda'", specifier = "==4.4.0.dev1" },
+    { name = "nvidia-cutlass-dsl-libs-base", marker = "extra == 'cuda'", specifier = "==4.4.0.dev1" },
+    { name = "nvidia-cutlass-dsl-libs-cu13", marker = "extra == 'cuda'", specifier = "==4.4.0.dev1" },
     { name = "pydantic", specifier = ">=2.11.10" },
     { name = "tb-nightly", marker = "extra == 'profile'", specifier = ">=2.21.0a20250820" },
     { name = "tilelang", marker = "extra == 'tilelang'", specifier = "==0.1.9" },
@@ -1549,15 +1561,15 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-cu12"
-version = "9.22.0.52"
+version = "9.12.0.46"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nvidia-cublas-cu12" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/ff/c6a098c1e0bccc68aac5f1684526cf8936abb7024dcc46dca315b8a6f47f/nvidia_cudnn_cu12-9.22.0.52-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:cd9011812498376f866b9826331cc965ac922eb2df8549c9f2989f10255e5001", size = 774536507, upload-time = "2026-05-08T15:36:09.067Z" },
-    { url = "https://files.pythonhosted.org/packages/a0/8f/2ede6b758b7524608472010f632bdd3370ea271d715d1d66044614b84cdc/nvidia_cudnn_cu12-9.22.0.52-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:391b9a7ee6386daaca7f8dca41e83c2c99f760c9581a0400755e87b4287b8847", size = 718382818, upload-time = "2026-05-08T15:37:38.061Z" },
-    { url = "https://files.pythonhosted.org/packages/f2/a4/045f8d0ce6b99726d88e76bbb8ee147123f55e80111d89262762d8149abb/nvidia_cudnn_cu12-9.22.0.52-py3-none-win_amd64.whl", hash = "sha256:5d10117314c861245992dbcf8a6f8ae1f54852137a7c9f80cc9de9fa596f7d62", size = 687235974, upload-time = "2026-05-08T15:39:37.967Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/46/143a6527e7a7a22c3d5d25792d6bdd961a457d845ad0cb3b66a21f2c88fe/nvidia_cudnn_cu12-9.12.0.46-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:af016cfc6c5a3e210bcd6a01aef96978a4dd834a0fdcd398898be9da652c9132", size = 570817182, upload-time = "2025-08-07T20:45:10.363Z" },
+    { url = "https://files.pythonhosted.org/packages/de/14/9288024887ba320eb4e51d01cf37aab11d38f774016bcc0dedac0948d0bc/nvidia_cudnn_cu12-9.12.0.46-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:73471a185656232b383693294431882edb14584ee47f41c0abd81556b92ef2ac", size = 571674872, upload-time = "2025-08-07T20:46:13.084Z" },
+    { url = "https://files.pythonhosted.org/packages/07/e4/7c76ba45ed0e801a2143758601fa1a938e26e1a38c8cd34a5f63783583fa/nvidia_cudnn_cu12-9.12.0.46-py3-none-win_amd64.whl", hash = "sha256:723195f8dc6280643a1438f2a22f7bf16f56b8cc4a497ff71d0872b9e9460206", size = 558204796, upload-time = "2025-08-07T20:47:16.137Z" },
 ]
 
 [[package]]
