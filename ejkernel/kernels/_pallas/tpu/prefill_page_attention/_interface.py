@@ -168,21 +168,15 @@ def prefill_page_attention(
     attn_group_size = num_q_heads // num_kv_heads
     pages_per_chunk = chunk_size // page_size
     num_pages = page_indices.shape[0]
-    # Number of KV chunks is determined by pages (static shape)
     num_kv_chunks = num_pages // pages_per_chunk
 
-    # Apply softmax scale to query
     if softmax_scale is None:
         softmax_scale = 1.0 / jnp.sqrt(head_dim).astype(query.dtype)
 
-    # Transpose query for kernel: [chunk_size, num_q_heads, head_dim] -> [num_q_heads, chunk_size, head_dim]
-    # Then reshape for GQA: [num_kv_heads, group_size, chunk_size, head_dim]
-    q = query.transpose((1, 0, 2))  # [num_q_heads, chunk_size, head_dim]
+    q = query.transpose((1, 0, 2))
     q = q.reshape(num_kv_heads, attn_group_size, chunk_size, head_dim)
     q = q * softmax_scale
 
-    # Block specs need to match the 4D shape of q: [num_kv_heads, group_size, chunk_size, head_dim]
-    # Grid iterates over num_kv_heads, so we select one kv_head at a time
     q_block_spec = pl.BlockSpec((1, attn_group_size, chunk_size, head_dim), lambda i, *_: (i, 0, 0, 0))
     lm_block_spec = pl.BlockSpec((1, attn_group_size, chunk_size, 1), lambda i, *_: (i, 0, 0, 0))
     lm_shape = jax.ShapeDtypeStruct(shape=(num_kv_heads, attn_group_size, chunk_size, 1), dtype=jnp.float32)
@@ -230,7 +224,6 @@ def prefill_page_attention(
         value_cache,
     )
 
-    # Transpose output back: [num_kv_heads, group_size, chunk_size, head_dim] -> [chunk_size, num_q_heads, head_dim]
     out = out.reshape(num_q_heads, chunk_size, head_dim)
     out = out.transpose((1, 0, 2))
 

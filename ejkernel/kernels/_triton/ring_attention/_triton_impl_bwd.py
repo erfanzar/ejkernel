@@ -40,7 +40,6 @@ from ..blocksparse_attention._triton_impl_fwd import _fwd_blocksparse_attn_call
 from ..flash_attention._triton_impl_bwd import _bwd_attention_kernel_call
 from ..flash_attention._triton_impl_fwd import _fwd_attention_kernel_call
 
-# ln(2) constant for converting between log2 and natural log
 LN2 = 0.6931471805599453
 
 
@@ -68,7 +67,7 @@ class RingFlashResiduals(NamedTuple):
     bias: jax.Array | None
     attention_mask: jax.Array | None
     o: jax.Array
-    lse: jax.Array  # In natural log space
+    lse: jax.Array
     dropout_seed: int | None
 
 
@@ -182,20 +181,17 @@ def _ring_flash_attention_fwd(
     q_seq_len = query.shape[1]
     num_heads = query.shape[2]
 
-    # Get ring size
     if axis_name is not None:
         axis_size = lax.psum(1, axis_name)
     else:
         axis_size = 1
 
-    # Initialize accumulators
     o = jnp.zeros(query.shape, dtype=jnp.float32)
     lse = jnp.full((batch, num_heads, q_seq_len), -jnp.inf, dtype=jnp.float32)
 
     def scan_ring(carry, idx):
         o_acc, lse_acc, k_curr, v_curr = carry
 
-        # Call flash attention forward kernel
         o_chunk, lse_chunk_log2 = _fwd_attention_kernel_call(
             q=query,
             k=k_curr,
@@ -212,35 +208,27 @@ def _ring_flash_attention_fwd(
             cum_seqlens_k=None,
             sliding_window=sliding_window,
             logits_soft_cap=logits_soft_cap,
-            softmax_aux=None,  # Attention sinks not supported in ring mode yet
+            softmax_aux=None,
         )
 
-        # Convert LSE from log2 to natural log
         lse_chunk = lse_chunk_log2 * LN2
-        # Handle padding: lse shape is (batch, heads, max_seqlen_q_rounded)
         lse_chunk = lse_chunk[..., :q_seq_len]
 
-        # Online softmax combination
         lse_max = jnp.maximum(lse_acc, lse_chunk)
         alpha = jnp.exp(lse_acc - lse_max)
         beta = jnp.exp(lse_chunk - lse_max)
         sum_weights = alpha + beta
 
-        # Avoid division by zero
         sum_weights_safe = jnp.where(sum_weights == 0, 1.0, sum_weights)
 
-        # Update output with weighted combination
-        # Transpose o_chunk to match lse shape broadcasting [batch, heads, seq] -> [batch, seq, heads]
-        alpha_expanded = jnp.transpose(alpha, (0, 2, 1))[..., None]  # [batch, seq, heads, 1]
+        alpha_expanded = jnp.transpose(alpha, (0, 2, 1))[..., None]
         beta_expanded = jnp.transpose(beta, (0, 2, 1))[..., None]
         sum_weights_expanded = jnp.transpose(sum_weights_safe, (0, 2, 1))[..., None]
 
         o_next = (alpha_expanded * o_acc + beta_expanded * o_chunk.astype(jnp.float32)) / sum_weights_expanded
 
-        # Update log-sum-exp
         lse_next = lse_max + jnp.log(jnp.where(sum_weights == 0, 1.0, sum_weights))
 
-        # Rotate K, V to next device in ring
         if axis_name is not None:
             perm = [(i, (i + 1) % axis_size) for i in range(axis_size)]
             k_next = lax.ppermute(k_curr, axis_name, perm)
@@ -297,25 +285,22 @@ def _ring_flash_attention_bwd(
         ``None`` for attention_mask and bias which are non-differentiable.
     """
     q, k, v, bias, attention_mask, o, lse, dropout_seed_res = res
-    del dropout_seed_res  # Use the one from nondiff_argnums
+    del dropout_seed_res
 
     if axis_name is not None:
         axis_size = lax.psum(1, axis_name)
     else:
         axis_size = 1
 
-    # Initialize gradient accumulators
     dq = jnp.zeros_like(q, dtype=jnp.float32)
     dk = jnp.zeros_like(k, dtype=jnp.float32)
     dv = jnp.zeros_like(v, dtype=jnp.float32)
 
-    # Convert LSE back to log2 for backward kernel (it expects log2 space)
     lse_log2 = lse / LN2
 
     def scan_ring_bwd(carry, idx):
         dq_acc, dk_acc, dv_acc, k_curr, v_curr = carry
 
-        # Compute gradients using flash attention backward kernel
         dq_chunk, dk_chunk, dv_chunk = _bwd_attention_kernel_call(
             dO=do,
             q=q,
@@ -341,7 +326,6 @@ def _ring_flash_attention_bwd(
         dk_acc = dk_acc + dk_chunk.astype(jnp.float32)
         dv_acc = dv_acc + dv_chunk.astype(jnp.float32)
 
-        # Rotate K, V and their gradients
         if axis_name is not None:
             perm = [(i, (i + 1) % axis_size) for i in range(axis_size)]
             k_next = lax.ppermute(k_curr, axis_name, perm)
@@ -355,7 +339,6 @@ def _ring_flash_attention_bwd(
 
     (dq, dk, dv, _, _), _ = lax.scan(scan_ring_bwd, (dq, dk, dv, k, v), jnp.arange(axis_size))
 
-    # Cast back to input dtypes
     dq = dq.astype(q.dtype)
     dk = dk.astype(k.dtype)
     dv = dv.astype(v.dtype)
@@ -387,15 +370,15 @@ class RingBlocksparseResiduals(NamedTuple):
             Converted from log2 output of the block-sparse kernel via ``* LN2``.
     """
 
-    q: jax.Array  # [B, Hq, Tq, D]
-    k: jax.Array  # [B, Hkv, Tk, D]
-    v: jax.Array  # [B, Hkv, Tk, D]
-    q_positions: jax.Array  # [B, Tq]
-    q_segment_ids: jax.Array  # [B, Tq]
-    kv_positions: jax.Array  # [B, Tk]
-    kv_segment_ids: jax.Array  # [B, Tk]
-    o: jax.Array  # [B, Hq, Tq, D]
-    lse: jax.Array  # [B, Hq, Tq] in natural log space
+    q: jax.Array
+    k: jax.Array
+    v: jax.Array
+    q_positions: jax.Array
+    q_segment_ids: jax.Array
+    kv_positions: jax.Array
+    kv_segment_ids: jax.Array
+    o: jax.Array
+    lse: jax.Array
 
 
 def _window_to_bounds(sliding_window: int | tuple[int, int] | None) -> tuple[int, int]:
@@ -463,10 +446,8 @@ def _build_positions(
     axis_idx = lax.axis_index(axis_name)
     offset = jnp.asarray(axis_idx * seq_len, dtype=jnp.int32)
     if pad_value == -1:
-        # Query padding positions are -1; keep them unchanged.
         positions = jnp.where(positions >= 0, positions + offset, positions)
     else:
-        # KV padding positions are usually int32_max; keep them unchanged based on segment ids.
         valid = segment_ids >= 0
         positions = jnp.where(valid, positions + offset, positions)
     return positions
@@ -634,7 +615,6 @@ def _ring_blocksparse_attention_fwd(
     o_acc = jnp.zeros((batch, num_heads, q_seq_len, query.shape[-1]), dtype=jnp.float32)
     lse_acc = jnp.full((batch, num_heads, q_seq_len), -jnp.inf, dtype=jnp.float32)
 
-    # Attention sinks contribute to normalization mass but not the output.
     if softmax_aux is not None:
         aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
         if aux.ndim == 1:

@@ -213,7 +213,6 @@ def _decode_stage1(
             v = tl.load(v_ptr + v_off, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
 
             m_new = tl.maximum(m, tl.max(qk, axis=0))
-            # If all positions are masked, keep the previous accumulator.
             m_new = tl.where(m_new > float("-inf"), m_new, m)
 
             alpha = tl.exp(m - m_new)

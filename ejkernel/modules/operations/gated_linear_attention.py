@@ -291,13 +291,26 @@ class GLAttention(Kernel[GLAttentionConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[GLAttentionConfig, Array]):
-        """Generate GPU candidates for GLA across Triton, TileLang and XLA."""
+        """Generate GPU candidates for GLA.
+
+        Gated linear attention has multiplicative gating but the same
+        underlying linear-attention tile structure as lightning_attention
+        and recurrent — sweep the same (block_q, block_k, block_d) space.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         block_configs = [
+            (64, 64, 32, 4, 1),
             (64, 64, 64, 4, 1),
             (128, 64, 64, 4, 2),
+            (64, 128, 64, 4, 2),
             (128, 128, 64, 8, 2),
+            (128, 128, 128, 8, 2),
+        ]
+        tilelang_configs = [
+            (64, 64, 64, 4, 1),
+            (128, 128, 64, 4, 2),
+            (128, 128, 128, 8, 2),
         ]
         candidates: list[GLAttentionConfig] = []
         if "triton" in platforms:
@@ -314,17 +327,18 @@ class GLAttention(Kernel[GLAttentionConfig, Array]):
                     )
                 )
         if "tilelang" in platforms:
-            candidates.append(
-                GLAttentionConfig(
-                    block_q=64,
-                    block_k=64,
-                    block_d=64,
-                    num_warps=4,
-                    num_stages=1,
-                    platform="tilelang",
-                    backend="gpu",
+            for block_q, block_k, block_d, num_warps, num_stages in tilelang_configs:
+                candidates.append(
+                    GLAttentionConfig(
+                        block_q=block_q,
+                        block_k=block_k,
+                        block_d=block_d,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
                 )
-            )
         if "xla" in platforms:
             candidates.append(
                 GLAttentionConfig(

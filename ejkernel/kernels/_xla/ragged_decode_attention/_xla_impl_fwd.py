@@ -92,23 +92,23 @@ def create_attention_mask(
         ``True`` means the corresponding key/value position is *attended to*.
     """
 
-    kv_positions = jnp.arange(kv_len, dtype=jnp.int32)[None, None, :]  # (1,1,K)
-    start = jnp.asarray(sequence_start, jnp.int32)[:, None, None]  # (B,1,1)
-    end = jnp.asarray(sequence_end, jnp.int32)[:, None, None]  # (B,1,1)
+    kv_positions = jnp.arange(kv_len, dtype=jnp.int32)[None, None, :]
+    start = jnp.asarray(sequence_start, jnp.int32)[:, None, None]
+    end = jnp.asarray(sequence_end, jnp.int32)[:, None, None]
 
-    kv_valid = (kv_positions >= start) & (kv_positions < end)  # (B,1,K)
-    kv_valid = jnp.broadcast_to(kv_valid, (batch_size, q_len, kv_len))  # (B,Q,K)
+    kv_valid = (kv_positions >= start) & (kv_positions < end)
+    kv_valid = jnp.broadcast_to(kv_valid, (batch_size, q_len, kv_len))
 
     mask = kv_valid
 
     if sliding_window is not None:
         window_left, window_right = sliding_window
         if q_len == 1:
-            q_pos = (end - 1).astype(jnp.int32)  # (B,1,1)
+            q_pos = (end - 1).astype(jnp.int32)
         else:
-            q_pos = (jnp.arange(q_len, dtype=jnp.int32)[None, :, None] + start).astype(jnp.int32)  # (B,Q,1)
+            q_pos = (jnp.arange(q_len, dtype=jnp.int32)[None, :, None] + start).astype(jnp.int32)
 
-        window_mask = (kv_positions >= (q_pos - window_left)) & (kv_positions <= (q_pos + window_right))  # (B,Q,K)
+        window_mask = (kv_positions >= (q_pos - window_left)) & (kv_positions <= (q_pos + window_right))
         mask = mask & window_mask
 
     return mask[:, :, None, :]
@@ -238,8 +238,6 @@ def flash_attention_block(
 
     mask_expanded = jnp.broadcast_to(mask_block, scores.shape)
 
-    # Use a large finite negative instead of -inf so completely-masked blocks
-    # don't produce NaNs via (-inf - -inf) in the blockwise softmax update.
     min_score = jnp.finfo(scores.dtype).min
     scores = jnp.where(mask_expanded, scores, min_score)
 
@@ -255,9 +253,6 @@ def flash_attention_block(
 
     l_new_safe = jnp.where(l_new == 0, 1.0, l_new)
 
-    # `exp_scores` are *unnormalized* attention weights already scaled into the
-    # global max-logit frame (`m_new`). Accumulate the weighted values directly
-    # and normalize once with `l_new_safe`.
     o_curr_times_l_curr = jnp.einsum("...qhk,...khd->...qhd", exp_scores, v_block)
     o_new = (correction_prev * l_prev * o_prev + o_curr_times_l_curr) / l_new_safe
 
@@ -461,11 +456,9 @@ def ragged_decode_mqa_xla(
     aux = softmax_aux
     if aux is not None and aux.ndim == 2:
         if aux.shape[0] == num_heads_kv:
-            # Per-KV-head sinks: feed a per-head 1D bias so it broadcasts over the grouped query heads.
-            aux = aux  # (num_kv_heads, num_sinks)
+            aux = aux
         elif aux.shape[0] == num_heads_q:
-            # Per-query-head sinks: reshape into KV-head groups so each group receives (group_size, num_sinks).
-            aux = aux.reshape(num_heads_kv, group_size, aux.shape[1])  # (num_kv_heads, group_size, num_sinks)
+            aux = aux.reshape(num_heads_kv, group_size, aux.shape[1])
         else:
             raise ValueError(
                 "softmax_aux must have shape (num_sinks,), (num_kv_heads, num_sinks) or (num_q_heads, num_sinks); "

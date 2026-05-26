@@ -118,7 +118,6 @@ def _normalize_softmax_aux(
     num_reps = num_q_heads // num_kv_heads
 
     if aux.ndim == 1:
-        # Heuristic: if length matches head count, treat as per-head single sink.
         if aux.shape[0] == num_q_heads:
             per_head = aux[:, None]
         elif aux.shape[0] == num_kv_heads:

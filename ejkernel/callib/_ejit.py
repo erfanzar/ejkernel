@@ -77,8 +77,6 @@ R = tp.TypeVar("R")
 
 RECOMPILE_FORCE = check_bool_flag("EASYDEL_RECOMPILE_FORCE", False)
 ECACHE_COMPILES = check_bool_flag("EASYDEL_CACHE_COMPILES", False)
-# Persisting "all" XLA caches can trigger instability on some JAX/XLA GPU builds
-# (e.g., CUDA kernel launch failures / kernel reuse cache errors). Keep it opt-in.
 ALLOW_FULL_CACHE = check_bool_flag("ALLOW_FULL_CACHE", False)
 
 CACHE_DIR = get_cache_dir()
@@ -279,12 +277,16 @@ def ejit(
     static_arg_indices = (
         set(static_argnums)
         if isinstance(static_argnums, list | tuple)
-        else {static_argnums} if static_argnums is not None else set()
+        else {static_argnums}
+        if static_argnums is not None
+        else set()
     )
     static_arg_names_set = (
         set(static_argnames)
         if isinstance(static_argnames, list | tuple)
-        else {static_argnames} if static_argnames is not None else set()
+        else {static_argnames}
+        if static_argnames is not None
+        else set()
     )
 
     def get_compiled_and_cache(static_key: str, args_sig: str, args, kwargs) -> Compiled | None:

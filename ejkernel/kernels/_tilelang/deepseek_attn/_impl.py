@@ -64,14 +64,14 @@ _TOPK_BIAS_CACHE: dict[tuple, callable] = {}
 _LOCK = threading.Lock()
 
 
-def _pick_block(n: int) -> int:
-    """Return 64 for ``n <= 64``, else 128 — used for GEMM tile sizing."""
-    return 64 if n <= 64 else 128
+_DEFAULT_GEMM_BLOCK: int = 128
+"""Constant fallback for direct-kernel callers (tests / low-level scripts).
+The operation layer (``DeepSeekAttention`` op via ``DeepSeekAttentionConfig.gemm_block``)
+is the single source of truth for shape-aware tile selection."""
 
 
-def _get_indexer_ffi(B, S, HI, DI, index_scale, causal, dtype):
-    bt = _pick_block(S)
-    bs = _pick_block(S)
+def _get_indexer_ffi(B, S, HI, DI, index_scale, causal, dtype, *, gemm_block: int):
+    bt = bs = int(gemm_block)
     key = (B, S, HI, DI, bt, bs, round(float(index_scale), 8), bool(causal), str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _INDEXER_CACHE.get(key)
@@ -97,10 +97,9 @@ def _get_indexer_ffi(B, S, HI, DI, index_scale, causal, dtype):
         return ffi
 
 
-def _get_matmul_ffi(M, K, N, dtype, out_dtype):
+def _get_matmul_ffi(M, K, N, dtype, out_dtype, *, gemm_block: int):
     """Native ``(M, K) @ (K, N) -> (M, N)`` GEMM FFI."""
-    bm = _pick_block(M)
-    bn = _pick_block(N)
+    bm = bn = int(gemm_block)
     bk = 64 if K % 64 == 0 else 32
     key = (M, K, N, bm, bn, bk, str(jnp.dtype(dtype)), str(jnp.dtype(out_dtype)))
     with _LOCK:
@@ -126,10 +125,9 @@ def _get_matmul_ffi(M, K, N, dtype, out_dtype):
         return ffi
 
 
-def _get_add_ffi(M, N, dtype):
+def _get_add_ffi(M, N, dtype, *, gemm_block: int):
     """Native elementwise add FFI."""
-    bm = _pick_block(M)
-    bn = _pick_block(N)
+    bm = bn = int(gemm_block)
     key = (M, N, bm, bn, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _ADD_CACHE.get(key)
@@ -151,10 +149,9 @@ def _get_add_ffi(M, N, dtype):
         return ffi
 
 
-def _get_cast_ffi(M, N, in_dtype, out_dtype):
+def _get_cast_ffi(M, N, in_dtype, out_dtype, *, gemm_block: int):
     """Native 2D dtype cast FFI."""
-    bm = _pick_block(M)
-    bn = _pick_block(N)
+    bm = bn = int(gemm_block)
     key = (M, N, bm, bn, str(jnp.dtype(in_dtype)), str(jnp.dtype(out_dtype)))
     with _LOCK:
         cached = _CAST_CACHE.get(key)
@@ -275,7 +272,7 @@ def _get_reduce_tail_ffi(B, S, H, main_dim, tail_dim, in_dim, dtype):
         return ffi
 
 
-def _get_topk_bias_ffi(B, S, index_topk, causal):
+def _get_topk_bias_ffi(B, S, index_topk, causal, *, gemm_block: int):
     """Build (or retrieve from cache) the top-k bias mask FFI call.
 
     The mask is a ``(B, 1, S, S)`` float32 tensor of ``0.0`` / ``-inf``
@@ -290,7 +287,7 @@ def _get_topk_bias_ffi(B, S, index_topk, causal):
     Returns:
         Compiled callable ``(index_score[B,S,S]) -> mask[B,1,S,S]``.
     """
-    bs = _pick_block(S)
+    bs = int(gemm_block)
     key = (B, S, int(index_topk), bs, bool(causal))
     with _LOCK:
         cached = _TOPK_BIAS_CACHE.get(key)
@@ -312,29 +309,29 @@ def _get_topk_bias_ffi(B, S, index_topk, causal):
         return ffi
 
 
-def _matmul(a, b, out_dtype):
+def _matmul(a, b, out_dtype, *, gemm_block: int):
     """``a @ b`` through the native tile-lang GEMM kernel."""
     m, k = a.shape
     k2, n = b.shape
     assert k == k2, (a.shape, b.shape)
-    ffi = _get_matmul_ffi(m, k, n, a.dtype, out_dtype)
+    ffi = _get_matmul_ffi(m, k, n, a.dtype, out_dtype, gemm_block=gemm_block)
     return ffi(a, b)
 
 
-def _add(a, b):
+def _add(a, b, *, gemm_block: int):
     """``a + b`` through a native tile-lang elementwise kernel."""
     m, n = a.shape
     assert a.shape == b.shape, (a.shape, b.shape)
-    ffi = _get_add_ffi(m, n, a.dtype)
+    ffi = _get_add_ffi(m, n, a.dtype, gemm_block=gemm_block)
     return ffi(a, b)
 
 
-def _cast2d(a, out_dtype):
+def _cast2d(a, out_dtype, *, gemm_block: int):
     """Cast a 2D tensor through a native tile-lang kernel."""
     if jnp.dtype(a.dtype) == jnp.dtype(out_dtype):
         return a
     m, n = a.shape
-    ffi = _get_cast_ffi(m, n, a.dtype, out_dtype)
+    ffi = _get_cast_ffi(m, n, a.dtype, out_dtype, gemm_block=gemm_block)
     return ffi(a)
 
 
@@ -487,7 +484,7 @@ def _mla_attention_tilelang(
     return _crop_lastdim(out_full, v_dim)
 
 
-def _kv_recon_impl(key_value, w_kc, w_vc):
+def _kv_recon_impl(key_value, w_kc, w_vc, *, gemm_block: int):
     """Reconstruct ``K`` / ``V`` from the compressed latent via native GEMMs."""
     B, S, L = key_value.shape
     _, H, Dk = w_kc.shape
@@ -498,23 +495,24 @@ def _kv_recon_impl(key_value, w_kc, w_vc):
     kv_flat = key_value.reshape(B * S, L)
     wkc_flat = w_kc.reshape(L, k_hd)
     wvc_flat = w_vc.reshape(L, v_hd)
-    k_r = _matmul(kv_flat, wkc_flat, key_value.dtype).reshape(B, S, H, Dk)
-    v_r = _matmul(kv_flat, wvc_flat, key_value.dtype).reshape(B, S, H, Dv)
+    k_r = _matmul(kv_flat, wkc_flat, key_value.dtype, gemm_block=gemm_block).reshape(B, S, H, Dk)
+    v_r = _matmul(kv_flat, wvc_flat, key_value.dtype, gemm_block=gemm_block).reshape(B, S, H, Dv)
     return k_r, v_r
 
 
-@jax.custom_vjp
-def _kv_recon(key_value, w_kc, w_vc):
+@partial(jax.custom_vjp, nondiff_argnums=(3,))
+def _kv_recon(key_value, w_kc, w_vc, gemm_block=_DEFAULT_GEMM_BLOCK):
     """Differentiable KV up-projection ``(K_r, V_r)`` from the latent."""
-    return _kv_recon_impl(key_value, w_kc, w_vc)
+    return _kv_recon_impl(key_value, w_kc, w_vc, gemm_block=int(gemm_block))
 
 
-def _kv_recon_fwd(key_value, w_kc, w_vc):
-    k_r, v_r = _kv_recon_impl(key_value, w_kc, w_vc)
+def _kv_recon_fwd(key_value, w_kc, w_vc, gemm_block=_DEFAULT_GEMM_BLOCK):
+    k_r, v_r = _kv_recon_impl(key_value, w_kc, w_vc, gemm_block=int(gemm_block))
     return (k_r, v_r), (key_value, w_kc, w_vc)
 
 
-def _kv_recon_bwd(residual, g):
+def _kv_recon_bwd(gemm_block, residual, g):
+    gb = int(gemm_block)
     key_value, w_kc, w_vc = residual
     dk_r, dv_r = g
     B, S, L = key_value.shape
@@ -526,15 +524,15 @@ def _kv_recon_bwd(residual, g):
     kv_flat = key_value.reshape(B * S, L)
     wkc_flat = w_kc.reshape(L, k_hd)
     wvc_flat = w_vc.reshape(L, v_hd)
-    dkr_flat = _cast2d(dk_r.reshape(B * S, k_hd), key_value.dtype)
-    dvr_flat = _cast2d(dv_r.reshape(B * S, v_hd), key_value.dtype)
+    dkr_flat = _cast2d(dk_r.reshape(B * S, k_hd), key_value.dtype, gemm_block=gb)
+    dvr_flat = _cast2d(dv_r.reshape(B * S, v_hd), key_value.dtype, gemm_block=gb)
 
-    dkv_k = _matmul(dkr_flat, wkc_flat.T, key_value.dtype)
-    dkv_v = _matmul(dvr_flat, wvc_flat.T, key_value.dtype)
-    dkv = _add(dkv_k, dkv_v).reshape(B, S, L)
+    dkv_k = _matmul(dkr_flat, wkc_flat.T, key_value.dtype, gemm_block=gb)
+    dkv_v = _matmul(dvr_flat, wvc_flat.T, key_value.dtype, gemm_block=gb)
+    dkv = _add(dkv_k, dkv_v, gemm_block=gb).reshape(B, S, L)
 
-    dwkc = _matmul(kv_flat.T, dkr_flat, w_kc.dtype).reshape(L, H, Dk)
-    dwvc = _matmul(kv_flat.T, dvr_flat, w_vc.dtype).reshape(L, H, Dv)
+    dwkc = _matmul(kv_flat.T, dkr_flat, w_kc.dtype, gemm_block=gb).reshape(L, H, Dk)
+    dwvc = _matmul(kv_flat.T, dvr_flat, w_vc.dtype, gemm_block=gb).reshape(L, H, Dv)
     return dkv, dwkc, dwvc
 
 
@@ -556,6 +554,7 @@ def deepseek_attn_tilelang(
     causal: bool,
     b_q: jax.Array | None = None,
     b_k: jax.Array | None = None,
+    gemm_block: int = _DEFAULT_GEMM_BLOCK,
 ) -> jax.Array:
     """DeepSeek Sparse Attention — native tile-lang kernels, forward + backward.
 
@@ -607,13 +606,17 @@ def deepseek_attn_tilelang(
     if index_softmax_scale is None:
         index_softmax_scale = 1.0 / math.sqrt(DI)
 
-    indexer = _get_indexer_ffi(B, S, HI, DI, index_softmax_scale, causal, query_index.dtype)
+    gb = int(gemm_block)
+    if gb <= 0:
+        raise ValueError(f"deepseek_attn: gemm_block must be a positive int (got {gb}).")
+
+    indexer = _get_indexer_ffi(B, S, HI, DI, index_softmax_scale, causal, query_index.dtype, gemm_block=gb)
     index_score = indexer(query_index, key_index, index_weights)
 
-    topk_bias = _get_topk_bias_ffi(B, S, index_topk, causal)
+    topk_bias = _get_topk_bias_ffi(B, S, index_topk, causal, gemm_block=gb)
     mask = jax.lax.stop_gradient(topk_bias(index_score))
 
-    k_r, v_r = _kv_recon(key_value, w_kc, w_vc)
+    k_r, v_r = _kv_recon(key_value, w_kc, w_vc, gb)
 
     return _mla_attention_tilelang(
         query,

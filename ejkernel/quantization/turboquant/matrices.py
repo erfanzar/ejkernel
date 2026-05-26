@@ -47,9 +47,7 @@ def generate_rotation_matrix(
     key = jax.random.PRNGKey(seed)
     G = jax.random.normal(key, (head_dim, head_dim), dtype=jnp.float32)
     Q, R = jnp.linalg.qr(G)
-    # Sign correction: ensure uniqueness by making diagonal of R positive
     signs = jnp.sign(jnp.diag(R))
-    # Where sign is 0, use 1
     signs = jnp.where(signs == 0, 1.0, signs)
     Pi = Q * signs[None, :]
     return Pi.astype(dtype)

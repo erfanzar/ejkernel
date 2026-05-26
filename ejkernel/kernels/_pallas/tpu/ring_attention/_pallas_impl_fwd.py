@@ -179,16 +179,13 @@ def _build_mask(
     """
     shape = (q_seq_len, kv_seq_len)
 
-    # Start with either causal or full mask
     if chunk_size is not None:
-        # Chunked causal attention (Llama4 style)
         mask = mask_lib.ChunkedCausalMask(shape=shape, chunk_size=chunk_size)
     elif causal:
         mask = mask_lib.CausalMask(shape=shape)
     else:
         mask = mask_lib.FullMask(shape)
 
-    # Apply sliding window if specified
     if sliding_window is not None:
         if isinstance(sliding_window, int):
             window = (sliding_window, sliding_window)
@@ -198,7 +195,6 @@ def _build_mask(
         if attention_sink_size > 0:
             sink_size = min(int(attention_sink_size), kv_seq_len)
             local_mask = local_mask | _AttentionSinkMask(shape=shape, attention_sink_size=sink_size)
-        # Combine with AND operation
         mask = mask & local_mask
 
     return mask
@@ -223,7 +219,6 @@ def _make_block_sizes(
     block_q = fwd_params.q_blocksize
     block_kv = fwd_params.kv_blocksize
 
-    # Set backward block sizes if provided
     if bwd_params is not None:
         block_q_dkv = bwd_params.q_blocksize
         block_kv_dkv = bwd_params.kv_blocksize
@@ -329,7 +324,6 @@ def ring_attention(
     Raises:
         NotImplementedError: If ``bias`` is provided when ``axis_name`` is set.
     """
-    # Get dimensions
     _, q_len, num_heads, head_dim = query.shape
     _, kv_len, num_kv_heads, _ = key.shape
 
@@ -339,7 +333,6 @@ def ring_attention(
         if aux.ndim != 1:
             raise ValueError(f"softmax_aux must be 1D, got shape {aux.shape}.")
 
-    # Single-device/non-sharded path: delegate to XLA ring attention.
     if axis_name is None:
         needs_ring_semantics = (
             q_segment_ids is not None
@@ -404,13 +397,11 @@ def ring_attention(
         softmax_scale = head_dim**-0.5
     query = query * softmax_scale
 
-    # Create block sizes configuration
     if fwd_params is None:
         fwd_params = FwdParams(q_blocksize=min(512, q_len), kv_blocksize=min(512, kv_len))
 
     block_sizes = _make_block_sizes(fwd_params, bwd_params)
 
-    # Build mask from parameters
     mask = _build_mask(
         q_seq_len=q_len,
         kv_seq_len=kv_len,
@@ -420,14 +411,12 @@ def ring_attention(
         chunk_size=chunk_size,
     )
 
-    # Set ring axis
     ring_axis = axis_name if axis_name is not None else RING_AXIS
 
     sinks = None
     if aux is not None:
         sinks = jnp.broadcast_to(logsumexp(aux), (num_heads,))
 
-    # Create segment IDs if provided
     segment_ids = None
     if q_segment_ids is not None or kv_segment_ids is not None:
         q_seg = q_segment_ids if q_segment_ids is not None else kv_segment_ids
@@ -436,14 +425,13 @@ def ring_attention(
 
     def single_batch_attention(q, k, v, seg_ids, sinks_batch):
         """Process single batch element."""
-        # Rearrange from [seq_len, num_heads, head_dim] to [num_heads, seq_len, head_dim]
         q = rearrange(q, "s h d -> h s d")
         k = rearrange(k, "s h d -> h s d")
         v = rearrange(v, "s h d -> h s d")
 
         if is_mqa:
-            k = k.squeeze(0)  # [seq_len, head_dim]
-            v = v.squeeze(0)  # [seq_len, head_dim]
+            k = k.squeeze(0)
+            v = v.squeeze(0)
 
         multi_head_mask = mask_lib.MultiHeadMask(masks=tuple([mask] * num_heads))
 

@@ -204,7 +204,6 @@ def _pack_bits(
         Packed uint32 array with shape (*values.shape[:-1], n_words).
     """
     bits = int(bits)
-    # MPS scatter/gather lowering is unreliable for generic small-bit paths.
     force_fast_on_mps = jax.default_backend() == "mps" and bits in {1, 2, 4, 8}
 
     if (prefer_fast_u4_u8 or force_fast_on_mps) and bits == 1:
@@ -238,7 +237,6 @@ def _unpack_bits(
         Unpacked uint32 array with shape (*packed.shape[:-1], n).
     """
     bits = int(bits)
-    # Keep small-bit unpacking on dedicated paths for MPS correctness.
     force_fast_on_mps = jax.default_backend() == "mps" and bits in {1, 2, 4, 8}
 
     if (prefer_fast_u4_u8 or force_fast_on_mps) and bits == 1:

@@ -106,44 +106,30 @@ def ref_paged_attention(
         length = int(context_lens[b])
         num_pages = (length + page_size - 1) // page_size
 
-        # Gather K/V from paged cache
         page_indices = block_tables[b, :num_pages]
-        k_pages = key_cache[:, page_indices]  # [num_kv_heads, num_pages, page_size, head_dim]
-        v_pages = value_cache[:, page_indices]  # [num_kv_heads, num_pages, page_size, head_dim]
+        k_pages = key_cache[:, page_indices]
+        v_pages = value_cache[:, page_indices]
 
-        # Reshape to [num_kv_heads, seq_len, head_dim]
         k = k_pages.reshape(num_kv_heads, -1, head_dim)[:, :length, :]
         v = v_pages.reshape(num_kv_heads, -1, head_dim)[:, :length, :]
 
-        # Repeat K/V for grouped query attention
-        k = jnp.repeat(k, num_groups, axis=0)  # [num_q_heads, seq_len, head_dim]
-        v = jnp.repeat(v, num_groups, axis=0)  # [num_q_heads, seq_len, head_dim]
+        k = jnp.repeat(k, num_groups, axis=0)
+        v = jnp.repeat(v, num_groups, axis=0)
 
-        # Compute attention: q @ k.T
-        q = query[b]  # [num_q_heads, head_dim]
-        qk = jnp.einsum("hd,htd->ht", q, k)  # [num_q_heads, seq_len]
+        q = query[b]
+        qk = jnp.einsum("hd,htd->ht", q, k)
 
-        # Apply soft cap if specified
         if attn_logits_soft_cap is not None:
             qk = attn_logits_soft_cap * jnp.tanh(qk / attn_logits_soft_cap)
 
-        # Apply sliding window mask if specified
-        # For decode (single query token), q_pos = length - 1 (last position)
-        # We want to attend only to positions where: kv_pos >= q_pos - sliding_window + 1
-        # Which means: kv_pos >= length - sliding_window
         if sliding_window is not None:
-            kv_positions = jnp.arange(length)  # [seq_len]
-            # Mask out positions outside the sliding window
-            # q_pos (current query position) = length - 1
-            # Valid kv positions: kv_pos >= q_pos - sliding_window + 1 = length - sliding_window
+            kv_positions = jnp.arange(length)
             sliding_mask = kv_positions < (length - sliding_window)
             qk = qk + jnp.where(sliding_mask, mask_value, 0.0)
 
-        # Softmax
         attn = jax.nn.softmax(qk, axis=-1)
 
-        # Compute output: attn @ v
-        out = jnp.einsum("ht,htd->hd", attn, v)  # [num_q_heads, head_dim]
+        out = jnp.einsum("ht,htd->hd", attn, v)
         outputs.append(out)
 
     return jnp.stack(outputs, axis=0)
@@ -396,13 +382,9 @@ def paged_flash_attention_kernel(
             capped_qk = jnp.tanh(qk / attn_logits_soft_cap)
             qk = capped_qk * attn_logits_soft_cap
 
-        # Mask for positions beyond sequence length
         kv_positions = i * bk + jax.lax.broadcasted_iota(jnp.int32, qk.shape, 1)
         mask = kv_positions < length
 
-        # Apply sliding window mask if specified
-        # For decode (single query token), q_pos = length - 1 (last position)
-        # Valid kv positions: kv_pos >= length - sliding_window
         if sliding_window is not None:
             sliding_mask = kv_positions >= (length - sliding_window)
             mask = jnp.logical_and(mask, sliding_mask)

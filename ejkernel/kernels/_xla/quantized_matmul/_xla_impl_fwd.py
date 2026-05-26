@@ -427,7 +427,6 @@ def _blocked_quantized_matmul(
         else:
             raise ValueError(f"Unsupported quantization mode: {mode}")
         if use_bf16:
-            # Match CUDA's fp16 dequantization followed by bf16 GEMM casting.
             return w.astype(jnp.float16).astype(compute_dtype)
         return w.astype(compute_dtype)
 
@@ -469,7 +468,6 @@ def _blocked_quantized_matmul(
         """
         off_n = n_idx * block_n
 
-        # Decode all K tiles once per N block (shared across M tiles).
         k_ids = jnp.arange(num_k, dtype=jnp.int32)
 
         def _decode_k(k_idx: jax.Array) -> jax.Array:
@@ -608,7 +606,6 @@ def _operate(
                 use_bf16=use_bf16,
             )
         except ValueError as e:
-            # Shape or tiling mismatch.
             if not allow_dense_fallback:
                 raise ValueError(
                     "XLA blocked quantized_matmul preconditions failed and dense dequantize+matmul fallback is "
@@ -718,10 +715,6 @@ def quantized_matmul(
     revsplit_k = normalize_revsplitk_mode(revsplit_k)
     revsplit_k_parts = normalize_revsplitk_parts(revsplit_k_parts)
 
-    # Keep the "blocked" XLA path enabled for common transpose=True cases by
-    # ensuring block_k matches the kernel preconditions. Without this, some
-    # (transpose=True, group_size=128) configurations hit a ValueError and
-    # silently fall back to dequantize+matmul (dense path).
     if transpose:
         value_alignment = _bit_aligned_values(int(bits))
         if block_k % value_alignment != 0 or block_k % int(group_size) != 0:

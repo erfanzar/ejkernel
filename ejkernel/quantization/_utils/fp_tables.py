@@ -50,11 +50,10 @@ def _decode_e2m1_codes(codes: jnp.ndarray, *, dtype: jnp.dtype) -> jnp.ndarray:
     exp = (codes_u >> 1) & jnp.uint32(0x3)
     mant = codes_u & jnp.uint32(0x1)
 
-    # bias = 1 for exp_bits=2
     mant_f = mant.astype(dtype) * jnp.asarray(0.5, dtype=dtype)
     exp_is_zero = exp == 0
 
-    sub = mant_f  # 2**(1-bias) == 1
+    sub = mant_f
     norm = jnp.ldexp(jnp.asarray(1.0, dtype=dtype) + mant_f, exp.astype(jnp.int32) - 1)
     val = jnp.where(exp_is_zero, sub, norm)
     return jnp.where(sign.astype(bool), -val, val)

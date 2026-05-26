@@ -393,9 +393,9 @@ class TestRingAttentionNumericalCorrectness:
         out_vanilla, _ = vanilla_attention(q, k, v)
 
         assert out_ring.shape == out_vanilla.shape
-        assert jnp.allclose(
-            out_ring, out_vanilla, rtol=1e-2, atol=1e-2
-        ), f"Ring attention output differs from vanilla attention. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention output differs from vanilla attention. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
 
     def test_numerical_correctness_vs_vanilla_causal(self):
         """Test numerical correctness with causal masking."""
@@ -413,9 +413,9 @@ class TestRingAttentionNumericalCorrectness:
         out_vanilla, _ = vanilla_attention(q, k, v, causal=True, dtype=jnp.float32)
 
         assert out_ring.shape == out_vanilla.shape
-        assert jnp.allclose(
-            out_ring, out_vanilla, rtol=1e-2, atol=1e-2
-        ), f"Ring attention with causal differs from vanilla. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention with causal differs from vanilla. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
 
     def test_numerical_correctness_vs_vanilla_sliding_window(self):
         """Test numerical correctness with sliding window."""
@@ -459,9 +459,9 @@ class TestRingAttentionNumericalCorrectness:
         out_vanilla, _ = vanilla_attention(q, k, v, softmax_aux=softmax_aux)
 
         assert out_ring.shape == out_vanilla.shape
-        assert jnp.allclose(
-            out_ring, out_vanilla, rtol=1e-2, atol=1e-2
-        ), f"Ring attention with softmax_aux differs from vanilla. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        assert jnp.allclose(out_ring, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Ring attention with softmax_aux differs from vanilla. Max diff: {jnp.max(jnp.abs(out_ring - out_vanilla))}"
+        )
 
     def test_numerical_correctness_vs_vanilla_logits_soft_cap(self):
         """Test numerical correctness with logit soft cap."""
@@ -568,9 +568,9 @@ class TestRingAttentionPallasDistributed:
 
         assert out.shape == (batch, seq_len, num_heads, head_dim)
         assert not jnp.any(jnp.isnan(out))
-        assert jnp.allclose(
-            out, out_vanilla, rtol=1e-2, atol=1e-2
-        ), f"Distributed ring attention output differs from vanilla. Max diff: {jnp.max(jnp.abs(out - out_vanilla))}"
+        assert jnp.allclose(out, out_vanilla, rtol=1e-2, atol=1e-2), (
+            f"Distributed ring attention output differs from vanilla. Max diff: {jnp.max(jnp.abs(out - out_vanilla))}"
+        )
 
 
 class TestRingAttentionPallasEdgeCases:

@@ -49,17 +49,7 @@ _RHS_BWD_CACHE: dict[tuple, callable] = {}
 _LOCK = threading.Lock()
 
 
-def _pick_tile(k, n):
-    """Choose ``(block_k, block_n)`` for the RHS backward kernel.
-
-    Returns 32 for each dimension if the dimension is <= 32, else 64.
-    """
-    bk = 32 if k <= 32 else 64
-    bn = 32 if n <= 32 else 64
-    return bk, bn
-
-
-def _get_rhs_bwd(m, n, k, num_groups, transpose_rhs, dtype):
+def _get_rhs_bwd(m, n, k, num_groups, transpose_rhs, dtype, *, block_k: int, block_n: int):
     """Build (or retrieve from cache) the RHS backward FFI call.
 
     Args:
@@ -69,12 +59,15 @@ def _get_rhs_bwd(m, n, k, num_groups, transpose_rhs, dtype):
         num_groups: number of groups.
         transpose_rhs: if True the output ``dRhs`` is ``(G, n, k)`` else ``(G, k, n)``.
         dtype: activation dtype.
+        block_k: tile size along ``k`` (caller-supplied; no fallback).
+        block_n: tile size along ``n`` (caller-supplied; no fallback).
 
     Returns:
         Compiled ``jax.ffi`` callable
         ``(Lhs[m,k], dY[m,n], GroupSizes[G]) -> dRhs[G, R1, R2]``.
     """
-    bk, bn = _pick_tile(k, n)
+    bk = int(block_k)
+    bn = int(block_n)
     key = (m, n, k, num_groups, bk, bn, bool(transpose_rhs), str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _RHS_BWD_CACHE.get(key)
@@ -109,6 +102,9 @@ def grouped_matmul_tilelang(
     group_offset: jax.Array | None = None,
     existing_out: jax.Array | None = None,
     transpose_rhs: bool = False,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 64,
 ) -> jax.Array:
     """Forward-only grouped matmul: ``out[g_rows] = lhs[g_rows] @ rhs[g]``.
 
@@ -137,6 +133,9 @@ def grouped_matmul_tilelang(
         group_offset=group_offset,
         existing_out=existing_out,
         transpose_rhs=transpose_rhs,
+        block_m=int(block_m),
+        block_n=int(block_n),
+        block_k=int(block_k),
     )
 
 
@@ -178,7 +177,7 @@ def _grouped_matmul_bwd(transpose_rhs, has_existing_out, residual, grad):
     ).astype(lhs.dtype)
     if group_offset.shape[0] != 0:
         raise RuntimeError("group_offset is handled by the grouped_matmulv3 native VJP.")
-    drhs = _get_rhs_bwd(m, n, k, num_groups, bool(transpose_rhs), rhs.dtype)(
+    drhs = _get_rhs_bwd(m, n, k, num_groups, bool(transpose_rhs), rhs.dtype, block_k=64, block_n=64)(
         lhs,
         grad.astype(lhs.dtype),
         group_sizes.astype(jnp.int32),
@@ -198,6 +197,9 @@ def grouped_matmul_trainable_tilelang(
     group_offset: jax.Array | None = None,
     existing_out: jax.Array | None = None,
     transpose_rhs: bool = False,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 64,
 ) -> jax.Array:
     """Grouped matmul with native forward and native VJP for ``lhs`` and ``rhs``.
 
@@ -244,4 +246,7 @@ def grouped_matmul_trainable_tilelang(
         group_offset=group_offset if group_offset.shape[0] != 0 else None,
         existing_out=existing_out if has_existing else None,
         transpose_rhs=bool(transpose_rhs),
+        block_m=int(block_m),
+        block_n=int(block_n),
+        block_k=int(block_k),
     )

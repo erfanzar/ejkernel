@@ -105,11 +105,8 @@ def _rwkv7_update(
             - h_next: Updated hidden state [B, H, K, V]
             - o_t: Output at time t [B, H, V]
     """
-    # Low-rank read: b^T @ h -> [B, H, V]
     hb = jnp.einsum("bhk,bhkv->bhv", b_t, h)
-    # DPLR update: diagonal + low-rank + key-value
     h = h * jnp.exp(w_t)[..., :, None] + a_t[..., :, None] * hb[..., None, :] + k_t[..., :, None] * v_t[..., None, :]
-    # Query the updated state
     o_t = jnp.einsum("bhk,bhkv->bhv", r_t, h)
     return h, o_t
 

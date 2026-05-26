@@ -18,11 +18,17 @@ Forward and backward are both native tile-lang kernels. The pair is
 stitched together with ``jax.custom_vjp`` so ``state_space_v1`` is fully
 differentiable: the forward emits every hidden state ``Hall`` and the
 backward runs a reverse-time adjoint scan over it.
+
+Block-size policy: this kernel is a pure executor — it does NOT pick
+``block_d`` from shape. The caller (operation layer or interface) must
+supply ``block_d``. All shape-aware tile choices live in the operation's
+``heuristic_cfg`` / ``candidate_cfgs_gpu``.
 """
 
 from __future__ import annotations
 
 import threading
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -52,27 +58,12 @@ _INIT_CACHE: dict[tuple, callable] = {}
 _LOCK = threading.Lock()
 
 
-def _pick_block_d(D, N):
-    """Choose the BLOCK_D tile size heuristic for SSM-1.
-
-    Returns ``D`` itself (up to 64) when the whole channel dimension fits in
-    one block; otherwise 64 for ``N<=16`` and 32 for larger state sizes to
-    keep the ``(BLOCK_D, N)`` fragment within register budget.
-    """
-    if D <= 64:
-        return D
-    if N <= 16:
-        return 64
-    return 32
-
-
-def _get_ffi(B, S, D, N, dtype):
+def _get_ffi(B, S, D, N, block_d, dtype):
     """Return (possibly cached) FFI callable for the SSM-1 forward kernel.
 
     Outputs: ``(Y: (B,S,D,dtype), Hf: (B,D,N,fp32))``.
     """
-    bd = _pick_block_d(D, N)
-    key = (B, S, D, N, bd, str(jnp.dtype(dtype)))
+    key = (B, S, D, N, block_d, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _FFI_CACHE.get(key)
         if cached is not None:
@@ -82,7 +73,7 @@ def _get_ffi(B, S, D, N, dtype):
             seq_len=S,
             intermediate_size=D,
             ssm_state_size=N,
-            block_d=bd,
+            block_d=block_d,
             dtype=dtype,
         )
         ffi = build_tilelang_call(
@@ -97,13 +88,12 @@ def _get_ffi(B, S, D, N, dtype):
         return ffi
 
 
-def _get_fwd_states_ffi(B, S, D, N, dtype):
+def _get_fwd_states_ffi(B, S, D, N, block_d, dtype):
     """Return (possibly cached) FFI callable for the forward + state-saving kernel.
 
     Outputs: ``(Y: (B,S,D,dtype), Hf: (B,D,N,fp32), Hall: (B,S,D,N,fp32))``.
     """
-    bd = _pick_block_d(D, N)
-    key = (B, S, D, N, bd, str(jnp.dtype(dtype)))
+    key = (B, S, D, N, block_d, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _FWD_STATES_CACHE.get(key)
         if cached is not None:
@@ -113,7 +103,7 @@ def _get_fwd_states_ffi(B, S, D, N, dtype):
             seq_len=S,
             intermediate_size=D,
             ssm_state_size=N,
-            block_d=bd,
+            block_d=block_d,
             dtype=dtype,
         )
         ffi = build_tilelang_call(
@@ -129,10 +119,9 @@ def _get_fwd_states_ffi(B, S, D, N, dtype):
         return ffi
 
 
-def _get_bwd_ffi(B, S, D, N, dtype):
-    bd = _pick_block_d(D, N)
-    ndb = (D + bd - 1) // bd
-    key = (B, S, D, N, bd, str(jnp.dtype(dtype)))
+def _get_bwd_ffi(B, S, D, N, block_d, dtype):
+    ndb = (D + block_d - 1) // block_d
+    key = (B, S, D, N, block_d, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _BWD_CACHE.get(key)
         if cached is not None:
@@ -142,7 +131,7 @@ def _get_bwd_ffi(B, S, D, N, dtype):
             seq_len=S,
             intermediate_size=D,
             ssm_state_size=N,
-            block_d=bd,
+            block_d=block_d,
             dtype=dtype,
         )
         ffi = build_tilelang_call(
@@ -162,9 +151,8 @@ def _get_bwd_ffi(B, S, D, N, dtype):
         return ffi, ndb
 
 
-def _get_init_ffi(B, S, D, N, dtype):
-    bd = _pick_block_d(D, N)
-    key = (B, S, D, N, bd, str(jnp.dtype(dtype)))
+def _get_init_ffi(B, S, D, N, block_d, dtype):
+    key = (B, S, D, N, block_d, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _INIT_CACHE.get(key)
         if cached is not None:
@@ -174,7 +162,7 @@ def _get_init_ffi(B, S, D, N, dtype):
             seq_len=S,
             intermediate_size=D,
             ssm_state_size=N,
-            block_d=bd,
+            block_d=block_d,
             dtype=dtype,
         )
         ffi = build_tilelang_call(
@@ -186,18 +174,22 @@ def _get_init_ffi(B, S, D, N, dtype):
         return ffi
 
 
-@jax.custom_vjp
-def _ssm1_init_state(x, A):
+@partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _ssm1_init_state(x, A, block_d):
     B, S, D_size = x.shape
     N_size = A.shape[-1]
-    return _get_init_ffi(B, S, D_size, N_size, x.dtype)(x)
+    return _get_init_ffi(B, S, D_size, N_size, block_d, x.dtype)(x)
 
 
-def _ssm1_init_state_fwd(x, A):
-    return _ssm1_init_state(x, A), None
+def _ssm1_init_state_fwd(x, A, block_d):
+    B, S, D_size = x.shape
+    N_size = A.shape[-1]
+    out = _get_init_ffi(B, S, D_size, N_size, block_d, x.dtype)(x)
+    return out, None
 
 
-def _ssm1_init_state_bwd(residual, g):
+def _ssm1_init_state_bwd(block_d, residual, g):
+    del block_d, residual, g
     return None, None
 
 
@@ -258,29 +250,29 @@ def _get_reduce_ndb_bsn(NDB, B, S, N, dtype):
         return ffi
 
 
-@jax.custom_vjp
-def _ssm1_core(x, A, Bp, C, D, dt, initial_state):
+@partial(jax.custom_vjp, nondiff_argnums=(7,))
+def _ssm1_core(x, A, Bp, C, D, dt, initial_state, block_d):
     B, S, D_size = x.shape
     N_size = A.shape[-1]
-    ffi = _get_ffi(B, S, D_size, N_size, x.dtype)
+    ffi = _get_ffi(B, S, D_size, N_size, block_d, x.dtype)
     y, hf = ffi(x, A, Bp, C, D, dt, initial_state)
     return y, hf
 
 
-def _ssm1_fwd(x, A, Bp, C, D, dt, initial_state):
+def _ssm1_fwd(x, A, Bp, C, D, dt, initial_state, block_d):
     B, S, D_size = x.shape
     N_size = A.shape[-1]
-    fwd = _get_fwd_states_ffi(B, S, D_size, N_size, x.dtype)
+    fwd = _get_fwd_states_ffi(B, S, D_size, N_size, block_d, x.dtype)
     y, hf, hall = fwd(x, A, Bp, C, D, dt, initial_state)
     return (y, hf), (x, A, Bp, C, D, dt, initial_state, hall)
 
 
-def _ssm1_bwd(residual, g):
+def _ssm1_bwd(block_d, residual, g):
     x, A, Bp, C, D, dt, initial_state, hall = residual
     g_y, g_hf = g
     B, S, D_size = x.shape
     N_size = A.shape[-1]
-    bwd, ndb = _get_bwd_ffi(B, S, D_size, N_size, x.dtype)
+    bwd, ndb = _get_bwd_ffi(B, S, D_size, N_size, block_d, x.dtype)
 
     dX, dA_p, dBp_p, dC_p, dD_p, dDt, dH0 = bwd(
         x,
@@ -312,7 +304,7 @@ def _ssm1_bwd(residual, g):
 _ssm1_core.defvjp(_ssm1_fwd, _ssm1_bwd)
 
 
-def ssm1_tilelang(x, A, Bp, C, D, dt, *, initial_state=None):
+def ssm1_tilelang(x, A, Bp, C, D, dt, *, initial_state=None, block_d: int):
     """SSM-1 (Mamba selective scan) forward + backward via native tile-lang kernels.
 
     Args:
@@ -325,6 +317,9 @@ def ssm1_tilelang(x, A, Bp, C, D, dt, *, initial_state=None):
         dt: time-delta, ``(B, S, D, dtype)``.
         initial_state: optional fp32 ``(B, D, N)`` initial hidden state;
             defaults to all-zeros.
+        block_d: keyword-only tile size along ``D``. **Required** — the
+            operation layer (``StateSpaceV1Config.block_d``) chooses
+            this; the kernel does not pick from shape.
 
     Returns:
         ``(y, hf)`` — ``y`` is ``(B, S, D)`` in the input dtype; ``hf`` is
@@ -332,11 +327,15 @@ def ssm1_tilelang(x, A, Bp, C, D, dt, *, initial_state=None):
 
     Raises:
         RuntimeError: if tilelang or jax_tvm_ffi is unavailable.
+        ValueError: if ``block_d <= 0``.
     """
     if not has_tilelang_ffi_support():
         raise RuntimeError("ssm1_tilelang requires tilelang + jax_tvm_ffi.")
+    bd = int(block_d)
+    if bd <= 0:
+        raise ValueError(f"ssm1_tilelang: block_d must be a positive int (got {bd}).")
     if initial_state is None:
-        initial_state = _ssm1_init_state(x, A)
+        initial_state = _ssm1_init_state(x, A, bd)
     else:
         initial_state = initial_state.astype(jnp.float32)
-    return _ssm1_core(x, A, Bp, C, D, dt, initial_state)
+    return _ssm1_core(x, A, Bp, C, D, dt, initial_state, bd)

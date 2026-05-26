@@ -168,7 +168,12 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
         impl = kernel_registry.get("mean_pooling", platform=resolved_platform, backend=cfg.backend)
         kwargs = dict(x=x, chunk_size=effective_chunk_size, cu_seqlens=cu_seqlens)
         if resolved_platform in (Platform.TRITON, Platform.TILELANG, Platform.XLA):
-            kwargs.update(block_dim=cfg.block_dim, num_warps=cfg.num_warps, num_stages=cfg.num_stages)
+            kwargs.update(
+                block_dim=cfg.block_dim,
+                block_size=cfg.block_size,
+                num_warps=cfg.num_warps,
+                num_stages=cfg.num_stages,
+            )
         return impl(**kwargs)
 
     def heuristic_cfg(self, inv: Invocation[MeanPoolingConfig, Array]) -> MeanPoolingConfig:
@@ -233,18 +238,43 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[MeanPoolingConfig, Array]):
-        """Generate GPU candidates for mean pooling across registered GPU backends."""
+        """Generate GPU candidates for mean pooling across registered GPU backends.
+
+        Mean pooling is bandwidth-bound: each token is read once and
+        accumulated. The two tiles are:
+
+        * ``block_size`` — sequence-axis tile (how many tokens per CTA).
+        * ``block_dim`` — hidden-axis tile (how many features per CTA).
+
+        On H100:
+
+        * Small ``block_size`` (32, 64) is wasteful for long sequences.
+        * ``block_size=256, block_dim=128`` covers most cases.
+        * For wide hidden_dim (>=1024) try ``block_dim=256``.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
-        block_configs = [
+        triton_configs = [
             (32, 32, 2, 1),
             (64, 64, 4, 1),
+            (128, 64, 4, 2),
             (128, 128, 8, 2),
+            (256, 64, 4, 2),
             (256, 128, 8, 2),
+            (256, 256, 8, 2),
+            (512, 128, 8, 2),
+        ]
+        tilelang_configs = [
+            (128, 64, 4, 1),
+            (128, 128, 4, 2),
+            (256, 64, 4, 1),
+            (256, 128, 4, 2),
+            (256, 256, 8, 2),
+            (512, 128, 8, 2),
         ]
         candidates: list[MeanPoolingConfig] = []
         if "triton" in platforms:
-            for block_size, block_dim, num_warps, num_stages in block_configs:
+            for block_size, block_dim, num_warps, num_stages in triton_configs:
                 candidates.append(
                     MeanPoolingConfig(
                         block_size=block_size,
@@ -256,21 +286,22 @@ class MeanPooling(Kernel[MeanPoolingConfig, Array]):
                     )
                 )
         if "tilelang" in platforms:
-            candidates.append(
-                MeanPoolingConfig(
-                    block_size=256,
-                    block_dim=128,
-                    num_warps=4,
-                    num_stages=1,
-                    platform="tilelang",
-                    backend="gpu",
+            for block_size, block_dim, num_warps, num_stages in tilelang_configs:
+                candidates.append(
+                    MeanPoolingConfig(
+                        block_size=block_size,
+                        block_dim=block_dim,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
                 )
-            )
         if "xla" in platforms:
             candidates.append(
                 MeanPoolingConfig(
-                    block_size=64,
-                    block_dim=64,
+                    block_size=128,
+                    block_dim=128,
                     num_warps=4,
                     num_stages=1,
                     platform="xla",

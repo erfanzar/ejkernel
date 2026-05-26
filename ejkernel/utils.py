@@ -878,7 +878,7 @@ def _dtype_packing(dtype: jnp.dtype) -> int:
     bw = jnp.dtype(dtype).itemsize * 8
     if bw not in (16, 32):
         raise ValueError(f"Only 16/32-bit floats supported for packing, got {dtype} ({bw} bits).")
-    return 32 // bw  # fp32->1, (b)fp16->2
+    return 32 // bw
 
 
 def make_dummy_rpa_inputs(
@@ -889,15 +889,13 @@ def make_dummy_rpa_inputs(
     page_size: int = 16,
     num_q_heads: int = 8,
     num_kv_heads: int = 2,
-    head_dim: int = 80,  # intentionally not multiple of 128 to exercise padding
-    kv_dtype: jnp.dtype = jnp.float32,  # must be 16/32-bit float
-    q_dtype: jnp.dtype | None = None,  # defaults to kv_dtype if None
-    kv_len_max: int | None = None,  # cap on kv_len per sequence; defaults to pages_per_seq*page_size
-    total_q: int | None = None,  # total number of query tokens (sum_q). If set, uses deterministic q/kv lengths.
+    head_dim: int = 80,
+    kv_dtype: jnp.dtype = jnp.float32,
+    q_dtype: jnp.dtype | None = None,
+    kv_len_max: int | None = None,
+    total_q: int | None = None,
     total_num_pages: int | None = None,
-    # physical kv_cache pages; can be < num_seqs*pages_per_seq when tables are padded.
     decode_prefill_mixed: tuple[int, int, int] | None = None,
-    # (decode_end, prefill_end, mixed_end/total). Defaults to (0,0,num_seqs).
 ):
     """Generate dummy inputs for Ragged Paged Attention testing and benchmarking.
 
@@ -961,15 +959,11 @@ def make_dummy_rpa_inputs(
         kv_len_max = kv_len_cap
     kv_len_max = min(kv_len_max, kv_len_cap)
 
-    # Build per-sequence kv_len and q_len with 0 < q_len <= kv_len.
     key = jax.random.PRNGKey(rng_seed)
     key_kv, key_q, key_data = jax.random.split(key, 3)
 
     if total_q is None:
-        # Sample kv_lens in [1, kv_len_max] and q_lens in [1, kv_len]
         kv_lens = jax.random.randint(key_kv, (num_seqs,), minval=1, maxval=kv_len_max + 1, dtype=jnp.int32)
-        # q_lens chosen uniformly in [1, kv_len]
-        # We generate a random factor in (0,1], then ceil -> [1, kv_len]
         rnd = jax.random.uniform(key_q, (num_seqs,), minval=0.0, maxval=1.0)
         q_lens = jnp.maximum(1, jnp.ceil(rnd * kv_lens).astype(jnp.int32))
     else:
@@ -987,11 +981,9 @@ def make_dummy_rpa_inputs(
             q_lens = q_lens.at[:rem].add(jnp.int32(1))
         kv_lens = q_lens
 
-    # Cumulative query starts
     query_start_loc = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(q_lens, dtype=jnp.int32)])
     sum_q = int(query_start_loc[-1])
 
-    # Distribution triple
     if decode_prefill_mixed is None:
         distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
     else:
@@ -1000,15 +992,7 @@ def make_dummy_rpa_inputs(
             raise ValueError("distribution must satisfy 0 <= i <= j <= k == num_seqs.")
         distribution = jnp.array([i, j, k], dtype=jnp.int32)
 
-    # Block tables: map each sequence's logical pages -> physical kv_cache pages.
-    # In real workloads, `pages_per_seq` is typically a *capacity* (padded table width),
-    # while the number of actually used pages is ceil(kv_len / page_size) and can be
-    # much smaller. Support both:
-    #   - default (total_num_pages is None): allocate and use num_seqs*pages_per_seq pages (old behavior)
-    #   - if total_num_pages is provided and >= num_seqs*pages_per_seq: keep old behavior (disjoint pages)
-    #   - if total_num_pages is provided and <  num_seqs*pages_per_seq: allocate only as many pages as needed by kv_lens,
-    #     and pad table entries with a safe, unused page index so all indices stay in-bounds.
-    pages_needed = (kv_lens + jnp.int32(page_size) - jnp.int32(1)) // jnp.int32(page_size)  # (num_seqs,)
+    pages_needed = (kv_lens + jnp.int32(page_size) - jnp.int32(1)) // jnp.int32(page_size)
     pages_needed_np = np.asarray(pages_needed, dtype=np.int32)
     total_pages_needed = int(pages_needed_np.sum())
     max_pages_needed = int(pages_needed_np.max())
@@ -1020,15 +1004,14 @@ def make_dummy_rpa_inputs(
         total_pages_used = total_pages_used_full
         seq_bases = jnp.arange(num_seqs, dtype=jnp.int32) * jnp.int32(pages_per_seq)
         per_seq = (seq_bases[:, None] + jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :]).reshape(-1)
-        block_tables = per_seq  # shape (num_seqs * pages_per_seq,)
+        block_tables = per_seq
     else:
         total_pages = int(total_num_pages)
         if total_pages >= total_pages_used_full:
-            # Old behavior: every sequence owns `pages_per_seq` disjoint pages.
             total_pages_used = total_pages_used_full
             seq_bases = jnp.arange(num_seqs, dtype=jnp.int32) * jnp.int32(pages_per_seq)
             per_seq = (seq_bases[:, None] + jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :]).reshape(-1)
-            block_tables = per_seq  # shape (num_seqs * pages_per_seq,)
+            block_tables = per_seq
         else:
             if total_pages < total_pages_needed:
                 raise ValueError(
@@ -1039,7 +1022,6 @@ def make_dummy_rpa_inputs(
                 raise ValueError(
                     f"pages_per_seq ({pages_per_seq}) must be >= max(ceil(kv_len/page_size)) ({max_pages_needed})."
                 )
-            # If any sequence has padding slots, reserve a single unused page index for padding.
             needs_padding = bool((pages_needed_np < pages_per_seq).any())
             if needs_padding and total_pages == total_pages_needed:
                 raise ValueError(
@@ -1059,11 +1041,10 @@ def make_dummy_rpa_inputs(
             total_pages_used = cursor
             block_tables = jnp.asarray(block_tables_2d.reshape(-1), dtype=jnp.int32)
 
-    # Allocate kv_cache with random data
     kv_cache_shape = (
         total_pages,
         page_size,
-        _align_to(num_kv_heads * 2, pack) // pack,  # x2_per_pack
+        _align_to(num_kv_heads * 2, pack) // pack,
         pack,
         head_dim_aligned,
     )
@@ -1082,7 +1063,6 @@ def make_dummy_rpa_inputs(
         block_tables=block_tables.astype(jnp.int32),
         query_start_loc=query_start_loc.astype(jnp.int32),
         distribution=distribution.astype(jnp.int32),
-        # Helpful metadata for debugging/inspection:
         _meta=dict(
             num_seqs=num_seqs,
             pages_per_seq=pages_per_seq,

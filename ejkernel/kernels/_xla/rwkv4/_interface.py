@@ -35,6 +35,8 @@ def rwkv4(
     k: Float[Array, "batch seq_len chans"],
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"] | None = None,
+    *,
+    block_c: int = 64,
 ) -> tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]:
     """RWKV-4 recurrent time-mix attention using XLA backend.
     Implements the RWKV-4 time-mixing mechanism which computes a weighted

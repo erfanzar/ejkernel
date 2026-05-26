@@ -166,8 +166,8 @@ def _decode_e8m0_scale(scale_code, accum):
     """Decode an 8-bit E8M0 exponent-only scale (MXFP block scale) to a float.
 
     E8M0 represents a power-of-two scaling factor: value = 2^(raw - 127)
-    where *raw* is interpreted as a signed integer (0–127 → positive exponents,
-    128–255 → negative exponents after bias subtraction).
+    where *raw* is interpreted as a signed integer (0-127 → positive exponents,
+    128-255 → negative exponents after bias subtraction).
 
     Args:
         scale_code: A scalar TileLang expression holding the raw 8-bit code.

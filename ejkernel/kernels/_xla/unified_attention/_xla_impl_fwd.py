@@ -166,8 +166,6 @@ def _unified_attention_fwd(
         logits_soft_cap_val = float(logits_soft_cap)
 
     qblocks = 16
-    # Pad by (qblocks - 1) so that `dynamic_slice`/`dynamic_update_slice` never
-    # clamps the start index for short per-sequence query lengths.
     pad_q = qblocks - 1
     q_grouped = queries.reshape(total_tokens, num_kv_heads, num_q_heads // num_kv_heads, head_dim)
     if pad_q:
@@ -256,7 +254,7 @@ def _unified_attention_fwd(
                 """
                 acc, l, m = carry
                 physical_block = block_tables[seq_idx, kb]
-                k_block = key_cache[physical_block].astype(jnp.float32)  # [B, HKV, D]
+                k_block = key_cache[physical_block].astype(jnp.float32)
                 v_block = value_cache[physical_block].astype(jnp.float32)
 
                 kv_pos = kb * jnp.int32(block_size) + arange_k

@@ -128,8 +128,6 @@ def _ragged_paged_attention(
     else:
         padded_queries = queries
 
-    # Ensure (dynamic) per-sequence block slices never clamp out-of-bounds.
-    # We may slice/update `qblocks` rows starting at arbitrary `query_start_loc` offsets.
     padded_queries = jnp.concatenate(
         [padded_queries, jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=padded_queries.dtype)],
         axis=0,
@@ -137,7 +135,6 @@ def _ragged_paged_attention(
 
     attention_output = jnp.zeros_like(padded_queries)
 
-    # V3 softmax_aux semantics: softmax_aux has shape [num_q_heads]
     have_sinks = softmax_aux is not None
     if have_sinks:
         if softmax_aux.ndim != 1 or softmax_aux.shape[0] != num_q_heads:
@@ -271,9 +268,7 @@ def _ragged_paged_attention(
                     return output_block, sum_exp_block, new_max
 
                 init_output_block = jnp.zeros((qblocks, num_kv_heads, q_heads_per_group, head_size), dtype=compute_dtype)
-                # V3 softmax_aux semantics: initialize with sink values
                 if have_sinks:
-                    # sinks_h has shape [num_kv_heads, q_heads_per_group]
                     init_sum_exp = jnp.ones((qblocks, num_kv_heads, q_heads_per_group), dtype=compute_dtype)
                     init_max = jnp.broadcast_to(
                         sinks_h[None, :, :].astype(compute_dtype),
@@ -290,7 +285,6 @@ def _ragged_paged_attention(
                     (init_output_block, init_sum_exp, init_max),
                 )
 
-                # Standard normalization (sink is already incorporated via initial m and l)
                 sum_exp_block = jnp.maximum(sum_exp_block, 1e-6)
                 normalized_output_block = (output_block / jnp.expand_dims(sum_exp_block, axis=3)).astype(
                     padded_queries.dtype

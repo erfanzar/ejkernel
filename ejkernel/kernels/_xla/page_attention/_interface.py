@@ -134,11 +134,6 @@ def page_attention(
     if attn_scale is None:
         attn_scale = 1.0 / jnp.sqrt(query.shape[-1]).astype(jnp.float32)
 
-    # Accept either cache layout:
-    # - blocks-first:   [num_blocks, num_kv_heads, block_size, head_dim]
-    # - kv-heads-first: [num_kv_heads, num_blocks, block_size, head_dim]
-    #
-    # The XLA implementation expects blocks-first.
     num_heads = query.shape[1]
     dim0, dim1 = key_cache.shape[0], key_cache.shape[1]
     dim0_div = (num_heads % dim0) == 0
@@ -151,7 +146,6 @@ def page_attention(
         key_cache_bf = key_cache.transpose(1, 0, 2, 3)
         value_cache_bf = value_cache.transpose(1, 0, 2, 3)
     else:
-        # Ambiguous (e.g. num_blocks == num_kv_heads). Assume num_blocks >= num_kv_heads.
         if dim0 >= dim1:
             key_cache_bf = key_cache
             value_cache_bf = value_cache

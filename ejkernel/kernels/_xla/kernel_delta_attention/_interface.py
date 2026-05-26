@@ -236,5 +236,4 @@ def kernel_delta_attention(
     return out, final_state
 
 
-# Alias for convenience.
 kda = kernel_delta_attention

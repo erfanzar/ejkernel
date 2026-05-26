@@ -58,23 +58,6 @@ _BIAS_BWD_CACHE: dict[tuple, callable] = {}
 _LOCK = threading.Lock()
 
 
-def _pick_tile(m, n, k):
-    """Choose GEMM tile dimensions based on problem size.
-
-    Rules:
-        - ``block_m`` = 128 if ``m >= 128`` else 64.
-        - ``block_n`` = 128 if ``n >= 128`` else 64.
-        - ``block_k`` = 64  if ``k >= 64``  else 32.
-
-    Returns:
-        ``(block_m, block_n, block_k)`` as Python ints.
-    """
-    bm = 128 if m >= 128 else 64
-    bn = 128 if n >= 128 else 64
-    bk = 64 if k >= 64 else 32
-    return bm, bn, bk
-
-
 def _get_ffi(
     m,
     n,
@@ -92,12 +75,16 @@ def _get_ffi(
     scale_dtype,
     bias_dtype,
     existing_dtype,
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
 ):
     """Build (or return cached) the forward FFI callable for grouped matmul v3.
 
     All parameters are baked into the TileLang prim_func at compile time.
-    The cache key includes tile dimensions (derived via :func:`_pick_tile`),
-    boolean flags, and dtype strings so that different configurations produce
+    The cache key includes the caller-supplied tile dimensions, boolean
+    flags, and dtype strings so that different configurations produce
     distinct compiled kernels.
 
     Returns:
@@ -106,7 +93,9 @@ def _get_ffi(
         ``(Lhs, Rhs, GroupSizes, GroupOffset, RhsScale, RhsBias, ExistingOut)``
         and returns ``Y`` of shape ``(m, n)``.
     """
-    bm, bn, bk = _pick_tile(m, n, k)
+    bm = int(block_m)
+    bn = int(block_n)
+    bk = int(block_k)
     key = (
         m,
         n,
@@ -175,13 +164,17 @@ def _get_lhs_bwd(
     use_group_offset,
     dtype,
     scale_dtype,
+    *,
+    block_m: int,
+    block_k: int,
 ):
     """Build (or return cached) the lhs-gradient FFI callable.
 
     Computes ``dLhs[g_rows] = dY[g_rows] @ rhs[g]^T`` (accounting for
     optional ``rhs_scale`` and transpose).  Output shape is ``(m, k)``.
     """
-    bm, _, bk = _pick_tile(m, n, k)
+    bm = int(block_m)
+    bk = int(block_k)
     key = (
         "lhs",
         m,
@@ -241,6 +234,9 @@ def _get_rhs_bwd(
     use_group_offset,
     dtype,
     scale_dtype,
+    *,
+    block_n: int,
+    block_k: int,
 ):
     """Build (or return cached) the rhs-gradient FFI callable.
 
@@ -248,7 +244,8 @@ def _get_rhs_bwd(
     Output shape is ``(num_groups, k, n)`` or ``(num_groups, n, k)`` when
     ``transpose_rhs=True``.
     """
-    _, bn, bk = _pick_tile(m, n, k)
+    bn = int(block_n)
+    bk = int(block_k)
     key = (
         "rhs",
         m,
@@ -309,6 +306,8 @@ def _get_scale_bwd(
     use_group_offset,
     dtype,
     scale_dtype,
+    *,
+    block_n: int,
 ):
     """Build (or return cached) the rhs_scale-gradient FFI callable.
 
@@ -316,7 +315,7 @@ def _get_scale_bwd(
     ``lhs[g_rows, k_block] * rhs[g, k_block, :] * dY[g_rows, :]`` per
     scale block.  Output shape is ``(num_groups, num_scale_blocks, 1, n)``.
     """
-    _, bn, _ = _pick_tile(m, n, k)
+    bn = int(block_n)
     key = (
         "scale",
         m,
@@ -359,13 +358,24 @@ def _get_scale_bwd(
         return ffi
 
 
-def _get_bias_bwd(m, n, num_groups, group_sizes_len, group_offset_size, use_group_offset, dtype, bias_dtype):
+def _get_bias_bwd(
+    m,
+    n,
+    num_groups,
+    group_sizes_len,
+    group_offset_size,
+    use_group_offset,
+    dtype,
+    bias_dtype,
+    *,
+    block_n: int,
+):
     """Build (or return cached) the rhs_bias-gradient FFI callable.
 
     Computes ``dBias[g, 0, :] = sum_{m in g_rows} dY[m, :]``.
     Output shape is ``(num_groups, 1, n)``.
     """
-    _, bn, _ = _pick_tile(m, n, 1)
+    bn = int(block_n)
     key = (
         "bias",
         m,
@@ -412,6 +422,9 @@ def _grouped_matmulv3_raw(
     rhs_scale: jax.Array | None = None,
     rhs_bias: jax.Array | None = None,
     transpose_rhs: bool = False,
+    block_m: int,
+    block_n: int,
+    block_k: int,
 ) -> jax.Array:
     """Execute the grouped matmul v3 forward kernel (validation + dispatch).
 
@@ -513,6 +526,9 @@ def _grouped_matmulv3_raw(
         rhs_scale.dtype,
         rhs_bias.dtype,
         existing_out.dtype,
+        block_m=int(block_m),
+        block_n=int(block_n),
+        block_k=int(block_k),
     )
     return ffi(
         lhs,
@@ -525,7 +541,7 @@ def _grouped_matmulv3_raw(
     )
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12, 13, 14))
 def _grouped_matmulv3_core(
     lhs,
     rhs,
@@ -539,12 +555,14 @@ def _grouped_matmulv3_core(
     has_scale,
     has_bias,
     has_group_offset,
+    block_m,
+    block_n,
+    block_k,
 ):
     """Bare forward path for the custom VJP (no residuals).
 
-    Boolean flags ``transpose_rhs``, ``has_existing_out``, ``has_scale``,
-    ``has_bias``, and ``has_group_offset`` are non-differentiable (captured
-    via ``nondiff_argnums``) so they can be used as compile-time constants.
+    Boolean flags and tile sizes are non-differentiable (captured via
+    ``nondiff_argnums``) so they bake into the compiled kernel.
     """
     return _grouped_matmulv3_raw(
         lhs,
@@ -555,6 +573,9 @@ def _grouped_matmulv3_core(
         rhs_scale=rhs_scale if has_scale else None,
         rhs_bias=rhs_bias if has_bias else None,
         transpose_rhs=transpose_rhs,
+        block_m=int(block_m),
+        block_n=int(block_n),
+        block_k=int(block_k),
     )
 
 
@@ -571,13 +592,11 @@ def _grouped_matmulv3_fwd(
     has_scale,
     has_bias,
     has_group_offset,
+    block_m,
+    block_n,
+    block_k,
 ):
-    """Forward pass for the custom VJP — runs the forward kernel and saves residuals.
-
-    Returns:
-        ``(out, residuals)`` where residuals are
-        ``(lhs, rhs, group_sizes, group_offset, existing_out, rhs_scale, rhs_bias)``.
-    """
+    """Forward pass for the custom VJP — runs the forward kernel and saves residuals."""
     out = _grouped_matmulv3_raw(
         lhs,
         rhs,
@@ -587,11 +606,25 @@ def _grouped_matmulv3_fwd(
         rhs_scale=rhs_scale if has_scale else None,
         rhs_bias=rhs_bias if has_bias else None,
         transpose_rhs=transpose_rhs,
+        block_m=int(block_m),
+        block_n=int(block_n),
+        block_k=int(block_k),
     )
     return out, (lhs, rhs, group_sizes, group_offset, existing_out, rhs_scale, rhs_bias)
 
 
-def _grouped_matmulv3_bwd(transpose_rhs, has_existing_out, has_scale, has_bias, has_group_offset, residual, grad):
+def _grouped_matmulv3_bwd(
+    transpose_rhs,
+    has_existing_out,
+    has_scale,
+    has_bias,
+    has_group_offset,
+    block_m,
+    block_n,
+    block_k,
+    residual,
+    grad,
+):
     """Backward pass for the custom VJP.
 
     Computes cotangents for ``lhs``, ``rhs``, ``group_sizes`` (``None``),
@@ -625,6 +658,8 @@ def _grouped_matmulv3_bwd(transpose_rhs, has_existing_out, has_scale, has_bias, 
         bool(use_group_offset),
         lhs.dtype,
         rhs_scale.dtype,
+        block_m=int(block_m),
+        block_k=int(block_k),
     )(grad_cast, rhs.astype(lhs.dtype), group_sizes_i32, group_offset_i32, rhs_scale)
     drhs = _get_rhs_bwd(
         m,
@@ -639,6 +674,8 @@ def _grouped_matmulv3_bwd(transpose_rhs, has_existing_out, has_scale, has_bias, 
         bool(use_group_offset),
         rhs.dtype,
         rhs_scale.dtype,
+        block_n=int(block_n),
+        block_k=int(block_k),
     )(lhs.astype(rhs.dtype), grad.astype(rhs.dtype), group_sizes_i32, group_offset_i32, rhs_scale)
     dexisting = grad.astype(existing_out.dtype) if has_existing_out else None
     dscale = None
@@ -655,6 +692,7 @@ def _grouped_matmulv3_bwd(transpose_rhs, has_existing_out, has_scale, has_bias, 
             bool(use_group_offset),
             lhs.dtype,
             rhs_scale.dtype,
+            block_n=int(block_n),
         )(lhs, rhs.astype(lhs.dtype), grad_cast, group_sizes_i32, group_offset_i32)
     dbias = None
     if has_bias:
@@ -667,6 +705,7 @@ def _grouped_matmulv3_bwd(transpose_rhs, has_existing_out, has_scale, has_bias, 
             bool(use_group_offset),
             lhs.dtype,
             rhs_bias.dtype,
+            block_n=int(block_n),
         )(grad_cast, group_sizes_i32, group_offset_i32)
     return dlhs.astype(lhs.dtype), drhs.astype(rhs.dtype), None, None, dexisting, dscale, dbias
 
@@ -684,6 +723,9 @@ def grouped_matmulv3_tilelang(
     rhs_scale: jax.Array | None = None,
     rhs_bias: jax.Array | None = None,
     transpose_rhs: bool = False,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 64,
 ) -> jax.Array:
     """Public entry-point for grouped matmul v3 with a native VJP.
 
@@ -747,4 +789,7 @@ def grouped_matmulv3_tilelang(
         has_scale,
         has_bias,
         has_group_offset,
+        int(block_m),
+        int(block_n),
+        int(block_k),
     )

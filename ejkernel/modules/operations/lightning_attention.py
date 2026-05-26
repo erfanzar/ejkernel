@@ -305,13 +305,29 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[LightningAttentionConfig, Array]):
-        """Generate GPU candidates for Lightning Attention across Triton, TileLang and XLA."""
+        """Generate GPU candidates for Lightning Attention.
+
+        Lightning attention is a linear-attention variant; ``block_d``
+        (head_dim tile) drives most of the GPU performance. Sweep:
+
+        * ``block_d`` ∈ {32, 64, 128}; 128 for wide heads.
+        * ``block_q`` / ``block_k`` ∈ {64, 128}.
+        * ``num_warps`` ∈ {4, 8}; 8 only when blocks are big.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         block_configs = [
+            (64, 64, 32, 4, 1),
             (64, 64, 64, 4, 1),
             (128, 64, 64, 4, 2),
+            (64, 128, 64, 4, 2),
             (128, 128, 64, 8, 2),
+            (128, 128, 128, 8, 2),
+        ]
+        tilelang_configs = [
+            (64, 64, 64, 4, 1),
+            (128, 128, 64, 4, 2),
+            (128, 128, 128, 8, 2),
         ]
         candidates: list[LightningAttentionConfig] = []
         if "triton" in platforms:
@@ -328,17 +344,18 @@ class LightningAttention(Kernel[LightningAttentionConfig, Array]):
                     )
                 )
         if "tilelang" in platforms:
-            candidates.append(
-                LightningAttentionConfig(
-                    block_q=64,
-                    block_k=64,
-                    block_d=64,
-                    num_warps=4,
-                    num_stages=1,
-                    platform="tilelang",
-                    backend="gpu",
+            for block_q, block_k, block_d, num_warps, num_stages in tilelang_configs:
+                candidates.append(
+                    LightningAttentionConfig(
+                        block_q=block_q,
+                        block_k=block_k,
+                        block_d=block_d,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
                 )
-            )
         if "xla" in platforms:
             candidates.append(
                 LightningAttentionConfig(

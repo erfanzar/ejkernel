@@ -82,15 +82,16 @@ _IGNORED_PARAM_CACHE: dict[Callable[..., Any], set[str]] = {}
 """Cache mapping functions to the set of parameter names explicitly deleted within their body."""
 
 _TUNING_PARAM_NAMES: set[str] = {
-    # Kernel tuning/autotuning parameter names that are excluded from unsupported-parameter
-    # checks. These parameters control low-level execution behaviour (block sizes, warp
-    # counts, etc.) and may be silently ignored by implementations that do not use them.
     "block_m",
     "block_n",
     "block_k",
     "block_q",
     "block_kv",
     "block_size",
+    "block_v",
+    "block_d",
+    "block_e",
+    "block_dim",
     "num_warps",
     "num_stages",
     "num_ctas",
@@ -105,6 +106,7 @@ _TUNING_PARAM_NAMES: set[str] = {
     "num_queries_per_block",
     "num_kv_pages_per_block",
     "num_kv_splits",
+    "gemm_block",
     "fwd_params",
     "bwd_params",
 }
@@ -261,12 +263,6 @@ def _normalize_type_string(type_annotation: Any) -> str:
 
     type_str = re.sub(r"\bjaxtyping\.", "", type_str)
 
-    # Normalize common JAX array type spellings.
-    #
-    # Why: with `from __future__ import annotations`, the annotation may stay as
-    # `Float[Array, ...]` (a string), while an eagerly-evaluated annotation will
-    # often render as `jaxtyping.Float[jaxlib._jax.Array, ...]`. These are
-    # semantically equivalent in this project and shouldn't trigger a mismatch.
     type_str = re.sub(r"\b(?:jaxlib\._jax\.Array|jax\.jaxlib\._jax\.Array|jax\.Array)\b", "Array", type_str)
     type_str = re.sub(r"\bjax\._src\.lax\.lax\.", "", type_str)
     type_str = re.sub(r"\bjax\._src\.typing\.", "", type_str)
@@ -631,7 +627,7 @@ class KernelRegistry:
 
         reference_spec = specs[0]
         reference_sig = inspect.signature(reference_spec.implementation)
-        reference_params = list(reference_sig.parameters.values())
+        reference_params = [param for param in reference_sig.parameters.values() if param.name not in _TUNING_PARAM_NAMES]
 
         if verbose:
             print(f"\n{'=' * 80}")
@@ -652,7 +648,7 @@ class KernelRegistry:
 
         for spec in specs[1:]:
             sig = inspect.signature(spec.implementation)
-            params = list(sig.parameters.values())
+            params = [param for param in sig.parameters.values() if param.name not in _TUNING_PARAM_NAMES]
 
             if len(params) != len(reference_params):
                 warnings.warn(

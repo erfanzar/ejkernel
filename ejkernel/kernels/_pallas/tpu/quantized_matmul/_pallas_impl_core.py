@@ -420,7 +420,6 @@ def estimate_qmm_tpu_vmem_limit_bytes(
     has_double_buffer: bool,
 ) -> int:
     """Estimate per-kernel VMEM usage and cap it to device budget."""
-    # Account for compute/vreg spill headroom similarly to other TPU kernels.
     estimated = 2 * (max(0, int(io_bytes)) + max(0, int(scratch_bytes)))
     if has_double_buffer:
         estimated += max(0, int(io_bytes))
@@ -499,7 +498,6 @@ def _decode_nf4(code: jax.Array) -> jax.Array:
         Float32 array of decoded values.
     """
     c = code.astype(jnp.int32)
-    # Table-free mapping avoids capturing array constants inside Pallas kernels.
     vals = jnp.where(
         c == 0,
         jnp.float32(-1.0),
@@ -755,7 +753,6 @@ def _predecode_dense_weight(
         raise ValueError("Packed weight width is smaller than scales-implied output width.")
     q = q_full[:, :n]
     w = _dequantize_tile(q, scales, biases, mode, group_size)
-    # TPU fused path computes using bf16 inputs with fp32 accumulation.
     return w.astype(jnp.bfloat16)
 
 

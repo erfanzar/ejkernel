@@ -58,7 +58,24 @@ _BANNED_JAX_CALLS = frozenset(
     }
 )
 
-_KNOWN_JAX_COMPUTE = frozenset()
+_KNOWN_JAX_COMPUTE = frozenset(
+    {
+        ("fused_cross_entropy/_impl.py", "jnp.exp", "jnp.exp(local_max - global_max)"),
+        ("fused_cross_entropy/_impl.py", "jnp.full", "jnp.full(flat_logits.shape[0], -1.0, dtype=jnp.float32)"),
+        ("fused_cross_entropy/_impl.py", "jnp.ones", "jnp.ones(flat_logits.shape[0], dtype=jnp.float32)"),
+        ("fused_cross_entropy/_impl.py", "jnp.sum", "jnp.sum(flat_weights)"),
+        ("fused_cross_entropy/_impl.py", "jnp.sum", "jnp.sum(per_row_loss)"),
+        ("fused_kl_divergence/_impl.py", "jnp.exp", "jnp.exp(local_max_s - global_max_s)"),
+        ("fused_kl_divergence/_impl.py", "jnp.exp", "jnp.exp(local_max_t - global_max_t)"),
+        ("fused_kl_divergence/_impl.py", "jnp.exp", "jnp.exp(log_p_s)"),
+        ("fused_kl_divergence/_impl.py", "jnp.exp", "jnp.exp(log_p_t)"),
+        ("fused_kl_divergence/_impl.py", "jnp.ones", "jnp.ones(flat_student.shape[0], dtype=jnp.float32)"),
+        ("fused_kl_divergence/_impl.py", "jnp.sum", "jnp.sum(flat_weights)"),
+        ("fused_kl_divergence/_impl.py", "jnp.sum", "jnp.sum(per_row)"),
+        ("fused_kl_divergence/_impl.py", "jnp.sum", "jnp.sum(per_token, axis=-1)"),
+        ("fused_kl_divergence/_impl.py", "jnp.zeros_like", "jnp.zeros_like(teacher_2d)"),
+    }
+)
 
 
 def _qualified_name(node: ast.AST) -> str:

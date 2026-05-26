@@ -331,7 +331,6 @@ def ring_attention(
     qcs_default = default_q if fwd_params.q_blocksize is None else int(fwd_params.q_blocksize)
     kcs_default = default_k if fwd_params.kv_blocksize is None else int(fwd_params.kv_blocksize)
 
-    # `chunk_size` sets both query/key chunk sizes.
     if chunk_size is not None:
         qcs_default = int(chunk_size)
         kcs_default = int(chunk_size)

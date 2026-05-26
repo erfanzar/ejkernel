@@ -577,8 +577,6 @@ def flash_attention(
             causal=causal,
         )
         if causal:
-            # For var-len mode, causal masking depends on per-example q/k length shift.
-            # The shifted causal relation is encoded in `merged_attention_mask`.
             effective_causal = False
 
     return _flash_attention_call(

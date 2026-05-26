@@ -253,7 +253,6 @@ def quantized_matmul_cuda(
         ValueError: If *x* dtype is not ``float16``, ``bfloat16``, or
             ``float32``.
     """
-    # Avoid device queries on tracers; runtime will error if no GPU backend.
 
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
     gemv_mode = normalize_gemv_mode(gemv_mode)

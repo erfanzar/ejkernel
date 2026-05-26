@@ -83,7 +83,6 @@ from ejkernel.xla_utils import get_corrected_named_sharding
 mdim_t = "batch nheads_or_1 qlen kvlen"
 """Type annotation string for 4D attention mask dimensions used in jaxtyping."""
 
-# Debug mode flag - set via environment variable
 _DEBUG_MODE = os.environ.get("EJKERNEL_MASK_DEBUG", "0") == "1"
 
 
@@ -158,7 +157,6 @@ def _debug_trace(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if _DEBUG_MODE:
-            # Get class name if this is a method
             if args and hasattr(args[0].__class__, "__name__"):
                 class_name = args[0].__class__.__name__
                 print(f"[MaskInfo Debug] Calling {class_name}.{func.__name__}()")
@@ -195,10 +193,6 @@ def _compress_ids_from_anchors(anchors: jnp.ndarray, pad_mask: jnp.ndarray) -> j
         >>> _compress_ids_from_anchors(anchors, pad_mask)
         Array([0, 0, 1, 1, -1], dtype=int32)
     """
-    # NOTE: Avoid sort/argsort here. Some JAX/XLA GPU builds have an intermittent
-    # kernel reuse cache crash in sorting primitives. We can derive contiguous IDs
-    # without sorting because `anchors` are defined as the *minimum index* of each
-    # group, so anchor indices are already ordered by first occurrence.
     n = anchors.shape[0]
     anchors = jnp.asarray(anchors, jnp.int32)
     pad_mask = jnp.asarray(pad_mask, jnp.bool_)
@@ -317,10 +311,6 @@ def mask_to_segment_ids(mask: jnp.ndarray, per_head: bool = False) -> tuple[jnp.
             q_ids, kv_ids = jax.vmap(jax.vmap(_mask_to_segments_single, in_axes=0), in_axes=0)(m)
             return q_ids, kv_ids
         else:
-            # Most attention masks are broadcast across heads; when they are not, a single
-            # (B,Q,K) segment-id representation cannot encode per-head differences anyway.
-            # We therefore default to head 0 for determinism and to avoid over-restricting
-            # the mask via an AND-reduction across heads.
             head0 = m[:, 0, :, :]
             q_ids, kv_ids = jax.vmap(_mask_to_segments_single, in_axes=0)(head0)
             return q_ids, kv_ids
@@ -610,23 +600,18 @@ def _attention_mask_to_padding_segment_ids(
     """
     m = _to_bool_mask(attention_mask)
 
-    # Normalize to 4D: (B, H, Q, K)
     if m.ndim == 2:
-        m = m[None, None, :, :]  # Add batch and head dims
+        m = m[None, None, :, :]
     elif m.ndim == 3:
-        m = m[:, None, :, :]  # Add head dim
+        m = m[:, None, :, :]
     elif m.ndim != 4:
         raise ValueError(f"attention_mask must be 2D, 3D, or 4D, got shape {attention_mask.shape}")
 
-    # Reduce over heads (any head having valid attention counts)
-    m_reduced = jnp.any(m, axis=1)  # (B, Q, K)
+    m_reduced = jnp.any(m, axis=1)
 
-    # Q is valid if it attends to at least one KV
-    q_valid = jnp.any(m_reduced, axis=-1)  # (B, Q)
-    # KV is valid if at least one Q attends to it
-    kv_valid = jnp.any(m_reduced, axis=-2)  # (B, K)
+    q_valid = jnp.any(m_reduced, axis=-1)
+    kv_valid = jnp.any(m_reduced, axis=-2)
 
-    # Convert to segment IDs: 0 for valid, -1 for padding
     q_segment_ids = jnp.where(q_valid, 0, -1).astype(jnp.int32)
     kv_segment_ids = jnp.where(kv_valid, 0, -1).astype(jnp.int32)
 
@@ -650,25 +635,18 @@ def _mask_to_start_end(mask: Bool[Array, "batch seq_len"], out_dtype: DTypeLike)
     """
     _batch_size, seq_len = mask.shape
 
-    # Find first valid position per batch (argmax of bool gives first True)
-    # If no valid tokens, argmax returns 0, so we need to handle that
-    has_valid = jnp.any(mask, axis=-1)  # (batch,)
-    first_valid = jnp.argmax(mask, axis=-1)  # (batch,) - first True index
+    has_valid = jnp.any(mask, axis=-1)
+    first_valid = jnp.argmax(mask, axis=-1)
 
-    # Find last valid position per batch
-    # Flip mask, find first True in flipped, convert back to original index
     flipped = jnp.flip(mask, axis=-1)
-    last_valid_from_end = jnp.argmax(flipped, axis=-1)  # first True in flipped
-    last_valid = seq_len - 1 - last_valid_from_end  # convert to original index
+    last_valid_from_end = jnp.argmax(flipped, axis=-1)
+    last_valid = seq_len - 1 - last_valid_from_end
 
-    # end position is one past last valid
     end_pos = last_valid + 1
 
-    # Handle case where no valid tokens: set start=0, end=0
     first_valid = jnp.where(has_valid, first_valid, 0)
     end_pos = jnp.where(has_valid, end_pos, 0)
 
-    # Interleave starts and ends: [start_0, end_0, start_1, end_1, ...]
     result = jnp.stack([first_valid, end_pos], axis=1).reshape(-1)
     return result.astype(out_dtype)
 
@@ -752,20 +730,15 @@ def _segment_ids_to_cu_seqlens(
         For JIT compatibility, max_segments must be a static value. The output
         always has shape (max_segments + 1,) with trailing zeros for unused segments.
     """
-    # Flatten to 1D for processing
     flat_ids = segment_ids.reshape(-1)
 
-    # Count tokens per segment ID (0 to max_segments-1)
-    # Use a fixed range for JIT compatibility
     seg_ids_range = jnp.arange(max_segments, dtype=jnp.int32)
 
-    # Count tokens for each segment ID using vmap
     def count_segment(seg_id):
         return jnp.sum(flat_ids == seg_id)
 
     segment_counts = jax.vmap(count_segment)(seg_ids_range)
 
-    # Compute cumulative sum with leading 0
     cu_seqlens = jnp.concatenate([jnp.array([0], dtype=out_dtype), jnp.cumsum(segment_counts, dtype=out_dtype)])
 
     return cu_seqlens
@@ -801,15 +774,13 @@ def cu_seqlens_to_mask(cu_seqlens: Int[Array, "batch*2"], max_len: int, dtype: D
     if cu.shape[0] % 2 != 0:
         raise ValueError(f"cu_seqlens must have even length (batch*2), got {cu.shape[0]}.")
 
-    # Reshape to (batch, 2) where [:, 0] = starts, [:, 1] = ends
     batch_size = cu.shape[0] // 2
     cu_pairs = cu.reshape(batch_size, 2)
-    starts = cu_pairs[:, 0]  # (batch,)
-    ends = cu_pairs[:, 1]  # (batch,)
+    starts = cu_pairs[:, 0]
+    ends = cu_pairs[:, 1]
 
-    # Create mask: position i is valid if starts[b] <= i < ends[b]
-    idx = jnp.arange(max_len, dtype=jnp.int32)[None, :]  # (1, max_len)
-    mask = (idx >= starts[:, None]) & (idx < ends[:, None])  # (batch, max_len)
+    idx = jnp.arange(max_len, dtype=jnp.int32)[None, :]
+    mask = (idx >= starts[:, None]) & (idx < ends[:, None])
     return mask.astype(dtype)
 
 
@@ -1042,7 +1013,6 @@ class MaskInfo:
     q_positions: Int[Array, "batch qlen"] | None = None
     kv_positions: Int[Array, "batch kvlen"] | None = None
 
-    # Baked-in mask operation flags (static metadata)
     causal_mask_baked_in: bool = field(default=False)
     sliding_window_baked_in: bool = field(default=False)
     chunked_mask_baked_in: bool = field(default=False)
@@ -1166,15 +1136,11 @@ class MaskInfo:
             q_ids_2d = q_ids[:, 0, :] if q_ids.ndim == 3 else q_ids
             flat_ids = q_ids_2d.reshape(-1)
             max_seg_id = int(jnp.max(flat_ids))
-            # Check if we have multiple distinct segments (packed format)
-            # vs simple padding (all valid tokens are same segment)
             if max_seg_id > 0:
-                # Multiple segments: return per-segment counts (FlashAttention style)
                 seg_ids_range = jnp.arange(max_seg_id + 1, dtype=jnp.int32)
                 segment_counts = jax.vmap(lambda s: jnp.sum(flat_ids == s))(seg_ids_range)
                 return segment_counts.astype(jnp.int32)
             else:
-                # Single segment (0) or all padding (-1): return per-batch counts
                 return jnp.sum(q_ids_2d >= 0, axis=-1).astype(jnp.int32)
         return None
 
@@ -1196,15 +1162,11 @@ class MaskInfo:
             kv_ids_2d = kv_ids[:, 0, :] if kv_ids.ndim == 3 else kv_ids
             flat_ids = kv_ids_2d.reshape(-1)
             max_seg_id = int(jnp.max(flat_ids))
-            # Check if we have multiple distinct segments (packed format)
-            # vs simple padding (all valid tokens are same segment)
             if max_seg_id > 0:
-                # Multiple segments: return per-segment counts (FlashAttention style)
                 seg_ids_range = jnp.arange(max_seg_id + 1, dtype=jnp.int32)
                 segment_counts = jax.vmap(lambda s: jnp.sum(flat_ids == s))(seg_ids_range)
                 return segment_counts.astype(jnp.int32)
             else:
-                # Single segment (0) or all padding (-1): return per-batch counts
                 return jnp.sum(kv_ids_2d >= 0, axis=-1).astype(jnp.int32)
         return None
 
@@ -1249,21 +1211,18 @@ class MaskInfo:
         if _DEBUG_MODE:
             print("[MaskInfo Debug] Property access: is_multi_sequence")
 
-        # Check query segment IDs
         q_ids = self._q_segment_ids
         if q_ids is not None:
             q_ids_2d = q_ids[:, 0, :] if q_ids.ndim == 3 else q_ids
             max_seg_id = jnp.max(q_ids_2d)
             return max_seg_id > 0
 
-        # Fallback to key-value segment IDs if query IDs not available
         kv_ids = self._kv_segment_ids
         if kv_ids is not None:
             kv_ids_2d = kv_ids[:, 0, :] if kv_ids.ndim == 3 else kv_ids
             max_seg_id = jnp.max(kv_ids_2d)
             return max_seg_id > 0
 
-        # If no segment IDs available, return False as JAX array
         return jnp.array(False, dtype=jnp.bool_)
 
     @property
@@ -1472,19 +1431,14 @@ class MaskInfo:
             kv_segment_ids = jnp.asarray(kv_segment_ids, dtype=jnp.int32)
 
         if kv_segment_ids is None:
-            # Self-attention case: KV segment IDs match query segment IDs, including padding (-1).
             kv_segment_ids = q_segment_ids
 
         attention_mask = None
 
         if is_attn_mask:
-            # Treat input as padding mask: non-zero = valid, 0 = padding
-            # Build pairwise outer product mask
-            pm = (q_segment_ids != 0).astype(jnp.bool_)  # (batch, qlen) - True=valid
-            kv_pm = (kv_segment_ids != 0).astype(jnp.bool_)  # (batch, kvlen) - True=valid
-            # Outer product: (batch, 1, qlen, kvlen) where both Q and KV must be valid
+            pm = (q_segment_ids != 0).astype(jnp.bool_)
+            kv_pm = (kv_segment_ids != 0).astype(jnp.bool_)
             attention_mask = (pm[:, None, :, None] & kv_pm[:, None, None, :]).astype(jnp.bool_)
-            # Convert to segment IDs: 0 for valid, -1 for padding
             q_segment_ids = jnp.where(pm, 0, -1).astype(jnp.int32)
             kv_segment_ids = jnp.where(kv_pm, 0, -1).astype(jnp.int32)
 
@@ -1558,7 +1512,6 @@ class MaskInfo:
             m = ~m
 
         if m.ndim == 2:
-            # 2D padding mask: directly convert to segment IDs
             q_segment_ids = jnp.where(m, 0, -1).astype(jnp.int32)
             kv_segment_ids = q_segment_ids
             pairwise_mask = segment_ids_to_mask((q_segment_ids, kv_segment_ids), dtype=jnp.bool_)
@@ -1583,8 +1536,6 @@ class MaskInfo:
                 f"Check that your mask has the proper dimensions for the attention operation."
             )
 
-        # For 3D/4D masks, extract padding-style segment IDs:
-        # Q is valid if it attends to at least one KV, KV is valid if at least one Q attends to it
         q_segment_ids, kv_segment_ids = _attention_mask_to_padding_segment_ids(m)
 
         return cls(
@@ -1934,7 +1885,6 @@ class MaskInfo:
             if self.kv_positions is not None
             else None
         )
-        # cu_seqlens are length-(batch+1) vectors; replicating them is typically the safest choice.
         cu_seqlens_q = None
         cu_seqlens_kv = None
         return MaskSharding(
@@ -2052,7 +2002,9 @@ class MaskInfo:
         )
 
     @_debug_trace
-    def get_qkv_masks(self, dtype: DTypeLike = jnp.bool_) -> tuple[
+    def get_qkv_masks(
+        self, dtype: DTypeLike = jnp.bool_
+    ) -> tuple[
         Array,
         Array,
         Bool[Array, "batch nheads_or_1 qlen kvlen"] | Int[Array, "batch nheads_or_1 qlen kvlen"],
@@ -2116,16 +2068,13 @@ class MaskInfo:
         kv_ids = self._kv_segment_ids
 
         if q_ids is not None and kv_ids is not None:
-            # Handle 3D segment IDs (batch, heads, seq) by reducing to 2D
             q_ids_2d = q_ids
             kv_ids_2d = kv_ids
             if q_ids.ndim == 3:
-                # Take first head or reduce across heads
                 q_ids_2d = q_ids[:, 0, :]
             if kv_ids.ndim == 3:
                 kv_ids_2d = kv_ids[:, 0, :]
 
-            # Use segment-aware cu_seqlens computation
             cu_q = _segment_ids_to_cu_seqlens(q_ids_2d, out_dtype=out_dtype, max_segments=max_segments)
             cu_kv = _segment_ids_to_cu_seqlens(kv_ids_2d, out_dtype=out_dtype, max_segments=max_segments)
             self._cu_seqlens_q = cu_q
@@ -2138,7 +2087,7 @@ class MaskInfo:
                 "Initialize MaskInfo with either an attention_mask or segment IDs."
             )
 
-        m = self.get_or_compute_attention_mask(dtype=jnp.bool_)  # (B,H,Q,K)
+        m = self.get_or_compute_attention_mask(dtype=jnp.bool_)
         q_valid = jnp.any(m, axis=(1, 3))
         kv_valid = jnp.any(m, axis=(1, 2))
         cu_q, cu_kv = qkv_masks_to_cu_seqlens(q_valid, kv_valid, out_dtype=out_dtype)
@@ -2179,10 +2128,8 @@ class MaskInfo:
         Returns:
             New MaskInfo with converted attention mask
         """
-        # Get or compute the attention mask
         mask = self.get_or_compute_attention_mask(dtype=jnp.bool_)
 
-        # Convert to requested dtype if needed
         if mask.dtype == dtype:
             return self
 
@@ -2315,7 +2262,7 @@ class MaskInfo:
 
         def _slice_q(x, klen, seg=None):
             start_q = jnp.clip(klen - q_len, 0, jnp.maximum(Q - q_len, 0))
-            x = jax.lax.dynamic_slice_in_dim(x, start_q, q_len, axis=1)  # x: (H,Q,K)
+            x = jax.lax.dynamic_slice_in_dim(x, start_q, q_len, axis=1)
             if seg is not None:
                 seg = jax.lax.dynamic_slice_in_dim(seg, start_q, q_len, axis=0)
             return x, seg
@@ -2330,7 +2277,7 @@ class MaskInfo:
 
             def _slice_k(x, klen, seg=None):
                 start_k = jnp.clip(klen - width, 0, jnp.maximum(K - width, 0))
-                x = jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)  # x: (H,q_len,K)
+                x = jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)
                 if seg is not None:
                     seg = jax.lax.dynamic_slice_in_dim(seg, start_k, width, axis=0)
                 return x, seg
@@ -2383,7 +2330,6 @@ class MaskInfo:
         base_mask = self.get_or_compute_attention_mask(dtype=jnp.bool_)
         B, _H, Q, K = base_mask.shape
 
-        # Handle scalar offset - convert to array if needed
         off = jnp.asarray(offset, dtype=jnp.int32)
         if off.ndim == 0:
             off = jnp.broadcast_to(off, (B,))
@@ -2393,8 +2339,8 @@ class MaskInfo:
             k = jnp.arange(K, dtype=jnp.int32)[None, :]
             return k <= (q + o)
 
-        causal = jax.vmap(_mk_causal, in_axes=(None, None, 0))(Q, K, off)  # (B,Q,K)
-        causal = causal[:, None, :, :]  # (B,1,Q,K)
+        causal = jax.vmap(_mk_causal, in_axes=(None, None, 0))(Q, K, off)
+        causal = causal[:, None, :, :]
 
         return self.replace(attention_mask=base_mask & causal, causal_mask_baked_in=True)
 
@@ -2491,7 +2437,7 @@ class MaskInfo:
                 "Please provide the current position index for decode mode."
             )
 
-        base = self.get_or_compute_attention_mask(dtype=jnp.bool_)  # (B,H,Q,K)
+        base = self.get_or_compute_attention_mask(dtype=jnp.bool_)
 
         B, H, Q, K = base.shape
 
@@ -2499,10 +2445,9 @@ class MaskInfo:
         if off.ndim == 0:
             off = jnp.broadcast_to(off, (B,))
 
-        # Helper to build window mask for a single (Q,K)
         def _window_mask_single(Q, K, off_b):
-            row = off_b + jnp.arange(Q, dtype=jnp.int32)[:, None]  # (Q,1)
-            col = jnp.arange(K, dtype=jnp.int32)[None, :]  # (1,K)
+            row = off_b + jnp.arange(Q, dtype=jnp.int32)[:, None]
+            col = jnp.arange(K, dtype=jnp.int32)[None, :]
             left_ok = col >= (row - left_window)
             right_ok = col <= (row + right_window)
             return left_ok & right_ok
@@ -2524,11 +2469,11 @@ class MaskInfo:
             start_k = jnp.clip(idx - left_window, 0, jnp.maximum(K - width, 0))
 
             def _slice_decode(x, i, sk):
-                x = jax.lax.dynamic_slice_in_dim(x, i, 1, axis=1)  # Q->1
-                x = jax.lax.dynamic_slice_in_dim(x, sk, width, 2)  # K->width
-                return x  # (H,1,width)
+                x = jax.lax.dynamic_slice_in_dim(x, i, 1, axis=1)
+                x = jax.lax.dynamic_slice_in_dim(x, sk, width, 2)
+                return x
 
-            masked = jax.vmap(_slice_decode, in_axes=(0, 0, 0), out_axes=0)(masked, idx, start_k)  # (B,H,1,width)
+            masked = jax.vmap(_slice_decode, in_axes=(0, 0, 0), out_axes=0)(masked, idx, start_k)
 
             q_seg = self._q_segment_ids
             kv_seg = self._kv_segment_ids
@@ -2594,9 +2539,9 @@ class MaskInfo:
             start_k = max(K - width, 0)
 
             def _slice_prefill(x):
-                return jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)  # keep full Q
+                return jax.lax.dynamic_slice_in_dim(x, start_k, width, axis=2)
 
-            masked = jax.vmap(_slice_prefill, in_axes=0, out_axes=0)(masked)  # (B,H,Q,width)
+            masked = jax.vmap(_slice_prefill, in_axes=0, out_axes=0)(masked)
 
             kv_seg = self._kv_segment_ids
             kv_pos = self.kv_positions
@@ -3027,7 +2972,6 @@ class MaskInfo:
             >>> new_mask_info.batch_axis_name
             'dp'
         """
-        # Build kwargs with private field names for dataclass_replace
         replace_kwargs = {}
         mask_rep_changed = False
         if attention_mask is not None:

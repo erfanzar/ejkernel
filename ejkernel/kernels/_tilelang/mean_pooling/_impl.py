@@ -21,6 +21,11 @@ This module provides:
   primitives that dispatch to the appropriate compiled FFI callable.
 - ``mean_pooling_tilelang``: the public entry-point used by ``_interface.py``.
 
+Block-size policy: this kernel is a pure executor — it does NOT pick
+``block_s`` / ``block_d`` from shape. The caller (operation layer or
+interface) supplies concrete values. All shape-aware tile choices live
+in :meth:`MeanPooling.heuristic_cfg` / :meth:`MeanPooling.candidate_cfgs_gpu`.
+
 Thread safety: all cache lookups and insertions are serialised with
 ``_LOCK`` (``threading.Lock``), so compilation happens at most once per
 unique key even under concurrent JAX tracing.
@@ -29,6 +34,7 @@ unique key even under concurrent JAX tracing.
 from __future__ import annotations
 
 import threading
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -48,45 +54,10 @@ _VARLEN_BWD_CACHE: dict[tuple, callable] = {}
 _LOCK = threading.Lock()
 
 
-def _pick_tile(hidden_dim: int) -> tuple[int, int]:
-    """Select ``(BLOCK_S, BLOCK_D)`` tile sizes for mean-pooling kernels.
-
-    The heuristic balances CTA occupancy against launch overhead.  Larger
-    ``BLOCK_S`` amortises the per-CTA fixed cost over more sequence tokens,
-    while ``BLOCK_D`` controls the register pressure along the hidden axis.
-    These values were chosen from an H100 benchmark sweep.
-
-    Args:
-        hidden_dim: Feature dimension of the input tensor.
-
-    Returns:
-        A ``(block_s, block_d)`` tuple: currently ``(256, 64)`` for
-        ``hidden_dim <= 64`` and ``(256, 128)`` for larger hidden dims.
-    """
-    if hidden_dim <= 64:
-        return 256, 64
-    if hidden_dim <= 256:
-        return 256, 128
-    return 256, 128
-
-
-def _get_fwd(batch, seq_len, hidden_dim, dtype):
-    """Retrieve (compiling on first call) the mean-pool forward FFI callable.
-
-    Results are cached under ``(batch, seq_len, hidden_dim, block_s, block_d,
-    dtype_str)``.  The output ``ShapeDtypeStruct`` is ``(batch, hidden_dim)``
-    in *dtype*.
-
-    Args:
-        batch: Batch size.
-        seq_len: Sequence length.
-        hidden_dim: Feature dimension.
-        dtype: Activation dtype.
-
-    Returns:
-        A compiled FFI callable ``ffi(X) -> Y``.
-    """
-    bs, bd = _pick_tile(hidden_dim)
+def _get_fwd(batch, seq_len, hidden_dim, dtype, *, block_s: int, block_d: int):
+    """Retrieve (compiling on first call) the mean-pool forward FFI callable."""
+    bs = int(block_s)
+    bd = int(block_d)
     key = (batch, seq_len, hidden_dim, bs, bd, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _FWD_CACHE.get(key)
@@ -109,22 +80,10 @@ def _get_fwd(batch, seq_len, hidden_dim, dtype):
         return ffi
 
 
-def _get_bwd(batch, seq_len, hidden_dim, dtype):
-    """Retrieve (compiling on first call) the mean-pool backward FFI callable.
-
-    The output ``ShapeDtypeStruct`` is ``(batch, seq_len, hidden_dim)`` in
-    *dtype*.  The backward expects the upstream gradient ``dY`` in float32.
-
-    Args:
-        batch: Batch size.
-        seq_len: Sequence length.
-        hidden_dim: Feature dimension.
-        dtype: Activation dtype.
-
-    Returns:
-        A compiled FFI callable ``ffi(dY_f32) -> dX``.
-    """
-    bs, bd = _pick_tile(hidden_dim)
+def _get_bwd(batch, seq_len, hidden_dim, dtype, *, block_s: int, block_d: int):
+    """Retrieve (compiling on first call) the mean-pool backward FFI callable."""
+    bs = int(block_s)
+    bd = int(block_d)
     key = (batch, seq_len, hidden_dim, bs, bd, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _BWD_CACHE.get(key)
@@ -147,21 +106,10 @@ def _get_bwd(batch, seq_len, hidden_dim, dtype):
         return ffi
 
 
-def _get_varlen_fwd(total_tokens, num_seqs, hidden_dim, dtype):
-    """Retrieve (compiling on first call) the packed mean-pool forward FFI callable.
-
-    The output ``ShapeDtypeStruct`` is ``(num_seqs, hidden_dim)`` in *dtype*.
-
-    Args:
-        total_tokens: Total token count across all sequences.
-        num_seqs: Number of sequences.
-        hidden_dim: Feature dimension.
-        dtype: Activation dtype.
-
-    Returns:
-        A compiled FFI callable ``ffi(X, cu_seqlens) -> Y``.
-    """
-    bs, bd = _pick_tile(hidden_dim)
+def _get_varlen_fwd(total_tokens, num_seqs, hidden_dim, dtype, *, block_s: int, block_d: int):
+    """Retrieve (compiling on first call) the packed mean-pool forward FFI callable."""
+    bs = int(block_s)
+    bd = int(block_d)
     key = (total_tokens, num_seqs, hidden_dim, bs, bd, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _VARLEN_FWD_CACHE.get(key)
@@ -184,22 +132,10 @@ def _get_varlen_fwd(total_tokens, num_seqs, hidden_dim, dtype):
         return ffi
 
 
-def _get_varlen_bwd(total_tokens, num_seqs, hidden_dim, dtype):
-    """Retrieve (compiling on first call) the packed mean-pool backward FFI callable.
-
-    The output ``ShapeDtypeStruct`` is ``(total_tokens, hidden_dim)`` in *dtype*.
-    The backward expects the upstream gradient ``dY`` in float32.
-
-    Args:
-        total_tokens: Total token count across all sequences.
-        num_seqs: Number of sequences.
-        hidden_dim: Feature dimension.
-        dtype: Activation dtype.
-
-    Returns:
-        A compiled FFI callable ``ffi(dY_f32, cu_seqlens) -> dX``.
-    """
-    bs, bd = _pick_tile(hidden_dim)
+def _get_varlen_bwd(total_tokens, num_seqs, hidden_dim, dtype, *, block_s: int, block_d: int):
+    """Retrieve (compiling on first call) the packed mean-pool backward FFI callable."""
+    bs = int(block_s)
+    bd = int(block_d)
     key = (total_tokens, num_seqs, hidden_dim, bs, bd, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _VARLEN_BWD_CACHE.get(key)
@@ -222,75 +158,71 @@ def _get_varlen_bwd(total_tokens, num_seqs, hidden_dim, dtype):
         return ffi
 
 
-@jax.custom_vjp
-def _mean_pool_core(x: jax.Array) -> jax.Array:
+@partial(jax.custom_vjp, nondiff_argnums=(1, 2))
+def _mean_pool_core(x: jax.Array, block_s: int, block_d: int) -> jax.Array:
     """Mean-pool a padded ``(B, S, D)`` array; registered with a VJP via ``defvjp``."""
     if x.ndim != 3:
         raise ValueError("mean_pooling (tile-lang) expects (B, S, D); got " + str(x.shape))
     B, S, D = x.shape
-    ffi = _get_fwd(B, S, D, x.dtype)
+    ffi = _get_fwd(B, S, D, x.dtype, block_s=block_s, block_d=block_d)
     return ffi(x)
 
 
-def _fwd(x):
-    """VJP primal for ``_mean_pool_core``. Returns ``(output, residual)``."""
+def _fwd(x, block_s, block_d):
     B, S, D = x.shape
-    ffi = _get_fwd(B, S, D, x.dtype)
+    ffi = _get_fwd(B, S, D, x.dtype, block_s=block_s, block_d=block_d)
     return ffi(x), (x,)
 
 
-def _bwd(residual, dy):
-    """VJP backward for ``_mean_pool_core``. Casts *dy* to float32 before dispatch."""
+def _bwd(block_s, block_d, residual, dy):
     (x,) = residual
     B, S, D = x.shape
-    ffi = _get_bwd(B, S, D, x.dtype)
+    ffi = _get_bwd(B, S, D, x.dtype, block_s=block_s, block_d=block_d)
     dy_f32 = dy.astype(jnp.float32)
-    dx = ffi(dy_f32)
-    return (dx,)
+    return (ffi(dy_f32),)
 
 
 _mean_pool_core.defvjp(_fwd, _bwd)
 
 
-@jax.custom_vjp
-def _mean_pool_varlen_core(x: jax.Array, cu_seqlens: jax.Array) -> jax.Array:
-    """Mean-pool a packed ``(T, D)`` array; registered with a VJP via ``defvjp``.
-
-    ``cu_seqlens`` has shape ``(num_seqs + 1,)`` and dtype int32.
-    """
+@partial(jax.custom_vjp, nondiff_argnums=(2, 3))
+def _mean_pool_varlen_core(x: jax.Array, cu_seqlens: jax.Array, block_s: int, block_d: int) -> jax.Array:
     if x.ndim != 2:
         raise ValueError("mean_pooling (tile-lang varlen) expects (T, D); got " + str(x.shape))
     if cu_seqlens.ndim != 1:
         raise ValueError("cu_seqlens must be rank-1; got " + str(cu_seqlens.shape))
     T, D = x.shape
     B = cu_seqlens.shape[0] - 1
-    ffi = _get_varlen_fwd(T, B, D, x.dtype)
+    ffi = _get_varlen_fwd(T, B, D, x.dtype, block_s=block_s, block_d=block_d)
     return ffi(x, cu_seqlens)
 
 
-def _varlen_fwd(x, cu_seqlens):
-    """VJP primal for ``_mean_pool_varlen_core``. Residual stores ``cu_seqlens`` and shape."""
+def _varlen_fwd(x, cu_seqlens, block_s, block_d):
     T, D = x.shape
     B = cu_seqlens.shape[0] - 1
-    ffi = _get_varlen_fwd(T, B, D, x.dtype)
+    ffi = _get_varlen_fwd(T, B, D, x.dtype, block_s=block_s, block_d=block_d)
     return ffi(x, cu_seqlens), (cu_seqlens, x.shape)
 
 
-def _varlen_bwd(residual, dy):
-    """VJP backward for ``_mean_pool_varlen_core``. Returns ``(dX, None)``."""
+def _varlen_bwd(block_s, block_d, residual, dy):
     cu_seqlens, shape = residual
     T, D = shape
     B = cu_seqlens.shape[0] - 1
-    ffi = _get_varlen_bwd(T, B, D, dy.dtype)
+    ffi = _get_varlen_bwd(T, B, D, dy.dtype, block_s=block_s, block_d=block_d)
     dy_f32 = dy.astype(jnp.float32)
-    dx = ffi(dy_f32, cu_seqlens)
-    return dx, None
+    return ffi(dy_f32, cu_seqlens), None
 
 
 _mean_pool_varlen_core.defvjp(_varlen_fwd, _varlen_bwd)
 
 
-def mean_pooling_tilelang(x: jax.Array, cu_seqlens: jax.Array | None = None) -> jax.Array:
+def mean_pooling_tilelang(
+    x: jax.Array,
+    cu_seqlens: jax.Array | None = None,
+    *,
+    block_s: int = 256,
+    block_d: int = 128,
+) -> jax.Array:
     """Tile-lang mean-pooling over the sequence axis (forward + differentiable backward).
 
     Dispatches to either the padded or packed kernel depending on whether
@@ -303,6 +235,14 @@ def mean_pooling_tilelang(x: jax.Array, cu_seqlens: jax.Array | None = None) -> 
         cu_seqlens: Cumulative sequence lengths of shape ``(num_seqs + 1,)``
             and dtype int32.  Required when *x* is packed.  Must be ``None``
             when *x* is padded.
+        block_s: tile size along the sequence axis. The constant default
+            here is the cold-start fallback for direct kernel-layer
+            callers; the operation layer (``MeanPooling`` op via
+            ``MeanPoolingConfig.block_size``) supplies the authoritative
+            value via ``heuristic_cfg`` / ``candidate_cfgs_gpu``.
+        block_d: tile size along the hidden-dim axis. Same caller policy
+            as ``block_s``; operation-side knob is
+            ``MeanPoolingConfig.block_dim``.
 
     Returns:
         ``(batch, hidden_dim)`` float array of per-sequence means, in the same
@@ -310,9 +250,14 @@ def mean_pooling_tilelang(x: jax.Array, cu_seqlens: jax.Array | None = None) -> 
 
     Raises:
         RuntimeError: If ``tilelang`` or ``jax_tvm_ffi`` are not installed.
+        ValueError: If ``block_s <= 0`` or ``block_d <= 0``.
     """
     if not has_tilelang_ffi_support():
         raise RuntimeError("tile-lang mean_pooling requires both `tilelang` and `jax_tvm_ffi`.")
+    bs = int(block_s)
+    bd = int(block_d)
+    if bs <= 0 or bd <= 0:
+        raise ValueError(f"mean_pooling_tilelang: block_s and block_d must be > 0 (got {bs}, {bd}).")
     if cu_seqlens is not None:
-        return _mean_pool_varlen_core(x, cu_seqlens)
-    return _mean_pool_core(x)
+        return _mean_pool_varlen_core(x, cu_seqlens, bs, bd)
+    return _mean_pool_core(x, bs, bd)

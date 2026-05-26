@@ -108,10 +108,10 @@ def _get_vmap_wrapper(static_args: tuple):
 
     The wrapper handles three batching scenarios:
 
-    * **No batched inputs** – falls through to a non-vmapped call.
-    * **Only ``x`` is batched** – flattens the leading batch dims into the M
+    * **No batched inputs** - falls through to a non-vmapped call.
+    * **Only ``x`` is batched** - flattens the leading batch dims into the M
       axis, calls the kernel once, and reshapes the result.
-    * **Any other combination** – broadcasts unbatched args to ``axis_size``
+    * **Any other combination** - broadcasts unbatched args to ``axis_size``
       and uses ``jax.lax.map`` for sequential per-sample dispatch.
     """
 

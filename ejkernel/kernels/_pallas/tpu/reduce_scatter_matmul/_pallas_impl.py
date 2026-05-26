@@ -598,8 +598,6 @@ def reduce_scatter_matmul(
         raise ValueError(f"K_shard ({k_shard}) must be divisible by bk ({bk}).")
 
     if x.dtype in (jnp.bfloat16, jnp.float16):
-        # Preserve strict numerical parity with the XLA reference path for
-        # low-precision inputs.
         partial_out = jnp.dot(x, y.T, precision=jax.lax.Precision.DEFAULT)
         return lax.psum_scatter(partial_out, axis_name=axis_name, scatter_dimension=0, tiled=True)
 

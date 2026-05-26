@@ -516,15 +516,15 @@ def _jax_bwd_attention_call(
         dq,
         dk,
         dv,
-        None,  # attention_mask
-        None,  # bias
-        None,  # dropout_seed
-        None,  # cum_seqlens_q
-        None,  # cum_seqlens_k
-        None,  # softmax_aux
-        None,  # q_segment_ids
-        None,  # kv_segment_ids
-        None,  # block_tables
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 
@@ -763,6 +763,38 @@ def flash_attention(
                 stacklevel=2,
             )
         attention_mask = None
+
+    if logits_soft_cap is not None:
+        warnings.warn(
+            "CUDA flash_attention logits_soft_cap is routed through XLA because the native CUDA softcap path can hang.",
+            stacklevel=2,
+        )
+        from ejkernel.kernels._xla.flash_attention._interface import flash_attention as _xla_flash_attention
+
+        return _xla_flash_attention(
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            bias=bias,
+            softmax_scale=softmax_scale,
+            dropout_prob=dropout_prob,
+            causal=causal,
+            dropout_seed=dropout_seed,
+            cum_seqlens_q=cum_seqlens_q,
+            cum_seqlens_k=cum_seqlens_k,
+            sliding_window=sliding_window,
+            fwd_params=fwd_params,
+            bwd_params=bwd_params,
+            logits_soft_cap=logits_soft_cap,
+            softmax_aux=softmax_aux,
+            normalize_output=normalize_output,
+            precision=precision,
+            logits_dtype=logits_dtype,
+            q_segment_ids=q_segment_ids,
+            kv_segment_ids=kv_segment_ids,
+            block_tables=block_tables,
+        )
 
     reason = _raise_error(
         query,

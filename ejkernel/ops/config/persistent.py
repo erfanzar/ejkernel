@@ -133,8 +133,6 @@ class PersistentCache(Generic[Cfg]):
         else:
             path_obj = pathlib.Path(path).expanduser()
 
-        # Best-effort: persistent caching is an optimization and must not crash if the
-        # default location isn't writable (e.g., sandboxed CI or read-only $HOME).
         dir_path = path_obj.parent
         try:
             dir_path.mkdir(exist_ok=True, parents=True)
@@ -247,5 +245,4 @@ class PersistentCache(Generic[Cfg]):
                 tmp_path = tmp.name
             os.replace(tmp_path, self.path)
         except (PermissionError, OSError):
-            # Non-fatal: persistent cache is best-effort.
             self._disabled = True

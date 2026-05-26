@@ -62,26 +62,15 @@ def _ssm2_step(
     """
     (h,) = carry
     x_t, B_t, C_t, dt_t = inputs
-    # x_t: [num_heads, head_dim]
-    # B_t: [num_heads, ssm_state_size]
-    # C_t: [num_heads, ssm_state_size]
-    # dt_t: [num_heads]
 
-    # dA = exp(dt * A) where A is [num_heads]
-    # dt_t: [num_heads] -> [num_heads, 1, 1]
     dA = jnp.exp(dt_t[:, None, None] * A[:, None, None])
 
-    # dBx = dt * B * x (outer product form)
-    # [num_heads, head_dim, ssm_state_size]
     dBx = (dt_t[:, None, None] * B_t[:, None, :]) * x_t[:, :, None]
 
-    # State update
     new_h = h * dA + dBx
 
-    # Output: einsum("hdn,hn->hd", new_h, C_t)
     y_t = jnp.einsum("hdn,hn->hd", new_h, C_t)
 
-    # Skip connection
     y_t = y_t + x_t * D[:, None]
 
     return (new_h,), y_t
@@ -155,16 +144,12 @@ def _ssm2_fwd(
             x_t, B_t, C_t, dt_t = inputs
             (h,) = carry
 
-            # dA = exp(dt * A)
             dA = jnp.exp(dt_t[:, None, None] * A[:, None, None])
 
-            # dBx = dt * B * x (outer product)
             dBx = (dt_t[:, None, None] * B_t[:, None, :]) * x_t[:, :, None]
 
-            # State update
             new_h = h * dA + dBx
 
-            # Output
             y_t = jnp.einsum("hdn,hn->hd", new_h, C_t) + x_t * D[:, None]
 
             return (new_h,), (new_h, y_t)
@@ -175,11 +160,11 @@ def _ssm2_fwd(
         return outputs, hidden_states_all, h_final
 
     outputs, all_hidden_states, final_states = jax.vmap(process_batch)(
-        x,  # [batch, seq_len, num_heads, head_dim]
-        B,  # [batch, seq_len, num_heads, ssm_state_size]
-        C,  # [batch, seq_len, num_heads, ssm_state_size]
-        dt,  # [batch, seq_len, num_heads]
-        initial_state,  # [batch, num_heads, head_dim, ssm_state_size]
+        x,
+        B,
+        C,
+        dt,
+        initial_state,
     )
 
     return outputs, all_hidden_states, final_states
@@ -211,21 +196,14 @@ def _ssm2_single_step_fwd(
     Returns:
         Tuple of (output, new_state)
     """
-    # dA = exp(dt * A)
-    # dt: [batch, num_heads] -> [batch, num_heads, 1, 1]
     dA = jnp.exp(dt[:, :, None, None] * A[None, :, None, None])
 
-    # dBx = dt * B * x (outer product)
-    # [batch, num_heads, head_dim, ssm_state_size]
     dBx = (dt[:, :, None, None] * B[:, :, None, :]) * x[:, :, :, None]
 
-    # State update
     new_state = ssm_state * dA + dBx
 
-    # Output: einsum("bhdn,bhn->bhd", new_state, C)
     y = jnp.einsum("bhdn,bhn->bhd", new_state, C)
 
-    # Skip connection
     y = y + x * D[None, :, None]
 
     return y, new_state

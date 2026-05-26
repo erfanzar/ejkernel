@@ -58,18 +58,7 @@ _HEAD_BWD_CACHE: dict[tuple, callable] = {}
 _LOCK = threading.Lock()
 
 
-def _pick_block_e(width: int) -> int:
-    """Choose the flat-element tile size based on the feature width.
-
-    Returns 128 for ``width <= 128``, otherwise 256.  Used for silu-gate
-    and head-gate kernels where the flat-element loop is the sole grid axis.
-    """
-    if width <= 128:
-        return 128
-    return 256
-
-
-def _get_silu_fwd(batch, seq_len, width, dtype, gate_dtype):
+def _get_silu_fwd(batch, seq_len, width, dtype, gate_dtype, *, block_e: int):
     """Build (or retrieve from cache) the silu-gate forward FFI call.
 
     Args:
@@ -78,11 +67,14 @@ def _get_silu_fwd(batch, seq_len, width, dtype, gate_dtype):
         width: feature width ``D``.
         dtype: activation dtype (float16 / bfloat16 / float32).
         gate_dtype: gate tensor dtype.
+        block_e: tile size along the width dimension. The caller (operation
+            layer) is responsible for choosing this — the kernel does not
+            pick from shape.
 
     Returns:
         Compiled ``jax.ffi`` callable ``(y[B,S,D], gate[B,S,D]) -> out[B,S,D]``.
     """
-    block_e = _pick_block_e(width)
+    block_e = int(block_e)
     key = (batch, seq_len, width, block_e, str(jnp.dtype(dtype)), str(jnp.dtype(gate_dtype)))
     with _LOCK:
         cached = _SILU_FWD_CACHE.get(key)
@@ -105,13 +97,13 @@ def _get_silu_fwd(batch, seq_len, width, dtype, gate_dtype):
         return ffi
 
 
-def _get_silu_bwd(batch, seq_len, width, dtype, gate_dtype):
+def _get_silu_bwd(batch, seq_len, width, dtype, gate_dtype, *, block_e: int):
     """Build (or retrieve from cache) the silu-gate backward FFI call.
 
     Returns:
         Compiled callable ``(y, gate, dout) -> (dy[B,S,D], dgate[B,S,D])``.
     """
-    block_e = _pick_block_e(width)
+    block_e = int(block_e)
     key = (batch, seq_len, width, block_e, str(jnp.dtype(dtype)), str(jnp.dtype(gate_dtype)))
     with _LOCK:
         cached = _SILU_BWD_CACHE.get(key)
@@ -204,7 +196,7 @@ def _get_rms_bwd(batch, seq_len, width, eps, dtype, gate_dtype):
         return ffi
 
 
-def _get_head_fwd(batch, seq_len, num_heads, head_dim, dtype, gate_dtype):
+def _get_head_fwd(batch, seq_len, num_heads, head_dim, dtype, gate_dtype, *, block_e: int):
     """Build (or retrieve from cache) the head-gate forward FFI call.
 
     Args:
@@ -214,11 +206,13 @@ def _get_head_fwd(batch, seq_len, num_heads, head_dim, dtype, gate_dtype):
         head_dim: head feature dimension ``D``.
         dtype: activation dtype for ``y``.
         gate_dtype: dtype for ``gate``.
+        block_e: tile size along the head_dim dimension. The caller
+            (operation layer) chooses this; the kernel does not.
 
     Returns:
         Compiled callable ``(y[B,S,H,D], gate[B,S,H]) -> out[B,S,H,D]``.
     """
-    block_e = _pick_block_e(head_dim)
+    block_e = int(block_e)
     key = (batch, seq_len, num_heads, head_dim, block_e, str(jnp.dtype(dtype)), str(jnp.dtype(gate_dtype)))
     with _LOCK:
         cached = _HEAD_FWD_CACHE.get(key)
@@ -273,8 +267,8 @@ def _get_head_bwd(batch, seq_len, num_heads, head_dim, dtype, gate_dtype):
         return ffi
 
 
-@jax.custom_vjp
-def silu_gate_tilelang(y: jax.Array, gate: jax.Array) -> jax.Array:
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def silu_gate_tilelang(y: jax.Array, gate: jax.Array, block_e: int) -> jax.Array:
     """Compute ``y * silu(gate)`` with native forward and backward kernels.
 
     ``silu(x) = x * sigmoid(x)``.  Both inputs must be rank-3
@@ -283,6 +277,8 @@ def silu_gate_tilelang(y: jax.Array, gate: jax.Array) -> jax.Array:
     Args:
         y: ``(batch, seq_len, width)`` activation tensor.
         gate: ``(batch, seq_len, width)`` gate tensor.
+        block_e: tile size along the width dimension. The caller chooses
+            this — the kernel does not pick from shape. Non-differentiable.
 
     Returns:
         ``(batch, seq_len, width)`` tensor ``y * silu(gate)`` in ``y.dtype``.
@@ -296,18 +292,19 @@ def silu_gate_tilelang(y: jax.Array, gate: jax.Array) -> jax.Array:
     if y.shape != gate.shape or y.ndim != 3:
         raise EjkernelRuntimeError(f"tile-lang silu gate expects matching rank-3 tensors, got {y.shape=} {gate.shape=}.")
     b, s, d = y.shape
-    return _get_silu_fwd(b, s, d, y.dtype, gate.dtype)(y, gate)
+    return _get_silu_fwd(b, s, d, y.dtype, gate.dtype, block_e=int(block_e))(y, gate)
 
 
-def _silu_gate_fwd(y, gate):
-    out = silu_gate_tilelang(y, gate)
+def _silu_gate_fwd(y, gate, block_e):
+    b, s, d = y.shape
+    out = _get_silu_fwd(b, s, d, y.dtype, gate.dtype, block_e=int(block_e))(y, gate)
     return out, (y, gate)
 
 
-def _silu_gate_bwd(residual, g):
+def _silu_gate_bwd(block_e, residual, g):
     y, gate = residual
     b, s, d = y.shape
-    dy, dgate = _get_silu_bwd(b, s, d, y.dtype, gate.dtype)(y, gate, g.astype(y.dtype))
+    dy, dgate = _get_silu_bwd(b, s, d, y.dtype, gate.dtype, block_e=int(block_e))(y, gate, g.astype(y.dtype))
     return dy.astype(y.dtype), dgate.astype(gate.dtype)
 
 
@@ -360,8 +357,8 @@ def _rmsnorm_silu_gate_bwd(eps, residual, g):
 rmsnorm_silu_gate_tilelang.defvjp(_rmsnorm_silu_gate_fwd, _rmsnorm_silu_gate_bwd)
 
 
-@jax.custom_vjp
-def head_gate_tilelang(y: jax.Array, gate: jax.Array) -> jax.Array:
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+def head_gate_tilelang(y: jax.Array, gate: jax.Array, block_e: int) -> jax.Array:
     """Compute ``y * gate[..., None]`` with native forward and backward kernels.
 
     Each head in ``y`` is scaled by the corresponding scalar from ``gate``.
@@ -371,6 +368,8 @@ def head_gate_tilelang(y: jax.Array, gate: jax.Array) -> jax.Array:
     Args:
         y: ``(batch, seq_len, num_heads, head_dim)`` activation tensor.
         gate: ``(batch, seq_len, num_heads)`` per-head scalar gate.
+        block_e: tile size along the head_dim dimension. The caller chooses
+            this — the kernel does not. Non-differentiable.
 
     Returns:
         ``(batch, seq_len, num_heads, head_dim)`` tensor in ``y.dtype``.
@@ -386,15 +385,17 @@ def head_gate_tilelang(y: jax.Array, gate: jax.Array) -> jax.Array:
             f"tile-lang head gate expects y:(B,S,H,D), gate:(B,S,H); got {y.shape=} {gate.shape=}."
         )
     b, s, h, d = y.shape
-    return _get_head_fwd(b, s, h, d, y.dtype, gate.dtype)(y, gate)
+    return _get_head_fwd(b, s, h, d, y.dtype, gate.dtype, block_e=int(block_e))(y, gate)
 
 
-def _head_gate_fwd(y, gate):
-    out = head_gate_tilelang(y, gate)
+def _head_gate_fwd(y, gate, block_e):
+    b, s, h, d = y.shape
+    out = _get_head_fwd(b, s, h, d, y.dtype, gate.dtype, block_e=int(block_e))(y, gate)
     return out, (y, gate)
 
 
-def _head_gate_bwd(residual, g):
+def _head_gate_bwd(block_e, residual, g):
+    del block_e
     y, gate = residual
     b, s, h, d = y.shape
     dy, dgate = _get_head_bwd(b, s, h, d, y.dtype, gate.dtype)(y, gate, g.astype(y.dtype))

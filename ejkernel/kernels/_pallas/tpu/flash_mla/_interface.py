@@ -161,12 +161,10 @@ def flash_mla(
         mask = attention_mask
         if mask.dtype != jnp.bool_:
             mask = mask.astype(jnp.bool_)
-        # Broadcast mask from [batch, 1, seq_q, kv_len] to [batch, q_heads, ...]
         if mask.shape[1] == 1:
             mask = jnp.broadcast_to(mask, (batch, q_heads, seq_q, kv_len))
         bias = jnp.where(mask, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.float32)
 
-    # Broadcast bias head dim if needed
     if bias is not None and bias.shape[1] == 1:
         bias = jnp.broadcast_to(bias, (batch, q_heads, seq_q, kv_len))
 
@@ -174,18 +172,14 @@ def flash_mla(
     block_k = min(128, kv_len)
     block_b = 1
 
-    # Ensure divisibility
     while seq_q % block_q != 0 and block_q > 64:
         block_q //= 2
     while kv_len % block_k != 0 and block_k > 64:
         block_k //= 2
 
-    # q: [batch, seq_q, q_heads, head_dim] -> [batch, q_heads, seq_q, head_dim]
     q_t = query.transpose(0, 2, 1, 3)
 
-    # w_kc: [kv_lora_rank, kv_heads, d_nope] -> [kv_heads, kv_lora_rank, d_nope]
     w_kc_t = jnp.transpose(w_kc, (1, 0, 2))
-    # w_vc: [kv_lora_rank, kv_heads, v_head_dim] -> [kv_heads, kv_lora_rank, v_head_dim]
     w_vc_t = jnp.transpose(w_vc, (1, 0, 2))
 
     o = flash_mla_impl(
@@ -205,7 +199,6 @@ def flash_mla(
         block_q,
         block_k,
     )
-    # o: [batch, q_heads, seq_q, v_head_dim] -> [batch, seq_q, q_heads, v_head_dim]
     return o.transpose(0, 2, 1, 3)
 
 

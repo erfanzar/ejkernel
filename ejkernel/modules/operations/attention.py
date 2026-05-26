@@ -211,8 +211,23 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
                 - output: Attention output [batch, seq_len, num_q_heads, vhead_dim]
                 - weights: Attention probabilities [batch, num_heads, seq_len, kv_len]
         """
-        resolved_platform = detect_platform("attention", cfg.platform)
-        impl = self.get_impl(cfg)
+        cfg_platform = getattr(cfg, "platform", "auto")
+        cfg_backend = getattr(cfg, "backend", "any")
+        block_q = int(getattr(cfg, "block_q", 128))
+        block_k = int(getattr(cfg, "block_k", 128))
+        num_warps = int(getattr(cfg, "num_warps", 4))
+        num_stages = int(getattr(cfg, "num_stages", 2))
+        weights_block_q = int(
+            getattr(cfg, "weights_block_q", self._heuristic_weights_block(int(query.shape[1])))
+        )
+        weights_block_k = int(getattr(cfg, "weights_block_k", self._heuristic_weights_block(int(key.shape[1]))))
+
+        resolved_platform = detect_platform("attention", cfg_platform)
+        impl = kernel_registry.get(
+            algorithm="attention",
+            platform=resolved_platform,
+            backend=cfg_backend,
+        )
         impl_kwargs = dict(
             query=query,
             key=key,
@@ -233,34 +248,46 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         )
         if resolved_platform == Platform.TILELANG:
             impl_kwargs["fwd_params"] = FwdParams(
-                q_blocksize=cfg.block_q,
-                kv_blocksize=cfg.block_k,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
+                q_blocksize=block_q,
+                kv_blocksize=block_k,
+                num_warps=num_warps,
+                num_stages=num_stages,
             )
             impl_kwargs["bwd_params"] = BwdParams(
-                q_blocksize=max(32, cfg.block_q // 2),
-                kv_blocksize=max(32, cfg.block_k // 2),
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
+                q_blocksize=max(32, block_q // 2),
+                kv_blocksize=max(32, block_k // 2),
+                num_warps=num_warps,
+                num_stages=num_stages,
             )
+        impl_kwargs["weights_block_q"] = weights_block_q
+        impl_kwargs["weights_block_k"] = weights_block_k
         return impl(**impl_kwargs)
 
-    def heuristic_cfg(self, inv: Invocation[AttentionConfig, Array]) -> AttentionConfig:
-        """Provide default configuration based on invocation context.
+    @staticmethod
+    def _seqlens_from_inv(inv: Invocation[AttentionConfig, Array]) -> tuple[int, int]:
+        """Pull ``(seq_len_q, seq_len_k)`` from the invocation's q/k tensors."""
+        query = inv.kwargs.get("query")
+        key = inv.kwargs.get("key")
+        q_len = int(query.shape[1]) if getattr(query, "shape", None) else 0
+        k_len = int(key.shape[1]) if getattr(key, "shape", None) else 0
+        return q_len, k_len
 
-        Selects optimal block sizes based on sequence length and head dimension.
+    @staticmethod
+    def _heuristic_weights_block(seq_len: int) -> int:
+        """Operation-side dense-weights tile heuristic — single source of truth.
 
-        Args:
-            inv: Invocation object with arguments and metadata
-
-        Returns:
-            Default configuration with block sizes
+        Mirrors the historical kernel-side ladder verbatim.
         """
+        return 32 if 0 < seq_len <= 32 else 64
 
+    def heuristic_cfg(self, inv: Invocation[AttentionConfig, Array]) -> AttentionConfig:
+        """Cold-start configuration with shape-aware ``weights_block_q/k``."""
+        q_len, k_len = self._seqlens_from_inv(inv)
         return AttentionConfig(
             block_q=128,
             block_k=128,
+            weights_block_q=self._heuristic_weights_block(q_len),
+            weights_block_k=self._heuristic_weights_block(k_len),
             num_warps=4,
             num_stages=2,
             platform="auto",
@@ -268,58 +295,96 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         )
 
     def candidate_cfgs(self, inv: Invocation[AttentionConfig, Array]):
-        """Generate candidate configurations for autotuning.
-
-        This operation uses XLA primitives directly without tunable block sizes,
-        so autotuning provides no benefit. Returns empty list to skip autotuning.
-
-        Args:
-            inv: Invocation object with arguments and metadata
-
-        Returns:
-            Empty list - no candidates to autotune since XLA handles optimization
-
-        Note:
-            XLA's attention primitive is not parameterized by block sizes,
-            so there are no meaningful configurations to benchmark.
-        """
-
+        """Generate candidate configurations for autotuning."""
         return [
-            AttentionConfig(block_q=128, block_k=128, num_warps=4, num_stages=2, platform="auto", backend="any"),
-            AttentionConfig(block_q=128, block_k=128, num_warps=4, num_stages=2, platform="xla", backend="any"),
+            self.heuristic_cfg(inv),
+            AttentionConfig(
+                block_q=128,
+                block_k=128,
+                weights_block_q=64,
+                weights_block_k=64,
+                num_warps=4,
+                num_stages=2,
+                platform="xla",
+                backend="any",
+            ),
         ]
 
     def candidate_cfgs_gpu(self, inv: Invocation[AttentionConfig, Array]):
-        """Generate GPU candidates for dense attention with weights."""
-        query = inv.kwargs["query"]
-        key = inv.kwargs["key"]
-        q_len = int(query.shape[1])
-        k_len = int(key.shape[1])
-        head_dim = int(query.shape[-1])
-        q_opts = [32, 64, 128] if q_len <= 256 else [64, 128]
-        k_opts = [32, 64, 128] if k_len <= 256 else [64, 128]
+        """Generate GPU candidates for dense attention with weights.
+
+        Two interleaved kernels share this op: the FlashAttention forward
+        (tuned via ``block_q``/``block_k``) and the dense ``(B, H, Sq, Sk)``
+        weights kernel (tuned via ``weights_block_q``/``weights_block_k``).
+        The sweep crosses both spaces, with shape-aware pruning:
+
+        * FA tiles ∈ {64, 128, 256} pruned by seq_len and head_dim.
+        * Weights tiles ∈ {32, 64} — smaller than FA because the dense
+          ``(Sq, Sk)`` matrix is the bottleneck.
+        * ``num_warps`` ∈ {4, 8}, ``num_stages`` ∈ {2, 3}.
+        """
+        q_len, k_len = self._seqlens_from_inv(inv)
+        query = inv.kwargs.get("query")
+        head_dim = int(query.shape[-1]) if getattr(query, "shape", None) else 64
+        q_opts = [32, 64, 128, 256] if q_len <= 256 else [64, 128, 256]
+        k_opts = [32, 64, 128, 256] if k_len <= 256 else [64, 128, 256]
         if head_dim >= 128:
-            k_opts = [k for k in k_opts if k <= 64] or [64]
-        candidates = [
-            AttentionConfig(
-                block_q=block_q,
-                block_k=block_k,
-                num_warps=8 if head_dim >= 128 and max(block_q, block_k) >= 128 else 4,
-                num_stages=2,
-                platform="tilelang",
-                backend="gpu",
-            )
-            for block_q in q_opts
-            for block_k in k_opts
-        ]
+            k_opts = [k for k in k_opts if k <= 128] or [128]
+            q_opts = [q for q in q_opts if q <= 128] or [128]
+        if q_len < 512:
+            q_opts = [q for q in q_opts if q < 256] or [128]
+        if k_len < 512:
+            k_opts = [k for k in k_opts if k < 256] or [128]
+        w_q_opts = [32, 64] if q_len <= 128 else [64]
+        w_k_opts = [32, 64] if k_len <= 128 else [64]
+        candidates: list[AttentionConfig] = []
+        for block_q in q_opts:
+            for block_k in k_opts:
+                big = max(block_q, block_k) >= 128
+                warps = 8 if (head_dim >= 128 and big) else 4
+                for wbq in w_q_opts:
+                    for wbk in w_k_opts:
+                        for stages in (2, 3) if k_len >= 1024 else (2,):
+                            candidates.append(
+                                AttentionConfig(
+                                    block_q=block_q,
+                                    block_k=block_k,
+                                    weights_block_q=wbq,
+                                    weights_block_k=wbk,
+                                    num_warps=warps,
+                                    num_stages=stages,
+                                    platform="tilelang",
+                                    backend="gpu",
+                                )
+                            )
         candidates.append(
-            AttentionConfig(block_q=128, block_k=128, num_warps=4, num_stages=2, platform="xla", backend="any")
+            AttentionConfig(
+                block_q=128,
+                block_k=128,
+                weights_block_q=64,
+                weights_block_k=64,
+                num_warps=4,
+                num_stages=2,
+                platform="xla",
+                backend="any",
+            )
         )
         return candidates
 
     def candidate_cfgs_tpu(self, inv: Invocation[AttentionConfig, Array]):
         """Return TPU candidates for the portable XLA dense-attention path."""
-        return [AttentionConfig(block_q=128, block_k=128, num_warps=4, num_stages=2, platform="xla", backend="any")]
+        return [
+            AttentionConfig(
+                block_q=128,
+                block_k=128,
+                weights_block_q=64,
+                weights_block_k=64,
+                num_warps=4,
+                num_stages=2,
+                platform="xla",
+                backend="any",
+            )
+        ]
 
 
 _executor: Executor[AttentionConfig, tuple[Array, Array]] = Executor(

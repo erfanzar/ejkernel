@@ -125,11 +125,11 @@ def _recurrent_kda_fwd(
     else:
         initial_state = initial_state.astype(jnp.float32)
 
-    q_seq = query.transpose(2, 0, 1, 3)  # (L, B, H, K)
-    k_seq = key.transpose(2, 0, 1, 3)  # (L, B, H, K)
-    v_seq = value.transpose(2, 0, 1, 3)  # (L, B, H, V)
-    g_seq = decay.transpose(2, 0, 1)  # (L, B, H)
-    b_seq = beta.transpose(2, 0, 1)  # (L, B, H)
+    q_seq = query.transpose(2, 0, 1, 3)
+    k_seq = key.transpose(2, 0, 1, 3)
+    v_seq = value.transpose(2, 0, 1, 3)
+    g_seq = decay.transpose(2, 0, 1)
+    b_seq = beta.transpose(2, 0, 1)
 
     def step_fn(state, inputs):
         """Execute a single recurrent KDA step.
@@ -266,7 +266,7 @@ def _chunk_kda_fwd(
 
     g_cumsum = jnp.cumsum(g, axis=-1)
 
-    g_diff = g_cumsum[:, :, :, :, None] - g_cumsum[:, :, :, None, :]  # (B, H, C, cs, cs)
+    g_diff = g_cumsum[:, :, :, :, None] - g_cumsum[:, :, :, None, :]
     decay_mask = jnp.tril(jnp.exp(jnp.tril(g_diff)))
 
     attn = jnp.einsum("bhcik,bhcjk->bhcij", k_beta, key, precision=_MATMUL_PRECISION)
@@ -332,12 +332,12 @@ def _chunk_kda_fwd(
     mask_triu_inner = jnp.triu(jnp.ones((chunk_size, chunk_size), dtype=bool), k=1)
 
     xs = {
-        "query": query.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, K)
-        "key": key.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, K)
-        "value": value_local.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, V)
-        "k_cumdecay": k_cumdecay.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, K)
-        "g_cumsum": g_cumsum.transpose(2, 0, 1, 3),  # (C, B, H, cs)
-        "decay_mask": decay_mask.transpose(2, 0, 1, 3, 4),  # (C, B, H, cs, cs)
+        "query": query.transpose(2, 0, 1, 3, 4),
+        "key": key.transpose(2, 0, 1, 3, 4),
+        "value": value_local.transpose(2, 0, 1, 3, 4),
+        "k_cumdecay": k_cumdecay.transpose(2, 0, 1, 3, 4),
+        "g_cumsum": g_cumsum.transpose(2, 0, 1, 3),
+        "decay_mask": decay_mask.transpose(2, 0, 1, 3, 4),
     }
 
     def chunk_step(state, inputs):
@@ -360,12 +360,12 @@ def _chunk_kda_fwd(
             Tuple of (new_state, chunk_output) where chunk_output has
             shape [batch, num_heads, chunk_size, value_dim].
         """
-        q_i = inputs["query"]  # (B, H, cs, K)
-        k_i = inputs["key"]  # (B, H, cs, K)
-        v_i = inputs["value"]  # (B, H, cs, V)
-        k_cumdecay_i = inputs["k_cumdecay"]  # (B, H, cs, K)
-        g_cumsum_i = inputs["g_cumsum"]  # (B, H, cs)
-        decay_mask_i = inputs["decay_mask"]  # (B, H, cs, cs)
+        q_i = inputs["query"]
+        k_i = inputs["key"]
+        v_i = inputs["value"]
+        k_cumdecay_i = inputs["k_cumdecay"]
+        g_cumsum_i = inputs["g_cumsum"]
+        decay_mask_i = inputs["decay_mask"]
 
         attn_qk = jnp.einsum("bhik,bhjk->bhij", q_i, k_i, precision=_MATMUL_PRECISION)
         attn_qk = jnp.where(mask_triu_inner, 0.0, attn_qk * decay_mask_i)
@@ -378,11 +378,11 @@ def _chunk_kda_fwd(
 
         core_out = attn_inter + jnp.einsum("bhij,bhjv->bhiv", attn_qk, v_new, precision=_MATMUL_PRECISION)
 
-        g_end = g_cumsum_i[:, :, -1]  # (B, H)
+        g_end = g_cumsum_i[:, :, -1]
         state_decayed = state * jnp.exp(g_end)[:, :, None, None]
 
-        g_diff_state = g_end[:, :, None] - g_cumsum_i  # (B, H, cs)
-        k_scaled = k_i * jnp.exp(g_diff_state)[:, :, :, None]  # (B, H, cs, K)
+        g_diff_state = g_end[:, :, None] - g_cumsum_i
+        k_scaled = k_i * jnp.exp(g_diff_state)[:, :, :, None]
         state_update = jnp.einsum("bhik,bhiv->bhkv", k_scaled, v_new, precision=_MATMUL_PRECISION)
         new_state = state_decayed + state_update
 
@@ -459,7 +459,7 @@ def _single_step_kda_fwd(
         g_exp = jnp.exp(decay.squeeze(2).astype(jnp.float32))[:, :, None, None]
         recurrent_state = recurrent_state * g_exp
 
-    kv_mem = jnp.sum(recurrent_state * key[:, :, :, None], axis=-2)  # (B, H, V)
+    kv_mem = jnp.sum(recurrent_state * key[:, :, :, None], axis=-2)
     delta = (value - kv_mem) * beta[:, :, None]
     new_state = recurrent_state + key[:, :, :, None] * delta[:, :, None, :]
 

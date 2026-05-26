@@ -75,14 +75,6 @@ def _neumann_inv(A, C, strict_lower=None, lower_mask=None):
         NaN/Inf entries replaced by 0.
     """
     _hp = lax.Precision.HIGHEST
-    # ``A`` is strict-lower triangular, so the Neumann series terminates
-    # exactly after at most ``C - 1`` powers. Repeated squaring needs
-    # ``ceil(log2(C))`` stages to materialize all terms up to ``A^(C-1)``.
-    #
-    # Clipping this to 4 only reconstructs powers through ``A^15``. That
-    # makes partially-filled chunks numerically wrong once the valid prefix
-    # exceeds ~16 tokens, which shows up most clearly on padded-heavy SFT
-    # batches where the last chunk is only partially active.
     num_iters = math.ceil(math.log2(C)) if C > 1 else 0
     if strict_lower is None:
         strict_lower = jnp.tril(jnp.ones((C, C), dtype=jnp.float32), k=-1)

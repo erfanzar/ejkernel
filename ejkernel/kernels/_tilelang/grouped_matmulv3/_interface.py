@@ -115,6 +115,11 @@ def grouped_matmulv3(
     """
     _check_common_options(preferred_element_type, tiling, group_offset, interpret, precision)
 
+    if isinstance(tiling, tuple) and len(tiling) == 3:
+        bm, bn, bk = int(tiling[0]), int(tiling[1]), int(tiling[2])
+    else:
+        bm, bn, bk = 128, 128, 64
+
     return grouped_matmulv3_tilelang(
         lhs,
         rhs,
@@ -124,6 +129,9 @@ def grouped_matmulv3(
         rhs_scale=rhs_scale,
         rhs_bias=rhs_bias,
         transpose_rhs=transpose_rhs,
+        block_m=bm,
+        block_n=bn,
+        block_k=bk,
     )
 
 

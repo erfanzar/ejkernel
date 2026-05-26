@@ -130,7 +130,6 @@ def gated_delta_rule(
     References:
         - Qwen3Next: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/
     """
-    # Transpose from public [batch, seq_len, heads, dim] to internal [batch, heads, seq_len, dim]
     q = query.transpose(0, 2, 1, 3)
     k = key.transpose(0, 2, 1, 3)
     v = value.transpose(0, 2, 1, 3)

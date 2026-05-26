@@ -111,16 +111,12 @@ def solve_lloyd_max(
         def x_pdf(x):
             return x * pdf(x)
 
-    # Initialize centroids uniformly in [-3*sigma, 3*sigma]
     lo, hi = -3.0 * sigma, 3.0 * sigma
     centroids = np.linspace(lo, hi, n_levels)
 
     for _ in range(max_iters):
-        # Decision boundaries: midpoints between adjacent centroids
         boundaries = 0.5 * (centroids[:-1] + centroids[1:])
 
-        # Compute new centroids as conditional expectations
-        # E[X | b_{i-1} <= X < b_i] = integral(x*pdf(x), b_{i-1}, b_i) / integral(pdf(x), b_{i-1}, b_i)
         edges = np.concatenate([[-np.inf], boundaries, [np.inf]])
         new_centroids = np.zeros(n_levels)
 
@@ -133,7 +129,6 @@ def solve_lloyd_max(
             else:
                 new_centroids[i] = centroids[i]
 
-        # Check convergence
         if np.max(np.abs(new_centroids - centroids)) < tol:
             centroids = new_centroids
             break
@@ -212,8 +207,6 @@ def dequantize_from_indices(
         float32 array of the same shape as ``indices``, where each element is
         replaced by its corresponding centroid value.
     """
-    # One-hot matmul avoids Mosaic's 2D-only gather on TPU Pallas.
-    # Safe for small codebooks (8-16 entries at 3-4 bits).
     return jnp.sum(
         jax.nn.one_hot(indices, centroids.shape[0], dtype=jnp.float32) * centroids,
         axis=-1,

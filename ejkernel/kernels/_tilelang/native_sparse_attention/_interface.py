@@ -179,7 +179,7 @@ def native_sparse_attention(
             softmax_scale,
         )
         if g_slc is not None:
-            out = head_gate_tilelang(out, g_slc)
+            out = head_gate_tilelang(out, g_slc, int(block_v))
         return out
     raise EjkernelRuntimeError("tile-lang native_sparse_attention requires block_indices until native top-k is added.")
 

@@ -186,11 +186,19 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
                 - ssm_state: Final hidden state [batch, intermediate_size, ssm_state_size]
                 - conv_state: Passed through conv_state (for caching)
         """
+        cfg_block_d = int(getattr(cfg, "block_d", self._heuristic_block_d(int(hidden_states.shape[-1]), int(A.shape[-1]))))
+        cfg_block_e = int(getattr(cfg, "block_e", 128))
+        cfg_backend = getattr(cfg, "backend", "any")
+
         if platform is not None:
             cfg = StateSpaceV1Config(
+                block_d=cfg_block_d,
+                block_e=cfg_block_e,
                 platform=platform,
-                backend=Backend.ANY if platform == "xla" else cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg_backend,
             )
+            cfg_block_d = cfg.block_d
+            cfg_block_e = cfg.block_e
 
         impl = self.get_impl(cfg)
         return impl(
@@ -204,53 +212,75 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
             initial_state=initial_state,
             conv_state=conv_state,
             act_fn=act_fn,
+            block_d=cfg_block_d,
+            block_e=cfg_block_e,
         )
 
-    def heuristic_cfg(self, inv: Invocation[StateSpaceV1Config, Array]) -> StateSpaceV1Config:
-        """Provide default configuration.
+    @staticmethod
+    def _DN_from_inv(inv: Invocation[StateSpaceV1Config, Array]) -> tuple[int, int]:
+        """Pull ``(intermediate_size, ssm_state_size)`` from invocation."""
+        hidden = inv.kwargs.get("hidden_states")
+        if hidden is None and inv.args:
+            hidden = inv.args[0]
+        A = inv.kwargs.get("A")
+        if A is None and len(inv.args) >= 2:
+            A = inv.args[1]
+        D_size = int(hidden.shape[-1]) if getattr(hidden, "shape", None) else 0
+        N_size = int(A.shape[-1]) if getattr(A, "shape", None) else 0
+        return D_size, N_size
 
-        Args:
-            inv: Invocation object containing arguments and metadata
+    @staticmethod
+    def _heuristic_block_d(D: int, N: int) -> int:
+        """Operation-side tile heuristic for the SSM-1 scan kernel.
 
-        Returns:
-            Default configuration for SSM1 operation
+        Mirrors the historical kernel-side ladder verbatim.
         """
+        if D == 0:
+            return 64
+        if D <= 64:
+            return D
+        if N <= 16:
+            return 64
+        return 32
+
+    def heuristic_cfg(self, inv: Invocation[StateSpaceV1Config, Array]) -> StateSpaceV1Config:
+        """Cold-start configuration with shape-aware ``block_d``."""
+        D, N = self._DN_from_inv(inv)
         return StateSpaceV1Config(
+            block_d=self._heuristic_block_d(D, N),
+            block_e=128,
             platform="auto",
             backend="any",
         )
 
     def candidate_cfgs(self, inv: Invocation[StateSpaceV1Config, Array]):
-        """Generate candidate configurations for autotuning.
-
-        Args:
-            inv: Invocation object containing arguments and metadata
-
-        Returns:
-            List of candidate configurations to benchmark during autotuning
-
-        Note:
-            SSM1 uses XLA implementation primarily, so candidates are minimal.
-        """
+        """Generate candidate configurations for autotuning."""
+        D, N = self._DN_from_inv(inv)
         return [
-            StateSpaceV1Config(platform="auto", backend="any"),
-            StateSpaceV1Config(platform="xla", backend="any"),
+            self.heuristic_cfg(inv),
+            StateSpaceV1Config(block_d=self._heuristic_block_d(D, N), block_e=128, platform="xla", backend="any"),
         ]
 
     def candidate_cfgs_gpu(self, inv: Invocation[StateSpaceV1Config, Array]):
         """Generate GPU candidates for TileLang and XLA SSM1."""
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        D, N = self._DN_from_inv(inv)
         candidates: list[StateSpaceV1Config] = []
         if "tilelang" in platforms:
-            candidates.append(StateSpaceV1Config(platform="tilelang", backend="gpu"))
+            seen: set[int] = set()
+            for bd in (self._heuristic_block_d(D, N), 32, 64, min(D, 128) if D > 0 else 128):
+                if bd <= 0 or bd in seen:
+                    continue
+                seen.add(bd)
+                candidates.append(StateSpaceV1Config(block_d=bd, block_e=128, platform="tilelang", backend="gpu"))
         if "xla" in platforms:
-            candidates.append(StateSpaceV1Config(platform="xla", backend="any"))
-        return candidates or self.candidate_cfgs(inv)
+            candidates.append(StateSpaceV1Config(block_d=64, block_e=128, platform="xla", backend="any"))
+        return candidates or [self.heuristic_cfg(inv)]
 
     def candidate_cfgs_tpu(self, inv: Invocation[StateSpaceV1Config, Array]):
         """Generate TPU candidates for the XLA SSM1 path."""
-        return [StateSpaceV1Config(platform="xla", backend="any")]
+        return [StateSpaceV1Config(block_d=64, block_e=128, platform="xla", backend="any")]
 
 
 _state_space_v1_executor: Executor[StateSpaceV1Config, Array] = Executor(

@@ -437,31 +437,59 @@ class GroupedMatmul(Kernel[GroupedMatmulConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[GroupedMatmulConfig, Array]):
-        """Generate GPU candidates for grouped matmul across TileLang and XLA."""
+        """Generate GPU candidates for grouped matmul across TileLang and XLA.
+
+        Grouped matmul (MoE) tile selection on H100:
+
+        * ``block_m`` ∈ {64, 128, 256} — driven by avg group size.
+        * ``block_n`` ∈ {64, 128, 256} — N is usually fixed (intermediate
+          dim or model dim); the sweep finds the best within the budget.
+        * ``block_k`` ∈ {32, 64, 128} — K must divide cleanly; 128 prefers
+          a deep pipeline.
+        * ``num_warps`` ∈ {4, 8}; ``num_stages`` ∈ {2, 3, 4}.
+
+        XLA path also gets a wider sweep since XLA's tiling hint is
+        passed through to its grouped-matmul implementation.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
-        block_configs = [
+        tilelang_configs = [
+            (64, 128, 64, 4, 2),
+            (128, 64, 64, 4, 2),
+            (128, 128, 32, 4, 2),
+            (128, 128, 64, 4, 2),
+            (128, 128, 64, 8, 3),
+            (128, 256, 64, 8, 3),
+            (256, 128, 64, 8, 3),
+            (256, 128, 32, 8, 3),
+            (256, 256, 64, 8, 3),
+            (128, 128, 128, 4, 3),
+        ]
+        xla_configs = [
             (128, 128, 128),
+            (128, 256, 128),
             (256, 256, 128),
+            (256, 256, 256),
             (512, 512, 128),
             (512, 512, 256),
             (1024, 1024, 256),
         ]
         candidates: list[GroupedMatmulConfig] = []
         if "tilelang" in platforms:
-            candidates.append(
-                GroupedMatmulConfig(
-                    block_m=128,
-                    block_n=128,
-                    block_k=128,
-                    num_warps=4,
-                    num_stages=2,
-                    platform="tilelang",
-                    backend="gpu",
+            for block_m, block_n, block_k, num_warps, num_stages in tilelang_configs:
+                candidates.append(
+                    GroupedMatmulConfig(
+                        block_m=block_m,
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
                 )
-            )
         if "xla" in platforms:
-            for block_m, block_n, block_k in block_configs:
+            for block_m, block_n, block_k in xla_configs:
                 candidates.append(
                     GroupedMatmulConfig(
                         block_m=block_m,

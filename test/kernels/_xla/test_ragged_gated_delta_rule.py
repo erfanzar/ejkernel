@@ -114,9 +114,9 @@ class TestDecodeOnly:
             use_chunked=False,
         )
 
-        assert jnp.allclose(
-            out_ragged[0], out_ref[0, 0], atol=1e-3, rtol=0
-        ), f"Output diff: {jnp.max(jnp.abs(out_ragged[0] - out_ref[0, 0]))}"
+        assert jnp.allclose(out_ragged[0], out_ref[0, 0], atol=1e-3, rtol=0), (
+            f"Output diff: {jnp.max(jnp.abs(out_ragged[0] - out_ref[0, 0]))}"
+        )
 
 
 class TestChunkedPrefill:
@@ -178,12 +178,12 @@ class TestChunkedPrefill:
             use_chunked=False,
         )
 
-        assert jnp.allclose(
-            out_ragged, out_ref[0], atol=5e-2, rtol=0
-        ), f"Output diff: {jnp.max(jnp.abs(out_ragged - out_ref[0]))}"
-        assert jnp.allclose(
-            st_ragged[0], st_ref[0], atol=5e-2, rtol=0
-        ), f"State diff: {jnp.max(jnp.abs(st_ragged[0] - st_ref[0]))}"
+        assert jnp.allclose(out_ragged, out_ref[0], atol=5e-2, rtol=0), (
+            f"Output diff: {jnp.max(jnp.abs(out_ragged - out_ref[0]))}"
+        )
+        assert jnp.allclose(st_ragged[0], st_ref[0], atol=5e-2, rtol=0), (
+            f"State diff: {jnp.max(jnp.abs(st_ragged[0] - st_ref[0]))}"
+        )
 
     def test_multiple_sequences(self):
         q, k, v, beta, decay = _make_tokens(10, seed=40)

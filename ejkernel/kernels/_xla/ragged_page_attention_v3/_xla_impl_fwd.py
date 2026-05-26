@@ -388,10 +388,8 @@ def ragged_paged_attention(
         pages_per_seq = block_tables.shape[0] // max_num_seqs
         tokens_per_seq = pages_per_seq * page_size
 
-        # Block sizes for a generic, jittable implementation.
         qblocks = 8 if num_queries_per_block is None else int(num_queries_per_block)
         if num_kv_pages_per_block is None:
-            # Larger kvblocks reduces Python/XLA loop overhead in `kv_loop`.
             if pages_per_seq >= 256:
                 kvblocks = 256
             elif pages_per_seq >= 128:
@@ -404,9 +402,6 @@ def ragged_paged_attention(
             kvblocks = max(1, min(pages_per_seq, int(num_kv_pages_per_block)))
         kv_tokens_per_block = kvblocks * page_size
 
-        # Pad Q/K/V so any qblocks-sized dynamic_slice is in-bounds.
-        # This may read across sequence boundaries for the final partial block, but
-        # masked writes ensure correctness.
         pad_q = qblocks - 1
         if pad_q:
             queries = jnp.concatenate(
@@ -435,7 +430,6 @@ def ragged_paged_attention(
         arange_q = jnp.arange(qblocks, dtype=jnp.int32)
         arange_kv = jnp.arange(kv_tokens_per_block, dtype=jnp.int32)
 
-        # Sliding-window KV start alignment; keep it simple and portable.
         bkv_sz = page_size if sliding_window is not None else None
 
         sinks_h = None
@@ -531,7 +525,6 @@ def ragged_paged_attention(
             kv_cache_acc = kv_cache_acc.at[page_indices].set(kv_pages)
 
         with jax.named_scope("rpa_v3_xla.attn_setup"):
-            # Pad pages axis to make kvblocks-sized slices safe.
             kv_pages_padded = jnp.concatenate(
                 [
                     kv_pages,

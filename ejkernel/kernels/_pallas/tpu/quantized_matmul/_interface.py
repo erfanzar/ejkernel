@@ -288,7 +288,6 @@ def _operate_impl(
     zeros = _biases_to_zeros(scales, biases)
 
     if transpose:
-        # Keep transpose=True on XLA baseline for now.
         return _xla_quantized_matmul(
             x,
             w,
@@ -687,10 +686,6 @@ def quantized_matmul(
     backend_mode = to_backend_mode(mode, bits)
     resolved_tpu_path = _normalize_tpu_path(get_qmm_tpu_path() if tpu_path is None else tpu_path)
 
-    # Pre-dispatch packed-legality recovery: if the caller's block_n is
-    # illegal for packed TPU execution, try n_pad which is always legal.
-    # This guards direct calls (e.g. from benchmarks) that bypass the
-    # QuantizedMatmul.run() normalization.
     if not transpose:
         if not is_packed_tpu_legal_forward(
             x,

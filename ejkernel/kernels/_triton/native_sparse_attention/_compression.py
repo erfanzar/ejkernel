@@ -399,7 +399,7 @@ def bwd_kernel_preprocess(
 ):
     """Compute per-token delta = sum(o * do) needed for stable softmax gradients.
 
-    Grid: ``(numel(o[..., 0]),)`` – one program per (batch * seq * head) row.
+    Grid: ``(numel(o[..., 0]),)`` - one program per (batch * seq * head) row.
 
     ``delta[i] = sum(o[i] * do[i])`` is the dot-product of the forward output
     with the upstream gradient, used to stabilise the softmax backward formula:

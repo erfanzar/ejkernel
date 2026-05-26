@@ -35,7 +35,8 @@ def mean_pooling(
     chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     *,
-    block_dim: int = 64,
+    block_dim: int = 128,
+    block_size: int = 256,
     num_warps: int = 4,
     num_stages: int = 1,
 ) -> Float[Array, "... hidden_dim"]:

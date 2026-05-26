@@ -207,7 +207,6 @@ def _gdr_bwd_grad_kernel(
     d_state_next = d_state_next_ref[0, 0].astype(jnp.float32)
     d_state_next = jnp.nan_to_num(d_state_next, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Process chunks in REVERSE order within the fused group
     for i in range(_N_FUSE - 1, -1, -1):
         s = i * C
         q = q_ref[0, 0, s : s + C].astype(jnp.float32)
@@ -216,14 +215,10 @@ def _gdr_bwd_grad_kernel(
         beta = beta_ref[0, 0, 0, i * C : (i + 1) * C]
         decay = decay_ref[0, 0, 0, i * C : (i + 1) * C]
         d_out = d_out_ref[0, 0, s : s + C].astype(jnp.float32)
-        # For state_pre: need the state BEFORE this chunk was processed.
-        # state_pre_ref holds the state before the FIRST chunk in the fused group.
-        # For subsequent chunks, we need to recompute state by running forward.
         if i == 0:
             state_pre = state_pre_ref[0, 0].astype(jnp.float32)
             state_pre = jnp.nan_to_num(state_pre, nan=0.0, posinf=0.0, neginf=0.0)
         else:
-            # Recompute state_pre for chunk i by running forward chunks 0..i-1
             from ._pallas_impl_fwd import _process_one_chunk
 
             sp = state_pre_ref[0, 0].astype(jnp.float32)
@@ -395,7 +390,7 @@ def _chunk_gdr_bwd(
         initial_state_was_none,
         effective_chunk_size,
     ) = res
-    chunk_size = effective_chunk_size  # override the nondiff_arg
+    chunk_size = effective_chunk_size
     d_out, d_final_state = g
     input_dtype = query.dtype
     B, H, num_chunks, _C, K_dim = query.shape
@@ -520,8 +515,8 @@ def _gdr_single_step_bwd_kernel(
     q_t = q_ref[0, 0, 0].astype(jnp.float32)
     k_t = k_ref[0, 0, 0].astype(jnp.float32)
     v_t = v_ref[0, 0, 0].astype(jnp.float32)
-    beta_t = beta_ref[0, 0].reshape(())  # already float32
-    decay_t = decay_ref[0, 0].reshape(())  # already float32
+    beta_t = beta_ref[0, 0].reshape(())
+    decay_t = decay_ref[0, 0].reshape(())
     state_prev = state_prev_ref[0, 0].astype(jnp.float32)
     d_out_t = d_out_ref[0, 0, 0].astype(jnp.float32)
     d_state_next = d_state_next_ref[0, 0].astype(jnp.float32)

@@ -208,12 +208,12 @@ def rwkv4(
         beta0 = state[:, 1, :].astype(jnp.float32)
         eps0 = state[:, 2, :].astype(jnp.float32)
 
-    xs = (jnp.swapaxes(k_f32, 0, 1), jnp.swapaxes(v_f32, 0, 1))  # [T, B, C]
+    xs = (jnp.swapaxes(k_f32, 0, 1), jnp.swapaxes(v_f32, 0, 1))
     (alphaT, betaT, epsT), wkvT = jax.lax.scan(
         lambda carry, x: _rwkv4_step(carry, x, w=w_f32, u=u_f32),
         (alpha0, beta0, eps0),
         xs,
     )
-    wkv = jnp.swapaxes(wkvT, 0, 1).astype(orig_dtype)  # [B, T, C]
-    final_state = jnp.stack([alphaT, betaT, epsT], axis=1)  # [B, 3, C]
+    wkv = jnp.swapaxes(wkvT, 0, 1).astype(orig_dtype)
+    final_state = jnp.stack([alphaT, betaT, epsT], axis=1)
     return wkv, final_state

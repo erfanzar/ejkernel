@@ -170,11 +170,6 @@ def page_attention(
     """
     batch_size, num_q_heads, head_dim = query.shape
 
-    # Normalize cache layout to the TPU kernel's expected layout:
-    #   [num_kv_heads, total_num_pages, page_size, head_dim]
-    #
-    # Some callers (e.g. module operations) provide:
-    #   [total_num_pages, num_kv_heads, page_size, head_dim]
     cache_dim0, cache_dim1 = key_cache.shape[0], key_cache.shape[1]
     dim0_div = (num_q_heads % cache_dim0) == 0
     dim1_div = (num_q_heads % cache_dim1) == 0
@@ -182,7 +177,6 @@ def page_attention(
         key_cache = key_cache.transpose(1, 0, 2, 3)
         value_cache = value_cache.transpose(1, 0, 2, 3)
     elif dim0_div and dim1_div and cache_dim0 > cache_dim1:
-        # Ambiguous (e.g. both dims divide num_q_heads). Assume num_kv_heads <= total_num_pages.
         key_cache = key_cache.transpose(1, 0, 2, 3)
         value_cache = value_cache.transpose(1, 0, 2, 3)
 
@@ -194,7 +188,6 @@ def page_attention(
         raise NotImplementedError("num_splits is not supported in PALLAS TPU implementation")
 
     if pages_per_compute_block is None:
-        # Choose a safe default that divides pages_per_sequence to avoid invalid grid shapes.
         for candidate in (8, 4, 2, 1):
             if candidate <= pages_per_sequence and pages_per_sequence % candidate == 0:
                 pages_per_compute_block = candidate
@@ -203,8 +196,6 @@ def page_attention(
     num_kv_heads, _, page_size, head_dim_k = key_cache.shape
     query_dtype = query.dtype
 
-    # Some callers use -1 padding in block_tables. Clamp to a valid page index;
-    # masked tokens are determined by context_lens.
     block_tables = jnp.where(block_tables < 0, 0, block_tables)
 
     if attn_scale is None:

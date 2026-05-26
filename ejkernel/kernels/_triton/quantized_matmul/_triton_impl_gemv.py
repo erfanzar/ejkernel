@@ -37,6 +37,10 @@ from ejkernel.quantization._utils.fp_tables import _get_e2m1_table, _get_e4m3_ta
 QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 
 
+_GEMV_BLOCK_N_CAP: int = 256
+_GEMV_BLOCK_N_DEFAULT: int = 128
+
+
 def _get_decode_tables() -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Build decode lookup tables as local arrays (no global state)."""
 
@@ -412,7 +416,6 @@ def _qmm_gemv_revsplitk_kernel(
         word_offsets_n1 = tl.minimum(word_offsets_n + 1, n_words - 1)
         group_idx_n = offs_n // GROUP_SIZE
 
-    # GemLite-style reverse split-K: each program processes two split parts.
     for k0 in tl.range(0, K, BK * REV_PARTS, loop_unroll_factor=1):
         offs_k0 = k0 + pid_k2 * BK + tl.arange(0, BK)
         offs_k1 = k0 + (pid_k2 + 1) * BK + tl.arange(0, BK)
@@ -667,9 +670,8 @@ def quantized_matmul_triton_gemv(
     _, stride_on = strides_from_shape(out_shape)
     bias_arg = biases if biases is not None else scales
 
-    bn = 64 if N <= 128 else (128 if N <= 2048 else min(int(block_n), 256))
-    if bn <= 0:
-        bn = 128
+    requested = int(block_n)
+    bn = min(_GEMV_BLOCK_N_CAP, requested) if requested > 0 else _GEMV_BLOCK_N_DEFAULT
 
     if kernel_family == "gemv_splitk":
         split_k = max(1, int(split_k))

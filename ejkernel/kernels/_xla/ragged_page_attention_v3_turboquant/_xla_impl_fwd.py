@@ -228,7 +228,6 @@ def ragged_paged_attention_turboquant(
             kvblocks = max(1, min(pages_per_seq, int(num_kv_pages_per_block)))
         kv_tokens_per_block = kvblocks * page_size
 
-        # Pad queries so qblocks-sized slices are always in-bounds
         pad_q = qblocks - 1
         if pad_q:
             queries = jnp.concatenate(
@@ -257,7 +256,6 @@ def ragged_paged_attention_turboquant(
         if softmax_aux is not None:
             sinks_h = softmax_aux.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head).astype(jnp.float32)
 
-    # --- Helper: compress keys for a block of tokens ---
     def _compress_keys_block(k_block_raw):
         """Compress a block of raw key tokens into TurboQuant format.
 
@@ -319,7 +317,6 @@ def ragged_paged_attention_turboquant(
             write_start = kv_len - q_len
             num_q_blocks = (q_len + qblocks - 1) // qblocks
 
-        # --- Gather and flatten pages for this sequence ---
         with jax.named_scope("rpa_v3_tq_xla.gather_pages"):
             indices_start = seq_idx * pages_per_seq
             page_indices = lax.dynamic_slice(block_tables, (indices_start,), (pages_per_seq,))
@@ -330,7 +327,6 @@ def ragged_paged_attention_turboquant(
             seq_vi = vi_pages[page_indices].reshape(tokens_per_seq, actual_num_kv_heads, packed_idx_dim)
             seq_vn = vn_pages[page_indices].reshape(tokens_per_seq, actual_num_kv_heads)
 
-        # --- Compress and write new KV tokens ---
         def _update_kv_block(qb, flat_state):
             """Compress and write one qblocks-sized chunk of new KV tokens."""
             s_ki, s_ks, s_kn, s_vi, s_vn = flat_state
@@ -349,7 +345,6 @@ def ragged_paged_attention_turboquant(
                 q_tok = q_off + arange_q
                 q_valid = q_tok < q_len
 
-                # Mask: only write valid tokens
                 ex_ki = lax.dynamic_slice(s_ki, (dst, 0, 0), (qblocks, actual_num_kv_heads, packed_idx_dim))
                 ex_ks = lax.dynamic_slice(s_ks, (dst, 0, 0), (qblocks, actual_num_kv_heads, packed_sign_dim))
                 ex_kn = lax.dynamic_slice(s_kn, (dst, 0, 0), (qblocks, actual_num_kv_heads, 2))
@@ -367,7 +362,6 @@ def ragged_paged_attention_turboquant(
             return s_ki, s_ks, s_kn, s_vi, s_vn
 
         with jax.named_scope("rpa_v3_tq_xla.kv_update"):
-            # Pad flattened pages for safe qblocks-sized slices
             pad_ki = jnp.zeros((qblocks - 1, actual_num_kv_heads, packed_idx_dim), dtype=seq_ki.dtype)
             pad_ks = jnp.zeros((qblocks - 1, actual_num_kv_heads, packed_sign_dim), dtype=seq_ks.dtype)
             pad_kn = jnp.zeros((qblocks - 1, actual_num_kv_heads, 2), dtype=seq_kn.dtype)
@@ -392,7 +386,6 @@ def ragged_paged_attention_turboquant(
             seq_vi = flat_state[3][:tokens_per_seq]
             seq_vn = flat_state[4][:tokens_per_seq]
 
-            # Write back to page tensors
             ki_reshaped = seq_ki.reshape(pages_per_seq, page_size, actual_num_kv_heads, packed_idx_dim)
             ks_reshaped = seq_ks.reshape(pages_per_seq, page_size, actual_num_kv_heads, packed_sign_dim)
             kn_reshaped = seq_kn.reshape(pages_per_seq, page_size, actual_num_kv_heads, 2)
@@ -405,9 +398,7 @@ def ragged_paged_attention_turboquant(
             vi_pages = vi_pages.at[page_indices].set(vi_reshaped)
             vn_pages = vn_pages.at[page_indices].set(vn_reshaped)
 
-        # --- Attention computation ---
         with jax.named_scope("rpa_v3_tq_xla.attn_setup"):
-            # Pad along pages axis for kvblocks-sized slices
             seq_ki_pad = jnp.concatenate(
                 [seq_ki, jnp.zeros(((kvblocks - 1) * page_size, actual_num_kv_heads, packed_idx_dim), seq_ki.dtype)],
                 axis=0,
@@ -446,9 +437,7 @@ def ragged_paged_attention_turboquant(
                 q_valid = q_tok < q_len
                 q_pos = write_start + q_tok
 
-                # Pre-rotate queries: Q @ Pi^T (eliminates per-block rotation for keys)
                 q_rotated = jnp.einsum("bihd,dD->bihD", q_block.astype(jnp.float32), rotation_matrix.T)
-                # Pre-project queries: Q @ S^T (for QJL correction)
                 q_projected = jnp.einsum("bihd,md->bihm", q_block.astype(jnp.float32), qjl_projection)
 
                 init_acc = jnp.zeros(
@@ -475,7 +464,6 @@ def ragged_paged_attention_turboquant(
                     acc, l, m = state
                     start = kb * kv_tokens_per_block
 
-                    # Fetch compressed key data
                     ki_blk = lax.dynamic_slice(
                         seq_ki_pad, (start, 0, 0), (kv_tokens_per_block, actual_num_kv_heads, packed_idx_dim)
                     )
@@ -484,21 +472,16 @@ def ragged_paged_attention_turboquant(
                     )
                     kn_blk = lax.dynamic_slice(seq_kn_pad, (start, 0, 0), (kv_tokens_per_block, actual_num_kv_heads, 2))
 
-                    # Unpack keys
-                    k_indices = unpack_4bit(ki_blk)  # [kv_tok, kv_heads, head_dim]
-                    k_signs = unpack_signs(ks_blk)  # [kv_tok, kv_heads, qjl_dim]
-                    k_orig_norms = kn_blk[..., 0].astype(jnp.float32)  # [kv_tok, kv_heads]
-                    k_res_norms = kn_blk[..., 1].astype(jnp.float32)  # [kv_tok, kv_heads]
+                    k_indices = unpack_4bit(ki_blk)
+                    k_signs = unpack_signs(ks_blk)
+                    k_orig_norms = kn_blk[..., 0].astype(jnp.float32)
+                    k_res_norms = kn_blk[..., 1].astype(jnp.float32)
 
                     with jax.named_scope("tq_logits"):
-                        # MSE term: q_rotated @ codebook[k_indices]^T * k_orig_norms
                         k_centroids = dequantize_from_indices(k_indices, key_codebook)
-                        # [b,i,h,d] x [k,i,d] -> [b,i,h,k]
                         logits_mse = jnp.einsum("bihd,kid->bihk", q_rotated, k_centroids)
-                        # Broadcast norms: [kv_tok, kv_heads] -> [1, kv_heads, 1, kv_tok]
                         logits_mse = logits_mse * k_orig_norms.T[None, :, None, :]
 
-                        # QJL correction term
                         correction = jnp.einsum("bihm,kim->bihk", q_projected, k_signs)
                         factor = jnp.sqrt(jnp.float32(jnp.pi / 2.0)) / jnp.float32(qjl_dim)
                         correction = correction * k_res_norms.T[None, :, None, :] * factor
@@ -529,7 +512,6 @@ def ragged_paged_attention_turboquant(
                         rescale = jnp.exp(m - new_m)
                         l = rescale * l + jnp.sum(exp_logits, axis=-1)
 
-                        # Dequantize values for weighted sum
                         vi_blk = lax.dynamic_slice(
                             seq_vi_pad, (start, 0, 0), (kv_tokens_per_block, actual_num_kv_heads, packed_idx_dim)
                         )
@@ -537,7 +519,6 @@ def ragged_paged_attention_turboquant(
 
                         v_indices = unpack_4bit(vi_blk)
                         v_centroids = dequantize_from_indices(v_indices, value_codebook)
-                        # Inverse rotation: centroids @ Pi, then scale by norms
                         v_block = jnp.einsum("kid,dD->kiD", v_centroids, rotation_matrix)
                         v_block = v_block * vn_blk.astype(jnp.float32)[..., None]
 

@@ -287,18 +287,45 @@ class RWKV7(Kernel[RWKV7Config, Array]):
         ]
 
     def candidate_cfgs_gpu(self, inv: Invocation[RWKV7Config, Array]):
-        """Generate GPU platform and Triton tile candidates for RWKV-7."""
+        """Generate GPU candidates for RWKV-7.
+
+        ``block_v`` is the head-dim tile for the Triton fused-recurrent
+        kernel. Low-rank (a, b) updates are autotuned internally; this
+        sweep covers the value-dim tile plus warps/stages:
+
+        * ``block_v`` ∈ {16, 32, 64, 128} — 16/32 for small heads,
+          64/128 for typical RWKV-7 widths.
+        * ``num_warps`` ∈ {4, 8}.
+        * ``num_stages`` ∈ {2, 3, 4} — deeper pipelines help memory-bound
+          long sequences.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         candidates: list[RWKV7Config] = []
         if "triton" in platforms:
             candidates.extend(
-                RWKV7Config(block_v=block_v, num_warps=num_warps, num_stages=3, platform="triton", backend="gpu")
-                for block_v in (16, 32, 64)
+                RWKV7Config(
+                    block_v=block_v,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    platform="triton",
+                    backend="gpu",
+                )
+                for block_v in (16, 32, 64, 128)
                 for num_warps in (4, 8)
+                for num_stages in (2, 3)
             )
         if "tilelang" in platforms:
-            candidates.append(RWKV7Config(block_v=64, num_warps=4, num_stages=3, platform="tilelang", backend="gpu"))
+            for block_v in (32, 64, 128):
+                candidates.append(
+                    RWKV7Config(
+                        block_v=block_v,
+                        num_warps=4,
+                        num_stages=3,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
+                )
         if "xla" in platforms:
             candidates.append(RWKV7Config(block_v=64, num_warps=4, num_stages=3, platform="xla", backend="any"))
         return candidates or self.candidate_cfgs(inv)
@@ -507,18 +534,34 @@ class RWKV7Mul(Kernel[RWKV7MulConfig, Array]):
         ]
 
     def candidate_cfgs_gpu(self, inv: Invocation[RWKV7MulConfig, Array]):
-        """Generate GPU platform and Triton tile candidates for RWKV-7 Mul."""
+        """Generate GPU candidates for RWKV-7 Mul (same tile space as RWKV-7)."""
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         candidates: list[RWKV7MulConfig] = []
         if "triton" in platforms:
             candidates.extend(
-                RWKV7MulConfig(block_v=block_v, num_warps=num_warps, num_stages=3, platform="triton", backend="gpu")
-                for block_v in (16, 32, 64)
+                RWKV7MulConfig(
+                    block_v=block_v,
+                    num_warps=num_warps,
+                    num_stages=num_stages,
+                    platform="triton",
+                    backend="gpu",
+                )
+                for block_v in (16, 32, 64, 128)
                 for num_warps in (4, 8)
+                for num_stages in (2, 3)
             )
         if "tilelang" in platforms:
-            candidates.append(RWKV7MulConfig(block_v=64, num_warps=4, num_stages=3, platform="tilelang", backend="gpu"))
+            for block_v in (32, 64, 128):
+                candidates.append(
+                    RWKV7MulConfig(
+                        block_v=block_v,
+                        num_warps=4,
+                        num_stages=3,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
+                )
         if "xla" in platforms:
             candidates.append(RWKV7MulConfig(block_v=64, num_warps=4, num_stages=3, platform="xla", backend="any"))
         return candidates or self.candidate_cfgs(inv)

@@ -51,6 +51,9 @@ def attention(
     sliding_window: int | tuple[int, int] | None = None,
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
+    *,
+    weights_block_q: int = 64,
+    weights_block_k: int = 64,
 ) -> tuple[Float[Array, "batch seq_len num_q_heads vhead_dim"], Float[Array, "batch num_heads seq_len kv_len"]]:
     """Compute multi-head attention using standard JAX operations.
     This function implements scaled dot-product attention with support for
@@ -122,7 +125,7 @@ def attention(
         >>> output.shape
         (2, 512, 8, 64)
     """
-    _ = fwd_params, bwd_params
+    _ = fwd_params, bwd_params, weights_block_q, weights_block_k
     return _attention_impl(
         query,
         key,

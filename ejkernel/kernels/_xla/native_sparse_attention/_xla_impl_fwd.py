@@ -135,7 +135,6 @@ def _sparse_attention_fwd(
             inds = bi_b[t, kvh]
             cnt = bc_b[t, kvh]
 
-            # Support sentinel values (e.g., -1) in `inds` by masking them out.
             nb = k_blocks_b.shape[0]
             inds_valid = (inds >= 0) & (inds < nb)
             inds_safe = jnp.where(inds_valid, inds, 0)

@@ -63,13 +63,16 @@ where = ["."]
 
 cuda = [
     "jax[cuda13]>=0.10.0",
-    "triton==3.6.0", 
+    "triton==3.6.0",
     "nvidia-cutlass-dsl[cu13]>=4.4.0.dev1",
     "jax-tvm-ffi==0.1.2",
-    "tilelang>=0.1.9",
 ]
 tpu = ["jax[tpu]>=0.10.0"]
 triton = ["triton==3.6.0"]
+tilelang = [
+    "tilelang==0.1.9",
+    "nvidia-cudnn-cu12>=9.12.0.46",
+]
 
 profile = [
     "xprof>=2.20.6",
@@ -89,10 +92,13 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
-ignore = ["F722", "B008", "UP015", "A005", "F821", "E741", "UP037","RUF002"]
+ignore = ["F722", "B008", "UP015", "A005", "F821", "E741", "UP037","RUF002","RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
 
 [tool.mypy]
 python_version = "3.11"

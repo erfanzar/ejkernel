@@ -476,14 +476,6 @@ _QMM_TPU_BESTCFG_POLICY: dict[str, dict[str, dict[str, object]]] = {
         },
         "default": {"fuse": False, "platform": "xla"},
     },
-    # Non-affine modes (nf4/mxfp*/nvfp*) use fused Pallas packed kernels
-    # on TPU regardless of whether weights are concrete or traced.
-    # The Pallas packed kernel is fully trace-safe: legality checks use
-    # only .shape attributes (concrete during tracing), and in-kernel
-    # dequant is pure arithmetic (jnp.where chains, bit ops) — no table
-    # lookups or captured constants.  allow_dense_fallback=True provides
-    # a safety net: if packed tiling is somehow illegal, the XLA fallback
-    # is still available.
     "non_affine": {
         "small": {
             "fuse": True,
@@ -602,7 +594,6 @@ def _should_try_tpu_predecode_once_default(
         return False
     if runtime_axis != "row" or runtime_transpose:
         return False
-    # Respect explicit non-Pallas platform requests.
     if platform not in (None, "auto", "pallas"):
         return False
     strategy = strategy_override if strategy_override is not None else _env_tpu_default_strategy()
@@ -645,7 +636,6 @@ def _maybe_tpu_predecode_once_matmul(
         Dense matmul output ``(M, N)`` in bfloat16, or ``None`` if the path
         cannot be used.
     """
-    # Predecode-once requires concrete quantized metadata.
     if _is_tracer_value(w) or _is_tracer_value(scales) or (zeros is not None and _is_tracer_value(zeros)):
         return None
     try:
@@ -716,8 +706,6 @@ def _packed_legal_block_n(
     value_alignment = _bit_aligned_values(bits)
     packed_lane_align = _lcm(128 * value_alignment, 128 * group_size)
     bn = max(packed_lane_align, _ceil_div(n, packed_lane_align) * packed_lane_align)
-    # If the computed bn exceeds the cap, prefer n_pad anyway (the Pallas
-    # compiler will handle VMEM spilling for correctness).
     return min(bn, n_pad)
 
 
@@ -745,7 +733,6 @@ def _pallas_tpu_heuristic_cfg(inv: Invocation[QuantizedMatmulConfig, Array]) -> 
     block_k = 256 if k >= 4096 else 128
     block_k = max(128, _ceil_div(block_k, 128) * 128)
 
-    # Pick a block_n that is guaranteed packed-legal for TPU Mosaic.
     block_n = _packed_legal_block_n(n, group_size=group_size, bits=bits, align_n=align_n)
 
     return QuantizedMatmulConfig(
@@ -804,7 +791,6 @@ def _pallas_tpu_candidate_cfgs(inv: Invocation[QuantizedMatmulConfig, Array]) ->
     bn_opts = sorted(set(bn_opts))
 
     large_problem = m >= 128 and n >= 4096 and k >= 4096
-    # For very large problems, keep candidate set smaller to reduce autotune cost.
     if large_problem:
         small_bn = max(align_n, 128)
         pressure_bn = {
@@ -1874,10 +1860,6 @@ def _quantized_matmul_impl(
         and _tilelang_runtime_available()
     )
     prefer_cuda = backend_name in ("gpu", "cuda") and (axis != "col" or prefer_cuda_col_lowbit)
-    # Column-packed large affine divisor-bit GEMM is fastest on the native CUDA
-    # path after its internal dequant layout conversion. TileLang remains
-    # available by explicit platform request; Triton is the fallback when no
-    # native preference applies.
     prefer_triton = backend_name in ("gpu", "cuda") and axis == "col" and not prefer_cuda and not prefer_tilelang
     resolved = detect_platform(
         "quantized_matmul",
@@ -2086,9 +2068,6 @@ def quantized_matmul(
         if tpu_path_n not in {"hybrid", "packed", "predecode"}:
             raise ValueError(f"tpu_path must be one of {{'hybrid','packed','predecode'}}, got {tpu_path!r}.")
         tpu_strategy_override = "predecode_once" if tpu_path_n in {"hybrid", "predecode"} else "packed"
-        # Kernel-level tpu_path is packed-only. Preserve predecode/hybrid as
-        # strategy overrides at this wrapper level; only force cfg.tpu_path
-        # when caller explicitly requests packed.
         if tpu_path_n == "packed":
             if cfg is None:
                 cfg = QuantizedMatmulConfig(tpu_path="packed")

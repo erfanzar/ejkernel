@@ -88,11 +88,8 @@ def _rwkv6_update(
             - h_next: Updated hidden state [B, H, K, V]
             - o_t: Output at time t [B, H, V]
     """
-    # Outer product of key and value
-    kv = k_t[..., :, None] * v_t[..., None, :]  # [B, H, K, V]
-    # Query against state with bonus for current token
-    o_t = jnp.einsum("bhk,bhkv->bhv", q_t, h + kv * u[None, :, :, None])  # [B, H, V]
-    # Exponential decay update
+    kv = k_t[..., :, None] * v_t[..., None, :]
+    o_t = jnp.einsum("bhk,bhkv->bhv", q_t, h + kv * u[None, :, :, None])
     h_next = h * jnp.exp(w_t)[..., :, None] + kv
     return h_next, o_t
 
@@ -123,10 +120,6 @@ def _rwkv6_scan(
     Returns:
         Tuple of (output [B, T, H, V], final_state [B, H, K, V])
     """
-    # Shapes:
-    # r,k,w: [B, T, H, K]
-    # v:     [B, T, H, V]
-    # u:     [H, K]
     if reverse:
         r = r[:, ::-1, :, :]
         k = k[:, ::-1, :, :]
@@ -154,7 +147,7 @@ def _rwkv6_scan(
         return h_next, o_t
 
     xs = (jnp.swapaxes(r, 0, 1), jnp.swapaxes(k, 0, 1), jnp.swapaxes(v, 0, 1), jnp.swapaxes(w, 0, 1))
-    h_final, oT = jax.lax.scan(step, initial_state, xs)  # oT: [T, B, H, V]
+    h_final, oT = jax.lax.scan(step, initial_state, xs)
     o = jnp.swapaxes(oT, 0, 1)
     if reverse:
         o = o[:, ::-1, :, :]
@@ -221,7 +214,6 @@ def _rwkv6_varlen(
     Raises:
         ValueError: If batch size is not 1 or initial_state count mismatches.
     """
-    # Packed mode expects B==1 and T==total_tokens.
     if r.shape[0] != 1:
         raise ValueError(f"Packed mode expects batch size 1, got {r.shape[0]}.")
     total_tokens = r.shape[1]
@@ -229,7 +221,6 @@ def _rwkv6_varlen(
     if initial_state.shape[0] != num_seqs:
         raise ValueError(f"`initial_state` must have shape [N,H,K,V] with N={num_seqs}, got {initial_state.shape}.")
 
-    # Precompute per-token metadata.
     idx = jnp.arange(total_tokens, dtype=cu_seqlens.dtype)
     seq_id = jnp.searchsorted(cu_seqlens[1:], idx, side="right")
     starts = cu_seqlens[seq_id]
@@ -273,7 +264,6 @@ def _rwkv6_varlen(
         finals = jax.lax.cond(end, lambda f: f.at[sid].set(h[0]), lambda f: f, finals)
         return (h, finals), o_t[0]
 
-    # Scan over packed tokens (batch dim is 1, so squeeze it).
     xs = (
         r[0],
         k[0],

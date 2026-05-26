@@ -429,23 +429,42 @@ class UnifiedAttention(Kernel[UnifiedAttentionConfig, Array]):
         return [self.heuristic_cfg(inv)]
 
     def candidate_cfgs_gpu(self, inv: Invocation[UnifiedAttentionConfig, Array]):
-        """Return GPU candidates for every registered unified-attention backend."""
+        """Return GPU candidates for every registered unified-attention backend.
+
+        The three knobs:
+
+        * ``seq_threshold_3d`` — sequence count below which the 2D grid
+          launches (lower decode overhead); above, the 3D segmented
+          softmax kernel kicks in (better parallelism on long contexts).
+          Heuristic value comes from vLLM; we also try the heuristic ÷ 2
+          and × 2 to bracket it.
+        * ``num_par_softmax_segments`` — segments for the 3D kernel's
+          parallel softmax reduction; powers of two near the heuristic.
+        * ``block_dim`` — CUDA thread-block dim; {64, 128, 256}, with 128
+          a strong default for most head_dims.
+        """
         base = self.heuristic_cfg(inv)
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "cuda", "cute", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        thr = max(1, int(base.seq_threshold_3d or 1))
+        thr_choices = sorted({max(1, thr // 2), thr, thr * 2})
+        seg = max(1, int(base.num_par_softmax_segments or 1))
+        seg_choices = sorted({max(1, seg // 2), seg, min(seg * 2, 64)})
         candidates: list[UnifiedAttentionConfig] = []
         if "triton" in platforms:
-            candidates.append(
-                UnifiedAttentionConfig(
-                    seq_threshold_3d=base.seq_threshold_3d,
-                    num_par_softmax_segments=base.num_par_softmax_segments,
-                    block_dim=base.block_dim,
-                    num_warps=None,
-                    num_stages=None,
-                    platform="triton",
-                    backend="gpu",
-                )
-            )
+            for t in thr_choices:
+                for s in seg_choices:
+                    candidates.append(
+                        UnifiedAttentionConfig(
+                            seq_threshold_3d=t,
+                            num_par_softmax_segments=s,
+                            block_dim=base.block_dim,
+                            num_warps=None,
+                            num_stages=None,
+                            platform="triton",
+                            backend="gpu",
+                        )
+                    )
         if "cuda" in platforms:
             candidates.extend(
                 UnifiedAttentionConfig(

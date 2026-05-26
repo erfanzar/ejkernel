@@ -310,18 +310,19 @@ def ragged_decode_attention(
     )
     aux_arg = _normalize_aux(softmax_aux)
 
-    block_k = 128 if head_dim >= 64 else 64
+    block_k = 128
     num_stages = 3
     threads = 128
     if fwd_params is not None:
         if fwd_params.kv_blocksize is not None:
-            block_k = max(1, min(int(fwd_params.kv_blocksize), seq_len))
+            block_k = int(fwd_params.kv_blocksize)
         elif fwd_params.blocksize_keys is not None:
-            block_k = max(1, min(int(fwd_params.blocksize_keys), seq_len))
+            block_k = int(fwd_params.blocksize_keys)
         if fwd_params.num_stages is not None:
             num_stages = int(fwd_params.num_stages)
         if fwd_params.num_warps is not None:
             threads = max(32, int(fwd_params.num_warps) * 32)
+    block_k = max(1, min(block_k, seq_len))
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
     soft_cap = -1.0 if logits_soft_cap is None else float(logits_soft_cap)

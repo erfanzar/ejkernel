@@ -96,7 +96,7 @@ def _dtype_packing(dtype: jnp.dtype) -> int:
     bw = jnp.dtype(dtype).itemsize * 8
     if bw not in (16, 32):
         raise ValueError(f"Only 16/32-bit floats supported for packing, got {dtype} ({bw} bits).")
-    return 32 // bw  # fp32->1, (b)fp16->2
+    return 32 // bw
 
 
 def _merge_kv(keys: jax.Array, values: jax.Array, *, head_dim_padded: int) -> jax.Array:
@@ -227,7 +227,6 @@ def _rpa_v3_attn_fwd(
     q_len = q_end - q_start
     kv_len = tl.load(kv_lens_ptr + pid_s, mask=seq_active, other=0).to(tl.int32)
 
-    # New tokens are appended at the end of the sequence KV.
     context_len = kv_len - q_len
 
     offs_m = pid_qb * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -245,13 +244,10 @@ def _rpa_v3_attn_fwd(
     k_idx = (2 * kv_head).to(tl.int32)
     v_idx = (2 * kv_head + 1).to(tl.int32)
 
-    # KV positions for the query rows.
     row_idx = context_len + offs_m
     row_idx = tl.where(row_mask, row_idx, 0).to(tl.int32)
 
     if HAS_SLIDING:
-        # Reference semantics: allow kv_pos > row_idx - sliding_window  (exclusive lower bound).
-        # => kv_pos >= row_idx - sliding_window + 1.
         left_bound = tl.maximum(row_idx - sliding_window + 1, 0).to(tl.int32)
     else:
         left_bound = tl.zeros([BLOCK_M], tl.int32)
@@ -265,7 +261,6 @@ def _rpa_v3_attn_fwd(
         l = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], tl.float32)
 
-    # Iterate over KV blocks (in pages). Loop count is (PAGES_PER_SEQ / BLOCK_NPAGES).
     kv_block_tokens: tl.constexpr = BLOCK_NPAGES * PAGE_SIZE
     offs_k = tl.arange(0, kv_block_tokens).to(tl.int32)
 
@@ -274,7 +269,6 @@ def _rpa_v3_attn_fwd(
 
         kv_valid = kv_pos < kv_len
 
-        # Map kv_pos -> (page_id, offset_in_page).
         page_idx = page_base + (offs_k // PAGE_SIZE)
         off_in_page = (offs_k % PAGE_SIZE).to(tl.int32)
 
@@ -379,7 +373,6 @@ def _kv_update_scatter(
     kv_cache_flat = kv_cache.reshape(-1, *kv_cache.shape[2:])
 
     t_idx = jnp.arange(total_tokens, dtype=jnp.int32)
-    # searchsorted is stable/jittable and avoids Python loops.
     s_idx = jnp.searchsorted(query_start_loc, t_idx, side="right") - jnp.int32(1)
     s_idx = jnp.clip(s_idx, 0, max_num_seqs - 1)
 
@@ -571,7 +564,6 @@ def ragged_paged_attention_triton(
     else:
         block_npages = int(num_kv_pages_per_block)
     block_npages = max(1, min(pages_per_seq, block_npages))
-    # Prevent accidentally constructing extremely large (BQ x BK) tiles.
     block_npages = min(block_npages, 32)
 
     block_dmodel = max(triton.next_power_of_2(head_dim), 16)

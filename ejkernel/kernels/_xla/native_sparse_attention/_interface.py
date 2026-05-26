@@ -246,16 +246,11 @@ def _nsa_topk_xla(
     future_mask = jnp.arange(C, dtype=jnp.int32)[None, None, None, :] > qb[None, :, None, None]
     p_sum = jnp.where(future_mask, -jnp.inf, p_sum)
 
-    # Triton bitonic sorting swaps on ties, which effectively prioritizes larger
-    # block indices when scores are exactly equal.
     tie = jnp.arange(C, dtype=p_sum.dtype)[None, None, None, :] * jnp.array(1e-8, dtype=p_sum.dtype)
     p_sum_adj = p_sum + tie
     S = block_counts if isinstance(block_counts, int) else int(block_counts)
     S = min(int(S), int(C))
     p_flat = p_sum_adj.reshape(B * T * H, C)
-    # Work around an intermittent XLA:GPU kernel reuse cache crash triggered by
-    # sorting/top-k ops on some JAX/XLA builds. For the small C used here, moving
-    # the selection to CPU is a practical workaround.
     if isinstance(p_flat, jax.Array) and p_flat.device.platform in ("gpu", "cuda"):
         cpu = jax.devices("cpu")[0]
         p_cpu = jax.device_put(p_flat, cpu)
@@ -264,8 +259,6 @@ def _nsa_topk_xla(
     else:
         _, idx_flat = jax.lax.top_k(p_flat, S)
     idx = idx_flat.reshape(B, T, H, S).astype(jnp.int32)
-    # Match Triton semantics: blocks beyond the current query block are invalid.
-    # Represent invalid blocks with -1 (the sparse attention implementation masks them out).
     idx = jnp.where(idx <= qb[None, :, None, None], idx, jnp.full_like(idx, -1))
     return idx
 
@@ -401,9 +394,6 @@ def apply_native_sparse_attention(
     num_kv_heads = key.shape[2]
     num_blocks = (seq_len + block_size - 1) // block_size
 
-    # Support both:
-    #  1) per-token indices: (B, T, H_kv, S)
-    #  2) per-query-block indices: (B, H_kv, num_blocks, S)
     block_indices_arr = jnp.asarray(block_indices, dtype=jnp.int32)
     if block_indices_arr.ndim != 4:
         raise ValueError(f"block_indices must be a 4D int32 array, got shape {block_indices_arr.shape}.")
@@ -411,9 +401,9 @@ def apply_native_sparse_attention(
     if block_indices_arr.shape[1] == seq_len and block_indices_arr.shape[2] == num_kv_heads:
         block_indices_tok = block_indices_arr
     elif block_indices_arr.shape[1] == num_kv_heads and block_indices_arr.shape[2] == num_blocks:
-        qb = (jnp.arange(seq_len, dtype=jnp.int32) // block_size).astype(jnp.int32)  # (T,)
-        block_indices_blk = jnp.transpose(block_indices_arr, (0, 2, 1, 3))  # (B, num_blocks, H_kv, S)
-        block_indices_tok = block_indices_blk[:, qb, :, :]  # (B, T, H_kv, S)
+        qb = (jnp.arange(seq_len, dtype=jnp.int32) // block_size).astype(jnp.int32)
+        block_indices_blk = jnp.transpose(block_indices_arr, (0, 2, 1, 3))
+        block_indices_tok = block_indices_blk[:, qb, :, :]
     else:
         raise ValueError(
             "block_indices must have shape (batch, seq_len, num_kv_heads, num_selected_blocks) "
@@ -431,9 +421,9 @@ def apply_native_sparse_attention(
         if block_counts_arr.shape == (batch, seq_len, num_kv_heads):
             block_counts_tok = block_counts_arr
         elif block_counts_arr.shape == (batch, num_kv_heads, num_blocks):
-            qb = (jnp.arange(seq_len, dtype=jnp.int32) // block_size).astype(jnp.int32)  # (T,)
-            block_counts_blk = jnp.transpose(block_counts_arr, (0, 2, 1))  # (B, num_blocks, H_kv)
-            block_counts_tok = block_counts_blk[:, qb, :]  # (B, T, H_kv)
+            qb = (jnp.arange(seq_len, dtype=jnp.int32) // block_size).astype(jnp.int32)
+            block_counts_blk = jnp.transpose(block_counts_arr, (0, 2, 1))
+            block_counts_tok = block_counts_blk[:, qb, :]
         else:
             raise ValueError(
                 "block_counts must have shape (batch, seq_len, num_kv_heads) or (batch, num_kv_heads, num_blocks). "

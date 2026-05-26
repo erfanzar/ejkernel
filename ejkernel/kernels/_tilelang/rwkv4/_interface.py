@@ -37,6 +37,8 @@ def rwkv4(
     k: Float[Array, "batch seq_len chans"],
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"] | None = None,
+    *,
+    block_c: int = 64,
 ) -> tuple[
     Float[Array, "batch seq_len chans"],
     Float[Array, "batch three chans"],
@@ -57,6 +59,10 @@ def rwkv4(
         v: ``(batch, seq_len, chans)`` values.
         state: optional fp32 ``(batch, 3, chans)`` initial state
             ``(alpha, beta, eps)``; defaults to all-zeros / ``eps=-1e30``.
+        block_c: tile size along ``C``. The operation layer (``RWKV4`` op
+            via ``RWKV4Config.block_c``) chooses this from shape; the
+            constant default here is the cold-start fallback for direct
+            kernel-layer callers (tests / scripts).
 
     Returns:
         ``(wkv, final_state)`` — ``wkv`` is ``(batch, seq_len, chans)`` in the
@@ -65,9 +71,9 @@ def rwkv4(
     Raises:
         RuntimeError: if tilelang or jax_tvm_ffi is not available.
         ValueError: if tensor shapes do not satisfy ``(B, S, C)`` / ``(C,)``
-            constraints.
+            constraints, or if ``block_c <= 0``.
     """
-    return rwkv4_tilelang(w, u, k, v, state=state)
+    return rwkv4_tilelang(w, u, k, v, state=state, block_c=block_c)
 
 
 __all__ = ["rwkv4"]

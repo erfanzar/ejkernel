@@ -32,13 +32,13 @@ from ejkernel.callib import cdiv, triton_call
 
 @triton.jit
 def _rwkv4_fwd_kernel(
-    w_ptr,  # [-exp(w_raw)], [C]
-    u_ptr,  # [C]
-    k_ptr,  # [B, T, C]
-    v_ptr,  # [B, T, C]
-    state_ptr,  # [B, 3, C]
-    o_ptr,  # [B, T, C]
-    state_out_ptr,  # [B, 3, C]
+    w_ptr,
+    u_ptr,
+    k_ptr,
+    v_ptr,
+    state_ptr,
+    o_ptr,
+    state_out_ptr,
     T: tl.constexpr,
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -111,14 +111,14 @@ def _rwkv4_fwd_kernel(
 
 @triton.jit
 def _rwkv4_fwd_kernel_with_hist(
-    w_ptr,  # [-exp(w_raw)], [C]
-    u_ptr,  # [C]
-    k_ptr,  # [B, T, C]
-    v_ptr,  # [B, T, C]
-    state_ptr,  # [B, 3, C]
-    o_ptr,  # [B, T, C]
-    state_out_ptr,  # [B, 3, C]
-    state_hist_ptr,  # [B, T + 1, 3, C]
+    w_ptr,
+    u_ptr,
+    k_ptr,
+    v_ptr,
+    state_ptr,
+    o_ptr,
+    state_out_ptr,
+    state_hist_ptr,
     T: tl.constexpr,
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -140,7 +140,6 @@ def _rwkv4_fwd_kernel_with_hist(
 
     base_seq = b * T * C
 
-    # Store initial state as state_hist[:, 0, :, :].
     base_hist0 = ((b * (T + 1)) * 3) * C
     tl.store(state_hist_ptr + base_hist0 + 0 * C + cs, alpha.to(tl.float32), mask=cmask)
     tl.store(state_hist_ptr + base_hist0 + 1 * C + cs, beta.to(tl.float32), mask=cmask)
@@ -166,7 +165,6 @@ def _rwkv4_fwd_kernel_with_hist(
         beta = e1b * beta + e2b
         eps = eps_next
 
-        # Store updated state as state_hist[:, t + 1, :, :].
         base_hist_t = ((b * (T + 1) + (t + 1)) * 3) * C
         tl.store(state_hist_ptr + base_hist_t + 0 * C + cs, alpha.to(tl.float32), mask=cmask)
         tl.store(state_hist_ptr + base_hist_t + 1 * C + cs, beta.to(tl.float32), mask=cmask)

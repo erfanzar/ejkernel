@@ -313,16 +313,23 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         return [GatedDeltaRuleConfig(chunk_size=c, platform="auto", backend="any") for c in cands]
 
     def candidate_cfgs_gpu(self, inv: Invocation[GatedDeltaRuleConfig, Array]):
-        """Generate GPU candidates for GDR across TileLang and XLA."""
+        """Generate GPU candidates for GDR across TileLang and XLA.
+
+        ``chunk_size`` is the dominant tuning knob: smaller chunks raise
+        inter-chunk state-propagation cost; larger chunks raise intra-chunk
+        attention-matrix memory. Sweep {32, 64, 128, 256, 512} — the
+        tilelang chunked path additionally tries a wider set on H100.
+        """
         requested = inv.kwargs.get("platform", None)
         use_chunked = bool(inv.kwargs.get("use_chunked", True))
-        cands = [128, 256]
+        chunk_choices = (32, 64, 128, 256, 512)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         candidates: list[GatedDeltaRuleConfig] = []
         if "tilelang" in platforms and use_chunked:
-            candidates.append(GatedDeltaRuleConfig(chunk_size=256, platform="tilelang", backend="gpu"))
+            for c in (64, 128, 256, 512):
+                candidates.append(GatedDeltaRuleConfig(chunk_size=c, platform="tilelang", backend="gpu"))
         if "xla" in platforms:
-            candidates.extend(GatedDeltaRuleConfig(chunk_size=c, platform="xla", backend="any") for c in cands)
+            candidates.extend(GatedDeltaRuleConfig(chunk_size=c, platform="xla", backend="any") for c in chunk_choices)
         return candidates or self.candidate_cfgs(inv)
 
     def candidate_cfgs_tpu(self, inv: Invocation[GatedDeltaRuleConfig, Array]):
@@ -474,7 +481,6 @@ def gated_delta_rule(
         ...     initial_state=state, return_state=True,
         ... )
     """
-    # Fast path: single-step inference bypasses the executor/autotuner.
     if query.shape[1] == 1 and initial_state is not None:
         from ejkernel.kernels._xla.gated_delta_rule._xla_impl_fwd import (
             _single_step_gdr_fwd,

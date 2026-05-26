@@ -24,11 +24,17 @@ This module owns the full forward + backward computation graph:
   ``make_bwd_prim_func`` followed by ``make_reduce_param_prim_func`` to reduce
   per-batch ``W`` / ``U`` gradients.
 * The public entry-point is :func:`rwkv4_tilelang`.
+
+Block-size policy: this kernel is a pure executor — it does NOT pick
+``block_c`` from shape. The caller (operation layer or interface) must
+hand in a concrete ``block_c``. All shape-aware tile choices live in
+the operation's ``heuristic_cfg`` / ``candidate_cfgs_gpu``.
 """
 
 from __future__ import annotations
 
 import threading
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -54,25 +60,12 @@ _INIT_CACHE: dict[tuple, callable] = {}
 _LOCK = threading.Lock()
 
 
-def _pick_block_c(channels: int) -> int:
-    """Choose the BLOCK_C tile size heuristic for RWKV-4.
-
-    Returns 64 for ``channels <= 64`` and 128 otherwise.
-    """
-    if channels <= 64:
-        return 64
-    if channels <= 256:
-        return 128
-    return 128
-
-
-def _get_fwd(B, S, C, dtype):
+def _get_fwd(B, S, C, block_c, dtype):
     """Return (possibly cached) FFI callable for the RWKV-4 forward kernel.
 
     Outputs: ``(WKV: (B,S,C,dtype), StateF: (B,3,C,fp32))``.
     """
-    bc = _pick_block_c(C)
-    key = (B, S, C, bc, str(jnp.dtype(dtype)))
+    key = (B, S, C, block_c, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _FWD_CACHE.get(key)
         if cached is not None:
@@ -81,7 +74,7 @@ def _get_fwd(B, S, C, dtype):
             batch=B,
             seq_len=S,
             channels=C,
-            block_c=bc,
+            block_c=block_c,
             dtype=dtype,
         )
         ffi = build_tilelang_call(
@@ -96,14 +89,13 @@ def _get_fwd(B, S, C, dtype):
         return ffi
 
 
-def _get_fwd_states(B, S, C, dtype):
+def _get_fwd_states(B, S, C, block_c, dtype):
     """Return (possibly cached) FFI callable for the forward + state-saving kernel.
 
     Outputs: ``(WKV: (B,S,C,dtype), StateF: (B,3,C,fp32), Hscan: (B,S+1,3,C,fp32))``.
     Used by the ``custom_vjp`` forward rule; the backward needs ``Hscan``.
     """
-    bc = _pick_block_c(C)
-    key = (B, S, C, bc, str(jnp.dtype(dtype)))
+    key = (B, S, C, block_c, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _FWD_STATES_CACHE.get(key)
         if cached is not None:
@@ -112,7 +104,7 @@ def _get_fwd_states(B, S, C, dtype):
             batch=B,
             seq_len=S,
             channels=C,
-            block_c=bc,
+            block_c=block_c,
             dtype=dtype,
         )
         ffi = build_tilelang_call(
@@ -128,13 +120,12 @@ def _get_fwd_states(B, S, C, dtype):
         return ffi
 
 
-def _get_init(B, S, C, dtype):
+def _get_init(B, S, C, block_c, dtype):
     """Return (possibly cached) FFI callable for the zero-state initialiser.
 
     Output: ``State0: (B, 3, C, fp32)`` with ``alpha=0, beta=0, eps=-1e30``.
     """
-    bc = _pick_block_c(C)
-    key = (B, S, C, bc, str(jnp.dtype(dtype)))
+    key = (B, S, C, block_c, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _INIT_CACHE.get(key)
         if cached is not None:
@@ -143,7 +134,7 @@ def _get_init(B, S, C, dtype):
             batch=B,
             seq_len=S,
             channels=C,
-            block_c=bc,
+            block_c=block_c,
             dtype=dtype,
         )
         ffi = build_tilelang_call(
@@ -155,7 +146,7 @@ def _get_init(B, S, C, dtype):
         return ffi
 
 
-def _get_bwd(B, S, C, dtype):
+def _get_bwd(B, S, C, block_c, dtype):
     """Return (possibly cached) FFI callable for the backward kernel.
 
     Outputs: ``(dW_p:(B,C,fp32), dU_p:(B,C,fp32), dK:(B,S,C,dtype),
@@ -163,8 +154,7 @@ def _get_bwd(B, S, C, dtype):
     ``dW_p`` / ``dU_p`` are per-batch partials that are summed by the reduce
     kernel.
     """
-    bc = _pick_block_c(C)
-    key = (B, S, C, bc, str(jnp.dtype(dtype)))
+    key = (B, S, C, block_c, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _BWD_CACHE.get(key)
         if cached is not None:
@@ -173,7 +163,7 @@ def _get_bwd(B, S, C, dtype):
             batch=B,
             seq_len=S,
             channels=C,
-            block_c=bc,
+            block_c=block_c,
             dtype=dtype,
         )
         ffi = build_tilelang_call(
@@ -191,19 +181,18 @@ def _get_bwd(B, S, C, dtype):
         return ffi
 
 
-def _get_reduce_param(B, C, dtype):
+def _get_reduce_param(B, C, block_c, dtype):
     """Return (possibly cached) FFI callable for the batch-reduce kernel.
 
     Reduces the per-batch partial ``dP (B, C, fp32)`` to ``dOut (C, dtype)``
     by summing over the batch dimension.
     """
-    bc = _pick_block_c(C)
-    key = (B, C, bc, str(jnp.dtype(dtype)))
+    key = (B, C, block_c, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _REDUCE_PARAM_CACHE.get(key)
         if cached is not None:
             return cached
-        prim = make_reduce_param_prim_func(batch=B, channels=C, block_c=bc, dtype=dtype)
+        prim = make_reduce_param_prim_func(batch=B, channels=C, block_c=block_c, dtype=dtype)
         ffi = build_tilelang_call(
             prim,
             output_shape_dtype=jax.ShapeDtypeStruct((C,), dtype),
@@ -213,35 +202,39 @@ def _get_reduce_param(B, C, dtype):
         return ffi
 
 
-@jax.custom_vjp
-def _rwkv4_init_state(k):
+@partial(jax.custom_vjp, nondiff_argnums=(1,))
+def _rwkv4_init_state(k, block_c):
     """Allocate and return a zeroed RWKV-4 hidden state.
 
     Args:
         k: ``(B, S, C)`` key tensor; shape and dtype drive allocation.
+        block_c: tile size along ``C`` for the initialiser kernel.
 
     Returns:
         fp32 ``(B, 3, C)`` state with ``alpha=0, beta=0, eps=-1e30``.
     """
     B, S, C = k.shape
-    return _get_init(B, S, C, k.dtype)(k)
+    return _get_init(B, S, C, block_c, k.dtype)(k)
 
 
-def _rwkv4_init_state_fwd(k):
-    """Forward rule for ``_rwkv4_init_state`` (no residuals needed)."""
-    return _rwkv4_init_state(k), None
+def _rwkv4_init_state_fwd(k, block_c):
+    """Forward rule — inlines the primal so it can return ``None`` residuals."""
+    B, S, C = k.shape
+    out = _get_init(B, S, C, block_c, k.dtype)(k)
+    return out, None
 
 
-def _rwkv4_init_state_bwd(residual, g):
+def _rwkv4_init_state_bwd(block_c, residual, g):
     """Backward rule for ``_rwkv4_init_state`` — gradients are zero."""
+    del block_c, residual, g
     return (None,)
 
 
 _rwkv4_init_state.defvjp(_rwkv4_init_state_fwd, _rwkv4_init_state_bwd)
 
 
-@jax.custom_vjp
-def _rwkv4_core(w, u, k, v, state0):
+@partial(jax.custom_vjp, nondiff_argnums=(5,))
+def _rwkv4_core(w, u, k, v, state0, block_c):
     """Execute the RWKV-4 forward scan (no state materialisation).
 
     Used when gradients are not required (e.g., inference).
@@ -252,34 +245,36 @@ def _rwkv4_core(w, u, k, v, state0):
         k: ``(B, S, C)`` keys.
         v: ``(B, S, C)`` values.
         state0: fp32 ``(B, 3, C)`` initial state.
+        block_c: tile size along ``C`` (set by the caller).
 
     Returns:
         ``(wkv: (B,S,C,dtype), final_state: (B,3,C,fp32))``.
     """
     B, S, C = k.shape
-    ffi = _get_fwd(B, S, C, k.dtype)
+    ffi = _get_fwd(B, S, C, block_c, k.dtype)
     return ffi(w, u, k, v, state0)
 
 
-def _rwkv4_fwd(w, u, k, v, state0):
+def _rwkv4_fwd(w, u, k, v, state0, block_c):
     """Custom VJP forward rule — also materialises ``Hscan`` for the backward.
 
     Returns:
         Primal outputs ``(wkv, sf)`` and residuals ``(w, u, k, v, hscan)``.
     """
     B, S, C = k.shape
-    fwd = _get_fwd_states(B, S, C, k.dtype)
+    fwd = _get_fwd_states(B, S, C, block_c, k.dtype)
     wkv, sf, hscan = fwd(w, u, k, v, state0)
     return (wkv, sf), (w, u, k, v, hscan)
 
 
-def _rwkv4_bwd(residual, g):
+def _rwkv4_bwd(block_c, residual, g):
     """Custom VJP backward rule — reverse-time adjoint scan.
 
     Runs the backward kernel then reduces per-batch ``dW_p`` / ``dU_p``
     over the batch dimension.
 
     Args:
+        block_c: tile size along ``C`` (nondiff).
         residual: ``(w, u, k, v, hscan)`` saved by ``_rwkv4_fwd``.
         g: cotangents ``(g_wkv: (B,S,C), g_sf: (B,3,C))``.
 
@@ -289,7 +284,7 @@ def _rwkv4_bwd(residual, g):
     w, u, k, v, hscan = residual
     g_wkv, g_sf = g
     B, S, C = k.shape
-    bwd = _get_bwd(B, S, C, k.dtype)
+    bwd = _get_bwd(B, S, C, block_c, k.dtype)
     dw_p, du_p, dk, dv, dstate0 = bwd(
         w,
         u,
@@ -299,7 +294,7 @@ def _rwkv4_bwd(residual, g):
         g_wkv.astype(k.dtype),
         g_sf.astype(jnp.float32),
     )
-    reduce_param = _get_reduce_param(B, C, w.dtype)
+    reduce_param = _get_reduce_param(B, C, block_c, w.dtype)
     dw = reduce_param(dw_p)
     du = reduce_param(du_p)
     return dw, du, dk, dv, dstate0
@@ -314,6 +309,8 @@ def rwkv4_tilelang(
     k: jax.Array,
     v: jax.Array,
     state: jax.Array | None = None,
+    *,
+    block_c: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Forward-only tile-lang RWKV-4 (channel-parallel scan).
 
@@ -326,6 +323,9 @@ def rwkv4_tilelang(
         k, v: ``(B, S, C)`` keys / values.
         state: optional ``(B, 3, C)`` initial state ``(alpha, beta, eps)``;
             defaults to zeros with ``eps = -1e30``.
+        block_c: keyword-only tile size along ``C``. **Required** — chosen
+            by the operation layer (``RWKV4Config.block_c``); the kernel
+            does not pick this.
 
     Returns:
         ``(wkv, final_state)`` where ``wkv`` is ``(B, S, C)`` in the input
@@ -339,9 +339,13 @@ def rwkv4_tilelang(
     if w.shape != (C,) or u.shape != (C,):
         raise ValueError("rwkv4: w/u must have shape (C,).")
 
+    bc = int(block_c)
+    if bc <= 0:
+        raise ValueError(f"rwkv4: block_c must be a positive int (got {bc}).")
+
     if state is None:
-        state0 = _rwkv4_init_state(k)
+        state0 = _rwkv4_init_state(k, bc)
     else:
         state0 = state.astype(jnp.float32)
 
-    return _rwkv4_core(w, u, k, v, state0)
+    return _rwkv4_core(w, u, k, v, state0, bc)

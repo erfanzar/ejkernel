@@ -327,21 +327,42 @@ class AllGatherMatmul(Kernel[AllGatherMatmulConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[AllGatherMatmulConfig, Array]):
-        """Return GPU candidates for TileLang and XLA all-gather matmul paths."""
+        """Return GPU candidates for TileLang and XLA all-gather matmul paths.
+
+        Two main knobs:
+
+        * ``block_n`` ∈ {64, 128, 256, 512} — output column tile.
+        * ``block_k`` ∈ {64, 128, 256} — contraction tile (deeper = more
+          pipelining, more SMEM).
+
+        Block sizes are silently clamped to the largest divisor of the
+        actual matrix dimension that is still ``<=`` the requested value,
+        so unaligned shapes still work.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        configs = (
+            (64, 128, 4, 2),
+            (128, 64, 4, 2),
+            (128, 128, 4, 2),
+            (128, 128, 8, 3),
+            (256, 128, 8, 3),
+            (256, 256, 8, 3),
+            (512, 256, 8, 3),
+        )
         candidates: list[AllGatherMatmulConfig] = []
         if "tilelang" in platforms:
-            candidates.append(
-                AllGatherMatmulConfig(
-                    block_n=128,
-                    block_k=128,
-                    num_warps=4,
-                    num_stages=2,
-                    platform="tilelang",
-                    backend="gpu",
+            for block_n, block_k, num_warps, num_stages in configs:
+                candidates.append(
+                    AllGatherMatmulConfig(
+                        block_n=block_n,
+                        block_k=block_k,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
                 )
-            )
         if "xla" in platforms:
             for block_n, block_k in ((128, 128), (256, 128), (256, 256), (512, 256)):
                 candidates.append(

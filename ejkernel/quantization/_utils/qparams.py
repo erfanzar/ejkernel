@@ -303,7 +303,6 @@ def select_qmm_kernel_family(
     if gemv_mode_n == "on" and m != 1:
         raise ValueError("gemv_mode='on' requires M == 1.")
 
-    # GemLite parity: MX paths use GEMM-SplitK for M==1.
     if m == 1 and mode in {"mxfp4", "mxfp8"}:
         return "gemm_splitk", None
 
@@ -472,7 +471,6 @@ def validate_packed_quantized_matmul_layout(
     if len(s_shape) != 2:
         raise ValueError(f"scales must be rank-2, got scales.shape={tuple(s_shape)}.")
 
-    # Dtype sanity checks catch common metadata mixups early.
     w_dtype = getattr(w_q, "dtype", None)
     if w_dtype is not None and str(w_dtype) != "uint32":
         raise ValueError(f"w_q must be uint32 packed codes, got w_q.dtype={w_dtype!s}.")

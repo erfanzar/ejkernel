@@ -138,13 +138,13 @@ def _deepseek_attn_pallas_call(
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=range(7, 13))
 def deepseek_attn_pallas_impl(
-    q,  # [batch, q_heads, seq_q, q_head_dim]
-    kv_latent,  # [batch, kv_len, kv_lora_rank]
-    w_kc,  # [kv_heads, kv_lora_rank, d_nope]
-    w_vc,  # [kv_heads, kv_lora_rank, v_head_dim]
-    b_q,  # [batch, seq_q, rope_dim] or None
-    b_k,  # [batch, kv_len, rope_dim] or None
-    sparse_mask,  # [batch, seq_q, kv_len] — float32, 1.0=selected
+    q,
+    kv_latent,
+    w_kc,
+    w_vc,
+    b_q,
+    b_k,
+    sparse_mask,
     rope_mode,
     causal,
     softmax_scale,

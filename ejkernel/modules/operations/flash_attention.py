@@ -118,8 +118,6 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         >>> output = executor(attn, query, key, value, sliding_window=(256, 256))
     """
 
-    # Bump for persistent-cache invalidation: wiring cfg.{fwd,bwd}_params into
-    # backend implementations changes runtime behavior for cached configs.
     version = "2"
 
     def __init__(self):
@@ -371,8 +369,6 @@ class FlashAttention(Kernel[FlashAttentionConfig, Array]):
         head_dim = int(q.shape[-1])
         use_segments = (inv.kwargs.get("q_segment_ids") is not None) or (inv.kwargs.get("kv_segment_ids") is not None)
 
-        # Conservative defaults to avoid SMEM launch failures on GPUs with ~99KiB limit.
-        # For head_dim=128 and/or segment masking enabled, 64x64 tiles can exceed SMEM on many GPUs.
         kv_block = 32 if (use_segments or head_dim >= 128) else 128
 
         return FlashAttentionConfig(

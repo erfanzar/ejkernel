@@ -164,7 +164,6 @@ def _ragged_page_attention(
         vmem_limit_bytes=vmem_limit_bytes,
     )
     if softmax_aux is None:
-        # Should be handled by caller, but for safety
         softmax_aux = jnp.full((num_q_heads,), -jnp.inf, dtype=jnp.float32)
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE

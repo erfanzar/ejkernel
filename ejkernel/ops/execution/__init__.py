@@ -85,7 +85,6 @@ from .tuning import (
     benchmark,
 )
 
-# Alias for backward compatibility and convenience
 Tuner = Autotuner
 
 __all__ = (

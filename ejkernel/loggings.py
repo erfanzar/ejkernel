@@ -438,7 +438,6 @@ class ProgressLogger:
         return False
 
 
-#: Module-level logger instance used internally by profiler utilities.
 logger = get_logger("ejKernelLoggings")
 
 

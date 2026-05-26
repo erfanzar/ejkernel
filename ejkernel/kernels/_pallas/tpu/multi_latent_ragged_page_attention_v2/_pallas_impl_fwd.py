@@ -987,9 +987,7 @@ def _mla_ragged_paged_attention_kernel(
             bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
                 bq_sz * num_q_heads_per_q_packing,
                 lkv_dim,
-            )[
-                ...
-            ] = pltpu.bitcast(out, jnp.int32)
+            )[...] = pltpu.bitcast(out, jnp.int32)
 
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 

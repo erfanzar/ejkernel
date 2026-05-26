@@ -185,10 +185,18 @@ def _get_attention_weights_ffi(
     window: tuple[int, int] | None,
     dropout_prob: float,
     logits_soft_cap: float | None,
+    block_q: int,
+    block_k: int,
 ):
-    """Build and cache the native dense-weights FFI call."""
-    block_q = 32 if seq_len_q <= 32 else 64
-    block_k = 32 if seq_len_k <= 32 else 64
+    """Build and cache the native dense-weights FFI call.
+
+    ``block_q`` / ``block_k`` are **required** — the caller (operation
+    layer via the kernel interface's ``weights_block_q`` /
+    ``weights_block_k`` keyword args) is responsible for choosing them.
+    The kernel does not pick from shape.
+    """
+    block_q = int(block_q)
+    block_k = int(block_k)
     key = (
         batch,
         num_heads,
@@ -360,7 +368,7 @@ def _get_attention_weights_bwd_dk_ffi(
         return ffi
 
 
-@partial(jax.custom_vjp, nondiff_argnums=tuple(range(6, 21)))
+@partial(jax.custom_vjp, nondiff_argnums=tuple(range(6, 23)))
 def _attention_weights_core(
     query_bhnd,
     key_bhnd,
@@ -383,6 +391,8 @@ def _attention_weights_core(
     window,
     dropout_prob,
     logits_soft_cap,
+    block_q,
+    block_k,
 ):
     """Differentiable native dense attention weights."""
     batch, num_heads, seq_len_q, head_dim = query_bhnd.shape
@@ -409,6 +419,8 @@ def _attention_weights_core(
         window=window,
         dropout_prob=float(dropout_prob),
         logits_soft_cap=logits_soft_cap,
+        block_q=int(block_q),
+        block_k=int(block_k),
     )
     return ffi(query_bhnd, key_bhnd, bias_buf, mask_buf, aux_buf, seed_buf)
 
@@ -435,30 +447,37 @@ def _attention_weights_core_fwd(
     window,
     dropout_prob,
     logits_soft_cap,
+    block_q,
+    block_k,
 ):
-    weights = _attention_weights_core(
-        query_bhnd,
-        key_bhnd,
-        bias_buf,
-        mask_buf,
-        aux_buf,
-        seed_buf,
-        softmax_scale,
-        causal,
-        num_kv_heads,
-        bias_shape,
-        bias_dtype,
-        use_bias,
-        mask_shape,
-        mask_dtype,
-        use_mask,
-        softmax_aux_shape,
-        softmax_aux_dtype,
-        use_softmax_aux,
-        window,
-        dropout_prob,
-        logits_soft_cap,
+    batch, num_heads, seq_len_q, head_dim = query_bhnd.shape
+    _, _, seq_len_k, _ = key_bhnd.shape
+    ffi = _get_attention_weights_ffi(
+        batch=batch,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        seq_len_q=seq_len_q,
+        seq_len_k=seq_len_k,
+        head_dim=head_dim,
+        softmax_scale=float(softmax_scale),
+        causal=bool(causal),
+        dtype=query_bhnd.dtype,
+        bias_shape=bias_shape,
+        bias_dtype=bias_dtype,
+        use_bias=use_bias,
+        mask_shape=mask_shape,
+        mask_dtype=mask_dtype,
+        use_mask=use_mask,
+        softmax_aux_shape=softmax_aux_shape,
+        softmax_aux_dtype=softmax_aux_dtype,
+        use_softmax_aux=use_softmax_aux,
+        window=window,
+        dropout_prob=float(dropout_prob),
+        logits_soft_cap=logits_soft_cap,
+        block_q=int(block_q),
+        block_k=int(block_k),
     )
+    weights = ffi(query_bhnd, key_bhnd, bias_buf, mask_buf, aux_buf, seed_buf)
     return weights, (query_bhnd, key_bhnd, weights)
 
 
@@ -478,9 +497,12 @@ def _attention_weights_core_bwd(
     window,
     dropout_prob,
     logits_soft_cap,
+    block_q,
+    block_k,
     residual,
     dweights,
 ):
+    _ = block_q, block_k
     query_bhnd, key_bhnd, weights = residual
     batch, num_heads, seq_len_q, head_dim = query_bhnd.shape
     _, _, seq_len_k, _ = key_bhnd.shape
@@ -526,6 +548,9 @@ def _attention_weights_tilelang(
     logits_soft_cap,
     dropout_prob,
     dropout_rng,
+    *,
+    block_q: int,
+    block_k: int,
 ):
     """Compute the dense ``(B, H, Sq, Sk)`` attention probability matrix.
 
@@ -592,6 +617,8 @@ def _attention_weights_tilelang(
         window,
         float(dropout_prob),
         logits_soft_cap,
+        int(block_q),
+        int(block_k),
     )
 
 
@@ -616,6 +643,9 @@ def attention(
     sliding_window: int | tuple[int, int] | None = None,
     fwd_params: FwdParams | None = None,
     bwd_params: BwdParams | None = None,
+    *,
+    weights_block_q: int = 64,
+    weights_block_k: int = 64,
 ) -> tuple[
     Float[Array, "batch seq_len num_q_heads vhead_dim"],
     Float[Array, "batch num_heads seq_len kv_len"],
@@ -711,6 +741,8 @@ def attention(
         logits_soft_cap,
         drop_p,
         dropout_rng,
+        block_q=int(weights_block_q),
+        block_k=int(weights_block_k),
     )
     return output, weights
 

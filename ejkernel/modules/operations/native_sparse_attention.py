@@ -295,51 +295,61 @@ class NativeSparseAttention(Kernel[NativeSparseAttentionConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[NativeSparseAttentionConfig, Array]):
-        """Generate GPU-optimized candidate configurations for autotuning.
+        """Generate GPU-optimized candidate configurations for NSA.
 
-        Creates configurations tailored for GPU execution with Triton backend.
-        Tests various block sizes (32, 64, 128) and warp counts (4, 8) to find
-        optimal configuration for the specific GPU architecture.
+        NSA's selected-block sparse attention has four interacting tiles:
 
-        Args:
-            inv: Invocation object containing arguments and metadata
+        * ``block_q`` / ``block_k`` — inner attention tile (within a
+          selected KV block).
+        * ``block_d`` — head_dim tile (clamped by actual head_dim below).
+        * ``block_size`` — granularity of KV block selection; smaller
+          values mean finer-grained sparsity but more bookkeeping.
 
-        Returns:
-            List of GPU-specific configurations with varying block sizes and warps
+        On H100:
+        * ``block_size`` ∈ {32, 64, 128}; 32 for short prompts, 128
+          amortises selection cost for long prompts.
+        * ``num_warps`` ∈ {2, 4, 8}; 8 only when tile area is large.
+        * ``num_stages`` ∈ {1, 2}; 2 helps memory-bound long-context.
         """
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
-        configs = []
+        q = inv.kwargs.get("query")
+        head_dim = int(q.shape[-1]) if getattr(q, "shape", None) else 64
+        bd_choices = [d for d in (32, 64, 128) if d <= max(head_dim, 32)] or [64]
+        configs: list[NativeSparseAttentionConfig] = []
 
         if "triton" in platforms:
-            for block_size in [32, 64, 128]:
-                for num_warps in [1, 2, 4]:
-                    configs.append(
-                        NativeSparseAttentionConfig(
-                            block_q=block_size,
-                            block_k=block_size,
-                            block_d=block_size,
-                            block_size=block_size,
-                            num_warps=num_warps,
-                            num_stages=1,
-                            platform="triton",
-                            backend="gpu",
+            for block_size in (32, 64, 128):
+                for bd in bd_choices:
+                    for num_warps, num_stages in ((2, 1), (4, 1), (4, 2), (8, 2)):
+                        configs.append(
+                            NativeSparseAttentionConfig(
+                                block_q=block_size,
+                                block_k=block_size,
+                                block_d=bd,
+                                block_size=block_size,
+                                num_warps=num_warps,
+                                num_stages=num_stages,
+                                platform="triton",
+                                backend="gpu",
+                            )
                         )
-                    )
         if "tilelang" in platforms:
-            for block_size in [64, 128]:
-                configs.append(
-                    NativeSparseAttentionConfig(
-                        block_q=block_size,
-                        block_k=block_size,
-                        block_d=block_size,
-                        block_size=block_size,
-                        num_warps=4,
-                        num_stages=1,
-                        platform="tilelang",
-                        backend="gpu",
-                    )
-                )
+            for block_size in (64, 128):
+                for bk in (64, 128) if block_size == 128 else (64,):
+                    for bv in (64, 128):
+                        configs.append(
+                            NativeSparseAttentionConfig(
+                                block_q=block_size,
+                                block_k=bk,
+                                block_d=min(bv, max(head_dim, 32)),
+                                block_size=block_size,
+                                num_warps=8 if max(block_size, bk) >= 128 else 4,
+                                num_stages=2,
+                                platform="tilelang",
+                                backend="gpu",
+                            )
+                        )
         if "xla" in platforms:
             configs.extend(self.candidate_cfgs_xla(inv))
         return configs

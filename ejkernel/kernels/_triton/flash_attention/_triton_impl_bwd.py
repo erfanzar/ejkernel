@@ -261,7 +261,6 @@ def _attn_bwd_dkdv(
         in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
         qk = tl.where(in_window, qk, float("-inf"))
 
-    # Keep `attn_mask` shape stable across control-flow (see fwd kernel).
     attn_mask = (offs_m_curr[:, None] < actual_seqlen_q) & (offs_n[None, :] >= 0)
     if PAD_COLS:
         attn_mask = attn_mask & (offs_n[None, :] < actual_seqlen_k)
@@ -650,7 +649,6 @@ def _attn_bwd_dq(
         in_window = (j_aligned >= (i_idx - window_left)) & (j_aligned <= (i_idx + window_right))
         qk = tl.where(in_window, qk, float("-inf"))
 
-    # Keep `attn_mask` shape stable across control-flow (see fwd kernel).
     attn_mask = (offs_m[:, None] < actual_seqlen_q) & (offs_n_curr[None, :] >= 0)
     if PAD_COLS:
         attn_mask = attn_mask & (offs_n_curr[None, :] < actual_seqlen_k)

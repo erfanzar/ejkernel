@@ -27,18 +27,18 @@ from ejkernel.callib import cdiv, triton_call
 
 @triton.jit
 def _rwkv4_bwd_kernel(
-    w_ptr,  # [C], negative exponentiated decay (w_neg)
-    u_ptr,  # [C]
-    k_ptr,  # [B, T, C]
-    v_ptr,  # [B, T, C]
-    state_hist_ptr,  # [B, T + 1, 3, C]
-    do_ptr,  # [B, T, C]
-    dstate_ptr,  # [B, 3, C], cotangent of final state
-    dk_ptr,  # [B, T, C]
-    dv_ptr,  # [B, T, C]
-    du_bt_ptr,  # [B, C]
-    dw_bt_ptr,  # [B, C]
-    dstate0_ptr,  # [B, 3, C]
+    w_ptr,
+    u_ptr,
+    k_ptr,
+    v_ptr,
+    state_hist_ptr,
+    do_ptr,
+    dstate_ptr,
+    dk_ptr,
+    dv_ptr,
+    du_bt_ptr,
+    dw_bt_ptr,
+    dstate0_ptr,
     T: tl.constexpr,
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -86,7 +86,6 @@ def _rwkv4_bwd_kernel(
         e1b = tl.exp(w_eps - eps_next)
         e2b = tl.exp(kt - eps_next)
 
-        # Gradients through state transition.
         d_alpha = d_alpha_next * e1b
         d_beta = d_beta_next * e1b
         d_v = d_alpha_next * e2b
@@ -112,7 +111,6 @@ def _rwkv4_bwd_kernel(
         dw_acc += d_w_eps
         d_eps = d_w_eps
 
-        # Gradients through wkv output.
         d_num = dot / den
         d_den = -dot * num / (den * den)
 

@@ -87,6 +87,8 @@ from .decode_attention import decode_attention
 from .deepseek_attn import deepseek_attn
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
+from .fused_cross_entropy import fused_cross_entropy
+from .fused_kl_divergence import fused_kl_divergence
 from .gated_delta_rule import gated_delta_rule
 from .gla import recurrent_gla
 from .grouped_matmul import grouped_matmul
@@ -127,6 +129,8 @@ __all__ = [
     "deepseek_attn",
     "flash_attention",
     "flash_mla",
+    "fused_cross_entropy",
+    "fused_kl_divergence",
     "gated_delta_rule",
     "grouped_matmul",
     "grouped_matmulv3",

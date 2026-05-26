@@ -42,7 +42,7 @@ from typing import Literal
 
 from jaxtyping import Array, Float
 
-from ejkernel.kernels._registry import Backend, kernel_registry
+from ejkernel.kernels._registry import Backend, Platform, kernel_registry
 from ejkernel.ops import (
     AutotunePolicy,
     ConfigCache,
@@ -122,18 +122,30 @@ class DeepSeekAttention(Kernel[DeepSeekAttentionConfig, Array]):
         Returns:
             Attention output [batch, seq_len, q_heads, v_head_dim].
         """
+        cfg_index_topk = int(getattr(cfg, "index_topk", 2048))
+        cfg_block_q = int(getattr(cfg, "block_q", 128))
+        cfg_block_k = int(getattr(cfg, "block_k", 128))
+        cfg_gemm_block = int(getattr(cfg, "gemm_block", self._heuristic_gemm_block(int(query.shape[1]))))
+        cfg_num_warps = int(getattr(cfg, "num_warps", 4))
+        cfg_num_stages = int(getattr(cfg, "num_stages", 2))
+        cfg_backend = getattr(cfg, "backend", "any")
+
         if platform is not None:
             cfg = DeepSeekAttentionConfig(
-                index_topk=cfg.index_topk,
-                block_q=cfg.block_q,
-                block_k=cfg.block_k,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
+                index_topk=cfg_index_topk,
+                block_q=cfg_block_q,
+                block_k=cfg_block_k,
+                gemm_block=cfg_gemm_block,
+                num_warps=cfg_num_warps,
+                num_stages=cfg_num_stages,
                 platform=platform,
-                backend=Backend.ANY if platform == "xla" else cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg_backend,
             )
+            cfg_index_topk = cfg.index_topk
+            cfg_gemm_block = cfg.gemm_block
         impl = self.get_impl(cfg)
-        return impl(
+        resolved = detect_platform("deepseek_attn", cfg.platform)
+        kwargs = dict(
             query=query,
             key_value=key_value,
             w_kc=w_kc,
@@ -141,31 +153,46 @@ class DeepSeekAttention(Kernel[DeepSeekAttentionConfig, Array]):
             query_index=query_index,
             key_index=key_index,
             index_weights=index_weights,
-            index_topk=index_topk if index_topk != 2048 else cfg.index_topk,
+            index_topk=index_topk if index_topk != 2048 else cfg_index_topk,
             softmax_scale=softmax_scale,
             index_softmax_scale=index_softmax_scale,
             b_q=b_q,
             b_k=b_k,
             causal=causal,
         )
+        if resolved == Platform.TILELANG:
+            kwargs["gemm_block"] = int(cfg_gemm_block)
+        return impl(**kwargs)
+
+    @staticmethod
+    def _seq_len_from_inv(inv: Invocation[DeepSeekAttentionConfig, Array]) -> int:
+        """Pull ``seq_len`` from the invocation's ``query`` tensor."""
+        q = inv.kwargs.get("query")
+        if q is None and inv.args:
+            q = inv.args[0]
+        shape = getattr(q, "shape", None)
+        if shape is None or len(shape) < 2:
+            return 0
+        return int(shape[1])
+
+    @staticmethod
+    def _heuristic_gemm_block(seq_len: int) -> int:
+        """Operation-side tile heuristic — single source of truth.
+
+        Mirrors the historical kernel-side ``_pick_block`` ladder.
+        """
+        if seq_len == 0 or seq_len <= 64:
+            return 64
+        return 128
 
     def heuristic_cfg(self, inv: Invocation[DeepSeekAttentionConfig, Array]) -> DeepSeekAttentionConfig:
-        """Generate default configuration with balanced block sizes.
-
-        Uses ``index_topk=2048`` and 128x128 query/key blocks as a safe
-        starting point before autotuning has profiled the workload.
-
-        Args:
-            inv: Invocation containing input tensors and metadata.
-
-        Returns:
-            Default ``DeepSeekAttentionConfig`` suitable for most sequence lengths.
-        """
+        """Cold-start configuration with shape-aware ``gemm_block``."""
         index_topk = int(inv.kwargs.get("index_topk", 2048))
         return DeepSeekAttentionConfig(
             index_topk=index_topk,
             block_q=128,
             block_k=128,
+            gemm_block=self._heuristic_gemm_block(self._seq_len_from_inv(inv)),
             num_warps=4,
             num_stages=2,
             platform="auto",
@@ -176,48 +203,63 @@ class DeepSeekAttention(Kernel[DeepSeekAttentionConfig, Array]):
         """Generate candidate configurations for autotuning.
 
         Keeps ``index_topk`` fixed to the caller's requested value because it
-        changes sparsity semantics and output numerics.  Platform-specific
-        methods add concrete backend candidates for GPU and TPU.
-
-        Args:
-            inv: Invocation containing input tensors and metadata.
-
-        Returns:
-            List of ``DeepSeekAttentionConfig`` candidates to benchmark.
+        changes sparsity semantics and output numerics.
         """
         return [self.heuristic_cfg(inv)]
 
     def candidate_cfgs_gpu(self, inv: Invocation[DeepSeekAttentionConfig, Array]):
-        """Generate GPU candidates for TileLang and XLA DeepSeek attention."""
+        """Generate GPU candidates for TileLang and XLA DeepSeek attention.
+
+        DSA enumerates two orthogonal axes:
+
+        * ``gemm_block`` — tile shared by the DSA-internal sub-kernels
+          (indexer, KV-recon GEMMs, elementwise add/cast, top-k bias).
+          On H100, 64 helps short prompts (``S<=512``) where CTA-count
+          dominates; 128 helps longer prompts; 256 only at S>=4K and
+          large heads (it's gated on seq_len below).
+        * ``(block_q, block_k)`` — FlashAttention inner core. The
+          MLA score dim can be wide (e.g. ``128+64`` with RoPE), so
+          ``block_k=64`` is the safer default; ``block_k=128`` only
+          when head_dim is small.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         index_topk = int(inv.kwargs.get("index_topk", 2048))
+        seq_len = self._seq_len_from_inv(inv)
+        gb_choices: list[int] = [64, 128]
+        if seq_len == 0 or seq_len >= 4096:
+            gb_choices.append(256)
+        fa_pairs = [(128, 64), (128, 128), (64, 128), (64, 64)]
         candidates: list[DeepSeekAttentionConfig] = []
         if "tilelang" in platforms:
-            candidates.append(
-                DeepSeekAttentionConfig(
-                    index_topk=index_topk,
-                    block_q=128,
-                    block_k=128,
-                    num_warps=4,
-                    num_stages=2,
-                    platform="tilelang",
-                    backend="gpu",
-                )
-            )
+            for gb in gb_choices:
+                for bq, bk in fa_pairs:
+                    candidates.append(
+                        DeepSeekAttentionConfig(
+                            index_topk=index_topk,
+                            block_q=bq,
+                            block_k=bk,
+                            gemm_block=gb,
+                            num_warps=8 if max(bq, bk) >= 128 else 4,
+                            num_stages=2,
+                            platform="tilelang",
+                            backend="gpu",
+                        )
+                    )
         if "xla" in platforms:
             candidates.append(
                 DeepSeekAttentionConfig(
                     index_topk=index_topk,
                     block_q=128,
                     block_k=128,
+                    gemm_block=128,
                     num_warps=4,
                     num_stages=2,
                     platform="xla",
                     backend="any",
                 )
             )
-        return candidates or self.candidate_cfgs(inv)
+        return candidates or [self.heuristic_cfg(inv)]
 
     def candidate_cfgs_tpu(self, inv: Invocation[DeepSeekAttentionConfig, Array]):
         """Generate TPU candidates for Pallas and XLA DeepSeek attention."""
@@ -227,6 +269,7 @@ class DeepSeekAttention(Kernel[DeepSeekAttentionConfig, Array]):
                 index_topk=index_topk,
                 block_q=128,
                 block_k=128,
+                gemm_block=128,
                 num_warps=4,
                 num_stages=2,
                 platform=platform,

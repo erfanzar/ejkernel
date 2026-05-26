@@ -194,7 +194,6 @@ def ring_attention(
         ...     axis_name="sp",
         ... )
     """
-    # Set defaults
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
     if fwd_params is None:

@@ -374,8 +374,13 @@ class AttentionConfig(BaseOperationConfig):
     """Configuration for basic Attention operation.
 
     Args:
-        block_q: Query block size (default: 128)
-        block_k: Key block size (default: 128)
+        block_q: Query block size for the FlashAttention path (default: 128).
+        block_k: Key block size for the FlashAttention path (default: 128).
+        weights_block_q: Q-tile size for the dense ``(B, H, Sq, Sk)``
+            attention-weights kernel (default: 64). The operation picks
+            this from seq_len via ``heuristic_cfg`` — the kernel does not.
+        weights_block_k: K-tile size for the dense attention-weights kernel
+            (default: 64). Same heuristic policy as ``weights_block_q``.
         num_warps: Number of warps for Triton kernels (default: 4)
         num_stages: Number of pipeline stages (default: 2)
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
@@ -384,6 +389,8 @@ class AttentionConfig(BaseOperationConfig):
 
     block_q: int = 128
     block_k: int = 128
+    weights_block_q: int = 64
+    weights_block_k: int = 64
     num_warps: int = 4
     num_stages: int = 2
 
@@ -871,15 +878,15 @@ class RWKV4Config(BaseOperationConfig):
         wkv_t = sum_{i<t} exp(-w*(t-i)) * k_i * v_i + u * k_t * v_t
 
     Args:
+        block_c: Channel-axis tile size for the tile-lang backend
+            (default ``64``). Ignored by the XLA backend. The
+            operation's ``heuristic_cfg`` picks this from channel
+            count; the autotuner enumerates a small set of values.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
-
-    Note:
-        This operation currently uses XLA implementation without
-        tunable block sizes.
     """
 
-    pass
+    block_c: int = 64
 
     __hash__ = hash_fn
 
@@ -984,8 +991,13 @@ class DeepSeekAttentionConfig(BaseOperationConfig):
 
     Args:
         index_topk: Number of KV tokens to select per query (default: 2048).
-        block_q: Query block size for tiled implementations (default: 128).
-        block_k: Key block size for tiled implementations (default: 128).
+        block_q: Query block size for the inner FlashAttention call (default: 128).
+        block_k: Key block size for the inner FlashAttention call (default: 128).
+        gemm_block: GEMM/indexer/topk tile size shared by the DSA-internal
+            tile-lang sub-kernels (indexer, KV-recon GEMMs, elementwise
+            add/cast, top-k bias). The operation's ``heuristic_cfg`` picks
+            this from seq_len; the autotuner enumerates ``{64, 128}``.
+            Default ``128`` is the cold-start fallback for direct callers.
         num_warps: Number of warps for Triton kernels (default: 4).
         num_stages: Number of pipeline stages (default: 2).
         platform: Target platform (triton/pallas/cuda/cute/xla/auto).
@@ -998,6 +1010,7 @@ class DeepSeekAttentionConfig(BaseOperationConfig):
     index_topk: int = 2048
     block_q: int = 128
     block_k: int = 128
+    gemm_block: int = 128
     num_warps: int = 4
     num_stages: int = 2
 
@@ -1048,13 +1061,18 @@ class PrefillPageAttentionConfig(BaseOperationConfig):
 class StateSpaceV1Config(BaseOperationConfig):
     """Configuration for SSM1 (Mamba1-style) Selective State Space operation.
 
-    Note: This operation uses XLA implementation primarily without tunable
-    block sizes. The config exists primarily for platform/backend selection.
-
     Args:
+        block_d: ``D``-axis tile size for the tile-lang SSM-1 scan kernel
+            (default ``64``). Ignored by XLA. The operation picks this from
+            shape via ``heuristic_cfg`` — the kernel does not.
+        block_e: Width-axis tile size for the gating helper (``silu_gate``)
+            applied after the scan (default ``128``).
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
+
+    block_d: int = 64
+    block_e: int = 128
 
     __hash__ = hash_fn
 
@@ -1067,6 +1085,8 @@ class StateSpaceV2Config(BaseOperationConfig):
         n_groups: Number of groups for B, C parameters (default: 1)
         use_gated_rmsnorm: Whether to use gated RMSNorm for output (default: False)
         rmsnorm_eps: Epsilon for RMSNorm stability (default: 1e-5)
+        block_e: Width-axis tile size for the silu gate helper applied after
+            the scan (default ``128``). Ignored when ``use_gated_rmsnorm``.
         platform: Target platform (triton/pallas/cuda/cute/xla/auto)
         backend: Backend specification (default: "any")
     """
@@ -1074,5 +1094,65 @@ class StateSpaceV2Config(BaseOperationConfig):
     n_groups: int = 1
     use_gated_rmsnorm: bool = False
     rmsnorm_eps: float = 1e-5
+    block_e: int = 128
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedCrossEntropyConfig(BaseOperationConfig):
+    """Configuration for fused cross-entropy.
+
+    Args:
+        block_v: Tile size along the **vocab** axis for the inner
+            online-softmax scan (default ``0`` = auto: 256 / 512 /
+            1024 / 2048 depending on ``V``). Each CTA streams its
+            row(s) through ``ceildiv(V, block_v)`` chunks; larger
+            ``block_v`` amortises chunk-loop overhead but uses more
+            SMEM / registers per CTA.
+        block_m: Rows per CTA (``M`` = flattened ``batch · seq``).
+            Default ``0`` = auto: ``1`` when ``N < 1024`` else ``4``.
+            ``block_m=1`` maximises SM occupancy (smallest SMEM
+            footprint, preferred for wide ``V``); larger amortises
+            per-CTA fixed cost when ``N`` is huge but burns more
+            registers / SMEM per CTA.
+        num_warps: Number of warps (kernel-only hint).
+        num_stages: Pipeline depth (kernel-only hint).
+        platform: Target platform (tilelang/xla/auto).
+        backend: Backend specification.
+    """
+
+    block_v: int = 0
+    block_m: int = 0
+    num_warps: int = 4
+    num_stages: int = 2
+
+    __hash__ = hash_fn
+
+
+@dataclass
+class FusedKLDivergenceConfig(BaseOperationConfig):
+    """Configuration for fused KL divergence (forward / reverse / JSD).
+
+    Args:
+        block_v: Tile size along the **vocab** axis for the inner
+            online-softmax scan (default ``0`` = auto: 256-4096 by
+            ``V``). Larger ``block_v`` amortises chunk-loop overhead;
+            smaller eases register / SMEM pressure for huge ``V``.
+        block_m: Rows per CTA (``M`` = flattened ``batch · seq``).
+            Default ``0`` = auto: ``1`` when ``N < 1024`` else ``4``.
+            ``block_m=1`` is preferred for wide vocabularies — keeps
+            occupancy high; larger ``block_m`` amortises fixed cost
+            on small-V/big-N shapes.
+        num_warps: Number of warps (kernel-only hint).
+        num_stages: Pipeline depth (kernel-only hint).
+        platform: Target platform (tilelang/xla/auto).
+        backend: Backend specification.
+    """
+
+    block_v: int = 0
+    block_m: int = 0
+    num_warps: int = 4
+    num_stages: int = 2
 
     __hash__ = hash_fn

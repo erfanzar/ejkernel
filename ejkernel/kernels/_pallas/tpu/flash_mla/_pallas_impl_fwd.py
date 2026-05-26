@@ -168,16 +168,15 @@ def _flash_mla_kernel_single_batch(
         m_prev = m_scratch_ref[bi, 0]
         l_prev = l_scratch_ref[bi, 0]
 
-        q = q_tile_ref[bi, 0]  # [block_q, q_head_dim]
-        kv = kv_tile_ref[bi]  # [block_k, kv_lora_rank]
-        w_kc = w_kc_tile_ref[0]  # [kv_lora_rank, d_nope]
-        w_vc = w_vc_tile_ref[0]  # [kv_lora_rank, v_head_dim]
+        q = q_tile_ref[bi, 0]
+        kv = kv_tile_ref[bi]
+        w_kc = w_kc_tile_ref[0]
+        w_vc = w_vc_tile_ref[0]
 
-        k_nope = jax.lax.dot(kv, w_kc, preferred_element_type=jnp.float32)  # [block_k, d_nope]
-        v = jax.lax.dot(kv, w_vc, preferred_element_type=jnp.float32)  # [block_k, v_head_dim]
+        k_nope = jax.lax.dot(kv, w_kc, preferred_element_type=jnp.float32)
+        v = jax.lax.dot(kv, w_vc, preferred_element_type=jnp.float32)
 
         if rope_mode == ROPE_NONE:
-            # q: [block_q, d_nope],  k_nope: [block_k, d_nope]
             s = jax.lax.dot_general(
                 q.astype(jnp.float32),
                 k_nope,
@@ -185,11 +184,10 @@ def _flash_mla_kernel_single_batch(
                 preferred_element_type=jnp.float32,
             )
         elif rope_mode == ROPE_FUSED:
-            # q has [d_nope | rope_dim]; b_k provides rope keys
             q_f32 = q.astype(jnp.float32)
             q_nope = q_f32[:, :d_nope]
             q_rope = q_f32[:, d_nope:]
-            bk = bk_tile_ref[bi].astype(jnp.float32)  # [block_k, rope_dim]
+            bk = bk_tile_ref[bi].astype(jnp.float32)
             s_nope = jax.lax.dot_general(
                 q_nope,
                 k_nope,
@@ -204,9 +202,8 @@ def _flash_mla_kernel_single_batch(
             )
             s = s_nope + s_rope
         else:
-            # ROPE_DECOUPLED: q is nope-only; b_q, b_k separate
-            bq = bq_tile_ref[bi].astype(jnp.float32)  # [block_q, rope_dim]
-            bk = bk_tile_ref[bi].astype(jnp.float32)  # [block_k, rope_dim]
+            bq = bq_tile_ref[bi].astype(jnp.float32)
+            bk = bk_tile_ref[bi].astype(jnp.float32)
             s_nope = jax.lax.dot_general(
                 q.astype(jnp.float32),
                 k_nope,
@@ -422,11 +419,8 @@ def _flash_mla_pallas_call(
         pl.BlockSpec((block_b, block_k, kv_lora_rank), kv_index_map),
         pl.BlockSpec((1, kv_lora_rank, d_nope), w_index_map),
         pl.BlockSpec((1, kv_lora_rank, v_head_dim), w_index_map),
-        # b_q
         (pl.BlockSpec((block_b, block_q, b_q.shape[-1]), bq_index_map) if b_q is not None else None),
-        # b_k
         (pl.BlockSpec((block_b, block_k, b_k.shape[-1]), bk_index_map) if b_k is not None else None),
-        # bias
         (pl.BlockSpec((block_b, 1, block_q, block_k), bias_index_map) if bias is not None else None),
     ]
 

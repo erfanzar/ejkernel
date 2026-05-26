@@ -65,32 +65,10 @@ _BWD_DQ_FULL_CACHE: dict[tuple, callable] = {}
 _CACHE_LOCK = threading.Lock()
 
 
-def _pick_fwd_tile(head_dim: int, seq_len_q: int, seq_len_k: int) -> tuple[int, int]:
-    """Pick ``(BLOCK_M, BLOCK_N)`` per shape. Defaults below are the
-    micro-tuned configurations that came out fastest on H100 across the
-    benchmark sweep.
-    """
-    if seq_len_q == 1:
-        if head_dim <= 64:
-            return 64, 256
-        return 64, 128
-
-    if head_dim <= 64:
-        return 128, 128
-    if head_dim <= 128:
-        return 128, 64
-    return 64, 64
-
-
-def _pick_bwd_tile(head_dim: int) -> tuple[int, int]:
-    """Pick reasonable default tiles for the backward. Smaller M/N due to
-    higher register pressure (two extra GEMMs per iteration).
-    """
-    if head_dim <= 64:
-        return 64, 64
-    if head_dim <= 128:
-        return 64, 64
-    return 32, 64
+_DEFAULT_FWD_BLOCK_M: int = 64
+_DEFAULT_FWD_BLOCK_N: int = 64
+_DEFAULT_BWD_BLOCK_M: int = 32
+_DEFAULT_BWD_BLOCK_N: int = 64
 
 
 def _threads_from_warps(num_warps) -> int:
@@ -115,7 +93,7 @@ def _get_fwd_ffi(
     num_stages: int = 2,
     threads: int = 128,
 ):
-    default_m, default_n = _pick_fwd_tile(head_dim, seq_len_q, seq_len_k)
+    default_m, default_n = _DEFAULT_FWD_BLOCK_M, _DEFAULT_FWD_BLOCK_N
     block_m = default_m if block_m is None else int(block_m)
     block_n = default_n if block_n is None else int(block_n)
     key = (
@@ -180,7 +158,7 @@ def _get_bwd_pre_ffi(
     block_m: int | None = None,
     threads: int = 128,
 ):
-    default_m, _ = _pick_bwd_tile(head_dim)
+    default_m, _ = _DEFAULT_BWD_BLOCK_M, _DEFAULT_BWD_BLOCK_N
     block_m = default_m if block_m is None else int(block_m)
     key = (batch, num_heads, seq_len_q, head_dim, block_m, int(threads), str(jnp.dtype(dtype)))
     with _CACHE_LOCK:
@@ -220,7 +198,7 @@ def _get_bwd_dkdv_ffi(
     num_stages: int = 2,
     threads: int = 128,
 ):
-    default_m, default_n = _pick_bwd_tile(head_dim)
+    default_m, default_n = _DEFAULT_BWD_BLOCK_M, _DEFAULT_BWD_BLOCK_N
     block_m = default_m if block_m is None else int(block_m)
     block_n = default_n if block_n is None else int(block_n)
     key = (
@@ -290,7 +268,7 @@ def _get_bwd_dq_ffi(
     num_stages: int = 2,
     threads: int = 128,
 ):
-    default_m, default_n = _pick_bwd_tile(head_dim)
+    default_m, default_n = _DEFAULT_BWD_BLOCK_M, _DEFAULT_BWD_BLOCK_N
     block_m = default_m if block_m is None else int(block_m)
     block_n = default_n if block_n is None else int(block_n)
     key = (
@@ -1310,8 +1288,8 @@ def _resolve_block_sizes(head_dim, seq_len_q, seq_len_k, fwd_params, bwd_params)
     The heuristic picker provides the default; an explicit ``q_blocksize`` /
     ``kv_blocksize`` on the params object overrides it (clamped to ``>= 16``).
     """
-    fwd_bm, fwd_bn = _pick_fwd_tile(head_dim, seq_len_q, seq_len_k)
-    bwd_bm, bwd_bn = _pick_bwd_tile(head_dim)
+    fwd_bm, fwd_bn = _DEFAULT_FWD_BLOCK_M, _DEFAULT_FWD_BLOCK_N
+    bwd_bm, bwd_bn = _DEFAULT_BWD_BLOCK_M, _DEFAULT_BWD_BLOCK_N
     if fwd_params is not None:
         qb = getattr(fwd_params, "q_blocksize", None)
         kvb = getattr(fwd_params, "kv_blocksize", None)

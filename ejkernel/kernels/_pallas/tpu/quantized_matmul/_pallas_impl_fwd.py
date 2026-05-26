@@ -96,7 +96,7 @@ def _pallas_qmm_transpose_false_packed(
     Raises:
         ValueError: If bits, mode, or block constraints are invalid.
     """
-    del use_bf16  # TPU fused path always computes in bfloat16.
+    del use_bf16
     if bits < 1 or bits > 8:
         raise ValueError("TPU packed fused path supports bits in [1, 8].")
     if mode not in _PACKED_SUPPORTED_MODES:
@@ -225,8 +225,6 @@ def _pallas_qmm_transpose_false_packed(
         scratch_bytes=tile_o_bytes,
         has_double_buffer=(num_m > 1 or num_n > 1 or num_k > 1),
     )
-    # Keep a floor so compiler scoped VMEM budgeting does not reject otherwise
-    # legal packed kernels for common decode tiles.
     vmem_budget = get_qmm_tpu_vmem_limit_bytes()
     vmem_limit_bytes = min(vmem_budget, max(estimated_vmem_limit, 32 * 1024 * 1024))
     cost_estimate = pl.CostEstimate(flops=flops, bytes_accessed=x_bytes + w_bytes + s_bytes + o_bytes, transcendentals=0)

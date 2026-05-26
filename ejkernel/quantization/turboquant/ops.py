@@ -71,34 +71,25 @@ def turboquant_compress_keys(
 
     keys_f32 = keys.astype(jnp.float32)
 
-    # 1. Normalize
     original_norms = jnp.linalg.norm(keys_f32, axis=-1, keepdims=True)
     safe_norms = jnp.maximum(original_norms, 1e-8)
     keys_normalized = keys_f32 / safe_norms
 
-    # 2. Rotate: y = keys_norm @ Pi^T (each row is Pi^T @ key)
     rotated = keys_normalized @ rotation_matrix.T
 
-    # 3. Lloyd-Max quantize
     indices = quantize_to_indices(rotated, key_codebook)
 
-    # 4. Reconstruct and compute residual (in rotated space)
     reconstructed_rotated = dequantize_from_indices(indices, key_codebook)
     residual_rotated = rotated - reconstructed_rotated
 
-    # 5. Project residual: projected = residual @ S^T, then take sign
     projected = residual_rotated @ projection_matrix.T
     signs_bool = projected >= 0
 
-    # Compute residual norm (of the rotated-space residual, which equals
-    # the norm of the original-space residual since Pi is orthogonal)
     residual_norms = jnp.linalg.norm(residual_rotated, axis=-1, keepdims=True)
 
-    # 6. Pack
     packed_indices = pack_4bit(indices)
     packed_signs = pack_signs(signs_bool.astype(jnp.uint8))
 
-    # Combine norms: [original_norm, residual_norm]
     norms = jnp.concatenate(
         [original_norms, residual_norms],
         axis=-1,
@@ -138,18 +129,14 @@ def turboquant_compress_values(
     """
     values_f32 = values.astype(jnp.float32)
 
-    # 1. Normalize
     original_norms = jnp.linalg.norm(values_f32, axis=-1)
     safe_norms = jnp.maximum(original_norms, 1e-8)
     values_normalized = values_f32 / safe_norms[..., None]
 
-    # 2. Rotate
     rotated = values_normalized @ rotation_matrix.T
 
-    # 3. Quantize
     indices = quantize_to_indices(rotated, value_codebook)
 
-    # 4. Pack
     packed_indices = pack_4bit(indices)
 
     return packed_indices, original_norms.astype(jnp.bfloat16)
@@ -178,17 +165,12 @@ def turboquant_dequantize_values(
     Returns:
         Dequantized values, shape [..., head_dim], same dtype as norms promoted to float32.
     """
-    # 1. Unpack
     indices = unpack_4bit(packed_indices)
 
-    # 2. Centroid lookup
     centroids = dequantize_from_indices(indices, value_codebook)
 
-    # 3. Inverse rotation: x_approx = centroids @ Pi (since Pi is orthogonal, Pi^{-1} = Pi^T,
-    #    and for row vectors: (Pi^T @ y)^T = y^T @ Pi, so row_vec @ Pi = inverse_rotate)
     derotated = centroids @ rotation_matrix
 
-    # 4. Rescale
     return derotated * norms[..., None].astype(jnp.float32)
 
 
@@ -219,23 +201,17 @@ def turboquant_asymmetric_scores(
     Returns:
         Attention logits, shape [qblocks, kv_heads, q_per_kv, kv_tok].
     """
-    # Unpack key data
-    k_indices = unpack_4bit(k_packed_indices)  # [kv_tok, kv_heads, head_dim]
-    k_signs = unpack_signs(k_packed_signs)  # [kv_tok, kv_heads, qjl_dim]
+    k_indices = unpack_4bit(k_packed_indices)
+    k_signs = unpack_signs(k_packed_signs)
 
-    k_orig_norms = k_norms[..., 0].astype(jnp.float32)  # [kv_tok, kv_heads]
-    k_res_norms = k_norms[..., 1].astype(jnp.float32)  # [kv_tok, kv_heads]
+    k_orig_norms = k_norms[..., 0].astype(jnp.float32)
+    k_res_norms = k_norms[..., 1].astype(jnp.float32)
 
-    # MSE term: q_rotated @ codebook[k_indices]^T * k_original_norms
-    k_centroids = dequantize_from_indices(k_indices, key_codebook)  # [kv_tok, kv_heads, head_dim]
+    k_centroids = dequantize_from_indices(k_indices, key_codebook)
 
-    # einsum output: [b(qblocks), i(kv_heads), h(q_per_kv), k(kv_tok)]
     logits_mse = jnp.einsum("bihd,kid->bihk", q_rotated, k_centroids)
-    # k_orig_norms [kv_tok, kv_heads] -> [kv_heads, kv_tok] -> [1, kv_heads, 1, kv_tok]
     logits_mse = logits_mse * k_orig_norms.T[None, :, None, :]
 
-    # QJL correction: sqrt(pi/2) / qjl_dim * (q_projected @ k_signs^T) * k_residual_norms
-    # einsum: [b,i,h,m] x [k,i,m] -> [b,i,h,k]
     correction = jnp.einsum("bihm,kim->bihk", q_projected, k_signs)
     factor = jnp.sqrt(jnp.float32(jnp.pi / 2.0)) / jnp.float32(qjl_dim)
     correction = correction * k_res_norms.T[None, :, None, :] * factor

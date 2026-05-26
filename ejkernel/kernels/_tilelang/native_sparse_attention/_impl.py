@@ -361,7 +361,7 @@ def _sparse_core(
 ):
     """Selected-block sparse attention primitive with custom VJP.
 
-    Nondiff args (5–10) are ``block_size``, ``softmax_scale``, ``index_layout``,
+    Nondiff args (5-10) are ``block_size``, ``softmax_scale``, ``index_layout``,
     ``count_layout``, ``count_is_scalar``, ``count_value`` — all compile-time
     constants baked into the kernel.
 

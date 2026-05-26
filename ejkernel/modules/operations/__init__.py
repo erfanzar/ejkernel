@@ -132,6 +132,8 @@ from .configs import (
     DeepSeekAttentionConfig,
     FlashAttentionConfig,
     FlashMLAConfig,
+    FusedCrossEntropyConfig,
+    FusedKLDivergenceConfig,
     GatedDeltaRuleConfig,
     GLAttentionConfig,
     GroupedMatmulConfig,
@@ -165,6 +167,8 @@ from .configs import (
 from .decode_attention import DecodeAttention, decode_attention
 from .deepseek_attn import DeepSeekAttention, deepseek_attn
 from .flash_attention import FlashAttention, flash_attention
+from .fused_cross_entropy import CrossEntropyOutput, FusedCrossEntropy, fused_cross_entropy
+from .fused_kl_divergence import FusedKLDivergence, KLDivergenceOutput, fused_kl_divergence
 from .gated_delta_rule import GatedDeltaRule, gated_delta_rule
 from .gated_linear_attention import GLAttention, gla_attention
 from .grouped_matmul import GroupedMatmul, grouped_matmul
@@ -221,6 +225,7 @@ __all__ = (
     "BlockSparseAttentionConfig",
     "ChunkedPrefillPagedDecode",
     "ChunkedPrefillPagedDecodeConfig",
+    "CrossEntropyOutput",
     "DecodeAttention",
     "DecodeAttentionConfig",
     "DeepSeekAttention",
@@ -229,12 +234,17 @@ __all__ = (
     "FlashAttentionConfig",
     "FlashMLA",
     "FlashMLAConfig",
+    "FusedCrossEntropy",
+    "FusedCrossEntropyConfig",
+    "FusedKLDivergence",
+    "FusedKLDivergenceConfig",
     "GLAttention",
     "GLAttentionConfig",
     "GatedDeltaRule",
     "GatedDeltaRuleConfig",
     "GroupedMatmul",
     "GroupedMatmulConfig",
+    "KLDivergenceOutput",
     "KernelDeltaAttention",
     "KernelDeltaAttentionConfig",
     "LightningAttention",
@@ -292,6 +302,8 @@ __all__ = (
     "deepseek_attn",
     "flash_attention",
     "flash_mla",
+    "fused_cross_entropy",
+    "fused_kl_divergence",
     "gated_delta_rule",
     "gdr_attention",
     "gla_attention",

@@ -131,7 +131,6 @@ class QuantRuntimeConfig:
             compute = "bf16"
             meta = "bf16"
         else:
-            # GPU/MPS: fp16 paths are generally the fastest for dequant pipelines.
             compute = "fp16"
             meta = "fp16"
 

@@ -199,9 +199,6 @@ def page_attention(
         attn_scale = 1.0 / (head_size**0.5)
 
     if max_context_len is None:
-        # Avoid computing reductions on-device just to obtain a Python int; this
-        # can interact poorly with async dispatch + subsequent Triton calls and
-        # has been observed to yield NaNs in page_attention outputs.
         max_context_len = int(jax.device_get(context_lens).max())
 
     if query_group_size == 1:
@@ -243,9 +240,6 @@ def page_attention(
         stride_o0 = stride_q0
         stride_o1 = stride_q1
         stride_o2 = stride_q2
-        # Output is laid out as (seq, head, dim). The kernel indexes heads via
-        # (kv_head_idx * QUERY_GROUP_SIZE + group_idx), so the group axis must
-        # stride by `stride_q1` (i.e. head_dim), not by the dim stride.
         stride_o3 = stride_q1
         stride_o4 = stride_q2
 
@@ -305,9 +299,9 @@ def page_attention(
         def grid(meta):
             return (num_seqs, num_kv_heads, num_splits)
 
-        assert (partition_size >= kv_blocksize) and (
-            partition_size % kv_blocksize == 0
-        ), f"partition_size={partition_size}, kv_blocksize={kv_blocksize}"
+        assert (partition_size >= kv_blocksize) and (partition_size % kv_blocksize == 0), (
+            f"partition_size={partition_size}, kv_blocksize={kv_blocksize}"
+        )
 
         metaparams = dict(
             grid=grid,

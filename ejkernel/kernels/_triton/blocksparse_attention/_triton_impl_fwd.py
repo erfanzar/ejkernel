@@ -120,7 +120,7 @@ def _blocksparse_attn_fwd_inner(
         Updated (acc, l, m) tuple
     """
     BIG_NEG: tl.constexpr = float("-inf")
-    LOG2_CONST: tl.constexpr = 1.4426950408889634  # log2(e)
+    LOG2_CONST: tl.constexpr = 1.4426950408889634
     key_transpose_block_ptr = tl.advance(key_transpose_block_ptr, (0, lower))
     value_block_ptr = tl.advance(value_block_ptr, (lower, 0))
     kv_arange = tl.arange(0, BLOCK_N)

@@ -126,7 +126,7 @@ def _all_gather_matmul_core(
     """Core all-gather matmul with custom VJP.
 
     Non-differentiable arguments ``axis_name``, ``rhs_transpose``, and
-    ``precision`` (positions 2–4) are captured by the VJP rules via
+    ``precision`` (positions 2-4) are captured by the VJP rules via
     ``nondiff_argnums``.
 
     Args:

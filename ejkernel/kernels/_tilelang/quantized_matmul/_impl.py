@@ -142,24 +142,13 @@ def _launch_safe_blocks(block_m: int, block_n: int, block_k: int) -> tuple[int, 
     return bm, bn, bk
 
 
-def _pick_tile(m: int, n: int, k: int) -> tuple[int, int, int]:
-    """Pick default ``(BLOCK_M, BLOCK_N, BLOCK_K)`` tile sizes.
+_QMM_INT8_DEFAULT_BLOCKS: tuple[int, int, int] = (64, 128, 64)
+"""Constant fallback tiles for the legacy int8 entry point.
 
-    Heuristic: use larger tiles when the problem dimension is large enough to
-    fill them, then clamp with ``_launch_safe_blocks``.
-
-    Args:
-        m: Row count of the activation matrix.
-        n: Column count of the weight matrix.
-        k: Reduction dimension.
-
-    Returns:
-        ``(block_m, block_n, block_k)`` tuple after clamping.
-    """
-    bm = 64 if m >= 64 else 32
-    bn = 128 if n >= 128 else 64
-    bk = 64 if k >= 64 else 32
-    return _launch_safe_blocks(bm, bn, bk)
+The packed entry point (``quantized_matmul_packed_tilelang``) accepts
+``block_m`` / ``block_n`` / ``block_k`` directly from the caller. This
+int8 fallback path is used only when the dispatcher routes here; the
+operation layer owns shape-aware tuning."""
 
 
 def _threads_from_warps(num_warps: int | None) -> int:
@@ -219,7 +208,7 @@ def _get_fwd(m, n, k, dtype):
         A compiled FFI callable ``ffi(X, W, S) -> Y`` where ``Y`` has shape
         ``(m, n)`` in *dtype*.
     """
-    bm, bn, bk = _pick_tile(m, n, k)
+    bm, bn, bk = _launch_safe_blocks(*_QMM_INT8_DEFAULT_BLOCKS)
     key = ("fwd", m, n, k, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _FWD_CACHE.get(key)
@@ -267,7 +256,7 @@ def _get_bwd(m, n, k, dtype):
         A compiled FFI callable ``ffi(dY, W, S) -> dX`` where ``dX`` has
         shape ``(m, k)`` in *dtype*.
     """
-    bm, bn, bk = _pick_tile(m, n, k)
+    bm, bn, bk = _launch_safe_blocks(*_QMM_INT8_DEFAULT_BLOCKS)
     key = ("bwd", m, n, k, str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _BWD_CACHE.get(key)

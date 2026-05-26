@@ -134,7 +134,7 @@ def _normalize_softmax_aux(
 
     if aux.ndim == 1:
         if aux.shape[0] == num_heads:
-            return aux[:, None]  # [num_heads, 1]
+            return aux[:, None]
         return jnp.broadcast_to(aux[None, :], (num_heads, aux.shape[0]))
 
     if aux.ndim == 2:
@@ -275,7 +275,6 @@ def _flash_mla_xla(
     k_nope = _repeat_kv_for_gqa(k_nope, q_heads)
     v = _repeat_kv_for_gqa(v, q_heads)
 
-    # logits: [batch, q_heads, seq_q, seq_k]
     if b_k is None:
         logits = jnp.einsum("bqhd,bkhd->bhqk", q_f, k_nope, optimize=True)
         d_scale = float(d_nope)
@@ -321,7 +320,6 @@ def _flash_mla_xla(
 
     if softmax_aux is not None:
         aux = _normalize_softmax_aux(softmax_aux, num_heads=q_heads, dtype=jnp.float32)
-        # aux: [q_heads, n_sinks] → broadcast to [batch, q_heads, seq_q, n_sinks]
         sinks = jnp.broadcast_to(aux[None, :, None, :], (batch, q_heads, seq_len_q, aux.shape[-1]))
         combined = jnp.concatenate([logits, sinks], axis=-1)
         combined = combined.astype(softmax_dtype)

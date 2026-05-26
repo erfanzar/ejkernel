@@ -270,7 +270,6 @@ def _unified_attention_2d(
         other=0.0,
     )
     if q.dtype != key_cache_ptr.dtype.element_ty:
-        # tl.dot requires q/k dtypes to match; align to KV cache dtype.
         q = q.to(key_cache_ptr.dtype.element_ty)
 
     block_table_offset = seq_idx * block_table_stride
@@ -516,7 +515,6 @@ def _unified_attention_3d(
         other=0.0,
     )
     if q.dtype != key_cache_ptr.dtype.element_ty:
-        # tl.dot requires q/k dtypes to match; align to KV cache dtype.
         q = q.to(key_cache_ptr.dtype.element_ty)
 
     block_table_offset = seq_idx * block_table_stride
@@ -853,7 +851,6 @@ def unified_attention_triton(
 
     head_size_padded = triton.next_power_of_2(head_size)
 
-    # contiguous strides
     q_stride_0 = num_query_heads * head_size
     q_stride_1 = head_size
     o_stride_0 = q_stride_0
@@ -881,8 +878,6 @@ def unified_attention_triton(
     else:
         logits_soft_cap_val = float(logits_soft_cap)
 
-    # vLLM selection logic: use segmented 3D kernel for decode-only, small batches.
-    # We treat the batch as "decode-only" when each sequence has a single query token.
     decode_only = total_tokens <= num_seqs
     use_2d = (
         seq_threshold_3d is None

@@ -200,14 +200,19 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
                 - ssm_state: Final hidden state [batch, num_heads, head_dim, ssm_state_size]
                 - conv_state: Passed through conv_state (for caching)
         """
+        cfg_block_e = int(getattr(cfg, "block_e", 128))
+        cfg_backend = getattr(cfg, "backend", "any")
+
         if platform is not None:
             cfg = StateSpaceV2Config(
                 n_groups=n_groups,
                 use_gated_rmsnorm=use_gated_rmsnorm,
                 rmsnorm_eps=rmsnorm_eps,
+                block_e=cfg_block_e,
                 platform=platform,
-                backend=Backend.ANY if platform == "xla" else cfg.backend,
+                backend=Backend.ANY if platform == "xla" else cfg_backend,
             )
+            cfg_block_e = cfg.block_e
 
         impl = self.get_impl(cfg)
         return impl(
@@ -225,6 +230,7 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
             use_gated_rmsnorm=use_gated_rmsnorm,
             rmsnorm_eps=rmsnorm_eps,
             precision=precision,
+            block_e=cfg_block_e,
         )
 
     def heuristic_cfg(self, inv: Invocation[StateSpaceV2Config, Array]) -> StateSpaceV2Config:
@@ -240,6 +246,7 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
             n_groups=int(inv.kwargs.get("n_groups", 1)),
             use_gated_rmsnorm=bool(inv.kwargs.get("use_gated_rmsnorm", False)),
             rmsnorm_eps=float(inv.kwargs.get("rmsnorm_eps", 1e-5)),
+            block_e=128,
             platform="auto",
             backend="any",
         )
@@ -262,29 +269,47 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
                 n_groups=int(inv.kwargs.get("n_groups", 1)),
                 use_gated_rmsnorm=bool(inv.kwargs.get("use_gated_rmsnorm", False)),
                 rmsnorm_eps=float(inv.kwargs.get("rmsnorm_eps", 1e-5)),
+                block_e=128,
                 platform="xla",
                 backend="any",
             ),
         ]
 
     def candidate_cfgs_gpu(self, inv: Invocation[StateSpaceV2Config, Array]):
-        """Generate GPU candidates for TileLang and XLA SSM2."""
+        """Generate GPU candidates for TileLang and XLA SSM2.
+
+        Tunable knob: ``block_e`` — tile size along the head_dim axis
+        for the silu_gate / rmsnorm_silu_gate helper applied after the
+        scan. Sweep {64, 128, 256}; 64 helps small heads (head_dim<=64),
+        256 amortises fixed cost on wide heads (>=128).
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         n_groups = int(inv.kwargs.get("n_groups", 1))
         use_gated_rmsnorm = bool(inv.kwargs.get("use_gated_rmsnorm", False))
         rmsnorm_eps = float(inv.kwargs.get("rmsnorm_eps", 1e-5))
         candidates: list[StateSpaceV2Config] = []
-        for platform, backend in (("tilelang", "gpu"), ("xla", "any")):
-            if platform not in platforms:
-                continue
+        if "tilelang" in platforms:
+            for be in (64, 128, 256):
+                candidates.append(
+                    StateSpaceV2Config(
+                        n_groups=n_groups,
+                        use_gated_rmsnorm=use_gated_rmsnorm,
+                        rmsnorm_eps=rmsnorm_eps,
+                        block_e=be,
+                        platform="tilelang",
+                        backend="gpu",
+                    )
+                )
+        if "xla" in platforms:
             candidates.append(
                 StateSpaceV2Config(
                     n_groups=n_groups,
                     use_gated_rmsnorm=use_gated_rmsnorm,
                     rmsnorm_eps=rmsnorm_eps,
-                    platform=platform,
-                    backend=backend,
+                    block_e=128,
+                    platform="xla",
+                    backend="any",
                 )
             )
         return candidates or self.candidate_cfgs(inv)
@@ -296,6 +321,7 @@ class StateSpaceV2(Kernel[StateSpaceV2Config, Array]):
                 n_groups=int(inv.kwargs.get("n_groups", 1)),
                 use_gated_rmsnorm=bool(inv.kwargs.get("use_gated_rmsnorm", False)),
                 rmsnorm_eps=float(inv.kwargs.get("rmsnorm_eps", 1e-5)),
+                block_e=128,
                 platform="xla",
                 backend="any",
             )

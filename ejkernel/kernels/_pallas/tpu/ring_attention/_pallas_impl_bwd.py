@@ -65,10 +65,8 @@ from ..blocksparse_attention import _masks as mask_lib
 
 partial = functools.partial
 
-# Default axis name for ring communication
 RING_AXIS = "sp"
 
-# Type aliases from splash attention
 MaskInfo = mask_info_lib.MaskInfo
 BlockSizes = splash_kernel.BlockSizes
 MaskFunctionType = splash_kernel.MaskFunctionType
@@ -89,8 +87,8 @@ class SegmentIds(NamedTuple):
             document/sequence the key/value token belongs to.
     """
 
-    q: jax.Array  # [q_seq_len]
-    kv: jax.Array  # [kv_seq_len]
+    q: jax.Array
+    kv: jax.Array
 
 
 def _update_out_and_lse(

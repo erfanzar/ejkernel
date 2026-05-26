@@ -128,65 +128,45 @@ def prefill_page_attention(
     if softmax_scale is None:
         softmax_scale = 1.0 / jnp.sqrt(head_dim).astype(query.dtype)
 
-    # Get context length as scalar
     length = context_len[0]
 
-    # Calculate number of pages needed
     (length + page_size - 1) // page_size
 
-    # Gather K/V from paged cache
-    # page_indices contains the physical page indices for this sequence
-    k_pages = key_cache[:, page_indices]  # [num_kv_heads, num_pages, page_size, head_dim]
-    v_pages = value_cache[:, page_indices]  # [num_kv_heads, num_pages, page_size, head_dim]
+    k_pages = key_cache[:, page_indices]
+    v_pages = value_cache[:, page_indices]
 
-    # Reshape to [num_kv_heads, total_seq_len, head_dim]
     max_seq_len = page_indices.shape[0] * page_size
     k = k_pages.reshape(num_kv_heads, max_seq_len, head_dim)
     v = v_pages.reshape(num_kv_heads, max_seq_len, head_dim)
 
-    # Repeat K/V for grouped query attention
-    k = jnp.repeat(k, num_groups, axis=0)  # [num_q_heads, max_seq_len, head_dim]
-    v = jnp.repeat(v, num_groups, axis=0)  # [num_q_heads, max_seq_len, head_dim]
+    k = jnp.repeat(k, num_groups, axis=0)
+    v = jnp.repeat(v, num_groups, axis=0)
 
-    # Compute attention scores: [num_q_heads, chunk_size, max_seq_len]
-    # q: [chunk_size, num_q_heads, head_dim] -> transpose for einsum
     qk = jnp.einsum("qhd,hsd->hqs", query, k, preferred_element_type=jnp.float32)
     qk = qk * softmax_scale
 
-    # Apply soft cap if specified
     if attn_logits_soft_cap is not None:
         qk = attn_logits_soft_cap * jnp.tanh(qk / attn_logits_soft_cap)
 
-    # Create masks
-    # Query positions: last chunk_size positions of the sequence
-    # q_pos[i] = length - chunk_size + i
-    q_positions = (length - chunk_size) + jnp.arange(chunk_size)  # [chunk_size]
-    kv_positions = jnp.arange(max_seq_len)  # [max_seq_len]
+    q_positions = (length - chunk_size) + jnp.arange(chunk_size)
+    kv_positions = jnp.arange(max_seq_len)
 
-    # Padding mask: only attend to valid positions (< length)
-    padding_mask = kv_positions[None, :] < length  # [1, max_seq_len]
+    padding_mask = kv_positions[None, :] < length
 
-    # Causal mask: q_pos >= kv_pos (can attend to current and past)
-    causal_mask = q_positions[:, None] >= kv_positions[None, :]  # [chunk_size, max_seq_len]
+    causal_mask = q_positions[:, None] >= kv_positions[None, :]
 
-    # Combine masks
     mask = jnp.logical_and(padding_mask, causal_mask)
 
-    # Apply sliding window if specified
     if sliding_window is not None:
-        # Can only attend to kv_pos >= q_pos - sliding_window + 1
         sliding_mask = kv_positions[None, :] >= (q_positions[:, None] - sliding_window + 1)
         mask = jnp.logical_and(mask, sliding_mask)
 
-    # Broadcast mask to [num_q_heads, chunk_size, max_seq_len]
     mask = jnp.broadcast_to(mask, (num_q_heads, chunk_size, max_seq_len))
 
     qk = qk + jnp.where(mask, 0.0, mask_value)
 
-    # Softmax
     attn = jax.nn.softmax(qk, axis=-1)
 
-    # Compute output: [num_q_heads, chunk_size, head_dim]
     out = jnp.einsum("hqs,hsd->qhd", attn, v)
 
     return out.astype(query.dtype)

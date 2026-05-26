@@ -38,16 +38,16 @@ from ejkernel.callib import cdiv, triton_call
 )
 @triton.jit
 def _rwkv6_fwd_kernel(
-    r,  # [B, T, H, K]
-    k,  # [B, T, H, K]
-    v,  # [B, T, H, V]
-    w,  # [B, T, H, K] (log decay)
-    u,  # [H, K]
-    h0,  # [B, H, K, V] or [N,H,K,V]
+    r,
+    k,
+    v,
+    w,
+    u,
+    h0,
     cu_seqlens,
     scale,
-    o,  # [NK, B, T, H, V]
-    ht,  # [N, H, K, V]
+    o,
+    ht,
     T: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,

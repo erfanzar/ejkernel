@@ -86,7 +86,6 @@ def pack_signs(signs: jax.Array) -> jax.Array:
     signs = signs.astype(jnp.uint8)
     reshaped = signs.reshape(*shape[:-1], shape[-1] // 8, 8)
 
-    # Pack 8 bits into one byte: bit 0 is LSB
     bits = jnp.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=jnp.uint8)
     packed = jnp.sum(reshaped * bits[None, :], axis=-1).astype(jnp.uint8)
     return packed
@@ -108,10 +107,8 @@ def unpack_signs(packed: jax.Array) -> jax.Array:
     shape = packed.shape
     bits = jnp.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=jnp.uint8)
 
-    # Expand packed bytes into individual bits
     expanded = packed[..., None].astype(jnp.uint8)
     unpacked = (expanded & bits) > 0
 
-    # Reshape and convert to +1/-1 float
     unpacked = unpacked.reshape(*shape[:-1], shape[-1] * 8)
     return jnp.where(unpacked, 1.0, -1.0).astype(jnp.float32)

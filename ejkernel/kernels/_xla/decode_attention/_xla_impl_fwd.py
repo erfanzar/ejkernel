@@ -123,7 +123,6 @@ def _decode_attention_fwd(
     k_pages = key_buffer.reshape(num_pages_total, page_size, num_kv_heads, head_dim)
     v_pages = value_buffer.reshape(num_pages_total, page_size, num_kv_heads, head_dim)
 
-    # Gather physical pages per request (batch, max_pages, page_size, num_kv_heads, head_dim).
     k_g = k_pages[req_to_tokens]
     v_g = v_pages[req_to_tokens]
 

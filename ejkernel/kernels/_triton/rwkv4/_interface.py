@@ -205,6 +205,8 @@ def rwkv4(
     k: Float[Array, "batch seq_len chans"],
     v: Float[Array, "batch seq_len chans"],
     state: Float[Array, "batch three chans"] | None = None,
+    *,
+    block_c: int = 64,
 ) -> tuple[Float[Array, "batch seq_len chans"], Float[Array, "batch three chans"]]:
     """RWKV-4 time-mix recurrence (Triton GPU implementation).
 
@@ -214,8 +216,11 @@ def rwkv4(
         k: Key tensor `[B, T, C]`.
         v: Value tensor `[B, T, C]`.
         state: Optional initial state `[B, 3, C]` (alpha, beta, eps).
+        block_c: Accepted for signature parity with the tilelang backend;
+            the Triton implementation chooses its own meta-parameters.
 
     Returns:
         Tuple of (output `[B, T, C]`, final_state `[B, 3, C]`).
     """
+    del block_c
     return _rwkv4(w, u, k, v, state)

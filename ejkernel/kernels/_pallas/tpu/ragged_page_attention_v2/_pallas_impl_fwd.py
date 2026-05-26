@@ -215,7 +215,7 @@ def ref_ragged_page_attention(
             reshaped_sink = jnp.repeat(reshaped_sink, q_len, axis=1)
             attn = jnp.concatenate([reshaped_sink, attn], axis=2)
             attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
-            attn = attn[..., 1:]  # Drop left sink column
+            attn = attn[..., 1:]
         else:
             attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
 
@@ -584,7 +584,7 @@ def ragged_page_attention_kernel(
             k = jnp.where(kv_mask, k, 0)
             v = jnp.where(kv_mask, v, 0)
 
-            sinks = softmax_aux_ref[...]  # [num_q_heads_per_kv_head, head_dim]
+            sinks = softmax_aux_ref[...]
             m_aux = jnp.concatenate([sinks] * num_q_per_blk, axis=0)
             l_aux = jnp.ones_like(m_aux)
 
@@ -651,13 +651,10 @@ def ragged_page_attention_kernel(
                     if shape[1] % arr.shape[1] == 0:
                         return jnp.concatenate([arr for _ in range(shape[1] // arr.shape[1])], axis=1)
 
-                # Fallback (will likely fail if shapes mismatch)
                 return jnp.broadcast_to(arr, shape)
 
             o_curr = load_with_init(head_acc_ref, 0.0).reshape(-1, head_dim)
 
-            # l_alpha, beta, l_next_safe are [num_q_per_blk * num_q_heads_per_kv_head, 1]
-            # qkv is [num_q_per_blk * num_q_heads_per_kv_head, head_dim]
 
             l_alpha = broadcast_to_shape(l_alpha, qkv.shape)
             beta = broadcast_to_shape(beta, qkv.shape)

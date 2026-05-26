@@ -56,7 +56,6 @@ _MIN_THREADS_PER_BLOCK = 64
 _THREAD_TILE_M = 4
 _THREAD_TILE_N = 4
 
-# Canonical NF4 lookup table (16 float32 values).
 _NF4_LUT_VALUES: tuple[float, ...] = (
     -1.0,
     -0.6961928009986877,
@@ -119,12 +118,8 @@ def _fake_tensor(dtype: type[cutlass.Numeric], shape: tuple[int, ...]):
         assumed_align=16,
     )
     if rank == 2:
-        # For 2-D row-major tensors, tell the compiler:
-        #   - mode (rank-1) is contiguous (stride 1)
-        #   - strides are compact with the leading stride divisible by
-        #     enough elements to ensure 128-bit alignment per row.
-        leading_dim = rank - 1  # innermost = contiguous
-        divisibility = max(1, 128 // dtype.width)  # 8 for fp16, 4 for fp32
+        leading_dim = rank - 1
+        divisibility = max(1, 128 // dtype.width)
         ft.mark_layout_dynamic(leading_dim=leading_dim)
         ft.mark_compact_shape_dynamic(
             mode=leading_dim,
@@ -747,7 +742,6 @@ def _build_tiled_qmm_host_fns(
     ttm = _THREAD_TILE_M
     ttn = _THREAD_TILE_N
 
-    # Ensure tile dims are divisible by register-tile dims.
     if tile_m % ttm != 0 or tile_n % ttn != 0:
         raise ValueError(f"Tile ({tile_m}, {tile_n}) must be divisible by thread tile ({ttm}, {ttn})")
 
@@ -782,7 +776,6 @@ def _build_tiled_qmm_host_fns(
             block_m = cutlass.Int32(bidx) * cutlass.Int32(tile_m)
             block_n = cutlass.Int32(bidy) * cutlass.Int32(tile_n)
 
-            # Static SMEM allocations.
             sh_x_ptr = cute.arch.smem.alloc_smem(out_dtype, smem_x_elems)
             sh_x = cute.make_tensor(sh_x_ptr, cute.make_layout((tile_m, tile_k)))
             sh_w_ptr = cute.arch.smem.alloc_smem(out_dtype, smem_w_elems)
@@ -794,7 +787,6 @@ def _build_tiled_qmm_host_fns(
             num_thr = cutlass.Int32(num_threads)
             group_size_i = cutlass.Int32(group_size)
 
-            # -- Init NF4 LUT --
             if use_nf4_lut:
                 if flat_tid < cutlass.Int32(16):
                     lut_val = cutlass.Float32(0.0)
@@ -807,7 +799,6 @@ def _build_tiled_qmm_host_fns(
                     nf4_lut[(flat_tid,)] = lut_val
                 cute.arch.sync_threads()
 
-            # -- Accumulators (register-resident, explicit 4x4 unroll) --
             a00 = cutlass.Float32(0.0)
             a01 = cutlass.Float32(0.0)
             a02 = cutlass.Float32(0.0)
@@ -827,7 +818,6 @@ def _build_tiled_qmm_host_fns(
 
             k_start = cutlass.Int32(0)
             while k_start < k_dim:
-                # == Cooperative load x tile ==
                 li = flat_tid
                 while li < cutlass.Int32(smem_x_elems):
                     lr = li // cutlass.Int32(tile_k)
@@ -842,7 +832,6 @@ def _build_tiled_qmm_host_fns(
                     sh_x[(lr, lc)] = out_dtype(xv)
                     li = li + num_thr
 
-                # == Cooperative load + dequant w tile ==
                 li = flat_tid
                 while li < cutlass.Int32(smem_w_elems):
                     lk = li // cutlass.Int32(tile_n)
@@ -873,7 +862,6 @@ def _build_tiled_qmm_host_fns(
 
                 cute.arch.sync_threads()
 
-                # == Compute (register tiling, explicit 4x4 unroll) ==
                 bm = cutlass.Int32(tidy) * cutlass.Int32(ttm)
                 bn = cutlass.Int32(tidx) * cutlass.Int32(ttn)
                 for kk in cutlass.range(0, tile_k):
@@ -905,7 +893,6 @@ def _build_tiled_qmm_host_fns(
                 cute.arch.sync_threads()
                 k_start = k_start + cutlass.Int32(tile_k)
 
-            # == Writeback (explicit 4x4 unroll) ==
             bm_g = block_m + cutlass.Int32(tidy) * cutlass.Int32(ttm)
             bn_g = block_n + cutlass.Int32(tidx) * cutlass.Int32(ttn)
             if bm_g < m_dim and bn_g < n_dim:
@@ -1014,7 +1001,6 @@ def _build_tiled_qmm_host_fns(
                 nf4_lut[(flat_tid,)] = lut_val
             cute.arch.sync_threads()
 
-        # -- Accumulators (register-resident, explicit 4x4 unroll) --
         a00 = cutlass.Float32(0.0)
         a01 = cutlass.Float32(0.0)
         a02 = cutlass.Float32(0.0)
@@ -1078,7 +1064,6 @@ def _build_tiled_qmm_host_fns(
 
             cute.arch.sync_threads()
 
-            # == Compute (register tiling, explicit 4x4 unroll) ==
             bm = cutlass.Int32(tidy) * cutlass.Int32(ttm)
             bn = cutlass.Int32(tidx) * cutlass.Int32(ttn)
             for kk in cutlass.range(0, tile_k):
@@ -1110,7 +1095,6 @@ def _build_tiled_qmm_host_fns(
             cute.arch.sync_threads()
             k_start = k_start + cutlass.Int32(tile_k)
 
-        # == Writeback (explicit 4x4 unroll) ==
         bm_g = block_m + cutlass.Int32(tidy) * cutlass.Int32(ttm)
         bn_g = block_n + cutlass.Int32(tidx) * cutlass.Int32(ttn)
         if bm_g < m_dim and bn_g < n_dim:
@@ -1244,10 +1228,10 @@ _MMA_ATOM_K = 16
 _MMA_ATOM_LAYOUT_M = 2
 _MMA_ATOM_LAYOUT_N = 2
 _MMA_ATOM_LAYOUT_K = 1
-_MMA_NUM_THREADS = _MMA_ATOM_LAYOUT_M * _MMA_ATOM_LAYOUT_N * _MMA_ATOM_LAYOUT_K * 32  # 128
-_MMA_TILED_M = _MMA_ATOM_LAYOUT_M * _MMA_ATOM_M  # 32
-_MMA_TILED_N = _MMA_ATOM_LAYOUT_N * _MMA_ATOM_N * 2  # 32 (with permutation doubling N)
-_MMA_TILED_K = _MMA_ATOM_LAYOUT_K * _MMA_ATOM_K  # 16
+_MMA_NUM_THREADS = _MMA_ATOM_LAYOUT_M * _MMA_ATOM_LAYOUT_N * _MMA_ATOM_LAYOUT_K * 32
+_MMA_TILED_M = _MMA_ATOM_LAYOUT_M * _MMA_ATOM_M
+_MMA_TILED_N = _MMA_ATOM_LAYOUT_N * _MMA_ATOM_N * 2
+_MMA_TILED_K = _MMA_ATOM_LAYOUT_K * _MMA_ATOM_K
 
 
 def _validate_mma_tile(tile_m: int, tile_n: int, tile_k: int) -> bool:
@@ -1345,7 +1329,7 @@ def _make_gmem_tiled_copy_x(
         out_dtype,
         num_bits_per_copy=copy_bits,
     )
-    copy_elems = copy_bits // out_dtype.width  # 128 // 16 = 8 for fp16
+    copy_elems = copy_bits // out_dtype.width
     k_groups = tile_k // copy_elems
     thread_layout = cute.make_layout(
         (num_threads // k_groups, k_groups),
@@ -1408,7 +1392,7 @@ def _build_mma_qmm_host_fns(
         )
 
     dequant = _build_dequant_fn(mode=mode, with_bias=with_bias)
-    num_threads = _MMA_NUM_THREADS  # 128 (4 warps)
+    num_threads = _MMA_NUM_THREADS
     smem_x_elems = tile_m * tile_k
     smem_w_elems = tile_n * tile_k
     smem_c_elems = tile_m * tile_n
@@ -1442,12 +1426,10 @@ def _build_mma_qmm_host_fns(
             num_thr = cutlass.Int32(num_threads)
             group_size_i = cutlass.Int32(group_size)
 
-            # -- SMEM allocation --
             smem = cutlass.utils.SmemAllocator()
             sA = smem.allocate_tensor(out_dtype, sA_layout, 16)
             sB = smem.allocate_tensor(out_dtype, sB_layout, 16)
 
-            # NF4 LUT
             nf4_lut_ptr = cute.arch.smem.alloc_smem(cutlass.Float32, 16)
             nf4_lut = cute.make_tensor(nf4_lut_ptr, cute.make_layout((16,)))
             if use_nf4_lut:
@@ -1462,7 +1444,6 @@ def _build_mma_qmm_host_fns(
                     nf4_lut[(flat_tid,)] = lut_val
                 cute.arch.sync_threads()
 
-            # -- MMA partition & fragment setup --
             thr_mma = tiled_mma.get_slice(tidx)
             tCsA = thr_mma.partition_A(sA)
             tCsB = thr_mma.partition_B(sB)
@@ -1475,7 +1456,6 @@ def _build_mma_qmm_host_fns(
             tCrC = tiled_mma.make_fragment_C(tCgC)
             tCrC.fill(0.0)
 
-            # SMEM→register copy setup
             thr_s2r_A = tiled_copy_s2r_A.get_slice(tidx)
             tCsA_s2r = thr_s2r_A.partition_S(sA)
             tCrA_s2r = thr_s2r_A.retile(tCrA)
@@ -1485,10 +1465,8 @@ def _build_mma_qmm_host_fns(
 
             num_k_block = cute.size(tCrA, mode=[2])
 
-            # -- K-tile mainloop --
             k_start = cutlass.Int32(0)
             while k_start < k_dim:
-                # == Cooperative load x → sA (M, K) ==
                 li = flat_tid
                 while li < cutlass.Int32(smem_x_elems):
                     lr = li // cutlass.Int32(tile_k)
@@ -1503,7 +1481,6 @@ def _build_mma_qmm_host_fns(
                     sA[(lr, lc)] = out_dtype(xv)
                     li = li + num_thr
 
-                # == Cooperative load + dequant w → sB (N, K) ==
                 li = flat_tid
                 while li < cutlass.Int32(smem_w_elems):
                     ln = li // cutlass.Int32(tile_k)
@@ -1534,7 +1511,6 @@ def _build_mma_qmm_host_fns(
 
                 cute.arch.sync_threads()
 
-                # == SMEM → register + MMA ==
                 for kb in cutlass.range(num_k_block, unroll_full=True):
                     cute.copy(tiled_copy_s2r_A, tCsA_s2r[None, None, kb], tCrA_s2r[None, None, kb])
                     cute.copy(tiled_copy_s2r_B, tCsB_s2r[None, None, kb], tCrB_s2r[None, None, kb])
@@ -1544,7 +1520,6 @@ def _build_mma_qmm_host_fns(
                 cute.arch.sync_threads()
                 k_start = k_start + cutlass.Int32(tile_k)
 
-            # -- Writeback: accumulator → SMEM → global --
             tCrD = cute.make_fragment_like(tCrC, out_dtype)
             tCrD[None] = tCrC.load().to(out_dtype)
 
@@ -1553,7 +1528,6 @@ def _build_mma_qmm_host_fns(
             cute.autovec_copy(tCrD, tCsC)
             cute.arch.sync_threads()
 
-            # Cooperative write sC → global
             li = flat_tid
             while li < cutlass.Int32(smem_c_elems):
                 lr = li // cutlass.Int32(tile_n)
@@ -1693,7 +1667,6 @@ def _build_mma_qmm_host_fns(
         num_thr = cutlass.Int32(num_threads)
         group_size_i = cutlass.Int32(group_size)
 
-        # -- SMEM allocation --
         smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(out_dtype, sA_layout, 16)
         sB = smem.allocate_tensor(out_dtype, sB_layout, 16)
@@ -1712,7 +1685,6 @@ def _build_mma_qmm_host_fns(
                 nf4_lut[(flat_tid,)] = lut_val
             cute.arch.sync_threads()
 
-        # -- MMA partition & fragment setup --
         thr_mma = tiled_mma.get_slice(tidx)
         tCsA = thr_mma.partition_A(sA)
         tCsB = thr_mma.partition_B(sB)
@@ -1734,10 +1706,8 @@ def _build_mma_qmm_host_fns(
 
         num_k_block = cute.size(tCrA, mode=[2])
 
-        # -- K-tile mainloop --
         k_start = cutlass.Int32(0)
         while k_start < k_dim:
-            # == Cooperative load x → sA (M, K) ==
             li = flat_tid
             while li < cutlass.Int32(smem_x_elems):
                 lr = li // cutlass.Int32(tile_k)
@@ -1752,7 +1722,6 @@ def _build_mma_qmm_host_fns(
                 sA[(lr, lc)] = out_dtype(xv)
                 li = li + num_thr
 
-            # == Cooperative load + dequant w → sB (N, K) ==
             li = flat_tid
             while li < cutlass.Int32(smem_w_elems):
                 ln = li // cutlass.Int32(tile_k)
@@ -1792,7 +1761,6 @@ def _build_mma_qmm_host_fns(
             cute.arch.sync_threads()
             k_start = k_start + cutlass.Int32(tile_k)
 
-        # -- Writeback --
         tCrD = cute.make_fragment_like(tCrC, out_dtype)
         tCrD[None] = tCrC.load().to(out_dtype)
 
@@ -1967,7 +1935,7 @@ def _build_mma_pipelined_qmm_host_fns(
         )
 
     dequant = _build_dequant_fn(mode=mode, with_bias=with_bias)
-    num_threads = _MMA_NUM_THREADS  # 128 (4 warps)
+    num_threads = _MMA_NUM_THREADS
     smem_w_elems = tile_n * tile_k
     use_nf4_lut = mode.lower() == "nf4"
 
@@ -2000,12 +1968,10 @@ def _build_mma_pipelined_qmm_host_fns(
             num_thr = cutlass.Int32(num_threads)
             group_size_i = cutlass.Int32(group_size)
 
-            # -- SMEM allocation (staged) --
             smem = cutlass.utils.SmemAllocator()
-            sA = smem.allocate_tensor(out_dtype, sA_layout, 16)  # 3-D (M, K, STAGES)
-            sB = smem.allocate_tensor(out_dtype, sB_layout, 16)  # 3-D (N, K, STAGES)
+            sA = smem.allocate_tensor(out_dtype, sA_layout, 16)
+            sB = smem.allocate_tensor(out_dtype, sB_layout, 16)
 
-            # NF4 LUT
             nf4_lut_ptr = cute.arch.smem.alloc_smem(cutlass.Float32, 16)
             nf4_lut = cute.make_tensor(nf4_lut_ptr, cute.make_layout((16,)))
             if use_nf4_lut:
@@ -2020,24 +1986,18 @@ def _build_mma_pipelined_qmm_host_fns(
                     nf4_lut[(flat_tid,)] = lut_val
                 cute.arch.sync_threads()
 
-            # -- Tiled view of x for cp.async --
             gA = cute.local_tile(x, tiler=(tile_m, tile_k), coord=(bidx, None))
-            # Annotate 16-byte (128-bit) alignment for cp.async CopyG2SOp
             gA = cute.make_tensor(gA.iterator.align(16), gA.layout)
 
-            # GMEM→SMEM partitions
             thr_g2s = tiled_copy_g2s.get_slice(tidx)
-            tAgA = thr_g2s.partition_S(gA)  # (CPY, CPY_M, CPY_K, k_tiles)
-            # Re-annotate 128-bit alignment after partition_S (which drops it)
+            tAgA = thr_g2s.partition_S(gA)
             tAgA = cute.make_tensor(tAgA.iterator.align(16), tAgA.layout)
-            tAsA = thr_g2s.partition_D(sA)  # (CPY, CPY_M, CPY_K, STAGES)
+            tAsA = thr_g2s.partition_D(sA)
 
-            # Identity tensor for M-boundary predication
             mcA = cute.make_identity_tensor(x.layout.shape)
             cA = cute.local_tile(mcA, tiler=(tile_m, tile_k), coord=(bidx, None))
             tAcA = thr_g2s.partition_S(cA)
 
-            # M-boundary predicate tensor
             tApA = cute.make_rmem_tensor(
                 cute.make_layout(
                     (
@@ -2053,7 +2013,6 @@ def _build_mma_pipelined_qmm_host_fns(
                 for m in range(tApA.shape[1]):
                     tApA[rest_v, m, 0] = cute.elem_less(tAcA[(0, rest_v), m, 0, 0][0], x.shape[0])
 
-            # -- MMA partition & fragment setup (3-D sA, sB) --
             thr_mma = tiled_mma.get_slice(tidx)
             tCsA = thr_mma.partition_A(sA)
             tCsB = thr_mma.partition_B(sB)
@@ -2066,9 +2025,8 @@ def _build_mma_pipelined_qmm_host_fns(
             tCrC = tiled_mma.make_fragment_C(tCgC)
             tCrC.fill(0.0)
 
-            # SMEM→register copy setup (staged)
             thr_s2r_A = tiled_copy_s2r_A.get_slice(tidx)
-            tCsA_s2r = thr_s2r_A.partition_S(sA)  # (CPY, M, K, STAGES)
+            tCsA_s2r = thr_s2r_A.partition_S(sA)
             tCrA_s2r = thr_s2r_A.retile(tCrA)
             thr_s2r_B = tiled_copy_s2r_B.get_slice(tidx)
             tCsB_s2r = thr_s2r_B.partition_S(sB)
@@ -2078,13 +2036,11 @@ def _build_mma_pipelined_qmm_host_fns(
             k_tile_count = cute.size(tAgA, mode=[3])
             num_smem_stages = cute.size(tAsA, mode=[3])
 
-            # ======== Prologue: prefetch (num_stages-1) tiles ========
             tAsA.fill(0)
             cute.arch.sync_threads()
 
             k_tile_index = cutlass.Int32(0)
 
-            # Stage 0: cp.async x[0] → sA[:,:,0] with K-residue handling
             for k in range(tApA.shape[2]):
                 if cute.elem_less(cutlass.Int32(-1), tAcA[0, 0, k, 0][1]):
                     cute.copy(
@@ -2096,7 +2052,6 @@ def _build_mma_pipelined_qmm_host_fns(
             k_tile_index = k_tile_index + cutlass.Int32(1)
             cute.arch.cp_async_commit_group()
 
-            # Stages 1..(num_stages-2)
             for stage in range(1, num_smem_stages - 1):
                 if stage == k_tile_count:
                     tApA.fill(0)
@@ -2109,11 +2064,9 @@ def _build_mma_pipelined_qmm_host_fns(
                 k_tile_index = k_tile_index + cutlass.Int32(1)
                 cute.arch.cp_async_commit_group()
 
-            # Wait for all prefetched x data
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
-            # Dequant w for prologue stages → sB[:,:,stage]
             for stage in range(num_smem_stages - 1):
                 k_start_s = cutlass.Int32(stage * tile_k)
                 li = flat_tid
@@ -2145,11 +2098,9 @@ def _build_mma_pipelined_qmm_host_fns(
                     li = li + num_thr
                 cute.arch.sync_threads()
 
-            # ======== Pipeline state ========
             smem_pipe_read = 0
             smem_pipe_write = num_smem_stages - 1
 
-            # ======== Register prefetch ========
             tCsA_p = tCsA_s2r[None, None, None, smem_pipe_read]
             tCsB_p = tCsB_s2r[None, None, None, smem_pipe_read]
             if num_k_block > 1:
@@ -2158,24 +2109,19 @@ def _build_mma_pipelined_qmm_host_fns(
                 cute.copy(tiled_copy_s2r_A, tCsA_p[None, None, 0], tCrA_s2r[None, None, 0])
                 cute.copy(tiled_copy_s2r_B, tCsB_p[None, None, 0], tCrB_s2r[None, None, 0])
 
-            # ======== Mainloop ========
             for k_tile in range(k_tile_count):
                 for kb in cutlass.range(num_k_block, unroll_full=True):
-                    # -- Last kb: advance SMEM pipeline --
                     if kb == num_k_block - 1:
                         tCsA_p = tCsA_s2r[None, None, None, smem_pipe_read]
                         tCsB_p = tCsB_s2r[None, None, None, smem_pipe_read]
                         cute.arch.cp_async_wait_group(num_smem_stages - 2)
                         cute.arch.sync_threads()
 
-                    # -- Prefetch next kb SMEM→register --
                     kb_next = (kb + 1) % num_k_block
                     cute.copy(tiled_copy_s2r_A, tCsA_p[None, None, kb_next], tCrA_s2r[None, None, kb_next])
                     cute.copy(tiled_copy_s2r_B, tCsB_p[None, None, kb_next], tCrB_s2r[None, None, kb_next])
 
-                    # -- First kb: issue future cp.async + dequant --
                     if kb == 0:
-                        # cp.async x[future] → sA[write]
                         if k_tile + num_smem_stages - 1 < k_tile_count:
                             cute.copy(
                                 tiled_copy_g2s,
@@ -2186,7 +2132,6 @@ def _build_mma_pipelined_qmm_host_fns(
                         k_tile_index = k_tile_index + cutlass.Int32(1)
                         cute.arch.cp_async_commit_group()
 
-                        # Dequant w for write stage
                         if k_tile + num_smem_stages - 1 < k_tile_count:
                             k_start_w = cutlass.Int32((k_tile + num_smem_stages - 1) * tile_k)
                             li_w = flat_tid
@@ -2218,14 +2163,11 @@ def _build_mma_pipelined_qmm_host_fns(
                                 li_w = li_w + num_thr
                             cute.arch.sync_threads()
 
-                        # Advance pipeline
                         smem_pipe_write = smem_pipe_read
                         smem_pipe_read = (smem_pipe_read + 1) % num_smem_stages
 
-                    # -- MMA compute --
                     cute.gemm(tiled_mma, tCrC, tCrA[None, None, kb], tCrB[None, None, kb], tCrC)
 
-            # ======== Epilogue ========
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
@@ -2237,7 +2179,6 @@ def _build_mma_pipelined_qmm_host_fns(
             cute.autovec_copy(tCrD, tCsC)
             cute.arch.sync_threads()
 
-            # Cooperative write sC → global
             li = flat_tid
             while li < cutlass.Int32(tile_m * tile_n):
                 lr = li // cutlass.Int32(tile_n)
@@ -2280,7 +2221,6 @@ def _build_mma_pipelined_qmm_host_fns(
                 + 128
             )
 
-            # Re-wrap x with explicit contiguous stride for cp.async alignment
             mA = cute.make_tensor(x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1)))
             grid_x = (out.shape[0] + tile_m - 1) // tile_m
             grid_y = (out.shape[1] + tile_n - 1) // tile_n
@@ -2336,7 +2276,6 @@ def _build_mma_pipelined_qmm_host_fns(
                 + 128
             )
 
-            # Re-wrap x with explicit contiguous stride for cp.async alignment
             mA = cute.make_tensor(x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1)))
             grid_x = (out.shape[0] + tile_m - 1) // tile_m
             grid_y = (out.shape[1] + tile_n - 1) // tile_n
@@ -2407,11 +2346,9 @@ def _build_mma_pipelined_qmm_host_fns(
             cute.arch.sync_threads()
 
         gA = cute.local_tile(x, tiler=(tile_m, tile_k), coord=(bidx, None))
-        # Annotate 16-byte (128-bit) alignment for cp.async CopyG2SOp
         gA = cute.make_tensor(gA.iterator.align(16), gA.layout)
         thr_g2s = tiled_copy_g2s.get_slice(tidx)
         tAgA = thr_g2s.partition_S(gA)
-        # Re-annotate 128-bit alignment after partition_S (which drops it)
         tAgA = cute.make_tensor(tAgA.iterator.align(16), tAgA.layout)
         tAsA = thr_g2s.partition_D(sA)
 
@@ -2457,7 +2394,6 @@ def _build_mma_pipelined_qmm_host_fns(
         k_tile_count = cute.size(tAgA, mode=[3])
         num_smem_stages = cute.size(tAsA, mode=[3])
 
-        # Prologue
         tAsA.fill(0)
         cute.arch.sync_threads()
 
@@ -2531,7 +2467,6 @@ def _build_mma_pipelined_qmm_host_fns(
             cute.copy(tiled_copy_s2r_A, tCsA_p[None, None, 0], tCrA_s2r[None, None, 0])
             cute.copy(tiled_copy_s2r_B, tCsB_p[None, None, 0], tCrB_s2r[None, None, 0])
 
-        # Mainloop
         for k_tile in range(k_tile_count):
             for kb in cutlass.range(num_k_block, unroll_full=True):
                 if kb == num_k_block - 1:
@@ -2591,7 +2526,6 @@ def _build_mma_pipelined_qmm_host_fns(
 
                 cute.gemm(tiled_mma, tCrC, tCrA[None, None, kb], tCrB[None, None, kb], tCrC)
 
-        # Epilogue
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
 
@@ -2644,7 +2578,6 @@ def _build_mma_pipelined_qmm_host_fns(
             + 128
         )
 
-        # Re-wrap x with explicit contiguous stride for cp.async alignment
         mA = cute.make_tensor(x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1)))
         grid_x = (out.shape[0] + tile_m - 1) // tile_m
         grid_y = (out.shape[1] + tile_n - 1) // tile_n
@@ -2698,7 +2631,6 @@ def _build_mma_pipelined_qmm_host_fns(
             + 128
         )
 
-        # Re-wrap x with explicit contiguous stride for cp.async alignment
         mA = cute.make_tensor(x.iterator, cute.make_layout((x.shape[0], x.shape[1]), stride=(x.shape[1], 1)))
         grid_x = (out.shape[0] + tile_m - 1) // tile_m
         grid_y = (out.shape[1] + tile_n - 1) // tile_n
@@ -2772,7 +2704,6 @@ def _build_fused_qmm_host_fns(
         tile_k=tile_k,
     )
 
-    # --- Explicit env-var overrides ---
     if _use_naive_kernel():
         return _build_naive_qmm_host_fns(**kw)
 
@@ -2793,7 +2724,6 @@ def _build_fused_qmm_host_fns(
         except Exception:
             return _build_naive_qmm_host_fns(**kw)
 
-    # --- Default: pipelined MMA → single-stage MMA → tiled → naive ---
     if _validate_mma_tile(tile_m, tile_n, tile_k):
         try:
             return _build_mma_pipelined_qmm_host_fns(**kw)

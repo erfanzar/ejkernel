@@ -38,17 +38,17 @@ from ejkernel.callib import cdiv, triton_call
 )
 @triton.jit
 def _rwkv7_fwd_kernel(
-    r,  # [B, T, H, K]
-    w,  # [B, T, H, K] (log decay)
-    k,  # [B, T, H, K]
-    v,  # [B, T, H, V]
-    a,  # [B, T, H, K]
-    b,  # [B, T, H, K]
-    h0,  # [B,H,K,V] or [N,H,K,V]
+    r,
+    w,
+    k,
+    v,
+    a,
+    b,
+    h0,
     cu_seqlens,
     scale,
-    o,  # [B, T, H, V]
-    ht,  # [N,H,K,V]
+    o,
+    ht,
     T: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -135,7 +135,7 @@ def _rwkv7_fwd_kernel(
         b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
         b_b = tl.load(p_b, mask=mask_k, other=0).to(tl.float32)
 
-        hb = tl.sum(b_b[:, None] * b_h, axis=0)  # [BV]
+        hb = tl.sum(b_b[:, None] * b_h, axis=0)
         b_h = tl.exp(b_w)[:, None] * b_h + b_a[:, None] * hb[None, :]
         b_h += b_k[:, None] * b_v[None, :]
         b_o = tl.sum(b_h * b_r[:, None], axis=0)

@@ -251,9 +251,6 @@ def _attn_fwd_inner(
         else:
             qk += bias * (LN2 / softmax_scale)
 
-    # Keep `attn_mask` shape stable across control-flow. Triton requires values
-    # carried through an `if` to have identical types/shapes in both branches.
-    # Start with a (BLOCK_M, BLOCK_N) mask (the `offs_n >= 0` term is always True).
     attn_mask = (offs_m[:, None] < actual_seqlen_q) & (offs_n[None, :] >= 0)
     if PADDED_COLS:
         attn_mask = attn_mask & ((index_start_n + offs_n)[None, :] < actual_seqlen_k)

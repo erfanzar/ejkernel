@@ -90,7 +90,6 @@ def _ssm1_core(
     _ssm_state_size = B.shape[-1]
 
     if use_single_step and seq_len == 1 and initial_state is not None:
-        # Single step inference mode
         y, final_state = _ssm1_single_step_fwd(
             hidden_state=hidden_states[:, 0, :],
             A=A,
@@ -102,7 +101,6 @@ def _ssm1_core(
         )
         return y[:, None, :], final_state
     else:
-        # Full sequence mode
         output, _, final_state = _ssm1_fwd(
             hidden_states=hidden_states,
             A=A,
@@ -159,7 +157,6 @@ def _ssm1_fwd_rule(
         )
 
     if use_single_step and seq_len == 1:
-        # Single step - no need for all hidden states
         y, final_state = _ssm1_single_step_fwd(
             hidden_state=hidden_states[:, 0, :],
             A=A,
@@ -169,7 +166,6 @@ def _ssm1_fwd_rule(
             dt=dt[:, 0, :],
             ssm_state=initial_state,
         )
-        # For single step, all_hidden_states is just the final state expanded
         all_hidden_states = final_state[:, None, :, :]
         output = y[:, None, :]
     else:
@@ -246,6 +242,9 @@ def state_space_v1(
     initial_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
     conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
     act_fn: Callable[[Array], Array] | None = None,
+    *,
+    block_d: int = 64,
+    block_e: int = 128,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],
     Float[Array, "batch intermediate_size ssm_state_size"],
@@ -326,7 +325,6 @@ def state_space_v1(
     _, seq_len, _ = hidden_states.shape
     dtype = hidden_states.dtype
 
-    # Determine if we should use single step optimization
     use_single_step = seq_len == 1 and initial_state is not None
 
     output, ssm_state = _ssm1_core(
@@ -340,10 +338,9 @@ def state_space_v1(
         use_single_step=use_single_step,
     )
 
-    # Apply gating if provided
     if gate is not None:
         if act_fn is None:
             act_fn = jax.nn.silu
         output = output * act_fn(gate)
-
+    del block_e, block_d
     return output.astype(dtype), ssm_state.astype(dtype), conv_state

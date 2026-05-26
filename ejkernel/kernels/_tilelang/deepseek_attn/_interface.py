@@ -50,6 +50,8 @@ def deepseek_attn(
     b_q: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
     b_k: Float[Array, "batch seq_len qk_rope_head_dim"] | None = None,
     causal: bool = True,
+    *,
+    gemm_block: int = 128,
 ) -> Float[Array, "batch seq_len q_heads v_head_dim"]:
     """DeepSeek Sparse Attention — native tile-lang Lightning-Indexer + fused
     sparse-MLA attention kernels (forward).
@@ -103,6 +105,7 @@ def deepseek_attn(
         b_q=b_q,
         b_k=b_k,
         causal=causal,
+        gemm_block=int(gemm_block),
     )
 
 

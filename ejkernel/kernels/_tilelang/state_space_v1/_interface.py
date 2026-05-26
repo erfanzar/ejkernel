@@ -54,11 +54,14 @@ def _impl(
     initial_state,
     conv_state,
     act_fn,
+    *,
+    block_d: int,
+    block_e: int,
 ):
-    y, hf = ssm1_tilelang(hidden_states, A, B, C, D, dt, initial_state=initial_state)
+    y, hf = ssm1_tilelang(hidden_states, A, B, C, D, dt, initial_state=initial_state, block_d=int(block_d))
     if gate is not None:
         _check_silu_act_fn(act_fn)
-        y = silu_gate_tilelang(y, gate)
+        y = silu_gate_tilelang(y, gate, int(block_e))
     return y, hf, conv_state
 
 
@@ -77,6 +80,9 @@ def state_space_v1(
     initial_state: Float[Array, "batch intermediate_size ssm_state_size"] | None = None,
     conv_state: Float[Array, "batch intermediate_size d_conv"] | None = None,
     act_fn: Callable[[Array], Array] | None = None,
+    *,
+    block_d: int = 64,
+    block_e: int = 128,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],
     Float[Array, "batch intermediate_size ssm_state_size"],
@@ -118,7 +124,20 @@ def state_space_v1(
     Raises:
         EjkernelRuntimeError: if ``act_fn`` is not silu/swish.
     """
-    return _impl(hidden_states, A, B, C, D, dt, gate, initial_state, conv_state, act_fn)
+    return _impl(
+        hidden_states,
+        A,
+        B,
+        C,
+        D,
+        dt,
+        gate,
+        initial_state,
+        conv_state,
+        act_fn,
+        block_d=int(block_d),
+        block_e=int(block_e),
+    )
 
 
 __all__ = ["state_space_v1"]

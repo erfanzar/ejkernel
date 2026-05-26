@@ -102,8 +102,6 @@ def _ssm1_bwd(
             Tuple of (dx_b, dA_b, dB_b, dC_b, dD_b, ddt_b, d_initial_state).
         """
 
-        # Get previous hidden states (shifted by 1)
-        # h_prev[t] = h_all[t-1] for t > 0, h_prev[0] = h0
         h_prev = jnp.concatenate([h0_b[None, :, :], h_all_b[:-1]], axis=0)
 
         def backward_step(carry, inputs):
@@ -124,44 +122,27 @@ def _ssm1_bwd(
             carry_dtype = dh_next.dtype
             _t_idx, x_t, B_t, C_t, dt_t, h_t, h_prev_t, do_t = inputs
 
-            # Compute dA_t for this timestep
-            dA_t = jnp.exp(A_val * dt_t[:, None])  # [d, n]
+            dA_t = jnp.exp(A_val * dt_t[:, None])
 
-            # dL/dh_t from output gradient
-            # y_t = sum(h_t * C_t, axis=-1) + D * x_t
-            # dy/dh = C_t (broadcast over d dimension)
-            dh_from_output = do_t[:, None] * C_t[None, :]  # [d, n]
+            dh_from_output = do_t[:, None] * C_t[None, :]
 
-            # Total gradient w.r.t. h_t
             dh_t = dh_next + dh_from_output
 
-            # dL/dx_t
-            # From output: dy/dx = D
-            # From state update: dh/dx = dt * B (integrated over state dimension)
             dx_t = do_t * D_val + jnp.sum(dh_t * dt_t[:, None] * B_t[None, :], axis=-1)
 
-            # dL/dB_t = sum over d of (dL/dh_t * dt * x)
-            dB_t = jnp.sum(dh_t * dt_t[:, None] * x_t[:, None], axis=0)  # [n]
+            dB_t = jnp.sum(dh_t * dt_t[:, None] * x_t[:, None], axis=0)
 
-            # dL/dC_t = sum over d of (dL/dy_t * h_t)
-            dC_t = jnp.sum(do_t[:, None] * h_t, axis=0)  # [n]
+            dC_t = jnp.sum(do_t[:, None] * h_t, axis=0)
 
-            # dL/ddt_t: gradient through discretization
-            # dA = exp(A * dt), d(dA)/d(dt) = A * dA
-            # dBx = dt * B * x, d(dBx)/d(dt) = B * x
             ddt_t = jnp.sum(dh_t * (A_val * dA_t * h_prev_t + B_t[None, :] * x_t[:, None]), axis=-1)
 
-            # dL/dA_t contribution from this step
-            # dA = exp(A * dt), d(dA)/dA = dt * dA
-            dA_contrib = dh_t * dt_t[:, None] * dA_t * h_prev_t  # [d, n]
+            dA_contrib = dh_t * dt_t[:, None] * dA_t * h_prev_t
 
-            # Propagate gradient to previous hidden state
             dh_prev = (dh_t * dA_t).astype(carry_dtype)
 
             outputs = (dx_t, dB_t, dC_t, ddt_t, dA_contrib)
             return dh_prev, outputs
 
-        # Prepare scan inputs (reverse order)
         scan_inputs = (
             jnp.arange(seq_len)[::-1],
             x_b[::-1],
@@ -177,31 +158,27 @@ def _ssm1_bwd(
 
         dx_b, dB_b, dC_b, ddt_b, dA_contribs = outputs
 
-        # Reverse outputs back to forward order
         dx_b = dx_b[::-1]
         dB_b = dB_b[::-1]
         dC_b = dC_b[::-1]
         ddt_b = ddt_b[::-1]
         dA_contribs = dA_contribs[::-1]
 
-        # Sum dA contributions over sequence
-        dA_b = jnp.sum(dA_contribs, axis=0)  # [d, n]
+        dA_b = jnp.sum(dA_contribs, axis=0)
 
-        # dD contribution from this batch
-        dD_b = jnp.sum(do_b * x_b, axis=0)  # [d]
+        dD_b = jnp.sum(do_b * x_b, axis=0)
 
         return dx_b, dA_b, dB_b, dC_b, dD_b, ddt_b, d_initial_state
 
-    # Process all batches - A and D are not batched, so use in_axes=None for them
     dx, dA_batch, dB, dC, dD_batch, ddt, d_initial_state = jax.vmap(
         process_batch,
         in_axes=(0, None, 0, 0, None, 0, 0, 0, 0, 0),
     )(
         hidden_states,
-        A,  # not batched
+        A,
         B,
         C,
-        D,  # not batched
+        D,
         dt,
         all_hidden_states,
         initial_state,
@@ -209,7 +186,6 @@ def _ssm1_bwd(
         dfinal_state,
     )
 
-    # Sum dA and dD over batch dimension
     dA = jnp.sum(dA_batch, axis=0)
     dD = jnp.sum(dD_batch, axis=0)
 

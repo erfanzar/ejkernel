@@ -282,15 +282,22 @@ class RaggedGatedDeltaRule(Kernel[RaggedGatedDeltaRuleConfig, Array]):
         return [RaggedGatedDeltaRuleConfig(chunk_size=c, platform="auto", backend="any") for c in [32, 64, 128]]
 
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedGatedDeltaRuleConfig, Array]):
-        """Generate GPU candidates for ragged GDR across TileLang and XLA."""
+        """Generate GPU candidates for ragged GDR across TileLang and XLA.
+
+        Ragged variant operates on packed variable-length sequences;
+        smaller chunks (32, 64) work well for short sequences in the pack,
+        larger chunks (128, 256) for longer ones.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
+        chunk_choices = (32, 64, 128, 256)
         candidates: list[RaggedGatedDeltaRuleConfig] = []
         if "tilelang" in platforms:
-            candidates.append(RaggedGatedDeltaRuleConfig(chunk_size=64, platform="tilelang", backend="gpu"))
+            for c in (32, 64, 128):
+                candidates.append(RaggedGatedDeltaRuleConfig(chunk_size=c, platform="tilelang", backend="gpu"))
         if "xla" in platforms:
             candidates.extend(
-                RaggedGatedDeltaRuleConfig(chunk_size=c, platform="xla", backend="any") for c in [32, 64, 128]
+                RaggedGatedDeltaRuleConfig(chunk_size=c, platform="xla", backend="any") for c in chunk_choices
             )
         return candidates or self.candidate_cfgs(inv)
 

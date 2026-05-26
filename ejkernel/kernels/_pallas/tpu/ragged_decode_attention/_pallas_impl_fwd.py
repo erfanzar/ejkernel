@@ -146,11 +146,6 @@ def ragged_flash_attention_kernel(
         qk = jnp.where(mask, qk, jnp.finfo(qk.dtype).min)
         m_curr = qk.max(axis=-1)
 
-        # When an entire block is masked (e.g. blocks that fall completely before
-        # `sequence_start`), `m_curr` becomes the mask fill value and
-        # `exp(qk - m_curr)` would produce 1s, incorrectly contributing to the
-        # running softmax. Explicitly zero-out masked positions to match the XLA
-        # reference behavior.
         s_curr = jnp.exp(qk - m_curr[..., None])
         s_curr = jnp.where(mask, s_curr, 0.0)
         o_curr_times_l_curr = jnp.dot(s_curr, v)
@@ -162,8 +157,6 @@ def ragged_flash_attention_kernel(
         l_next = alpha * l_prev + beta * jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
         l_next_safe = jnp.where(l_next == 0.0, 1.0, l_next)
 
-        # Store the true normalizer (which may be 0 for fully-masked prefixes) and
-        # only use the safe variant for the division.
         m_ref[...], l_ref[...] = m_next, l_next
         o_ref[...] = ((l_prev * alpha * o_ref[...] + beta * o_curr_times_l_curr) / l_next_safe).astype(o_ref.dtype)
 
@@ -218,9 +211,6 @@ def ragged_decode_mqa(
     if softmax_scale is None:
         softmax_scale = query.shape[-1] ** -0.5
 
-    # Ensure we run at least one block and never pick a block size larger than
-    # the available KV length (otherwise `seq_len // block_size == 0` and the
-    # kernel never executes, returning zeros).
     block_size = min(int(block_size), int(seq_len))
     num_blocks = (int(seq_len) + block_size - 1) // block_size
     pad_len = (num_blocks * block_size) - int(seq_len)
@@ -238,9 +228,6 @@ def ragged_decode_mqa(
             num_scalar_prefetch=2,
             in_specs=[
                 pl.BlockSpec((None, num_heads, head_dim), lambda b, i, *_: (b, 0, 0)),
-                # `i` is already the KV block index. Pallas will scale it by the
-                # `block_size` from the `BlockSpec`, so we must not multiply by
-                # `block_size` here (doing so can produce out-of-bounds DMAs).
                 pl.BlockSpec((None, block_size, head_dim), lambda b, i, *_: (b, i, 0)),
                 pl.BlockSpec((None, block_size, head_dim), lambda b, i, *_: (b, i, 0)),
             ],

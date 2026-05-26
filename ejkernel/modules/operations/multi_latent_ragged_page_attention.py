@@ -339,10 +339,19 @@ class MultiLatentRaggedPageAttention(Kernel[MultiLatentRaggedPageAttentionConfig
         self,
         inv: Invocation[MultiLatentRaggedPageAttentionConfig, tuple[Array, Array]],
     ):
-        """Generate GPU candidates for TileLang and XLA MLRPA."""
+        """Generate GPU candidates for TileLang and XLA MLRPA.
+
+        Sweep the two main MLRPA knobs:
+
+        * ``num_kv_pages_per_block`` ∈ {estimated, 2×estimated, 4} —
+          bracket the per-page estimate.
+        * ``num_queries_per_block`` ∈ {8, 16, 32, 64} — covers narrow
+          (decode-style) and wide (prefill-style) batches.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         kv_pages = self._estimate_kv_pages(inv)
+        kv_choices = sorted({max(1, kv_pages // 2), kv_pages, kv_pages * 2})
         candidates: list[MultiLatentRaggedPageAttentionConfig] = []
         for platform, backend in (("tilelang", "gpu"), ("xla", "any")):
             if platform not in platforms:
@@ -350,7 +359,7 @@ class MultiLatentRaggedPageAttention(Kernel[MultiLatentRaggedPageAttentionConfig
             candidates.extend(
                 MultiLatentRaggedPageAttentionConfig(
                     chunk_prefill_size=None,
-                    num_kv_pages_per_block=kv_pages,
+                    num_kv_pages_per_block=kv_block,
                     num_queries_per_block=q_block,
                     vmem_limit_bytes=None,
                     num_warps=4,
@@ -358,7 +367,8 @@ class MultiLatentRaggedPageAttention(Kernel[MultiLatentRaggedPageAttentionConfig
                     platform=platform,
                     backend=backend,
                 )
-                for q_block in (16, 32)
+                for kv_block in kv_choices
+                for q_block in (8, 16, 32, 64)
             )
         return candidates or self.candidate_cfgs(inv)
 

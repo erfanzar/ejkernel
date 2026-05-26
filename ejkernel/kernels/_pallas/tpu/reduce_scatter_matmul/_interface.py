@@ -157,8 +157,8 @@ def _reduce_scatter_matmul_core_bwd(
     Returns:
         Tuple ``(grad_x, grad_y)`` where:
 
-        - **grad_x** – Gradient w.r.t. x [m, k_shard]: ``dy_full @ y``.
-        - **grad_y** – Gradient w.r.t. y [n, k_shard]: ``dy_full.T @ x``.
+        - **grad_x** - Gradient w.r.t. x [m, k_shard]: ``dy_full @ y``.
+        - **grad_y** - Gradient w.r.t. y [n, k_shard]: ``dy_full.T @ x``.
     """
     del bm, bn, bk, tp_size, collective_id
     x, y = residual

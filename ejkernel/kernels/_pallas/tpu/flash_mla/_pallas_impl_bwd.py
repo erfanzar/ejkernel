@@ -160,7 +160,7 @@ def _flash_mla_dkv_kernel(
                 TRANS_B_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             )
-        else:  # ROPE_DECOUPLED
+        else:
             bq = bq_tile_ref[0, :, :].astype(jnp.float32)
             bk = bk_tile_ref[0, :, :].astype(jnp.float32)
             logits = lax.dot_general(
@@ -233,7 +233,7 @@ def _flash_mla_dkv_kernel(
                 preferred_element_type=jnp.float32,
             )
             db_k_scratch_ref[:, :] += db_k_inc.astype(db_k_scratch_ref.dtype)
-        else:  # ROPE_DECOUPLED
+        else:
             dk = lax.dot(ds.T.astype(q.dtype), q, preferred_element_type=jnp.float32)
             bq = bq_tile_ref[0, :, :].astype(jnp.float32)
             db_k_inc = lax.dot(ds.T.astype(bq.dtype), bq, preferred_element_type=jnp.float32)
@@ -569,7 +569,7 @@ def _flash_mla_dq_kernel(
                 TRANS_B_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             )
-        else:  # ROPE_DECOUPLED
+        else:
             bq = bq_tile_ref[0, :, :].astype(jnp.float32)
             bk = bk_tile_ref[0, :, :].astype(jnp.float32)
             logits = lax.dot_general(
@@ -641,7 +641,7 @@ def _flash_mla_dq_kernel(
             )
             dq_rope = lax.dot(ds.astype(bk.dtype), bk, preferred_element_type=jnp.float32)
             dq_inc = jnp.concatenate([dq_nope, dq_rope], axis=-1)
-        else:  # ROPE_DECOUPLED
+        else:
             dq_inc = lax.dot(
                 ds.astype(k_nope.dtype),
                 k_nope,
@@ -912,11 +912,9 @@ def _flash_mla_bwd_impl(
     w_kc_f32 = w_kc.astype(jnp.float32)
     w_vc_f32 = w_vc.astype(jnp.float32)
 
-    # k_nope: [B, kv_len, kv_heads, d_nope] → [B, kv_heads, kv_len, d_nope]
     k_nope = jnp.einsum("btl,hld->bthd", kv_f32, w_kc_f32)
     k_nope = jnp.transpose(k_nope, (0, 2, 1, 3))
 
-    # v: [B, kv_len, kv_heads, v_head_dim] → [B, kv_heads, kv_len, v_head_dim]
     v = jnp.einsum("btl,hld->bthd", kv_f32, w_vc_f32)
     v = jnp.transpose(v, (0, 2, 1, 3))
 
@@ -964,7 +962,6 @@ def _flash_mla_bwd_impl(
         causal=causal,
     )
 
-    # [B, q_heads, kv_len, d] → [B, kv_heads, kv_len, d]
     if gqa_ratio > 1:
         dk_nope_kv = dk_nope_all.reshape(batch_size, kv_heads, gqa_ratio, kv_len, d_nope).sum(axis=2)
         dv_kv = dv_all.reshape(batch_size, kv_heads, gqa_ratio, kv_len, v_head_dim).sum(axis=2)
@@ -972,7 +969,6 @@ def _flash_mla_bwd_impl(
         dk_nope_kv = dk_nope_all
         dv_kv = dv_all
 
-    # [B, kv_heads, kv_len, d] → [B, kv_len, kv_heads, d]
     dk_nope_for_proj = jnp.transpose(dk_nope_kv, (0, 2, 1, 3))
     dv_for_proj = jnp.transpose(dv_kv, (0, 2, 1, 3))
 

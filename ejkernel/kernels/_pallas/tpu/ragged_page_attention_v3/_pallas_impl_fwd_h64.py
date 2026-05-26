@@ -212,7 +212,6 @@ def ref_ragged_paged_attention_hd64(
         indices = block_tables[indices_start + start_page : indices_start + end_page]
         q = queries[q_start:q_end, :, :]
 
-        # Update the kv cache.
         assert kv_len - q_len >= 0
         gathered_kv = kv_cache[indices]
         gathered_shape = gathered_kv.shape

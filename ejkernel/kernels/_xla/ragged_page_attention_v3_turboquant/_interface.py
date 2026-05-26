@@ -109,8 +109,6 @@ def ragged_page_attention_v3_turboquant(
         Tuple of (output, key_indices_pages, key_signs_pages,
                   key_norms_pages, value_indices_pages, value_norms_pages).
     """
-    # Accepted for API parity with the standard RPA v3 interface.
-    # The current XLA TurboQuant backend does not use these hints.
     _ = (chunk_prefill_size, vmem_limit_bytes)
 
     if softmax_scale is None:

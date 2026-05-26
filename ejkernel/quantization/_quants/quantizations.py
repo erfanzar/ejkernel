@@ -210,10 +210,6 @@ def _quantize_candidate_cfgs(
     mode: QuantizationMode,
 ) -> list[QuantRuntimeConfig]:
     """Build quantize autotune candidates around *base*."""
-    # For quantize, prefer stable "store once, use many times" artifacts.
-    # The default backend-tuned config already picks a compact metadata dtype
-    # (bf16 on TPU, fp16 elsewhere). Callers can override via runtime_config
-    # if they want input/fp32 metadata for parity or debugging.
     del mode
     return [base]
 
@@ -816,7 +812,6 @@ def _prefer_arith_minifloat_decode(runtime_cfg: QuantRuntimeConfig) -> bool:
         return False
     if policy != "auto":
         raise ValueError(f"Unsupported minifloat decode policy: {policy!r}.")
-    # Default to table lookup; it tends to map to fast constant-memory gathers.
     return False
 
 
@@ -985,8 +980,6 @@ def _dequantize_mxfp_bits(
             table, _ = _get_e4m3_table()
         table = table.astype(compute_dtype)
         vals = table[q_i]
-    # MXFP scales are shared exponents (int8); ldexp maps to x * 2**exp and is
-    # often cheaper than exp2 + multiply for integer exponents.
     exp_i = scales.astype(jnp.int8).astype(jnp.int32)
     out = jnp.ldexp(vals, exp_i[..., None])
     if out.dtype != output_dtype:
@@ -1163,7 +1156,7 @@ def dequantize(
     """
     axis = normalize_axis(axis)
     axis_n = axis
-    del axis  # kept for API symmetry and future layout-aware validation.
+    del axis
     mode, group_size, bits, _ = resolve_qparams(mode, group_size, bits)
     runtime_cfg = resolve_runtime_config(runtime_config)
     if runtime_config is None:
@@ -1343,7 +1336,6 @@ def quantized_matmul(
         transpose=transpose,
     )
 
-    # Runtime layout determines dequant axis convention.
     dequant_axis: QuantizationAxis = runtime_axis
     w_f = dequantize(
         w,

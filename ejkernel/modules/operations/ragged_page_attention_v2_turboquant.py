@@ -424,23 +424,42 @@ class RaggedPageAttentionv2TurboQuant(Kernel[RaggedPageAttentionv2TurboQuantConf
         ]
 
     def candidate_cfgs_gpu(self, inv: Invocation[RaggedPageAttentionv2TurboQuantConfig, Array]):
-        """Generate GPU candidates for TileLang and XLA TurboQuant RPA v2."""
+        """Generate GPU candidates for TileLang and XLA TurboQuant RPA v2.
+
+        TurboQuant RPA v2 tiles along KV-pages and queries. Pairs sweep:
+
+        * ``(None, None)`` — kernel-default baseline.
+        * Small KV-per-block (1, 2) with various queries-per-block — best
+          for short contexts.
+        * Larger KV-per-block (4, 8) — amortise per-block fixed cost on
+          long contexts.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
-        pairs = ((None, None), (1, 8), (2, 16))
+        pairs = (
+            (None, None),
+            (1, 8),
+            (1, 16),
+            (2, 16),
+            (2, 32),
+            (4, 16),
+            (4, 32),
+            (8, 16),
+        )
         candidates: list[RaggedPageAttentionv2TurboQuantConfig] = []
         if "tilelang" in platforms:
-            candidates.extend(
-                RaggedPageAttentionv2TurboQuantConfig(
-                    num_kv_pages_per_block=kv_block,
-                    num_queries_per_block=q_block,
-                    num_warps=4,
-                    num_stages=1,
-                    platform="tilelang",
-                    backend="gpu",
-                )
-                for kv_block, q_block in pairs
-            )
+            for kv_block, q_block in pairs:
+                for stages in (1, 2):
+                    candidates.append(
+                        RaggedPageAttentionv2TurboQuantConfig(
+                            num_kv_pages_per_block=kv_block,
+                            num_queries_per_block=q_block,
+                            num_warps=4,
+                            num_stages=stages,
+                            platform="tilelang",
+                            backend="gpu",
+                        )
+                    )
         if "xla" in platforms:
             candidates.extend(
                 RaggedPageAttentionv2TurboQuantConfig(

@@ -348,26 +348,47 @@ class ReduceScatterMatmul(Kernel[ReduceScatterMatmulConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[ReduceScatterMatmulConfig, Array]):
-        """Return GPU candidates for TileLang and XLA reduce-scatter matmul paths."""
+        """Return GPU candidates for TileLang and XLA reduce-scatter matmul.
+
+        Three tile knobs: ``(block_m, block_n, block_k)``. On H100,
+        wgmma instructions prefer power-of-two tiles >= 64; we also try
+        deeper pipelines (num_stages=3) for large-K shapes.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
-        base_configs = ((128, 128, 128), (256, 128, 128), (256, 256, 128), (256, 256, 256))
+        tilelang_configs = (
+            (64, 128, 64, 4, 2),
+            (128, 128, 64, 4, 2),
+            (128, 128, 128, 4, 3),
+            (128, 256, 64, 8, 3),
+            (256, 128, 64, 8, 3),
+            (256, 256, 64, 8, 3),
+            (256, 256, 128, 8, 3),
+        )
+        xla_configs = (
+            (128, 128, 128),
+            (256, 128, 128),
+            (256, 256, 128),
+            (256, 256, 256),
+            (512, 256, 128),
+            (512, 256, 256),
+        )
         candidates: list[ReduceScatterMatmulConfig] = []
         if "tilelang" in platforms:
-            for block_m, block_n, block_k in base_configs:
+            for block_m, block_n, block_k, num_warps, num_stages in tilelang_configs:
                 candidates.append(
                     ReduceScatterMatmulConfig(
                         block_m=block_m,
                         block_n=block_n,
                         block_k=block_k,
-                        num_warps=4,
-                        num_stages=2,
+                        num_warps=num_warps,
+                        num_stages=num_stages,
                         platform="tilelang",
                         backend="gpu",
                     )
                 )
         if "xla" in platforms:
-            for block_m, block_n, block_k in base_configs:
+            for block_m, block_n, block_k in xla_configs:
                 candidates.append(
                     ReduceScatterMatmulConfig(
                         block_m=block_m,

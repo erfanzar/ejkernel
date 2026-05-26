@@ -415,9 +415,16 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
     def candidate_cfgs_gpu(self, inv: Invocation[ScaledDotProductAttentionConfig, Array]):
         """Generate GPU candidates for SDPA.
 
-        TileLang candidates tune FlashAttention tile sizes. Pallas/Triton
-        route to the cuDNN-backed SDPA wrapper and therefore have a single
-        platform candidate.
+        TileLang candidates sweep the FlashAttention-2 tile space:
+
+        * ``block_q`` ∈ {32, 64, 128, 256} pruned by ``q_len``; 256 only
+          when ``q_len >= 512`` (otherwise wasted CTAs).
+        * ``block_k`` ∈ {32, 64, 128, 256}, capped at 128 when
+          ``head_dim >= 128`` to keep SMEM in budget on H100.
+        * ``num_stages`` ∈ {2, 3} — 3 helps memory-bound large-``S`` runs.
+
+        Pallas/Triton route to the cuDNN-backed SDPA wrapper, which has
+        its own internal autotuning; a single platform candidate suffices.
         """
         query = inv.kwargs["query"]
         key = inv.kwargs["key"]
@@ -425,25 +432,33 @@ class ScaledDotProductAttention(Kernel[ScaledDotProductAttentionConfig, Array]):
         head_dim = int(query.shape[-1])
         q_len = int(query.shape[1])
         k_len = int(key.shape[1])
-        q_opts = [32, 64, 128] if q_len <= 256 else [64, 128]
-        k_opts = [32, 64, 128] if k_len <= 256 else [64, 128, 256]
+        q_opts = [32, 64, 128, 256] if q_len <= 256 else [64, 128, 256]
+        k_opts = [32, 64, 128, 256] if k_len <= 256 else [64, 128, 256]
         if head_dim >= 128:
             k_opts = [k for k in k_opts if k <= 128] or [128]
+            q_opts = [q for q in q_opts if q <= 128] or [128]
+        if q_len < 512:
+            q_opts = [q for q in q_opts if q < 256] or [128]
+        if k_len < 512:
+            k_opts = [k for k in k_opts if k < 256] or [128]
         platforms = ("tilelang", "pallas", "xla") if requested in (None, "auto") else (str(requested),)
         candidates: list[ScaledDotProductAttentionConfig] = []
         if "tilelang" in platforms:
             for block_q in q_opts:
                 for block_k in k_opts:
-                    candidates.append(
-                        ScaledDotProductAttentionConfig(
-                            block_q=block_q,
-                            block_k=block_k,
-                            num_warps=8 if head_dim >= 128 and max(block_q, block_k) >= 128 else 4,
-                            num_stages=2,
-                            platform="tilelang",
-                            backend="gpu",
+                    big = max(block_q, block_k) >= 128
+                    warps = 8 if (head_dim >= 128 and big) else 4
+                    for stages in (2, 3) if k_len >= 1024 else (2,):
+                        candidates.append(
+                            ScaledDotProductAttentionConfig(
+                                block_q=block_q,
+                                block_k=block_k,
+                                num_warps=warps,
+                                num_stages=stages,
+                                platform="tilelang",
+                                backend="gpu",
+                            )
                         )
-                    )
         if "pallas" in platforms or "triton" in platforms:
             platform_name = "triton" if "triton" in platforms else "pallas"
             candidates.append(

@@ -58,6 +58,8 @@ def state_space_v2(
     use_gated_rmsnorm: bool = False,
     rmsnorm_eps: float = 1e-5,
     precision: lax.Precision | None = None,
+    *,
+    block_e: int = 128,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],
     Float[Array, "batch num_heads head_dim ssm_state_size"],
@@ -129,7 +131,7 @@ def state_space_v2(
         if use_gated_rmsnorm:
             y_flat = rmsnorm_silu_gate_tilelang(y_flat, gate, float(rmsnorm_eps))
         else:
-            y_flat = silu_gate_tilelang(y_flat, gate)
+            y_flat = silu_gate_tilelang(y_flat, gate, int(block_e))
     return y_flat, hf, conv_state
 
 

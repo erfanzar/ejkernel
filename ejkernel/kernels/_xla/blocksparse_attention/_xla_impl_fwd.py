@@ -187,7 +187,6 @@ def _normalize_attention_mask(
     if m.ndim == 4:
         if m.shape[0] != batch or m.shape[2] != q_len or m.shape[3] != kv_len:
             raise ValueError(f"attention_mask must have shape (B, H/1, Q, K); got {m.shape}")
-        # Head-specific masks cannot be encoded in a single (B,Q,K) in general; use head 0 for determinism.
         return m[:, 0, :, :]
     if m.ndim == 3:
         if m.shape != (batch, q_len, kv_len):
@@ -236,8 +235,6 @@ def _normalize_softmax_aux(
         return None
     aux = jnp.asarray(softmax_aux, dtype=dtype)
     if aux.ndim == 1:
-        # For block-sparse (Splash) attention, `softmax_aux` acts like a per-head
-        # attention sink logit (i.e. one extra "sink" entry per head).
         if aux.shape[0] == num_heads:
             return aux[:, None]
         if aux.shape[0] == num_kv_heads:

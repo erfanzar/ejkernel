@@ -539,6 +539,31 @@ def _cfgs_mean_pooling():
     return _limit_configs(configs)
 
 
+def _cfgs_fused_cross_entropy():
+    """Generate benchmark configs for fused cross-entropy."""
+    configs = _grid(
+        batch=[1, 2, 4],
+        seq=[128, 512],
+        vocab=[4096, 16384],
+        dtype=["fp16"],
+        reduction=["mean"],
+    )
+    return _limit_configs(configs)
+
+
+def _cfgs_fused_kl_divergence():
+    """Generate benchmark configs for fused KL divergence."""
+    configs = _grid(
+        batch=[1, 2, 4],
+        seq=[128, 512],
+        vocab=[4096, 16384],
+        dtype=["fp16"],
+        reduction=["mean"],
+        direction=["forward"],
+    )
+    return _limit_configs(configs)
+
+
 def _cfgs_rwkv4():
     """Generate benchmark configs for RWKV-4 recurrence."""
     configs = _grid(
@@ -1424,6 +1449,34 @@ def _gen_simple_seq_inputs(config: dict[str, Any]):
     return (x,)
 
 
+def _gen_fused_cross_entropy_inputs(config: dict[str, Any]):
+    """Generate logits, integer targets, weights, and reduction mode for CE."""
+    batch = config.get("batch", 2)
+    seq = config.get("seq", 128)
+    vocab = config.get("vocab", 4096)
+    dtype = _as_jax_dtype(config.get("dtype", _default_dtype()))
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k_logits, k_targets = jax.random.split(key)
+    logits = (jax.random.normal(k_logits, (batch, seq, vocab)) * 0.25).astype(dtype)
+    targets = jax.random.randint(k_targets, (batch, seq), 0, vocab, dtype=jnp.int32)
+    weights = jnp.ones((batch, seq), dtype=jnp.float32)
+    return logits, targets, weights, config.get("reduction", "mean")
+
+
+def _gen_fused_kl_divergence_inputs(config: dict[str, Any]):
+    """Generate student logits, teacher logits, weights, reduction, and direction."""
+    batch = config.get("batch", 2)
+    seq = config.get("seq", 128)
+    vocab = config.get("vocab", 4096)
+    dtype = _as_jax_dtype(config.get("dtype", _default_dtype()))
+    key = jax.random.PRNGKey(config.get("seed", 0))
+    k_student, k_teacher = jax.random.split(key)
+    student = (jax.random.normal(k_student, (batch, seq, vocab)) * 0.25).astype(dtype)
+    teacher = (jax.random.normal(k_teacher, (batch, seq, vocab)) * 0.25).astype(dtype)
+    weights = jnp.ones((batch, seq), dtype=jnp.float32)
+    return student, teacher, weights, config.get("reduction", "mean"), config.get("direction", "forward")
+
+
 def _gen_kernel_delta_inputs(config: dict[str, Any]):
     """Generate q, k, v, beta tensors for kernel delta attention."""
     batch = config.get("batch", 2)
@@ -1888,6 +1941,26 @@ def _grouped_matmul_v3_wrapper(op_fn: Callable[..., Any], platform: str):
     return _fn
 
 
+def _fused_cross_entropy_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap fused CE with static reduction and platform."""
+
+    def _fn(logits, targets, weights, reduction):
+        out = op_fn(logits, targets, weights, reduction=reduction, platform=platform)
+        return out.loss if hasattr(out, "loss") else out[0]
+
+    return _fn
+
+
+def _fused_kl_divergence_wrapper(op_fn: Callable[..., Any], platform: str):
+    """Wrap fused KL with static reduction/direction and platform."""
+
+    def _fn(student, teacher, weights, reduction, direction):
+        out = op_fn(student, teacher, weights, reduction=reduction, direction=direction, platform=platform)
+        return out.loss if hasattr(out, "loss") else out
+
+    return _fn
+
+
 SPECS: dict[str, OpBenchmarkSpec] = {
     "all_gather_matmul": OpBenchmarkSpec(
         op_name="all_gather_matmul",
@@ -2159,6 +2232,26 @@ SPECS: dict[str, OpBenchmarkSpec] = {
         op_fn=ops.mean_pooling,
         input_generator=_gen_simple_seq_inputs,
         configs=_cfgs_mean_pooling(),
+    ),
+    "fused_cross_entropy": OpBenchmarkSpec(
+        op_name="fused_cross_entropy",
+        algorithm="fused_cross_entropy",
+        op_fn=ops.fused_cross_entropy,
+        input_generator=_gen_fused_cross_entropy_inputs,
+        configs=_cfgs_fused_cross_entropy(),
+        wrapper_factory=_fused_cross_entropy_wrapper,
+        static_kwargs=["reduction"],
+        bench_bwd=True,
+    ),
+    "fused_kl_divergence": OpBenchmarkSpec(
+        op_name="fused_kl_divergence",
+        algorithm="fused_kl_divergence",
+        op_fn=ops.fused_kl_divergence,
+        input_generator=_gen_fused_kl_divergence_inputs,
+        configs=_cfgs_fused_kl_divergence(),
+        wrapper_factory=_fused_kl_divergence_wrapper,
+        static_kwargs=["reduction", "direction"],
+        bench_bwd=True,
     ),
     "rwkv4": OpBenchmarkSpec(
         op_name="rwkv4",

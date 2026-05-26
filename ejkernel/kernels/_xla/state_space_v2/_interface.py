@@ -99,19 +99,17 @@ def _ssm2_core(
     _batch_size, seq_len, _num_heads, _head_dim = x.shape
 
     if use_single_step and seq_len == 1 and initial_state is not None:
-        # Single step inference mode
         y, final_state = _ssm2_single_step_fwd(
-            x=x[:, 0, :, :],  # [batch, num_heads, head_dim]
+            x=x[:, 0, :, :],
             A=A,
-            B=B[:, 0, :, :],  # [batch, num_heads, ssm_state_size]
-            C=C[:, 0, :, :],  # [batch, num_heads, ssm_state_size]
+            B=B[:, 0, :, :],
+            C=C[:, 0, :, :],
             D=D,
-            dt=dt[:, 0, :],  # [batch, num_heads]
+            dt=dt[:, 0, :],
             ssm_state=initial_state,
         )
         return y[:, None, :, :], final_state
     else:
-        # Full sequence mode
         output, _, final_state = _ssm2_fwd(
             x=x,
             A=A,
@@ -168,7 +166,6 @@ def _ssm2_fwd_rule(
         )
 
     if use_single_step and seq_len == 1:
-        # Single step - no need for all hidden states
         y, final_state = _ssm2_single_step_fwd(
             x=x[:, 0, :, :],
             A=A,
@@ -178,7 +175,6 @@ def _ssm2_fwd_rule(
             dt=dt[:, 0, :],
             ssm_state=initial_state,
         )
-        # For single step, all_hidden_states is just the final state expanded
         all_hidden_states = final_state[:, None, :, :, :]
         output = y[:, None, :, :]
     else:
@@ -258,6 +254,8 @@ def state_space_v2(
     use_gated_rmsnorm: bool = False,
     rmsnorm_eps: float = 1e-5,
     precision: lax.Precision | None = None,
+    *,
+    block_e: int = 128,
 ) -> tuple[
     Float[Array, "batch seq_len intermediate_size"],
     Float[Array, "batch num_heads head_dim ssm_state_size"],
@@ -347,12 +345,10 @@ def state_space_v2(
     dtype = x.dtype
     intermediate_size = num_heads * head_dim
 
-    # Expand B, C from n_groups to num_heads
     group_rep = num_heads // n_groups
-    B_expanded = jnp.repeat(B, repeats=group_rep, axis=2)  # [batch, seq_len, num_heads, n]
-    C_expanded = jnp.repeat(C, repeats=group_rep, axis=2)  # [batch, seq_len, num_heads, n]
+    B_expanded = jnp.repeat(B, repeats=group_rep, axis=2)
+    C_expanded = jnp.repeat(C, repeats=group_rep, axis=2)
 
-    # Determine if we should use single step optimization
     use_single_step = seq_len == 1 and initial_state is not None
 
     output, ssm_state = _ssm2_core(
@@ -367,22 +363,19 @@ def state_space_v2(
         use_single_step=use_single_step,
     )
 
-    # Reshape output from [batch, seq_len, num_heads, head_dim] to [batch, seq_len, intermediate_size]
     output = output.reshape(batch_size, seq_len, intermediate_size)
 
-    # Apply gating if provided
     if gate is not None:
         if act_fn is None:
             act_fn = jax.nn.silu
 
         if use_gated_rmsnorm:
-            # Gated RMSNorm: y = rmsnorm(y) * act_fn(gate)
             output_f32 = output.astype(jnp.float32)
             variance = jnp.mean(jnp.square(output_f32), axis=-1, keepdims=True)
             output_norm = output_f32 * lax.rsqrt(variance + rmsnorm_eps)
             output = (output_norm * act_fn(gate.astype(jnp.float32))).astype(dtype)
         else:
-            # Simple gating: y = y * act_fn(gate)
             output = output * act_fn(gate)
 
+    del block_e
     return output.astype(dtype), ssm_state.astype(dtype), conv_state

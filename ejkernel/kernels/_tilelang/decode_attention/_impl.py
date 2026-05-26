@@ -43,22 +43,20 @@ _COMBINE_FFI_CACHE: dict[tuple, callable] = {}
 _LOCK = threading.Lock()
 
 
-def _pick_split_config(L: int) -> tuple[int, int]:
-    """Choose ``(num_splits, block_k)`` for split-K decode."""
-    if L <= 1024:
-        return 4, 128
-    if L <= 4096:
-        return 8, 128
-    return 16, 256
+def _get_split_ffi(B, H, L, D, scale, dtype, *, num_splits: int, block_k: int):
+    """Build (cached) split-K decode FFI.
 
-
-def _get_split_ffi(B, H, L, D, scale, dtype):
-    num_splits, block_k = _pick_split_config(L)
+    ``num_splits`` and ``block_k`` are **required** — the caller
+    (operation layer or interface) picks them; this kernel does not
+    pick from shape.
+    """
+    num_splits = int(num_splits)
+    block_k = int(block_k)
     key = (B, H, L, D, num_splits, block_k, round(float(scale), 8), str(jnp.dtype(dtype)))
     with _LOCK:
         cached = _SPLIT_FFI_CACHE.get(key)
         if cached is not None:
-            return cached, num_splits
+            return cached
         prim = make_split_decode_prim_func(
             batch=B,
             num_heads=H,
@@ -79,7 +77,7 @@ def _get_split_ffi(B, H, L, D, scale, dtype):
             compile_flags=_DEFAULT_COMPILE_FLAGS,
         )
         _SPLIT_FFI_CACHE[key] = ffi
-        return ffi, num_splits
+        return ffi
 
 
 def _get_combine_ffi(B, H, D, num_splits, dtype):
@@ -107,7 +105,7 @@ def _get_combine_ffi(B, H, D, num_splits, dtype):
         return ffi
 
 
-def _decode_split_path(query, key_buffer, value_buffer, *, softmax_scale):
+def _decode_split_path(query, key_buffer, value_buffer, *, softmax_scale, num_splits: int, block_k: int):
     B, H, D = query.shape
     total = key_buffer.shape[0]
     L = total // B
@@ -116,7 +114,7 @@ def _decode_split_path(query, key_buffer, value_buffer, *, softmax_scale):
     k = key_buffer.reshape(B, L, H, D)
     v = value_buffer.reshape(B, L, H, D)
 
-    split_ffi, num_splits = _get_split_ffi(B, H, L, D, scale, query.dtype)
+    split_ffi = _get_split_ffi(B, H, L, D, scale, query.dtype, num_splits=num_splits, block_k=block_k)
     o_partial, m_partial, l_partial = split_ffi(query, k, v)
 
     combine_ffi = _get_combine_ffi(B, H, D, num_splits, query.dtype)
@@ -149,6 +147,8 @@ def decode_attention_tilelang(
     value_buffer: jax.Array,
     *,
     softmax_scale: float | None = None,
+    num_splits: int = 8,
+    block_k: int = 128,
 ) -> tuple[jax.Array, jax.Array]:
     """Single-Q decode attention (forward only) with adaptive split-K routing.
 
@@ -191,6 +191,8 @@ def decode_attention_tilelang(
             key_buffer,
             value_buffer,
             softmax_scale=softmax_scale,
+            num_splits=int(num_splits),
+            block_k=int(block_k),
         )
     return _decode_fa_path(
         query,

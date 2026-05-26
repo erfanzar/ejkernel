@@ -160,7 +160,6 @@ def _validate_inputs(
     if num_queries_per_block is not None and int(num_queries_per_block) <= 0:
         raise ValueError("num_queries_per_block must be > 0 when provided.")
 
-    # Parameters accepted for API compatibility.
     del softmax_scale, mask_value, q_scale, k_scale, v_scale
 
 

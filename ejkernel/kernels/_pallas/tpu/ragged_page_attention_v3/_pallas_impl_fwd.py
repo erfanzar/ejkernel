@@ -489,7 +489,6 @@ def _ragged_paged_attention_kernel(*args, **kwargs):
 
 def _ragged_paged_attention_kernel_loop(
     seq_idx,
-    # --- Scalar prefetch refs (SMEM) ---
     kv_lens_ref,
     page_indices_ref,
     cu_q_lens_ref,
@@ -497,14 +496,12 @@ def _ragged_paged_attention_kernel_loop(
     sem_ids_ref,
     bo_ids_ref,
     bkv_update_ids_ref,
-    # --- HBM input/output refs ---
     q_hbm_ref,
     kv_hbm_ref,
     kv_cache_hbm_ref,
     attention_sink_ref,
     o_hbm_ref,
     updated_kv_cache_hbm_ref,
-    # --- VMEM scratch refs ---
     bkv_x2_ref,
     bq_x2_ref,
     bo_x2_ref,

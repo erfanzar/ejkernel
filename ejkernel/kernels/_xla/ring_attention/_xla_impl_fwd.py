@@ -446,9 +446,6 @@ def _ring_attention_fwd(
     denominator = jnp.zeros((batch, num_heads, q_len)).astype(jnp.float32)
     prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(jnp.float32)
 
-    # `softmax_aux` participates in softmax normalization but does not contribute
-    # to the output. For numerical stability and parity with Splash attention, we
-    # incorporate its total exp-mass once into the initial (denominator, max).
     if softmax_aux is not None:
         aux = jnp.asarray(softmax_aux, dtype=jnp.float32)
         if aux.ndim == 1:

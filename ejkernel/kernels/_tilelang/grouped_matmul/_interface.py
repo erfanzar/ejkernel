@@ -34,7 +34,7 @@ from ..._registry import Backend, Platform, kernel_registry
 from .._grouped_matmul_impl import grouped_matmul_trainable_tilelang
 
 
-def _impl(lhs, rhs, group_sizes, group_offset, existing_out, transpose_rhs):
+def _impl(lhs, rhs, group_sizes, group_offset, existing_out, transpose_rhs, *, block_m, block_n, block_k):
     """Thin shim that forwards to the shared v3-backed trainable kernel."""
     return grouped_matmul_trainable_tilelang(
         lhs,
@@ -43,7 +43,22 @@ def _impl(lhs, rhs, group_sizes, group_offset, existing_out, transpose_rhs):
         group_offset=group_offset,
         existing_out=existing_out,
         transpose_rhs=transpose_rhs,
+        block_m=int(block_m),
+        block_n=int(block_n),
+        block_k=int(block_k),
     )
+
+
+def _tile_from(tiling) -> tuple[int, int, int]:
+    """Extract ``(block_m, block_n, block_k)`` from a tiling tuple.
+
+    Falls back to constants when ``tiling`` is None or a non-tuple LUT
+    function (the caller did not specify tiles). The operation layer
+    supplies the authoritative tiles via cfg.
+    """
+    if isinstance(tiling, tuple) and len(tiling) == 3:
+        return int(tiling[0]), int(tiling[1]), int(tiling[2])
+    return 128, 128, 64
 
 
 def _check_common_options(preferred_element_type, tiling, interpret, precision):
@@ -123,7 +138,18 @@ def grouped_matmul(
         EjkernelRuntimeError: If unsupported options are passed.
     """
     _check_common_options(preferred_element_type, tiling, interpret, precision)
-    return _impl(lhs, rhs, group_sizes, group_offset, existing_out, transpose_rhs)
+    bm, bn, bk = _tile_from(tiling)
+    return _impl(
+        lhs,
+        rhs,
+        group_sizes,
+        group_offset,
+        existing_out,
+        transpose_rhs,
+        block_m=bm,
+        block_n=bn,
+        block_k=bk,
+    )
 
 
 @kernel_registry.register("grouped_matmulv2", Platform.TILELANG, Backend.GPU)
@@ -166,7 +192,18 @@ def grouped_matmulv2(
         EjkernelRuntimeError: If unsupported options are passed.
     """
     _check_common_options(preferred_element_type, tiling, interpret, precision)
-    return _impl(lhs, rhs, group_sizes, group_offset, existing_out, transpose_rhs)
+    bm, bn, bk = _tile_from(tiling)
+    return _impl(
+        lhs,
+        rhs,
+        group_sizes,
+        group_offset,
+        existing_out,
+        transpose_rhs,
+        block_m=bm,
+        block_n=bn,
+        block_k=bk,
+    )
 
 
 __all__ = ["grouped_matmul", "grouped_matmulv2"]

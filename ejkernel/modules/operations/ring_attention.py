@@ -120,8 +120,6 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         - Blockwise transformer architectures
     """
 
-    # Bump for persistent-cache invalidation: heuristic block sizes now adapt to
-    # sequence lengths to satisfy SplashAttention divisibility constraints.
     version = "1"
 
     def __init__(self):
@@ -422,12 +420,23 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
         return candidates
 
     def candidate_cfgs_gpu(self, inv: Invocation[RingAttentionConfig, Array]):
-        """Generate GPU candidates for Triton, TileLang, and XLA ring attention."""
+        """Generate GPU candidates for Triton, TileLang, and XLA ring attention.
+
+        Ring attention shards the KV axis across devices; per-device tiles
+        see ``seq_len_k / ring_size`` effectively. The candidates below
+        cover both small per-device shards (``<=4K``) and large
+        ones (``>=16K``). Backward uses smaller tiles (extra GEMMs per
+        iteration → higher register pressure).
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("triton", "tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         block_configs = [
+            (64, 64, 4, 2),
             (128, 128, 4, 2),
-            (256, 256, 4, 2),
+            (128, 128, 4, 3),
+            (256, 128, 8, 2),
+            (128, 256, 8, 2),
+            (256, 256, 8, 2),
             (512, 512, 8, 2),
         ]
         candidates: list[RingAttentionConfig] = []
@@ -444,8 +453,8 @@ class RingAttention(Kernel[RingAttentionConfig, Array]):
                             num_warps=num_warps,
                         ),
                         bwd_params=BwdParams(
-                            q_blocksize=block_q,
-                            kv_blocksize=block_k,
+                            q_blocksize=max(32, block_q // 2),
+                            kv_blocksize=max(32, block_k // 2),
                             num_stages=num_stages,
                             num_warps=num_warps,
                         ),

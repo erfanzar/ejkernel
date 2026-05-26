@@ -38,7 +38,8 @@ def mean_pooling(
     chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     *,
-    block_dim: int = 64,
+    block_dim: int = 128,
+    block_size: int = 256,
     num_warps: int = 4,
     num_stages: int = 1,
 ) -> Float[Array, "... hidden_dim"]:
@@ -69,7 +70,13 @@ def mean_pooling(
         cu_seqlens: Cumulative sequence-length array of shape
             ``(num_seqs + 1,)`` and dtype int32.  Pass ``None`` for the
             padded variant.
-        block_dim: Accepted for API compatibility with Triton; ignored by TileLang.
+        block_dim: Hidden-axis tile size (``BLOCK_D``). The operation
+            layer (``MeanPooling`` op via ``MeanPoolingConfig.block_dim``)
+            chooses this from shape; the constant default here is the
+            cold-start fallback for direct kernel-layer callers.
+        block_size: Sequence-axis tile size (``BLOCK_S``). The operation
+            layer (``MeanPoolingConfig.block_size``) chooses this; same
+            caller policy as ``block_dim``.
         num_warps: Accepted for API compatibility with Triton; ignored by TileLang.
         num_stages: Accepted for API compatibility with Triton; ignored by TileLang.
 
@@ -80,16 +87,16 @@ def mean_pooling(
     Raises:
         EjkernelRuntimeError: If input rank/dtype constraints are violated.
     """
-    _ = chunk_size
+    _ = chunk_size, num_warps, num_stages
     if cu_seqlens is not None:
         if x.ndim != 2:
             raise EjkernelRuntimeError("tile-lang mean_pooling with cu_seqlens requires packed (T, D) input.")
         if cu_seqlens.dtype.name != "int32":
             raise EjkernelRuntimeError("tile-lang mean_pooling requires int32 cu_seqlens.")
-        return mean_pooling_tilelang(x, cu_seqlens)
+        return mean_pooling_tilelang(x, cu_seqlens, block_s=block_size, block_d=block_dim)
     if x.ndim != 3:
         raise EjkernelRuntimeError("tile-lang mean_pooling without cu_seqlens requires (B, S, D) input.")
-    return mean_pooling_tilelang(x, None)
+    return mean_pooling_tilelang(x, None, block_s=block_size, block_d=block_dim)
 
 
 __all__ = ["mean_pooling"]

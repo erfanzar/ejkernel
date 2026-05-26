@@ -94,10 +94,8 @@ def quantized_matmul_input_grad(
         zeros = -biases / safe_scale
     w_f = dequantize(w, scales, zeros, group_size=group_size, bits=bits, mode=mode)
     if transpose:
-        # y = x @ w_f.T, so dX = dY @ w_f
         dims = (((1,), (0,)), ((), ()))
     else:
-        # y = x @ w_f, so dX = dY @ w_f.T
         dims = (((1,), (1,)), ((), ()))
     return jax.lax.dot_general(dy, w_f, dims, preferred_element_type=jnp.float32)
 

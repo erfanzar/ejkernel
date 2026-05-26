@@ -108,7 +108,6 @@ def _quantize_to_codebook_threshold_from_map(
         return jnp.zeros(values.shape, dtype=jnp.uint32)
 
     if jax.default_backend() == "mps":
-        # MPS currently lacks a stable searchsorted lowering for this pattern.
         lo = jnp.zeros(values.shape, dtype=jnp.int32)
         hi = jnp.full(values.shape, boundaries.shape[0], dtype=jnp.int32)
         steps = int((boundaries.shape[0] + 1).bit_length())
@@ -151,8 +150,6 @@ def _quantize_to_codebook(
         >>> values = jnp.array([0.3, -0.8, 0.9])
         >>> indices = _quantize_to_codebook(values, codebook)  # [1, 0, 2]
     """
-    # Avoid materializing values[..., None] - codebook for large tensors.
-    # A streaming argmin keeps memory O(values) instead of O(values * codebook).
     codebook = jnp.asarray(codebook)
     if codebook.ndim != 1:
         raise ValueError("codebook must be 1D.")

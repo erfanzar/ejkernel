@@ -1074,15 +1074,11 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         if workload is None:
             return []
 
-        # Generate power-of-2 candidates
-        # KV: 16, 32, 64 (bounded by pages_per_seq)
-        # Q: 4, 8, 16, 32, 64 (bounded by max_num_tokens)
 
         kv_candidates = list(_tpu_kv_candidates(workload))
         q_candidates = [4, 8, 16, 32, 64]
 
         kv_limit = max(1, workload.pages_per_seq)
-        # 512 is arbitrary cap from before, but we are capped at 64 anyway.
         q_limit = max(1, min(workload.max_num_tokens, 512))
 
         pairs = []
@@ -1094,7 +1090,6 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
                     continue
                 pairs.append((kv, q))
 
-        # If no pairs found (e.g. very small limits), add minimal
         if not pairs:
             pairs.append((16, 4))
 

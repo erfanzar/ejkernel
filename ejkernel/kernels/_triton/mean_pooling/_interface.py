@@ -119,7 +119,6 @@ def _bwd_call(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    # `cu_seqlens` is an integer index tensor (non-differentiable).
     return dEo, None
 
 
@@ -168,7 +167,8 @@ def mean_pooling(
     chunk_size: int = 32,
     cu_seqlens: Int[Array, "num_seqs_plus_one"] | None = None,
     *,
-    block_dim: int = 64,
+    block_dim: int = 128,
+    block_size: int = 256,
     num_warps: int = 4,
     num_stages: int = 1,
 ) -> Float[Array, "... hidden_dim"]:
@@ -199,9 +199,9 @@ def mean_pooling(
     """
     return _mean_pooling(
         x=x,
-        chunk_size=chunk_size,
+        chunk_size=int(chunk_size),
         cu_seqlens=cu_seqlens,
-        block_dim=block_dim,
+        block_dim=int(block_dim),
         num_warps=num_warps,
         num_stages=num_stages,
     )

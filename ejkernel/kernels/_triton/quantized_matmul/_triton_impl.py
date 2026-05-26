@@ -47,7 +47,6 @@ from ejkernel.quantization._utils.qparams import (
 
 from ._triton_impl_gemv import quantized_matmul_triton_gemv
 
-#: Supported quantization modes for Triton kernels.
 QuantizationMode = Literal["affine", "nf4", "mxfp4", "mxfp8", "nvfp4", "nvfp8"]
 GemvMode = Literal["auto", "on", "off"]
 RevSplitKMode = Literal["auto", "on", "off"]
@@ -1103,21 +1102,16 @@ def _qmm_smem_limit_bytes() -> int:
     so it must not query JAX runtime backend state (which would eagerly
     initialize backends at import time).
     """
-    # Conservative default when CUDA runtime querying is unavailable.
     default = 96 * 1024
 
-    # Prefer the device-reported per-block limit (opt-in when available).
     limit = _cuda_max_shared_mem_per_block_bytes()
     if limit is None:
         return default
 
-    # Keep the historical 96KB cap for compile time bounds, but honor smaller
-    # device limits to avoid invalid configs (and warnings) during autotune.
     return min(default, int(limit))
 
 
 def _qmm_estimated_smem_bytes(*, bm: int, bn: int, bk: int, num_stages: int) -> int:
-    # Two tiles (A: BMxBK, B: BKxBN) with 16-bit elements, pipelined by num_stages.
     return int((bm * bk + bk * bn) * 2 * num_stages)
 
 
@@ -2160,31 +2154,7 @@ def _validate_weight_shapes(
     return K, N
 
 
-def _select_split_k(k: int, block_k: int, max_split: int = 8) -> int:
-    """Select the split-K factor based on the K dimension size.
-
-    Heuristically determines how many splits to use along the K dimension
-    for parallel reduction. Larger K dimensions benefit from more splits
-    to increase parallelism on the GPU.
-
-    Args:
-        k: Total K dimension size.
-        block_k: Block size for the K dimension.
-        max_split: Maximum allowed split-K value.
-
-    Returns:
-        Split-K factor (1, 2, 4, or 8).
-    """
-    if block_k <= 0:
-        return 1
-    tiles = math.ceil(k / block_k)
-    if tiles >= 256:
-        return min(8, max_split)
-    if tiles >= 128:
-        return min(4, max_split)
-    if tiles >= 64:
-        return min(2, max_split)
-    return 1
+_DEFAULT_SPLIT_K_WHEN_NONE: int = 1
 
 
 def quantized_matmul_dequant_triton(
@@ -2477,14 +2447,9 @@ def quantized_matmul_triton(
     )
     if kernel_family == "gemm":
         split_k_selected = 1
-    elif kernel_family == "gemm_splitk":
+    elif kernel_family in ("gemm_splitk", "gemv_splitk"):
         if split_k is None:
-            split_k_selected = max(1, _select_split_k(K, block_k, max_split=8))
-        else:
-            split_k_selected = max(1, int(split_k))
-    elif kernel_family == "gemv_splitk":
-        if split_k is None:
-            split_k_selected = max(1, _select_split_k(K, block_k, max_split=16))
+            split_k_selected = _DEFAULT_SPLIT_K_WHEN_NONE
         else:
             split_k_selected = max(1, int(split_k))
     else:

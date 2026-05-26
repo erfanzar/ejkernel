@@ -56,14 +56,8 @@ def _ssm1_step(
     (h,) = carry
     x_t, dA_t, dB_t, C_t = inputs
 
-    # State update: h_t = dA_t * h_{t-1} + dB_t * x_t
-    # dA_t: [intermediate_size, ssm_state_size]
-    # dB_t: [intermediate_size, ssm_state_size] (already includes x_t multiplication)
     new_h = dA_t * h + dB_t
 
-    # Output: y_t = h_t @ C_t + D * x_t
-    # new_h: [intermediate_size, ssm_state_size]
-    # C_t: [ssm_state_size]
     y_t = jnp.sum(new_h * C_t[None, :], axis=-1) + D * x_t
 
     return (new_h,), y_t
@@ -112,14 +106,8 @@ def _ssm1_fwd(
     else:
         initial_state = initial_state.astype(state_dtype)
 
-    # Discretization
-    # dA = exp(A * dt) where A is [d, n] and dt is [batch, seq_len, d]
-    # Result: [batch, seq_len, d, n]
     discrete_A = jnp.exp(A[None, None, :, :] * dt[:, :, :, None]).astype(state_dtype)
 
-    # dB * x = (dt * B) * x
-    # dt: [batch, seq_len, d], B: [batch, seq_len, n]
-    # Result: [batch, seq_len, d, n]
     discrete_Bx = (dt[:, :, :, None] * B[:, None, :, :].swapaxes(1, 2) * hidden_states[:, :, :, None]).astype(
         state_dtype
     )
@@ -158,10 +146,8 @@ def _ssm1_fwd(
             x_t, dA_t, dBx_t, C_t = inputs
             (h,) = carry
 
-            # State update
             new_h = (dA_t * h + dBx_t).astype(h.dtype)
 
-            # Output
             c_t = C_t.astype(output_dtype)
             y_t = (
                 jnp.sum(new_h.astype(output_dtype) * c_t[None, :], axis=-1)
@@ -176,11 +162,11 @@ def _ssm1_fwd(
         return outputs, hidden_states_all, h_final
 
     outputs, all_hidden_states, final_states = jax.vmap(process_batch)(
-        hidden_states,  # [batch, seq_len, d]
-        discrete_A,  # [batch, seq_len, d, n]
-        discrete_Bx,  # [batch, seq_len, d, n]
-        C,  # [batch, seq_len, n]
-        initial_state,  # [batch, d, n]
+        hidden_states,
+        discrete_A,
+        discrete_Bx,
+        C,
+        initial_state,
     )
 
     return outputs, all_hidden_states, final_states
@@ -215,17 +201,12 @@ def _ssm1_single_step_fwd(
     state_dtype = ssm_state.dtype
     output_dtype = hidden_state.dtype
 
-    # Discretization
-    # dA = exp(A * dt)
-    discrete_A = jnp.exp(A[None, :, :] * dt[:, :, None]).astype(state_dtype)  # [batch, d, n]
+    discrete_A = jnp.exp(A[None, :, :] * dt[:, :, None]).astype(state_dtype)
 
-    # dB * x = dt * B * x
-    discrete_Bx = (dt[:, :, None] * B[:, None, :] * hidden_state[:, :, None]).astype(state_dtype)  # [batch, d, n]
+    discrete_Bx = (dt[:, :, None] * B[:, None, :] * hidden_state[:, :, None]).astype(state_dtype)
 
-    # State update
     new_state = (discrete_A * ssm_state + discrete_Bx).astype(state_dtype)
 
-    # Output: y = h @ C + D * x
     y = (
         jnp.sum(new_state.astype(output_dtype) * C.astype(output_dtype)[:, None, :], axis=-1)
         + D.astype(output_dtype)[None, :] * hidden_state.astype(output_dtype)

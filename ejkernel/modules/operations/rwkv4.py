@@ -186,61 +186,94 @@ class RWKV4(Kernel[RWKV4Config, Array]):
         """
         if platform is not None:
             cfg = RWKV4Config(
+                block_c=cfg.block_c,
                 platform=platform,
                 backend=Backend.ANY if platform == "xla" else cfg.backend,
             )
 
         impl = self.get_impl(cfg)
-        out, final_state = impl(w=w, u=u, k=k, v=v, state=state)
+        resolved = detect_platform("rwkv4", cfg.platform)
+        if resolved == "tilelang":
+            out, final_state = impl(w=w, u=u, k=k, v=v, state=state, block_c=int(cfg.block_c))
+        else:
+            out, final_state = impl(w=w, u=u, k=k, v=v, state=state)
         if return_state:
             return out, final_state
         return out
 
-    def heuristic_cfg(self, inv: Invocation[RWKV4Config, Array]) -> RWKV4Config:
-        """Provide default configuration.
+    @staticmethod
+    def _channels_from_inv(inv: Invocation[RWKV4Config, Array]) -> int:
+        """Pull channel count ``C`` from the invocation's ``k`` tensor."""
+        k = inv.kwargs.get("k")
+        if k is None and len(inv.args) >= 3:
+            k = inv.args[2]
+        shape = getattr(k, "shape", None)
+        if shape is None or len(shape) < 1:
+            return 0
+        return int(shape[-1])
 
-        Args:
-            inv: Invocation object containing arguments and metadata
+    @staticmethod
+    def _heuristic_block_c(channels: int) -> int:
+        """Operation-side tile heuristic — single source of truth.
 
-        Returns:
-            Default configuration with auto platform selection
+        Mirrors the historical kernel-side ladder.
         """
-        return RWKV4Config(platform="auto", backend="any")
+        if channels == 0 or channels <= 64:
+            return 64
+        return 128
+
+    def heuristic_cfg(self, inv: Invocation[RWKV4Config, Array]) -> RWKV4Config:
+        """Cold-start configuration with shape-aware ``block_c``."""
+        return RWKV4Config(
+            block_c=self._heuristic_block_c(self._channels_from_inv(inv)),
+            platform="auto",
+            backend="any",
+        )
 
     def candidate_cfgs(self, inv: Invocation[RWKV4Config, Array]):
-        """Generate candidate configurations for autotuning.
-
-        Args:
-            inv: Invocation object containing arguments and metadata
-
-        Returns:
-            Empty list as RWKV-4 has minimal configuration options
-
-        Note:
-            RWKV-4's simple recurrence pattern means platform selection
-            is the primary optimization lever.
-        """
+        """Generate candidate configurations for autotuning."""
         return [
-            RWKV4Config(platform="auto", backend="any"),
-            RWKV4Config(platform="xla", backend="any"),
+            self.heuristic_cfg(inv),
+            RWKV4Config(block_c=self._heuristic_block_c(self._channels_from_inv(inv)), platform="xla", backend="any"),
         ]
 
     def candidate_cfgs_gpu(self, inv: Invocation[RWKV4Config, Array]):
-        """Generate GPU platform candidates for RWKV-4."""
+        """Generate GPU platform + block_c candidates for RWKV-4.
+
+        The RWKV-4 fused-recurrence kernel parallelises over the channel
+        axis ``C``. Each CTA processes a ``block_c``-wide slab. On H100:
+
+        * ``block_c=32`` only useful for tiny ``C`` (<=64) — high CTA count.
+        * ``block_c=64`` good for moderate ``C`` (128–256); balances
+          occupancy with register pressure.
+        * ``block_c=128`` best for wide-channel models (>=512); amortises
+          the per-CTA fixed cost.
+        * ``block_c=256`` only when ``C`` is large *and* the
+          per-channel state fits in registers — register-pressure
+          guard is applied below.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "triton", "xla") if requested in (None, "auto") else (str(requested),)
+        channels = self._channels_from_inv(inv)
+        bc_choices: list[int] = []
+        for bc in (32, 64, 128, 256):
+            if channels == 0 or bc <= max(channels, 32):
+                bc_choices.append(bc)
+        if not bc_choices:
+            bc_choices = [64]
         candidates: list[RWKV4Config] = []
         if "tilelang" in platforms:
-            candidates.append(RWKV4Config(platform="tilelang", backend="gpu"))
+            for bc in bc_choices:
+                candidates.append(RWKV4Config(block_c=bc, platform="tilelang", backend="gpu"))
         if "triton" in platforms:
-            candidates.append(RWKV4Config(platform="triton", backend="gpu"))
+            candidates.append(RWKV4Config(block_c=64, platform="triton", backend="gpu"))
         if "xla" in platforms:
-            candidates.append(RWKV4Config(platform="xla", backend="any"))
-        return candidates or self.candidate_cfgs(inv)
+            candidates.append(RWKV4Config(block_c=64, platform="xla", backend="any"))
+        return candidates or [self.heuristic_cfg(inv)]
 
     def candidate_cfgs_tpu(self, inv: Invocation[RWKV4Config, Array]):
         """Return TPU candidates for the XLA RWKV-4 path."""
-        return [RWKV4Config(platform="xla", backend="any")]
+        return [RWKV4Config(block_c=64, platform="xla", backend="any")]
 
 
 _executor: Executor[RWKV4Config, Array] = Executor(

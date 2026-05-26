@@ -251,21 +251,33 @@ class FlashMLA(Kernel[FlashMLAConfig, Array]):
         return [self.heuristic_cfg(inv)]
 
     def candidate_cfgs_gpu(self, inv: Invocation[FlashMLAConfig, Array]):
-        """Generate GPU candidates for TileLang and XLA FlashMLA."""
+        """Generate GPU candidates for TileLang and XLA FlashMLA.
+
+        MLA's effective head dim is ``qk_nope_dim + qk_rope_dim`` (often
+        128 + 64 = 192), so ``block_k`` is capped to keep SMEM in budget.
+        On H100:
+
+        * ``(64, 64)`` — short prompts / decode-style.
+        * ``(128, 64)`` — common training tile, wide head dim.
+        * ``(64, 128)`` — long KV with smaller Q chunks.
+        * ``(128, 128)`` — only when head dim fits SMEM.
+        """
         requested = inv.kwargs.get("platform", None)
         platforms = ("tilelang", "xla") if requested in (None, "auto") else (str(requested),)
         candidates: list[FlashMLAConfig] = []
         if "tilelang" in platforms:
-            candidates.append(
-                FlashMLAConfig(
-                    block_q=128,
-                    block_k=128,
-                    num_warps=4,
-                    num_stages=2,
-                    platform="tilelang",
-                    backend="gpu",
-                )
-            )
+            for bq, bk in ((64, 64), (128, 64), (64, 128), (128, 128)):
+                for stages in (2, 3):
+                    candidates.append(
+                        FlashMLAConfig(
+                            block_q=bq,
+                            block_k=bk,
+                            num_warps=8 if max(bq, bk) >= 128 else 4,
+                            num_stages=stages,
+                            platform="tilelang",
+                            backend="gpu",
+                        )
+                    )
         if "xla" in platforms:
             candidates.append(
                 FlashMLAConfig(

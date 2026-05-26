@@ -190,11 +190,6 @@ def ragged_gated_delta_rule(
     seq_lengths = query_start_loc[1:] - query_start_loc[:-1]
     is_all_decode = jnp.all(seq_lengths <= 1)
 
-    # _decode_path gathers recurrent_state[state_indices] and passes it
-    # to a Pallas kernel whose output shape is (query.shape[0], ...) with
-    # input_output_aliases={5:1}.  Both must match, so state_indices must
-    # have exactly num_tokens entries.  lax.cond traces both branches, so
-    # num_tokens may differ from len(state_indices) at trace time.
     num_tokens = query.shape[0]
     num_si = state_indices.shape[0]
     if num_tokens > num_si:

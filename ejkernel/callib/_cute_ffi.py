@@ -283,8 +283,6 @@ def _compile_or_get_kernel(
         try:
             compiled = _compile(expects_stream)
         except Exception:
-            # Some wrapped launchers do not expose a stable python signature.
-            # Retry with flipped stream assumption before surfacing the error.
             compiled = _compile(not expects_stream)
 
         digest = _cache_key_hash(cache_key)[:24]

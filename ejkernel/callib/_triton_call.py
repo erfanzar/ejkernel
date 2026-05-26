@@ -96,8 +96,50 @@ from jax import tree_util
 from jax._src import core, state, util
 from jax._src.lib import gpu_triton as triton_kernel_call_lib
 from jax.interpreters import ad, batching, mlir, xla
+from jaxlib import xla_client
+
+try:
+    from jaxlib.plugin_support import import_from_plugin
+except ImportError:
+    import_from_plugin = None
 
 from ._utils import ShapeDtype, check_bool_flag, get_cache_dir
+
+
+def _has_triton_kernel_call_runtime(module: Any) -> bool:
+    return all(
+        hasattr(module, attr)
+        for attr in (
+            "TritonKernel",
+            "TritonKernelCall",
+            "TritonAutotunedKernelCall",
+            "create_array_parameter",
+            "create_scalar_parameter",
+            "get_custom_call",
+        )
+    )
+
+
+def _load_triton_kernel_call_lib(module: Any) -> Any:
+    if _has_triton_kernel_call_runtime(module):
+        return module
+    if import_from_plugin is None:
+        return module
+
+    for plugin_name, xla_platform in (("cuda", "CUDA"), ("rocm", "ROCM")):
+        plugin_module = import_from_plugin(plugin_name, "_triton", check_version=False)
+        if plugin_module is None or not _has_triton_kernel_call_runtime(plugin_module):
+            continue
+        xla_client.register_custom_call_target(
+            "triton_kernel_call",
+            plugin_module.get_custom_call(),
+            platform=xla_platform,
+        )
+        return plugin_module
+    return module
+
+
+triton_kernel_call_lib = _load_triton_kernel_call_lib(triton_kernel_call_lib)
 
 CAN_USE_TRITON = False
 try:
@@ -230,8 +272,6 @@ def _device_set_from_sharding(sharding) -> set | None:
         Set of devices referenced by the sharding, or ``None`` if unavailable.
     """
     for attr_name in ("device_set", "devices"):
-        # Some sharding objects (e.g. AbstractMesh-backed shardings during jit
-        # tracing) raise on attribute access; treat those as "unknown".
         try:
             attr = getattr(sharding, attr_name, None)
         except Exception:
@@ -471,6 +511,47 @@ def aval_size_bytes(aval):
         Size in bytes as integer.
     """
     return np.dtype(aval.dtype).itemsize * aval.size
+
+
+def _normalize_cuda_compute_capability(value: Any) -> int:
+    if isinstance(value, tuple):
+        if len(value) < 2:
+            raise ValueError(f"Invalid CUDA compute capability tuple: {value!r}.")
+        return int(value[0]) * 10 + int(value[1])
+    if isinstance(value, str):
+        value = value.strip()
+        if "." in value:
+            major, minor = value.split(".", 1)
+            return int(major) * 10 + int(minor[:1] or 0)
+        value_i = int(value)
+        return value_i if value_i >= 20 else value_i * 10
+    if isinstance(value, float):
+        return round(value * 10)
+    value_i = int(value)
+    return value_i if value_i >= 20 else value_i * 10
+
+
+def _get_cuda_compute_capability(device: int) -> int:
+    getter = getattr(triton_kernel_call_lib, "get_compute_capability", None)
+    if getter is not None:
+        return _normalize_cuda_compute_capability(getter(device))
+
+    try:
+        devices = jax.devices("gpu")
+    except Exception:
+        devices = jax.devices()
+    try:
+        device_obj = devices[int(device)]
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ValueError(f"Unable to resolve CUDA device {device!r} for Triton compilation.") from exc
+
+    compute_capability = getattr(device_obj, "compute_capability", None)
+    if compute_capability is None:
+        raise ValueError(
+            "Unable to determine CUDA compute capability: jaxlib.gpu_triton does not expose "
+            "get_compute_capability and the JAX device has no compute_capability attribute."
+        )
+    return _normalize_cuda_compute_capability(compute_capability)
 
 
 def get_cuda_backend(device, compute_capability):
@@ -840,7 +921,7 @@ def _load_triton_kernel_cache(
         if platform == "cuda":
             binary = binary.decode("utf-8")
         return CompilationResult(
-            binary=binary,  # str for cuda, bytes for rocm
+            binary=binary,
             name=data["name"],
             shared_mem_bytes=data["shared_mem_bytes"],
             cluster_dims=tuple(data.get("cluster_dims", (0, 0, 0))),
@@ -978,8 +1059,12 @@ def get_or_create_triton_kernel(
     if num_stages is None:
         num_stages = 3
     if compute_capability is None:
-        compute_capability = triton_kernel_call_lib.get_compute_capability(device)
-    if num_ctas > 1 and compute_capability < 90:
+        compute_capability = (
+            _get_cuda_compute_capability(device)
+            if platform == "cuda"
+            else triton_kernel_call_lib.get_arch_details(device)
+        )
+    if platform == "cuda" and num_ctas > 1 and compute_capability < 90:
         raise ValueError("num_ctas > 1 unsupported before Hopper.")
 
     backend = backend_init_func(device, compute_capability)
@@ -1298,7 +1383,6 @@ def triton_kernel_call_lowering(
 
         return kernel, configs
 
-    # Support both decorator orders: @heuristics @autotune @jit and @autotune @heuristics @jit.
     fn, configs = unwrap_triton_kernel(fn, [default_config])
 
     if not isinstance(fn, triton.JITFunction):

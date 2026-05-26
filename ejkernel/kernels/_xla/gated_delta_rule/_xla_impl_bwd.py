@@ -118,7 +118,6 @@ def _chunk_gdr_bwd(
     decay_mask_tm = decay_mask.transpose(2, 0, 1, 3, 4)
     d_out_tm = d_out.transpose(2, 0, 1, 3, 4)
 
-    # ---- Forward state scan: reconstruct per-chunk states ----
     def fwd_state_scan(state, inputs):
         k_i, v_i, k_cum_i, g_end_i, g_diff_i = inputs
         v_prime = jnp.einsum("bhik,bhkv->bhiv", k_cum_i, state, precision=_MATMUL_PRECISION)
@@ -143,7 +142,6 @@ def _chunk_gdr_bwd(
         ),
     )
 
-    # ---- Reverse chunk scan: propagate gradients backward ----
     def rev_chunk_scan(d_state_next, inputs):
         (
             state_i,
