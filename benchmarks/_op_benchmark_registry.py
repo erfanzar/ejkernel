@@ -270,6 +270,8 @@ def _grid(**options: list[Any]) -> list[dict[str, Any]]:
     Returns:
         List of dicts, one per combination in the Cartesian product.
     """
+    if jax.default_backend() == "tpu" and "dtype" in options:
+        options = {**options, "dtype": ["bf16"]}
     keys = list(options.keys())
     values = [options[k] for k in keys]
     return [dict(zip(keys, combo, strict=True)) for combo in itertools.product(*values)]

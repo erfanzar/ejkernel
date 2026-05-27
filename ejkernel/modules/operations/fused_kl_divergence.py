@@ -118,9 +118,11 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
     """Fused forward KL between two logit tensors with platform + sharding auto-dispatch."""
 
     def __init__(self):
+        """Create the operation object bound to the registry op id."""
         super().__init__(op_id="fused_kl_divergence")
 
     def get_impl(self, cfg: FusedKLDivergenceConfig):
+        """Resolve the concrete backend implementation for ``cfg``."""
         platform = detect_platform("fused_kl_divergence", cfg.platform)
         return kernel_registry.get("fused_kl_divergence", platform=platform, backend=cfg.backend)
 
@@ -139,6 +141,13 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
         platform: PlatformName | None = None,
         cfg: FusedKLDivergenceConfig,
     ) -> Float[Array, "..."]:
+        """Run the registered KL backend with optional mask folding.
+
+        ``attention_mask`` is multiplied into ``weights`` before dispatch
+        so masked rows have zero loss and zero gradient. ``direction`` selects
+        forward KL, reverse KL, or the XLA-only JSD path exposed by the public
+        wrapper.
+        """
         if attention_mask is not None:
             mask_f32 = attention_mask.astype(jnp.float32)
             if weights is None:
@@ -185,6 +194,7 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
         teacher_logits: Float[Array, "... vocab_size"],
         weights: Float[Array, "..."] | None = None,
         *,
+        attention_mask: Array | None = None,
         reduction: str = "mean",
         direction: str = "forward",
         temperature: float = 1.0,
@@ -208,16 +218,13 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
         * For ``reduction in ("sum", "mean")`` the leading-axis mesh names
           (``in_specs[0][:-1]``) form the reduction axes for the per-row
           count / sum ``psum``.
-        * The user-supplied ``check_vma`` is intentionally ignored —
-          the collectives inserted inside ``_per_device`` require
-          ``check_rep=True`` (shard_map's default) for the gradient to
-          flow correctly through the replicated scalar output.
+        * ``check_vma`` is forwarded to ``shard_map``. TPU Pallas kernels
+          need the public default (``False``) because nested ``pallas_call``
+          outputs do not currently annotate ``manual_axis_type``.
         """
         assert mesh is not None, "mesh must be provided for shard_map execution"
         assert in_specs is not None, "in_specs must be provided for shard_map execution"
         assert out_specs is not None, "out_specs must be provided for shard_map execution"
-        _ = check_vma
-
         if vocab_parallel_axis is None:
             vocab_parallel_axis = _infer_vocab_axis(in_specs[0])
 
@@ -231,6 +238,9 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
         else:
             call_args = (student_logits, teacher_logits, weights)
             actual_in_specs = in_specs[:3]
+        if attention_mask is not None:
+            call_args = (*call_args, attention_mask)
+            actual_in_specs = in_specs[: len(call_args)]
         if len(actual_in_specs) != len(call_args):
             raise ValueError(f"in_specs length {len(actual_in_specs)} != call_args length {len(call_args)}")
 
@@ -244,9 +254,14 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
         _cfg = cfg
         _leading = leading_axes
         _has_weights = weights is not None
+        _has_attention_mask = attention_mask is not None
         _inner_red = "none" if reduction == "none" else "sum"
 
         def _per_device(*args):
+            """Run one shard-local KL call and merge scalar reductions globally."""
+            ms = None
+            if _has_attention_mask:
+                *args, ms = args
             if _has_weights:
                 ss, tt, ws = args
             else:
@@ -260,6 +275,7 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
                 direction=_direction,
                 temperature=_temperature,
                 beta=_beta,
+                attention_mask=ms,
                 vocab_parallel_axis=_vocab_axis,
                 platform=_platform,
                 cfg=_cfg,
@@ -268,9 +284,12 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
                 return local_out
             if ws is None:
                 local_cnt = reduce(mul, ss.shape[:-1], 1)
-                cnt_local = jnp.array(int(local_cnt), dtype=jnp.float32)
+                cnt_weights = jnp.ones((local_cnt,), dtype=jnp.float32)
             else:
-                cnt_local = ws.astype(jnp.float32).sum()
+                cnt_weights = ws.astype(jnp.float32).reshape(-1)
+            if ms is not None:
+                cnt_weights = cnt_weights * ms.astype(jnp.float32).reshape(-1)
+            cnt_local = cnt_weights.sum()
             loss_sum = jax.lax.psum(local_out, _leading) if _leading else local_out
             cnt = jax.lax.psum(cnt_local, _leading) if _leading else cnt_local
             if _reduction == "sum":
@@ -283,12 +302,14 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
                 mesh=mesh,
                 in_specs=actual_in_specs,
                 out_specs=out_specs,
+                check_vma=check_vma,
             ),
             call_args,
         )
 
     @staticmethod
     def _shape_from_inv(inv: Invocation[FusedKLDivergenceConfig, Array]) -> tuple[int, int]:
+        """Extract ``(num_rows, vocab_size)`` from the invocation's student logits."""
         logits = inv.kwargs.get("student_logits")
         if logits is None and inv.args:
             logits = inv.args[0]
@@ -315,9 +336,11 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
 
     @staticmethod
     def _heuristic_block_m(n: int) -> int:
+        """Pick the row-block size used before autotuning has a cache hit."""
         return 1 if n < 1024 else 4
 
     def heuristic_cfg(self, inv: Invocation[FusedKLDivergenceConfig, Array]) -> FusedKLDivergenceConfig:
+        """Build the non-autotuned fallback config for this invocation."""
         n, v = self._shape_from_inv(inv)
         return FusedKLDivergenceConfig(
             block_v=self._heuristic_block_v(v),
@@ -329,6 +352,7 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
         )
 
     def candidate_cfgs(self, inv: Invocation[FusedKLDivergenceConfig, Array]):
+        """Return autotune candidates for the default GPU-tuning path."""
         return self.candidate_cfgs_gpu(inv)
 
     def candidate_cfgs_gpu(self, inv: Invocation[FusedKLDivergenceConfig, Array]):
@@ -392,6 +416,7 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
         return candidates or [self.heuristic_cfg(inv)]
 
     def candidate_cfgs_tpu(self, inv: Invocation[FusedKLDivergenceConfig, Array]):
+        """Return TPU autotune candidates; XLA remains the portable baseline."""
         return [
             FusedKLDivergenceConfig(
                 block_v=0,

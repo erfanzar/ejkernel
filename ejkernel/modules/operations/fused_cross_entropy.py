@@ -133,9 +133,11 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
     """
 
     def __init__(self):
+        """Create the operation object bound to the registry op id."""
         super().__init__(op_id="fused_cross_entropy")
 
     def get_impl(self, cfg: FusedCrossEntropyConfig):
+        """Resolve the concrete backend implementation for ``cfg``."""
         platform = detect_platform("fused_cross_entropy", cfg.platform)
         return kernel_registry.get("fused_cross_entropy", platform=platform, backend=cfg.backend)
 
@@ -215,6 +217,7 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
         targets: Int[Array, "..."] | None = None,
         weights: Float[Array, "..."] | None = None,
         *,
+        attention_mask: Array | None = None,
         ignore_index: int = -100,
         label_smoothing: float = 0.0,
         z_loss: float = 0.0,
@@ -242,18 +245,15 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
           leading (batch/seq) dimensions of ``targets`` are collected and
           a ``psum`` over them is inserted inside the wrapper so the
           returned scalar is the *global* (mesh-wide) loss.
-        * The user-supplied ``check_vma`` is intentionally ignored —
-          the collectives inserted inside ``_per_device`` require
-          ``check_rep=True`` (shard_map's default) for the gradient to
-          flow correctly through the replicated scalar output.
+        * ``check_vma`` is forwarded to ``shard_map``. TPU Pallas kernels
+          need the public default (``False``) because nested ``pallas_call``
+          outputs do not currently annotate ``manual_axis_type``.
 
         Returns ``(shard_map_fn, call_args)`` per the Executor contract.
         """
         assert mesh is not None, "mesh must be provided for shard_map execution"
         assert in_specs is not None, "in_specs must be provided for shard_map execution"
         assert out_specs is not None, "out_specs must be provided for shard_map execution"
-        _ = check_vma
-
         if vocab_parallel_axis is None:
             vocab_parallel_axis = _infer_vocab_axis(in_specs[0])
 
@@ -266,6 +266,9 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
         else:
             call_args = (logits, targets, weights)
             actual_in_specs = in_specs[:3]
+        if attention_mask is not None:
+            call_args = (*call_args, attention_mask)
+            actual_in_specs = in_specs[: len(call_args)]
         if len(actual_in_specs) != len(call_args):
             raise ValueError(f"in_specs length {len(actual_in_specs)} != call_args length {len(call_args)}")
 
@@ -285,9 +288,14 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
         _cfg = cfg
         _leading = leading_axes
         _has_weights = weights is not None
+        _has_attention_mask = attention_mask is not None
         _inner_red = "none" if reduction == "none" else "sum"
 
         def _per_device(*args):
+            """Run one shard-local loss and merge scalar reductions globally."""
+            ms = None
+            if _has_attention_mask:
+                *args, ms = args
             if _has_weights:
                 xs, ts, ws = args
             else:
@@ -300,6 +308,7 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
                 ignore_index=_ignore_index,
                 label_smoothing=_label_smoothing,
                 z_loss=_z_loss,
+                attention_mask=ms,
                 reduction=_inner_red,
                 vocab_parallel_axis=_vocab_axis,
                 platform=_platform,
@@ -308,9 +317,12 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
             if _reduction == "none":
                 return local_loss, local_correct
             if ws is None:
-                cnt_local = (ts != _ignore_index).astype(jnp.float32).sum()
+                cnt_weights = (ts != _ignore_index).astype(jnp.float32)
             else:
-                cnt_local = ws.astype(jnp.float32).sum()
+                cnt_weights = ws.astype(jnp.float32)
+            if ms is not None:
+                cnt_weights = cnt_weights * ms.astype(jnp.float32)
+            cnt_local = cnt_weights.sum()
             loss_sum = jax.lax.psum(local_loss, _leading) if _leading else local_loss
             cnt = jax.lax.psum(cnt_local, _leading) if _leading else cnt_local
             if _reduction == "sum":
@@ -328,6 +340,7 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
                 mesh=mesh,
                 in_specs=actual_in_specs,
                 out_specs=wrapped_out_specs,
+                check_vma=check_vma,
             ),
             call_args,
         )
@@ -364,9 +377,11 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
 
     @staticmethod
     def _heuristic_block_m(n: int) -> int:
+        """Pick the row-block size used before autotuning has a cache hit."""
         return 1 if n < 1024 else 4
 
     def heuristic_cfg(self, inv: Invocation[FusedCrossEntropyConfig, Array]) -> FusedCrossEntropyConfig:
+        """Build the non-autotuned fallback config for this invocation."""
         n, v = self._shape_from_inv(inv)
         return FusedCrossEntropyConfig(
             block_v=self._heuristic_block_v(v),
@@ -378,6 +393,7 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
         )
 
     def candidate_cfgs(self, inv: Invocation[FusedCrossEntropyConfig, Array]):
+        """Return autotune candidates for the default GPU-tuning path."""
         return self.candidate_cfgs_gpu(inv)
 
     def candidate_cfgs_gpu(self, inv: Invocation[FusedCrossEntropyConfig, Array]):
@@ -449,6 +465,7 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
         return candidates or [self.heuristic_cfg(inv)]
 
     def candidate_cfgs_tpu(self, inv: Invocation[FusedCrossEntropyConfig, Array]):
+        """Return TPU autotune candidates; XLA remains the portable baseline."""
         return [
             FusedCrossEntropyConfig(
                 block_v=0,
@@ -647,8 +664,11 @@ def fused_cross_entropy(
     else:
         z_loss_metric = jnp.zeros((), dtype=jnp.float32)
 
+    inferred_vocab_parallel_axis = vocab_parallel_axis
+    if inferred_vocab_parallel_axis is None and in_specs is not None and len(in_specs) > 0:
+        inferred_vocab_parallel_axis = _infer_vocab_axis(in_specs[0])
     accuracy: Array | None
-    is_per_row_sentinel = soft_targets is not None or targets is None or vocab_parallel_axis is not None
+    is_per_row_sentinel = soft_targets is not None or targets is None or inferred_vocab_parallel_axis is not None
     if is_per_row_sentinel:
         accuracy = None
     else:

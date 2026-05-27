@@ -627,7 +627,9 @@ class KernelRegistry:
 
         reference_spec = specs[0]
         reference_sig = inspect.signature(reference_spec.implementation)
-        reference_params = [param for param in reference_sig.parameters.values() if param.name not in _TUNING_PARAM_NAMES]
+        reference_params = [
+            param for param in reference_sig.parameters.values() if param.name not in _TUNING_PARAM_NAMES
+        ]
 
         if verbose:
             print(f"\n{'=' * 80}")

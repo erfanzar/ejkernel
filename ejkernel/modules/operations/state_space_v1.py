@@ -186,7 +186,9 @@ class StateSpaceV1(Kernel[StateSpaceV1Config, Array]):
                 - ssm_state: Final hidden state [batch, intermediate_size, ssm_state_size]
                 - conv_state: Passed through conv_state (for caching)
         """
-        cfg_block_d = int(getattr(cfg, "block_d", self._heuristic_block_d(int(hidden_states.shape[-1]), int(A.shape[-1]))))
+        cfg_block_d = int(
+            getattr(cfg, "block_d", self._heuristic_block_d(int(hidden_states.shape[-1]), int(A.shape[-1])))
+        )
         cfg_block_e = int(getattr(cfg, "block_e", 128))
         cfg_backend = getattr(cfg, "backend", "any")
 

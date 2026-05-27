@@ -294,7 +294,10 @@ def make_ce_fwd_only_prim_func(
                                 target_logit = T.Cast(accum, Logits[row, safe_t])
                                 lse_nat = lse_log2[i] * inv_scale
                                 base = (
-                                    lse_nat - eff_target_w * target_logit - low_conf * sum_logits[i] - normalizing_constant
+                                    lse_nat
+                                    - eff_target_w * target_logit
+                                    - low_conf * sum_logits[i]
+                                    - normalizing_constant
                                 )
                                 z_term = z_loss * lse_nat * lse_nat
                                 Loss[row] = valid * weight * (base + z_term)
@@ -357,9 +360,7 @@ def make_ce_fwd_only_prim_func(
                             exp_x[i, j] = T.exp2(x_local[i, j] * scale - max_x[i] * scale)
                         T.reduce_sum(exp_x, sum_exp, dim=1, clear=True)
                         for i in T.Parallel(BM):
-                            lse_log2[i] = max_x[i] * scale + T.log2(
-                                T.exp2(lse_log2[i] - max_x[i] * scale) + sum_exp[i]
-                            )
+                            lse_log2[i] = max_x[i] * scale + T.log2(T.exp2(lse_log2[i] - max_x[i] * scale) + sum_exp[i])
                         for i, j in T.Parallel(BM, BV):
                             v_idx = k * BV + j
                             arg_candidate[i, j] = T.if_then_else(

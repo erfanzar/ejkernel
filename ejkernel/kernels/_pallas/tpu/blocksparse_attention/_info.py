@@ -1059,7 +1059,6 @@ def _slice_mask_info(
     return block_mask, data_next, mask_next
 
 
-
 process_mask = functools.partial(_process_mask, is_dkv=False)
 
 process_mask_dkv = functools.partial(_process_mask, is_dkv=True)

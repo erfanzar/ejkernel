@@ -1074,7 +1074,6 @@ class RaggedPageAttentionv3(Kernel[RaggedPageAttentionv3Config, tuple[Array, Arr
         if workload is None:
             return []
 
-
         kv_candidates = list(_tpu_kv_candidates(workload))
         q_candidates = [4, 8, 16, 32, 64]
 

@@ -538,8 +538,6 @@ def _flatten_logits(logits: jax.Array) -> tuple[jax.Array, tuple[int, ...]]:
     return logits.reshape(-1, logits.shape[-1]), logits.shape[:-1]
 
 
-
-
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
 def _fused_kl_core_forward(student_2d, teacher_2d, weights_1d, temperature, block_v, block_m):
     n, v = student_2d.shape

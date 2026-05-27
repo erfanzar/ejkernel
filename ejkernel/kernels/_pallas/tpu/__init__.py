@@ -29,6 +29,8 @@ Available kernels:
         lightning indexer for KV cache selection.
     flash_attention: Memory-efficient exact attention (FlashAttention-TPU).
     flash_mla: Multi-head latent attention forward pass.
+    fused_cross_entropy: Fused sparse cross-entropy with analytic backward.
+    fused_kl_divergence: Fused KL divergence with analytic student backward.
     gated_delta_rule: Gated delta-rule linear attention recurrence.
     grouped_matmul: Grouped (expert) matrix multiplication (v1).
     grouped_matmulv2: Grouped matmul v2 with improved tiling.
@@ -51,6 +53,8 @@ from .blocksparse_attention import blocksparse_attention as blocksparse_attentio
 from .deepseek_attn import deepseek_attn
 from .flash_attention import flash_attention
 from .flash_mla import flash_mla
+from .fused_cross_entropy import fused_cross_entropy
+from .fused_kl_divergence import fused_kl_divergence
 from .gated_delta_rule import gated_delta_rule
 from .grouped_matmul import grouped_matmul
 from .grouped_matmulv2 import grouped_matmulv2
@@ -73,6 +77,8 @@ __all__ = (
     "deepseek_attn",
     "flash_attention",
     "flash_mla",
+    "fused_cross_entropy",
+    "fused_kl_divergence",
     "gated_delta_rule",
     "grouped_matmul",
     "grouped_matmulv2",

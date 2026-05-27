@@ -217,9 +217,7 @@ class Attention(Kernel[AttentionConfig, tuple[Array, Array]]):
         block_k = int(getattr(cfg, "block_k", 128))
         num_warps = int(getattr(cfg, "num_warps", 4))
         num_stages = int(getattr(cfg, "num_stages", 2))
-        weights_block_q = int(
-            getattr(cfg, "weights_block_q", self._heuristic_weights_block(int(query.shape[1])))
-        )
+        weights_block_q = int(getattr(cfg, "weights_block_q", self._heuristic_weights_block(int(query.shape[1]))))
         weights_block_k = int(getattr(cfg, "weights_block_k", self._heuristic_weights_block(int(key.shape[1]))))
 
         resolved_platform = detect_platform("attention", cfg_platform)

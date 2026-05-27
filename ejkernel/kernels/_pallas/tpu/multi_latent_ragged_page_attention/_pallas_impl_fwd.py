@@ -888,7 +888,6 @@ def _mla_ragged_paged_attention_kernel(
 
         lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
 
-
     @pl.when(seq_idx == 0)
     def prologue():
         upd_sem = sems.at[3, 0]
@@ -997,7 +996,6 @@ def _mla_ragged_paged_attention_kernel(
     def epilogue():
         for i in range(2):
             wait_send_bo(i)
-
 
 
 def prepare_q_inputs(
@@ -1206,7 +1204,6 @@ def mla_ragged_paged_attention(
         vmem_limit_bytes=vmem_limit_bytes,
     )
 
-
     _, actual_num_q_heads, actual_lkv_dim = ql_nope.shape
 
     ql_nope = prepare_q_inputs(ql_nope)
@@ -1333,8 +1330,6 @@ def mla_ragged_paged_attention(
         new_k_pe,
         cache_kv,
     )
-    output = prepare_outputs(
-        output, actual_num_q_heads, actual_lkv_dim
-    )
+    output = prepare_outputs(output, actual_num_q_heads, actual_lkv_dim)
 
     return output, updated_kv

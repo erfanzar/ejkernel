@@ -323,9 +323,7 @@ def make_kl_fwd_only_prim_func(
                                 exp_x[i, j] = T.exp2(s_local[i, j] * scale - max_x[i] * scale)
                         T.reduce_sum(exp_x, sum_exp, dim=1, clear=True)
                         for i in T.Parallel(BM):
-                            lse_beta[i] = max_x[i] * scale + T.log2(
-                                T.exp2(lse_beta[i] - max_x[i] * scale) + sum_exp[i]
-                            )
+                            lse_beta[i] = max_x[i] * scale + T.log2(T.exp2(lse_beta[i] - max_x[i] * scale) + sum_exp[i])
                         for i, j in T.Parallel(BM, BV):
                             v_idx = k * BV + j
                             in_v = T.if_then_else(v_idx < V, 1.0, 0.0)

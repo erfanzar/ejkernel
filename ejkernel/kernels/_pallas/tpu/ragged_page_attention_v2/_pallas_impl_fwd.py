@@ -655,7 +655,6 @@ def ragged_page_attention_kernel(
 
             o_curr = load_with_init(head_acc_ref, 0.0).reshape(-1, head_dim)
 
-
             l_alpha = broadcast_to_shape(l_alpha, qkv.shape)
             beta = broadcast_to_shape(beta, qkv.shape)
             l_next_safe = broadcast_to_shape(l_next_safe, qkv.shape)
