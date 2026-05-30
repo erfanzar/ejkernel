@@ -548,6 +548,87 @@ def _gdr_single_step_bwd_kernel(
     d_state_ref[0, 0] = d_state
 
 
+def _gdr_single_step_bwd_dma_kernel(
+    q_ref,
+    k_ref,
+    v_ref,
+    beta_ref,
+    decay_ref,
+    state_prev_ref,
+    d_out_ref,
+    d_state_next_ref,
+    d_q_ref,
+    d_k_ref,
+    d_v_ref,
+    d_beta_ref,
+    d_decay_ref,
+    d_state_ref,
+    state_tile_ref,
+    d_state_next_tile_ref,
+    dma_sem_ref,
+):
+    """DMA-backed Pallas kernel for single-step GDR backward.
+
+    DMA is used only for the state matrices that can amortize the semaphore
+    cost. The per-token vectors and scalar beta/decay inputs stay as direct
+    loads because they are consumed once and are small relative to the state.
+    """
+    qk_dim = q_ref.shape[3]
+    v_dim = v_ref.shape[3]
+    copies = (
+        pltpu.make_async_copy(
+            src_ref=state_prev_ref.at[pl.ds(0, 1), pl.ds(0, 1), pl.ds(0, qk_dim), pl.ds(0, v_dim)],
+            dst_ref=state_tile_ref.at[pl.ds(0, 1), pl.ds(0, 1), pl.ds(0, qk_dim), pl.ds(0, v_dim)],
+            sem=dma_sem_ref.at[0],
+        ),
+        pltpu.make_async_copy(
+            src_ref=d_state_next_ref.at[pl.ds(0, 1), pl.ds(0, 1), pl.ds(0, qk_dim), pl.ds(0, v_dim)],
+            dst_ref=d_state_next_tile_ref.at[pl.ds(0, 1), pl.ds(0, 1), pl.ds(0, qk_dim), pl.ds(0, v_dim)],
+            sem=dma_sem_ref.at[1],
+        ),
+    )
+    for copy in copies:
+        copy.start()
+
+    k_t = k_ref[0, 0, 0].astype(jnp.float32)
+    v_t = v_ref[0, 0, 0].astype(jnp.float32)
+    beta_t = beta_ref[0, 0, 0, 0]
+    decay_t = decay_ref[0, 0, 0, 0]
+    for copy in copies:
+        copy.wait()
+    state_prev = state_tile_ref[0, 0].astype(jnp.float32)
+    d_state_next = d_state_next_tile_ref[0, 0].astype(jnp.float32)
+
+    g_exp = jnp.exp(jnp.clip(decay_t, -20.0, 20.0))
+    state_decayed = state_prev * g_exp
+    kv_mem = jnp.sum(state_decayed * k_t[:, None], axis=0)
+    delta_raw = v_t - kv_mem
+    delta = delta_raw * beta_t
+    state = state_decayed + k_t[:, None] * delta[None, :]
+
+    q_t = q_ref[0, 0, 0].astype(jnp.float32)
+    d_out_t = d_out_ref[0, 0, 0].astype(jnp.float32)
+
+    d_s = d_state_next + q_t[:, None] * d_out_t[None, :]
+    d_q = jnp.sum(state * d_out_t[None, :], axis=-1)
+    d_k = jnp.sum(d_s * delta[None, :], axis=-1)
+    d_delta = jnp.sum(d_s * k_t[:, None], axis=0)
+    d_beta = jnp.sum(d_delta * delta_raw)
+    d_v = d_delta * beta_t
+    d_kv_mem = -d_delta * beta_t
+    d_state_decayed = d_s + k_t[:, None] * d_kv_mem[None, :]
+    d_k = d_k + jnp.sum(state_decayed * d_kv_mem[None, :], axis=-1)
+    d_state = d_state_decayed * g_exp
+    d_decay = jnp.sum(d_state_decayed * state_prev) * g_exp
+
+    d_q_ref[0, 0, 0] = d_q
+    d_k_ref[0, 0, 0] = d_k
+    d_v_ref[0, 0, 0] = d_v
+    d_beta_ref[0, 0] = d_beta.reshape(1, 1)
+    d_decay_ref[0, 0] = d_decay.reshape(1, 1)
+    d_state_ref[0, 0] = d_state
+
+
 def _run_single_step_backward(
     query,
     key,
@@ -579,7 +660,7 @@ def _run_single_step_backward(
     beta = beta[..., None].astype(jnp.float32)
     decay = decay[..., None].astype(jnp.float32)
     call = pl.pallas_call(
-        _gdr_single_step_bwd_kernel,
+        _gdr_single_step_bwd_dma_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
@@ -599,6 +680,11 @@ def _run_single_step_backward(
                 _chunk_blockspec((1, 1, 1, 1)),
                 _chunk_blockspec((1, 1, 1, 1)),
                 _chunk_blockspec((1, 1, qk_dim, v_dim)),
+            ],
+            scratch_shapes=[
+                pltpu.VMEM((1, 1, qk_dim, v_dim), recurrent_state.dtype),
+                pltpu.VMEM((1, 1, qk_dim, v_dim), d_state_next.dtype),
+                pltpu.SemaphoreType.DMA((2,)),
             ],
             grid=(bsz, num_heads),
         ),

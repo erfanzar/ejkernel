@@ -926,8 +926,9 @@ def make_kl_jsd_fwd_prim_func(
       * Pass 1 builds ``lse_t`` (T-scaled).
       * Pass 2 builds ``lse_s`` (T-scaled).
       * Pass 3 streams ``(t, s)`` once more to evaluate ``log m`` per
-        element (``log_m = max + log(exp(log p_t + log(1-β) - max)
-        + exp(log p_s + log(β) - max))``) and accumulates the two KL
+        element (``log_m = max + log(exp(log p_t + log(β) - max)
+        + exp(log p_s + log(1-β) - max))``, i.e. mixture
+        ``m = β·p_t + (1-β)·p_s``) and accumulates the two KL
         contributions.
 
     The kernel writes ``Loss`` (already scaled by ``weight``) plus the
@@ -1026,8 +1027,9 @@ def make_kl_jsd_fwd_prim_func(
                     in_v = T.if_then_else(v_idx < V, 1.0, 0.0)
                     log_pt = t_local[i, j] - lse_t[i] * inv_scale
                     log_ps = s_local[i, j] - lse_s[i] * inv_scale
-                    a = log_pt + log_one_minus_beta
-                    b = log_ps + log_beta
+                    # Mixture m = beta * p_t + (1 - beta) * p_s (matches docstring / GKD): teacher pairs with log(beta).
+                    a = log_pt + log_beta
+                    b = log_ps + log_one_minus_beta
                     m_ = T.max(a, b)
                     log_m = m_ + T.log2(T.exp2((a - m_) * scale) + T.exp2((b - m_) * scale)) * inv_scale
                     p_t = T.exp2(log_pt * scale)

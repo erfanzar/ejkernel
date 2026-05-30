@@ -145,32 +145,36 @@ def test_pallas_vocab_parallel_mesh_matches_reference_and_grad():
             lambda x: fused_cross_entropy(x, targets, weights, platform="xla", reduction="mean").loss
         )(logits)
         ce_grad_mesh = jax.grad(
-            lambda x: fused_cross_entropy(
-                x,
-                targets,
-                weights,
-                platform="pallas",
-                reduction="mean",
-                mesh=mesh,
-                in_specs=(logits_spec, rows_spec, rows_spec),
-                out_specs=P(),
-            ).loss
+            lambda x: (
+                fused_cross_entropy(
+                    x,
+                    targets,
+                    weights,
+                    platform="pallas",
+                    reduction="mean",
+                    mesh=mesh,
+                    in_specs=(logits_spec, rows_spec, rows_spec),
+                    out_specs=P(),
+                ).loss
+            )
         )(logits)
 
         kl_grad_ref = jax.grad(
             lambda x: fused_kl_divergence(x, teacher, weights, platform="xla", reduction="mean").loss
         )(student)
         kl_grad_mesh = jax.grad(
-            lambda x: fused_kl_divergence(
-                x,
-                teacher,
-                weights,
-                platform="pallas",
-                reduction="mean",
-                mesh=mesh,
-                in_specs=(logits_spec, logits_spec, rows_spec),
-                out_specs=P(),
-            ).loss
+            lambda x: (
+                fused_kl_divergence(
+                    x,
+                    teacher,
+                    weights,
+                    platform="pallas",
+                    reduction="mean",
+                    mesh=mesh,
+                    in_specs=(logits_spec, logits_spec, rows_spec),
+                    out_specs=P(),
+                ).loss
+            )
         )(student)
 
     np.testing.assert_allclose(np.asarray(ce_mesh), np.asarray(ce_ref), rtol=0.0, atol=6e-3)

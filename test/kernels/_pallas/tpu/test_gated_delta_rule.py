@@ -135,6 +135,40 @@ def test_pallas_backward_matches_xla_recurrent():
         assert jnp.allclose(grad_pallas, grad_xla, atol=2e-2, rtol=0)
 
 
+def test_pallas_single_step_backward_matches_xla():
+    q, k, v, beta, decay = _make_inputs(seq_len=1, dtype=jnp.float32, seed=50)
+    init = (
+        jax.random.normal(
+            jax.random.PRNGKey(51),
+            (q.shape[0], q.shape[2], q.shape[3], v.shape[3]),
+            dtype=jnp.float32,
+        )
+        * 0.01
+    )
+
+    def loss_pallas(q_in, k_in, v_in, beta_in, decay_in, state_in):
+        out, state = gated_delta_rule_pallas(q_in, k_in, v_in, beta_in, decay_in, initial_state=state_in)
+        return jnp.sum(out) + 0.1 * jnp.sum(state)
+
+    def loss_xla(q_in, k_in, v_in, beta_in, decay_in, state_in):
+        out, state = gated_delta_rule_xla(
+            q_in,
+            k_in,
+            v_in,
+            beta_in,
+            decay_in,
+            initial_state=state_in,
+            use_chunked=False,
+        )
+        return jnp.sum(out) + 0.1 * jnp.sum(state)
+
+    grads_pallas = jax.grad(loss_pallas, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, beta, decay, init)
+    grads_xla = jax.grad(loss_xla, argnums=(0, 1, 2, 3, 4, 5))(q, k, v, beta, decay, init)
+    for grad_pallas, grad_xla in zip(grads_pallas, grads_xla, strict=True):
+        assert jnp.all(jnp.isfinite(grad_pallas))
+        assert jnp.allclose(grad_pallas, grad_xla, atol=1e-5, rtol=0)
+
+
 def test_pallas_use_chunked_false_falls_back_to_xla_recurrent():
     q, k, v, beta, decay = _make_inputs(dtype=jnp.float32, seed=6)
     out_pallas, state_pallas = gated_delta_rule_pallas(q, k, v, beta, decay, chunk_size=8, use_chunked=False)

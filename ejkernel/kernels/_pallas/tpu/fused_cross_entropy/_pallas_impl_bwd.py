@@ -144,7 +144,7 @@ def _ce_bwd_pallas(
     the current TP forward rejects label smoothing, so the default non-TP value
     is used for the supported paths.
     """
-    block_v = min(int(block_v), 1024)
+    block_v = min(int(block_v), 4096)
     n_rows, vocab_size = logits_2d.shape
     n_rows_pad = pl.cdiv(n_rows, int(block_m)) * int(block_m)
     pad_rows = n_rows_pad - n_rows

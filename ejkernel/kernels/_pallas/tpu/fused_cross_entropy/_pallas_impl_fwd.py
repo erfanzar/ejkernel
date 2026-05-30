@@ -160,8 +160,15 @@ def _ce_fwd_kernel(
 
     @pl.when(jnp.any(valid))
     def _compute_active_block():
-        """Stream vocab tiles only when at least one row contributes loss."""
+        """Single streaming pass over vocab tiles (online softmax).
+
+        One DMA + reduction per tile: track a running max and a running sum-exp
+        (rescaled when the max grows), plus sum-of-logits and the target logit.
+        Logits are read from HBM exactly once (the former kernel streamed them
+        twice: once for max, once for sum-exp).
+        """
         max_val = jnp.full((block_m,), -jnp.inf, dtype=jnp.float32)
+        sum_exp = jnp.zeros((block_m,), dtype=jnp.float32)
         sum_logits = jnp.zeros((block_m,), dtype=jnp.float32)
         target_logit = jnp.zeros((block_m,), dtype=jnp.float32)
         num_blocks = pl.cdiv(vocab_size, block_v)
@@ -174,23 +181,15 @@ def _ce_fwd_kernel(
             vocab_idx = start + offsets
             in_vocab = offsets < size
             masked = jnp.where(in_vocab[None, :], tile, -jnp.inf)
-            local_max = jnp.max(masked, axis=1)
-            max_val = jnp.maximum(max_val, local_max)
+            tile_max = jnp.max(masked, axis=1)
+            new_max = jnp.maximum(max_val, tile_max)
+            correction = jnp.exp(max_val - new_max)
+            tile_sum_exp = jnp.sum(jnp.where(in_vocab[None, :], jnp.exp(tile - new_max[:, None]), 0.0), axis=1)
+            sum_exp = sum_exp * correction + tile_sum_exp
+            max_val = new_max
             sum_logits = sum_logits + jnp.sum(jnp.where(in_vocab[None, :], tile, 0.0), axis=1)
             target_logit = target_logit + jnp.sum(
                 jnp.where(in_vocab[None, :] & (vocab_idx[None, :] == safe_target[:, None]), tile, 0.0),
-                axis=1,
-            )
-
-        sum_exp = jnp.zeros((block_m,), dtype=jnp.float32)
-        for block_idx in range(num_blocks):
-            start = block_idx * block_v
-            size = min(block_v, vocab_size - start)
-            _copy_hbm_to_vmem(logits_ref, logits_tile_ref, dma_sem_ref, row_start, start, block_m, size)
-            tile = logits_tile_ref[...].astype(jnp.float32)
-            in_vocab = offsets < size
-            sum_exp = sum_exp + jnp.sum(
-                jnp.where(in_vocab[None, :], jnp.exp(tile - max_val[:, None]), 0.0),
                 axis=1,
             )
 

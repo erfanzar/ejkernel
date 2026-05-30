@@ -36,26 +36,32 @@ import jax.numpy as jnp
 
 
 def _ce_fwd(logits, targets, weights, ignore_index):
-    """VJP primal for the single-shard fused cross-entropy."""
+    """VJP primal for the single-shard fused cross-entropy.
+
+    Saves only the per-row ``lse`` (and the input ``logits``, which is already
+    live) rather than the full ``[..., V]`` ``exp_shifted``. The backward
+    recomputes ``softmax = exp(logits - lse)``. On bandwidth-bound hardware this
+    trades a ``[..., V]`` HBM round-trip (write in fwd + read in bwd) for a cheap
+    in-place ``exp`` recompute — ~25% less HBM traffic than caching the softmax.
+    """
     del ignore_index
     vocab = logits.shape[-1]
     safe_targets = jnp.clip(targets, 0, vocab - 1)
-    max_logit = jnp.max(logits, axis=-1, keepdims=True)
-    shifted = logits - max_logit
-    exp_shifted = jnp.exp(shifted)
-    sum_exp = jnp.sum(exp_shifted, axis=-1, keepdims=True)
-    lse = (jnp.log(sum_exp) + max_logit)[..., 0]
+    lse = jax.nn.logsumexp(logits, axis=-1)
     target_logit = jnp.take_along_axis(logits, safe_targets[..., None], axis=-1)[..., 0]
     per_row = (lse - target_logit) * weights
-    residual = (exp_shifted, sum_exp, safe_targets, weights, logits)
+    residual = (logits, lse, safe_targets, weights)
     return per_row.astype(jnp.float32), residual
 
 
 def _ce_bwd(ignore_index, residual, dy):
-    """Analytic backward: ``dlogits = weight * (softmax - onehot) * dy``."""
+    """Analytic backward: ``dlogits = weight * (softmax - onehot) * dy``.
+
+    Recomputes ``softmax = exp(logits - lse)`` from the saved per-row ``lse``.
+    """
     del ignore_index
-    exp_shifted, sum_exp, safe_targets, weights, logits = residual
-    probs = exp_shifted / sum_exp
+    logits, lse, safe_targets, weights = residual
+    probs = jnp.exp(logits - lse[..., None])
     onehot = jax.nn.one_hot(safe_targets, probs.shape[-1], dtype=probs.dtype)
     factor = (weights.astype(probs.dtype) * dy.astype(probs.dtype))[..., None]
     dlogits = (probs - onehot) * factor

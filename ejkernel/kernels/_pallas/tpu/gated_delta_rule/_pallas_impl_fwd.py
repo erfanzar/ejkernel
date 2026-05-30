@@ -770,6 +770,50 @@ def _gdr_single_step_fwd_kernel(q_ref, k_ref, v_ref, beta_ref, decay_ref, state_
     final_state_ref[0, 0] = state.astype(final_state_ref.dtype)
 
 
+def _gdr_single_step_fwd_dma_kernel(
+    q_ref,
+    k_ref,
+    v_ref,
+    beta_ref,
+    decay_ref,
+    state_ref,
+    out_ref,
+    final_state_ref,
+    state_tile_ref,
+    dma_sem_ref,
+):
+    """DMA-backed Pallas kernel for one GDR decode step.
+
+    The recurrent state is the only operand large enough to amortize DMA
+    setup. It is copied asynchronously while the per-token q/k/v vectors and
+    scalar gate/decay values are loaded directly.
+    """
+    qk_dim = q_ref.shape[3]
+    v_dim = v_ref.shape[3]
+    state_copy = pltpu.make_async_copy(
+        src_ref=state_ref.at[pl.ds(0, 1), pl.ds(0, 1), pl.ds(0, qk_dim), pl.ds(0, v_dim)],
+        dst_ref=state_tile_ref.at[pl.ds(0, 1), pl.ds(0, 1), pl.ds(0, qk_dim), pl.ds(0, v_dim)],
+        sem=dma_sem_ref.at[0],
+    )
+    state_copy.start()
+
+    k_t = k_ref[0, 0, 0].astype(jnp.float32)
+    v_t = v_ref[0, 0, 0].astype(jnp.float32)
+    beta_t = beta_ref[0, 0, 0, 0]
+    g_exp = jnp.exp(jnp.clip(decay_ref[0, 0, 0, 0], -20.0, 20.0))
+    state_copy.wait()
+    state_prev = state_tile_ref[0, 0].astype(jnp.float32)
+    state_decayed = state_prev * g_exp
+    kv_mem = jnp.sum(state_decayed * k_t[:, None], axis=0)
+    delta = (v_t - kv_mem) * beta_t
+    state = state_decayed + k_t[:, None] * delta[None, :]
+
+    q_t = q_ref[0, 0, 0].astype(jnp.float32)
+    out = jnp.sum(state * q_t[:, None], axis=0)
+    out_ref[0, 0, 0] = out.astype(out_ref.dtype)
+    final_state_ref[0, 0] = state.astype(final_state_ref.dtype)
+
+
 def _run_single_step_forward(query, key, value, beta, decay, recurrent_state):
     """Launch the single-step GDR Pallas kernel and return (output, new_state).
 
@@ -789,7 +833,7 @@ def _run_single_step_forward(query, key, value, beta, decay, recurrent_state):
     beta = beta[..., None].astype(jnp.float32)
     decay = decay[..., None].astype(jnp.float32)
     call = pl.pallas_call(
-        _gdr_single_step_fwd_kernel,
+        _gdr_single_step_fwd_dma_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
@@ -801,6 +845,10 @@ def _run_single_step_forward(query, key, value, beta, decay, recurrent_state):
                 _chunk_blockspec((1, 1, qk_dim, v_dim)),
             ],
             out_specs=[_chunk_blockspec((1, 1, 1, v_dim)), _chunk_blockspec((1, 1, qk_dim, v_dim))],
+            scratch_shapes=[
+                pltpu.VMEM((1, 1, qk_dim, v_dim), recurrent_state.dtype),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
             grid=(bsz, num_heads),
         ),
         out_shape=[

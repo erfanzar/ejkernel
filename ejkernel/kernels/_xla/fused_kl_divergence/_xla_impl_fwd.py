@@ -94,8 +94,11 @@ def _kl_per_row(student_logits, teacher_logits, weights, direction, temperature,
     same as autodiff would produce).
     """
     inv_T = 1.0 / float(temperature)
-    s = student_logits * inv_T
-    t = teacher_logits * inv_T
+    # Accumulate in float32 for numerical stability (bf16/fp16 logits lose precision in the
+    # softmax / log-mixture, and the 1/T scaling amplifies it). The gradient is still taken
+    # w.r.t. the original student dtype. Matches the fp32 accumulation of reference KL losses.
+    s = student_logits.astype(jnp.float32) * inv_T
+    t = teacher_logits.astype(jnp.float32) * inv_T
     log_p_s = jax.nn.log_softmax(s, axis=-1)
     log_p_t = jax.nn.log_softmax(t, axis=-1)
     p_s = jnp.exp(log_p_s)
@@ -106,10 +109,13 @@ def _kl_per_row(student_logits, teacher_logits, weights, direction, temperature,
     elif direction == "reverse":
         per_row = jnp.sum(p_s * (log_p_s - log_p_t), axis=-1)
     elif direction == "jsd":
-        log_beta = jnp.log(jnp.asarray(beta, dtype=student_logits.dtype))
-        log_one_minus_beta = jnp.log1p(-jnp.asarray(beta, dtype=student_logits.dtype))
+        # Mixture weights in float32 (a bf16 beta loses precision in log/log1p).
+        log_beta = jnp.log(jnp.asarray(beta, dtype=jnp.float32))
+        log_one_minus_beta = jnp.log1p(-jnp.asarray(beta, dtype=jnp.float32))
+        # Mixture m = beta * p_t + (1 - beta) * p_s (matches the module docstring and the
+        # standard GKD / Agarwal et al. convention): teacher pairs with log(beta).
         log_m = jax.scipy.special.logsumexp(
-            jnp.stack([log_p_t + log_one_minus_beta, log_p_s + log_beta]),
+            jnp.stack([log_p_t + log_beta, log_p_s + log_one_minus_beta]),
             axis=0,
         )
         per_row = beta * jnp.sum(p_t * (log_p_t - log_m), axis=-1) + (1.0 - beta) * jnp.sum(

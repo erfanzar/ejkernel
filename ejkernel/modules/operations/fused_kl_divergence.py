@@ -74,10 +74,17 @@ class KLDivergenceOutput(NamedTuple):
             is the quantity to backprop through.
         weight_sum: Sum of the per-row weights (denominator of
             ``"mean"`` reduction), detached from the gradient flow.
+        teacher_entropy: Teacher distribution entropy
+            ``H(p_t) = -sum_v p_t(v) log p_t(v)`` (temperature-softened),
+            reduced and ``T²``-scaled exactly like ``loss``. ``None`` unless
+            ``return_teacher_entropy=True``. Detached (teacher-only, no
+            gradient). For forward KL this gives the standard distillation
+            decomposition: the teacher cross-entropy is ``loss + teacher_entropy``.
     """
 
     loss: Array
     weight_sum: Array
+    teacher_entropy: Array | None = None
 
 
 def _flatten_axes(spec_entry) -> list[str]:
@@ -416,8 +423,16 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
         return candidates or [self.heuristic_cfg(inv)]
 
     def candidate_cfgs_tpu(self, inv: Invocation[FusedKLDivergenceConfig, Array]):
-        """Return TPU autotune candidates; XLA remains the portable baseline."""
-        return [
+        """Return TPU autotune candidates: XLA baseline + Pallas streaming variants.
+
+        XLA is the bandwidth-floor baseline and is usually fastest on TPU; the Pallas
+        candidates let the autotuner pick a streaming kernel where it wins (very sparse
+        masks, other TPU generations). ``direction="jsd"`` falls back to XLA inside the
+        Pallas path regardless. Only ``block_v`` is swept (Pallas fixes ``block_m``);
+        values are pruned to the vocab size.
+        """
+        _, v = self._shape_from_inv(inv)
+        candidates = [
             FusedKLDivergenceConfig(
                 block_v=0,
                 block_m=0,
@@ -427,6 +442,14 @@ class FusedKLDivergence(Kernel[FusedKLDivergenceConfig, Array]):
                 backend="any",
             )
         ]
+        for bv in (4096, 8192):
+            if v == 0 or bv <= max(v, 1):
+                candidates.append(
+                    FusedKLDivergenceConfig(
+                        block_v=bv, block_m=256, num_warps=4, num_stages=2, platform="pallas", backend="any"
+                    )
+                )
+        return candidates
 
     candidate_cfgs_shard_map_gpu = candidate_cfgs_gpu
     candidate_cfgs_shard_map_tpu = candidate_cfgs_tpu
@@ -458,6 +481,7 @@ def fused_kl_divergence(
     temperature: float = 1.0,
     beta: float = 0.5,
     vocab_parallel_axis: str | None = None,
+    return_teacher_entropy: bool = False,
     platform: PlatformName | None = None,
     cfg: FusedKLDivergenceConfig | None = None,
     mesh: Mesh | None = None,
@@ -493,6 +517,11 @@ def fused_kl_divergence(
         beta: JSD interpolation factor in ``(0, 1)``; ignored unless
             ``direction="jsd"``.
         vocab_parallel_axis: TP mesh axis (forward + ``T=1`` only).
+        return_teacher_entropy: When ``True``, also return the teacher
+            entropy ``H(p_t)`` on the output (same reduction + ``T²`` scaling
+            as ``loss``, detached). Lets distillation callers recover the
+            cross-entropy decomposition (teacher cross-entropy =
+            ``loss + teacher_entropy`` for forward KL) without a second kernel.
         platform: Backend override (``"tilelang"``, ``"xla"``, …).
         cfg: Optional :class:`FusedKLDivergenceConfig` override.
         mesh / in_specs / out_specs: When all three are provided the
@@ -585,4 +614,20 @@ def fused_kl_divergence(
         flat_w = flat_w * attention_mask.astype(jnp.float32)
     weight_sum = jax.lax.stop_gradient(flat_w.sum())
 
-    return KLDivergenceOutput(loss=loss, weight_sum=weight_sum)
+    teacher_entropy = None
+    if return_teacher_entropy:
+        # H(p_t) = -sum_v p_t log p_t over the temperature-softened teacher distribution.
+        # Teacher-only and detached (no gradient); reduced and T**2-scaled exactly like `loss`.
+        t_scaled = jax.lax.stop_gradient(teacher_logits.astype(jnp.float32) / temperature)
+        log_p_t = jax.nn.log_softmax(t_scaled, axis=-1)
+        ent = -jnp.sum(jnp.exp(log_p_t) * log_p_t, axis=-1)  # (...,)
+        t_sq = float(temperature) ** 2
+        if reduction == "none":
+            teacher_entropy = ent * t_sq
+        elif reduction == "sum":
+            teacher_entropy = jnp.sum(ent * flat_w) * t_sq
+        else:  # "mean"
+            teacher_entropy = (jnp.sum(ent * flat_w) / jnp.maximum(flat_w.sum(), 1e-8)) * t_sq
+        teacher_entropy = jax.lax.stop_gradient(teacher_entropy)
+
+    return KLDivergenceOutput(loss=loss, weight_sum=weight_sum, teacher_entropy=teacher_entropy)
