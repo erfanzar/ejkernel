@@ -237,7 +237,6 @@ def _recurrent_gdr_fwd(
 
     if seg_ids is not None:
         seg_hc = seg_full.reshape(B, H, NC, C)  # [B, H, NC, C] document id per token
-        same_as_first = seg_hc == seg_hc[..., :1]
         is_start = jnp.concatenate(
             [jnp.ones((B, H, NC, 1), dtype=jnp.bool_), seg_hc[..., 1:] != seg_hc[..., :-1]],
             axis=-1,
@@ -252,11 +251,9 @@ def _recurrent_gdr_fwd(
         )
         g_cumsum = raw_cumsum - cumsum_at_start
         same_seg_pair = seg_hc[..., :, None] == seg_hc[..., None, :]  # [B, H, NC, C, C]
-        same_as_first = seg_hc == seg_hc[..., :1]  # [B, H, NC, C]
     else:
         g_cumsum = jnp.cumsum(g_c, axis=-1)
         same_seg_pair = None
-        same_as_first = None
 
     k_beta = k_c * beta_c[..., None]
     v_beta = v_c * beta_c[..., None]
