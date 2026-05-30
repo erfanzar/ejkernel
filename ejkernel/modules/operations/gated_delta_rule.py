@@ -72,7 +72,7 @@ from typing import Literal
 
 from jax import shard_map
 from jax.sharding import Mesh, PartitionSpec
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 
 from ejkernel.kernels._registry import Backend, kernel_registry
 from ejkernel.ops import (
@@ -133,6 +133,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         in_specs: tuple[PartitionSpec | None, ...] | None = None,
         out_specs: PartitionSpec | tuple[PartitionSpec | None, ...] | None = None,
         check_vma: bool = False,
+        seg_ids: Int[Array, "batch seq_len"] | None = None,
         **_,
     ):
         """Create a shard_map wrapper for GDR execution.
@@ -151,6 +152,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
             beta: Float[Array, "batch seq_len num_heads"],
             decay: Float[Array, "batch seq_len num_heads"] | None,
             initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None,
+            seg_ids: Int[Array, "batch seq_len"] | None = None,
         ):
             return self.run(
                 query=query,
@@ -158,6 +160,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
                 value=value,
                 beta=beta,
                 decay=decay,
+                seg_ids=seg_ids,
                 initial_state=initial_state,
                 use_qk_l2norm=use_qk_l2norm,
                 use_chunked=use_chunked,
@@ -174,7 +177,14 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
             decay,
             initial_state,
         )
-        assert len(in_specs) == len(call_args), f"in_specs length {len(in_specs)} != call_args length {len(call_args)}"
+
+        if seg_ids is not None:
+            call_args = (*call_args, seg_ids)
+
+        assert len(in_specs) == len(call_args), (
+            f"in_specs length {len(in_specs)} != call_args length {len(call_args)} "
+            "(when seg_ids is provided, in_specs must include its sharding as the last entry)"
+        )
 
         shard_map_fn = shard_map(
             _wrapped_gdr,
@@ -208,6 +218,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
         beta: Float[Array, "batch seq_len num_heads"],
         decay: Float[Array, "batch seq_len num_heads"] | None = None,
         initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
+        seg_ids: Int[Array, "batch seq_len"] | None = None,
         *,
         use_qk_l2norm: bool = True,
         use_chunked: bool = True,
@@ -271,6 +282,7 @@ class GatedDeltaRule(Kernel[GatedDeltaRuleConfig, Array]):
             value=value,
             beta=beta,
             decay=decay,
+            seg_ids=seg_ids,
             chunk_size=int(cfg.chunk_size),
             initial_state=initial_state,
             use_qk_l2norm=bool(use_qk_l2norm),
@@ -368,6 +380,7 @@ def gated_delta_rule(
     value: Float[Array, "batch seq_len num_heads v_head_dim"],
     beta: Float[Array, "batch seq_len num_heads"],
     decay: Float[Array, "batch seq_len num_heads"] | None = None,
+    seg_ids: Int[Array, "batch seq_len"] | None = None,
     initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
     /,
     *,
@@ -516,6 +529,7 @@ def gated_delta_rule(
         value=value,
         beta=beta,
         decay=decay,
+        seg_ids=seg_ids,
         initial_state=initial_state,
         autotune_chunk_candidates=autotune_chunk_candidates,
         use_qk_l2norm=use_qk_l2norm,

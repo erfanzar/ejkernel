@@ -46,7 +46,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 
 _MATMUL_PRECISION = lax.Precision.HIGHEST
 
@@ -141,6 +141,7 @@ def _recurrent_gdr_fwd(
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
     chunk_size: int = 64,
+    seg_ids: Int[Array, "batch seq_len"] | None = None,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -212,6 +213,10 @@ def _recurrent_gdr_fwd(
     else:
         decay = decay.astype(input_dtype)
 
+    seg_hc = None
+    if seg_ids is not None:
+        seg_full = jnp.broadcast_to(seg_ids.astype(jnp.int32)[:, None, :], (B, H, L))
+
     pad_size = (C - L % C) % C
     if pad_size > 0:
         query = jnp.pad(query, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
@@ -219,6 +224,8 @@ def _recurrent_gdr_fwd(
         value = jnp.pad(value, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
         beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad_size)))
         decay = jnp.pad(decay, ((0, 0), (0, 0), (0, pad_size)))
+        if seg_ids is not None:
+            seg_full = jnp.pad(seg_full, ((0, 0), (0, 0), (0, pad_size)), constant_values=-1)
 
     NC = (L + pad_size) // C
 
@@ -228,7 +235,28 @@ def _recurrent_gdr_fwd(
     beta_c = beta.reshape(B, H, NC, C)
     g_c = decay.reshape(B, H, NC, C)
 
-    g_cumsum = jnp.cumsum(g_c, axis=-1)
+    if seg_ids is not None:
+        seg_hc = seg_full.reshape(B, H, NC, C)  # [B, H, NC, C] document id per token
+        same_as_first = seg_hc == seg_hc[..., :1]
+        is_start = jnp.concatenate(
+            [jnp.ones((B, H, NC, 1), dtype=jnp.bool_), seg_hc[..., 1:] != seg_hc[..., :-1]],
+            axis=-1,
+        )
+        raw_cumsum = jnp.cumsum(g_c, axis=-1)
+        idx = jnp.arange(C)
+        start_idx = jax.lax.cummax(jnp.where(is_start, idx[None, None, None, :], 0), axis=3)
+        cumsum_at_start = jnp.take_along_axis(
+            jnp.concatenate([jnp.zeros((B, H, NC, 1), raw_cumsum.dtype), raw_cumsum[..., :-1]], axis=-1),
+            start_idx,
+            axis=-1,
+        )
+        g_cumsum = raw_cumsum - cumsum_at_start
+        same_seg_pair = seg_hc[..., :, None] == seg_hc[..., None, :]  # [B, H, NC, C, C]
+        same_as_first = seg_hc == seg_hc[..., :1]  # [B, H, NC, C]
+    else:
+        g_cumsum = jnp.cumsum(g_c, axis=-1)
+        same_seg_pair = None
+        same_as_first = None
 
     k_beta = k_c * beta_c[..., None]
     v_beta = v_c * beta_c[..., None]
@@ -238,6 +266,10 @@ def _recurrent_gdr_fwd(
     g_diff = g_cumsum[..., :, None] - g_cumsum[..., None, :]
     strict_lower = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_), k=-1)
     lower_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_))
+    if same_seg_pair is not None:
+        # Intra-chunk attention only within the same document.
+        strict_lower = jnp.logical_and(strict_lower, same_seg_pair)
+        lower_mask = jnp.logical_and(lower_mask, same_seg_pair)
     g_diff = jnp.where(strict_lower, g_diff, -1e30)
     S = jnp.where(strict_lower, S * jnp.exp(jnp.clip(g_diff, -20.0, 20.0)), 0.0)
 
@@ -269,6 +301,15 @@ def _recurrent_gdr_fwd(
     g_end_exp = jnp.exp(jnp.clip(g_cumsum[..., -1], -20.0, 20.0))[..., None, None]
     g_diff_state = jnp.exp(jnp.clip(g_cumsum[..., -1, None] - g_cumsum, -20.0, 20.0))[..., None]
     k_g_diff = (k_c.astype(jnp.float32) * g_diff_state).astype(input_dtype)
+
+    if seg_hc is not None:
+        # Only the LAST segment of a chunk carries recurrent state OUT of the chunk; mask the
+        # state-update so only last-segment keys are folded in. (The inter-chunk READ mask
+        # and the old-state survival are segment-dependent on the *incoming* state and are
+        # applied inside the scan, where ``state_seg`` is known.)
+        seg_last = seg_hc[..., -1]  # [B, H, NC]
+        same_as_last = (seg_hc == seg_last[..., None]).astype(k_g_diff.dtype)  # [B, H, NC, C]
+        k_g_diff = k_g_diff * same_as_last[..., None]
 
     xs = (
         u_chunks.transpose(2, 0, 1, 3, 4),
@@ -303,7 +344,35 @@ def _recurrent_gdr_fwd(
 
         return new_state, core_out
 
-    final_state, core_out_tm = lax.scan(scan_body, initial_state, xs)
+    def scan_body_seg(carry, inputs):
+        """Segment-aware chunk step for sequence packing.
+
+        Carries ``(state, state_seg)`` where ``state_seg`` is the document id the recurrent
+        ``state`` belongs to. A token reads the incoming state only if its segment matches
+        ``state_seg`` (so a new document never inherits the previous document's memory); the
+        old state survives to the next chunk only if the chunk's last token continues that
+        same document. The outgoing state always represents the chunk's last token's segment.
+        """
+        state, state_seg = carry
+        u, w, q_scaled, attn_intra, g_last_exp, k_scaled, seg_c, seg_last_c = inputs
+
+        read = (seg_c == state_seg[..., None]).astype(state.dtype)[..., None]  # [B, H, C, 1]
+        v_prime = jnp.einsum("bhck,bhkv->bhcv", w, state, precision=_MATMUL_PRECISION) * read
+        attn_inter = jnp.einsum("bhck,bhkv->bhcv", q_scaled, state, precision=_MATMUL_PRECISION) * read
+        v_new = u.astype(jnp.float32) - v_prime
+        core_out = attn_inter + jnp.einsum("bhcr,bhrv->bhcv", attn_intra, v_new, precision=_MATMUL_PRECISION)
+
+        state_update = jnp.einsum("bhkc,bhcv->bhkv", k_scaled.transpose(0, 1, 3, 2), v_new, precision=_MATMUL_PRECISION)
+        survive = (seg_last_c == state_seg).astype(state.dtype)[..., None, None]
+        new_state = jnp.nan_to_num(state * g_last_exp * survive + state_update, nan=0.0, posinf=0.0, neginf=0.0)
+        return (new_state, seg_last_c), core_out
+
+    if seg_hc is None:
+        final_state, core_out_tm = lax.scan(scan_body, initial_state, xs)
+    else:
+        xs_seg = (*xs, seg_hc.transpose(2, 0, 1, 3), seg_last.transpose(2, 0, 1))
+        state_seg0 = seg_hc[:, :, 0, 0]  # segment the (zero) initial state nominally belongs to
+        (final_state, _), core_out_tm = lax.scan(scan_body_seg, (initial_state, state_seg0), xs_seg)
 
     core_out = core_out_tm.transpose(1, 2, 0, 3, 4)
     outputs = core_out.reshape(B, H, -1, V_dim)[:, :, :L, :].astype(input_dtype)
@@ -551,6 +620,13 @@ def _chunk_gdr_fwd_neumann(
 
     Returns:
         Tuple of (outputs, final_state).
+
+    Note:
+        This Neumann-series variant uses a hand-written, SEGMENT-BLIND backward
+        (``_xla_impl_bwd._chunk_gdr_bwd``). It therefore does NOT support sequence
+        packing — there is intentionally no ``seg_ids`` parameter, and packed
+        training must route through ``_chunk_gdr_fwd`` -> ``_recurrent_gdr_fwd``
+        (plain autodiff) so segment boundaries are honored in the backward pass.
     """
     return _chunk_gdr_fwd_impl(
         query,
@@ -634,6 +710,7 @@ def _chunk_gdr_fwd(
     chunk_size: int = 64,
     initial_state: Float[Array, "batch num_heads head_dim d_state"] | None = None,
     use_qk_l2norm: bool = True,
+    seg_ids: Int[Array, "batch seq_len"] | None = None,
 ) -> tuple[
     Float[Array, "batch num_heads seq_len d_state"],
     Float[Array, "batch num_heads head_dim d_state"],
@@ -662,6 +739,12 @@ def _chunk_gdr_fwd(
     Returns:
         Tuple of (outputs, final_state) — see ``_recurrent_gdr_fwd`` for details.
     """
+    # IMPORTANT (sequence packing): this delegates to ``_recurrent_gdr_fwd``, which has NO
+    # custom_vjp — JAX autodiff differentiates through its segmented cumsum + same-segment
+    # masks, so ``seg_ids`` is honored in the BACKWARD pass for free. Do NOT reroute this to
+    # the ``_chunk_gdr_fwd_neumann`` custom_vjp variant when ``seg_ids`` is set: that path's
+    # hand-written backward (``_xla_impl_bwd._chunk_gdr_bwd``) is segment-blind and would
+    # silently produce wrong gradients across document boundaries.
     return _recurrent_gdr_fwd(
         query=query,
         key=key,
@@ -671,6 +754,7 @@ def _chunk_gdr_fwd(
         initial_state=initial_state,
         use_qk_l2norm=use_qk_l2norm,
         chunk_size=chunk_size,
+        seg_ids=seg_ids,
     )
 
 

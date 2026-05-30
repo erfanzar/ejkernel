@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import jaxtyping
 from beartype import beartype
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 
 from ..._registry import Backend, Platform, kernel_registry
 from ._xla_impl_fwd import _chunk_gdr_fwd, _recurrent_gdr_fwd, _single_step_gdr_fwd
@@ -58,6 +58,7 @@ def gated_delta_rule(
     initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
+    seg_ids: Int[Array, "batch seq_len"] | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads v_head_dim"],
     Float[Array, "batch num_heads qk_head_dim v_head_dim"],
@@ -157,6 +158,7 @@ def gated_delta_rule(
             chunk_size=chunk_size,
             initial_state=initial_state,
             use_qk_l2norm=use_qk_l2norm,
+            seg_ids=seg_ids,
         )
     else:
         out, final_state = _recurrent_gdr_fwd(
@@ -165,6 +167,7 @@ def gated_delta_rule(
             value=v,
             beta=b,
             decay=d,
+            seg_ids=seg_ids,
             initial_state=initial_state,
             use_qk_l2norm=use_qk_l2norm,
         )

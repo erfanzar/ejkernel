@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import jaxtyping
 from beartype import beartype
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 
 from ...._registry import Backend, Platform, kernel_registry
 from ...._xla.gated_delta_rule._xla_impl_fwd import (
@@ -40,6 +40,7 @@ def gated_delta_rule(
     initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
+    seg_ids: Int[Array, "batch seq_len"] | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads v_head_dim"],
     Float[Array, "batch num_heads qk_head_dim v_head_dim"],
@@ -90,6 +91,15 @@ def gated_delta_rule(
           — the recurrent state after processing the full sequence, which can
           be fed as ``initial_state`` to a subsequent call.
     """
+
+    # ``seg_ids`` (sequence packing) is accepted for signature parity with the XLA backend
+    # (the kernel registry validates matching signatures across platforms). This Pallas path
+    # does not implement segment-aware recurrence; packed training routes through the XLA
+    # chunked path instead, so seg_ids should never be non-None here.
+    if seg_ids is not None:
+        raise NotImplementedError(
+            "Pallas GDR does not support sequence packing (seg_ids); the packed path uses the XLA backend."
+        )
 
     q = query.transpose(0, 2, 1, 3)
     k = key.transpose(0, 2, 1, 3)

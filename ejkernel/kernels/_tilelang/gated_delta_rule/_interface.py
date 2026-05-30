@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import jaxtyping
 from beartype import beartype
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 
 from ejkernel.errors import EjkernelRuntimeError
 
@@ -44,6 +44,7 @@ def gated_delta_rule(
     initial_state: Float[Array, "batch num_heads qk_head_dim v_head_dim"] | None = None,
     use_qk_l2norm: bool = True,
     use_chunked: bool = True,
+    seg_ids: Int[Array, "batch seq_len"] | None = None,
 ) -> tuple[
     Float[Array, "batch seq_len num_heads v_head_dim"],
     Float[Array, "batch num_heads qk_head_dim v_head_dim"],
@@ -83,6 +84,10 @@ def gated_delta_rule(
             is folded into the kernel and is differentiable.
         use_chunked: Accepted for API compatibility with the XLA backend;
             has no effect on the TileLang kernel.
+        seg_ids: Accepted for signature parity with the XLA backend (sequence
+            packing). The TileLang kernel does not implement segment-aware
+            recurrence, so a non-``None`` value raises ``NotImplementedError``;
+            packed training routes through the XLA backend instead.
 
     Returns:
         A 2-tuple ``(output, final_state)`` where:
@@ -96,7 +101,17 @@ def gated_delta_rule(
     Raises:
         EjkernelRuntimeError: If ``chunk_size <= 0`` or ``use_chunked`` is not
             a bool.
+        NotImplementedError: If ``seg_ids`` is provided (sequence packing is
+            unsupported on the TileLang backend; use the XLA backend instead).
     """
+    # ``seg_ids`` (sequence packing) is accepted for signature parity with the XLA backend
+    # (the kernel registry validates matching signatures across platforms). This TileLang path
+    # does not implement segment-aware recurrence; packed training routes through the XLA
+    # chunked path instead, so seg_ids should never be non-None here.
+    if seg_ids is not None:
+        raise NotImplementedError(
+            "TileLang GDR does not support sequence packing (seg_ids); the packed path uses the XLA backend."
+        )
     if chunk_size <= 0:
         raise EjkernelRuntimeError("tile-lang gated_delta_rule requires chunk_size > 0.")
     if not isinstance(use_chunked, bool):
