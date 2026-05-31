@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "ejkernel"
-version = "0.0.80"
+version = "0.0.80.1"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 readme = "README.md"
@@ -66,9 +66,9 @@ cuda = [
     "jax-cuda13-plugin[with-cuda]~=0.10.0",
     "jax-cuda13-pjrt~=0.10.0",
     "triton==3.6.0",
-    "nvidia-cutlass-dsl[cu13]==4.4.0.dev1",
-    "nvidia-cutlass-dsl-libs-base==4.4.0.dev1",
-    "nvidia-cutlass-dsl-libs-cu13==4.4.0.dev1",
+    "nvidia-cutlass-dsl[cu13]==4.5.2",
+    "nvidia-cutlass-dsl-libs-base==4.5.2",
+    "nvidia-cutlass-dsl-libs-cu13==4.5.2",
     "jax-tvm-ffi==0.1.2",
     "apache-tvm-ffi==0.1.8.post2",
 ]

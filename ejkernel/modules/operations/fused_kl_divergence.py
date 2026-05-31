@@ -516,7 +516,8 @@ def fused_kl_divergence(
             temperatures.
         beta: JSD interpolation factor in ``(0, 1)``; ignored unless
             ``direction="jsd"``.
-        vocab_parallel_axis: TP mesh axis (forward + ``T=1`` only).
+        vocab_parallel_axis: TP mesh axis (forward direction only; any
+            temperature supported).
         return_teacher_entropy: When ``True``, also return the teacher
             entropy ``H(p_t)`` on the output (same reduction + ``T²`` scaling
             as ``loss``, detached). Lets distillation callers recover the

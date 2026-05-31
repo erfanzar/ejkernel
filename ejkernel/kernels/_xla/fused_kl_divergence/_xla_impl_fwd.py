@@ -155,8 +155,10 @@ def fused_kl_divergence(
         temperature: Softmax temperature ``T``; loss scaled by ``T²``.
         beta: JSD interpolation factor (only used when
             ``direction="jsd"``).
-        vocab_parallel_axis: Mesh axis name for TP (forward + ``T=1`` only;
-            other combos fall back to the non-fused path).
+        vocab_parallel_axis: Mesh axis name for TP. Forward direction only
+            (reverse/JSD fall back to the non-fused path); any temperature is
+            supported via a ``1/T`` pre-scale + ``T**2`` post-scale around the
+            vocab-parallel core.
     """
     if reduction not in ("none", "sum", "mean"):
         raise ValueError(f"Invalid reduction '{reduction}'; expected one of none/sum/mean.")
@@ -181,12 +183,24 @@ def fused_kl_divergence(
         wts = weights.astype(jnp.float32)
 
     if vocab_parallel_axis is not None:
-        if direction != "forward" or temperature != 1.0:
+        if direction != "forward":
             raise NotImplementedError(
-                "vocab-parallel mode currently only supports direction='forward' with "
-                "temperature=1.0 in the XLA fallback."
+                "vocab-parallel mode currently only supports direction='forward' in the XLA fallback."
             )
-        per_row = _fused_kl_core_tp(student_logits, teacher_logits, wts, vocab_parallel_axis)
+        # Temperature is a linear 1/T pre-scale on the (still per-shard ``V_local``) logits plus a
+        # T^2 post-scale on the per-row loss. Both compose through ``_fused_kl_core_tp``'s custom_vjp
+        # via outer autodiff, yielding the exact T^2*(1/T)=T-scaled distillation gradient WITHOUT
+        # ever materializing the full vocabulary (the whole point of the vocab-parallel path).
+        if temperature != 1.0:
+            inv_T = 1.0 / float(temperature)
+            per_row = _fused_kl_core_tp(
+                student_logits * inv_T,
+                teacher_logits * inv_T,
+                wts,
+                vocab_parallel_axis,
+            ) * (float(temperature) ** 2)
+        else:
+            per_row = _fused_kl_core_tp(student_logits, teacher_logits, wts, vocab_parallel_axis)
     elif direction == "forward" and temperature == 1.0:
         per_row = _fused_kl_core(student_logits, teacher_logits, wts)
     else:
