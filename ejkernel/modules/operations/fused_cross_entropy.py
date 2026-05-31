@@ -261,26 +261,35 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
         if vocab_parallel_axis is None:
             vocab_parallel_axis = _infer_vocab_axis(in_specs[0])
 
-        targets_spec = in_specs[1] if len(in_specs) > 1 else None
-        leading_axes = _infer_leading_axes(targets_spec)
+        # The logits spec carries the vocab sharding; the per-token spec is just its leading (batch/seq)
+        # dims with the vocab axis dropped. Deriving it here (rather than indexing in_specs[1:]) keeps the
+        # wrapper correct for every operand layout -- sparse targets, dense soft_targets, optional
+        # weights / attention_mask -- and gives the per-row second output its proper sharding.
+        logit_spec = in_specs[0]
+        token_spec = PartitionSpec(*logit_spec[:-1])
+        leading_axes = _infer_leading_axes(token_spec)
 
-        if weights is None:
-            call_args: tuple = (logits, targets)
-            actual_in_specs = in_specs[:2]
-        else:
-            call_args = (logits, targets, weights)
-            actual_in_specs = in_specs[:3]
-        if attention_mask is not None:
+        _is_soft = soft_targets is not None
+        _has_targets = (not _is_soft) and targets is not None
+        _has_weights = weights is not None
+        _has_attention_mask = attention_mask is not None
+
+        # Assemble the sharded operands + specs in a fixed order. ``targets`` (sparse) and
+        # ``soft_targets`` (dense) are mutually exclusive; soft_targets is vocab-sharded like logits.
+        call_args: tuple = (logits,)
+        actual_in_specs: tuple = (logit_spec,)
+        if _is_soft:
+            call_args = (*call_args, soft_targets)
+            actual_in_specs = (*actual_in_specs, logit_spec)
+        elif _has_targets:
+            call_args = (*call_args, targets)
+            actual_in_specs = (*actual_in_specs, token_spec)
+        if _has_weights:
+            call_args = (*call_args, weights)
+            actual_in_specs = (*actual_in_specs, token_spec)
+        if _has_attention_mask:
             call_args = (*call_args, attention_mask)
-            actual_in_specs = in_specs[: len(call_args)]
-        if len(actual_in_specs) != len(call_args):
-            raise ValueError(f"in_specs length {len(actual_in_specs)} != call_args length {len(call_args)}")
-
-        if soft_targets is not None:
-            raise NotImplementedError(
-                "shard_map dispatch with `soft_targets` is not implemented yet. "
-                "Call the kernel directly inside your own shard_map for dense targets."
-            )
+            actual_in_specs = (*actual_in_specs, token_spec)
 
         _run = self.run
         _ignore_index = ignore_index
@@ -291,20 +300,16 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
         _platform = platform
         _cfg = cfg
         _leading = leading_axes
-        _has_weights = weights is not None
-        _has_attention_mask = attention_mask is not None
         _inner_red = "none" if reduction == "none" else "sum"
 
         def _per_device(*args):
             """Run one shard-local loss and merge scalar reductions globally."""
-            ms = None
-            if _has_attention_mask:
-                *args, ms = args
-            if _has_weights:
-                xs, ts, ws = args
-            else:
-                xs, ts = args
-                ws = None
+            args = list(args)
+            xs = args.pop(0)
+            soft = args.pop(0) if _is_soft else None
+            ts = args.pop(0) if _has_targets else None
+            ws = args.pop(0) if _has_weights else None
+            ms = args.pop(0) if _has_attention_mask else None
             local_loss, local_correct = _run(
                 xs,
                 ts,
@@ -312,6 +317,7 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
                 ignore_index=_ignore_index,
                 label_smoothing=_label_smoothing,
                 z_loss=_z_loss,
+                soft_targets=soft,
                 attention_mask=ms,
                 reduction=_inner_red,
                 vocab_parallel_axis=_vocab_axis,
@@ -320,10 +326,12 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
             )
             if _reduction == "none":
                 return local_loss, local_correct
-            if ws is None:
+            if ws is not None:
+                cnt_weights = ws.astype(jnp.float32)
+            elif ts is not None:
                 cnt_weights = (ts != _ignore_index).astype(jnp.float32)
             else:
-                cnt_weights = ws.astype(jnp.float32)
+                cnt_weights = jnp.ones(xs.shape[:-1], dtype=jnp.float32)
             if ms is not None:
                 cnt_weights = cnt_weights * ms.astype(jnp.float32)
             cnt_local = cnt_weights.sum()
@@ -335,8 +343,7 @@ class FusedCrossEntropy(Kernel[FusedCrossEntropyConfig, Array]):
                 final_loss = loss_sum / jnp.maximum(cnt, 1e-8)
             return final_loss, local_correct
 
-        per_row_spec = targets_spec if targets_spec is not None else PartitionSpec()
-        wrapped_out_specs = (out_specs, per_row_spec)
+        wrapped_out_specs = (out_specs, token_spec)
 
         return (
             shard_map(
@@ -611,6 +618,7 @@ def _fused_linear_cross_entropy_dispatch(
     token_chunk_size,
     compute_dtype,
     checkpoint=True,
+    sparse_skip=False,
 ):
     """Route an FLCE call to the token-chunked XLA fused-linear kernel."""
     from ejkernel.kernels._xla.fused_cross_entropy._xla_impl_linear import fused_linear_cross_entropy
@@ -635,12 +643,123 @@ def _fused_linear_cross_entropy_dispatch(
         token_chunk_size=int(token_chunk_size),
         compute_dtype=cdtype,
         checkpoint=checkpoint,
+        sparse_skip=sparse_skip,
     )
     return CrossEntropyOutput(
         loss=loss,
         z_loss=jax.lax.stop_gradient(zl),
         weight_sum=jax.lax.stop_gradient(wsum),
         accuracy=jax.lax.stop_gradient(acc),
+    )
+
+
+def _fused_linear_cross_entropy_vp_dispatch(
+    *,
+    hidden,
+    targets,
+    weights,
+    lm_head_weight,
+    lm_head_bias,
+    lm_head_fn,
+    logit_softcap,
+    attention_mask,
+    ignore_index,
+    reduction,
+    token_chunk_size,
+    compute_dtype,
+    checkpoint,
+    vocab_parallel_axis,
+    mesh,
+    in_specs,
+    out_specs,
+    sparse_skip=False,
+):
+    """Vocab-parallel fused-linear cross-entropy (FLCE) wrapped in ``shard_map``.
+
+    A closure ``lm_head_fn`` cannot be vocab-sharded (``shard_map`` manual mode materializes a closed-over
+    weight in full on every device), so vocab-parallel FLCE requires the raw ``lm_head_weight`` ``[H, V]``
+    sharded ``[H, V/tp]`` and passed as a shard_map argument. Each token chunk projects to ``[chunk,
+    V/tp]`` and the per-chunk CE ``psum``s the softmax normalizer over the vocab axis -- so the full
+    ``[chunk, V]`` logits are never formed. The per-shard token sums are then ``psum``-reduced over the
+    batch/seq mesh axes; gradients flow to ``hidden`` (psum-replicated over the vocab axis) and the local
+    weight slab. ``in_specs`` is ``(hidden_spec, lm_head_weight_spec, ...)``.
+    """
+    from ejkernel.kernels._xla.fused_cross_entropy._xla_impl_linear import fused_linear_cross_entropy
+
+    if targets is None:
+        raise ValueError("FLCE mode requires integer `targets`.")
+    if lm_head_weight is None:
+        raise ValueError(
+            "vocab-parallel FLCE requires `lm_head_weight` (a closure `lm_head_fn` cannot be sharded by "
+            "shard_map; pass the raw [H, V] weight sharded on the vocab axis instead)."
+        )
+    if lm_head_fn is not None:
+        raise ValueError("vocab-parallel FLCE: pass `lm_head_weight`, not `lm_head_fn`.")
+
+    cdtype = jnp.dtype(compute_dtype) if compute_dtype is not None else hidden.dtype
+    eff_weights = _combine_weights(targets, weights, attention_mask, ignore_index, cdtype)
+
+    hidden_spec = in_specs[0]
+    weight_spec = in_specs[1]
+    token_spec = PartitionSpec(*hidden_spec[:-1])
+    leading_axes = _infer_leading_axes(token_spec)
+
+    _has_bias = lm_head_bias is not None
+    call_args: tuple = (hidden, lm_head_weight, targets, eff_weights)
+    actual_in_specs: tuple = (hidden_spec, weight_spec, token_spec, token_spec)
+    if _has_bias:
+        call_args = (*call_args, lm_head_bias)
+        actual_in_specs = (*actual_in_specs, PartitionSpec(weight_spec[-1]))
+
+    _tcs = int(token_chunk_size)
+    _is_mean = reduction == "mean"
+
+    def _per_device(*args):
+        args = list(args)
+        h = args.pop(0)
+        w_head = args.pop(0)
+        t = args.pop(0)
+        w = args.pop(0)
+        b = args.pop(0) if _has_bias else None
+        loss_sum, _z, w_sum, acc = fused_linear_cross_entropy(
+            h,
+            t,
+            w,
+            lm_head_weight=w_head,
+            lm_head_bias=b,
+            lm_head_fn=None,
+            logit_softcap=logit_softcap,
+            ignore_index=ignore_index,
+            reduction="sum",
+            token_chunk_size=_tcs,
+            compute_dtype=cdtype,
+            checkpoint=checkpoint,
+            vocab_parallel_axis=vocab_parallel_axis,
+            sparse_skip=sparse_skip,
+            # Make the per-chunk sparse-skip predicate uniform across the token (batch/seq) shards inside
+            # shard_map, so divergent control flow never deadlocks the inner vocab psum (no-op when
+            # sparse_skip is off).
+            sparse_reduce_axes=tuple(leading_axes),
+        )
+        correct_local = acc * w_sum  # recover the per-shard correct count from the ratio
+        loss_g = jax.lax.psum(loss_sum, leading_axes) if leading_axes else loss_sum
+        w_g = jax.lax.psum(w_sum, leading_axes) if leading_axes else w_sum
+        correct_g = jax.lax.psum(correct_local, leading_axes) if leading_axes else correct_local
+        final_loss = loss_g / jnp.maximum(w_g, jnp.asarray(1e-8, dtype=loss_g.dtype)) if _is_mean else loss_g
+        return final_loss, w_g, correct_g
+
+    loss, w_sum, correct = shard_map(
+        _per_device,
+        mesh=mesh,
+        in_specs=actual_in_specs,
+        out_specs=(out_specs, PartitionSpec(), PartitionSpec()),
+        check_vma=True,
+    )(*call_args)
+    return CrossEntropyOutput(
+        loss=loss,
+        z_loss=jax.lax.stop_gradient(jnp.zeros((), dtype=loss.dtype)),
+        weight_sum=jax.lax.stop_gradient(w_sum),
+        accuracy=jax.lax.stop_gradient(correct / jnp.maximum(w_sum, jnp.asarray(1e-8, dtype=w_sum.dtype))),
     )
 
 
@@ -665,6 +784,7 @@ def fused_cross_entropy(
     vocab_parallel_axis: str | None = None,
     compute_dtype: jnp.dtype | None = None,
     checkpoint: bool = True,
+    sparse_skip: bool = False,
     platform: PlatformName | None = None,
     cfg: FusedCrossEntropyConfig | None = None,
     mesh: Mesh | None = None,
@@ -799,6 +919,33 @@ def fused_cross_entropy(
         ... )
     """
     if hidden is not None:
+        # Vocab-parallel FLCE: when a mesh + specs are supplied and the vocab axis is given (explicitly or
+        # inferred from the lm_head_weight spec's last dim), run the token-chunked projection + CE inside a
+        # shard_map with a column-parallel ``[H, V/tp]`` weight so the full ``[chunk, V]`` is never formed.
+        flce_vp_axis = vocab_parallel_axis
+        if flce_vp_axis is None and lm_head_weight is not None and in_specs is not None and len(in_specs) > 1:
+            flce_vp_axis = _infer_vocab_axis(in_specs[1])
+        if flce_vp_axis is not None and mesh is not None and in_specs is not None and out_specs is not None:
+            return _fused_linear_cross_entropy_vp_dispatch(
+                hidden=hidden,
+                targets=targets,
+                weights=weights,
+                lm_head_weight=lm_head_weight,
+                lm_head_bias=lm_head_bias,
+                lm_head_fn=lm_head_fn,
+                logit_softcap=logit_softcap,
+                attention_mask=attention_mask,
+                ignore_index=ignore_index,
+                reduction=reduction,
+                token_chunk_size=chunk_size,
+                compute_dtype=compute_dtype,
+                checkpoint=checkpoint,
+                vocab_parallel_axis=flce_vp_axis,
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                sparse_skip=sparse_skip,
+            )
         return _fused_linear_cross_entropy_dispatch(
             hidden=hidden,
             targets=targets,
@@ -815,6 +962,7 @@ def fused_cross_entropy(
             token_chunk_size=chunk_size,
             compute_dtype=compute_dtype,
             checkpoint=checkpoint,
+            sparse_skip=sparse_skip,
         )
 
     if chunk_size and soft_targets is None and vocab_parallel_axis is None and mesh is None:
@@ -839,6 +987,15 @@ def fused_cross_entropy(
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
+        # The vocab-parallel custom backward needs VMA (varying-manual-axis)
+        # propagation through shard_map to be differentiated correctly. Without
+        # check_vma the per-shard normalization term is dropped from the VJP and
+        # the logit gradient is wrong (value exact, grad ~off). Force it on
+        # whenever vocab-parallel reduction is requested -- explicitly or inferred
+        # from in_specs (same inference run() uses) -- so the op API produces
+        # exact gradients without the caller knowing this quirk.
+        if (vocab_parallel_axis if vocab_parallel_axis is not None else _infer_vocab_axis(in_specs[0])) is not None:
+            check_vma = True
 
     loss, per_row_correct = _executor(
         FusedCrossEntropy(),

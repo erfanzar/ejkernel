@@ -38,7 +38,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from ._xla_impl_bwd import _ce_bwd, _ce_fwd, _ce_tp_bwd, _ce_tp_fwd
+from ._xla_impl_bwd import _ce_bwd, _ce_fwd, _ce_tp_bwd, _ce_tp_fwd, _soft_ce_tp_bwd, _soft_ce_tp_fwd
 
 
 def _per_token_weights(targets, weights, ignore_index):
@@ -106,6 +106,28 @@ def _fused_ce_core_tp(logits_local, targets, weights, ignore_index, vocab_axis):
 _fused_ce_core_tp.defvjp(_ce_tp_fwd, _ce_tp_bwd)
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(2,))
+def _fused_soft_ce_core_tp(logits_local, soft_local, vocab_axis):
+    """Vocab-parallel *dense* (soft-target) CE on the per-shard ``V_local`` slice.
+
+    Must be called inside ``shard_map`` with ``vocab_axis`` as the sharded vocab mesh axis. Returns the
+    *unweighted* per-row loss ``-Σ_v soft_v·log_softmax_v`` (global softmax via ``pmax``/``psum``). The
+    custom VJP keeps ``pmax`` out of autodiff and emits a fully local ``(softmax·S - soft)`` backward.
+    """
+    local_max = jnp.max(logits_local, axis=-1)
+    local_se = jnp.sum(jnp.exp(logits_local - local_max[..., None]), axis=-1)
+    global_max = jax.lax.pmax(local_max, vocab_axis)
+    scaled_local_se = local_se * jnp.exp(local_max - global_max)
+    global_se = jax.lax.psum(scaled_local_se, vocab_axis)
+    lse = jnp.log(global_se) + global_max
+    local_dot = jnp.sum(soft_local * (logits_local - lse[..., None]), axis=-1)
+    per_row = -jax.lax.psum(local_dot, vocab_axis)
+    return per_row.astype(jnp.float32)
+
+
+_fused_soft_ce_core_tp.defvjp(_soft_ce_tp_fwd, _soft_ce_tp_bwd)
+
+
 def _label_smoothing_correction(logits, lse, targets, weights, label_smoothing):
     """Compute the label-smoothing loss correction in pure JAX.
 
@@ -159,17 +181,25 @@ def fused_cross_entropy(
     if soft_targets is not None:
         if label_smoothing > 0.0:
             raise ValueError("`label_smoothing` cannot combine with `soft_targets` — apply smoothing externally.")
-        if vocab_parallel_axis is not None:
-            raise ValueError("Dense (soft-target) CE does not support vocab-parallel mode yet.")
         if soft_targets.shape != logits.shape:
             raise ValueError(f"soft_targets.shape={soft_targets.shape} must equal logits.shape={logits.shape}")
-        max_logit = jnp.max(logits, axis=-1, keepdims=True)
-        shifted = logits - max_logit
-        lse = jnp.log(jnp.sum(jnp.exp(shifted), axis=-1)) + max_logit[..., 0]
-        log_softmax = logits - lse[..., None]
-        per_row = -jnp.sum(soft_targets * log_softmax, axis=-1)
-        if z_loss > 0.0:
-            per_row = per_row + z_loss * lse * lse
+        if vocab_parallel_axis is None:
+            max_logit = jnp.max(logits, axis=-1, keepdims=True)
+            shifted = logits - max_logit
+            lse = jnp.log(jnp.sum(jnp.exp(shifted), axis=-1)) + max_logit[..., 0]
+            log_softmax = logits - lse[..., None]
+            per_row = -jnp.sum(soft_targets * log_softmax, axis=-1)
+            if z_loss > 0.0:
+                per_row = per_row + z_loss * lse * lse
+        else:
+            # Vocab-parallel dense (soft-target) CE via the custom-VJP core: builds the global softmax
+            # with pmax+psum over the vocab axis (kept out of autodiff) and emits a local
+            # ``(softmax·S - soft)`` backward. Returns the unweighted per-row loss (weights applied below).
+            if z_loss > 0.0:
+                raise NotImplementedError(
+                    "z_loss is not yet wired through the vocab-parallel dense (soft-target) XLA path."
+                )
+            per_row = _fused_soft_ce_core_tp(logits, soft_targets, vocab_parallel_axis)
         if weights is not None:
             if weights.shape != logits.shape[:-1]:
                 raise ValueError(f"weights.shape={weights.shape} must equal logits.shape[:-1]={logits.shape[:-1]}")

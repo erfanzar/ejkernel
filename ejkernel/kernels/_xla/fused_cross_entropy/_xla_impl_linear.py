@@ -43,7 +43,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from ._xla_impl_fwd import _fused_ce_core, _label_smoothing_correction
+from ._xla_impl_fwd import _fused_ce_core, _fused_ce_core_tp, _label_smoothing_correction
 
 
 def _default_token_chunk_size(seq_len: int, vocab_size: int | None, dtype_bytes: int) -> int:
@@ -73,6 +73,9 @@ def fused_linear_cross_entropy(
     token_chunk_size: int = 0,
     compute_dtype: jnp.dtype | None = None,
     checkpoint: bool = True,
+    vocab_parallel_axis: str | None = None,
+    sparse_skip: bool = False,
+    sparse_reduce_axes: tuple[str, ...] = (),
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Token-chunked fused linear cross-entropy.
 
@@ -111,6 +114,8 @@ def fused_linear_cross_entropy(
         raise ValueError(f"fused_linear_cross_entropy supports reduction sum/mean, got {reduction!r}")
     if (lm_head_weight is None) == (lm_head_fn is None):
         raise ValueError("provide exactly one of `lm_head_weight` or `lm_head_fn`.")
+    if vocab_parallel_axis is not None and (label_smoothing > 0.0 or z_loss > 0.0):
+        raise NotImplementedError("label_smoothing / z_loss are not yet wired through the vocab-parallel FLCE path.")
     if hidden.ndim < 2:
         raise ValueError(f"hidden must be at least rank-2 ([..., T, H]); got shape {hidden.shape}.")
     if targets.shape != hidden.shape[:-1]:
@@ -141,30 +146,46 @@ def fused_linear_cross_entropy(
         valid = chunk_targets != ignore_index
         safe = jnp.where(valid, chunk_targets, 0).astype(jnp.int32)
         w = valid.astype(compute_dtype) if chunk_weights is None else valid.astype(compute_dtype) * chunk_weights
-        # Base CE via the analytic custom-VJP core (``softmax - onehot``). Under the
-        # outer ``jax.checkpoint`` this hand-written backward schedules markedly
-        # better than autodiff-through-logsumexp + take_along_axis (~5% faster
-        # fwd+bwd on TPU), and matches the dense path's gradient exactly. ``per_row``
-        # is ``(lse - target_logit) * w``.
-        per_row = _fused_ce_core(logits, safe, w, ignore_index)
-        z_row = jnp.zeros_like(per_row)
-        if label_smoothing > 0.0 or z_loss > 0.0:
-            lse = jax.scipy.special.logsumexp(logits, axis=-1)
-            if label_smoothing > 0.0:
-                per_row = per_row + _label_smoothing_correction(logits, lse, safe, w, label_smoothing) * w
-            if z_loss > 0.0:
-                z_row = z_loss * lse * lse * w
-                per_row = per_row + z_row
+        if vocab_parallel_axis is not None:
+            # Vocab-parallel FLCE: each ``_project`` produced the per-shard ``[chunk, V_local]`` slice
+            # (column-parallel LM head); the TP core merges the softmax normalizer + gathers the (possibly
+            # cross-shard) target logit via psum, so the per-row loss is globally correct without ever
+            # forming the full ``[chunk, V]``. Backward is the local ``(softmax - onehot)`` slab.
+            per_row = _fused_ce_core_tp(logits, safe, w, ignore_index, vocab_parallel_axis)
+            z_row = jnp.zeros_like(per_row)
+            # Cross-shard argmax for accuracy (a pure metric -- fully detached so the ``pmax`` never enters
+            # autodiff): the shard owning the global max contributes its global token id; ``psum`` reduces
+            # to that id on every shard.
+            det_logits = jax.lax.stop_gradient(logits)
+            tp_idx = jax.lax.axis_index(vocab_parallel_axis)
+            local_best_val = jnp.max(det_logits, axis=-1)
+            local_best_id = tp_idx * det_logits.shape[-1] + jnp.argmax(det_logits, axis=-1).astype(jnp.int32)
+            global_best_val = jax.lax.pmax(local_best_val, vocab_parallel_axis)
+            is_winner = local_best_val >= global_best_val
+            global_best_id = jax.lax.psum(jnp.where(is_winner, local_best_id, 0), vocab_parallel_axis)
+            correct = jnp.sum((global_best_id == chunk_targets).astype(compute_dtype) * jax.lax.stop_gradient(w))
+        else:
+            # Base CE via the analytic custom-VJP core (``softmax - onehot``). Under the
+            # outer ``jax.checkpoint`` this hand-written backward schedules markedly
+            # better than autodiff-through-logsumexp + take_along_axis (~5% faster
+            # fwd+bwd on TPU), and matches the dense path's gradient exactly. ``per_row``
+            # is ``(lse - target_logit) * w``.
+            per_row = _fused_ce_core(logits, safe, w, ignore_index)
+            z_row = jnp.zeros_like(per_row)
+            if label_smoothing > 0.0 or z_loss > 0.0:
+                lse = jax.scipy.special.logsumexp(logits, axis=-1)
+                if label_smoothing > 0.0:
+                    per_row = per_row + _label_smoothing_correction(logits, lse, safe, w, label_smoothing) * w
+                if z_loss > 0.0:
+                    z_row = z_loss * lse * lse * w
+                    per_row = per_row + z_row
+            correct = jnp.sum((jnp.argmax(logits, axis=-1) == chunk_targets).astype(compute_dtype) * w)
         # _fused_ce_core returns fp32 per-row; cast the sums back to compute_dtype
         # so the fori_loop carry types match and the output contract is preserved.
         loss_sum = jnp.sum(per_row).astype(compute_dtype)
         z_sum = jnp.sum(z_row).astype(compute_dtype)
         w_sum = jnp.sum(w)
-        correct = jnp.sum((jnp.argmax(logits, axis=-1) == chunk_targets).astype(compute_dtype) * w)
         return loss_sum, z_sum, w_sum, correct
-
-    if checkpoint:
-        _chunk_loss = jax.checkpoint(_chunk_loss, prevent_cse=False)
 
     # Pad the token axis up to a whole number of chunks (ignored labels => zero weight).
     pad_len = (-seq_len) % token_chunk_size
@@ -179,15 +200,60 @@ def fused_linear_cross_entropy(
             weights = jnp.pad(weights, t_pad)
     num_chunks = (seq_len + pad_len) // token_chunk_size
 
+    # Sparse skip: only the leading chunks that contain a real (unmasked) token do work; the trailing
+    # fully-masked chunks (the common case -- a short prompt right-padded to a long ``max_length``) are
+    # skipped. ``fori_loop`` must keep a STATIC trip count for reverse-mode AD, so the loop still spans all
+    # ``num_chunks`` and each chunk is gated by ``i < sparse_upper`` -- but ``sparse_upper`` is computed ONCE
+    # (not a per-chunk predicate) and is UNIFORM across mesh shards, so the gate never diverges: every shard
+    # runs the same branch each iteration and the inner vocab ``psum`` stays in lock-step (a per-shard /
+    # per-chunk predicate would deadlock shard_map). Uniformity: under SPMD the reduction already
+    # all-reduces to a replicated scalar; under shard_map we ``pmax`` over the token (batch/seq) mesh axes.
+    # Trailing-only -- interior / left padding simply isn't skipped (still correct, just not faster).
+    sparse_upper = None
+    if sparse_skip:
+        active = targets != ignore_index
+        if weights is not None:
+            active = active & (weights > 0)
+        active_chunks = jnp.any(
+            active.reshape(*active.shape[:-1], num_chunks, token_chunk_size),
+            axis=tuple(a for a in range(active.ndim + 1) if a != active.ndim - 1),
+        )  # [num_chunks]
+        idx = jnp.arange(num_chunks, dtype=jnp.int32)
+        sparse_upper = jnp.max(jnp.where(active_chunks, idx + 1, 0)).astype(jnp.int32)
+        if sparse_reduce_axes:
+            sparse_upper = jax.lax.pmax(sparse_upper, sparse_reduce_axes)
+
+    def _chunk_step(ch, ct, cw, i):
+        if sparse_skip:
+
+            def _skip():
+                zr = jnp.zeros((), compute_dtype) * jnp.sum(ch.astype(compute_dtype))
+                return zr, zr, zr, zr
+
+            return lax.cond(i < sparse_upper, lambda: _chunk_loss(ch, ct, cw), _skip)
+        return _chunk_loss(ch, ct, cw)
+
+    # Checkpoint the whole per-chunk step (the ``cond`` included, not just the inner projection+CE): the
+    # backward then recomputes a skipped chunk as the trivial ``_skip`` branch instead of re-running the
+    # LM-head projection, so the sparse skip carries through to the gradient pass too.
+    if checkpoint:
+        _chunk_step = jax.checkpoint(_chunk_step, prevent_cse=False)
+
     def _accumulate(i, carry):
         start = i * token_chunk_size
         ch = lax.dynamic_slice_in_dim(hidden, start, token_chunk_size, axis=-2)
         ct = lax.dynamic_slice_in_dim(targets, start, token_chunk_size, axis=-1)
         cw = None if weights is None else lax.dynamic_slice_in_dim(weights, start, token_chunk_size, axis=-1)
-        loss_sum, z_sum, w_sum, correct = _chunk_loss(ch, ct, cw)
+        loss_sum, z_sum, w_sum, correct = _chunk_step(ch, ct, cw, i)
         return (carry[0] + loss_sum, carry[1] + z_sum, carry[2] + w_sum, carry[3] + correct)
 
     zero = jnp.array(0.0, dtype=compute_dtype)
+    if vocab_parallel_axis is not None:
+        # Seed the accumulators with the varying-manual-axis (VMA) type of the (possibly batch/seq-sharded)
+        # inputs so the fori_loop carry-in matches the carry-out under shard_map(check_vma=True) -- the
+        # per-chunk loss varies over the batch/seq mesh axes, the bare scalar zero does not. The
+        # ``0 * sum(hidden)`` term contributes neither value nor gradient; it only carries the VMA tag.
+        zero = zero + jnp.zeros((), compute_dtype) * jnp.sum(hidden.astype(compute_dtype))
     total_loss, total_z_loss, weight_sum, correct_sum = lax.fori_loop(
         0, num_chunks, _accumulate, (zero, zero, zero, zero)
     )

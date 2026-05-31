@@ -516,7 +516,7 @@ def fused_kl_divergence(
             temperatures.
         beta: JSD interpolation factor in ``(0, 1)``; ignored unless
             ``direction="jsd"``.
-        vocab_parallel_axis: TP mesh axis (forward direction only; any
+        vocab_parallel_axis: TP mesh axis (forward / reverse / JSD all supported; any
             temperature supported).
         return_teacher_entropy: When ``True``, also return the teacher
             entropy ``H(p_t)`` on the output (same reduction + ``T²`` scaling
@@ -586,6 +586,15 @@ def fused_kl_divergence(
     method = None
     if mesh is not None and in_specs is not None and out_specs is not None:
         method = "shard_map"
+        # The vocab-parallel custom backward needs VMA (varying-manual-axis)
+        # propagation through shard_map to be differentiated correctly. Without
+        # check_vma the per-shard normalization term is dropped from the VJP and
+        # the student-logit gradient is wrong (~7% rel error, value exact). Force
+        # it on whenever vocab-parallel reduction is requested -- explicitly or
+        # inferred from in_specs (same inference run() uses) -- so the op API
+        # produces exact gradients without the caller knowing this quirk.
+        if (vocab_parallel_axis if vocab_parallel_axis is not None else _infer_vocab_axis(in_specs[0])) is not None:
+            check_vma = True
 
     loss = _executor(
         FusedKLDivergence(),

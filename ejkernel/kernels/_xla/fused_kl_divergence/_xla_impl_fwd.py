@@ -129,6 +129,53 @@ def _kl_per_row(student_logits, teacher_logits, weights, direction, temperature,
     return (per_row * weights).astype(jnp.float32)
 
 
+def _kl_per_row_tp(student_logits, teacher_logits, weights, direction, temperature, beta, vocab_axis):
+    """Vocab-parallel per-row KL for *any* direction (forward / reverse / JSD) + temperature.
+
+    Mirrors :func:`_kl_per_row` but the inputs are the per-shard ``(..., V_local)`` slices and the
+    softmax normalizers (and the JSD log-mixture) are built globally with an online-softmax
+    ``pmax`` + ``psum`` over ``vocab_axis``; the per-row divergence is then ``psum``-reduced across
+    shards. ``pmax`` is fed a ``stop_gradient`` input -- the global max only re-centers the exp and the
+    loss is invariant to it -- so plain autodiff differentiates the (differentiable) ``psum`` collectives
+    directly, with no hand-written VJP. Must be called inside ``shard_map``.
+    """
+    inv_T = 1.0 / float(temperature)
+    s = student_logits.astype(jnp.float32) * inv_T
+    t = teacher_logits.astype(jnp.float32) * inv_T
+
+    def _log_softmax_tp(z):
+        global_max = jax.lax.pmax(jax.lax.stop_gradient(jnp.max(z, axis=-1)), vocab_axis)
+        global_se = jax.lax.psum(jnp.sum(jnp.exp(z - global_max[..., None]), axis=-1), vocab_axis)
+        return z - (jnp.log(global_se) + global_max)[..., None]
+
+    log_p_s = _log_softmax_tp(s)
+    log_p_t = _log_softmax_tp(t)
+    p_s = jnp.exp(log_p_s)
+    p_t = jnp.exp(log_p_t)
+
+    if direction == "forward":
+        local = jnp.sum(p_t * (log_p_t - log_p_s), axis=-1)
+    elif direction == "reverse":
+        local = jnp.sum(p_s * (log_p_s - log_p_t), axis=-1)
+    elif direction == "jsd":
+        log_beta = jnp.log(jnp.asarray(beta, dtype=jnp.float32))
+        log_one_minus_beta = jnp.log1p(-jnp.asarray(beta, dtype=jnp.float32))
+        log_m = jax.scipy.special.logsumexp(
+            jnp.stack([log_p_t + log_beta, log_p_s + log_one_minus_beta]),
+            axis=0,
+        )
+        local = beta * jnp.sum(p_t * (log_p_t - log_m), axis=-1) + (1.0 - beta) * jnp.sum(
+            p_s * (log_p_s - log_m), axis=-1
+        )
+    else:
+        raise ValueError(f"direction must be forward / reverse / jsd; got {direction!r}")
+
+    per_row = jax.lax.psum(local, vocab_axis)
+    if temperature != 1.0:
+        per_row = per_row * (float(temperature) ** 2)
+    return (per_row * weights).astype(jnp.float32)
+
+
 def fused_kl_divergence(
     student_logits,
     teacher_logits,
@@ -183,24 +230,27 @@ def fused_kl_divergence(
         wts = weights.astype(jnp.float32)
 
     if vocab_parallel_axis is not None:
-        if direction != "forward":
-            raise NotImplementedError(
-                "vocab-parallel mode currently only supports direction='forward' in the XLA fallback."
-            )
-        # Temperature is a linear 1/T pre-scale on the (still per-shard ``V_local``) logits plus a
-        # T^2 post-scale on the per-row loss. Both compose through ``_fused_kl_core_tp``'s custom_vjp
-        # via outer autodiff, yielding the exact T^2*(1/T)=T-scaled distillation gradient WITHOUT
-        # ever materializing the full vocabulary (the whole point of the vocab-parallel path).
-        if temperature != 1.0:
-            inv_T = 1.0 / float(temperature)
-            per_row = _fused_kl_core_tp(
-                student_logits * inv_T,
-                teacher_logits * inv_T,
-                wts,
-                vocab_parallel_axis,
-            ) * (float(temperature) ** 2)
+        if direction == "forward":
+            # Forward KL keeps the memory-optimal custom_vjp core. Temperature is a linear 1/T pre-scale
+            # on the (still per-shard ``V_local``) logits plus a T^2 post-scale on the per-row loss; both
+            # compose through ``_fused_kl_core_tp``'s custom_vjp via outer autodiff, yielding the exact
+            # T^2*(1/T)=T-scaled distillation gradient WITHOUT ever materializing the full vocabulary.
+            if temperature != 1.0:
+                inv_T = 1.0 / float(temperature)
+                per_row = _fused_kl_core_tp(
+                    student_logits * inv_T,
+                    teacher_logits * inv_T,
+                    wts,
+                    vocab_parallel_axis,
+                ) * (float(temperature) ** 2)
+            else:
+                per_row = _fused_kl_core_tp(student_logits, teacher_logits, wts, vocab_parallel_axis)
         else:
-            per_row = _fused_kl_core_tp(student_logits, teacher_logits, wts, vocab_parallel_axis)
+            # Reverse / JSD vocab-parallel via the plain-autodiff per-row path (global softmax + log-mixture
+            # built with pmax+psum over the vocab axis; gradient flows through the differentiable psum).
+            per_row = _kl_per_row_tp(
+                student_logits, teacher_logits, wts, direction, float(temperature), float(beta), vocab_parallel_axis
+            )
     elif direction == "forward" and temperature == 1.0:
         per_row = _fused_kl_core(student_logits, teacher_logits, wts)
     else:

@@ -121,4 +121,47 @@ def _ce_tp_bwd(ignore_index, vocab_axis, residual, dy):
     return (dlogits_local.astype(logits_local.dtype), None, None)
 
 
-__all__ = ("_ce_bwd", "_ce_fwd", "_ce_tp_bwd", "_ce_tp_fwd")
+def _soft_ce_tp_fwd(logits_local, soft_local, vocab_axis):
+    """VJP primal for vocab-parallel *dense* (soft-target) cross-entropy.
+
+    Builds the global log-sum-exp via an online-softmax ``pmax`` + ``psum`` over the vocab axis (the
+    ``pmax`` lives only here, never under autodiff), then ``psum``-reduces the per-row
+    ``soft·(logits - lse)`` dot product across shards. Returns the *unweighted* per-row loss; the caller
+    multiplies by the token weights. Caches the per-shard softmax state + global soft mass for a fully
+    local backward.
+    """
+    local_max = jnp.max(logits_local, axis=-1)
+    local_se = jnp.sum(jnp.exp(logits_local - local_max[..., None]), axis=-1)
+    global_max = jax.lax.pmax(local_max, vocab_axis)
+    scaled_local_se = local_se * jnp.exp(local_max - global_max)
+    global_se = jax.lax.psum(scaled_local_se, vocab_axis)
+    lse = jnp.log(global_se) + global_max
+    local_dot = jnp.sum(soft_local * (logits_local - lse[..., None]), axis=-1)
+    per_row = -jax.lax.psum(local_dot, vocab_axis)
+    soft_mass = jax.lax.psum(jnp.sum(soft_local, axis=-1), vocab_axis)
+    residual = (logits_local, global_max, global_se, soft_local, soft_mass)
+    return per_row.astype(jnp.float32), residual
+
+
+def _soft_ce_tp_bwd(vocab_axis, residual, dy):
+    """Backward for vocab-parallel dense CE: ``dlogits = (softmax·S - soft) · dy`` (local, no collectives).
+
+    ``S`` is the per-row global soft mass (1 for a normalized distribution); each shard owns its slice
+    of the (global) softmax and its slice of ``soft_targets``, so the slab is exact without any psum.
+    """
+    del vocab_axis
+    logits_local, global_max, global_se, soft_local, soft_mass = residual
+    probs_local = jnp.exp(logits_local - global_max[..., None]) / global_se[..., None]
+    factor = dy.astype(probs_local.dtype)[..., None]
+    dlogits_local = (probs_local * soft_mass[..., None] - soft_local) * factor
+    return (dlogits_local.astype(logits_local.dtype), None)
+
+
+__all__ = (
+    "_ce_bwd",
+    "_ce_fwd",
+    "_ce_tp_bwd",
+    "_ce_tp_fwd",
+    "_soft_ce_tp_bwd",
+    "_soft_ce_tp_fwd",
+)
