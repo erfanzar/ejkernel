@@ -108,6 +108,13 @@ def _infer_vocab_axis(logits_spec: PartitionSpec | None) -> str | None:
     last = logits_spec[-1]
     if isinstance(last, str):
         return last
+    if isinstance(last, tuple) and len(last) > 0:
+        # Vocab sharded over >1 mesh axis. The collectives below take a single axis name, so silently
+        # falling back to the dense per-shard KL would use a wrong (partial-vocab) normalizer -- fail loud.
+        raise NotImplementedError(
+            f"Vocab parallelism over multiple mesh axes (logits_spec[-1]={last!r}) is not supported; "
+            "shard the vocab dimension over a single mesh axis."
+        )
     return None
 
 

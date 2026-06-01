@@ -162,7 +162,10 @@ def fused_linear_cross_entropy(
             local_best_id = tp_idx * det_logits.shape[-1] + jnp.argmax(det_logits, axis=-1).astype(jnp.int32)
             global_best_val = jax.lax.pmax(local_best_val, vocab_parallel_axis)
             is_winner = local_best_val >= global_best_val
-            global_best_id = jax.lax.psum(jnp.where(is_winner, local_best_id, 0), vocab_parallel_axis)
+            # Deterministic tie-break: when >=2 shards hold the global max, ``psum`` of ids would *sum* them
+            # into a bogus id. Take the smallest winning id via ``pmin`` (losers carry a large sentinel).
+            cand_id = jnp.where(is_winner, local_best_id, jnp.int32(2**30))
+            global_best_id = jax.lax.pmin(cand_id, vocab_parallel_axis)
             correct = jnp.sum((global_best_id == chunk_targets).astype(compute_dtype) * jax.lax.stop_gradient(w))
         else:
             # Base CE via the analytic custom-VJP core (``softmax - onehot``). Under the

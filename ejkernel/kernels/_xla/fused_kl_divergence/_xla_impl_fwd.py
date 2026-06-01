@@ -44,6 +44,9 @@ from ._xla_impl_bwd import _kl_bwd, _kl_fwd, _kl_tp_bwd, _kl_tp_fwd
 @jax.custom_vjp
 def _fused_kl_core(student, teacher, weights):
     """Per-row forward KL on rank-N ``(..., V)`` tensors."""
+    # fp32 softmax to match the reverse/JSD paths -- a bf16 log_softmax diverges from dense by ~2.5e-2.
+    student = student.astype(jnp.float32)
+    teacher = teacher.astype(jnp.float32)
     log_p_t = jax.nn.log_softmax(teacher, axis=-1)
     log_p_s = jax.nn.log_softmax(student, axis=-1)
     p_t = jnp.exp(log_p_t)
@@ -61,6 +64,10 @@ def _fused_kl_core_tp(student_local, teacher_local, weights, vocab_axis):
     Both inputs are ``(..., V_local)`` per-shard slices. Must be called
     inside ``shard_map`` with ``vocab_axis`` as the TP mesh axis.
     """
+    # fp32 softmax merge -- the cross-shard online ``exp(local_max - global_max)`` accumulates bf16 error
+    # across shards, diverging from dense by ~2.5e-2; the reverse/JSD paths already upcast.
+    student_local = student_local.astype(jnp.float32)
+    teacher_local = teacher_local.astype(jnp.float32)
     local_max_t = jnp.max(teacher_local, axis=-1)
     local_se_t = jnp.sum(jnp.exp(teacher_local - local_max_t[..., None]), axis=-1)
     local_max_s = jnp.max(student_local, axis=-1)
@@ -202,10 +209,9 @@ def fused_kl_divergence(
         temperature: Softmax temperature ``T``; loss scaled by ``T²``.
         beta: JSD interpolation factor (only used when
             ``direction="jsd"``).
-        vocab_parallel_axis: Mesh axis name for TP. Forward direction only
-            (reverse/JSD fall back to the non-fused path); any temperature is
-            supported via a ``1/T`` pre-scale + ``T**2`` post-scale around the
-            vocab-parallel core.
+        vocab_parallel_axis: Mesh axis name for TP. Forward, reverse, and JSD are
+            all supported under vocab parallelism; any temperature is supported via
+            a ``1/T`` pre-scale + ``T**2`` post-scale around the vocab-parallel core.
     """
     if reduction not in ("none", "sum", "mean"):
         raise ValueError(f"Invalid reduction '{reduction}'; expected one of none/sum/mean.")

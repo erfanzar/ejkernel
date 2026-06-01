@@ -41,8 +41,10 @@ def _kl_fwd(student, teacher, weights):
 
     Caches both softmaxes for the analytic backward.
     """
-    log_p_t = jax.nn.log_softmax(teacher, axis=-1)
-    log_p_s = jax.nn.log_softmax(student, axis=-1)
+    # fp32 softmax (bf16 log_softmax diverges ~2.5e-2); residual keeps the original dtype so the
+    # backward casts ``dstudent`` back to the student's dtype.
+    log_p_t = jax.nn.log_softmax(teacher.astype(jnp.float32), axis=-1)
+    log_p_s = jax.nn.log_softmax(student.astype(jnp.float32), axis=-1)
     p_t = jnp.exp(log_p_t)
     p_s = jnp.exp(log_p_s)
     per_row = jnp.sum(p_t * (log_p_t - log_p_s), axis=-1) * weights
@@ -68,6 +70,11 @@ def _kl_tp_fwd(student_local, teacher_local, weights, vocab_axis):
     *globally correct* KL. Caches the rescaled per-shard probabilities
     so the backward is fully local.
     """
+    # fp32 softmax merge (bf16 cross-shard online-softmax diverges ~2.5e-2); ``s_in``/``t_in`` keep the
+    # original dtype so the backward casts ``dstudent`` back to the student's dtype.
+    s_in, t_in = student_local, teacher_local
+    student_local = student_local.astype(jnp.float32)
+    teacher_local = teacher_local.astype(jnp.float32)
     local_max_t = jnp.max(teacher_local, axis=-1)
     local_se_t = jnp.sum(jnp.exp(teacher_local - local_max_t[..., None]), axis=-1)
     local_max_s = jnp.max(student_local, axis=-1)
@@ -88,7 +95,7 @@ def _kl_tp_fwd(student_local, teacher_local, weights, vocab_axis):
 
     local_loss_part = jnp.sum(p_t_local * (log_p_t_local - log_p_s_local), axis=-1)
     per_row = jax.lax.psum(local_loss_part, vocab_axis) * weights
-    residual = (p_s_local, p_t_local, weights, student_local, teacher_local)
+    residual = (p_s_local, p_t_local, weights, s_in, t_in)
     return per_row.astype(jnp.float32), residual
 
 
