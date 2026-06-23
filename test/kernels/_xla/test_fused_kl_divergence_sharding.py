@@ -39,11 +39,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from ejkernel.modules.operations import fused_kl_divergence
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
-
-from ejkernel.modules.operations import fused_kl_divergence
 
 if jax.device_count() < 2:
     pytest.skip(
@@ -72,16 +71,30 @@ def _mesh():
 
 def _dense(student, teacher, mask, direction, beta=0.5):
     return fused_kl_divergence(
-        student, teacher, mask, reduction="mean", direction=direction,
-        temperature=TEMP, beta=beta, platform="xla",
+        student,
+        teacher,
+        mask,
+        reduction="mean",
+        direction=direction,
+        temperature=TEMP,
+        beta=beta,
+        platform="xla",
     ).loss
 
 
 def _sharded(student, teacher, mask, mesh, direction, beta=0.5):
     return fused_kl_divergence(
-        student, teacher, mask, reduction="mean", direction=direction,
-        temperature=TEMP, beta=beta, platform="xla",
-        mesh=mesh, in_specs=(LOGIT_SPEC, LOGIT_SPEC, TOKEN_SPEC), out_specs=P(),
+        student,
+        teacher,
+        mask,
+        reduction="mean",
+        direction=direction,
+        temperature=TEMP,
+        beta=beta,
+        platform="xla",
+        mesh=mesh,
+        in_specs=(LOGIT_SPEC, LOGIT_SPEC, TOKEN_SPEC),
+        out_specs=P(),
     ).loss
 
 
@@ -114,8 +127,7 @@ def test_xla_vocab_parallel_cakld_blend_parity():
     gamma = 0.7
     ref = gamma * _dense(student, teacher, mask, "reverse") + (1.0 - gamma) * _dense(student, teacher, mask, "forward")
     with mesh:
-        got = (
-            gamma * _sharded(student, teacher, mask, mesh, "reverse")
-            + (1.0 - gamma) * _sharded(student, teacher, mask, mesh, "forward")
+        got = gamma * _sharded(student, teacher, mask, mesh, "reverse") + (1.0 - gamma) * _sharded(
+            student, teacher, mask, mesh, "forward"
         )
     np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=0.0, atol=1e-5)
