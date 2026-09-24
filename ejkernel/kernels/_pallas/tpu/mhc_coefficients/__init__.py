@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pallas TPU top-k."""
+"""Packed TPU mHC coefficients."""
 
-from ._interface import topk
-from ._pallas_impl_fwd import topk_threshold_tpu
+from ._interface import mhc_coefficients
 
-__all__ = ("topk", "topk_threshold_tpu")
+__all__ = ("mhc_coefficients",)
